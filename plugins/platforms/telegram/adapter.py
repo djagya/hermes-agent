@@ -2060,6 +2060,16 @@ class TelegramAdapter(BasePlatformAdapter):
         """Whether rich delivery is allowed (``rich_messages`` opt-in)."""
         return bool(getattr(self, "_rich_messages_enabled", True))
 
+    def _exceeds_legacy_message_limit(self, content: str) -> bool:
+        """Whether classic MarkdownV2 delivery would require chunking.
+
+        Check both raw and formatted payloads: MarkdownV2 escaping can push a
+        raw-under-limit reply beyond Telegram's 4096 UTF-16-unit limit.
+        """
+        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+            return True
+        return utf16_len(self.format_message(content)) > self.MAX_MESSAGE_LENGTH
+
     def _rich_eligible(self, content: str) -> bool:
         """Capability/content eligibility for rich, ignoring ``expect_edits``.
 
@@ -2074,7 +2084,10 @@ class TelegramAdapter(BasePlatformAdapter):
             and not getattr(self, "_rich_send_disabled", False)
             and content
             and content.strip()
-            and self._needs_rich_rendering(content)
+            and (
+                self._needs_rich_rendering(content)
+                or self._exceeds_legacy_message_limit(content)
+            )
             and not self._has_telegram_desktop_details_math_crash_shape(content)
             and not self._has_telegram_desktop_cjk_rich_garble_shape(content)
             and self._content_fits_rich_limits(content)

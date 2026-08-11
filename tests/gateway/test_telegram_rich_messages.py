@@ -20,7 +20,7 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter, utf16_len
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 
@@ -138,6 +138,36 @@ async def test_plain_markdown_stays_on_legacy_path():
     assert bot is not None
     bot.do_api_request.assert_not_called()
     bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_long_plain_markdown_uses_rich_path():
+    adapter = _make_adapter()
+    content = "Long structured answer.\n\n" + ("x" * 5000)
+
+    result = await adapter.send("12345", content, metadata={"notify": True})
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_awaited_once()
+    bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_formatted_payload_over_limit_uses_rich_path():
+    adapter = _make_adapter()
+    content = "!" * 3000
+    assert len(content) < TelegramAdapter.MAX_MESSAGE_LENGTH
+    assert utf16_len(adapter.format_message(content)) > adapter.MAX_MESSAGE_LENGTH
+
+    result = await adapter.send("12345", content, metadata={"notify": True})
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_awaited_once()
+    bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
