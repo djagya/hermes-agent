@@ -49,19 +49,33 @@ project until total store size is under ``max_total_size_mb``.
 """
 
 import hashlib
+import inspect
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from typing import Dict, List, Optional, Set, Tuple
 
 from utils import env_int
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX runtime
+    msvcrt = None
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +84,77 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 CHECKPOINT_BASE = get_hermes_home() / "checkpoints"
+
+_CHECKPOINT_PROCESS_LOCK = threading.RLock()
+_CHECKPOINT_LOCK_STATE = threading.local()
+
+
+def _checkpoint_lock_path(base: Path) -> Path:
+    """Return the cross-process lock beside the mutable checkpoint base."""
+    base = Path(base)
+    return base.parent / f".{base.name}.lock"
+
+
+@contextmanager
+def _checkpoint_store_lock(checkpoint_base: Optional[Path] = None):
+    """Serialize checkpoint-store mutation across threads and processes.
+
+    The lock is re-entrant within one thread because operations such as
+    ``restore`` take a pre-rollback checkpoint.  The outermost acquisition owns
+    the OS file lock; nested acquisitions only increase the local depth.
+    """
+    base = Path(checkpoint_base or CHECKPOINT_BASE)
+    with _CHECKPOINT_PROCESS_LOCK:
+        depth = getattr(_CHECKPOINT_LOCK_STATE, "depth", 0)
+        if depth:
+            _CHECKPOINT_LOCK_STATE.depth = depth + 1
+            try:
+                yield
+            finally:
+                _CHECKPOINT_LOCK_STATE.depth -= 1
+            return
+
+        lock_path = _checkpoint_lock_path(base)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            elif msvcrt is not None:  # pragma: no cover - Windows fallback
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                locking = getattr(msvcrt, "locking")
+                locking(handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+            _CHECKPOINT_LOCK_STATE.depth = 1
+            yield
+        finally:
+            _CHECKPOINT_LOCK_STATE.depth = 0
+            try:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                elif msvcrt is not None:  # pragma: no cover - Windows fallback
+                    handle.seek(0)
+                    locking = getattr(msvcrt, "locking")
+                    locking(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+            finally:
+                handle.close()
+
+
+def _checkpoint_store_mutation(func):
+    """Run a mutating entrypoint under the shared checkpoint-store lock."""
+    signature = inspect.signature(func)
+
+    @wraps(func)
+    def locked(*args, **kwargs):
+        bound = signature.bind_partial(*args, **kwargs)
+        base = bound.arguments.get("checkpoint_base") or CHECKPOINT_BASE
+        with _checkpoint_store_lock(Path(base)):
+            return func(*args, **kwargs)
+
+    return locked
 
 # Single shared store directory under CHECKPOINT_BASE.
 _STORE_DIRNAME = "store"
@@ -1004,6 +1089,7 @@ class CheckpointManager:
         if m:
             entry["deletions"] = int(m.group(1))
 
+    @_checkpoint_store_mutation
     def diff(self, working_dir: str, commit_hash: str) -> Dict:
         """Show diff between a checkpoint and the current working tree."""
         hash_err = _validate_commit_hash(commit_hash)
@@ -1086,6 +1172,7 @@ class CheckpointManager:
                 result["empty"] = True
         return result
 
+    @_checkpoint_store_mutation
     def restore(
         self,
         working_dir: str,
@@ -1262,6 +1349,7 @@ class CheckpointManager:
     # Internal
     # ------------------------------------------------------------------
 
+    @_checkpoint_store_mutation
     def _take(self, working_dir: str, reason: str) -> bool:
         """Take a snapshot.  Returns True on success."""
         store = _store_path(CHECKPOINT_BASE)
@@ -1770,6 +1858,7 @@ def _dir_has_any_entry(directory: Path) -> bool:
     return False
 
 
+@_checkpoint_store_mutation
 def prune_checkpoints(
     retention_days: int = 7,
     delete_orphans: bool = True,
@@ -2202,6 +2291,7 @@ def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
     return out
 
 
+@_checkpoint_store_mutation
 def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
     """Nuke the entire checkpoint base (store + legacy).  Irreversible.
 
@@ -2221,6 +2311,7 @@ def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
     return out
 
 
+@_checkpoint_store_mutation
 def clear_legacy(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
     """Delete all ``legacy-*`` archive directories.
 

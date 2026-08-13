@@ -6,7 +6,9 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import time
+from contextlib import contextmanager
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -27,6 +29,7 @@ from tools.checkpoint_manager import (
     store_status,
     clear_all,
     clear_legacy,
+    _checkpoint_store_lock,
 )
 
 
@@ -71,6 +74,65 @@ def mgr(work_dir, checkpoint_base, monkeypatch):
 def disabled_mgr(checkpoint_base, monkeypatch):
     monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
     return CheckpointManager(enabled=False)
+
+
+# =========================================================================
+# Cross-process store lock
+# =========================================================================
+
+
+class TestCheckpointStoreLock:
+    def test_contender_waits_for_cross_process_holder(self, checkpoint_base):
+        checkpoint_base.mkdir()
+        lock_path = checkpoint_base.parent / ".checkpoints.lock"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl,sys,time; "
+                    "f=open(sys.argv[1], 'a+'); "
+                    "fcntl.flock(f, fcntl.LOCK_EX); "
+                    "print('held', flush=True); "
+                    "time.sleep(1.0)"
+                ),
+                str(lock_path),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "held"
+            started = time.monotonic()
+            with _checkpoint_store_lock(checkpoint_base):
+                elapsed = time.monotonic() - started
+            assert elapsed >= 0.7
+        finally:
+            holder.terminate()
+            holder.wait(timeout=5)
+
+    def test_mutating_entrypoints_share_owner_lock(
+        self, checkpoint_base, work_dir, monkeypatch,
+    ):
+        entered = []
+
+        @contextmanager
+        def recording_lock(base=None):
+            entered.append(Path(base or checkpoint_base))
+            yield
+
+        monkeypatch.setattr(
+            "tools.checkpoint_manager._checkpoint_store_lock", recording_lock
+        )
+        monkeypatch.setattr(
+            "tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base
+        )
+        manager = CheckpointManager(enabled=True)
+        assert manager.ensure_checkpoint(str(work_dir), "lock probe") is True
+        prune_checkpoints(checkpoint_base=checkpoint_base, delete_orphans=False)
+        assert len(entered) >= 2
+        assert all(path == checkpoint_base for path in entered)
 
 
 # =========================================================================
