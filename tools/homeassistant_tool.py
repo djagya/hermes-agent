@@ -14,6 +14,8 @@ import asyncio
 import json
 import logging
 import re
+import urllib.error
+import urllib.request
 from typing import Any, Dict, Optional
 
 from agent.secret_scope import get_secret
@@ -58,6 +60,31 @@ _BLOCKED_DOMAINS = frozenset({
     "pyscript",         # scripting integration with broader access
     "hassio",           # addon control, host shutdown/reboot, stdin to containers
     "rest_command",     # HTTP requests from HA server (SSRF vector)
+})
+
+# HA long-lived tokens are account-wide. Keep the model-facing write surface
+# narrower than the credential with a positive allowlist before any HTTP call.
+_ALLOWED_SERVICE_CALLS = frozenset({
+    ("light", "turn_on"),
+    ("light", "turn_off"),
+    ("light", "toggle"),
+})
+
+_ALLOWED_LIGHT_DATA_KEYS = frozenset({
+    "brightness",
+    "brightness_pct",
+    "color_name",
+    "color_temp_kelvin",
+    "effect",
+    "flash",
+    "hs_color",
+    "kelvin",
+    "rgb_color",
+    "rgbw_color",
+    "rgbww_color",
+    "transition",
+    "white",
+    "xy_color",
 })
 
 
@@ -108,28 +135,22 @@ async def _async_list_entities(
     area: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Fetch entity states from HA and optionally filter by domain/area."""
-    import aiohttp
-
     hass_url, hass_token = _get_config()
     url = f"{hass_url}/api/states"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            resp.raise_for_status()
-            states = await resp.json()
+    states = await asyncio.to_thread(
+        _request_json, url, _get_headers(hass_token), None, 15
+    )
 
     return _filter_and_summarize(states, domain, area)
 
 
 async def _async_get_state(entity_id: str) -> Dict[str, Any]:
     """Fetch detailed state of a single entity."""
-    import aiohttp
-
     hass_url, hass_token = _get_config()
     url = f"{hass_url}/api/states/{entity_id}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=_get_headers(hass_token), timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
+    data = await asyncio.to_thread(
+        _request_json, url, _get_headers(hass_token), None, 10
+    )
 
     return {
         "entity_id": data["entity_id"],
@@ -152,6 +173,19 @@ def _build_service_payload(
     if entity_id:
         payload["entity_id"] = entity_id
     return payload
+
+
+def _request_json(
+    url: str,
+    headers: Dict[str, str],
+    payload: Optional[Dict[str, Any]],
+    timeout: int,
+) -> Any:
+    """Perform a bounded HA REST request using only the Python standard library."""
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
 
 
 def _parse_service_response(
@@ -182,21 +216,12 @@ async def _async_call_service(
     data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Call a Home Assistant service."""
-    import aiohttp
-
     hass_url, hass_token = _get_config()
     url = f"{hass_url}/api/services/{domain}/{service}"
     payload = _build_service_payload(entity_id, data)
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            url,
-            headers=_get_headers(hass_token),
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            resp.raise_for_status()
-            result = await resp.json()
+    result = await asyncio.to_thread(
+        _request_json, url, _get_headers(hass_token), payload, 15
+    )
 
     return _parse_service_response(domain, service, result)
 
@@ -270,9 +295,23 @@ def _handle_call_service(args: dict, **kw) -> str:
             f"Blocked domains: {', '.join(sorted(_BLOCKED_DOMAINS))}"
         )
 
+    if (domain, service) not in _ALLOWED_SERVICE_CALLS:
+        allowed = ", ".join(
+            f"{allowed_domain}.{allowed_service}"
+            for allowed_domain, allowed_service in sorted(_ALLOWED_SERVICE_CALLS)
+        )
+        return tool_error(
+            f"Service '{domain}.{service}' is outside the commissioned Home "
+            f"Assistant write allowlist. Allowed services: {allowed}"
+        )
+
     entity_id = args.get("entity_id")
-    if entity_id and not _ENTITY_ID_RE.match(entity_id):
+    if not entity_id:
+        return tool_error("An explicit light entity_id is required")
+    if not _ENTITY_ID_RE.match(entity_id):
         return tool_error(f"Invalid entity_id format: {entity_id}")
+    if not entity_id.startswith("light."):
+        return tool_error("Only light.* entities are commissioned for control")
 
     data = args.get("data")
     if isinstance(data, str):
@@ -280,6 +319,16 @@ def _handle_call_service(args: dict, **kw) -> str:
             data = json.loads(data) if data.strip() else None
         except json.JSONDecodeError as e:
             return tool_error(f"Invalid JSON string in 'data' parameter: {e}")
+
+    if data is not None and not isinstance(data, dict):
+        return tool_error("Service data must be a JSON object")
+    if data:
+        disallowed_keys = sorted(set(data) - _ALLOWED_LIGHT_DATA_KEYS)
+        if disallowed_keys:
+            return tool_error(
+                "Service data contains non-commissioned keys: "
+                + ", ".join(disallowed_keys)
+            )
 
     try:
         result = _run_async(_async_call_service(domain, service, entity_id, data))
@@ -295,15 +344,10 @@ def _handle_call_service(args: dict, **kw) -> str:
 
 async def _async_list_services(domain: Optional[str] = None) -> Dict[str, Any]:
     """Fetch available services from HA and optionally filter by domain."""
-    import aiohttp
-
     hass_url, hass_token = _get_config()
     url = f"{hass_url}/api/services"
     headers = {"Authorization": f"Bearer {hass_token}", "Content-Type": "application/json"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            resp.raise_for_status()
-            services = await resp.json()
+    services = await asyncio.to_thread(_request_json, url, headers, None, 15)
 
     if domain:
         services = [s for s in services if s.get("domain") == domain]
@@ -428,45 +472,37 @@ HA_LIST_SERVICES_SCHEMA = {
 HA_CALL_SERVICE_SCHEMA = {
     "name": "ha_call_service",
     "description": (
-        "Call a Home Assistant service to control a device. Use ha_list_services "
-        "to discover available services and their parameters for each domain."
+        "Control one explicitly named Home Assistant light. The commissioned "
+        "write surface permits only light.turn_on, light.turn_off, and "
+        "light.toggle with bounded brightness/color/effect parameters."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "domain": {
                 "type": "string",
-                "description": (
-                    "Service domain (e.g. 'light', 'switch', 'climate', "
-                    "'cover', 'media_player', 'fan', 'scene', 'script')."
-                ),
+                "description": "Service domain. Only 'light' is commissioned.",
             },
             "service": {
                 "type": "string",
-                "description": (
-                    "Service name (e.g. 'turn_on', 'turn_off', 'toggle', "
-                    "'set_temperature', 'set_hvac_mode', 'open_cover', "
-                    "'close_cover', 'set_volume_level')."
-                ),
+                "description": "Service name: 'turn_on', 'turn_off', or 'toggle'.",
             },
             "entity_id": {
                 "type": "string",
                 "description": (
-                    "Target entity ID (e.g. 'light.living_room'). "
-                    "Some services (like scene.turn_on) may not need this."
+                    "Required explicit target light entity ID, for example "
+                    "'light.living_room'. Area/device-wide targets are rejected."
                 ),
             },
             "data": {
                 "type": "string",
                 "description": (
-                    "Additional service data as a JSON string. Examples: "
-                    '{"brightness": 255, "color_name": "blue"} for lights, '
-                    '{"temperature": 22, "hvac_mode": "heat"} for climate, '
-                    '{"volume_level": 0.5} for media players.'
+                    "Optional light parameters as a JSON string, for example "
+                    '{"brightness": 128, "color_name": "blue", "transition": 2}.'
                 ),
             },
         },
-        "required": ["domain", "service"],
+        "required": ["domain", "service", "entity_id"],
     },
 }
 
