@@ -9,6 +9,7 @@ pin+declared-chain composition cell raised in the #80450 cross-PR map.
 import unittest
 from unittest.mock import MagicMock, patch
 
+import hermes_cli.config as hermes_config
 from tools.delegate_tool import _build_child_agent, _resolve_child_fallback_chain
 from tests.tools.test_delegate import _make_mock_parent
 
@@ -198,6 +199,49 @@ class TestBuildChildAgentWiring(unittest.TestCase):
     def test_default_inheritance_preserved(self):
         kwargs = self._spawn(_parent(list(PARENT_CHAIN)), {})
         self.assertEqual(kwargs["fallback_model"], PARENT_CHAIN)
+
+
+def test_real_config_loader_wires_declared_chain_into_pinned_child(tmp_path, monkeypatch):
+    """Exercise config.yaml -> _load_config() -> _build_child_agent without
+    mocking the configuration seam.  A pinned child must receive its explicit
+    delegation-scoped fallback rather than the parent's unrelated chain."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "delegation:\n"
+        "  provider: zai\n"
+        "  model: glm-5.3\n"
+        "  fallback_providers:\n"
+        "    - provider: kimi-coding\n"
+        "      model: k3-256k\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    hermes_config._LOAD_CONFIG_CACHE.clear()
+
+    parent = _parent(list(PARENT_CHAIN))
+    try:
+        with patch("run_agent.AIAgent") as mock_agent:
+            mock_agent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="real config fallback wiring",
+                context=None,
+                toolsets=None,
+                model="glm-5.3",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="zai",
+                override_base_url="https://api.z.ai/api/coding/paas/v4",
+                override_api_key="zai-key",
+            )
+        chain = mock_agent.call_args.kwargs["fallback_model"]
+        assert [(entry["provider"], entry["model"]) for entry in chain] == [
+            ("kimi-coding", "k3-256k")
+        ]
+    finally:
+        hermes_config._LOAD_CONFIG_CACHE.clear()
 
 
 if __name__ == "__main__":
