@@ -42,3 +42,19 @@ def test_upstream_only_large_runners_have_standard_fork_fallbacks() -> None:
         "ubuntu-latest-32-core": 6,
         "windows-latest-32-core": 1,
     }
+
+
+def test_python_suite_is_sharded_only_on_fork_runners() -> None:
+    """A standard fork runner must not receive the 96-core whole-suite load."""
+
+    workflow = (WORKFLOWS / "tests.yml").read_text(encoding="utf-8")
+    fork_slices = [f'"{index}/8"' for index in range(1, 9)]
+
+    assert "name: Run tests (${{ matrix.slice }})" in workflow
+    assert "'[\"all\"]'" in workflow
+    assert all(slice_name in workflow for slice_name in fork_slices)
+    assert 'scripts/run_tests.sh --slice "${{ matrix.slice }}"' in workflow
+    assert (
+        "HERMES_TEST_WORKERS: ${{ github.repository == "
+        "'NousResearch/hermes-agent' && 96 || 8 }}"
+    ) in workflow
