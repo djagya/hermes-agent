@@ -116,6 +116,134 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def _park_task_for_review(title: str = "dashboard review") -> str:
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=title, assignee="implementer")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready",
+            reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        return task_id
+
+
+def test_patch_done_maps_nonpassing_review_to_conflict(client):
+    task_id = _park_task_for_review()
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={
+            "status": "done",
+            "summary": "conditional",
+            "metadata": {"verdict": "CONDITIONAL PASS"},
+        },
+    )
+
+    assert response.status_code == 409
+    assert "metadata.verdict" in response.json()["detail"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+
+
+def test_patch_done_maps_late_review_race_to_conflict(client, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="racy dashboard completion", assignee="worker")
+        child_id = kb.create_task(
+            conn,
+            title="must remain gated",
+            assignee="release",
+            parents=[task_id],
+        )
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+
+    original_merge = kb._merge_completion_prose_artifacts
+    injected = False
+
+    def request_review_between_preflight_and_write(*args, **kwargs):
+        nonlocal injected
+        merged = original_merge(*args, **kwargs)
+        if not injected:
+            injected = True
+            with kb.connect() as concurrent:
+                assert kb.request_review(
+                    concurrent,
+                    task_id,
+                    summary="review landed during dashboard completion",
+                    reviewer="reviewer",
+                    expected_run_id=implementation.current_run_id,
+                )
+        return merged
+
+    monkeypatch.setattr(
+        kb,
+        "_merge_completion_prose_artifacts",
+        request_review_between_preflight_and_write,
+    )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done", "summary": "implementation done"},
+    )
+
+    assert response.status_code == 409
+    assert "metadata.verdict" in response.json()["detail"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        child = kb.get_task(conn, child_id)
+        assert task is not None and task.status == "review"
+        assert child is not None and child.status == "todo"
+        assert any(
+            event.kind == "completion_blocked_nonpassing_verdict"
+            for event in kb.list_events(conn, task_id)
+        )
+
+
+def test_bulk_done_reports_nonpassing_review_per_task(client):
+    task_id = _park_task_for_review("bulk dashboard review")
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [task_id],
+            "status": "done",
+            "summary": "failed",
+            "metadata": {"verdict": "FAIL"},
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()["results"][0]
+    assert result["ok"] is False
+    assert "metadata.verdict" in result["error"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+
+
+def test_patch_done_accepts_exact_pass_review(client):
+    task_id = _park_task_for_review("approved dashboard review")
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={
+            "status": "done",
+            "summary": "approved",
+            "metadata": {"verdict": "PASS"},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["status"] == "done"
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
@@ -372,6 +500,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
             conn,
             child_id,
             summary="approved after parent stabilized",
+            metadata={"verdict": "PASS"},
             expected_run_id=review.current_run_id,
         )
         grandchild = kb.get_task(conn, grandchild_id)

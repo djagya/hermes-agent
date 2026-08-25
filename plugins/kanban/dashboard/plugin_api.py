@@ -235,13 +235,16 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
     }
 
 
-# Hallucination-warning event kinds — see complete_task() in kanban_db.py.
+# Completion-warning event kinds — see complete_task() in kanban_db.py.
 # completion_blocked_hallucination: kernel rejected created_cards with
 #   phantom ids; task stays in prior state.
+# completion_blocked_nonpassing_verdict: review completion lacked exact PASS;
+#   task stays in-flight and dependent work remains unpromoted.
 # suspected_hallucinated_references: prose scan found t_<hex> in summary
 #   that doesn't resolve; completion succeeded, advisory only.
 _WARNING_EVENT_KINDS = (
     "completion_blocked_hallucination",
+    "completion_blocked_nonpassing_verdict",
     "suspected_hallucinated_references",
 )
 
@@ -898,12 +901,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                    )
+                except kanban_db.NonPassingVerdictError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
@@ -1342,12 +1348,20 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
-                        ok = kanban_db.complete_task(
-                            conn, tid,
-                            result=payload.result,
-                            summary=payload.summary,
-                            metadata=payload.metadata,
-                        )
+                        try:
+                            ok = kanban_db.complete_task(
+                                conn, tid,
+                                result=payload.result,
+                                summary=payload.summary,
+                                metadata=payload.metadata,
+                            )
+                        except kanban_db.NonPassingVerdictError as exc:
+                            entry.update(
+                                ok=False,
+                                error=str(exc),
+                            )
+                            results.append(entry)
+                            continue
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
                     elif s == "review":

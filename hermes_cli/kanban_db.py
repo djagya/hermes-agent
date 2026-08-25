@@ -3126,6 +3126,28 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         _check_file_length_invariant(conn)
 
 
+@contextlib.contextmanager
+def _write_txn_raise_after_commit(conn: sqlite3.Connection):
+    """Commit an auditable rejection before surfacing its domain error.
+
+    ``defer(error)`` records one exception. A normal exit from the body commits
+    through :func:`write_txn`, then raises that exception. Transaction or commit
+    failures take precedence and are never hidden by the deferred error.
+    """
+    deferred_error: Optional[Exception] = None
+
+    def defer(error: Exception) -> None:
+        nonlocal deferred_error
+        if deferred_error is not None:
+            raise RuntimeError("only one post-commit exception may be deferred")
+        deferred_error = error
+
+    with write_txn(conn):
+        yield defer
+    if deferred_error is not None:
+        raise deferred_error
+
+
 # ---------------------------------------------------------------------------
 # ID generation
 # ---------------------------------------------------------------------------
@@ -5360,6 +5382,108 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class NonPassingVerdictError(ValueError):
+    """Raised when review completion lacks an exact ``PASS`` verdict.
+
+    The task is left in-flight and an auditable rejection event is committed
+    before this exception reaches the caller.
+    """
+
+    def __init__(self, verdict: str, task_id: str):
+        self.verdict = verdict
+        self.task_id = task_id
+        super().__init__(
+            "review completion blocked: metadata.verdict must normalize to "
+            f"exactly 'PASS'; received {verdict!r}"
+        )
+
+
+def _normalize_completion_verdict(metadata: Optional[dict]) -> str:
+    """Return the normalized review verdict from completion metadata."""
+    if not isinstance(metadata, dict) or "verdict" not in metadata:
+        return "MISSING"
+    raw = metadata.get("verdict")
+    if not isinstance(raw, str):
+        return "INVALID"
+    normalized = raw.strip().upper()
+    return normalized or "MISSING"
+
+
+def _completion_review_context(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int],
+) -> Optional[tuple[str, Optional[int], bool]]:
+    """Resolve current completion ownership and whether it is a review.
+
+    ``None`` means the task/run is not currently eligible for completion.
+    Review identity is durable: a parked review task is review work directly,
+    a claimed reviewer run is recognized by its ``source_status`` event, and a
+    reviewer escalation remains review work while parked in ``blocked``.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in {"running", "ready", "blocked", "review"}:
+        return None
+    current_run_id = row["current_run_id"]
+    if expected_run_id is not None and (
+        current_run_id is None or int(current_run_id) != int(expected_run_id)
+    ):
+        return None
+    is_review = (
+        row["status"] == "review"
+        or (
+            row["status"] == "running"
+            and current_run_id is not None
+            and _retry_status_for_run(conn, task_id, int(current_run_id)) == "review"
+        )
+        or (
+            row["status"] == "blocked"
+            and _resume_status_from_events(conn, task_id) == "review"
+        )
+    )
+    return str(row["status"]), current_run_id, is_review
+
+
+def _enforce_completion_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    expected_run_id: Optional[int],
+) -> bool:
+    """Fail closed when durable review work lacks an exact PASS verdict.
+
+    Returns ``False`` for an ineligible/stale completion target. A semantic
+    rejection commits its own event and then raises
+    :class:`NonPassingVerdictError`, leaving task state untouched.
+    """
+    rejected: Optional[str] = None
+    with write_txn(conn):
+        context = _completion_review_context(conn, task_id, expected_run_id)
+        if context is None:
+            return False
+        _, current_run_id, is_review = context
+        verdict = _normalize_completion_verdict(metadata)
+        if is_review and verdict != "PASS":
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_nonpassing_verdict",
+                {
+                    "verdict": verdict,
+                    "source_status": "review",
+                },
+                run_id=current_run_id,
+            )
+            rejected = verdict
+    if rejected is not None:
+        raise NonPassingVerdictError(rejected, task_id)
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5384,9 +5508,12 @@ def complete_task(
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
     When ``summary`` is omitted we fall back to ``result`` so single-run
-    callers do not have to pass both. ``metadata`` is a free-form dict
-    (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers
-    are encouraged to use it for structured handoff facts.
+    callers do not have to pass both. ``metadata`` remains a free-form dict
+    (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers are
+    encouraged to use it for structured handoff facts. When the durable task
+    context identifies review work, ``metadata.verdict`` must normalize to
+    exact ``PASS``; rejection commits an audit event and raises
+    :class:`NonPassingVerdictError` without changing task or dependency state.
 
     ``created_cards`` is an optional list of task ids the completing
     worker claims to have created. Each id is verified against
@@ -5407,6 +5534,18 @@ def complete_task(
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
+        return False
+
+    # Semantic review gate. Validate run ownership before recording any
+    # rejection so a stale worker cannot write a false verdict event. Review
+    # tasks (parked or actively claimed) require metadata.verdict=PASS;
+    # ordinary completions preserve the existing free-form metadata contract.
+    if not _enforce_completion_verdict(
+        conn,
+        task_id,
+        metadata,
+        expected_run_id=expected_run_id,
+    ):
         return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -5439,17 +5578,37 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    completion_is_review = False
+    with _write_txn_raise_after_commit(conn) as raise_after_commit:
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
         if not _parents_satisfied(conn, task_id):
             return False
-        prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        prior_status = prior["status"] if prior else None
+        # The review lane can change after the preflight check (for example, a
+        # concurrent request_review can land while prose artifacts are staged).
+        # Resolve it again under the same write lock as the final UPDATE.
+        context = _completion_review_context(conn, task_id, expected_run_id)
+        if context is None:
+            return False
+        _, current_run_id, completion_is_review = context
+        verdict = _normalize_completion_verdict(metadata)
+        if completion_is_review and verdict != "PASS":
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_nonpassing_verdict",
+                {
+                    "verdict": verdict,
+                    "source_status": "review",
+                },
+                run_id=current_run_id,
+            )
+            # A normal return commits the rejection event; the wrapper then
+            # overrides this pending return with the same actionable exception
+            # used by the ordinary preflight path.
+            raise_after_commit(NonPassingVerdictError(verdict, task_id))
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5510,16 +5669,20 @@ def complete_task(
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
         if run_id is None and (
-            summary or metadata or result or prior_status == "review"
+            summary or metadata or result or completion_is_review
         ):
             synth_summary = summary if summary is not None else result
             synth_metadata = metadata
-            if prior_status == "review" and not synth_summary and not synth_metadata:
-                synth_summary = "Review approved without additional evidence."
-                synth_metadata = {
-                    "source_status": "review",
-                    "approval": "manual",
-                }
+            if completion_is_review:
+                if not synth_summary:
+                    synth_summary = "Review approved without additional evidence."
+                synth_metadata = dict(metadata or {})
+                synth_metadata.update(
+                    {
+                        "source_status": "review",
+                        "approval": "manual",
+                    }
+                )
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",
@@ -5531,7 +5694,7 @@ def complete_task(
         # second SQL round-trip. First line only, 400 char cap — the
         # full summary stays on the run row.
         event_summary = summary if summary is not None else result
-        if prior_status == "review" and not event_summary:
+        if completion_is_review and not event_summary:
             event_summary = "Review approved without additional evidence."
         _ev_lines = (event_summary or "").strip().splitlines()
         ev_summary = _ev_lines[0][:400] if _ev_lines else ""

@@ -140,6 +140,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
         conn,
         task_id,
         summary="Approved after independent verification.",
+        metadata={"verdict": "PASS"},
         expected_run_id=review_2.current_run_id,
     )
 
@@ -540,10 +541,10 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
     assert current.current_run_id == successor.current_run_id
 
 
-def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -> None:
+def test_parked_review_approval_with_only_verdict_creates_audit_run(conn) -> None:
     task_id = kb.create_task(conn, title="Manual approval", assignee="reviewer")
     assert kb.request_review(conn, task_id, summary="implementation handoff")
-    assert kb.complete_task(conn, task_id)
+    assert kb.complete_task(conn, task_id, metadata={"verdict": "PASS"})
     completed_event = _event(kb.list_events(conn, task_id), "completed")
     assert completed_event.run_id is not None
     run = kb.latest_run(conn, task_id)
@@ -553,6 +554,7 @@ def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -
     assert run.profile == "reviewer"
     assert run.summary == "Review approved without additional evidence."
     assert run.metadata == {
+        "verdict": "PASS",
         "source_status": "review",
         "approval": "manual",
     }
