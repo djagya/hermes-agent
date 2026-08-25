@@ -2689,8 +2689,12 @@ _LONG_LIVED_FOREGROUND_PATTERNS = (
     re.compile(r"\bnext\s+dev\b", re.IGNORECASE),
     re.compile(r"\bvite(?:\s|$)", re.IGNORECASE),
     re.compile(r"\bnodemon\b", re.IGNORECASE),
-    re.compile(r"\buvicorn\b", re.IGNORECASE),
-    re.compile(r"\bgunicorn\b", re.IGNORECASE),
+    # Package paths such as ``site-packages/uvicorn/protocols/...`` are
+    # arguments, not server invocations. Keep matching bare, module, and
+    # absolute-path executables while rejecting both POSIX and Windows package
+    # directory false positives by requiring no following path separator.
+    re.compile(r"\buvicorn\b(?![/\\])", re.IGNORECASE),
+    re.compile(r"\bgunicorn\b(?![/\\])", re.IGNORECASE),
     re.compile(r"\bpython(?:3)?\s+-m\s+http\.server\b", re.IGNORECASE),
 )
 
