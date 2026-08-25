@@ -563,19 +563,19 @@ def _cwd_marker(session_id: str) -> str:
     return f"__HERMES_CWD_{session_id}__"
 
 
-# Per-session variables that the gateway bridges freshly onto every command's
-# process environment (via tools/environments/local._inject_session_context_env,
-# reading gateway.session_context._VAR_MAP). They must NEVER be persisted into
-# the shared bash session snapshot: a single long-lived backend serves many
-# concurrent sessions (the messaging gateway, TUI, desktop/web dashboard all
-# collapse the terminal to one "default" environment), so ``export -p`` dumping
-# the FIRST session's HERMES_SESSION_ID into the snapshot makes every LATER
-# session ``source`` that stale value and see a FOREIGN session's identity —
-# overriding the correct per-command Popen env (issue: cross-session
-# HERMES_SESSION_ID leak via the shared snapshot). Stripping them from the
-# snapshot is safe because they are re-injected on every command; a snapshot
-# should only carry the user's own shell state (PATH, functions, exports they
-# set), not Hermes' per-turn session identity.
+# Runtime-scoped identity variables must NEVER persist into the shared bash
+# session snapshot. A single long-lived backend can serve many concurrent
+# sessions and delegated children (the gateway, TUI, desktop/web dashboard, and
+# delegate_task all collapse the terminal to one "default" environment). If an
+# identity value is dumped by one command, the next command sources the stale
+# value *after* its correct per-call Popen environment was built.
+#
+# Prefix-owned gateway/cron variables are removed directly by the shell dump
+# helper. Explicit scoped subprocess and Kanban lineage names come from
+# agent.delegation_context via ``_snapshot_runtime_scoped_names`` below so the
+# terminal snapshot contract stays aligned with the mutation trust boundary.
+# A snapshot should carry the user's shell state (PATH, functions, exports),
+# never Hermes' per-turn execution identity.
 #
 # Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
 # with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
@@ -586,6 +586,23 @@ _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _snapshot_runtime_scoped_names() -> tuple[str, ...]:
+    """Return explicit execution-identity names that snapshots must not own.
+
+    These values are injected or scrubbed for every subprocess according to
+    the current Python ContextVar / dispatcher process. Parent and delegated
+    child terminal calls intentionally share an execution backend, so snapshot
+    persistence would turn a valid child marker into sticky parent state and
+    could reintroduce dispatcher identity after the child env was scrubbed.
+    """
+    from agent.delegation_context import (
+        KANBAN_ENV_KEYS,
+        SCOPED_SUBPROCESS_ENV_MARKERS,
+    )
+
+    return tuple(sorted({*SCOPED_SUBPROCESS_ENV_MARKERS, *KANBAN_ENV_KEYS}))
 
 
 def _export_dump_excluding_session_vars(
@@ -613,6 +630,8 @@ def _export_dump_excluding_session_vars(
     ``mv``. The brace-group redirect is expanded in the current shell,
     keeping both expansions consistent.
     """
+    from agent.delegation_context import SCOPED_SUBPROCESS_ENV_MARKERS
+
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
     # because ``unset`` with only missing names is ignored under 2>/dev/null.
     # Quote caller-provided names so malformed configuration can never become
@@ -635,6 +654,14 @@ def _export_dump_excluding_session_vars(
         # harness value arriving via the process env, exactly like the
         # session-var leak this dump already guards against.
         "AI_AGENT HERMES_AGENT "
+        # Scoped subprocess markers (delegation child, cron session bridge):
+        # injected into subprocess envs by scrub_kanban_env()/cron bridging,
+        # excluded here by construction. The unset list is BUILT from
+        # SCOPED_SUBPROCESS_ENV_MARKERS so a marker added at the injection
+        # side is excluded automatically — persisting one would make every
+        # later `source` re-assert it (#90782's leak class, closed
+        # structurally rather than per-incident).
+        f"{' '.join(SCOPED_SUBPROCESS_ENV_MARKERS)} "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
@@ -754,6 +781,13 @@ class BaseEnvironment(ABC):
             )
         return tuple(sorted(self._snapshot_passthrough_names))
 
+    def _snapshot_excluded_names(self) -> tuple[str, ...]:
+        """Return all explicit names saved around and excluded from snapshots."""
+        return tuple(sorted({
+            *self._snapshot_excluded_passthrough_names(),
+            *_snapshot_runtime_scoped_names(),
+        }))
+
     def init_session(self):
         """Capture login shell environment into a snapshot file.
 
@@ -800,7 +834,7 @@ class BaseEnvironment(ABC):
         # every later expansion is consistent.
         _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
         _snap_tmp = '"$__hermes_snap_tmp"'
-        snapshot_excluded = self._snapshot_excluded_passthrough_names()
+        snapshot_excluded = self._snapshot_excluded_names()
         bootstrap = (
             f"umask 077\n"
             f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || exit 1\n"
@@ -921,7 +955,7 @@ class BaseEnvironment(ABC):
         _snap_tmp = '"$__hermes_snap_tmp"'
 
         parts = []
-        passthrough_names = self._snapshot_excluded_passthrough_names()
+        snapshot_excluded = self._snapshot_excluded_names()
 
         # A shared snapshot may contain the previous profile's value. Save
         # the current process environment before sourcing it, then restore the
@@ -929,8 +963,8 @@ class BaseEnvironment(ABC):
         # Values stay in environment memory and never enter the shell command
         # string, so secrets are not exposed through process arguments/logs.
         saved_names: list[tuple[str, str, str]] = []
-        for name in passthrough_names:
-            marker = f"_HERMES_RUNTIME_PASSTHROUGH_{name}"
+        for name in snapshot_excluded:
+            marker = f"_HERMES_RUNTIME_SNAPSHOT_{name}"
             present = f"{marker}_PRESENT"
             value = f"{marker}_VALUE"
             saved_names.append((name, present, value))
@@ -996,7 +1030,7 @@ class BaseEnvironment(ABC):
         if self._snapshot_ready:
             parts.append(
                 f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) && "
-                f"{{ {_export_dump_excluding_session_vars(_snap_tmp, passthrough_names)} "
+                f"{{ {_export_dump_excluding_session_vars(_snap_tmp, snapshot_excluded)} "
                 f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
                 f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
             )
