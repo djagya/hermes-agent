@@ -9653,7 +9653,16 @@ class TelegramAdapter(BasePlatformAdapter):
             elif cached.kind == "video":
                 event.message_type = MessageType.VIDEO
             elif cached.kind == "audio":
-                event.message_type = MessageType.AUDIO
+                # Preserve Telegram's voice-note semantics for replied-to
+                # media. The gateway intentionally transcribes VOICE but not
+                # generic AUDIO attachments, so collapsing a replied voice
+                # note to AUDIO makes it bypass the configured Hermes STT
+                # provider and pushes transcription back onto the agent.
+                event.message_type = (
+                    MessageType.VOICE
+                    if getattr(reply_msg, "voice", None) is not None
+                    else MessageType.AUDIO
+                )
         event.text = self._append_observed_note(
             event.text,
             f"[Replied-to {cached.kind} '{cached.display_name}' saved at: {cached.path}]",

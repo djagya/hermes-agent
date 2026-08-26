@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
-from gateway.platforms.base import MessageType
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 
@@ -727,6 +727,111 @@ def test_triggered_location_message_uses_shared_session_in_observe_mode():
 # ---------------------------------------------------------------------------
 # Replied-to media caching
 # ---------------------------------------------------------------------------
+
+
+def _empty_text_event():
+    return MessageEvent(
+        text="continue",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100",
+            chat_type="group",
+            user_id="111",
+            user_name="Alice",
+        ),
+        media_urls=[],
+        media_types=[],
+    )
+
+
+def _replied_audio_source(*, filename="voice.ogg"):
+    file_obj = SimpleNamespace(
+        file_path=filename,
+        download_as_bytearray=AsyncMock(return_value=bytearray(b"OggS replied voice")),
+    )
+    return SimpleNamespace(
+        file_name=filename,
+        file_size=1024,
+        get_file=AsyncMock(return_value=file_obj),
+    )
+
+
+def test_replied_voice_keeps_voice_semantics_for_gateway_stt(monkeypatch):
+    async def _run():
+        adapter = _make_adapter()
+        adapter._max_doc_bytes = 20 * 1024 * 1024
+        source = _replied_audio_source()
+        msg = SimpleNamespace(
+            reply_to_message=SimpleNamespace(
+                photo=None,
+                video=None,
+                voice=source,
+                audio=None,
+                document=None,
+            )
+        )
+        event = _empty_text_event()
+        cached = SimpleNamespace(
+            path="/tmp/replied-voice.ogg",
+            media_type="audio/ogg",
+            kind="audio",
+            display_name="voice.ogg",
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base.cache_media_bytes",
+            lambda *_a, **_kw: cached,
+        )
+
+        await adapter._cache_replied_media(msg, event)
+
+        from gateway.run import _event_media_is_stt_input
+
+        assert event.message_type == MessageType.VOICE
+        assert event.media_urls == [cached.path]
+        assert event.media_types == ["audio/ogg"]
+        assert _event_media_is_stt_input(event, 0) is True
+        assert "[Replied-to audio 'voice.ogg' saved at:" in event.text
+
+    asyncio.run(_run())
+
+
+def test_replied_audio_file_remains_non_stt_audio(monkeypatch):
+    async def _run():
+        adapter = _make_adapter()
+        adapter._max_doc_bytes = 20 * 1024 * 1024
+        source = _replied_audio_source(filename="recording.mp3")
+        msg = SimpleNamespace(
+            reply_to_message=SimpleNamespace(
+                photo=None,
+                video=None,
+                voice=None,
+                audio=source,
+                document=None,
+            )
+        )
+        event = _empty_text_event()
+        cached = SimpleNamespace(
+            path="/tmp/replied-audio.mp3",
+            media_type="audio/mpeg",
+            kind="audio",
+            display_name="recording.mp3",
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base.cache_media_bytes",
+            lambda *_a, **_kw: cached,
+        )
+
+        await adapter._cache_replied_media(msg, event)
+
+        from gateway.run import _event_media_is_stt_input
+
+        assert event.message_type == MessageType.AUDIO
+        assert event.media_urls == [cached.path]
+        assert event.media_types == ["audio/mpeg"]
+        assert _event_media_is_stt_input(event, 0) is False
+
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
