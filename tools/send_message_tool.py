@@ -6,6 +6,7 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+from contextlib import ExitStack
 import json
 import logging
 import os
@@ -1556,6 +1557,44 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
+async def _send_telegram_photo_album(bot, chat_id, image_paths, media_kwargs):
+    """Send one Telegram photo album and verify the returned receipt group."""
+    from telegram import InputFile, InputMediaPhoto
+
+    with ExitStack() as stack:
+        media = [
+            InputMediaPhoto(
+                media=InputFile(
+                    stack.enter_context(open(path, "rb")),
+                    filename=os.path.basename(path),
+                    attach=True,
+                )
+            )
+            for path in image_paths
+        ]
+        receipts = await bot.send_media_group(
+            chat_id=chat_id,
+            media=media,
+            **media_kwargs,
+        )
+
+    receipts = list(receipts or [])
+    if len(receipts) != len(image_paths):
+        raise RuntimeError(
+            "Telegram album receipt count mismatch: "
+            f"expected {len(image_paths)}, got {len(receipts)}"
+        )
+    group_ids = {
+        getattr(receipt, "media_group_id", None)
+        for receipt in receipts
+    }
+    if None in group_ids or len(group_ids) != 1:
+        raise RuntimeError(
+            "Telegram album receipts did not share one media_group_id"
+        )
+    return receipts[-1]
+
+
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
@@ -1723,6 +1762,63 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         )
                     else:
                         raise
+
+        # Telegram renders two or more photos as a native album only when they
+        # are sent through sendMediaGroup.  Keep mixed-media and force-document
+        # payloads on the established per-file path below; only homogeneous,
+        # existing photo batches are eligible.  Bot API albums are capped at
+        # ten items, so larger batches are chunked without silently degrading
+        # to individual sendPhoto calls.
+        _album_paths = [
+            media_path
+            for media_path, is_voice in media_files
+            if (
+                not is_voice
+                and os.path.exists(media_path)
+                and os.path.splitext(media_path)[1].lower() in _IMAGE_EXTS
+            )
+        ]
+        _send_as_albums = (
+            not force_document
+            and len(_album_paths) >= 2
+            and len(_album_paths) == len(media_files)
+        )
+        if _send_as_albums:
+            try:
+                for start in range(0, len(_album_paths), 10):
+                    chunk = _album_paths[start:start + 10]
+                    album_kwargs = dict(thread_kwargs)
+                    try:
+                        last_msg = await _send_telegram_photo_album(
+                            bot, int_chat_id, chunk, album_kwargs,
+                        )
+                    except Exception as album_err:
+                        if (
+                            _is_telegram_thread_not_found(album_err)
+                            and album_kwargs.get("message_thread_id") is not None
+                        ):
+                            logger.warning(
+                                "Thread %s not found for Telegram album, retrying "
+                                "without message_thread_id",
+                                album_kwargs["message_thread_id"],
+                            )
+                            album_kwargs.pop("message_thread_id", None)
+                            last_msg = await _send_telegram_photo_album(
+                                bot, int_chat_id, chunk, album_kwargs,
+                            )
+                        else:
+                            raise
+            except Exception as e:
+                warning = _sanitize_error_text(
+                    f"Failed to send Telegram photo album: {e}"
+                )
+                logger.error(warning)
+                warnings.append(warning)
+                return {"error": warning, "warnings": warnings}
+            # An intended album must never fall back to individual photos: that
+            # can duplicate a partially accepted group and violates the caller's
+            # batching contract. Receipt failures return an explicit error.
+            media_files = []
 
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
