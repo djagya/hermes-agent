@@ -2667,6 +2667,25 @@ def _run_single_child(
     leased_cred_id = None
     if child_pool is not None:
         leased_cred_id = child_pool.acquire_lease()
+        if leased_cred_id is None:
+            # The pool still returns a least-leased credential when all healthy
+            # entries are merely busy. ``None`` therefore means every primary
+            # credential is exhausted or unavailable. Do not spend one doomed
+            # API call before walking the child fallback chain.
+            fallback_chain = list(getattr(child, "fallback_chain", None) or [])
+            switch_to_fallback = getattr(child, "_switch_to_fallback", None)
+            for fallback in fallback_chain:
+                if not callable(switch_to_fallback):
+                    break
+                try:
+                    if switch_to_fallback(fallback):
+                        break
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to activate child fallback after credential "
+                        "pool exhaustion: %s",
+                        exc,
+                    )
         if leased_cred_id is not None:
             try:
                 leased_entry = child_pool.current()

@@ -1339,6 +1339,39 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child._swap_credential.assert_called_once_with(leased_entry)
         child._credential_pool.release_lease.assert_called_once_with("cred-b")
 
+    def test_run_single_child_uses_fallback_when_primary_credentials_exhausted(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child._credential_pool = MagicMock()
+        child._credential_pool.acquire_lease.return_value = None
+        child.fallback_chain = [
+            {
+                "provider": "kimi-coding",
+                "model": "kimi-for-coding",
+                "base_url": "https://api.kimi.com/coding/",
+            }
+        ]
+        child._switch_to_fallback.return_value = True
+        child.run_conversation.return_value = {
+            "final_response": "fallback done",
+            "completed": True,
+            "interrupted": False,
+            "tool_calls": 0,
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="use fallback",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        child._switch_to_fallback.assert_called_once_with(child.fallback_chain[0])
+        child.run_conversation.assert_called_once()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["summary"], "fallback done")
+
     def test_run_single_child_releases_lease_after_failure(self):
         from tools.delegate_tool import _run_single_child
 
