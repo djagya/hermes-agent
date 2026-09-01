@@ -503,6 +503,30 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.rate_limit
         assert result.should_rotate_credential is True
 
+    def test_zai_1310_subscription_limit_is_terminal_quota(self):
+        """Z.AI code 1310 is a fixed weekly/monthly quota, not a burst limit."""
+        e = MockAPIError(
+            "Weekly/Monthly Limit Exhausted. Your limit will reset at "
+            "2026-09-03 04:43:35",
+            status_code=429,
+            body={
+                "error": {
+                    "code": "1310",
+                    "message": (
+                        "Weekly/Monthly Limit Exhausted. Your limit will reset "
+                        "at 2026-09-03 04:43:35"
+                    ),
+                }
+            },
+        )
+
+        result = classify_api_error(e, provider="zai", model="glm-5.3")
+
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
     # ── 5xx that are actually request-validation errors ──
     # Some OpenAI-compatible gateways (e.g. codex.nekos.me) return
     # request-validation failures with a 5xx status. These are

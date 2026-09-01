@@ -941,6 +941,26 @@ def classify_api_error(
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 
+    # Z.AI Coding Plan code 1310 is an exhausted weekly/monthly account
+    # bucket with an explicit future reset time. It is not burst throttling:
+    # retrying the same key seconds later only burns attempts. Keep this
+    # provider-scoped because numeric codes are not portable across compatible
+    # backends.
+    if (
+        status_code == 429
+        and provider_lower in {"zai", "glm", "z-ai", "z.ai", "zhipu"}
+        and (
+            error_code == "1310"
+            or "weekly/monthly limit exhausted" in error_msg
+        )
+    ):
+        return _result(
+            FailoverReason.billing,
+            retryable=False,
+            should_rotate_credential=True,
+            should_fallback=True,
+        )
+
     # Provider content-policy / safety-filter block. The provider has made a
     # deterministic refusal decision about THIS prompt — retrying unchanged
     # just reproduces the same refusal and burns paid attempts. Must run
