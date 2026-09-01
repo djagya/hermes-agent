@@ -321,12 +321,12 @@ def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
 
 
 def interrupt_subagent(subagent_id: str) -> bool:
-    """Request that a single running subagent stop at its next iteration boundary.
+    """Request destructive cancellation of one running subagent.
 
-    Does not hard-kill the worker thread (Python can't); sets the child's
-    interrupt flag which propagates to in-flight tools and recurses into
-    grandchildren via AIAgent.interrupt().  Returns True if a matching
-    subagent was found.
+    Python cannot hard-kill the worker thread, but the interrupt propagates to
+    the child's in-flight tool call and recursively to grandchildren via
+    AIAgent.interrupt(). The child may therefore finish without a usable
+    summary. Returns True if a matching subagent was found and signalled.
     """
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
@@ -594,10 +594,11 @@ def _handle_control_action(
                     "subagent_id": sid,
                     "status": "interrupt_requested",
                     "note": (
-                        "The subagent stops at its next iteration boundary "
-                        "(in-flight tool calls are asked to cancel). Its "
-                        "partial result still re-enters the conversation as a "
-                        "completion message — do not wait or poll."
+                        "Destructive cancellation requested; the in-flight tool "
+                        "call is asked to cancel. A completion status still "
+                        "re-enters the conversation, but a usable partial "
+                        "summary is not guaranteed. Use steer — not stop — to "
+                        "request an early summary."
                     ),
                 },
                 ensure_ascii=False,
@@ -3903,7 +3904,8 @@ def delegate_task(
       - action='list'  -> live children of this conversation's spawn tree
       - action='steer' -> queue course-correction text into a running child
                           (subagent_id + message)
-      - action='stop'  -> interrupt a running child early (subagent_id)
+      - action='stop'  -> destructively cancel a running child; usable partial
+                          output is not guaranteed (subagent_id)
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -4598,8 +4600,9 @@ def delegate_task(
                     "While a child runs you can orchestrate it live with this "
                     "same tool: delegate_task(action='list') to see live "
                     "children, action='steer' with subagent_id + message to "
-                    "redirect one, action='stop' with subagent_id to end one "
-                    "early."
+                    "redirect or request an early summary without cancelling, "
+                    "and action='stop' only to destructively cancel work that "
+                    "should be abandoned."
                 )
             if live_paths:
                 payload["live_transcripts"] = list(live_paths)
@@ -5063,15 +5066,16 @@ def _build_top_level_description() -> str:
 
     return (
         "Spawn subagents in isolated contexts; each gets its own conversation, "
-        "terminal session, and toolset, and only its final summary returns to "
+        "terminal session, and toolset, and only its completion result returns to "
         "you. Pass every task in `tasks` — one entry spawns one subagent, "
         "several run in parallel (limit in the tasks description).\n\n"
         "Runs in the background: dispatch returns immediately with live "
         "transcript paths, and the completed result (one consolidated message, "
         "results in task order) re-enters the conversation on its own. Do NOT "
         "wait or poll; continue other work. While children run, `action` "
-        "(list/steer/stop) controls them live — steer when a transcript shows "
-        "a child drifting.\n\n"
+        "(list/steer/stop) controls them live: steer redirects or requests an "
+        "early summary without cancelling; stop is destructive cancellation "
+        "and may yield no usable summary.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -5233,10 +5237,12 @@ DELEGATE_TASK_SCHEMA = {
                     "Default 'spawn'. Live control of running children: "
                     "'list' = ids/goals/status/transcripts; 'steer' = queue "
                     "course-correction text into one child (subagent_id + "
-                    "message) without stopping it; 'stop' = end one child "
-                    "early (subagent_id; partial result still returns). "
-                    "Control actions return immediately; goal/tasks are "
-                    "ignored unless spawning."
+                    "message) without stopping it; 'stop' = destructively "
+                    "cancel one child (subagent_id). A completion status "
+                    "returns, but usable partial output is not guaranteed; "
+                    "use 'steer' to request an early summary. Control actions "
+                    "return immediately; goal/tasks are ignored unless "
+                    "spawning."
                 ),
             },
             "subagent_id": {
