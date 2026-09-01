@@ -37,6 +37,65 @@ def _fake_cli(tmp_path, body):
     return str(script)
 
 
+class TestDaemonMaintenance:
+    def test_missing_reaper_is_a_noop(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(
+            "HERMES_BROWSER_DAEMON_REAPER", str(tmp_path / "missing.py")
+        )
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: pytest.fail("subprocess must not run"),
+        )
+
+        bu_cli._maintain_browser_daemons({}, "research")
+
+    def test_touches_and_preserves_selected_session(self, tmp_path, monkeypatch):
+        reaper = tmp_path / "reaper.py"
+        reaper.write_text("# test sentinel\n")
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            return bu_cli.subprocess.CompletedProcess(args, 0, "", "")
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", fake_run)
+        env = {"HERMES_BROWSER_DAEMON_REAPER": str(reaper)}
+
+        bu_cli._maintain_browser_daemons(env, "research")
+
+        assert calls == [
+            (
+                [
+                    bu_cli.sys.executable,
+                    str(reaper),
+                    "--preserve",
+                    "research",
+                    "--touch",
+                    "research",
+                ],
+                {
+                    "capture_output": True,
+                    "text": True,
+                    "timeout": 15,
+                    "env": env,
+                },
+            )
+        ]
+
+    def test_timeout_is_best_effort(self, tmp_path, monkeypatch):
+        reaper = tmp_path / "reaper.py"
+        reaper.write_text("# test sentinel\n")
+        monkeypatch.setenv("HERMES_BROWSER_DAEMON_REAPER", str(reaper))
+
+        def timeout(*args, **kwargs):
+            raise bu_cli.subprocess.TimeoutExpired(args[0], timeout=15)
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", timeout)
+
+        bu_cli._maintain_browser_daemons({}, "research")
+
+
 class TestModeDetection:
     def test_default_on_when_cli_available(self, monkeypatch):
         """Backend unset: Browser Use mode is the default when the CLI runs."""

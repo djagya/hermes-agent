@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -439,6 +440,41 @@ def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
         return None
 
 
+def _maintain_browser_daemons(env: dict, session_name: str) -> None:
+    """Touch this session and reap idle browser-harness daemons.
+
+    Detached CLI daemons are intentionally persistent, but without an idle
+    owner they accumulate one process (and one dedicated Chromium tab for
+    named sessions) per historical ``BU_NAME``.  The external reaper owns the
+    identity/liveness checks.  Maintenance is best-effort so browser work does
+    not fail merely because the reaper is absent or unhealthy.
+    """
+    script = Path(
+        env.get("HERMES_BROWSER_DAEMON_REAPER")
+        or os.environ.get("HERMES_BROWSER_DAEMON_REAPER")
+        or "/opt/data/scripts/reap-browser-daemons.py"
+    )
+    if not script.is_file():
+        return
+    name = session_name or "default"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--preserve", name, "--touch", name],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        if proc.returncode != 0:
+            logger.debug(
+                "browser daemon maintenance failed (%s): %s",
+                proc.returncode,
+                (proc.stderr or proc.stdout or "").strip()[-500:],
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug("browser daemon maintenance unavailable: %s", exc)
+
+
 def _find_screenshot(stdout: str, since: float) -> Optional[str]:
     """Return the last screenshot path printed during this exec, or None.
 
@@ -758,6 +794,11 @@ def browser_exec(
                 "dashes, or underscores (e.g. 'r7k2')."
             )
         env["BU_NAME"] = session
+
+    # Refresh the selected daemon's activity marker before cleanup so this call
+    # and concurrent calls cannot be mistaken for idle historical sessions.
+    _maintain_browser_daemons(env, session)
+
     # Real-profile consent: on a local backend this upgrades the attach to
     # the user's default browser (profile snapshot, logins included); with
     # local=True it forces that even under a cloud backend. Runs BEFORE
