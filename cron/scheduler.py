@@ -2923,6 +2923,19 @@ def _extract_media_caption_map(content: str) -> tuple[dict[str, str], str]:
     return caption_by_path, "\n".join(cleaned_lines)
 
 
+def _requires_native_image_album(media_files: list, visible_text: str) -> bool:
+    """Whether Telegram must preserve this media-only result as one album."""
+    return bool(
+        len(media_files) > 1
+        and not (visible_text or "").strip()
+        and all(
+            not is_voice
+            and Path(media_path).suffix.lower() in _TELEGRAM_ALBUM_IMAGE_EXTS
+            for media_path, is_voice in media_files
+        )
+    )
+
+
 def _send_media_via_adapter(
     adapter,
     chat_id: str,
@@ -2971,6 +2984,9 @@ def _send_media_via_adapter(
     # album. Keep GIFs and mixed media on the ordinary per-file routes: Telegram
     # treats animations separately and media groups are all-or-nothing.
     platform_key = str(getattr(platform, "value", platform) or "").lower()
+    require_native_group = bool(
+        metadata and metadata.get("_require_native_media_group")
+    )
     album_paths = [
         path
         for path, is_voice in media_files
@@ -3001,6 +3017,11 @@ def _send_media_via_adapter(
             )
             if future is None:
                 errors.append("cannot send Telegram image album: gateway loop unavailable")
+                if require_native_group:
+                    album_set = set(album_paths)
+                    media_files = [
+                        item for item in media_files if item[0] not in album_set
+                    ]
             else:
                 future.result(timeout=_get_media_send_timeout())
                 album_set = set(album_paths)
@@ -3009,6 +3030,14 @@ def _send_media_via_adapter(
             errors.append(
                 f"failed to send Telegram image album: {str(exc) or type(exc).__name__}"
             )
+            if require_native_group:
+                album_set = set(album_paths)
+                media_files = [item for item in media_files if item[0] not in album_set]
+
+    elif platform_key == "telegram" and len(album_paths) >= 2 and require_native_group:
+        errors.append("native Telegram image album unavailable on live adapter")
+        album_set = set(album_paths)
+        media_files = [item for item in media_files if item[0] not in album_set]
 
     for media_path, _is_voice in media_files:
         try:
@@ -3214,6 +3243,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     requested_media = [(str(p), v) for p, v in media_files]
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    _, unwrapped_without_captions = _extract_media_caption_map(content)
+    _, unwrapped_text = BasePlatformAdapter.extract_media(unwrapped_without_captions)
+    requires_native_image_album = _requires_native_image_album(
+        media_files, unwrapped_text
+    )
     # Attachments the policy filter dropped will never be sent on ANY lane —
     # record them up front so the run status says so (previously one
     # stderr WARNING was the only trace: text delivered, file vanished).
@@ -3755,7 +3789,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # skipped attachments so the drop is visible rather than silently
                 # lost.
                 if adapter_ok and not timed_out and media_files:
-                    routed_media_metadata = dict(media_metadata or {})
+                    routed_media_metadata: dict[str, Any] = dict(media_metadata or {})
+                    if requires_native_image_album and platform == Platform.TELEGRAM:
+                        routed_media_metadata["_require_native_media_group"] = True
                     if transport is not None and transport.is_relay:
                         routed_media_metadata["_relay_logical_platform"] = platform.value
                         logical_home = config.get_home_channel(platform)

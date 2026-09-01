@@ -8133,17 +8133,25 @@ class TelegramAdapter(BasePlatformAdapter):
         are peeled off and sent individually via the base default path.
 
         URL-based photos go into the group directly; local files are
-        opened as byte streams. On failure the whole batch falls back to
-        the base adapter's per-image loop.
+        opened as multipart attachments. Generic callers retain the legacy
+        per-image fallback. Callers that set ``_require_native_media_group``
+        fail closed and verify Telegram returned one shared ``media_group_id``.
         """
+        require_native_group = bool(
+            metadata and metadata.get("_require_native_media_group")
+        )
         if not self._bot:
+            if require_native_group:
+                raise RuntimeError("Telegram bot is not connected")
             return
         if not images:
             return
 
         try:
-            from telegram import InputMediaPhoto
+            from telegram import InputFile, InputMediaPhoto
         except Exception as exc:  # pragma: no cover - missing SDK
+            if require_native_group:
+                raise RuntimeError("Telegram media-group types are unavailable") from exc
             logger.warning(
                 "[%s] InputMediaPhoto unavailable, falling back to per-image send: %s",
                 self.name, exc,
@@ -8162,6 +8170,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Animations: route through the base default (per-image send_animation)
         if animations:
+            if require_native_group:
+                raise RuntimeError("animations cannot be included in a native photo album")
             await super().send_multiple_images(
                 chat_id, animations, metadata, human_delay=human_delay,
             )
@@ -8185,9 +8195,15 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 for image_url, alt_text in chunk:
                     caption = alt_text[:1024] if alt_text else None
+                    local_path = None
                     if image_url.startswith("file://"):
                         local_path = _unquote(image_url[7:])
+                    elif os.path.isabs(image_url) or os.path.exists(image_url):
+                        local_path = image_url
+                    if local_path is not None:
                         if not os.path.exists(local_path):
+                            if require_native_group:
+                                raise FileNotFoundError(local_path)
                             logger.warning(
                                 "[%s] Skipping missing image in media group: %s",
                                 self.name, local_path,
@@ -8195,7 +8211,12 @@ class TelegramAdapter(BasePlatformAdapter):
                             continue
                         fh = open(local_path, "rb")
                         opened_files.append(fh)
-                        media.append(InputMediaPhoto(media=fh, caption=caption))
+                        media.append(
+                            InputMediaPhoto(
+                                media=InputFile(fh, attach=True),
+                                caption=caption,
+                            )
+                        )
                     else:
                         media.append(InputMediaPhoto(media=image_url, caption=caption))
 
@@ -8222,7 +8243,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
-                await self._send_with_dm_topic_reply_anchor_retry(
+                sent_messages = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_media_group,
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
@@ -8237,7 +8258,32 @@ class TelegramAdapter(BasePlatformAdapter):
                     "media group",
                     reset_media=_reset_opened_files,
                 )
+                if require_native_group:
+                    if not isinstance(sent_messages, (list, tuple)):
+                        raise RuntimeError("Telegram returned no media-group receipt")
+                    if len(sent_messages) != len(media):
+                        raise RuntimeError(
+                            f"Telegram acknowledged {len(sent_messages)}/{len(media)} album items"
+                        )
+                    group_ids = {
+                        str(getattr(message, "media_group_id", "") or "")
+                        for message in sent_messages
+                    }
+                    if len(group_ids) != 1 or "" in group_ids:
+                        raise RuntimeError(
+                            "Telegram response did not contain one shared media_group_id"
+                        )
             except Exception as e:
+                if require_native_group:
+                    logger.error(
+                        "[%s] strict send_media_group failed (chunk %d/%d): %s",
+                        self.name,
+                        chunk_idx + 1,
+                        len(chunks),
+                        _redact_telegram_error_text(e),
+                        exc_info=True,
+                    )
+                    raise
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
                     self.name, chunk_idx + 1, len(chunks), _redact_telegram_error_text(e),
