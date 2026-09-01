@@ -2889,6 +2889,38 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
 _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
+_TELEGRAM_ALBUM_IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp'})
+
+
+def _extract_media_caption_map(content: str) -> tuple[dict[str, str], str]:
+    """Extract ``CAPTION:`` lines bound to the preceding ``MEDIA:`` path.
+
+    The lightweight directive stays cron-local: the canonical media extractor
+    continues to own path parsing and safety, while this pass merely associates
+    optional per-image text and removes those directives from visible output.
+    """
+    from pathlib import Path
+
+    caption_by_path: dict[str, str] = {}
+    cleaned_lines: list[str] = []
+    last_media_path: str | None = None
+    for line in (content or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("MEDIA:"):
+            raw_path = stripped[len("MEDIA:"):].strip().strip('`"\'')
+            try:
+                last_media_path = str(Path(raw_path).expanduser()) if raw_path else None
+            except (OSError, RuntimeError, ValueError):
+                last_media_path = None
+            cleaned_lines.append(line)
+            continue
+        if stripped.startswith("CAPTION:") and last_media_path:
+            caption = stripped[len("CAPTION:"):].strip()
+            if caption:
+                caption_by_path[last_media_path] = caption
+            continue
+        cleaned_lines.append(line)
+    return caption_by_path, "\n".join(cleaned_lines)
 
 
 def _send_media_via_adapter(
@@ -2899,6 +2931,7 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
+    captions_by_path: dict[str, str] | None = None,
 ) -> list:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
@@ -2933,6 +2966,49 @@ def _send_media_via_adapter(
                 )
         except Exception:
             errors.append(f"attachment dropped by media path policy: {raw_path}")
+
+    # Telegram can preserve image ordering and per-frame captions in one native
+    # album. Keep GIFs and mixed media on the ordinary per-file routes: Telegram
+    # treats animations separately and media groups are all-or-nothing.
+    platform_key = str(getattr(platform, "value", platform) or "").lower()
+    album_paths = [
+        path
+        for path, is_voice in media_files
+        if not is_voice and Path(path).suffix.lower() in _TELEGRAM_ALBUM_IMAGE_EXTS
+    ]
+    if (
+        platform_key == "telegram"
+        and len(album_paths) >= 2
+        and callable(getattr(adapter, "send_multiple_images", None))
+    ):
+        album_payload = [
+            (
+                Path(path).resolve().as_uri(),
+                (captions_by_path or {}).get(path, ""),
+            )
+            for path in album_paths
+        ]
+        try:
+            from agent.async_utils import safe_schedule_threadsafe
+
+            future = safe_schedule_threadsafe(
+                adapter.send_multiple_images(
+                    chat_id=chat_id,
+                    images=album_payload,
+                    metadata=metadata,
+                ),
+                loop,
+            )
+            if future is None:
+                errors.append("cannot send Telegram image album: gateway loop unavailable")
+            else:
+                future.result(timeout=_get_media_send_timeout())
+                album_set = set(album_paths)
+                media_files = [item for item in media_files if item[0] not in album_set]
+        except Exception as exc:
+            errors.append(
+                f"failed to send Telegram image album: {str(exc) or type(exc).__name__}"
+            )
 
     for media_path, _is_voice in media_files:
         try:
@@ -3134,6 +3210,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     apply_media_policy_env(user_cfg)
 
+    media_captions, delivery_content = _extract_media_caption_map(delivery_content)
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     requested_media = [(str(p), v) for p, v in media_files]
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -3695,6 +3772,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                         job,
                         platform=platform,
+                        captions_by_path=media_captions,
                     )
                     # Surface per-file failures into the run status (parity
                     # with the standalone lane): text delivered but an
