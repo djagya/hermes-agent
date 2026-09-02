@@ -3426,6 +3426,8 @@ def create_task(
             )
         skills_list = cleaned
 
+    fixed_notify_target = _fixed_notify_target()
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -3439,6 +3441,12 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            if fixed_notify_target:
+                add_notify_sub(
+                    conn,
+                    task_id=row["id"],
+                    **fixed_notify_target,
+                )
             return row["id"]
 
     now = int(time.time())
@@ -3588,6 +3596,20 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if fixed_notify_target:
+                    _insert_notify_sub(
+                        conn,
+                        task_id=task_id,
+                        delivery_metadata={
+                            key: value
+                            for key, value in {
+                                "thread_id": fixed_notify_target.get("thread_id"),
+                                "chat_type": fixed_notify_target.get("chat_type"),
+                            }.items()
+                            if value
+                        } or None,
+                        **fixed_notify_target,
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -11556,6 +11578,145 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     }
 
 
+def _fixed_notify_target() -> Optional[dict[str, Any]]:
+    """Return the install-wide Kanban notification target, when configured.
+
+    The target is operator policy, not a caller preference: every task is born
+    subscribed to it and every later subscription request converges on the same
+    route.  Resolving it at the DB seam covers CLI, dashboard, cron, slash
+    commands, and agent tools without duplicating policy in those callers.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        kanban = config.get("kanban") if isinstance(config, Mapping) else None
+        raw = (
+            kanban.get("fixed_notify_target", {})
+            if isinstance(kanban, Mapping)
+            else {}
+        )
+    except Exception:
+        return None
+    if not isinstance(raw, Mapping) or not raw.get("enabled"):
+        return None
+    platform = str(raw.get("platform") or "").strip().lower()
+    chat_id = str(raw.get("chat_id") or "").strip()
+    if not platform or not chat_id:
+        _log.warning(
+            "kanban.fixed_notify_target is enabled but platform/chat_id is missing"
+        )
+        return None
+    return {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": str(raw.get("thread_id") or "").strip() or None,
+        "chat_type": str(raw.get("chat_type") or "").strip() or None,
+        "notifier_profile": (
+            str(raw.get("notifier_profile") or "").strip() or None
+        ),
+    }
+
+
+def _insert_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+    chat_type: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    delivery_mode: Optional[str] = None,
+    delivery_metadata: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Insert or refresh one subscription inside the caller's transaction."""
+    insert_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else (
+        # api_server is stateless: its wake self-post is the delivery.
+        "notify+wake" if platform == "api_server" else "notify"
+    )
+    insert_chat_type = chat_type or "dm"
+    metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+             chat_type, notifier_profile, delivery_mode, delivery_metadata,
+             created_at, last_event_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+        """,
+        (
+            task_id,
+            platform,
+            chat_id,
+            thread_id or "",
+            user_id,
+            user_id_alt,
+            insert_chat_type,
+            notifier_profile,
+            insert_mode,
+            metadata_json,
+            int(time.time()),
+            task_id,
+        ),
+    )
+    if chat_type:
+        # Explicit chat_type is last-write-wins on re-subscribe.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET chat_type = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (chat_type, task_id, platform, chat_id, thread_id or ""),
+        )
+    if user_id_alt:
+        # Self-heal legacy rows created before alternate IDs were tracked.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET user_id_alt = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+               AND (user_id_alt IS NULL OR user_id_alt = '')
+            """,
+            (user_id_alt, task_id, platform, chat_id, thread_id or ""),
+        )
+    if notifier_profile:
+        # Self-heal legacy rows that predate notifier ownership.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET notifier_profile = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+               AND (notifier_profile IS NULL OR notifier_profile = '')
+            """,
+            (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+        )
+    if delivery_mode in _NOTIFY_DELIVERY_MODES:
+        # Explicit delivery_mode is last-write-wins on re-subscribe.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET delivery_mode = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (delivery_mode, task_id, platform, chat_id, thread_id or ""),
+        )
+    if metadata_json:
+        # Refresh the routing anchor for duplicate subscriptions.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET delivery_metadata = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (metadata_json, task_id, platform, chat_id, thread_id or ""),
+        )
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -11570,124 +11731,44 @@ def add_notify_sub(
     delivery_mode: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread).
+    """Register a terminal-state notification route for ``task_id``.
 
-    ``user_id_alt`` records the originating source's platform-specific stable
-    alt ID (Signal UUID, Feishu union_id, ...) alongside ``user_id``. Active-wake
-    replay must reproduce it so the woken turn's ``build_session_key`` matches
-    the original event's — ``build_session_key`` prefers ``user_id_alt`` over
-    ``user_id`` (gateway/session.py), so replaying only ``user_id`` would key a
-    wake into a different session whenever the two diverge for this source.
-
-    ``chat_type`` records the originating source's chat type; the active-wake
-    delivery modes replay it so the woken turn resolves the operator's real
-    channel. ``None`` keeps an existing row's value.
-
-    ``delivery_mode`` (see ``_NOTIFY_DELIVERY_MODES``) selects how the
-    kanban-notifier reacts to a terminal event for this subscription. ``None``
-    leaves an existing row's mode untouched (and inserts the ``"notify"``
-    default for a fresh row); an explicit value is last-write-wins, so an
-    operator can intentionally re-subscribe to change the mode (e.g.
-    ``notify`` -> ``wake``). An unknown value falls back to ``"notify"``.
-    New subscriptions start "caught up": ``last_event_id`` snaps to the
-    task's current ``MAX(task_events.id)`` at creation instead of the
-    schema default 0. A cursor of 0 on an already-active task made the
-    gateway notifier replay every historical terminal event on its next
-    tick — and with many stale subs, a single boot-time burst of 100+
-    messages (issue #29905). Subscribers only want events that occur
-    AFTER they subscribe; the gateway/tool auto-subscribe paths run at
-    task creation, where the snapshot is 0 anyway.
+    When ``kanban.fixed_notify_target`` is enabled, caller-supplied routing is
+    canonicalized here.  Delivery mode remains a caller choice; source identity
+    is cleared because an install-wide operator route is not owned by the
+    originating user/session.
     """
-    insert_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else (
-        # api_server is stateless: the adapter has no send() — the wake
-        # self-post IS the delivery on that path (see gateway/wake.py and
-        # test_kanban_notifier_apiserver_wake). A plain-'notify' default
-        # would leave those subscriptions with no delivery mechanism at
-        # all, regressing the pre-delivery_mode behavior where a task
-        # carrying a session_id always woke. Explicit modes still win.
-        "notify+wake" if platform == "api_server" else "notify"
-    )
-    insert_chat_type = chat_type or "dm"
-    now = int(time.time())
-    metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
+    fixed_target = _fixed_notify_target()
+    if fixed_target:
+        platform = str(fixed_target["platform"])
+        chat_id = str(fixed_target["chat_id"])
+        thread_id = fixed_target.get("thread_id")
+        chat_type = fixed_target.get("chat_type")
+        notifier_profile = fixed_target.get("notifier_profile")
+        user_id = None
+        user_id_alt = None
+        delivery_metadata = {
+            key: value
+            for key, value in {
+                "thread_id": thread_id,
+                "chat_type": chat_type,
+            }.items()
+            if value
+        } or None
     with write_txn(conn):
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-                 chat_type, notifier_profile, delivery_mode, delivery_metadata,
-                 created_at, last_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
-            """,
-            (
-                task_id,
-                platform,
-                chat_id,
-                thread_id or "",
-                user_id,
-                user_id_alt,
-                insert_chat_type,
-                notifier_profile,
-                insert_mode,
-                metadata_json,
-                now,
-                task_id,
-            ),
+        _insert_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            user_id_alt=user_id_alt,
+            chat_type=chat_type,
+            notifier_profile=notifier_profile,
+            delivery_mode=delivery_mode,
+            delivery_metadata=delivery_metadata,
         )
-        if chat_type:
-            # Explicit chat_type is last-write-wins on re-subscribe.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET chat_type = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                """,
-                (chat_type, task_id, platform, chat_id, thread_id or ""),
-            )
-        if user_id_alt:
-            # Self-heal legacy rows created before alternate IDs were tracked.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET user_id_alt = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (user_id_alt IS NULL OR user_id_alt = '')
-                """,
-                (user_id_alt, task_id, platform, chat_id, thread_id or ""),
-            )
-        if notifier_profile:
-            # Self-heal legacy rows that predate notifier ownership.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
-            )
-        if delivery_mode in _NOTIFY_DELIVERY_MODES:
-            # Explicit delivery_mode is last-write-wins on re-subscribe.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET delivery_mode = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                """,
-                (delivery_mode, task_id, platform, chat_id, thread_id or ""),
-            )
-        if metadata_json:
-            # Refresh the routing anchor for duplicate subscriptions.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET delivery_metadata = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                """,
-                (metadata_json, task_id, platform, chat_id, thread_id or ""),
-            )
 
 
 def _notify_profile_filter(
