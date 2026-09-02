@@ -985,8 +985,8 @@ Inspect and manage the shadow git store at `~/.hermes/checkpoints/` — the stor
 | Option | Subcommand | Description |
 |--------|------------|-------------|
 | `--limit N` | `status`, `list` | Max projects to list (default 20). |
-| `--retention-days N` | `prune` | Drop projects whose `last_touch` is older than N days (default 7). |
-| `--max-size-mb N` | `prune` | After the orphan/stale pass, drop the oldest commit per project until total store size ≤ N MB (default 500). |
+| `--retention-days N` | `prune` | Drop projects whose `last_touch` is older than N days (default: configured `checkpoints.retention_days`, normally 7). |
+| `--max-size-mb N` | `prune` | Override the configured physical hard cap for this run. Without the flag, uses `checkpoints.max_total_size_mb` (normally 500). |
 | `--keep-orphans` | `prune` | Skip deleting projects whose working directory no longer exists. |
 | `-f`, `--force` | `clear`, `clear-legacy` | Skip the confirmation prompt. |
 

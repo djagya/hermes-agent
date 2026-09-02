@@ -3,7 +3,9 @@
 import argparse
 import json
 import logging
+import multiprocessing
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -23,7 +25,10 @@ from tools.checkpoint_manager import (
     _store_path,
     _ref_name,
     _project_meta_path,
+    _index_path,
     _touch_project,
+    _checkpoint_store_lock,
+    _dir_size_bytes,
     prune_checkpoints,
     maybe_auto_prune_checkpoints,
     store_status,
@@ -31,6 +36,18 @@ from tools.checkpoint_manager import (
     clear_legacy,
     _checkpoint_store_lock,
 )
+
+
+def _hold_checkpoint_store_lock(base, ready, release):
+    with _checkpoint_store_lock(Path(base), timeout=5.0) as acquired:
+        if not acquired:
+            return
+        ready.set()
+        release.wait(timeout=10)
+
+
+def _clear_checkpoint_base(base, result_queue):
+    result_queue.put(clear_all(Path(base)))
 
 
 # =========================================================================
@@ -330,6 +347,306 @@ class TestRealPruning:
         names = set(files.splitlines())
         assert "small.py" in names
         assert "weights.bin" not in names  # filtered by size cap
+
+
+class TestHardStoreSizeCap:
+    @staticmethod
+    def _incompressible_bytes(size: int, seed: int) -> bytes:
+        return random.Random(seed).randbytes(size)
+
+    def test_evicts_oldest_single_snapshot_project_to_honor_cap(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """One-tip-per-project is not allowed to defeat the advertised cap."""
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(
+            enabled=True,
+            max_snapshots=20,
+            max_total_size_mb=1,
+            max_file_size_mb=10,
+        )
+        old = tmp_path / "old-project"
+        new = tmp_path / "new-project"
+        old.mkdir()
+        new.mkdir()
+        (old / "payload.bin").write_bytes(self._incompressible_bytes(750_000, 1))
+        (new / "payload.bin").write_bytes(self._incompressible_bytes(400_000, 2))
+
+        assert manager.ensure_checkpoint(str(old), "old") is True
+        manager.new_turn()
+        assert manager.ensure_checkpoint(str(new), "new") is True
+
+        store = _store_path(checkpoint_base)
+        assert _dir_size_bytes(store) <= 1024 * 1024
+        old_ref = _ref_name(_project_hash(str(old)))
+        new_ref = _ref_name(_project_hash(str(new)))
+        ok_old, _, _ = _run_git(
+            ["rev-parse", "--verify", old_ref], store, str(checkpoint_base),
+            allowed_returncodes={128},
+        )
+        ok_new, _, _ = _run_git(
+            ["rev-parse", "--verify", new_ref], store, str(checkpoint_base),
+            allowed_returncodes={128},
+        )
+        assert ok_old is False
+        assert ok_new is True
+        assert not _project_meta_path(store, _project_hash(str(old))).exists()
+
+    def test_new_project_over_half_budget_is_rejected_before_old_history(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(
+            enabled=True,
+            max_snapshots=20,
+            max_total_size_mb=1,
+            max_file_size_mb=10,
+        )
+        old = tmp_path / "old-small"
+        new = tmp_path / "new-giant"
+        old.mkdir()
+        new.mkdir()
+        (old / "payload.bin").write_bytes(self._incompressible_bytes(300_000, 40))
+        (new / "payload.bin").write_bytes(self._incompressible_bytes(900_000, 41))
+
+        assert manager.ensure_checkpoint(str(old), "old") is True
+        manager.new_turn()
+        assert manager.ensure_checkpoint(str(new), "giant") is False
+
+        store = _store_path(checkpoint_base)
+        old_ref = _ref_name(_project_hash(str(old)))
+        new_ref = _ref_name(_project_hash(str(new)))
+        assert _run_git(
+            ["rev-parse", "--verify", old_ref], store, str(checkpoint_base),
+        )[0]
+        assert not _run_git(
+            ["rev-parse", "--verify", new_ref], store, str(checkpoint_base),
+            allowed_returncodes={128},
+        )[0]
+        assert _dir_size_bytes(store) <= 1024 * 1024
+
+    def test_single_snapshot_larger_than_cap_is_not_reported_as_retained(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(
+            enabled=True,
+            max_snapshots=20,
+            max_total_size_mb=1,
+            max_file_size_mb=10,
+        )
+        project = tmp_path / "too-large"
+        project.mkdir()
+        (project / "payload.bin").write_bytes(
+            self._incompressible_bytes(1_500_000, 3)
+        )
+
+        assert manager.ensure_checkpoint(str(project), "too large") is False
+        store = _store_path(checkpoint_base)
+        dir_hash = _project_hash(str(project))
+        assert _dir_size_bytes(store) <= 1024 * 1024
+        assert store_status(checkpoint_base)["project_count"] == 0
+        assert not _project_meta_path(store, dir_hash).exists()
+        assert not _index_path(store, dir_hash).exists()
+
+    def test_explicit_prune_uses_same_hard_cap_policy(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(
+            enabled=True,
+            max_snapshots=20,
+            max_total_size_mb=0,
+            max_file_size_mb=10,
+        )
+        for index in range(2):
+            project = tmp_path / f"project-{index}"
+            project.mkdir()
+            (project / "payload.bin").write_bytes(
+                self._incompressible_bytes(700_000, 10 + index)
+            )
+            manager.new_turn()
+            assert manager.ensure_checkpoint(str(project), f"project {index}") is True
+
+        result = prune_checkpoints(
+            retention_days=0,
+            delete_orphans=False,
+            checkpoint_base=checkpoint_base,
+            max_total_size_mb=1,
+        )
+        assert result["cap_satisfied"] == 1
+        assert result["projects_evicted_for_cap"] >= 1
+        assert _dir_size_bytes(_store_path(checkpoint_base)) <= 1024 * 1024
+
+    def test_physical_size_fallback_still_enforces_cap(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        monkeypatch.setattr(
+            "tools.checkpoint_manager._reachable_object_size_bytes",
+            lambda _store: None,
+        )
+        manager = CheckpointManager(
+            enabled=True,
+            max_snapshots=20,
+            max_total_size_mb=0,
+            max_file_size_mb=10,
+        )
+        for index in range(2):
+            project = tmp_path / f"fallback-{index}"
+            project.mkdir()
+            (project / "payload.bin").write_bytes(
+                self._incompressible_bytes(700_000, 60 + index)
+            )
+            manager.new_turn()
+            assert manager.ensure_checkpoint(str(project), "fixture") is True
+
+        result = prune_checkpoints(
+            retention_days=0,
+            delete_orphans=False,
+            checkpoint_base=checkpoint_base,
+            max_total_size_mb=1,
+        )
+        assert result["cap_satisfied"] == 1
+        assert _dir_size_bytes(_store_path(checkpoint_base)) <= 1024 * 1024
+
+    def test_failed_ref_deletion_reports_unsatisfied_cap(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(
+            enabled=True,
+            max_snapshots=20,
+            max_total_size_mb=0,
+            max_file_size_mb=10,
+        )
+        project = tmp_path / "undeletable"
+        project.mkdir()
+        (project / "payload.bin").write_bytes(
+            self._incompressible_bytes(1_500_000, 70)
+        )
+        assert manager.ensure_checkpoint(str(project), "fixture") is True
+        monkeypatch.setattr(
+            "tools.checkpoint_manager._delete_ref",
+            lambda _store, _ref: False,
+        )
+
+        result = prune_checkpoints(
+            retention_days=0,
+            delete_orphans=False,
+            checkpoint_base=checkpoint_base,
+            max_total_size_mb=1,
+        )
+        assert result["cap_satisfied"] == 0
+        assert _dir_size_bytes(_store_path(checkpoint_base)) > 1024 * 1024
+
+    def test_hard_cap_trims_old_history_before_evicting_project(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(
+            enabled=True,
+            max_snapshots=20,
+            max_total_size_mb=0,
+            max_file_size_mb=10,
+        )
+        project = tmp_path / "history"
+        project.mkdir()
+        payload = project / "payload.bin"
+        for revision in range(3):
+            payload.write_bytes(self._incompressible_bytes(500_000, 30 + revision))
+            manager.new_turn()
+            assert manager.ensure_checkpoint(str(project), f"revision {revision}") is True
+
+        result = prune_checkpoints(
+            retention_days=0,
+            delete_orphans=False,
+            checkpoint_base=checkpoint_base,
+            max_total_size_mb=1,
+        )
+        store = _store_path(checkpoint_base)
+        ref = _ref_name(_project_hash(str(project)))
+        ok, count_out, _ = _run_git(
+            ["rev-list", "--count", ref], store, str(checkpoint_base),
+        )
+        assert result["cap_satisfied"] == 1
+        assert result["commits_dropped_for_cap"] >= 1
+        assert result["projects_evicted_for_cap"] == 0
+        assert ok is True
+        assert int(count_out) < 3
+        assert _dir_size_bytes(store) <= 1024 * 1024
+
+    def test_hard_cap_evicts_missing_workdir_before_live_project(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """A vanished scratch root must not displace a still-live project."""
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(
+            enabled=True,
+            max_snapshots=20,
+            max_total_size_mb=0,
+            max_file_size_mb=10,
+        )
+        live = tmp_path / "live"
+        vanished = tmp_path / "vanished"
+        live.mkdir()
+        vanished.mkdir()
+        (live / "payload.bin").write_bytes(self._incompressible_bytes(700_000, 20))
+        (vanished / "payload.bin").write_bytes(
+            self._incompressible_bytes(700_000, 21)
+        )
+        assert manager.ensure_checkpoint(str(live), "older live") is True
+        manager.new_turn()
+        assert manager.ensure_checkpoint(str(vanished), "newer scratch") is True
+        shutil.rmtree(vanished)
+
+        result = prune_checkpoints(
+            retention_days=0,
+            delete_orphans=False,
+            checkpoint_base=checkpoint_base,
+            max_total_size_mb=1,
+        )
+        store = _store_path(checkpoint_base)
+        live_ref = _ref_name(_project_hash(str(live)))
+        vanished_ref = _ref_name(_project_hash(str(vanished)))
+        ok_live, _, _ = _run_git(
+            ["rev-parse", "--verify", live_ref], store, str(checkpoint_base),
+            allowed_returncodes={128},
+        )
+        ok_vanished, _, _ = _run_git(
+            ["rev-parse", "--verify", vanished_ref], store, str(checkpoint_base),
+            allowed_returncodes={128},
+        )
+        assert result["cap_satisfied"] == 1
+        assert ok_live is True
+        assert ok_vanished is False
+
+    def test_store_lock_is_reentrant_within_one_transaction(self, checkpoint_base):
+        with _checkpoint_store_lock(checkpoint_base, timeout=0.1) as outer:
+            assert outer is True
+            with _checkpoint_store_lock(checkpoint_base, timeout=0.1) as inner:
+                assert inner is True
+
+    def test_store_lock_serializes_other_processes(self, checkpoint_base):
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        release = context.Event()
+        holder = context.Process(
+            target=_hold_checkpoint_store_lock,
+            args=(str(checkpoint_base), ready, release),
+        )
+        holder.start()
+        try:
+            assert ready.wait(timeout=5)
+            with _checkpoint_store_lock(checkpoint_base, timeout=0.1) as acquired:
+                assert acquired is False
+        finally:
+            release.set()
+            holder.join(timeout=5)
+            if holder.is_alive():
+                holder.terminate()
+                holder.join(timeout=5)
+        assert holder.exitcode == 0
 
 
 # =========================================================================
@@ -1180,6 +1497,29 @@ class TestClearFunctions:
         result = clear_all()
         assert result["deleted"] is False
         assert result["bytes_freed"] == 0
+
+    def test_clear_all_waits_for_an_inflight_store_mutation(self, tmp_path):
+        base = tmp_path / "checkpoints"
+        base.mkdir()
+        (base / "marker").write_text("still here")
+        ctx = multiprocessing.get_context("spawn")
+        result_queue = ctx.Queue()
+
+        with _checkpoint_store_lock(base, timeout=1.0) as acquired:
+            assert acquired is True
+            process = ctx.Process(
+                target=_clear_checkpoint_base,
+                args=(str(base), result_queue),
+            )
+            process.start()
+            time.sleep(0.2)
+            assert process.is_alive()
+            assert base.exists()
+
+        process.join(timeout=10)
+        assert process.exitcode == 0
+        assert result_queue.get(timeout=1)["deleted"] is True
+        assert not base.exists()
 
     def test_clear_legacy_only_removes_legacy_dirs(
         self, tmp_path, monkeypatch, work_dir,

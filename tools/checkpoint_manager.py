@@ -48,6 +48,7 @@ reclaim object storage.  A size-cap pass drops the oldest checkpoints per
 project until total store size is under ``max_total_size_mb``.
 """
 
+import contextlib
 import hashlib
 import inspect
 import json
@@ -63,7 +64,17 @@ from functools import wraps
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
+
+try:  # POSIX advisory locking
+    import fcntl  # type: ignore
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore
+
+try:  # Windows advisory locking
+    import msvcrt  # type: ignore
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore
 
 from utils import env_int
 
@@ -163,6 +174,9 @@ _INDEXES_DIRNAME = "indexes"
 _PROJECTS_DIRNAME = "projects"
 _LEDGERS_DIRNAME = "ledgers"
 _LEGACY_PREFIX = "legacy-"
+_STORE_LOCK_TIMEOUT_SECONDS = 120.0
+_STORE_THREAD_LOCK = threading.RLock()
+_STORE_LOCK_LOCAL = threading.local()
 
 # Agent-write ledger cap: newest entries retained per project.
 _LEDGER_MAX_ENTRIES = 2000
@@ -296,6 +310,84 @@ def _project_hash(working_dir: str) -> str:
 def _store_path(base: Optional[Path] = None) -> Path:
     """Return the single shared shadow store path."""
     return (base or CHECKPOINT_BASE) / _STORE_DIRNAME
+
+
+@contextlib.contextmanager
+def _checkpoint_store_lock(
+    base: Path,
+    timeout: float = _STORE_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[bool]:
+    """Serialize shared-store mutations across threads and processes.
+
+    Git's own per-file locks do not make a multi-command checkpoint transaction
+    atomic, and ``git gc`` can otherwise delete/repack objects while another
+    Hermes process is staging them.  The lock lives next to the checkpoint base
+    so ``clear_all`` can remove the base without unlinking the active lock file.
+
+    Acquisition is bounded.  Checkpointing is a safety net, not a reason to
+    wedge an agent indefinitely when another process is stuck.
+    """
+    with _STORE_THREAD_LOCK:
+        depth = int(getattr(_STORE_LOCK_LOCAL, "depth", 0))
+        if depth > 0:
+            _STORE_LOCK_LOCAL.depth = depth + 1
+            try:
+                yield True
+            finally:
+                _STORE_LOCK_LOCAL.depth = depth
+            return
+
+        handle = None
+        acquired = False
+        lock_path = base.parent / f".{base.name}.lock"
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(lock_path, "a+b")  # noqa: SIM115 - held across yield
+            if msvcrt is not None:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+
+            deadline = time.monotonic() + max(0.0, timeout)
+            while True:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    elif msvcrt is not None:  # pragma: no cover - Windows
+                        handle.seek(0)
+                        getattr(msvcrt, "locking")(
+                            handle.fileno(), getattr(msvcrt, "LK_NBLCK"), 1,
+                        )
+                    acquired = True
+                    break
+                except (BlockingIOError, OSError):
+                    if time.monotonic() >= deadline:
+                        logger.warning(
+                            "Checkpoint store lock timed out after %.1fs: %s",
+                            timeout, lock_path,
+                        )
+                        break
+                    time.sleep(0.05)
+
+            if acquired:
+                _STORE_LOCK_LOCAL.depth = 1
+            yield acquired
+        finally:
+            if acquired and handle is not None:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    elif msvcrt is not None:  # pragma: no cover - Windows
+                        handle.seek(0)
+                        getattr(msvcrt, "locking")(
+                            handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1,
+                        )
+                except OSError:
+                    pass
+            _STORE_LOCK_LOCAL.depth = 0
+            if handle is not None:
+                handle.close()
 
 
 def _shadow_repo_path(working_dir: str) -> Path:  # pragma: no cover — kept for BC
@@ -1007,7 +1099,11 @@ class CheckpointManager:
         self._checkpointed_dirs.add(abs_dir)
 
         try:
-            return self._take(abs_dir, reason)
+            with _checkpoint_store_lock(CHECKPOINT_BASE) as acquired:
+                if acquired is False:
+                    self._checkpointed_dirs.discard(abs_dir)
+                    return False
+                return self._take(abs_dir, reason)
         except Exception as e:
             logger.debug("Checkpoint failed (non-fatal): %s", e)
             return False
@@ -1089,8 +1185,7 @@ class CheckpointManager:
         if m:
             entry["deletions"] = int(m.group(1))
 
-    @_checkpoint_store_mutation
-    def diff(self, working_dir: str, commit_hash: str) -> Dict:
+    def _diff_unlocked(self, working_dir: str, commit_hash: str) -> Dict:
         """Show diff between a checkpoint and the current working tree."""
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
@@ -1140,6 +1235,13 @@ class CheckpointManager:
             "diff": diff_out if ok_diff else "",
         }
 
+    def diff(self, working_dir: str, commit_hash: str) -> Dict:
+        """Show a checkpoint diff under the shared-store mutation lock."""
+        with _checkpoint_store_lock(CHECKPOINT_BASE) as acquired:
+            if acquired is False:
+                return {"success": False, "error": "Checkpoint store is busy"}
+            return self._diff_unlocked(working_dir, commit_hash)
+
     def session_diff(self, working_dir: str) -> Dict:
         """Show the cumulative diff of everything changed in this directory.
 
@@ -1172,12 +1274,11 @@ class CheckpointManager:
                 result["empty"] = True
         return result
 
-    @_checkpoint_store_mutation
-    def restore(
+    def _restore_unlocked(
         self,
         working_dir: str,
         commit_hash: str,
-        file_path: str = None,
+        file_path: Optional[str] = None,
         safe: bool = False,
     ) -> Dict:
         """Restore files to a checkpoint state.
@@ -1326,6 +1427,21 @@ class CheckpointManager:
             if failed_deletes:
                 result["failed_deletes"] = failed_deletes
         return result
+
+    def restore(
+        self,
+        working_dir: str,
+        commit_hash: str,
+        file_path: Optional[str] = None,
+        safe: bool = False,
+    ) -> Dict:
+        """Restore checkpoint data under the shared-store mutation lock."""
+        with _checkpoint_store_lock(CHECKPOINT_BASE) as acquired:
+            if acquired is False:
+                return {"success": False, "error": "Checkpoint store is busy"}
+            return self._restore_unlocked(
+                working_dir, commit_hash, file_path, safe=safe,
+            )
 
     def get_working_dir_for_path(self, file_path: str) -> str:
         """Resolve a file path to its working directory for checkpointing."""
@@ -1479,10 +1595,11 @@ class CheckpointManager:
         # Real pruning — drop old commits beyond max_snapshots.
         self._prune(store, working_dir, ref)
 
-        # Enforce global size cap.
-        self._enforce_size_cap(store)
+        # Enforce the global physical cap.  If this new ref alone cannot fit,
+        # the hard-cap policy evicts it and the checkpoint must report failure.
+        cap_result = self._enforce_size_cap(store, protected_ref=ref)
 
-        return True
+        return not bool(cap_result.get("protected_ref_evicted", 0))
 
     def _exceeds_size_cap(self, path: Path) -> bool:
         """Whether *path* is larger than ``max_file_size_mb``.
@@ -1611,94 +1728,22 @@ class CheckpointManager:
         )
         _repair_bare_repo_dirs(store)
 
-    def _enforce_size_cap(self, store: Path) -> None:
-        """If total store size exceeds ``max_total_size_mb``, drop oldest
-        checkpoints across ALL projects until under the cap.
+    def _enforce_size_cap(
+        self,
+        store: Path,
+        protected_ref: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """Enforce the configured physical cap across the shared store.
+
+        Older history is trimmed first.  If one tip per project still cannot
+        fit, least-recently-used project refs are evicted; otherwise the cap is
+        not actually a cap.
         """
-        if self.max_total_size_mb <= 0:
-            return
-        cap_bytes = self.max_total_size_mb * 1024 * 1024
-        size = _dir_size_bytes(store)
-        if size <= cap_bytes:
-            return
-        logger.info(
-            "Checkpoint store exceeded %d MB (actual %d MB) — pruning oldest",
-            self.max_total_size_mb, size // (1024 * 1024),
+        return _enforce_store_size_cap(
+            store,
+            self.max_total_size_mb,
+            protected_ref=protected_ref,
         )
-
-        # Collect (commit_time, ref, sha) across all per-project refs.
-        ok, stdout, _ = _run_git(
-            ["for-each-ref", "--format=%(refname)", _REFS_PREFIX],
-            store, str(store.parent),
-            allowed_returncodes={128},
-        )
-        if not ok or not stdout:
-            return
-        refs = [r for r in stdout.splitlines() if r.strip()]
-
-        any_dropped = False
-        # Round-robin-drop oldest commit per ref until under cap.
-        for _ in range(20):  # hard upper bound to avoid pathological loops
-            size = _dir_size_bytes(store)
-            if size <= cap_bytes:
-                break
-            for ref in refs:
-                ok_count, count_out, _ = _run_git(
-                    ["rev-list", "--count", ref], store, str(store.parent),
-                    allowed_returncodes={128},
-                )
-                try:
-                    count = int(count_out) if ok_count else 0
-                except ValueError:
-                    count = 0
-                if count <= 1:
-                    continue  # keep at least one snapshot per project
-                ok_list, list_out, _ = _run_git(
-                    ["rev-list", "--reverse", ref], store, str(store.parent),
-                )
-                if not ok_list or not list_out:
-                    continue
-                commits = list_out.splitlines()
-                keep = commits[1:]  # drop oldest
-                new_parent: Optional[str] = None
-                fail = False
-                for sha in keep:
-                    ok_tree, tree_sha, _ = _run_git(
-                        ["rev-parse", f"{sha}^{{tree}}"], store, str(store.parent),
-                    )
-                    if not ok_tree or not tree_sha:
-                        fail = True
-                        break
-                    ok_msg, msg, _ = _run_git(
-                        ["log", "--format=%s", "-1", sha], store, str(store.parent),
-                    )
-                    commit_msg = msg if ok_msg and msg else "checkpoint"
-                    args = ["commit-tree", tree_sha, "-m", commit_msg, "--no-gpg-sign"]
-                    if new_parent is not None:
-                        args = ["commit-tree", tree_sha, "-p", new_parent,
-                                "-m", commit_msg, "--no-gpg-sign"]
-                    ok_commit, new_sha, _ = _run_git(args, store, str(store.parent))
-                    if not ok_commit or not new_sha:
-                        fail = True
-                        break
-                    new_parent = new_sha
-                if fail or new_parent is None:
-                    continue
-                _run_git(["update-ref", ref, new_parent], store, str(store.parent))
-                any_dropped = True
-            if not any_dropped:
-                break
-
-        _run_git(
-            ["reflog", "expire", "--expire=now", "--all"],
-            store, str(store.parent),
-        )
-        _run_git(
-            ["gc", "--prune=now", "--quiet"],
-            store, str(store.parent), timeout=_GIT_TIMEOUT * 3,
-        )
-        _repair_bare_repo_dirs(store)
-
 
 def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:
     """Format checkpoint list for display to user."""
@@ -1756,6 +1801,390 @@ def _delete_ref(store: Path, ref: str) -> bool:
         allowed_returncodes={128},
     )
     return ok
+
+
+def _checkpoint_refs(store: Path) -> List[str]:
+    ok, stdout, _ = _run_git(
+        ["for-each-ref", "--format=%(refname)", _REFS_PREFIX],
+        store, str(store.parent), allowed_returncodes={128},
+    )
+    if not ok or not stdout:
+        return []
+    return [ref for ref in stdout.splitlines() if ref.strip()]
+
+
+def _reachable_object_size_bytes(store: Path) -> Optional[int]:
+    """Return Git's packed/loose disk usage for objects reachable from refs."""
+    ok, stdout, _ = _run_git(
+        ["rev-list", "--disk-usage", "--objects", "--all"],
+        store, str(store.parent), allowed_returncodes={128},
+    )
+    if not ok:
+        return None
+    try:
+        return int(stdout or "0")
+    except ValueError:
+        return None
+
+
+def _ref_history(store: Path, ref: str) -> List[Tuple[int, str]]:
+    ok, stdout, _ = _run_git(
+        ["rev-list", "--reverse", "--timestamp", ref],
+        store, str(store.parent), allowed_returncodes={128},
+    )
+    if not ok or not stdout:
+        return []
+    history: List[Tuple[int, str]] = []
+    for line in stdout.splitlines():
+        try:
+            timestamp, sha = line.split(None, 1)
+            history.append((int(timestamp), sha.strip()))
+        except (ValueError, TypeError):
+            continue
+    return history
+
+
+def _drop_oldest_commit(store: Path, ref: str) -> bool:
+    """Rewrite ``ref`` without its oldest commit, retaining later trees."""
+    history = _ref_history(store, ref)
+    if len(history) <= 1:
+        return False
+
+    new_parent: Optional[str] = None
+    for _timestamp, sha in history[1:]:
+        ok_tree, tree_sha, _ = _run_git(
+            ["rev-parse", f"{sha}^{{tree}}"], store, str(store.parent),
+        )
+        if not ok_tree or not tree_sha:
+            return False
+        ok_msg, msg, _ = _run_git(
+            ["log", "--format=%s", "-1", sha], store, str(store.parent),
+        )
+        commit_msg = msg if ok_msg and msg else "checkpoint"
+        args = ["commit-tree", tree_sha, "-m", commit_msg, "--no-gpg-sign"]
+        if new_parent is not None:
+            args = [
+                "commit-tree", tree_sha, "-p", new_parent,
+                "-m", commit_msg, "--no-gpg-sign",
+            ]
+        ok_commit, new_sha, _ = _run_git(args, store, str(store.parent))
+        if not ok_commit or not new_sha:
+            return False
+        new_parent = new_sha
+
+    if new_parent is None:
+        return False
+    ok_update, _, _ = _run_git(
+        ["update-ref", ref, new_parent], store, str(store.parent),
+    )
+    return ok_update
+
+
+def _drop_project_state_for_ref(store: Path, ref: str) -> bool:
+    """Delete one project ref plus its index and metadata."""
+    if not _delete_ref(store, ref):
+        return False
+    dir_hash = ref.rsplit("/", 1)[-1]
+    for path in (
+        _index_path(store, dir_hash),
+        _project_meta_path(store, dir_hash),
+    ):
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            logger.warning("Could not remove evicted checkpoint state %s", path)
+    return True
+
+
+def _remove_unreferenced_project_state(store: Path, refs: Set[str]) -> None:
+    """Remove metadata/index files that have no rollback ref."""
+    hashes = {ref.rsplit("/", 1)[-1] for ref in refs}
+    for directory, suffix in (
+        (store / _PROJECTS_DIRNAME, ".json"),
+        (store / _INDEXES_DIRNAME, ""),
+    ):
+        if not directory.exists():
+            continue
+        for path in directory.iterdir():
+            dir_hash = path.name[:-len(suffix)] if suffix else path.name
+            if suffix and not path.name.endswith(suffix):
+                continue
+            if dir_hash in hashes:
+                continue
+            try:
+                if path.is_file():
+                    path.unlink()
+            except OSError:
+                logger.debug("Could not remove unreferenced checkpoint state %s", path)
+
+
+def _ref_unique_object_size_bytes(store: Path, ref: str, refs: List[str]) -> int:
+    """Return bytes that would become unreachable if ``ref`` were deleted."""
+    args = ["rev-list", "--disk-usage", "--objects", ref]
+    others = [candidate for candidate in refs if candidate != ref]
+    if others:
+        args.extend(["--not", *others])
+    ok, out, _ = _run_git(args, store, str(store.parent))
+    if not ok:
+        return 0
+    try:
+        return int(out.strip() or 0)
+    except ValueError:
+        return 0
+
+
+def _ref_eviction_order(
+    store: Path,
+    refs: List[str],
+    protected_ref: Optional[str],
+    *,
+    bytes_to_free: int = 0,
+    cap_bytes: int = 0,
+) -> List[str]:
+    """Rank whole-project evictions by recoverability and bytes reclaimed.
+
+    Missing workdirs go first because cap pressure must evict *something* and
+    those roots are least likely to remain useful. A newly-created project
+    whose unique footprint exceeds half the budget is rejected before it can
+    monopolize the store. Within each class, choose the smallest unique
+    footprint that satisfies the overage (or the largest gain when no single
+    ref is enough). This avoids deleting dozens of independent histories to
+    preserve one giant transient project.
+    """
+    project_state = {}
+    for meta in _list_projects(store):
+        dir_hash = str(meta.get("_hash") or "")
+        if not dir_hash:
+            continue
+        workdir = str(meta.get("workdir") or "")
+        try:
+            last_touch = float(meta.get("last_touch", 0) or 0)
+        except (TypeError, ValueError):
+            last_touch = 0.0
+        project_state[_ref_name(dir_hash)] = (
+            bool(workdir) and Path(workdir).exists(),
+            last_touch,
+        )
+
+    unique_sizes = {
+        ref: _ref_unique_object_size_bytes(store, ref, refs)
+        for ref in refs
+    }
+    missing: List[str] = []
+    oversized_protected: List[str] = []
+    live: List[str] = []
+    protected: List[str] = []
+    for ref in refs:
+        exists, _last_touch = project_state.get(ref, (False, 0.0))
+        if not exists:
+            missing.append(ref)
+        elif (
+            ref == protected_ref
+            and cap_bytes > 0
+            and unique_sizes.get(ref, 0) > cap_bytes // 2
+        ):
+            oversized_protected.append(ref)
+        elif ref == protected_ref:
+            protected.append(ref)
+        else:
+            live.append(ref)
+
+    def _ordered(group: List[str]) -> List[str]:
+        if not group:
+            return []
+        enough = [ref for ref in group if unique_sizes.get(ref, 0) >= bytes_to_free]
+        if enough:
+            return sorted(
+                group,
+                key=lambda ref: (
+                    ref not in enough,
+                    unique_sizes.get(ref, 0),
+                    project_state.get(ref, (False, 0.0))[1],
+                    ref,
+                ),
+            )
+        return sorted(
+            group,
+            key=lambda ref: (
+                -unique_sizes.get(ref, 0),
+                project_state.get(ref, (False, 0.0))[1],
+                ref,
+            ),
+        )
+
+    return (
+        _ordered(missing)
+        + _ordered(oversized_protected)
+        + _ordered(live)
+        + _ordered(protected)
+    )
+
+
+def _gc_checkpoint_store(store: Path) -> bool:
+    _run_git(
+        ["reflog", "expire", "--expire=now", "--all"],
+        store, str(store.parent),
+    )
+    ok, _, _ = _run_git(
+        ["gc", "--prune=now", "--quiet"],
+        store, str(store.parent), timeout=_GIT_TIMEOUT * 3,
+    )
+    _repair_bare_repo_dirs(store)
+    return ok
+
+
+def _enforce_store_size_cap(
+    store: Path,
+    max_total_size_mb: int,
+    protected_ref: Optional[str] = None,
+) -> Dict[str, int]:
+    """Enforce a hard physical cap on the shared checkpoint store.
+
+    Git does not reclaim unreachable packed objects until GC.  The old pruner
+    repeatedly measured the unchanged pack before its one final GC and also
+    refused to evict the last snapshot of any project, so a many-project store
+    could remain permanently above its advertised hard cap.  This pass uses
+    ``rev-list --disk-usage`` to measure reachable objects while refs are
+    rewritten, then performs one GC.  When one tip per project still cannot fit,
+    entire project histories are evicted missing-root first and by marginal
+    space recovery, minimizing the number of useful roots lost.  A newly-created
+    ref is normally considered last, but it is rejected early if it alone would
+    consume more than half the global budget.
+    """
+    cap_bytes = max(0, int(max_total_size_mb)) * 1024 * 1024
+    initial_size = _dir_size_bytes(store)
+    result = {
+        "initial_size_bytes": initial_size,
+        "final_size_bytes": initial_size,
+        "commits_dropped_for_cap": 0,
+        "projects_evicted_for_cap": 0,
+        "protected_ref_evicted": 0,
+        "cap_satisfied": 1,
+    }
+    if cap_bytes <= 0 or initial_size <= cap_bytes:
+        return result
+    if not (store / "HEAD").exists():
+        result["cap_satisfied"] = 0
+        return result
+
+    logger.info(
+        "Checkpoint store exceeded %d MB (actual %d MB) — enforcing hard cap",
+        max_total_size_mb, initial_size // (1024 * 1024),
+    )
+
+    refs = _checkpoint_refs(store)
+    _remove_unreferenced_project_state(store, set(refs))
+    reachable = _reachable_object_size_bytes(store)
+    # Baseline pack-index/metadata overhead guides the expected post-GC size.
+    # Ref rewrites create additional temporary unreachable bytes, so only the
+    # final physical-size fallback below is authoritative.
+    overhead = max(0, initial_size - (reachable or 0)) if reachable is not None else 0
+
+    histories = {ref: _ref_history(store, ref) for ref in refs}
+    while refs:
+        estimate = (
+            (reachable + overhead)
+            if reachable is not None
+            else _dir_size_bytes(store)
+        )
+        if estimate <= cap_bytes:
+            break
+        candidates = [
+            (history[0][0], ref)
+            for ref, history in histories.items()
+            if len(history) > 1
+        ]
+        if not candidates:
+            break
+        _oldest_timestamp, ref = min(candidates)
+        if not _drop_oldest_commit(store, ref):
+            histories[ref] = histories[ref][-1:]
+            continue
+        histories[ref] = histories[ref][1:]
+        result["commits_dropped_for_cap"] += 1
+        reachable = _reachable_object_size_bytes(store)
+        if reachable is None:
+            _gc_checkpoint_store(store)
+
+    estimate = (
+        (reachable + overhead)
+        if reachable is not None
+        else _dir_size_bytes(store)
+    )
+    if estimate > cap_bytes:
+        while estimate > cap_bytes and refs:
+            order = _ref_eviction_order(
+                store,
+                refs,
+                protected_ref,
+                bytes_to_free=estimate - cap_bytes,
+                cap_bytes=cap_bytes,
+            )
+            if not order:
+                break
+            ref = order[0]
+            if not _drop_project_state_for_ref(store, ref):
+                refs.remove(ref)
+                continue
+            result["projects_evicted_for_cap"] += 1
+            refs.remove(ref)
+            reachable = _reachable_object_size_bytes(store)
+            estimate = (
+                (reachable + overhead)
+                if reachable is not None
+                else _dir_size_bytes(store)
+            )
+
+    _gc_checkpoint_store(store)
+    final_size = _dir_size_bytes(store)
+
+    # Account for pack/index rounding or a failed reachability estimate.  The
+    # cap is the invariant, so evict additional LRU refs until physical bytes
+    # actually satisfy it, running GC after each fallback eviction.
+    if final_size > cap_bytes:
+        refs = _checkpoint_refs(store)
+        while final_size > cap_bytes and refs:
+            order = _ref_eviction_order(
+                store,
+                refs,
+                protected_ref,
+                bytes_to_free=final_size - cap_bytes,
+                cap_bytes=cap_bytes,
+            )
+            if not order:
+                break
+            ref = order[0]
+            if not _drop_project_state_for_ref(store, ref):
+                refs.remove(ref)
+                continue
+            refs.remove(ref)
+            result["projects_evicted_for_cap"] += 1
+            _gc_checkpoint_store(store)
+            final_size = _dir_size_bytes(store)
+
+    live_refs = set(_checkpoint_refs(store))
+    _remove_unreferenced_project_state(store, live_refs)
+    final_size = _dir_size_bytes(store)
+    result["final_size_bytes"] = final_size
+    result["cap_satisfied"] = int(final_size <= cap_bytes)
+    result["protected_ref_evicted"] = int(
+        bool(protected_ref) and protected_ref not in live_refs
+    )
+    if not result["cap_satisfied"]:
+        logger.error(
+            "Checkpoint hard cap enforcement failed: %d bytes remain above %d",
+            final_size, cap_bytes,
+        )
+    elif result["commits_dropped_for_cap"] or result["projects_evicted_for_cap"]:
+        logger.info(
+            "Checkpoint hard cap satisfied at %.1f MB: dropped %d commit(s), "
+            "evicted %d project(s)",
+            final_size / (1024 * 1024),
+            result["commits_dropped_for_cap"],
+            result["projects_evicted_for_cap"],
+        )
+    return result
 
 
 def _workdir_is_observably_gone(
@@ -1858,8 +2287,7 @@ def _dir_has_any_entry(directory: Path) -> bool:
     return False
 
 
-@_checkpoint_store_mutation
-def prune_checkpoints(
+def _prune_checkpoints_unlocked(
     retention_days: int = 7,
     delete_orphans: bool = True,
     checkpoint_base: Optional[Path] = None,
@@ -2057,83 +2485,50 @@ def prune_checkpoints(
         )
         _repair_bare_repo_dirs(store)
 
-        # Size-cap pass across remaining projects.
+        # Size-cap pass across remaining projects.  This is the same hard-cap
+        # implementation used after each newly-created checkpoint.
         if max_total_size_mb > 0:
-            cap_bytes = max_total_size_mb * 1024 * 1024
-            for _i in range(20):
-                size = _dir_size_bytes(store)
-                if size <= cap_bytes:
-                    break
-                ok, stdout, _ = _run_git(
-                    ["for-each-ref", "--format=%(refname)", _REFS_PREFIX],
-                    store, str(base),
-                    allowed_returncodes={128},
-                )
-                refs = [r for r in stdout.splitlines() if r.strip()] if ok else []
-                if not refs:
-                    break
-                any_drop = False
-                for ref in refs:
-                    ok_c, count_out, _ = _run_git(
-                        ["rev-list", "--count", ref], store, str(base),
-                        allowed_returncodes={128},
-                    )
-                    try:
-                        count = int(count_out) if ok_c else 0
-                    except ValueError:
-                        count = 0
-                    if count <= 1:
-                        continue
-                    ok_l, lo, _ = _run_git(
-                        ["rev-list", "--reverse", ref], store, str(base),
-                    )
-                    if not ok_l or not lo:
-                        continue
-                    commits = lo.splitlines()
-                    keep = commits[1:]
-                    new_parent: Optional[str] = None
-                    fail = False
-                    for sha in keep:
-                        ok_t, tsha, _ = _run_git(
-                            ["rev-parse", f"{sha}^{{tree}}"], store, str(base),
-                        )
-                        if not ok_t or not tsha:
-                            fail = True
-                            break
-                        ok_m, m, _ = _run_git(
-                            ["log", "--format=%s", "-1", sha], store, str(base),
-                        )
-                        msg = m if ok_m and m else "checkpoint"
-                        args = ["commit-tree", tsha, "-m", msg, "--no-gpg-sign"]
-                        if new_parent is not None:
-                            args = ["commit-tree", tsha, "-p", new_parent,
-                                    "-m", msg, "--no-gpg-sign"]
-                        ok_cm, new_sha, _ = _run_git(args, store, str(base))
-                        if not ok_cm or not new_sha:
-                            fail = True
-                            break
-                        new_parent = new_sha
-                    if fail or new_parent is None:
-                        continue
-                    _run_git(["update-ref", ref, new_parent], store, str(base))
-                    any_drop = True
-                if not any_drop:
-                    break
-            _run_git(
-                ["reflog", "expire", "--expire=now", "--all"],
-                store, str(base),
-            )
-            _run_git(
-                ["gc", "--prune=now", "--quiet"],
-                store, str(base), timeout=_GIT_TIMEOUT * 3,
-            )
-            _repair_bare_repo_dirs(store)
+            cap_result = _enforce_store_size_cap(store, max_total_size_mb)
+            result.update({
+                "commits_dropped_for_cap": cap_result["commits_dropped_for_cap"],
+                "projects_evicted_for_cap": cap_result["projects_evicted_for_cap"],
+                "cap_satisfied": cap_result["cap_satisfied"],
+                "final_size_bytes": cap_result["final_size_bytes"],
+            })
 
     size_after = _dir_size_bytes(base)
     delta = size_before - size_after
     result["bytes_freed"] = max(result["bytes_freed"], delta)
 
     return result
+
+
+def prune_checkpoints(
+    retention_days: int = 7,
+    delete_orphans: bool = True,
+    checkpoint_base: Optional[Path] = None,
+    max_total_size_mb: int = 0,
+    orphan_allowlist: Optional[set] = None,
+) -> Dict[str, int]:
+    """Locked wrapper for checkpoint maintenance and hard-cap enforcement."""
+    base = checkpoint_base or CHECKPOINT_BASE
+    with _checkpoint_store_lock(base) as acquired:
+        if acquired is False:
+            return {
+                "scanned": 0,
+                "deleted_orphan": 0,
+                "deleted_stale": 0,
+                "errors": 1,
+                "bytes_freed": 0,
+                "cap_satisfied": 0,
+            }
+        return _prune_checkpoints_unlocked(
+            retention_days=retention_days,
+            delete_orphans=delete_orphans,
+            checkpoint_base=base,
+            max_total_size_mb=max_total_size_mb,
+            orphan_allowlist=orphan_allowlist,
+        )
 
 
 def maybe_auto_prune_checkpoints(
@@ -2291,8 +2686,9 @@ def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
     return out
 
 
-@_checkpoint_store_mutation
-def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
+def _clear_all_unlocked(
+    checkpoint_base: Optional[Path] = None,
+) -> Dict[str, int]:
     """Nuke the entire checkpoint base (store + legacy).  Irreversible.
 
     Returns ``{"bytes_freed": N, "deleted": bool}``.
@@ -2309,6 +2705,15 @@ def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
     except OSError as exc:
         logger.warning("Could not clear checkpoint base %s: %s", base, exc)
     return out
+
+
+def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
+    """Clear the checkpoint base while excluding concurrent store mutations."""
+    base = checkpoint_base or CHECKPOINT_BASE
+    with _checkpoint_store_lock(base) as acquired:
+        if acquired is False:
+            return {"bytes_freed": 0, "deleted": False}
+        return _clear_all_unlocked(checkpoint_base=base)
 
 
 @_checkpoint_store_mutation
