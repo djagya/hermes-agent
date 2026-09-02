@@ -8371,6 +8371,11 @@ def shutdown_mcp_servers():
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
         _stop_mcp_loop()
+        # OAuth providers retain asyncio primitives and SDK auth-flow state.
+        # A full shutdown replaces the MCP loop, so never carry those objects
+        # into the next discovery cycle. Disk tokens remain intact.
+        from tools.mcp_oauth_manager import get_manager
+        get_manager().clear_cached_providers()
         return
 
     async def _shutdown():
@@ -8415,6 +8420,11 @@ def shutdown_mcp_servers():
         _server_connect_failures.clear()
 
     _stop_mcp_loop()
+    # The next discovery creates a fresh MCP event loop. Rebuild OAuth
+    # providers against it instead of reusing locks/auth-flow state owned by
+    # the loop we just closed. Persisted OAuth state is not removed.
+    from tools.mcp_oauth_manager import get_manager
+    get_manager().clear_cached_providers()
 
 
 def _kill_orphaned_mcp_children(

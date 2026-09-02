@@ -1040,6 +1040,29 @@ class TestGracefulFallback:
 
 class TestShutdown:
 
+    def test_shutdown_clears_oauth_provider_cache_on_empty_fast_path(self):
+        """A new MCP loop must never inherit providers owned by the old loop."""
+        import tools.mcp_tool as mcp_mod
+        from tools.mcp_tool import shutdown_mcp_servers
+
+        with mcp_mod._lock:
+            saved_servers = dict(mcp_mod._servers)
+            mcp_mod._servers.clear()
+
+        manager = MagicMock()
+        try:
+            with patch(
+                "tools.mcp_oauth_manager.get_manager",
+                return_value=manager,
+            ), patch("tools.mcp_tool._stop_mcp_loop"):
+                shutdown_mcp_servers()
+        finally:
+            with mcp_mod._lock:
+                mcp_mod._servers.clear()
+                mcp_mod._servers.update(saved_servers)
+
+        manager.clear_cached_providers.assert_called_once_with()
+
     def test_shutdown_drains_parked_server_after_bounded_wait_expires(self):
         """The public shutdown path drains a parked server if graceful shutdown stalls.
 

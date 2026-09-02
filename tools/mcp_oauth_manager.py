@@ -812,6 +812,30 @@ class MCPOAuthManager:
         with self._entries_lock:
             self._entries.pop(self._key(server_name, hermes_home), None)
 
+    def clear_cached_providers(self) -> int:
+        """Drop every in-process provider while preserving OAuth files.
+
+        A full MCP shutdown also replaces the dedicated asyncio event loop.
+        OAuth providers are not safe to carry across that boundary: each
+        manager entry owns an ``asyncio.Lock`` and the SDK provider keeps
+        request/auth-flow state created on the old loop. Reusing either can
+        leave the next connection waiting on state that can no longer make
+        progress. Persisted tokens, client registrations, and metadata are
+        deliberately untouched so the next provider cold-loads normally.
+
+        Returns the number of cached entries discarded.
+        """
+        with self._entries_lock:
+            count = len(self._entries)
+            self._entries.clear()
+        if count:
+            logger.info(
+                "MCP OAuth: cleared %d in-process provider cache entr%s",
+                count,
+                "y" if count == 1 else "ies",
+            )
+        return count
+
     # -- Disk watch ----------------------------------------------------------
 
     async def invalidate_if_disk_changed(
