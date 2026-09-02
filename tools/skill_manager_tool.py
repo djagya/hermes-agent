@@ -1189,6 +1189,17 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     return result
 
 
+def _patch_old_string_required_error() -> str:
+    """Return the single recovery contract for a patch without an anchor."""
+    return (
+        "old_string is required for 'patch' and must be the EXACT text currently in the "
+        "file. Read the target file first (read_file on the skill's SKILL.md, or the file "
+        "named by file_path) and copy the snippet verbatim, then retry 'patch'. "
+        "Do NOT fall back to action='write_file' — that rewrites the entire file and "
+        "destroys unrelated content."
+    )
+
+
 def _patch_skill(
     name: str,
     old_string: str,
@@ -1206,16 +1217,7 @@ def _patch_skill(
         # omitted the arg or supplied it wrongly, so it retries blindly and often
         # escapes to action='write_file', clobbering the whole skill file. Tell it
         # how to recover. Upstream: NousResearch/hermes-agent#33064.
-        return {
-            "success": False,
-            "error": (
-                "old_string is required for 'patch' and must be the EXACT text currently in the "
-                "file. Read the target file first (read_file on the skill's SKILL.md, or the file "
-                "named by file_path) and copy the snippet verbatim, then retry 'patch'. "
-                "Do NOT fall back to action='write_file' — that rewrites the entire file and "
-                "destroys unrelated content."
-            ),
-        }
+        return {"success": False, "error": _patch_old_string_required_error()}
     if new_string is None:
         return {"success": False, "error": "new_string is required for 'patch'. Use an empty string to delete matched text."}
     # No old_string == new_string guard here: fuzzy_find_and_replace already
@@ -1569,6 +1571,154 @@ _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
 )
 
 
+def _validate_skill_manage_request(
+    action: str,
+    name: str,
+    *,
+    content: Optional[str],
+    category: Optional[str],
+    file_path: Optional[str],
+    file_content: Optional[str],
+    old_string: Optional[str],
+    new_string: Optional[str],
+) -> Optional[str]:
+    """Reject structurally impossible writes before the approval gate."""
+    supported = {"create", "edit", "patch", "delete", "write_file", "remove_file"}
+    if action not in supported:
+        return (
+            f"Unknown action '{action}'. Use: create, edit, patch, delete, "
+            "write_file, remove_file"
+        )
+    name_error = _validate_name(name)
+    if name_error:
+        return name_error
+    if action == "create":
+        if not content:
+            return "content is required for 'create'. Provide the full SKILL.md text (frontmatter + body)."
+        category_error = _validate_category(category)
+        if category_error:
+            return category_error
+    elif action == "edit" and not content:
+        return "content is required for 'edit'. Provide the full updated SKILL.md text."
+    elif action == "patch":
+        # Two supported shapes mirror the dispatcher below:
+        #   * content alone -> full SKILL.md rewrite
+        #   * old_string/new_string -> targeted replacement
+        # The approval preflight must not reject the historical full-rewrite
+        # shorthand merely because it has no targeted-patch anchor.
+        if content:
+            if old_string or new_string is not None:
+                return (
+                    "Pass EITHER content (full SKILL.md rewrite) OR "
+                    "old_string/new_string (targeted replacement), not both."
+                )
+        else:
+            if not old_string:
+                return _patch_old_string_required_error()
+            if new_string is None:
+                return "new_string is required for 'patch'. Use empty string to delete matched text."
+            if file_path:
+                path_error = _validate_file_path(file_path)
+                if path_error:
+                    return path_error
+    elif action == "write_file":
+        if not file_path:
+            return "file_path is required for 'write_file'. Example: 'references/api-guide.md'"
+        if file_content is None:
+            return "file_content is required for 'write_file'."
+        path_error = _validate_file_path(file_path)
+        if path_error:
+            return path_error
+    elif action == "remove_file":
+        if not file_path:
+            return "file_path is required for 'remove_file'."
+        path_error = _validate_file_path(file_path)
+        if path_error:
+            return path_error
+    return None
+
+
+def _canonicalize_staged_skill_payload(
+    action: str,
+    name: str,
+    payload_kwargs: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Return an exact replay payload for the approval queue.
+
+    Fuzzy matching is an ingress convenience, not a transaction primitive.
+    Exact patches remain patches. A fuzzy-only patch is resolved against the
+    current file once and frozen as a full ``edit``/``write_file`` candidate.
+    """
+    payload = {"action": action, "name": name}
+    payload.update({k: v for k, v in payload_kwargs.items() if v is not None})
+    if action != "patch":
+        return payload, None
+
+    existing = _find_skill(name)
+    if not existing:
+        return payload, _skill_not_found_error(name)
+    skill_dir = existing["path"]
+    file_path = payload_kwargs.get("file_path")
+    if file_path:
+        path_error = _validate_file_path(file_path)
+        if path_error:
+            return payload, path_error
+        target, path_error = _resolve_skill_target(skill_dir, file_path)
+        if path_error:
+            return payload, path_error
+        assert target is not None
+    else:
+        target = skill_dir / "SKILL.md"
+    if not target.is_file():
+        return payload, f"File not found: {target.relative_to(skill_dir)}"
+
+    current = target.read_text(encoding="utf-8")
+    old_string = payload_kwargs.get("old_string") or ""
+    replace_all = bool(payload_kwargs.get("replace_all", False))
+    exact_count = current.count(old_string)
+    if (replace_all and exact_count >= 1) or (not replace_all and exact_count == 1):
+        return payload, None
+
+    from tools.fuzzy_match import fuzzy_find_and_replace
+
+    candidate, match_count, strategy, match_error = fuzzy_find_and_replace(
+        current,
+        old_string,
+        payload_kwargs.get("new_string") or "",
+        replace_all,
+    )
+    if match_error:
+        return payload, match_error
+    target_label = "SKILL.md" if not file_path else file_path
+    content_error = _validate_content_size(candidate, label=target_label)
+    if content_error:
+        return payload, content_error
+    if not file_path:
+        frontmatter_error = _validate_frontmatter(candidate)
+        if frontmatter_error:
+            return payload, f"Patch would break SKILL.md structure: {frontmatter_error}"
+
+    audit = {
+        "staged_from_action": "patch",
+        "fuzzy_strategy": strategy,
+        "fuzzy_match_count": match_count,
+    }
+    if file_path:
+        return {
+            "action": "write_file",
+            "name": name,
+            "file_path": file_path,
+            "file_content": candidate,
+            **audit,
+        }, None
+    return {
+        "action": "edit",
+        "name": name,
+        "content": candidate,
+        **audit,
+    }, None
+
+
 def _apply_skill_write_gate(action, name, **payload_kwargs):
     """Evaluate the skill write gate. Returns a JSON tool-result string when the
     write should NOT proceed (blocked or staged), or None to perform the real
@@ -1590,9 +1740,15 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     if decision.blocked:
         return tool_error(decision.message, success=False)
 
-    # stage — record the full skill_manage kwargs so approval can replay it.
-    payload = {"action": action, "name": name}
-    payload.update({k: v for k, v in payload_kwargs.items() if v is not None})
+    # Stage a deterministic replay payload. Exact patches remain patches. A
+    # fuzzy-only patch is resolved once against the current file and frozen as
+    # a full edit/write_file candidate so approval never depends on fuzzy
+    # matching a second time against a differently wrapped anchor.
+    payload, canonical_error = _canonicalize_staged_skill_payload(
+        action, name, payload_kwargs
+    )
+    if canonical_error:
+        return tool_error(canonical_error, success=False)
     gist = wa.skill_gist(
         action, name,
         content=payload_kwargs.get("content") or "",
@@ -1608,7 +1764,11 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     )
 
 
-def apply_skill_pending(payload: Dict[str, Any]) -> str:
+def apply_skill_pending(
+    payload: Dict[str, Any], *,
+    refresh_runtime: bool = True,
+    emit_lifecycle: bool = True,
+) -> str:
     """Replay a staged skill write, bypassing the gate. Returns the tool result
     JSON string. Called by the /skills approve handler.
     """
@@ -1626,6 +1786,8 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
             replace_all=payload.get("replace_all", False),
             absorbed_into=payload.get("absorbed_into"),
             operations=payload.get("operations"),
+            _refresh_runtime=refresh_runtime,
+            _emit_lifecycle=emit_lifecycle,
         )
     finally:
         _skill_gate_bypass.reset(token)
@@ -1950,6 +2112,16 @@ def _maybe_debounced_sync_push(skill_name: str) -> None:
         _sync_push_timer.start()
 
 
+def _refresh_runtime_skill_cache() -> None:
+    """Invalidate process-local skill prompt state after an in-process write."""
+    try:
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+    except Exception:
+        pass
+
+
 def skill_manage(
     action: str,
     name: str,
@@ -1964,6 +2136,8 @@ def skill_manage(
     task_id: str = None,
     session_id: str = None,
     operations=None,
+    _refresh_runtime: bool = True,
+    _emit_lifecycle: bool = True,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
@@ -1979,6 +2153,20 @@ def skill_manage(
             operations, default_name=name or None,
             task_id=task_id, session_id=session_id,
         )
+
+    request_error = _validate_skill_manage_request(
+        action,
+        name,
+        content=content,
+        category=category,
+        file_path=file_path,
+        file_content=file_content,
+        old_string=old_string,
+        new_string=new_string,
+    )
+    if request_error:
+        return tool_error(request_error, success=False)
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
@@ -2099,11 +2287,8 @@ def skill_manage(
             )
         except Exception:
             pass
-        try:
-            from agent.prompt_builder import clear_skills_system_prompt_cache
-            clear_skills_system_prompt_cache(clear_snapshot=True)
-        except Exception:
-            pass
+        if _refresh_runtime:
+            _refresh_runtime_skill_cache()
         # Curator telemetry: bump patch_count on edit/patch/write_file (the actions
         # that mutate an existing skill's guidance), drop the record on delete.
         # Only mark a skill as agent-created when the background self-improvement
@@ -2113,12 +2298,16 @@ def skill_manage(
         try:
             from tools.skill_usage import bump_patch, forget, record_created
             from tools.skill_provenance import is_background_review
+            lifecycle_kwargs = (
+                {} if _emit_lifecycle else {"emit_lifecycle": False}
+            )
             if action == "create":
                 record_created(
                     name,
                     agent_created=is_background_review(),
                     task_id=task_id,
                     session_id=session_id,
+                    **lifecycle_kwargs,
                 )
             elif action in {"patch", "edit", "write_file", "remove_file"}:
                 bump_patch(
@@ -2126,6 +2315,7 @@ def skill_manage(
                     action=action,
                     task_id=task_id,
                     session_id=session_id,
+                    **lifecycle_kwargs,
                 )
             elif action == "delete":
                 # A recoverable curator archive (routed through archive_skill)

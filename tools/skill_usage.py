@@ -913,6 +913,7 @@ def bump_patch(
     action: str = "patch",
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    emit_lifecycle: bool = True,
 ) -> None:
     """Bump patch_count and last_patched_at. Called from skill_manage (patch/edit).
 
@@ -927,7 +928,7 @@ def bump_patch(
         return {"created_by": rec.get("created_by")}
 
     facts = _mutate(skill_name, _apply)
-    if isinstance(facts, dict):
+    if isinstance(facts, dict) and emit_lifecycle:
         _emit_skill_lifecycle(
             skill_name,
             lifecycle_action,
@@ -943,6 +944,7 @@ def record_created(
     agent_created: bool,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    emit_lifecycle: bool = True,
 ) -> None:
     """Persist explicit creation provenance and emit a successful create fact."""
     def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:
@@ -955,7 +957,7 @@ def record_created(
         return {"created_by": rec["created_by"]}
 
     facts = _mutate(skill_name, _apply)
-    if isinstance(facts, dict):
+    if isinstance(facts, dict) and emit_lifecycle:
         _emit_skill_lifecycle(
             skill_name,
             "created",

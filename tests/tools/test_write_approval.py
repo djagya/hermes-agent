@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -262,6 +263,178 @@ def test_memory_invalid_params_rejected_before_staging(hermes_home):
     r = json.loads(memory_tool("add", "memory", None, store=store))
     assert r["success"] is False
     assert wa.pending_count("memory") == 0
+
+
+def test_skill_invalid_name_rejected_before_staging(hermes_home):
+    """A request that cannot replay must never enter the approval queue."""
+    from tools.skill_manager_tool import skill_manage
+    from tools import write_approval as wa
+
+    _set_approval("skills", True)
+    result = json.loads(
+        skill_manage(
+            "patch",
+            "research/demo-skill",
+            old_string="old",
+            new_string="new",
+        )
+    )
+
+    assert result["success"] is False
+    assert "invalid skill name" in result["error"].lower()
+    assert wa.pending_count("skills") == 0
+
+
+def test_skill_required_author_is_frozen_into_pending_payload(hermes_home):
+    """Approval must review the exact authored content that replay will write."""
+    import hermes_cli.config as cfg
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import _parse_frontmatter, skill_manage
+
+    config = cfg.load_config()
+    config.setdefault("skills", {})["write_approval"] = True
+    config["skills"]["required_author"] = "Sera"
+    cfg.save_config(config)
+
+    result = json.loads(skill_manage(
+        action="create",
+        name="authored-skill",
+        content=(
+            "---\n"
+            "name: authored-skill\n"
+            "description: Use when testing approved authored skills.\n"
+            "---\n\n"
+            "# Authored skill\n"
+        ),
+    ))
+
+    assert result["success"] is True
+    assert result["staged"] is True
+    records = wa.list_pending("skills")
+    assert len(records) == 1
+    frontmatter, _ = _parse_frontmatter(records[0]["payload"]["content"])
+    assert frontmatter["author"] == "Sera"
+    assert not (Path(hermes_home) / "skills" / "authored-skill").exists()
+
+
+def test_fuzzy_skill_patch_stages_deterministic_full_write(hermes_home):
+    """Fuzzy convenience belongs at ingress; pending replay stays exact."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.skill_manager_tool import skill_manage
+    from tools import write_approval as wa
+
+    skill_dir = Path(hermes_home) / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    target = skill_dir / "SKILL.md"
+    target.write_text(
+        "---\nname: demo-skill\ndescription: Demo skill\n---\n"
+        "# Demo\n\n- A sentence  with   irregular spacing.\n",
+        encoding="utf-8",
+    )
+    _set_approval("skills", True)
+
+    result = json.loads(
+        skill_manage(
+            "patch",
+            "demo-skill",
+            old_string="- A sentence with irregular spacing.",
+            new_string="- Canonical replacement.",
+        )
+    )
+    assert result["staged"] is True
+
+    records = wa.list_pending("skills")
+    assert len(records) == 1
+    record = records[0]
+    payload = record["payload"]
+    assert payload["action"] == "edit"
+    assert payload["staged_from_action"] == "patch"
+    assert "Canonical replacement" in payload["content"]
+    assert "old_string" not in payload
+
+    out = handle_pending_subcommand(
+        wa.SKILLS,
+        ["approve", record["id"]],
+        refresh_skill_runtime=False,
+    )
+    assert "Approved 1" in out
+    assert "Canonical replacement" in target.read_text(encoding="utf-8")
+    assert wa.pending_count("skills") == 0
+
+
+def test_unresolvable_skill_patch_is_rejected_before_staging(hermes_home):
+    """Approval must not become deferred validation for a doomed patch."""
+    from tools.skill_manager_tool import skill_manage
+    from tools import write_approval as wa
+
+    skill_dir = Path(hermes_home) / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: Demo skill\n---\n"
+        "# Demo\n\nA sentence is physically\nwrapped across lines.\n",
+        encoding="utf-8",
+    )
+    _set_approval("skills", True)
+
+    result = json.loads(
+        skill_manage(
+            "patch",
+            "demo-skill",
+            old_string="A sentence is physically wrapped across lines.",
+            new_string="Replacement.",
+        )
+    )
+
+    assert result["success"] is False
+    assert "match" in result["error"].lower()
+    assert wa.pending_count("skills") == 0
+
+
+def test_headless_skill_approval_skips_process_local_refresh(hermes_home, monkeypatch):
+    """A short-lived reconciler must not import the agent/plugin prompt stack."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    import tools.skill_manager_tool as sm
+    import tools.skill_usage as su
+    from tools import write_approval as wa
+
+    skill_dir = Path(hermes_home) / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    target = skill_dir / "SKILL.md"
+    target.write_text(_SKILL, encoding="utf-8")
+    record = wa.stage_write(
+        wa.SKILLS,
+        {"action": "edit", "name": "demo-skill", "content": _SKILL.replace("body", "updated")},
+        summary="rewrite demo-skill",
+        origin="foreground",
+    )
+    refresh_calls = []
+    lifecycle_calls = []
+    monkeypatch.setattr(sm, "_refresh_runtime_skill_cache", lambda: refresh_calls.append(True))
+    monkeypatch.setattr(su, "_emit_skill_lifecycle", lambda *a, **kw: lifecycle_calls.append((a, kw)))
+
+    out = handle_pending_subcommand(
+        wa.SKILLS,
+        ["approve", record["id"]],
+        refresh_skill_runtime=False,
+    )
+
+    assert "Approved 1" in out
+    assert refresh_calls == []
+    assert lifecycle_calls == []
+    assert "updated" in target.read_text(encoding="utf-8")
+
+    # Normal gateway/CLI approval keeps both defaults enabled.
+    second = wa.stage_write(
+        wa.SKILLS,
+        {"action": "edit", "name": "demo-skill", "content": _SKILL.replace("body", "again")},
+        summary="rewrite demo-skill normally",
+        origin="foreground",
+    )
+    out = handle_pending_subcommand(wa.SKILLS, ["approve", second["id"]])
+    assert out is not None
+    assert "Approved 1" in out
+    assert refresh_calls == [True]
+    assert len(lifecycle_calls) == 1
 
 
 class TestSkillGist:

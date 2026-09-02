@@ -57,6 +57,7 @@ def handle_pending_subcommand(
     *,
     memory_store=None,
     set_mode_fn=None,
+    refresh_skill_runtime: bool = True,
 ) -> Optional[str]:
     """Dispatch a /memory or /skills subcommand.
 
@@ -85,7 +86,12 @@ def handle_pending_subcommand(
         return _fmt_pending_list(subsystem)
 
     if sub in {"approve", "apply"}:
-        return _approve(subsystem, rest, memory_store)
+        return _approve(
+            subsystem,
+            rest,
+            memory_store,
+            refresh_skill_runtime=refresh_skill_runtime,
+        )
 
     if sub in {"reject", "deny", "drop"}:
         return _reject(subsystem, rest)
@@ -105,7 +111,13 @@ def _resolve_one(subsystem: str, rest: List[str]):
     return rest[0], None
 
 
-def _approve(subsystem: str, rest: List[str], memory_store) -> str:
+def _approve(
+    subsystem: str,
+    rest: List[str],
+    memory_store,
+    *,
+    refresh_skill_runtime: bool = True,
+) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
         return err or f"Usage: /{subsystem} approve <id>"
@@ -124,7 +136,12 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
     applied, failed = 0, []
     for rec in targets:
-        ok, msg = _apply_one(subsystem, rec, memory_store)
+        ok, msg = _apply_one(
+            subsystem,
+            rec,
+            memory_store,
+            refresh_skill_runtime=refresh_skill_runtime,
+        )
         if ok:
             wa.discard_pending(subsystem, rec["id"])
             applied += 1
@@ -138,7 +155,13 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     return "\n".join(out)
 
 
-def _apply_one(subsystem: str, rec, memory_store):
+def _apply_one(
+    subsystem: str,
+    rec,
+    memory_store,
+    *,
+    refresh_skill_runtime: bool = True,
+):
     payload = rec.get("payload", {})
     try:
         if subsystem == wa.MEMORY:
@@ -149,7 +172,13 @@ def _apply_one(subsystem: str, rec, memory_store):
             return bool(result.get("success")), result.get("error", "")
         else:
             from tools.skill_manager_tool import apply_skill_pending
-            result = json.loads(apply_skill_pending(payload))
+            result = json.loads(
+                apply_skill_pending(
+                    payload,
+                    refresh_runtime=refresh_skill_runtime,
+                    emit_lifecycle=refresh_skill_runtime,
+                )
+            )
             return bool(result.get("success")), result.get("error", "")
     except Exception as e:
         return False, str(e)
