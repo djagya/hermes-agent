@@ -1,0 +1,39 @@
+name: hermes-local-tests
+
+services:
+  runner:
+    build:
+      context: ../..
+      dockerfile: docker/local-test-runner/Dockerfile
+    image: hermes-local-test-runner:current
+    container_name: hermes-test-runner
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 768
+    mem_limit: 8g
+    cpus: 4.0
+    stop_grace_period: 15s
+    volumes:
+      - ../../../test-runner/spool:/spool:rw
+    tmpfs:
+      - /work:rw,exec,nosuid,nodev,size=12g,uid=1000,gid=1000,mode=1770
+      - /tmp:rw,exec,nosuid,nodev,size=2g,uid=1000,gid=1000,mode=1770
+    healthcheck:
+      test:
+        - CMD
+        - /opt/test-env/.venv/bin/python
+        - -c
+        - >-
+          import json,time;
+          d=json.load(open('/spool/runner-status.json'));
+          assert time.time()-d['heartbeat_epoch'] < 20
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s

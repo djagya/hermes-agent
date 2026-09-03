@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Spool client for the local isolated Hermes test-runner sidecar."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+
+DEFAULT_SPOOL = Path(os.environ.get("HERMES_TEST_SPOOL", "/opt/data/test-runner/spool"))
+TARGET_RE = re.compile(r"tests/[A-Za-z0-9_./-]+\.py(?:::[A-Za-z0-9_.\[\]-]+)*")
+EXCLUDED_PARTS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
+MAX_FILE_BYTES = 32 * 1024 * 1024
+MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
+
+
+class Refusal(RuntimeError):
+    pass
+
+
+def run(*args: str, cwd: Path | None = None) -> str:
+    proc = subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=False)
+    if proc.returncode:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise Refusal(f"command failed ({proc.returncode}): {' '.join(args)}\n{detail}")
+    return proc.stdout
+
+
+def discover_repo(explicit: str | None) -> Path:
+    start = Path(explicit).expanduser().resolve() if explicit else Path.cwd()
+    try:
+        return Path(run("git", "-C", str(start), "rev-parse", "--show-toplevel").strip())
+    except Refusal:
+        fallback = Path("/opt/data/hermes-agent")
+        return Path(run("git", "-C", str(fallback), "rev-parse", "--show-toplevel").strip())
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_status(spool: Path) -> dict:
+    path = spool / "runner-status.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Refusal(
+            "local runner is unavailable; on the Docker host run "
+            "/home/dlz/monolith/data/hermes/hermes-agent/"
+            "docker/local-test-runner/install-host.sh"
+        ) from exc
+    age = time.time() - float(data.get("heartbeat_epoch", 0))
+    if age > 20:
+        raise Refusal(f"runner heartbeat is stale ({age:.1f}s)")
+    if not data.get("isolation_ok"):
+        raise Refusal(f"runner did not attest isolation: {data}")
+    return data
+
+
+def validate_target(repo: Path, target: str) -> str:
+    if not TARGET_RE.fullmatch(target) or ".." in target:
+        raise Refusal("target must be one tests/...py path or exact :: node ID")
+    file_part = target.split("::", 1)[0]
+    if not (repo / file_part).is_file():
+        raise Refusal(f"target file does not exist: {file_part}")
+    return target
+
+
+def listed_files(repo: Path) -> list[Path]:
+    raw = subprocess.check_output(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=repo,
+    )
+    result: list[Path] = []
+    total = 0
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        rel = Path(os.fsdecode(item))
+        pure = PurePosixPath(rel.as_posix())
+        if pure.is_absolute() or ".." in pure.parts or EXCLUDED_PARTS.intersection(pure.parts):
+            continue
+        if pure.name == ".env" or (pure.name.startswith(".env.") and pure.name != ".env.example"):
+            continue
+        source = repo / rel
+        if source.is_symlink():
+            raise Refusal(f"snapshot refuses symlink: {rel}")
+        if not source.is_file():
+            continue
+        size = source.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise Refusal(f"snapshot file exceeds 32 MiB: {rel}")
+        total += size
+        if total > MAX_SNAPSHOT_BYTES:
+            raise Refusal("snapshot exceeds 512 MiB")
+        result.append(rel)
+    if not result:
+        raise Refusal("git snapshot selected no files")
+    return result
+
+
+def build_request(repo: Path, spool: Path, mode: str, target: str, timeout: int) -> str:
+    request_id = f"{int(time.time())}-{os.getpid()}-{secrets.token_hex(4)}"
+    requests = spool / "requests"
+    building = requests / f".{request_id}.building"
+    ready = requests / f"{request_id}.ready"
+    building.mkdir(parents=False)
+    try:
+        files = listed_files(repo)
+        archive = building / "source.tar.gz"
+        with tarfile.open(archive, "w:gz", compresslevel=3) as tf:
+            for rel in files:
+                tf.add(repo / rel, arcname=rel.as_posix(), recursive=False)
+        request = {
+            "version": 1,
+            "id": request_id,
+            "mode": mode,
+            "target": target,
+            "timeout_seconds": timeout,
+            "lock_sha256": sha256(repo / "uv.lock"),
+            "source_file_count": len(files),
+            "source_archive_sha256": sha256(archive),
+        }
+        (building / "request.json").write_text(json.dumps(request, sort_keys=True) + "\n")
+        os.replace(building, ready)
+    except Exception:
+        shutil.rmtree(building, ignore_errors=True)
+        raise
+    return request_id
+
+
+def wait_result(spool: Path, request_id: str, timeout: int) -> dict:
+    result_dir = spool / "results" / request_id
+    deadline = time.monotonic() + timeout + 60
+    while time.monotonic() < deadline:
+        result_path = result_dir / "result.json"
+        if result_path.exists():
+            result = json.loads(result_path.read_text())
+            log_path = result_dir / "output.log"
+            if log_path.exists():
+                sys.stdout.write(log_path.read_text(errors="replace"))
+            return result
+        time.sleep(1)
+    raise Refusal(f"timed out waiting for runner result {request_id}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run changed Hermes code in a local isolated sidecar container."
+    )
+    parser.add_argument("target", nargs="?", help="tests/...py or exact :: node ID")
+    parser.add_argument("--full", action="store_true", help="run the full suite explicitly")
+    parser.add_argument("--repo-path", help="checkout/worktree; default is current git repo")
+    parser.add_argument("--spool", default=str(DEFAULT_SPOOL))
+    parser.add_argument("--doctor", action="store_true", help="verify runner heartbeat and isolation")
+    parser.add_argument("--timeout", type=int, help="seconds; defaults to 1800 narrow / 7200 full")
+    args = parser.parse_args()
+
+    try:
+        spool = Path(args.spool).resolve()
+        status = read_status(spool)
+        if args.doctor:
+            print(json.dumps(status, sort_keys=True))
+            return 0
+        if args.full and args.target:
+            raise Refusal("--full and a narrow target are mutually exclusive")
+        if not args.full and not args.target:
+            raise Refusal("supply a narrow target or use --full explicitly")
+        timeout = args.timeout or (7200 if args.full else 1800)
+        if not 1 <= timeout <= 10800:
+            raise Refusal("--timeout must be between 1 and 10800 seconds")
+
+        repo = discover_repo(args.repo_path)
+        target = "" if args.full else validate_target(repo, args.target)
+        local_lock = sha256(repo / "uv.lock")
+        if status.get("lock_sha256") != local_lock:
+            raise Refusal("uv.lock differs from runner image; rebuild it with install-host.sh")
+
+        request_id = build_request(
+            repo, spool, "full" if args.full else "narrow", target, timeout
+        )
+        print(f"queued local isolated run: {request_id}", flush=True)
+        result = wait_result(spool, request_id, timeout)
+        print(
+            f"isolation={result.get('isolation')} exit={result.get('exit_code')} "
+            f"duration={result.get('duration_seconds')}s"
+        )
+        return int(result.get("exit_code", 1))
+    except (Refusal, OSError, subprocess.CalledProcessError) as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
