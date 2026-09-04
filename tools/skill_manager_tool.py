@@ -1706,9 +1706,48 @@ def _skill_write_target_state(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _skill_batch_target_state(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Snapshot every skill tree a staged batch would touch."""
+    operations = payload.get("operations")
+    if not isinstance(operations, list) or not operations:
+        raise ValueError("Pending batch write has malformed operations; restage it.")
+    default = str(payload.get("name") or "")
+    names: List[str] = []
+    for op in operations:
+        if not isinstance(op, dict):
+            raise ValueError("Pending batch write has a malformed operation; restage it.")
+        name = str(op.get("name") or default or "")
+        if not name:
+            raise ValueError("Pending batch write names no skill; restage it.")
+        if name not in names:
+            names.append(name)
+
+    targets = []
+    for name in names:
+        found = _find_skill(name)
+        if found:
+            target = Path(found["path"])
+        else:
+            target = _resolve_skill_dir(name, payload.get("category"))
+        exists = target.exists()
+        digest = _skill_tree_sha256(target) if exists else "ABSENT"
+        targets.append(
+            {
+                "name": name,
+                "target_path": str(target.resolve(strict=False)),
+                "target_kind": "tree",
+                "exists": exists,
+                "sha256": digest,
+            }
+        )
+    return {"version": 1, "target_kind": "batch", "targets": targets}
+
+
 def build_skill_write_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Public staging helper used by the skill tool and bounded plugins."""
     clean = {key: value for key, value in payload.items() if not key.startswith("_")}
+    if str(clean.get("action", "")) == "batch":
+        return _skill_batch_target_state(clean)
     return _skill_write_target_state(clean)
 
 
@@ -1716,7 +1755,15 @@ def _verify_skill_write_guard(payload: Dict[str, Any]) -> None:
     guard = payload.get("_write_guard")
     if not isinstance(guard, dict) or guard.get("version") != 1:
         raise ValueError("Pending skill write has no supported base-state guard; restage it.")
-    current = _skill_write_target_state(payload)
+    clean = {key: value for key, value in payload.items() if not key.startswith("_")}
+    if guard.get("target_kind") == "batch" or str(clean.get("action", "")) == "batch":
+        current = _skill_batch_target_state(clean)
+        if current.get("targets") != guard.get("targets"):
+            raise ValueError(
+                "Pending skill write is stale: target changed after staging; inspect and restage."
+            )
+        return
+    current = _skill_write_target_state(clean)
     for key in ("target_path", "target_kind", "exists", "sha256"):
         if current.get(key) != guard.get(key):
             raise ValueError(
@@ -2122,25 +2169,42 @@ def _skill_manage_batch(
     if not _skill_gate_bypass.get():
         try:
             from tools import write_approval as wa
-        except Exception:
-            wa = None  # fail open, matching _apply_skill_write_gate
-        if wa is not None:
             decision = wa.evaluate_gate(wa.SKILLS)
-            if decision.blocked:
-                return tool_error(decision.message, success=False)
-            if not decision.allow:
-                payload = {"action": "batch", "operations": operations}
-                acts = ", ".join(op["action"] for op in operations)
-                skills = ", ".join(sorted(set(names)))
-                gist = f"batch({len(operations)} ops: {acts}) on {skills}"
-                record = wa.stage_write(
-                    wa.SKILLS, payload, summary=gist, origin=wa.current_origin()
+        except Exception as exc:
+            return tool_error(
+                f"Skill write approval runtime unavailable; write refused: {exc}",
+                success=False,
+            )
+        if decision.blocked:
+            return tool_error(decision.message, success=False)
+        if not decision.allow:
+            payload = {"action": "batch", "operations": operations}
+            if default_name:
+                payload["name"] = default_name
+            acts = ", ".join(op["action"] for op in operations)
+            skills = ", ".join(sorted(set(names)))
+            gist = f"batch({len(operations)} ops: {acts}) on {skills}"
+            try:
+                record = stage_skill_write(
+                    payload, summary=gist, origin=wa.current_origin()
                 )
-                return json.dumps(
-                    {"success": True, "staged": True, "pending_id": record["id"],
-                     "gist": gist, "message": decision.message},
-                    ensure_ascii=False,
+            except Exception as exc:
+                return tool_error(
+                    f"Skill write could not be durably staged: {exc}", success=False
                 )
+            return json.dumps(
+                {
+                    "success": True,
+                    "staged": True,
+                    "persisted": bool(record.get("persisted")),
+                    "deduplicated": bool(record.get("deduplicated")),
+                    "recovery_required": bool(record.get("recovery_required")),
+                    "pending_id": record["id"],
+                    "gist": gist,
+                    "message": decision.message,
+                },
+                ensure_ascii=False,
+            )
 
     # --- snapshot every touched skill for rollback ---
     snap_root = Path(tempfile.mkdtemp(prefix="skill_batch_"))
