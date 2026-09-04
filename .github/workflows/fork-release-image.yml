@@ -1,0 +1,180 @@
+# Fork-owned release image pipeline (djagya/hermes-agent -> GHCR).
+#
+# Why this exists: the monolith deployment consumes digest-pinned images built
+# from this fork's release/* branches, never upstream Docker Hub tags. The
+# upstream docker.yml is repository-guarded to NousResearch/hermes-agent and
+# uses 32-core paid runners, so the fork has its own single-arch (amd64)
+# pipeline: build -> docker integration tests (secret-free) -> publish to
+# ghcr.io behind the protected `ghcr-release` environment, with GitHub build
+# provenance attestation so the box can verify image identity post-pull
+# (`gh attestation verify`).
+name: Fork Release Image (GHCR)
+
+on:
+  push:
+    branches: ['release/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel an in-flight release build: every release-branch push gets its
+# own image so the digest trail stays complete.
+concurrency:
+  group: fork-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/djagya/hermes-agent
+
+jobs:
+  # Build the image and run the docker integration suite against it.
+  # This job runs branch code, so it stays secret-free; publishing happens
+  # in the separate environment-gated job below.
+  build-test:
+    if: github.repository == 'djagya/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Retry once on transient registry/buildkit failures; same pattern and
+      # rationale as upstream docker.yml (docker/setup-buildx-action#510).
+      - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build image (amd64)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_NAME }}:test
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+            HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
+            HERMES_BUILD_REF=${{ github.ref_name }}
+          cache-from: type=gha,scope=fork-amd64
+          cache-to: type=gha,mode=max,scope=fork-amd64
+
+      - name: Install uv (for docker tests)
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+
+      - name: Set up Python 3.11 (for docker tests)
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install Python dependencies (for docker tests)
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra dev
+
+      - name: Run docker integration tests
+        env:
+          # Use the image already loaded by the build step; skip rebuild.
+          HERMES_TEST_IMAGE: ${{ env.IMAGE_NAME }}:test
+          # No accidental real-API calls from inside the harness.
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          # Standard runners have 4 cores (not upstream's 32), so cap the
+          # container-spawning workers at nproc and give slow files headroom.
+          HERMES_TEST_WORKERS=$(nproc) scripts/run_tests.sh tests/docker/ --file-timeout 900
+
+  # Sole GHCR credential boundary. The `ghcr-release` environment requires a
+  # manual approval, so nothing publishes without an operator click even if
+  # the branch itself is compromised.
+  publish:
+    needs: [build-test]
+    if: github.repository == 'djagya/hermes-agent'
+    environment: ghcr-release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout trusted source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Docker tags cannot contain '/'; release/v0.21-dlz -> v0.21-dlz.
+      - name: Derive image tag from ref
+        id: tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${REF_NAME#release/}"
+          tag="${tag//\//-}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Push image
+        id: push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+            ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/djagya/hermes-agent
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+            HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
+            HERMES_BUILD_REF=${{ github.ref_name }}
+          # BuildKit SLSA provenance + SBOM attached to the image manifest.
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=fork-amd64
+          cache-to: type=gha,mode=max,scope=fork-amd64
+
+      # GitHub-native attestation: lets the box verify post-pull with
+      # `gh attestation verify oci://<image>@<digest> --repo djagya/hermes-agent`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Print digest pin for compose
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          echo "Compose pin:"
+          echo "  image: ${IMAGE_NAME}:${TAG}@${DIGEST}"
