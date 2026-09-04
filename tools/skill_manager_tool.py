@@ -32,12 +32,15 @@ Directory layout for user skills:
             └── SKILL.md
 """
 
+import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import threading
 import contextvars as _ctxvars
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -52,6 +55,16 @@ from agent.skill_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+try:  # POSIX
+    import fcntl as _skill_fcntl
+except ImportError:  # pragma: no cover - Windows
+    _skill_fcntl = None
+
+try:  # Windows
+    import msvcrt as _skill_msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    _skill_msvcrt = None
 
 class _BackgroundReviewReadMarks:
     """Read marks shared by copied tool contexts within one review run."""
@@ -718,7 +731,7 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
     return None
 
 
-def _resolve_skill_dir(name: str, category: str = None) -> Path:
+def _resolve_skill_dir(name: str, category: Optional[str] = None) -> Path:
     """Build the directory path for a new skill, optionally under a category."""
     if category:
         return _skills_dir() / category / name
@@ -1024,7 +1037,7 @@ def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Non
         )
 
 
-def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+def _create_skill(name: str, content: str, category: Optional[str] = None) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
     # Validate name
     err = _validate_name(name)
@@ -1204,7 +1217,7 @@ def _patch_skill(
     name: str,
     old_string: str,
     new_string: str,
-    file_path: str = None,
+    file_path: Optional[str] = None,
     replace_all: bool = False,
 ) -> Dict[str, Any]:
     """Targeted find-and-replace within a skill file.
@@ -1565,10 +1578,166 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
 
 # ContextVar bypass: set while replaying an already-approved staged skill write
 # so skill_manage() does not re-gate (and re-stage) it.
-import contextvars as _ctxvars
 _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
     "skill_gate_bypass", default=False
 )
+
+# All commissioned skill mutations share one profile-scoped lock. This makes a
+# staged guard a real CAS boundary against every other skill_manage writer:
+# staging holds the lock while snapshotting + persisting the guarded payload;
+# approval holds it from guard verification through mutation. Raw filesystem
+# editors remain outside this API contract and are detected as stale whenever
+# they land before verification.
+_skill_write_lock_active: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
+    "skill_write_lock_active", default=False
+)
+_skill_write_thread_lock = threading.RLock()
+
+
+@contextmanager
+def _skill_write_lock():
+    """Serialize profile skill writes across threads and processes.
+
+    Lock order is ``skill-write -> pending-store`` during staging. Approved
+    apply transitions its pending record to durable ``applying`` and releases
+    the pending-store lock before entering this lock, so no reverse nesting is
+    possible. Re-entry in the same context is explicit via ContextVar.
+    """
+    if _skill_write_lock_active.get():
+        yield
+        return
+
+    with _skill_write_thread_lock:
+        lock_dir = get_hermes_home() / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(lock_dir, 0o700)
+        lock_path = lock_dir / "skill-write.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        locked = False
+        token = None
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            if _skill_fcntl is not None:
+                _skill_fcntl.flock(fd, _skill_fcntl.LOCK_EX)
+            elif _skill_msvcrt is not None:  # pragma: no cover - Windows
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                    os.fsync(fd)
+                os.lseek(fd, 0, os.SEEK_SET)
+                getattr(_skill_msvcrt, "locking")(
+                    fd, getattr(_skill_msvcrt, "LK_LOCK"), 1
+                )
+            else:  # pragma: no cover - unsupported platform
+                raise RuntimeError("no supported cross-process skill-write lock")
+            locked = True
+            token = _skill_write_lock_active.set(True)
+            yield
+        finally:
+            if token is not None:
+                _skill_write_lock_active.reset(token)
+            if locked:
+                if _skill_fcntl is not None:
+                    _skill_fcntl.flock(fd, _skill_fcntl.LOCK_UN)
+                elif _skill_msvcrt is not None:  # pragma: no cover - Windows
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    getattr(_skill_msvcrt, "locking")(
+                        fd, getattr(_skill_msvcrt, "LK_UNLCK"), 1
+                    )
+            os.close(fd)
+
+
+def _skill_tree_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    if not path.exists():
+        return "ABSENT"
+    for child in sorted(item for item in path.rglob("*") if item.is_file()):
+        relative = child.relative_to(path).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        raw = child.read_bytes()
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def _skill_write_target_state(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve the exact mutation target and its current preimage digest."""
+    action = str(payload.get("action", ""))
+    name = str(payload.get("name", ""))
+    category = payload.get("category")
+    file_path = payload.get("file_path")
+    found = _find_skill(name)
+
+    if action == "create":
+        target = _resolve_skill_dir(name, category)
+        kind = "tree"
+    else:
+        if not found:
+            raise ValueError(f"Skill '{name}' is no longer available; restage the write.")
+        skill_dir = Path(found["path"])
+        if action == "delete":
+            target = skill_dir
+            kind = "tree"
+        elif action in {"patch", "write_file", "remove_file"} and file_path:
+            error = _validate_file_path(str(file_path))
+            if error:
+                raise ValueError(error)
+            resolved, error = _resolve_skill_target(skill_dir, str(file_path))
+            if error or resolved is None:
+                raise ValueError(error or "cannot resolve staged skill target")
+            target = resolved
+            kind = "file"
+        else:
+            target = skill_dir / "SKILL.md"
+            kind = "file"
+
+    exists = target.exists()
+    if kind == "tree":
+        digest = _skill_tree_sha256(target)
+    else:
+        digest = hashlib.sha256(target.read_bytes()).hexdigest() if exists else "ABSENT"
+    return {
+        "version": 1,
+        "target_path": str(target.resolve(strict=False)),
+        "target_kind": kind,
+        "exists": exists,
+        "sha256": digest,
+    }
+
+
+def build_skill_write_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Public staging helper used by the skill tool and bounded plugins."""
+    clean = {key: value for key, value in payload.items() if not key.startswith("_")}
+    return _skill_write_target_state(clean)
+
+
+def _verify_skill_write_guard(payload: Dict[str, Any]) -> None:
+    guard = payload.get("_write_guard")
+    if not isinstance(guard, dict) or guard.get("version") != 1:
+        raise ValueError("Pending skill write has no supported base-state guard; restage it.")
+    current = _skill_write_target_state(payload)
+    for key in ("target_path", "target_kind", "exists", "sha256"):
+        if current.get(key) != guard.get(key):
+            raise ValueError(
+                "Pending skill write is stale: target changed after staging; inspect and restage."
+            )
+
+
+def stage_skill_write(
+    payload: Dict[str, Any], *, summary: str, origin: str, stage_context: Dict[str, Any] | None = None
+) -> Dict[str, Any]:
+    """Stage one guarded skill mutation and return its durable pending receipt."""
+    from tools import write_approval as wa
+
+    with _skill_write_lock():
+        staged_payload = dict(payload)
+        if stage_context:
+            staged_payload["_stage_context"] = dict(stage_context)
+        staged_payload["_write_guard"] = build_skill_write_guard(staged_payload)
+        return wa.stage_write(
+            wa.SKILLS, staged_payload, summary=summary, origin=origin
+        )
 
 
 def _validate_skill_manage_request(
@@ -1720,10 +1889,7 @@ def _canonicalize_staged_skill_payload(
 
 
 def _apply_skill_write_gate(action, name, **payload_kwargs):
-    """Evaluate the skill write gate. Returns a JSON tool-result string when the
-    write should NOT proceed (blocked or staged), or None to perform the real
-    write. Bypassed during approved-pending replay.
-    """
+    """Return a blocked/staged tool result, or ``None`` when writing is allowed."""
     if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
         return None
     if _skill_gate_bypass.get():
@@ -1731,10 +1897,17 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
 
     try:
         from tools import write_approval as wa
-    except Exception:
-        return None  # fail open
+    except Exception as exc:
+        return tool_error(
+            f"Skill write approval runtime unavailable; write refused: {exc}", success=False
+        )
 
-    decision = wa.evaluate_gate(wa.SKILLS)
+    try:
+        decision = wa.evaluate_gate(wa.SKILLS)
+    except Exception as exc:
+        return tool_error(
+            f"Skill write approval decision failed closed: {exc}", success=False
+        )
     if decision.allow:
         return None
     if decision.blocked:
@@ -1756,10 +1929,23 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         old_string=payload_kwargs.get("old_string") or "",
         new_string=payload_kwargs.get("new_string") or "",
     )
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    try:
+        record = stage_skill_write(
+            payload, summary=gist, origin=wa.current_origin()
+        )
+    except Exception as exc:
+        return tool_error(f"Skill write could not be durably staged: {exc}", success=False)
     return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "gist": gist, "message": decision.message},
+        {
+            "success": True,
+            "staged": True,
+            "persisted": bool(record.get("persisted")),
+            "deduplicated": bool(record.get("deduplicated")),
+            "recovery_required": bool(record.get("recovery_required")),
+            "pending_id": record["id"],
+            "gist": gist,
+            "message": decision.message,
+        },
         ensure_ascii=False,
     )
 
@@ -1769,28 +1955,49 @@ def apply_skill_pending(
     refresh_runtime: bool = True,
     emit_lifecycle: bool = True,
 ) -> str:
-    """Replay a staged skill write, bypassing the gate. Returns the tool result
-    JSON string. Called by the /skills approve handler.
-    """
-    token = _skill_gate_bypass.set(True)
+    """Replay a staged skill write under a live one-shot approval capability."""
     try:
-        return skill_manage(
-            action=payload.get("action", ""),
-            name=payload.get("name", ""),
-            content=payload.get("content"),
-            category=payload.get("category"),
-            file_path=payload.get("file_path"),
-            file_content=payload.get("file_content"),
-            old_string=payload.get("old_string"),
-            new_string=payload.get("new_string"),
-            replace_all=payload.get("replace_all", False),
-            absorbed_into=payload.get("absorbed_into"),
-            operations=payload.get("operations"),
-            _refresh_runtime=refresh_runtime,
-            _emit_lifecycle=emit_lifecycle,
-        )
-    finally:
-        _skill_gate_bypass.reset(token)
+        with _skill_write_lock():
+            _verify_skill_write_guard(payload)
+            clean = {
+                key: value for key, value in payload.items() if not key.startswith("_")
+            }
+            from tools import write_approval as wa
+
+            if not wa.consume_pending_apply_capability(wa.SKILLS, payload):
+                return tool_error(
+                    "Pending skill write must be applied through its live approval record.",
+                    success=False,
+                )
+            token = _skill_gate_bypass.set(True)
+            try:
+                raw = skill_manage(
+                    action=clean.get("action", ""),
+                    name=clean.get("name", ""),
+                    content=clean.get("content"),
+                    category=clean.get("category"),
+                    file_path=clean.get("file_path"),
+                    file_content=clean.get("file_content"),
+                    old_string=clean.get("old_string"),
+                    new_string=clean.get("new_string"),
+                    replace_all=clean.get("replace_all", False),
+                    absorbed_into=clean.get("absorbed_into"),
+                    operations=clean.get("operations"),
+                    _refresh_runtime=refresh_runtime,
+                    _emit_lifecycle=emit_lifecycle,
+                )
+            finally:
+                _skill_gate_bypass.reset(token)
+    except Exception as exc:
+        return tool_error(str(exc), success=False)
+
+    try:
+        result = json.loads(raw)
+    except Exception:
+        return raw
+    if result.get("success"):
+        result["pending_guard_verified"] = True
+    return json.dumps(result, ensure_ascii=False)
 
 
 _BATCH_OP_ACTIONS = {"create", "patch", "write_file", "remove_file"}
@@ -2122,19 +2329,19 @@ def _refresh_runtime_skill_cache() -> None:
         pass
 
 
-def skill_manage(
+def _skill_manage_impl(
     action: str,
     name: str,
-    content: str = None,
-    category: str = None,
-    file_path: str = None,
-    file_content: str = None,
-    old_string: str = None,
-    new_string: str = None,
+    content: Optional[str] = None,
+    category: Optional[str] = None,
+    file_path: Optional[str] = None,
+    file_content: Optional[str] = None,
+    old_string: Optional[str] = None,
+    new_string: Optional[str] = None,
     replace_all: bool = False,
-    absorbed_into: str = None,
-    task_id: str = None,
-    session_id: str = None,
+    absorbed_into: Optional[str] = None,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
     operations=None,
     _refresh_runtime: bool = True,
     _emit_lifecycle: bool = True,
@@ -2339,6 +2546,49 @@ def skill_manage(
             pass
 
     return json.dumps(result, ensure_ascii=False)
+
+
+def skill_manage(
+    action: str,
+    name: str,
+    content: Optional[str] = None,
+    category: Optional[str] = None,
+    file_path: Optional[str] = None,
+    file_content: Optional[str] = None,
+    old_string: Optional[str] = None,
+    new_string: Optional[str] = None,
+    replace_all: bool = False,
+    absorbed_into: Optional[str] = None,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    operations=None,
+    _refresh_runtime: bool = True,
+    _emit_lifecycle: bool = True,
+) -> str:
+    """Serialize every commissioned skill mutation through one CAS lock."""
+    try:
+        with _skill_write_lock():
+            return _skill_manage_impl(
+                action=action,
+                name=name,
+                content=content,
+                category=category,
+                file_path=file_path,
+                file_content=file_content,
+                old_string=old_string,
+                new_string=new_string,
+                replace_all=replace_all,
+                absorbed_into=absorbed_into,
+                task_id=task_id,
+                session_id=session_id,
+                operations=operations,
+                _refresh_runtime=_refresh_runtime,
+                _emit_lifecycle=_emit_lifecycle,
+            )
+    except Exception as exc:
+        return tool_error(
+            f"Skill write lock unavailable; mutation refused: {exc}", success=False
+        )
 
 
 # =============================================================================

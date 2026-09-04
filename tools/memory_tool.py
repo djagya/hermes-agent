@@ -24,6 +24,7 @@ Design:
 """
 
 import copy
+import hashlib
 import json
 import logging
 import time
@@ -411,7 +412,33 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
+    def _pending_guard_error(
+        self, target: str, expected_sha256: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        if expected_sha256 is None:
+            return None
+        path = self._path_for(target)
+        try:
+            if path.exists():
+                actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            else:
+                actual = "ABSENT"
+        except (OSError, IOError):
+            return _read_failed_error(path)
+        if actual == expected_sha256:
+            return None
+        return {
+            "success": False,
+            "error": (
+                "Pending memory write is stale: target changed after staging; "
+                "inspect current memory and restage."
+            ),
+            "target": target,
+        }
+
+    def add(
+        self, target: str, content: str, *, expected_sha256: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
         if not content:
@@ -423,6 +450,9 @@ class MemoryStore:
             return {"success": False, "error": scan_error}
 
         with self._file_lock(self._path_for(target)):
+            guard_error = self._pending_guard_error(target, expected_sha256)
+            if guard_error is not None:
+                return guard_error
             # Re-read from disk under lock to pick up writes from other sessions.
             # For add (append-only), we skip the drift guard — appending never
             # clobbers existing content, so round-trip mismatches from prior
@@ -470,7 +500,14 @@ class MemoryStore:
 
         return self._success_response(target, "Entry added.")
 
-    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+    def replace(
+        self,
+        target: str,
+        old_text: str,
+        new_content: str,
+        *,
+        expected_sha256: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
         old_text = old_text.strip()
         new_content = new_content.strip()
@@ -485,6 +522,9 @@ class MemoryStore:
             return {"success": False, "error": scan_error}
 
         with self._file_lock(self._path_for(target)):
+            guard_error = self._pending_guard_error(target, expected_sha256)
+            if guard_error is not None:
+                return guard_error
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -541,13 +581,18 @@ class MemoryStore:
 
         return self._success_response(target, "Entry replaced.")
 
-    def remove(self, target: str, old_text: str) -> Dict[str, Any]:
+    def remove(
+        self, target: str, old_text: str, *, expected_sha256: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
 
         with self._file_lock(self._path_for(target)):
+            guard_error = self._pending_guard_error(target, expected_sha256)
+            if guard_error is not None:
+                return guard_error
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -583,7 +628,13 @@ class MemoryStore:
 
         return self._success_response(target, "Entry removed.")
 
-    def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def apply_batch(
+        self,
+        target: str,
+        operations: List[Dict[str, Any]],
+        *,
+        expected_sha256: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Apply a sequence of add/replace/remove ops to one target atomically.
 
         All operations are validated and applied against the FINAL budget --
@@ -610,6 +661,9 @@ class MemoryStore:
                     return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
 
         with self._file_lock(self._path_for(target)):
+            guard_error = self._pending_guard_error(target, expected_sha256)
+            if guard_error is not None:
+                return guard_error
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -946,8 +1000,27 @@ def load_on_disk_store() -> "MemoryStore":
     return store
 
 
-def _apply_write_gate(action: str, target: str, content: Optional[str],
-                      old_text: Optional[str]) -> Optional[str]:
+def _build_memory_write_guard(store: "MemoryStore", target: str) -> Dict[str, Any]:
+    """Snapshot the exact target bytes under the store's mutation lock."""
+    path = store._path_for(target)
+    with store._file_lock(path):
+        try:
+            if path.exists():
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            else:
+                digest = "ABSENT"
+        except (OSError, IOError) as exc:
+            raise RuntimeError(f"Cannot stage memory write from unreadable target: {path}") from exc
+    return {"target": target, "expected_sha256": digest}
+
+
+def _apply_write_gate(
+    action: str,
+    target: str,
+    content: Optional[str],
+    old_text: Optional[str],
+    store: "MemoryStore",
+) -> Optional[str]:
     """Evaluate the memory write gate. Returns a JSON tool-result string when
     the write should NOT proceed normally (blocked or staged), or None when the
     caller should perform the real write.
@@ -959,10 +1032,11 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
 
     try:
         from tools import write_approval as wa
-    except Exception:
-        # If the gate module can't load, fail open (current behaviour) rather
-        # than blocking all memory writes.
-        return None
+    except Exception as exc:
+        return tool_error(
+            f"Memory write approval runtime unavailable; write refused: {exc}",
+            success=False,
+        )
 
     # Build a small inline summary/detail for the foreground approval prompt.
     label = "user profile" if target == "user" else "memory"
@@ -976,7 +1050,14 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         summary = f"remove from {label}"
         detail = old_text or ""
 
-    decision = wa.evaluate_gate(wa.MEMORY, inline_summary=summary, inline_detail=detail)
+    try:
+        decision = wa.evaluate_gate(
+            wa.MEMORY, inline_summary=summary, inline_detail=detail
+        )
+    except Exception as exc:
+        return tool_error(
+            f"Memory write approval decision failed closed: {exc}", success=False
+        )
 
     if decision.allow:
         return None
@@ -990,20 +1071,36 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         "target": target,
         "content": content,
         "old_text": old_text,
+        "_write_guard": _build_memory_write_guard(store, target),
     }
-    record = wa.stage_write(
-        wa.MEMORY, payload,
-        summary=f"{summary}: {detail[:120]}",
-        origin=wa.current_origin(),
-    )
+    try:
+        record = wa.stage_write(
+            wa.MEMORY,
+            payload,
+            summary=f"{summary}: {detail[:120]}",
+            origin=wa.current_origin(),
+        )
+    except Exception as exc:
+        return tool_error(
+            f"Memory write could not be durably staged: {exc}", success=False
+        )
     return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "message": decision.message},
+        {
+            "success": True,
+            "staged": True,
+            "persisted": bool(record.get("persisted")),
+            "deduplicated": bool(record.get("deduplicated")),
+            "recovery_required": bool(record.get("recovery_required")),
+            "pending_id": record["id"],
+            "message": decision.message,
+        },
         ensure_ascii=False,
     )
 
 
-def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Optional[str]:
+def _apply_batch_write_gate(
+    target: str, operations: List[Dict[str, Any]], store: "MemoryStore"
+) -> Optional[str]:
     """Evaluate the write gate for a batch of memory operations.
 
     Returns a JSON tool-result string when the batch should NOT proceed
@@ -1012,8 +1109,11 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
     """
     try:
         from tools import write_approval as wa
-    except Exception:
-        return None
+    except Exception as exc:
+        return tool_error(
+            f"Memory write approval runtime unavailable; write refused: {exc}",
+            success=False,
+        )
 
     label = "user profile" if target == "user" else "memory"
     summary = f"apply {len(operations)} op(s) to {label}"
@@ -1030,7 +1130,14 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
             detail_lines.append(f"- {act}: {_op_content}")
     detail = "\n".join(detail_lines)
 
-    decision = wa.evaluate_gate(wa.MEMORY, inline_summary=summary, inline_detail=detail)
+    try:
+        decision = wa.evaluate_gate(
+            wa.MEMORY, inline_summary=summary, inline_detail=detail
+        )
+    except Exception as exc:
+        return tool_error(
+            f"Memory write approval decision failed closed: {exc}", success=False
+        )
 
     if decision.allow:
         return None
@@ -1038,15 +1145,33 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
     if decision.blocked:
         return tool_error(decision.message, success=False)
 
-    payload = {"action": "batch", "target": target, "operations": operations}
-    record = wa.stage_write(
-        wa.MEMORY, payload,
-        summary=f"{summary}: {detail[:120]}",
-        origin=wa.current_origin(),
-    )
+    payload = {
+        "action": "batch",
+        "target": target,
+        "operations": operations,
+        "_write_guard": _build_memory_write_guard(store, target),
+    }
+    try:
+        record = wa.stage_write(
+            wa.MEMORY,
+            payload,
+            summary=f"{summary}: {detail[:120]}",
+            origin=wa.current_origin(),
+        )
+    except Exception as exc:
+        return tool_error(
+            f"Memory write could not be durably staged: {exc}", success=False
+        )
     return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "message": decision.message},
+        {
+            "success": True,
+            "staged": True,
+            "persisted": bool(record.get("persisted")),
+            "deduplicated": bool(record.get("deduplicated")),
+            "recovery_required": bool(record.get("recovery_required")),
+            "pending_id": record["id"],
+            "message": decision.message,
+        },
         ensure_ascii=False,
     )
 
@@ -1130,7 +1255,7 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        gate_result = _apply_batch_write_gate(target, operations)
+        gate_result = _apply_batch_write_gate(target, operations, store)
         if gate_result is not None:
             return gate_result
         result = store.apply_batch(target, operations)
@@ -1155,7 +1280,7 @@ def memory_tool(
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
-    gate_result = _apply_write_gate(action, target, content, old_text)
+    gate_result = _apply_write_gate(action, target, content, old_text, store)
     if gate_result is not None:
         return gate_result
 
@@ -1245,17 +1370,97 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     target_error = _memory_target_error(store, target)
     if target_error is not None:
         return target_error
+
+    guard = payload.get("_write_guard")
+    if not isinstance(guard, dict):
+        return {
+            "success": False,
+            "error": "Pending memory write has no base-state guard; inspect and restage it.",
+            "target": target,
+        }
+    if guard.get("target") != target:
+        return {
+            "success": False,
+            "error": "Pending memory write guard targets a different store; inspect and restage it.",
+            "target": target,
+        }
+    expected_sha256 = guard.get("expected_sha256")
+    if not (
+        expected_sha256 == "ABSENT"
+        or (
+            isinstance(expected_sha256, str)
+            and len(expected_sha256) == 64
+            and all(char in "0123456789abcdef" for char in expected_sha256)
+        )
+    ):
+        return {
+            "success": False,
+            "error": "Pending memory write has a malformed base-state guard; inspect and restage it.",
+            "target": target,
+        }
+
+    # Check once before consuming the one-shot approval capability so an
+    # already-stale proposal remains safely retryable/restageable. Every store
+    # mutation checks the same digest again under its file lock, closing the
+    # check-to-act race; drift in that narrow window therefore quarantines the
+    # applying record rather than mutating unexpected bytes.
+    guard_error = store._pending_guard_error(target, expected_sha256)
+    if guard_error is not None:
+        return guard_error
+
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
+    if action not in {"add", "replace", "remove", "batch"}:
+        return {
+            "success": False,
+            "error": f"Unknown staged action '{action}'.",
+            "target": target,
+        }
+    if action == "add" and not content:
+        return {"success": False, "error": "Staged add has no content.", "target": target}
+    if action == "replace" and (not old_text or not content):
+        return {
+            "success": False,
+            "error": "Staged replace lacks old_text or content.",
+            "target": target,
+        }
+    if action == "remove" and not old_text:
+        return {
+            "success": False,
+            "error": "Staged remove has no old_text.",
+            "target": target,
+        }
+    if action == "batch" and not isinstance(payload.get("operations"), list):
+        return {
+            "success": False,
+            "error": "Staged batch operations are malformed.",
+            "target": target,
+        }
+
+    from tools import write_approval as wa
+
+    if not wa.consume_pending_apply_capability(wa.MEMORY, payload):
+        return {
+            "success": False,
+            "error": "Pending memory write must be applied through its live approval record.",
+            "target": target,
+        }
+
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
+        return store.apply_batch(
+            target,
+            payload.get("operations") or [],
+            expected_sha256=expected_sha256,
+        )
     if action == "add":
-        return store.add(target, content)
+        return store.add(target, content, expected_sha256=expected_sha256)
     if action == "replace":
-        return store.replace(target, old_text, content)
+        return store.replace(
+            target, old_text, content, expected_sha256=expected_sha256
+        )
     if action == "remove":
-        return store.remove(target, old_text)
-    return {"success": False, "error": f"Unknown staged action '{action}'."}
+        return store.remove(target, old_text, expected_sha256=expected_sha256)
+    raise AssertionError("validated staged memory action was not dispatched")
 # OpenAI Function-Calling Schema
 # =============================================================================
 
