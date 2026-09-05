@@ -8,6 +8,8 @@
 # ghcr.io behind the protected `ghcr-release` environment, with GitHub build
 # provenance attestation so the box can verify image identity post-pull
 # (`gh attestation verify`).
+#
+# Do not enable or retarget upstream docker.yml on this fork.
 name: Fork Release Image (GHCR)
 
 on:
@@ -58,12 +60,59 @@ jobs:
           load: true
           platforms: linux/amd64
           tags: ${{ env.IMAGE_NAME }}:test
+          labels: |
+            HERMES_GIT_SHA=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/djagya/hermes-agent
+            org.opencontainers.image.revision=${{ github.sha }}
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
             HERMES_BUILD_REF=${{ github.ref_name }}
           cache-from: type=gha,scope=fork-amd64
           cache-to: type=gha,mode=max,scope=fork-amd64
+
+      - name: Assert image SHA labels and provenance
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:test
+          EXPECT_SHA: ${{ github.sha }}
+          EXPECT_IMAGE: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          label_sha="$(docker image inspect --format '{{index .Config.Labels "HERMES_GIT_SHA"}}' "$IMAGE")"
+          oci_rev="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")"
+          if [ "$label_sha" != "$EXPECT_SHA" ]; then
+            echo "ERROR: HERMES_GIT_SHA=$label_sha != $EXPECT_SHA" >&2
+            exit 1
+          fi
+          if [ "$oci_rev" != "$EXPECT_SHA" ]; then
+            echo "ERROR: OCI revision=$oci_rev != $EXPECT_SHA" >&2
+            exit 1
+          fi
+          docker run --rm --entrypoint cat "$IMAGE" /etc/hermes/image-provenance.json > /tmp/prov.json
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          payload = json.load(open("/tmp/prov.json", encoding="utf-8"))
+          expect_sha = os.environ["EXPECT_SHA"]
+          expect_image = os.environ["EXPECT_IMAGE"]
+          errors = []
+          if payload.get("schema") != 1:
+              errors.append(f"schema={payload.get('schema')!r}")
+          if payload.get("deployment_kind") != "image":
+              errors.append(f"deployment_kind={payload.get('deployment_kind')!r}")
+          if payload.get("manager") != "docker":
+              errors.append(f"manager={payload.get('manager')!r}")
+          if payload.get("image") != expect_image:
+              errors.append(f"image={payload.get('image')!r} != {expect_image!r}")
+          if payload.get("revision") != expect_sha:
+              errors.append(f"revision={payload.get('revision')!r} != {expect_sha!r}")
+          if errors:
+              print("ERROR: provenance marker mismatch:", *errors, sep="\n  ", file=sys.stderr)
+              sys.exit(1)
+          print("labels+provenance ok:", json.dumps(payload, sort_keys=True))
+          PY
 
       - name: Install uv (for docker tests)
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
@@ -128,6 +177,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Docker tags cannot contain '/'; release/v0.21-dlz -> v0.21-dlz.
+      # Plan contract tag is the triggering git SHA; branch alias is extra.
       - name: Derive image tag from ref
         id: tag
         env:
@@ -147,9 +197,10 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
             ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
-            ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}-${{ github.sha }}
           labels: |
+            HERMES_GIT_SHA=${{ github.sha }}
             org.opencontainers.image.source=https://github.com/djagya/hermes-agent
             org.opencontainers.image.revision=${{ github.sha }}
           build-args: |
@@ -171,10 +222,54 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
+      - name: Assert published image SHA labels and provenance
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          EXPECT_SHA: ${{ github.sha }}
+          EXPECT_IMAGE: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+          label_sha="$(docker image inspect --format '{{index .Config.Labels "HERMES_GIT_SHA"}}' "$IMAGE")"
+          oci_rev="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")"
+          if [ "$label_sha" != "$EXPECT_SHA" ]; then
+            echo "ERROR: published HERMES_GIT_SHA=$label_sha != $EXPECT_SHA" >&2
+            exit 1
+          fi
+          if [ "$oci_rev" != "$EXPECT_SHA" ]; then
+            echo "ERROR: published OCI revision=$oci_rev != $EXPECT_SHA" >&2
+            exit 1
+          fi
+          docker run --rm --entrypoint cat "$IMAGE" /etc/hermes/image-provenance.json > /tmp/prov.json
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          payload = json.load(open("/tmp/prov.json", encoding="utf-8"))
+          expect_sha = os.environ["EXPECT_SHA"]
+          expect_image = os.environ["EXPECT_IMAGE"]
+          errors = []
+          if payload.get("schema") != 1:
+              errors.append(f"schema={payload.get('schema')!r}")
+          if payload.get("deployment_kind") != "image":
+              errors.append(f"deployment_kind={payload.get('deployment_kind')!r}")
+          if payload.get("manager") != "docker":
+              errors.append(f"manager={payload.get('manager')!r}")
+          if payload.get("image") != expect_image:
+              errors.append(f"image={payload.get('image')!r} != {expect_image!r}")
+          if payload.get("revision") != expect_sha:
+              errors.append(f"revision={payload.get('revision')!r} != {expect_sha!r}")
+          if errors:
+              print("ERROR: published provenance marker mismatch:", *errors, sep="\n  ", file=sys.stderr)
+              sys.exit(1)
+          print("published labels+provenance ok:", json.dumps(payload, sort_keys=True))
+          PY
+
       - name: Print digest pin for compose
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          SHA: ${{ github.sha }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           echo "Compose pin:"
-          echo "  image: ${IMAGE_NAME}:${TAG}@${DIGEST}"
+          echo "  image: ${IMAGE_NAME}:${SHA}@${DIGEST}"

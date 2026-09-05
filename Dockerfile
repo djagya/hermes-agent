@@ -2,7 +2,9 @@
 # corruption bug. Build a pinned shared library for the runtime image instead
 # of relying on a distro backport that trixie does not currently provide.
 # See #70480 and https://sqlite.org/wal.html#walresetbug.
-FROM debian:13.4 AS sqlite_build
+# Hub index digest for debian:13.4 (2026-05-08). Pin both stages so CI
+# cannot silently float onto a newer 13.4 rebuild.
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS sqlite_build
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
 RUN apt-get -o Acquire::Retries=3 update && \
@@ -49,7 +51,7 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # 2.41) runtime.  Bumping to a new Node major is a one-line ARG change; see
 # #4977.
 FROM node:26-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS node_source
-FROM debian:13.4
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da
 
 # Disable Python stdout buffering to ensure logs are printed immediately.
 # Do not write .pyc files at runtime: /opt/hermes is immutable in the
@@ -340,6 +342,11 @@ ARG HERMES_GIT_SHA=
 # byte-compatible with the previous hardcoded marker.
 ARG HERMES_IMAGE_NAME=nousresearch/hermes-agent
 ARG HERMES_BUILD_REF=
+# Baked into image config so `docker image inspect` (and the monolith
+# post-pull verifier) can bind the bytes to the triggering git SHA
+# without starting the container. Empty when built without --build-arg.
+LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
+      org.opencontainers.image.revision="${HERMES_GIT_SHA}"
 RUN set -eu; \
     if [ -n "${HERMES_GIT_SHA}" ]; then \
         printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
