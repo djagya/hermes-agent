@@ -2211,8 +2211,24 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
-    """Apply the goal judge to every terminal worker handoff, including review."""
+_REVIEW_HANDOFF_GOAL_PREFIX = (
+    "Evaluate readiness for the review handoff, not final task completion. "
+    "Return DONE when the implementation-phase work is complete enough for an "
+    "independent reviewer to begin and the handoff contains concrete verification "
+    "evidence. All implementation requirements and constraints remain binding. "
+    "Do not require the independent review verdict, reviewer-authored evidence, "
+    "final approval, or downstream activation that can only happen after this "
+    "handoff.\n\nOriginal task:\n"
+)
+
+
+def _goal_mode_handoff_rejection(
+    task: Optional[kb.Task],
+    evidence: str,
+    *,
+    review_handoff: bool = False,
+) -> Optional[str]:
+    """Apply the goal judge to completion or review-phase handoff."""
     if task is None or not task.goal_mode:
         return None
     try:
@@ -2229,8 +2245,11 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
     verdict = "done"
     reason = ""
     try:
+        goal = f"{task.title}\n\n{task.body or ''}".strip()
+        if review_handoff:
+            goal = f"{_REVIEW_HANDOFF_GOAL_PREFIX}{goal}"
         verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
+            goal=goal,
             last_response=evidence.strip(),
         )
     except Exception as judge_exc:
@@ -2435,6 +2454,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         rejection = _goal_mode_handoff_rejection(
             kb.get_task(conn, tid),
             summary or "",
+            review_handoff=True,
         )
         if rejection is not None:
             print(

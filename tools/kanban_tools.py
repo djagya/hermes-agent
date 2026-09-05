@@ -251,15 +251,34 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
+_REVIEW_HANDOFF_GOAL_PREFIX = (
+    "Evaluate readiness for the review handoff, not final task completion. "
+    "Return DONE when the implementation-phase work is complete enough for an "
+    "independent reviewer to begin and the handoff contains concrete verification "
+    "evidence. All implementation requirements and constraints remain binding. "
+    "Do not require the independent review verdict, reviewer-authored evidence, "
+    "final approval, or downstream activation that can only happen after this "
+    "handoff.\n\nOriginal task:\n"
+)
+
+
+def _goal_mode_handoff_rejection(
+    task,
+    evidence: str,
+    *,
+    review_handoff: bool = False,
+) -> Optional[str]:
+    """Reject premature goal-mode completion or review-phase handoff."""
     if not task or not task.goal_mode or not _goal_judge_available():
         return None
     verdict = "done"
     reason = ""
     try:
+        goal = f"{task.title}\n\n{task.body or ''}".strip()
+        if review_handoff:
+            goal = f"{_REVIEW_HANDOFF_GOAL_PREFIX}{goal}"
         verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
+            goal=goal,
             last_response=evidence.strip(),
         )
     except Exception as judge_exc:
@@ -937,7 +956,11 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
+            rejection = _goal_mode_handoff_rejection(
+                task,
+                summary,
+                review_handoff=True,
+            )
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "
