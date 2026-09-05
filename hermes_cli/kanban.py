@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_goal_gate import build_goal_judge_objective
 
 
 # ---------------------------------------------------------------------------
@@ -2211,17 +2212,6 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-_REVIEW_HANDOFF_GOAL_PREFIX = (
-    "Evaluate readiness for the review handoff, not final task completion. "
-    "Return DONE when the implementation-phase work is complete enough for an "
-    "independent reviewer to begin and the handoff contains concrete verification "
-    "evidence. All implementation requirements and constraints remain binding. "
-    "Do not require the independent review verdict, reviewer-authored evidence, "
-    "final approval, or downstream activation that can only happen after this "
-    "handoff.\n\nOriginal task:\n"
-)
-
-
 def _goal_mode_handoff_rejection(
     task: Optional[kb.Task],
     evidence: str,
@@ -2245,9 +2235,11 @@ def _goal_mode_handoff_rejection(
     verdict = "done"
     reason = ""
     try:
-        goal = f"{task.title}\n\n{task.body or ''}".strip()
-        if review_handoff:
-            goal = f"{_REVIEW_HANDOFF_GOAL_PREFIX}{goal}"
+        goal = build_goal_judge_objective(
+            title=task.title,
+            body=task.body,
+            phase="review" if review_handoff else "completion",
+        )
         verdict, reason, _, _, _ = judge_goal(
             goal=goal,
             last_response=evidence.strip(),
@@ -2459,7 +2451,8 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         if rejection is not None:
             print(
                 f"kanban: goal review handoff of {tid} rejected by judge: "
-                f"{rejection}. Provide acceptance evidence matching the task.",
+                f"{rejection}. Provide concrete implementation-phase evidence; "
+                "post-review verdicts are not required.",
                 file=sys.stderr,
             )
             return 1

@@ -35,6 +35,7 @@ from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli.kanban_goal_gate import build_goal_judge_objective
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -251,17 +252,6 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
-_REVIEW_HANDOFF_GOAL_PREFIX = (
-    "Evaluate readiness for the review handoff, not final task completion. "
-    "Return DONE when the implementation-phase work is complete enough for an "
-    "independent reviewer to begin and the handoff contains concrete verification "
-    "evidence. All implementation requirements and constraints remain binding. "
-    "Do not require the independent review verdict, reviewer-authored evidence, "
-    "final approval, or downstream activation that can only happen after this "
-    "handoff.\n\nOriginal task:\n"
-)
-
-
 def _goal_mode_handoff_rejection(
     task,
     evidence: str,
@@ -274,9 +264,11 @@ def _goal_mode_handoff_rejection(
     verdict = "done"
     reason = ""
     try:
-        goal = f"{task.title}\n\n{task.body or ''}".strip()
-        if review_handoff:
-            goal = f"{_REVIEW_HANDOFF_GOAL_PREFIX}{goal}"
+        goal = build_goal_judge_objective(
+            title=task.title,
+            body=task.body,
+            phase="review" if review_handoff else "completion",
+        )
         verdict, reason, _, _, _ = judge_goal(
             goal=goal,
             last_response=evidence.strip(),
@@ -964,8 +956,8 @@ def _handle_request_review(args: dict, **kw) -> str:
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "
-                    "Provide acceptance evidence matching the card before "
-                    "requesting review."
+                    "Provide concrete implementation-phase evidence before "
+                    "requesting review; post-review verdicts are not required."
                 )
             ok, fail_reason = kb.request_review(
                 conn, tid,

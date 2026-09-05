@@ -361,6 +361,33 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
         assert cli_after.status == "running"
 
 
+def test_goal_judge_objective_scopes_review_without_weakening_completion() -> None:
+    from hermes_cli.kanban_goal_gate import build_goal_judge_objective
+
+    original = "Implement feature\n\nReview contract: reviewer must issue PASS"
+    completion = build_goal_judge_objective(
+        title="Implement feature",
+        body="Review contract: reviewer must issue PASS",
+        phase="completion",
+    )
+    review = build_goal_judge_objective(
+        title="Implement feature",
+        body="Review contract: reviewer must issue PASS",
+        phase="review",
+    )
+
+    assert completion == original
+    assert review.endswith(original)
+    assert "Evaluate readiness for the review handoff" in review
+    assert "Do not require the independent review verdict" in review
+    with pytest.raises(ValueError, match="unsupported Kanban handoff phase"):
+        build_goal_judge_objective(
+            title="Implement feature",
+            body=None,
+            phase="publish",  # type: ignore[arg-type]
+        )
+
+
 def test_goal_mode_review_handoff_judges_phase_readiness(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
