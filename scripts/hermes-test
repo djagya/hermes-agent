@@ -59,8 +59,8 @@ def read_status(spool: Path) -> dict:
     except (OSError, json.JSONDecodeError) as exc:
         raise Refusal(
             "local runner is unavailable; on the Docker host run "
-            "/home/dlz/monolith/data/hermes/hermes-agent/"
-            "docker/local-test-runner/install-host.sh"
+            "HERMES_TEST_STATE_ROOT=/home/dlz/monolith/data/hermes/test-runner "
+            "/home/dlz/hermes-agent/docker/local-test-runner/install-host.sh"
         ) from exc
     age = time.time() - float(data.get("heartbeat_epoch", 0))
     if age > 20:

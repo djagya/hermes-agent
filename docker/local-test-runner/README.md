@@ -26,8 +26,15 @@ A worktree, temporary `HERMES_HOME`, or mock is not treated as isolation.
 Run on the Docker host, not inside the Hermes container:
 
 ```bash
-/home/dlz/monolith/data/hermes/hermes-agent/docker/local-test-runner/install-host.sh
+HERMES_TEST_STATE_ROOT=/home/dlz/monolith/data/hermes/test-runner \
+  /home/dlz/hermes-agent/docker/local-test-runner/install-host.sh
 ```
+
+`HERMES_TEST_STATE_ROOT` is explicit because the source checkout may be mounted
+into the gateway independently of its persistent data root. Deriving the spool
+from the repository's parent can create a healthy runner whose queue is invisible
+to the gateway. The installer exports the exact spool path to Compose and verifies
+the effective container mount source before succeeding.
 
 The installer builds and starts only `hermes-test-runner`; it neither recreates
 nor restarts the gateway. It verifies the effective mounts, network mode,
@@ -69,8 +76,9 @@ Rerun the host installer. It rebuilds the image against the current
 On the Docker host:
 
 ```bash
-cd /home/dlz/monolith/data/hermes/hermes-agent
-docker compose -p hermes-local-tests \
+cd /home/dlz/hermes-agent
+HERMES_TEST_SPOOL_HOST=/home/dlz/monolith/data/hermes/test-runner/spool \
+  docker compose -p hermes-local-tests \
   -f docker/local-test-runner/compose.yml down --remove-orphans
 ```
 

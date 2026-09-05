@@ -20,7 +20,7 @@ services:
     cpus: 4.0
     stop_grace_period: 15s
     volumes:
-      - ../../../test-runner/spool:/spool:rw
+      - ${HERMES_TEST_SPOOL_HOST:?set HERMES_TEST_SPOOL_HOST to the host spool path}:/spool:rw
     tmpfs:
       - /work:rw,exec,nosuid,nodev,size=12g,uid=1000,gid=1000,mode=1770
       - /tmp:rw,exec,nosuid,nodev,size=2g,uid=1000,gid=1000,mode=1770
