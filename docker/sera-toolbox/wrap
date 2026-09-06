@@ -4,6 +4,25 @@
 # No unsandboxed fallback. Network tools are not installed as wrappers.
 set -euo pipefail
 
+# Do not call /usr/bin/rm from this script. Nested wrap (ImageMagick
+# execs /usr/local/bin/file) runs here inside the parent bwrap, where
+# `rm` can 127 and replace the oversized-output exit 3.
+drop_path() {
+  python3 -c '
+import os, shutil, sys
+for p in sys.argv[1:]:
+    if not p or not os.path.lexists(p):
+        continue
+    if os.path.isdir(p) and not os.path.islink(p):
+        shutil.rmtree(p, ignore_errors=True)
+    else:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+' "$@"
+}
+
 tool="$(basename "$0")"
 real="/usr/libexec/sera-toolbox/${tool}"
 origin="${real}.origin"
@@ -65,7 +84,7 @@ case "$tool" in
 esac
 cleanup() {
   if [ -n "${lo_profile:-}" ]; then
-    rm -rf "$lo_profile"
+    drop_path "$lo_profile"
   fi
 }
 trap cleanup EXIT
@@ -182,6 +201,26 @@ else
   fs_binds+=(--ro-bind "$cwd" "$cwd" --bind "$out_dir" "$out_dir")
 fi
 
+# Hide PATH wrappers inside the sandbox so ImageMagick `file` (and
+# similar) cannot re-enter wrap. Prefer the libexec real binary.
+wrapper_overrides=()
+for w in /usr/local/bin/*; do
+  [ -L "$w" ] || continue
+  case "$(readlink -f "$w" 2>/dev/null || true)" in
+    */docker/sera-toolbox/wrap)
+      name="$(basename "$w")"
+      if [ -x "/usr/libexec/sera-toolbox/${name}" ]; then
+        wrapper_overrides+=(--ro-bind "/usr/libexec/sera-toolbox/${name}" "$w")
+      elif [ -f "/usr/libexec/sera-toolbox/${name}.origin" ]; then
+        orig="$(tr -d '\n' < "/usr/libexec/sera-toolbox/${name}.origin")"
+        if [ -n "$orig" ] && [ -e "$orig" ]; then
+          wrapper_overrides+=(--ro-bind "$orig" "$w")
+        fi
+      fi
+      ;;
+  esac
+done
+
 start_ns="$(date +%s%N)"
 tmp_receipt="$(mktemp /tmp/sera-bwrap.XXXXXX.json)"
 tmp_before="$(mktemp /tmp/sera-bwrap.XXXXXX.before)"
@@ -266,6 +305,7 @@ env -i \
     "${venv_binds[@]}" \
     "${lo_binds[@]}" \
     "${fs_binds[@]}" \
+    "${wrapper_overrides[@]}" \
     --chdir "$cwd" \
     -- "$real" "${extra[@]}" "$@" \
   || status=$?
@@ -309,10 +349,10 @@ if len(new) > max_files or total > max_bytes:
 PY
 then
   echo "sera-toolbox: refusing oversized output (${max_out_bytes} bytes / ${max_out_files} files)" >&2
-  rm -f "$tmp_before"
+  drop_path "$tmp_before"
   exit 3
 fi
-rm -f "$tmp_before"
+drop_path "$tmp_before"
 
 python3 - "$tool" "$status" "$elapsed_ms" "$tmp_receipt" "$@" <<'PY'
 import hashlib, json, os, sys, time
