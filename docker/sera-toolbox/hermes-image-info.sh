@@ -70,7 +70,7 @@ echo "uid/gid ${uid}:${gid}"
 echo
 echo "=== toolbox ==="
 for c in bwrap file sqlite3 jq pdftotext qpdf gs tesseract convert pandoc soffice \
-         ffmpeg exiftool shellcheck ruff gh gitleaks tirith rclone yt-dlp \
+         ffmpeg exiftool shellcheck ruff gh gitleaks tirith rclone op yt-dlp \
          markdownlint-cli2; do
   if command -v "$c" >/dev/null 2>&1; then
     printf '%-20s %s\n' "$c" "$(command -v "$c")"

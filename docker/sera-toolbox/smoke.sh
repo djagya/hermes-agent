@@ -9,7 +9,7 @@ need=(
   ffmpeg ffprobe exiftool
   shellcheck ruff
   python3
-  gh gitleaks tirith rclone
+  gh gitleaks tirith rclone op
 )
 
 fail=0
@@ -47,6 +47,16 @@ if ! hermes-image-info --json >/tmp/image-info.json; then
 fi
 if ! hermes-image-doctor; then
   echo "hermes-image-doctor failed" >&2
+  fail=1
+fi
+
+# Final stage must not ship compilers or docker-cli.
+if command -v gcc >/dev/null 2>&1; then
+  echo "gcc must not be in runtime image: $(command -v gcc)" >&2
+  fail=1
+fi
+if command -v docker >/dev/null 2>&1; then
+  echo "docker must not be in runtime image: $(command -v docker)" >&2
   fail=1
 fi
 

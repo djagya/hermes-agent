@@ -22,7 +22,7 @@ def ver(cmd):
 tools = [
     "bwrap", "file", "sqlite3", "jq", "pdftotext", "qpdf", "gs",
     "tesseract", "convert", "pandoc", "soffice", "ffmpeg", "exiftool",
-    "shellcheck", "ruff", "gh", "gitleaks", "tirith", "rclone",
+    "shellcheck", "ruff", "gh", "gitleaks", "tirith", "rclone", "op",
     "markdownlint-cli2", "hermes",
 ]
 payload = {

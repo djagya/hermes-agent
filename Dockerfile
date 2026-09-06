@@ -51,7 +51,9 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # 2.41) runtime.  Bumping to a new Node major is a one-line ARG change; see
 # #4977.
 FROM node:26-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS node_source
-FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da
+# Builder keeps compilers so uv/matrix/python-olm can build wheels.
+# Final published target is `runtime` (last stage) — no gcc/docker-cli.
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS builder
 
 # Disable Python stdout buffering to ensure logs are printed immediately.
 # Do not write .pyc files at runtime: /opt/hermes is immutable in the
@@ -534,5 +536,77 @@ RUN mkdir -p /opt/data
 # supervised PID-1 path and the non-PID-1 fallback path. Without the
 # wrapper-as-ENTRYPOINT, leading-dash args like `--version` would be
 # intercepted by /init's POSIX shell.
+ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
+CMD [ ]
+
+# ---------- runtime (published target) ----------
+# Compilers and docker-cli stay in `builder` only. Hermes has no Docker
+# socket; shipping docker-cli just adds attack surface.
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS runtime
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false
+ENV UV_NO_PROGRESS=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV npm_config_install_links=false
+ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
+ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
+ENV HERMES_HOME=/opt/data
+ENV HERMES_WRITE_SAFE_ROOT=/opt/data:/opt/vault:/tmp
+ENV HERMES_DISABLE_LAZY_INSTALLS=1
+ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
+ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+ARG HERMES_GIT_SHA=
+ARG HERMES_IMAGE_NAME=nousresearch/hermes-agent
+ARG HERMES_BUILD_REF=
+LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
+      org.opencontainers.image.revision="${HERMES_GIT_SHA}"
+
+RUN apt-get -o Acquire::Retries=3 update && \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+    ca-certificates curl iputils-ping python3 python-is-python3 \
+    ripgrep ffmpeg libffi8 libolm3 libatomic1 procps git openssh-client xz-utils \
+    bubblewrap \
+    file jq zip unzip p7zip-full zstd \
+    poppler-utils qpdf ghostscript \
+    tesseract-ocr tesseract-ocr-eng ocrmypdf \
+    imagemagick \
+    pandoc \
+    libreoffice-writer libreoffice-calc \
+    libimage-exiftool-perl libheif1 libheif-examples \
+    fonts-noto-core fonts-noto-color-emoji fonts-liberation \
+    iproute2 bind9-dnsutils lsof psmisc rclone \
+    shellcheck \
+    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd -u 10000 -m -d /opt/data hermes
+
+COPY --from=builder /opt/hermes /opt/hermes
+COPY --from=builder /usr/local /usr/local
+COPY --from=builder /usr/libexec/sera-toolbox /usr/libexec/sera-toolbox
+COPY --from=builder /etc/hermes /etc/hermes
+COPY --from=builder /etc/sera-toolbox /etc/sera-toolbox
+COPY --from=builder /etc/cont-init.d /etc/cont-init.d
+COPY --from=builder /etc/s6-overlay /etc/s6-overlay
+COPY --from=builder /etc/ld.so.conf.d/000-sqlite-fixed.conf /etc/ld.so.conf.d/000-sqlite-fixed.conf
+COPY --from=builder /init /init
+COPY --from=builder /command /command
+COPY --from=builder /package /package
+COPY --from=builder /usr/bin/tini /usr/bin/tini
+COPY --chmod=0755 docker/sera-toolbox/hermes-healthcheck.sh /usr/local/bin/hermes-healthcheck
+
+RUN ldconfig && \
+    cd /opt/hermes && /usr/local/bin/npx --no-install playwright install-deps chromium && \
+    mkdir -p /opt/data && \
+    test ! -x /usr/bin/gcc && \
+    test ! -x /usr/bin/docker
+
 ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
 CMD [ ]

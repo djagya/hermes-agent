@@ -1,0 +1,2 @@
+# Documented, expiring exceptions only. Empty means fail-closed on
+# fixable CRITICAL/HIGH. Add a CVE per line with a comment + expiry.
