@@ -213,7 +213,7 @@ else:
             IDLE_RSS_KB="$rss_kb" CACHE_WRITE_BYTES="$cache_bytes" \
             python3 docker/sera-toolbox/check-image-budget.py
 
-      - name: Named SPDX SBOM
+      - name: Named SPDX and CycloneDX SBOMs
         env:
           IMAGE: ${{ env.IMAGE_NAME }}:test
         run: |
@@ -222,14 +222,19 @@ else:
             https://github.com/anchore/syft/releases/download/v1.27.1/syft_1.27.1_linux_amd64.tar.gz
           echo 'c2cb5867a238baf41adf15f7e01e28cbd886378859eed81e52c080ca0346eefe  /tmp/syft.tgz' | sha256sum -c -
           tar -C /tmp -xzf /tmp/syft.tgz syft
-          /tmp/syft "$IMAGE" -o spdx-json=hermes-agent.spdx.json
+          /tmp/syft "$IMAGE" \
+            -o spdx-json=hermes-agent.spdx.json \
+            -o cyclonedx-json=hermes-agent.cdx.json
           python3 docker/sera-toolbox/verify-spdx.py hermes-agent.spdx.json
+          python3 docker/sera-toolbox/verify-cyclonedx.py hermes-agent.cdx.json
 
-      - name: Upload SPDX SBOM
+      - name: Upload SPDX and CycloneDX SBOMs
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: hermes-agent-spdx
-          path: hermes-agent.spdx.json
+          name: hermes-agent-sbom
+          path: |
+            hermes-agent.spdx.json
+            hermes-agent.cdx.json
 
       - name: Assert image SHA labels and provenance
         env:
