@@ -40,6 +40,32 @@ def gh_latest_tag(repo: str) -> tuple[str, str]:
     return tag, html
 
 
+def ghcr_digest(image: str, tag: str) -> str:
+    token_url = (
+        f"https://ghcr.io/token?service=ghcr.io&scope=repository:{image}:pull"
+    )
+    token = json.loads(fetch_text(token_url)).get("token") or ""
+    if not token:
+        raise RuntimeError(f"no ghcr token for {image}")
+    req = urllib.request.Request(
+        f"https://ghcr.io/v2/{image}/manifests/{tag}",
+        headers={
+            "User-Agent": UA,
+            "Authorization": f"Bearer {token}",
+            "Accept": (
+                "application/vnd.oci.image.index.v1+json, "
+                "application/vnd.docker.distribution.manifest.list.v2+json"
+            ),
+        },
+    )
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+        digest = str(resp.headers.get("Docker-Content-Digest") or "")
+    if not digest.startswith("sha256:"):
+        raise RuntimeError(f"no digest for ghcr.io/{image}:{tag}")
+    return digest
+
+
 def dockerhub_digest(image: str, tag: str) -> str:
     url = f"https://hub.docker.com/v2/namespaces/library/repositories/{image}/tags/{tag}"
     payload = json.loads(fetch_text(url))
@@ -217,7 +243,24 @@ def main() -> int:
         errors.append(f"gitleaks: {exc}")
         row("gitleaks", bins["gitleaks"], "", "https://github.com/gitleaks/gitleaks/releases")
 
-    row("uv image tag", pins["uv_tag"], pins["uv_tag"], "https://github.com/astral-sh/uv/pkgs/container/uv")
+    try:
+        uv_ver, uv_url = gh_latest_tag("astral-sh/uv")
+        uv_new_tag = f"{uv_ver}-python3.13-trixie"
+        uv_new_digest = ghcr_digest("astral-sh/uv", uv_new_tag)
+        row("uv image", f"{pins['uv_tag']}@{pins['uv_digest']}", f"{uv_new_tag}@{uv_new_digest}", uv_url)
+        if args.apply and (
+            uv_new_tag != pins["uv_tag"] or uv_new_digest != pins["uv_digest"]
+        ):
+            text = DOCKERFILE.read_text(encoding="utf-8")
+            old = f"ghcr.io/astral-sh/uv:{pins['uv_tag']}@{pins['uv_digest']}"
+            new = f"ghcr.io/astral-sh/uv:{uv_new_tag}@{uv_new_digest}"
+            if old in text:
+                DOCKERFILE.write_text(text.replace(old, new), encoding="utf-8")
+                applied.append(f"uv {pins['uv_tag']} -> {uv_new_tag}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"uv: {exc}")
+        row("uv image", f"{pins['uv_tag']}@{pins['uv_digest']}", "", "https://github.com/astral-sh/uv/pkgs/container/uv")
+
     row("sqlite-autoconf", pins["sqlite"], pins["sqlite"], "https://sqlite.org/download.html")
     row("DEBIAN_SNAPSHOT", pins["snapshot"], pins["snapshot"], "https://snapshot.debian.org/")
 
