@@ -170,6 +170,17 @@ else
   echo "BAD skip-migration healthcheck: $(cat "$skip_home/err")" >&2
   fail=1
 fi
+rm -f "$skip_home/.migration-skipped"
+touch "$skip_home/.skills-sync-skipped"
+if HERMES_HOME="$skip_home" hermes-healthcheck 2>"$skip_home/err"; then
+  echo "FAIL healthcheck ignored .skills-sync-skipped" >&2
+  fail=1
+elif grep -q 'skills sync skipped' "$skip_home/err"; then
+  echo "OK skip-skills not-ready"
+else
+  echo "BAD skip-skills healthcheck: $(cat "$skip_home/err")" >&2
+  fail=1
+fi
 rm -rf "$skip_home"
 
 # Himalaya public command is the v2.1 guard over v2.0.0 real binary.

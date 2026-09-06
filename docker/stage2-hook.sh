@@ -7,8 +7,8 @@
 # (and in main-wrapper.sh) via s6-setuidgid, not here.
 #
 # Wired into the image as /etc/cont-init.d/01-hermes-setup by the
-# Dockerfile. The shim at docker/entrypoint.sh forwards to this script
-# so external references to docker/entrypoint.sh still work.
+# Dockerfile. The shim at docker/entrypoint.sh runs this script, then
+# execs main-wrapper.sh so a hard-coded old ENTRYPOINT still runs CMD.
 #
 # NB: cont-init.d scripts run with no arguments — the user's CMD args
 # are NOT visible here. That's fine: we use Architecture B (s6-overlay
@@ -734,7 +734,14 @@ fi
 if [ -d "$INSTALL_DIR/skills" ]; then
     if [ "${HERMES_SKIP_SKILLS_SYNC:-}" = "1" ]; then
         echo "[stage2] HERMES_SKIP_SKILLS_SYNC=1; skipping skills_sync.py"
+        # Plan 5c: hatch is inspection-only. Healthcheck must stay not-ready.
+        if ! refuse_symlinked_path "skip-marker" "$HERMES_HOME/.skills-sync-skipped"; then
+            : > "$HERMES_HOME/.skills-sync-skipped"
+            chown hermes:hermes "$HERMES_HOME/.skills-sync-skipped" 2>/dev/null || true
+            chmod 644 "$HERMES_HOME/.skills-sync-skipped"
+        fi
     else
+        rm -f "$HERMES_HOME/.skills-sync-skipped"
         as_hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" \
             || { echo "[stage2] ERROR: skills_sync.py failed" >&2; exit 1; }
     fi
@@ -803,6 +810,8 @@ fi
 migrate="ok"
 [ -f "$HERMES_HOME/.migration-in-progress" ] && migrate="in-progress"
 [ -f "$HERMES_HOME/.migration-skipped" ] && migrate="skipped"
-echo "[stage2] banner revision=${rev} uid=$(id -u hermes) gid=$(id -g hermes) profiles=${profiles} schema=${schema} migrate=${migrate} mount=${mounted} disk=${avail_kb}KB estop=${estop}"
+skills="ok"
+[ -f "$HERMES_HOME/.skills-sync-skipped" ] && skills="skipped"
+echo "[stage2] banner revision=${rev} uid=$(id -u hermes) gid=$(id -g hermes) profiles=${profiles} schema=${schema} migrate=${migrate} skills=${skills} mount=${mounted} disk=${avail_kb}KB estop=${estop}"
 
 echo "[stage2] Setup complete; starting user services"
