@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Debian 13 still ships SQLite 3.46.1, which contains the upstream WAL-reset
 # corruption bug. Build a pinned shared library for the runtime image instead
 # of relying on a distro backport that trixie does not currently provide.
@@ -11,11 +12,12 @@ ARG DEBIAN_SNAPSHOT=20260508T000000Z
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
-RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         build-essential ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/* && \
     (curl -fsSL --retry 1 --retry-all-errors --connect-timeout 15 --max-time 60 \
         -o /tmp/sqlite.tar.gz \
         "https://sqlite.org/2026/sqlite-autoconf-${SQLITE_AUTOCONF_VERSION}.tar.gz" || \
@@ -92,14 +94,8 @@ ENV UV_NO_PROGRESS=1
 # must not fetch a second browser tree into /opt/data.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-# One persisted cache root per class. Child HOME stays /opt/data/home;
-# these env vars stop uv/HF from splitting into /opt/data/.cache vs
-# /opt/data/home/.cache. Do not auto-prune at boot.
-ENV XDG_CACHE_HOME=/opt/data/cache
-ENV UV_CACHE_DIR=/opt/data/cache/uv
-ENV HF_HOME=/opt/data/cache/huggingface
-ENV TRANSFORMERS_CACHE=/opt/data/cache/huggingface
-ENV HUGGINGFACE_HUB_CACHE=/opt/data/cache/huggingface
+# Runtime cache roots live on the `runtime` stage only. Setting them
+# here would make `uv sync` write into /opt/data during the image build.
 
 # Install system dependencies in one layer, clear APT cache.
 # tini was previously PID 1 to reap orphaned zombie processes (MCP stdio
@@ -110,17 +106,20 @@ ENV HUGGINGFACE_HUB_CACHE=/opt/data/cache/huggingface
 # hermes process, the dashboard, and per-profile gateways.
 ARG DEBIAN_SNAPSHOT=20260508T000000Z
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
-RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
-    rm -rf /var/lib/apt/lists/*
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils
 
 # Release B toolbox (Sera document/media + unix + lint). Separate layer so
 # the compiler line above stays cached. No sudo. tesseract-ocr-eng only —
 # no full language packs. LibreOffice is Writer+Calc only.
 # Parsers are relocated to libexec after COPY . . (see install-wrappers.sh).
-RUN apt-get -o Acquire::Retries=3 update && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     bubblewrap \
     file jq zip unzip p7zip-full zstd \
@@ -133,8 +132,7 @@ RUN apt-get -o Acquire::Retries=3 update && \
     fonts-noto-core fonts-noto-color-emoji fonts-liberation \
     iproute2 bind9-dnsutils lsof psmisc rclone \
     shellcheck \
-    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info && \
-    rm -rf /var/lib/apt/lists/*
+    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info
 
 # Prefer the fixed SQLite over Debian's vulnerable libsqlite3.so.0. Keep the
 # public library name stable so both the system interpreter and the uv-created
@@ -265,12 +263,12 @@ ENV npm_config_install_links=false
 # monorepo (incl. apps/*) but this image only installs root/web/ui-tui.
 # A lock-strict ci fails on that partial workspace. Keep npm install
 # until a dedicated web/ui lock or workspace prune exists.
-RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
+RUN --mount=type=cache,target=/root/.npm \
+    npm install --prefer-offline --no-audit --fetch-retries=5 && \
     for i in 1 2 3; do \
         npx playwright install --with-deps chromium --only-shell && break || \
         { [ "$i" = 3 ] && exit 1; echo "playwright install failed (attempt $i); retrying in 10s"; sleep 10; }; \
-    done && \
-    npm cache clean --force
+    done
 
 # ---------- Photon iMessage sidecar deps (baked, NS-606) ----------
 # The photon plugin's Node sidecar needs its own node_modules
@@ -284,9 +282,9 @@ COPY plugins/platforms/photon/sidecar/package.json \
      plugins/platforms/photon/sidecar/package-lock.json \
      plugins/platforms/photon/sidecar/patch-spectrum-mixed-attachments.mjs \
      plugins/platforms/photon/sidecar/
-RUN cd plugins/platforms/photon/sidecar && \
-    npm ci --no-audit --fetch-retries=5 && \
-    npm cache clean --force
+RUN --mount=type=cache,target=/root/.npm \
+    cd plugins/platforms/photon/sidecar && \
+    npm ci --no-audit --fetch-retries=5
 
 # ---------- Layer-cached Python dependency install ----------
 # Copy only pyproject.toml + uv.lock so the Python dep resolve + wheel
@@ -333,7 +331,8 @@ RUN cd plugins/platforms/photon/sidecar && \
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
@@ -358,11 +357,13 @@ COPY --link --chmod=a+rX,go-w . .
 # Link hermes-agent itself (editable). Deps are already installed in the
 # cached layer above; `--no-deps` makes this a fast egg-link creation with no
 # resolution or downloads.
-RUN uv pip install --no-cache-dir --no-deps -e "."
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-deps -e "."
 
 # Release B Python toolbox. Pinned; not in uv.lock. Models for
 # faster-whisper stay under /opt/data (lazy), not the image.
-RUN uv pip install --no-cache-dir \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install \
     "PyMuPDF==1.25.5" \
     "pymupdf4llm==0.0.17" \
     "weasyprint==69.0" \
@@ -373,11 +374,11 @@ RUN uv pip install --no-cache-dir \
     "pillow-heif==1.7.0" \
     "ruff==0.12.12"
 
-RUN npm install -g --omit=dev \
+RUN --mount=type=cache,target=/root/.npm \
+    npm install -g --omit=dev \
         markdownlint-cli2@0.18.1 \
         @hauptsache.net/clickup-mcp@1.8.0 \
-        caldav-mcp@0.10.0 && \
-    npm cache clean --force
+        caldav-mcp@0.10.0
 
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and
@@ -622,7 +623,9 @@ LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
 
 ARG DEBIAN_SNAPSHOT=20260508T000000Z
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
-RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 \
@@ -638,8 +641,7 @@ RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     fonts-noto-core fonts-noto-color-emoji fonts-liberation \
     iproute2 bind9-dnsutils lsof psmisc rclone \
     shellcheck \
-    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info && \
-    rm -rf /var/lib/apt/lists/*
+    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info
 
 RUN useradd -u 10000 -m -d /opt/data hermes
 
