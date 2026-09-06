@@ -76,6 +76,16 @@ esac
 timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
 start_ns="$(date +%s%N)"
 tmp_receipt="$(mktemp /tmp/sera-bwrap.XXXXXX.json)"
+# Debian snapshot bwrap rejected both --nproc and --rlimit-nproc.
+# Detect optional flags; timeout already caps wall clock.
+bwrap_extra=()
+bwrap_help="$(bwrap --help 2>&1 || true)"
+case "$bwrap_help" in
+  *--rlimit-nproc*) bwrap_extra+=(--rlimit-nproc 64) ;;
+esac
+case "$bwrap_help" in
+  *--rlimit-nofile*) bwrap_extra+=(--rlimit-nofile 1024) ;;
+esac
 # shellcheck disable=SC2016
 status=0
 # env -i: no secrets, no Docker/SSH/MCP, no HERMES_HOME.
@@ -95,8 +105,7 @@ env -i \
     --unshare-ipc \
     --die-with-parent \
     --new-session \
-    --rlimit-nproc 64 \
-    --rlimit-nofile 1024 \
+    "${bwrap_extra[@]}" \
     --tmpfs /tmp \
     --dir /tmp/home \
     --ro-bind /usr /usr \
