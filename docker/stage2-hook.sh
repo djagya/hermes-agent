@@ -595,8 +595,12 @@ fi
 # after first-boot seeding and before supervised gateway services start.
 # Set HERMES_SKIP_CONFIG_MIGRATION=1 for controlled/manual migrations.
 if [ -f "$HERMES_HOME/config.yaml" ]; then
-    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
-        || echo "[stage2] Warning: docker_config_migrate.py failed; continuing"
+    if [ "${HERMES_SKIP_CONFIG_MIGRATION:-}" = "1" ]; then
+        echo "[stage2] HERMES_SKIP_CONFIG_MIGRATION=1; skipping docker_config_migrate.py"
+    else
+        s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
+            || { echo "[stage2] ERROR: docker_config_migrate.py failed" >&2; exit 1; }
+    fi
 fi
 
 # auth.json: bootstrap from env on first boot only. Same semantics as the
@@ -681,8 +685,12 @@ fi
 # the python binary's own bin-stub already sets up (sys.path is rooted
 # at the venv's site-packages by virtue of running .venv/bin/python).
 if [ -d "$INSTALL_DIR/skills" ]; then
-    as_hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" \
-        || echo "[stage2] Warning: skills_sync.py failed; continuing"
+    if [ "${HERMES_SKIP_SKILLS_SYNC:-}" = "1" ]; then
+        echo "[stage2] HERMES_SKIP_SKILLS_SYNC=1; skipping skills_sync.py"
+    else
+        as_hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" \
+            || { echo "[stage2] ERROR: skills_sync.py failed" >&2; exit 1; }
+    fi
 fi
 
 # --- Discover agent-browser's Chromium binary ---

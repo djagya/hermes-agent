@@ -51,6 +51,21 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # 2.41) runtime.  Bumping to a new Node major is a one-line ARG change; see
 # #4977.
 FROM node:26-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS node_source
+
+# Live himalaya is v2.0.0 rev b1f6dece with +gmail +msgraph +native-tls
+# +vendored (not the stock pimalaya install.sh tarball).
+FROM rust:1-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS himalaya_build
+ARG HIMALAYA_REV=b1f6dece32c3afc97d44adeb148bf87e89fde140
+ARG HIMALAYA_SHA256=6c99cabff4c9367d53d52537e2cec311c9dbbaff30edde6ff045437e9d60496b
+RUN curl -fsSL --retry 3 -o /tmp/himalaya.tar.gz \
+        "https://github.com/pimalaya/himalaya/archive/${HIMALAYA_REV}.tar.gz" && \
+    printf '%s  %s\n' "${HIMALAYA_SHA256}" /tmp/himalaya.tar.gz | sha256sum -c - && \
+    tar -C /tmp -xzf /tmp/himalaya.tar.gz && \
+    rustc --version && \
+    cd "/tmp/himalaya-${HIMALAYA_REV}" && \
+    cargo build --release --locked --features native-tls,vendored && \
+    install -m 0755 target/release/himalaya /usr/local/bin/himalaya.real && \
+    /usr/local/bin/himalaya.real --version
 # Builder keeps compilers so uv/matrix/python-olm can build wheels.
 # Final published target is `runtime` (last stage) — no gcc/docker-cli.
 FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS builder
@@ -337,7 +352,11 @@ RUN uv pip install --no-cache-dir \
     "pillow-heif==1.7.0" \
     "ruff==0.12.12"
 
-RUN npm install -g --omit=dev markdownlint-cli2@0.18.1 && npm cache clean --force
+RUN npm install -g --omit=dev \
+        markdownlint-cli2@0.18.1 \
+        @hauptsache.net/clickup-mcp@1.8.0 \
+        caldav-mcp@0.10.0 && \
+    npm cache clean --force
 
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and
@@ -480,11 +499,15 @@ COPY --chmod=0755 docker/sera-toolbox/hermes-image-info.sh /usr/local/bin/hermes
 COPY --chmod=0755 docker/sera-toolbox/hermes-image-doctor.sh /usr/local/bin/hermes-image-doctor
 COPY --chmod=0755 docker/sera-toolbox/write-toolchain-manifest.sh /opt/hermes/docker/sera-toolbox/write-toolchain-manifest.sh
 COPY --chmod=0755 docker/sera-toolbox/adversarial/zip-slip.sh /opt/hermes/docker/sera-toolbox/adversarial/zip-slip.sh
+COPY --chmod=0755 docker/sera-toolbox/adversarial/no-network.sh /opt/hermes/docker/sera-toolbox/adversarial/no-network.sh
+COPY --chmod=0755 docker/sera-toolbox/golden-smoke.sh /opt/hermes/docker/sera-toolbox/golden-smoke.sh
 COPY docker/sera-toolbox/seccomp-bwrap.json /opt/hermes/docker/sera-toolbox/seccomp-bwrap.json
 COPY docker/sera-toolbox/ImageMagick/ /etc/sera-toolbox/ImageMagick/
 RUN /opt/hermes/docker/sera-toolbox/install-wrappers.sh
 # TARGETARCH already declared for s6-overlay.
 RUN /opt/hermes/docker/sera-toolbox/install-network-bins.sh
+COPY --from=himalaya_build /usr/local/bin/himalaya.real /usr/local/bin/himalaya.real
+COPY --chmod=0755 docker/sera-toolbox/himalaya-guard.sh /usr/local/bin/himalaya
 RUN /opt/hermes/docker/sera-toolbox/write-toolchain-manifest.sh
 
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported

@@ -172,6 +172,14 @@ jobs:
             --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
             --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/zip-slip.sh \
             "$IMAGE"
+          docker run --rm --network none \
+            --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
+            --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/no-network.sh \
+            "$IMAGE"
+          docker run --rm --network none \
+            --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
+            --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh \
+            "$IMAGE"
 
       - name: Trivy vuln scan (fixable CRITICAL/HIGH)
         env:

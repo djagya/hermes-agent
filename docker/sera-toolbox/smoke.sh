@@ -9,7 +9,7 @@ need=(
   ffmpeg ffprobe exiftool
   shellcheck ruff
   python3
-  gh gitleaks tirith rclone op
+  gh gitleaks tirith rclone op himalaya
 )
 
 fail=0
@@ -57,6 +57,11 @@ if command -v gcc >/dev/null 2>&1; then
 fi
 if command -v docker >/dev/null 2>&1; then
   echo "docker must not be in runtime image: $(command -v docker)" >&2
+  fail=1
+fi
+
+if [ ! -x /usr/local/bin/himalaya.real ]; then
+  echo "MISSING /usr/local/bin/himalaya.real" >&2
   fail=1
 fi
 
