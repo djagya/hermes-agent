@@ -31,11 +31,19 @@ jobs:
             echo "# Pin refresh ${stamp}"
             echo
             echo "Review-only. No unattended merge, publish, or deploy."
-            echo "Compare old vs new versions, release notes, SBOM/CVE"
+            echo "Fill old vs new versions, release links, SBOM/CVE"
             echo "delta, and image-size delta before bumping."
             echo
+            echo "## Accepted budget"
+            echo
+            echo '```json'
+            cat docker/sera-toolbox/image-budget.json
             echo '```'
-            grep -E '^(FROM |ARG |    ")' Dockerfile | head -80
+            echo
+            echo "## Dockerfile pins"
+            echo
+            echo '```'
+            grep -E '^(FROM |ARG )' Dockerfile | head -80
             echo '```'
           } > "$report"
           git config user.name "github-actions[bot]"

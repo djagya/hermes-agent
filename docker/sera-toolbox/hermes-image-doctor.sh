@@ -85,12 +85,38 @@ else
   fi
 fi
 
+if [ -f /etc/hermes/config.yaml ]; then
+  ok "managed policy /etc/hermes/config.yaml present"
+  if [ -w /etc/hermes/config.yaml ] && [ "$(id -u)" != 0 ]; then
+    bad "managed policy writable by non-root"
+  fi
+else
+  bad "missing /etc/hermes/config.yaml"
+fi
+
+if [ "${HERMES_HOME:-/opt/data}" = "/opt/data" ] && [ "${HERMES_CHILD_HOME:-}" = "/opt/data/home" ]; then
+  ok "dual-HOME env HERMES_HOME=$HERMES_HOME HERMES_CHILD_HOME=$HERMES_CHILD_HOME"
+else
+  note "WARN dual-HOME HERMES_HOME=${HERMES_HOME:-unset} HERMES_CHILD_HOME=${HERMES_CHILD_HOME:-unset}"
+fi
+
 home="${HERMES_HOME:-/opt/data}"
 if [ -d "$home" ]; then
+  if mountpoint -q "$home" 2>/dev/null; then
+    ok "$home is an explicit mount"
+  elif [ "${HERMES_REQUIRE_DATA_MOUNT:-}" = 1 ]; then
+    bad "$home is not an explicit mount"
+  else
+    note "WARN $home is not a mount (ok for CLI / image-info)"
+  fi
   if [ -w "$home" ]; then
     ok "$home writable"
   else
     bad "$home not writable"
+  fi
+  if [ -f "$home/config.yaml" ]; then
+    schema="$(awk '/^_config_version:/{print $2; exit}' "$home/config.yaml" 2>/dev/null || true)"
+    note "config schema ${schema:-unknown}"
   fi
   avail_kb="$(df -Pk "$home" 2>/dev/null | awk 'NR==2 {print $4}')"
   inodes="$(df -Pi "$home" 2>/dev/null | awk 'NR==2 {print $4}')"

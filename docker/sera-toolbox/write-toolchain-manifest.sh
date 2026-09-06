@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Bake /etc/hermes/toolchain-manifest.json (name, version, path). No secrets.
+# Bake /etc/hermes/toolchain-manifest.json (name, version, path, sha256).
+# No secrets.
 set -euo pipefail
 
 mkdir -p /etc/hermes
@@ -20,7 +21,8 @@ def ver(cmd):
         version = text[0] if text else ""
     except Exception as exc:  # noqa: BLE001
         version = f"error:{exc}"
-    return {"name": cmd, "path": exe, "version": version}
+    digest = sha256(exe)
+    return {"name": cmd, "path": exe, "version": version, "sha256": digest}
 
 def sha256(path):
     p = Path(path)
