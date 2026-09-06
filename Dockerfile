@@ -350,7 +350,12 @@ COPY web/ web/
 COPY ui-tui/ ui-tui/
 COPY apps/shared/ apps/shared/
 RUN cd web && npm run build && \
-    cd ../ui-tui && npm run build
+    cd ../ui-tui && npm run build && \
+    cd /opt/hermes && npm prune --omit=dev --include-workspace-root \
+      --workspace=web \
+      --workspace=hermes-tui \
+      --workspace=@hermes/ink \
+      --workspace=@hermes/shared
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
@@ -372,7 +377,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Release B Python toolbox. Pinned; not in uv.lock. Models for
 # faster-whisper stay under /opt/data (lazy), not the image.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install \
+    uv pip install --refresh \
     "PyMuPDF==1.25.5" \
     "pymupdf4llm==0.0.17" \
     "weasyprint==69.0" \
@@ -380,7 +385,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     "yt-dlp==2025.10.14" \
     "faster-whisper==1.2.1" \
     "fal-client==0.13.1" \
-    "pillow-heif==1.7.0" \
+    "pillow-heif==1.5.0" \
     "ruff==0.12.12"
 
 RUN --mount=type=cache,target=/root/.npm \

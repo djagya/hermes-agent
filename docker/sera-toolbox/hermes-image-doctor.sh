@@ -1,11 +1,67 @@
 #!/usr/bin/env bash
-# Read-only image/runtime doctor. No secrets, no mutations.
+# Image/runtime doctor. Default is read-only. Prune is explicit, never
+# at boot: --prune-dry-run lists disposable cache; --prune deletes it
+# only when HERMES_CACHE_PRUNE=1. Hugging Face / STT models are never
+# deleted unless HERMES_PRUNE_MODELS=1 is also set.
 set -euo pipefail
 
 fail=0
 note() { printf '%s\n' "$*"; }
 bad() { printf 'FAIL %s\n' "$*" >&2; fail=1; }
 ok() { printf 'OK   %s\n' "$*"; }
+
+days="${HERMES_CACHE_PRUNE_DAYS:-30}"
+home="${HERMES_HOME:-/opt/data}"
+uv_cache="${UV_CACHE_DIR:-$home/cache/uv}"
+hf_home="${HF_HOME:-$home/cache/huggingface}"
+
+prune_list() {
+  local dir="$1"
+  [ -d "$dir" ] || return 0
+  find "$dir" -type f -atime "+$days" -print 2>/dev/null || true
+}
+
+do_prune() {
+  local dry="$1"
+  note "cache policy: disposable=$uv_cache durable=$hf_home age>${days}d"
+  if [ "$dry" = 1 ]; then
+    note "DRY-RUN disposable candidates:"
+    prune_list "$uv_cache"
+    if [ "${HERMES_PRUNE_MODELS:-}" = 1 ]; then
+      note "DRY-RUN durable model candidates (HERMES_PRUNE_MODELS=1):"
+      prune_list "$hf_home"
+    else
+      note "durable $hf_home listed only, not pruned (set HERMES_PRUNE_MODELS=1)"
+    fi
+    return 0
+  fi
+  if [ "${HERMES_CACHE_PRUNE:-}" != 1 ]; then
+    bad "--prune refused: set HERMES_CACHE_PRUNE=1"
+    return 1
+  fi
+  prune_list "$uv_cache" | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rm -f "$f"
+    note "removed $f"
+  done
+  if [ "${HERMES_PRUNE_MODELS:-}" = 1 ]; then
+    prune_list "$hf_home" | while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      rm -f "$f"
+      note "removed $f"
+    done
+  fi
+}
+
+case "${1:-}" in
+  --prune-dry-run) do_prune 1; exit 0 ;;
+  --prune) do_prune 0; exit "$fail" ;;
+  ""|--check) ;;
+  *)
+    echo "usage: hermes-image-doctor [--check|--prune-dry-run|--prune]" >&2
+    exit 2
+    ;;
+esac
 
 if [ -f /etc/hermes/image-provenance.json ]; then
   ok "provenance marker present"

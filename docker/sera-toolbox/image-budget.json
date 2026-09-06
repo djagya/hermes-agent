@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "note": "Fill max_image_bytes and max_fixable_high after the first accepted B digest. Null means record-only. Trivy still fails the job on any fixable CRITICAL/HIGH.",
+  "accepted_digest": null,
+  "accepted_git_sha": null,
+  "max_image_bytes": null,
+  "max_fixable_critical": 0,
+  "max_fixable_high": null
+}

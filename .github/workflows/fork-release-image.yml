@@ -147,8 +147,7 @@ jobs:
           echo "image_bytes=$bytes"
           echo "image_mib=$((bytes / 1024 / 1024))"
           docker history --format '{{.Size}}\t{{.CreatedBy}}' "$IMAGE" | head -40
-          # First accepted B digest sets the fail-on-regression budget.
-          # Record only until that digest exists.
+          IMAGE_BYTES="$bytes" python3 docker/sera-toolbox/check-image-budget.py
 
       - name: Assert image SHA labels and provenance
         env:
@@ -214,6 +213,18 @@ jobs:
             --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
             --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh \
             "$IMAGE"
+
+      - name: Offline CLI without data mount
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:test
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint hermes-image-info \
+            "$IMAGE" --json
+          docker run --rm --network none --entrypoint hermes-image-doctor \
+            "$IMAGE" --prune-dry-run
+          docker run --rm --network none --entrypoint /opt/hermes/.venv/bin/hermes \
+            "$IMAGE" --help >/dev/null
 
       - name: Trivy vuln scan (fixable CRITICAL/HIGH)
         env:
