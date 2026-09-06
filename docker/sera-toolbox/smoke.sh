@@ -55,6 +55,42 @@ if ! grep -q stage2-hook /etc/cont-init.d/01-hermes-setup; then
   echo "01-hermes-setup does not exec stage2-hook" >&2
   fail=1
 fi
+if ! python3 - <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+man = json.loads(Path("/etc/hermes/toolchain-manifest.json").read_text(encoding="utf-8"))
+wanted = {
+    "/etc/cont-init.d/01-hermes-setup",
+    "/opt/hermes/docker/stage2-hook.sh",
+}
+recorded = man.get("init_files") or {}
+fail = 0
+for path in sorted(wanted):
+    digest = recorded.get(path)
+    if not digest:
+        print(f"MISSING init_files hash for {path}", file=sys.stderr)
+        fail = 1
+        continue
+    actual = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    if digest != actual:
+        print(f"BAD init_files hash {path}: manifest {digest} file {actual}", file=sys.stderr)
+        fail = 1
+    else:
+        print("OK init_files", path)
+sys.exit(fail)
+PY
+then
+  fail=1
+fi
+if ! grep -q 'umask 002' /opt/hermes/bin/hermes \
+  || ! grep -q 'umask 002' /opt/hermes/docker/main-wrapper.sh \
+  || ! grep -q 'umask 002' /opt/hermes/docker/stage2-hook.sh; then
+  echo "umask 002 missing from hermes shim, main-wrapper, or stage2-hook" >&2
+  fail=1
+fi
 for mcp in \
   /usr/local/lib/node_modules/@hauptsache.net/clickup-mcp \
   /usr/local/lib/node_modules/caldav-mcp; do

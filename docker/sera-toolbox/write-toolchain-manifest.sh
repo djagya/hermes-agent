@@ -4,7 +4,10 @@ set -euo pipefail
 
 mkdir -p /etc/hermes
 python3 - <<'PY'
-import json, shutil, subprocess
+import hashlib
+import json
+import shutil
+import subprocess
 from pathlib import Path
 
 def ver(cmd):
@@ -19,15 +22,29 @@ def ver(cmd):
         version = f"error:{exc}"
     return {"name": cmd, "path": exe, "version": version}
 
+def sha256(path):
+    p = Path(path)
+    if not p.is_file():
+        return None
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
 tools = [
     "bwrap", "file", "sqlite3", "jq", "pdftotext", "qpdf", "gs",
     "tesseract", "convert", "pandoc", "soffice", "ffmpeg", "exiftool",
     "shellcheck", "ruff", "gh", "gitleaks", "tirith", "rclone", "op",
     "markdownlint-cli2", "hermes",
 ]
+# Plan 5c: record both the cont-init shim and the hook it execs. A
+# service restart does not rerun cont-init; hashes prove the baked
+# execution path, not just the source copy under /opt/hermes.
+init_files = {
+    "/etc/cont-init.d/01-hermes-setup": sha256("/etc/cont-init.d/01-hermes-setup"),
+    "/opt/hermes/docker/stage2-hook.sh": sha256("/opt/hermes/docker/stage2-hook.sh"),
+}
 payload = {
     "schema": 1,
     "tools": [ver(t) for t in tools],
+    "init_files": init_files,
 }
 path = Path("/etc/hermes/toolchain-manifest.json")
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

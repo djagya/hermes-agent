@@ -63,6 +63,7 @@ fi
 # resolve paths via $HOME (e.g. discord lockfile under XDG_STATE_HOME)
 # don't try to write to /root.
 export HOME=/opt/data
+umask 002
 
 # Save the Docker -w (or default) working directory before init
 # scripts cd to /opt/data, so the container starts in the

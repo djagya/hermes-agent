@@ -7,6 +7,12 @@ set -euo pipefail
 arch="${TARGETARCH:-amd64}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+# install-wrappers.sh may already have replaced PATH unzip/7z with the
+# Bubblewrap sandbox. That wrapper refuses absolute /tmp paths and
+# needs bwrap, which the builder may not have. These archives are
+# checksum-pinned; extract them with real binutils.
+PATH="/usr/bin:/bin:${PATH}"
+export PATH
 
 fetch() {
   local url="$1" dest="$2" sha="$3"
