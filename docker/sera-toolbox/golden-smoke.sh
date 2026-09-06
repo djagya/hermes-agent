@@ -69,4 +69,24 @@ timeout 120s soffice --headless --nologo --nolockcheck --norestore \
   --convert-to xlsx --outdir xlsx-out golden.csv >/dev/null
 test -f xlsx-out/golden.xlsx
 
-echo "OK golden heif/wav/docx/xlsx"
+python3 - <<'PY'
+from PIL import Image, ImageDraw, ImageFont
+
+im = Image.new("RGB", (420, 90), "white")
+draw = ImageDraw.Draw(im)
+font = ImageFont.truetype(
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 48
+)
+draw.text((12, 18), "GOLDEN", fill="black", font=font)
+im.save("scan.png")
+print("OK golden scan.png")
+PY
+tesseract scan.png stdout -l eng | grep -qi GOLDEN
+
+printf 'not a sqlite database\n' > bad.db
+if sqlite3 bad.db 'PRAGMA integrity_check' >/dev/null 2>&1; then
+  echo "malformed sqlite was accepted" >&2
+  exit 1
+fi
+
+echo "OK golden heif/wav/docx/xlsx/ocr/bad-sqlite"

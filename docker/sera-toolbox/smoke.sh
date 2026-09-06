@@ -91,4 +91,33 @@ case "${XDG_CACHE_HOME:-}:${UV_CACHE_DIR:-}:${HF_HOME:-}" in
     fail=1 ;;
 esac
 
+# Himalaya public command is the v2.1 guard over v2.0.0 real binary.
+himalaya_ver="$(himalaya --version 2>&1 || true)"
+case "$himalaya_ver" in
+  *v2.0.0*) echo "OK himalaya $himalaya_ver" ;;
+  *) echo "BAD himalaya version: $himalaya_ver" >&2; fail=1 ;;
+esac
+unset HIMALAYA_WRITE_APPROVED HIMALAYA_SEND_APPROVED || true
+if himalaya_out="$(himalaya message move 1 --to INBOX 2>&1)"; then
+  echo "himalaya write must refuse without HIMALAYA_WRITE_APPROVED=1: $himalaya_out" >&2
+  fail=1
+else
+  case "$himalaya_out" in
+    *HIMALAYA_WRITE_APPROVED*) echo "OK himalaya write refused" ;;
+    *) echo "BAD himalaya write refusal: $himalaya_out" >&2; fail=1 ;;
+  esac
+fi
+
+tirith_bin="$(command -v tirith)"
+tirith_file="$(file "$tirith_bin")"
+echo "tirith file $tirith_file"
+case "$(uname -m):$tirith_file" in
+  x86_64:*x86-64*|x86_64:*x86_64*|aarch64:*ARM*|aarch64:*aarch64*)
+    echo "OK tirith arch" ;;
+  *)
+    echo "BAD tirith architecture: $tirith_file" >&2
+    fail=1 ;;
+esac
+tirith --version >/dev/null
+
 exit "$fail"
