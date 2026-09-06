@@ -349,10 +349,10 @@ if len(new) > max_files or total > max_bytes:
 PY
 then
   echo "sera-toolbox: refusing oversized output (${max_out_bytes} bytes / ${max_out_files} files)" >&2
-  drop_path "$tmp_before"
+  drop_path "$tmp_before" || true
   exit 3
 fi
-drop_path "$tmp_before"
+drop_path "$tmp_before" || true
 
 python3 - "$tool" "$status" "$elapsed_ms" "$tmp_receipt" "$@" <<'PY'
 import hashlib, json, os, sys, time
