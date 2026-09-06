@@ -9,6 +9,7 @@ need=(
   ffmpeg ffprobe exiftool
   shellcheck ruff
   python3
+  gh gitleaks tirith rclone
 )
 
 fail=0

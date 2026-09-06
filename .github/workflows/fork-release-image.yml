@@ -114,6 +114,12 @@ jobs:
           print("labels+provenance ok:", json.dumps(payload, sort_keys=True))
           PY
 
+      - name: Sera toolbox smoke
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:test
+        run: |
+          docker run --rm --entrypoint /opt/hermes/docker/sera-toolbox/smoke.sh "$IMAGE"
+
       - name: Install uv (for docker tests)
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
         with:

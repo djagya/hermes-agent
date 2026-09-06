@@ -90,7 +90,7 @@ RUN apt-get -o Acquire::Retries=3 update && \
     libreoffice-writer libreoffice-calc \
     libimage-exiftool-perl libheif1 libheif-examples \
     fonts-noto-core fonts-liberation \
-    iproute2 bind9-dnsutils lsof psmisc \
+    iproute2 bind9-dnsutils lsof psmisc rclone \
     shellcheck \
     libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info && \
     rm -rf /var/lib/apt/lists/*
@@ -461,9 +461,12 @@ COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
 COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
 COPY --chmod=0755 docker/sera-toolbox/wrap /opt/hermes/docker/sera-toolbox/wrap
 COPY --chmod=0755 docker/sera-toolbox/install-wrappers.sh /opt/hermes/docker/sera-toolbox/install-wrappers.sh
+COPY --chmod=0755 docker/sera-toolbox/install-network-bins.sh /opt/hermes/docker/sera-toolbox/install-network-bins.sh
 COPY --chmod=0755 docker/sera-toolbox/smoke.sh /opt/hermes/docker/sera-toolbox/smoke.sh
 COPY docker/sera-toolbox/ImageMagick/ /etc/sera-toolbox/ImageMagick/
 RUN /opt/hermes/docker/sera-toolbox/install-wrappers.sh
+# TARGETARCH already declared for s6-overlay.
+RUN /opt/hermes/docker/sera-toolbox/install-network-bins.sh
 
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported
 # the venv bin onto PATH; Architecture B's main-wrapper.sh does the
