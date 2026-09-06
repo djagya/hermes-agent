@@ -41,6 +41,11 @@ except ImportError:
     raise SystemExit(1)
 PY
 
+if [ ! -f /etc/hermes/config.yaml ]; then
+  echo "MISSING /etc/hermes/config.yaml managed policy" >&2
+  fail=1
+fi
+
 if ! hermes-image-info --json >/tmp/image-info.json; then
   echo "hermes-image-info failed" >&2
   fail=1

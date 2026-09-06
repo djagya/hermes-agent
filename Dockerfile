@@ -418,6 +418,8 @@ RUN set -eu; \
     fi; \
     mkdir -p /etc/hermes; \
     HERMES_GIT_SHA="${HERMES_GIT_SHA}" HERMES_IMAGE_NAME="${HERMES_IMAGE_NAME}" HERMES_BUILD_REF="${HERMES_BUILD_REF}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); payload = {"schema": 1, "deployment_kind": "image", "manager": "docker", "image": os.environ.get("HERMES_IMAGE_NAME") or "nousresearch/hermes-agent", "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}; ref = os.environ.get("HERMES_BUILD_REF");  payload.update({"ref": ref} if ref else {}); marker.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+COPY docker/sera-toolbox/managed-config.yaml /etc/hermes/config.yaml
+RUN chmod 0444 /etc/hermes/config.yaml
 
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.
