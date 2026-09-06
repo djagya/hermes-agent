@@ -616,6 +616,7 @@ ENV UV_NO_PROGRESS=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV XDG_CACHE_HOME=/opt/data/cache
+ENV XDG_CONFIG_HOME=/opt/data/.config
 ENV UV_CACHE_DIR=/opt/data/cache/uv
 ENV HF_HOME=/opt/data/cache/huggingface
 ENV TRANSFORMERS_CACHE=/opt/data/cache/huggingface
@@ -627,7 +628,7 @@ ENV HERMES_HOME=/opt/data
 ENV HERMES_WRITE_SAFE_ROOT=/opt/data:/opt/vault:/tmp
 ENV HERMES_DISABLE_LAZY_INSTALLS=1
 ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
-ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/command:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 ARG HERMES_GIT_SHA=
 ARG HERMES_IMAGE_NAME=nousresearch/hermes-agent

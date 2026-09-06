@@ -4,12 +4,14 @@ set -euo pipefail
 
 need=(
   bwrap file jq sqlite3 zip unzip 7z zstd
-  pdftotext qpdf gs tesseract
+  pdftotext qpdf gs tesseract ocrmypdf
   convert pandoc soffice
   ffmpeg ffprobe exiftool
-  shellcheck ruff
+  shellcheck ruff markdownlint-cli2
   python3
   gh gitleaks tirith rclone op himalaya
+  ss dig lsof fuser
+  s6-svstat
 )
 
 fail=0
@@ -45,6 +47,24 @@ if [ ! -f /etc/hermes/config.yaml ]; then
   echo "MISSING /etc/hermes/config.yaml managed policy" >&2
   fail=1
 fi
+if [ ! -x /etc/cont-init.d/01-hermes-setup ]; then
+  echo "MISSING /etc/cont-init.d/01-hermes-setup" >&2
+  fail=1
+fi
+if ! grep -q stage2-hook /etc/cont-init.d/01-hermes-setup; then
+  echo "01-hermes-setup does not exec stage2-hook" >&2
+  fail=1
+fi
+for mcp in \
+  /usr/local/lib/node_modules/@hauptsache.net/clickup-mcp \
+  /usr/local/lib/node_modules/caldav-mcp; do
+  if [ ! -d "$mcp" ]; then
+    echo "MISSING baked MCP $mcp" >&2
+    fail=1
+  else
+    echo "OK mcp $mcp"
+  fi
+done
 
 if ! hermes-image-info --json >/tmp/image-info.json; then
   echo "hermes-image-info failed" >&2

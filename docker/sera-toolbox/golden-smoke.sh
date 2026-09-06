@@ -86,6 +86,10 @@ im.save("scan.png")
 print("OK golden scan.png")
 PY
 tesseract scan.png stdout -l eng | grep -qi GOLDEN
+convert scan.png scan-in.pdf
+timeout 90s ocrmypdf --language eng --force-ocr scan-in.pdf scan-ocr.pdf
+pdftotext scan-ocr.pdf - | grep -qi GOLDEN
+echo "OK ocrmypdf searchable pdf"
 
 printf 'not a sqlite database\n' > bad.db
 if sqlite3 bad.db 'PRAGMA integrity_check' >/dev/null 2>&1; then
