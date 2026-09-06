@@ -81,7 +81,15 @@ jobs:
             https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz
           echo 'a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb  /tmp/gitleaks.tgz' | sha256sum -c -
           tar -C /tmp -xzf /tmp/gitleaks.tgz gitleaks
-          /tmp/gitleaks detect --redact
+          # Upstream history is noisy. Gate only the triggering range.
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            range="${{ github.event.pull_request.base.sha }}..${{ github.sha }}"
+          elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            range="-1"
+          else
+            range="${{ github.event.before }}..${{ github.sha }}"
+          fi
+          /tmp/gitleaks detect --redact --log-opts="$range"
 
   # Build the image and run the docker integration suite against it.
   # This job runs branch code, so it stays secret-free; publishing happens
