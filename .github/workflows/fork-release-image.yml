@@ -55,14 +55,22 @@ jobs:
           # Published checksum from the v1.7.12 release checksums.txt.
           echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  /tmp/actionlint.tgz' | sha256sum -c -
           tar -C /tmp -xzf /tmp/actionlint.tgz actionlint
-          /tmp/actionlint -color
+          # Only the fork-owned release workflows. Upstream ci.yaml and
+          # friends fail actionlint today and are not this image lane.
+          /tmp/actionlint -color \
+            .github/workflows/fork-release-image.yml \
+            .github/workflows/pin-refresh.yml \
+            .github/workflows/reproducible-build.yml
 
       - name: zizmor
         run: |
           set -euo pipefail
           python3 -m pip install --user zizmor==1.30.0
           export PATH="$HOME/.local/bin:$PATH"
-          zizmor .github/workflows
+          zizmor \
+            .github/workflows/fork-release-image.yml \
+            .github/workflows/pin-refresh.yml \
+            .github/workflows/reproducible-build.yml
 
       - name: gitleaks
         run: |
