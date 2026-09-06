@@ -30,7 +30,7 @@ case "$tool" in
     extra+=(--headless --norestore --nolockcheck --nofirststartwizard
             "-env:UserInstallation=file:///tmp/lo-profile")
     ;;
-  ffmpeg|ffprobe)
+  ffmpeg)
     extra+=(-nostdin)
     ;;
 esac
