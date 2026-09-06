@@ -6,6 +6,17 @@ set -euo pipefail
 
 tool="$(basename "$0")"
 real="/usr/libexec/sera-toolbox/${tool}"
+origin="${real}.origin"
+if [ -f "$origin" ]; then
+  real="$(tr -d '\n' < "$origin")"
+fi
+case "$real" in
+  /usr/*|/bin/*|/opt/hermes/*|/usr/libexec/sera-toolbox/*) ;;
+  *)
+    echo "sera-toolbox: refuse origin ${real}" >&2
+    exit 127
+    ;;
+esac
 if [ ! -x "$real" ]; then
   echo "sera-toolbox: missing ${real}" >&2
   exit 127

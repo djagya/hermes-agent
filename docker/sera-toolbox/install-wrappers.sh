@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Move parser binaries to libexec and expose PATH wrappers.
+# Expose PATH wrappers. Real bits stay where the distro put them when
+# they are scripts that locate siblings via $0 (soffice). Binaries that
+# live in /usr/local/bin are copied to libexec first so replacing the
+# PATH entry does not delete the tool.
 set -euo pipefail
 
 libexec=/usr/libexec/sera-toolbox
@@ -27,11 +30,25 @@ for t in "${tools[@]}"; do
     missing=$((missing + 1))
     continue
   fi
-  # Do not wrap an already-wrapped path.
-  if [ "$src" = "/usr/local/bin/${t}" ] && [ -L "$src" ]; then
+  if [ "$(readlink -f "$src")" = "$(readlink -f "$wrap")" ]; then
     continue
   fi
-  cp -a "$src" "${libexec}/${t}"
+  resolved="$(readlink -f "$src")"
+  if [ ! -e "$resolved" ]; then
+    echo "sera-toolbox: skip broken ${t} -> ${src}" >&2
+    missing=$((missing + 1))
+    continue
+  fi
+  # Replacing /usr/local/bin/T would delete the real binary; copy first.
+  if [ "$src" = "/usr/local/bin/${t}" ]; then
+    cp -L -p "$resolved" "${libexec}/${t}"
+    rm -f "${libexec}/${t}.origin"
+  else
+    # Distro path (e.g. /usr/bin/soffice -> program/soffice). Keep it;
+    # a libexec copy breaks $0-relative LibreOffice.
+    printf '%s\n' "$resolved" > "${libexec}/${t}.origin"
+    rm -f "${libexec}/${t}"
+  fi
   ln -sfn "$wrap" "/usr/local/bin/${t}"
   installed=$((installed + 1))
 done
