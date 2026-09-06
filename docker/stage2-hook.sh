@@ -635,7 +635,14 @@ fi
 if [ -f "$HERMES_HOME/config.yaml" ]; then
     if [ "${HERMES_SKIP_CONFIG_MIGRATION:-}" = "1" ]; then
         echo "[stage2] HERMES_SKIP_CONFIG_MIGRATION=1; skipping docker_config_migrate.py"
+        # Plan 5c: hatch is inspection-only. Healthcheck must stay not-ready.
+        if ! refuse_symlinked_path "skip-marker" "$HERMES_HOME/.migration-skipped"; then
+            : > "$HERMES_HOME/.migration-skipped"
+            chown hermes:hermes "$HERMES_HOME/.migration-skipped" 2>/dev/null || true
+            chmod 644 "$HERMES_HOME/.migration-skipped"
+        fi
     else
+        rm -f "$HERMES_HOME/.migration-skipped"
         s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
             || { echo "[stage2] ERROR: docker_config_migrate.py failed" >&2; exit 1; }
     fi
@@ -791,6 +798,9 @@ if [ -f "$HERMES_HOME/config.yaml" ]; then
     schema="$(awk '/^_config_version:/{print $2; exit}' "$HERMES_HOME/config.yaml" 2>/dev/null || echo unknown)"
     [ -n "$schema" ] || schema="unknown"
 fi
-echo "[stage2] banner revision=${rev} uid=$(id -u hermes) gid=$(id -g hermes) profiles=${profiles} schema=${schema} mount=${mounted} disk=${avail_kb}KB estop=${estop}"
+migrate="ok"
+[ -f "$HERMES_HOME/.migration-in-progress" ] && migrate="in-progress"
+[ -f "$HERMES_HOME/.migration-skipped" ] && migrate="skipped"
+echo "[stage2] banner revision=${rev} uid=$(id -u hermes) gid=$(id -g hermes) profiles=${profiles} schema=${schema} migrate=${migrate} mount=${mounted} disk=${avail_kb}KB estop=${estop}"
 
 echo "[stage2] Setup complete; starting user services"

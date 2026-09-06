@@ -151,6 +151,27 @@ case "${XDG_CACHE_HOME:-}:${UV_CACHE_DIR:-}:${HF_HOME:-}" in
     fail=1 ;;
 esac
 
+case "${HERMES_HOME:-}:${HERMES_CHILD_HOME:-}" in
+  /opt/data:/opt/data/home)
+    echo "OK dual-HOME env" ;;
+  *)
+    echo "BAD dual-HOME HERMES_HOME=${HERMES_HOME:-} HERMES_CHILD_HOME=${HERMES_CHILD_HOME:-}" >&2
+    fail=1 ;;
+esac
+
+skip_home="$(mktemp -d)"
+touch "$skip_home/.migration-skipped"
+if HERMES_HOME="$skip_home" hermes-healthcheck 2>"$skip_home/err"; then
+  echo "FAIL healthcheck ignored .migration-skipped" >&2
+  fail=1
+elif grep -q 'migration skipped' "$skip_home/err"; then
+  echo "OK skip-migration not-ready"
+else
+  echo "BAD skip-migration healthcheck: $(cat "$skip_home/err")" >&2
+  fail=1
+fi
+rm -rf "$skip_home"
+
 # Himalaya public command is the v2.1 guard over v2.0.0 real binary.
 himalaya_ver="$(himalaya --version 2>&1 || true)"
 case "$himalaya_ver" in

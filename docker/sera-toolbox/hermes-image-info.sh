@@ -33,7 +33,8 @@ policy_hash="missing"
 if [ -f /etc/hermes/config.yaml ]; then
   policy_hash="$(sha256sum /etc/hermes/config.yaml | awk '{print $1}')"
 fi
-source_epoch="${SOURCE_DATE_EPOCH:-unset}"
+source_epoch="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("source_date_epoch") or "")' <<<"$prov" 2>/dev/null || true)"
+[ -n "${source_epoch:-}" ] || source_epoch="${SOURCE_DATE_EPOCH:-unset}"
 browser_ver="unknown"
 if [ -d /opt/hermes/.playwright ]; then
   chrome="$(find /opt/hermes/.playwright -type f \( -name chrome -o -name chromium -o -name chrome-headless-shell \) 2>/dev/null | head -1 || true)"
@@ -70,6 +71,7 @@ out = {
         "path": os.environ.get("PATH", ""),
         "home": os.environ.get("HOME", ""),
         "hermes_home": os.environ.get("HERMES_HOME", ""),
+        "child_home": os.environ.get("HERMES_CHILD_HOME", ""),
         "xdg_config_home": os.environ.get("XDG_CONFIG_HOME", ""),
         "xdg_cache_home": os.environ.get("XDG_CACHE_HOME", ""),
         "uv_cache_dir": os.environ.get("UV_CACHE_DIR", ""),
@@ -96,6 +98,8 @@ echo "uid/gid ${uid}:${gid}"
 echo "manifest ${manifest_hash}"
 echo "policy  ${policy_hash}"
 echo "epoch   ${source_epoch}"
+echo "home    ${HERMES_HOME:-unset}"
+echo "child   ${HERMES_CHILD_HOME:-unset}"
 echo "cache   ${XDG_CACHE_HOME:-unset}"
 echo "uv      ${UV_CACHE_DIR:-unset}"
 echo "hf      ${HF_HOME:-unset}"

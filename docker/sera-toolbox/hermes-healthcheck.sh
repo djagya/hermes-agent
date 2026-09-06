@@ -12,6 +12,10 @@ if [ -f "$home/.migration-in-progress" ]; then
   echo "healthcheck: migration in progress" >&2
   exit 1
 fi
+if [ -f "$home/.migration-skipped" ]; then
+  echo "healthcheck: migration skipped (HERMES_SKIP_CONFIG_MIGRATION)" >&2
+  exit 1
+fi
 
 avail_kb="$(df -Pk "$home" 2>/dev/null | awk 'NR==2 {print $4}')"
 if [ -z "${avail_kb:-}" ] || [ "$avail_kb" -lt 65536 ]; then

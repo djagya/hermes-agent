@@ -29,11 +29,14 @@ class TestGetSubprocessHome:
         monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
         monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
         monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_CHILD_HOME", raising=False)
 
     def _container_mode(self, monkeypatch):
         monkeypatch.setattr(hermes_constants, "is_container", lambda: True)
         monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
         monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_CHILD_HOME", raising=False)
+        monkeypatch.delenv("HERMES_CHILD_HOME", raising=False)
 
 
 
@@ -57,6 +60,18 @@ class TestGetSubprocessHome:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         from hermes_constants import get_subprocess_home
         assert get_subprocess_home() == str(profile_home)
+
+    def test_container_child_home_env_wins(self, tmp_path, monkeypatch):
+        self._container_mode(monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        default_home = hermes_home / "home"
+        default_home.mkdir(parents=True)
+        child_home = tmp_path / "child-home"
+        child_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_CHILD_HOME", str(child_home))
+        from hermes_constants import get_subprocess_home
+        assert get_subprocess_home() == str(child_home)
 
     def test_returns_profile_specific_path(self, tmp_path, monkeypatch):
         """Explicit profile mode keeps the old per-profile HOME behavior."""

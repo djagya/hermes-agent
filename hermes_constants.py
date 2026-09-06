@@ -1193,8 +1193,16 @@ def _norm_home_path(path: str | None) -> str:
 
 
 def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
-    """Return ``{HERMES_HOME}/home`` when the profile-home directory exists."""
-    hermes_home = get_hermes_home_override() or (env or {}).get("HERMES_HOME") or os.getenv("HERMES_HOME")
+    """Return the child-process HOME when that directory exists.
+
+    Image/compose set ``HERMES_CHILD_HOME=/opt/data/home``. Fall back to
+    ``{HERMES_HOME}/home`` so host installs and older images keep working.
+    """
+    env = env or {}
+    explicit = str(env.get("HERMES_CHILD_HOME") or os.getenv("HERMES_CHILD_HOME") or "").strip()
+    if explicit and os.path.isdir(explicit):
+        return explicit
+    hermes_home = get_hermes_home_override() or env.get("HERMES_HOME") or os.getenv("HERMES_HOME")
     if not hermes_home:
         return None
     profile_home = os.path.join(hermes_home, "home")

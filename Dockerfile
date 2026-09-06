@@ -451,6 +451,7 @@ ARG HERMES_GIT_SHA=
 # byte-compatible with the previous hardcoded marker.
 ARG HERMES_IMAGE_NAME=nousresearch/hermes-agent
 ARG HERMES_BUILD_REF=
+ARG SOURCE_DATE_EPOCH=
 # Baked into image config so `docker image inspect` (and the monolith
 # post-pull verifier) can bind the bytes to the triggering git SHA
 # without starting the container. Empty when built without --build-arg.
@@ -461,7 +462,7 @@ RUN set -eu; \
         printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
     fi; \
     mkdir -p /etc/hermes; \
-    HERMES_GIT_SHA="${HERMES_GIT_SHA}" HERMES_IMAGE_NAME="${HERMES_IMAGE_NAME}" HERMES_BUILD_REF="${HERMES_BUILD_REF}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); payload = {"schema": 1, "deployment_kind": "image", "manager": "docker", "image": os.environ.get("HERMES_IMAGE_NAME") or "nousresearch/hermes-agent", "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}; ref = os.environ.get("HERMES_BUILD_REF");  payload.update({"ref": ref} if ref else {}); marker.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+    HERMES_GIT_SHA="${HERMES_GIT_SHA}" HERMES_IMAGE_NAME="${HERMES_IMAGE_NAME}" HERMES_BUILD_REF="${HERMES_BUILD_REF}" SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); payload = {"schema": 1, "deployment_kind": "image", "manager": "docker", "image": os.environ.get("HERMES_IMAGE_NAME") or "nousresearch/hermes-agent", "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}; ref = os.environ.get("HERMES_BUILD_REF"); epoch = os.environ.get("SOURCE_DATE_EPOCH"); payload.update({"ref": ref} if ref else {}); payload.update({"source_date_epoch": epoch} if epoch else {}); marker.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 COPY docker/sera-toolbox/managed-config.yaml /etc/hermes/config.yaml
 RUN chmod 0444 /etc/hermes/config.yaml
 
@@ -635,6 +636,7 @@ ENV npm_config_install_links=false
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
 ENV HERMES_HOME=/opt/data
+ENV HERMES_CHILD_HOME=/opt/data/home
 ENV HERMES_WRITE_SAFE_ROOT=/opt/data:/opt/vault:/tmp
 ENV HERMES_DISABLE_LAZY_INSTALLS=1
 ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages

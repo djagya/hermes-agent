@@ -34,10 +34,10 @@ docker run --rm --network none \
 
 Builder stage keeps compilers. Do not publish `builder`.
 
-ClickUp 1.8.0 and `caldav-mcp` 0.10.0 are baked. Live hooks stay
-`npx -y @pinned` until this image is the box pin; then switch to
-`--no-install`. Todoist stays `mcp-remote` until native URL-only
-OAuth keeps `/mcp`. Do not switch that transport in this image.
+ClickUp 1.8.0 and `caldav-mcp` 0.10.0 are baked. Live hooks are
+`npx --no-install` (fail-closed if the package dir is missing).
+Todoist stays `mcp-remote` until native URL-only OAuth keeps `/mcp`.
+Do not switch that transport in this image.
 
 Reproducible-build experiment (two clean builds, compare IDs) is
 `workflow_dispatch` only: `.github/workflows/reproducible-build.yml`.
