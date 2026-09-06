@@ -211,6 +211,7 @@ jobs:
           fi
           run_bwrap() {
             docker run --rm --network none \
+              --userns=host \
               --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
               --security-opt apparmor=unconfined \
               "$@"
