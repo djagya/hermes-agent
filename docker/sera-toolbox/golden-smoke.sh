@@ -12,12 +12,10 @@ cp "$fix/hello.md" "$fix/golden-docx.md" "$fix/golden.csv" "$fix/bad.db" \
    "$fix/golden.pdf" "$fix/golden.wav" "$fix/golden.zip" \
    "$fix/golden.docx" "$fix/golden.xlsx" "$fix/scan.png" "$fix/scan-in.pdf" .
 
-# Renderer proof: WeasyPrint must still produce a Unicode PDF. Stored
-# golden.pdf is the workflow fixture; this one is generated on purpose.
-python3 - <<'PY'
-from weasyprint import HTML
-HTML(string="<html><body><p>Здравствуй golden 😀</p></body></html>").write_pdf("unicode.pdf")
-PY
+# Renderer proof: wrapped WeasyPrint must still produce a Unicode PDF.
+# Stored golden.pdf is the workflow fixture; this one is generated.
+printf '%s\n' '<html><body><p>Здравствуй golden 😀</p></body></html>' > unicode.html
+weasyprint unicode.html unicode.pdf
 
 pdftotext golden.pdf golden.txt
 grep -q golden golden.txt
@@ -33,13 +31,8 @@ cmp -s golden.zip golden.zip.out
 7z a -bd -y golden.7z hello.md >/dev/null
 7z t golden.7z >/dev/null
 
-python3 - <<'PY'
-import fitz
-doc = fitz.open("golden.pdf")
-text = "".join(page.get_text() for page in doc)
-assert "golden" in text.lower()
-print("OK golden pdf/zip/zstd/7z/pymupdf")
-PY
+sera-pymupdf extract golden.pdf | grep -qi golden
+echo "OK golden pdf/zip/zstd/7z/pymupdf"
 
 python3 - <<'PY'
 from PIL import Image
@@ -67,19 +60,9 @@ grep -q golden-xlsx xlsx-out/golden.csv
 
 tesseract scan.png stdout -l eng | grep -qi GOLDEN
 # ImageMagick delegates are disabled (no gs). Rebuild scan-in.pdf via
-# PyMuPDF so the baked renderer is still the proof.
-python3 - <<'PY'
-import fitz
-src = fitz.open("scan.png")
-rect = src[0].rect
-doc = fitz.open()
-page = doc.new_page(width=rect.width, height=rect.height)
-page.insert_image(rect, filename="scan.png")
-doc.save("scan-in.pdf")
-src.close()
-doc.close()
-print("OK scan-in.pdf via pymupdf")
-PY
+# the wrapped PyMuPDF helper so the baked renderer is still the proof.
+sera-pymupdf image-pdf scan.png scan-in.pdf
+echo "OK scan-in.pdf via pymupdf"
 timeout 90s ocrmypdf --language eng --force-ocr scan-in.pdf scan-ocr.pdf
 ocr_txt="$(pdftotext scan-ocr.pdf - || true)"
 if ! printf '%s\n' "$ocr_txt" | grep -qi GOLDEN; then

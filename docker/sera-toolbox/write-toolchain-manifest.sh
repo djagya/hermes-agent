@@ -34,7 +34,7 @@ tools = [
     "bwrap", "file", "sqlite3", "jq", "pdftotext", "qpdf", "gs",
     "tesseract", "convert", "pandoc", "soffice", "ffmpeg", "exiftool",
     "shellcheck", "ruff", "gh", "gitleaks", "tirith", "rclone", "op",
-    "markdownlint-cli2", "hermes",
+    "markdownlint-cli2", "hermes", "weasyprint", "sera-pymupdf",
 ]
 # Plan 5c: record both the cont-init shim and the hook it execs. A
 # service restart does not rerun cont-init; hashes prove the baked

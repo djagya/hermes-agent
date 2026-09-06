@@ -34,13 +34,23 @@ mkdir -p "$out_dir"
 # Tool-specific hardened flags. Extra caller flags still apply
 # except ffmpeg/ffprobe protocol_whitelist — wrap forces file-only.
 extra=()
+lo_binds=()
+venv_binds=()
+lo_profile=""
 case "$tool" in
   gs|ghostscript)
     extra+=(-dSAFER -dNOPAUSE)
     ;;
   soffice|libreoffice)
-    extra+=(--headless --norestore --nolockcheck --nofirststartwizard
+    extra+=(--headless --norestore --nolockcheck --nofirststartwizard --nologo
             "-env:UserInstallation=file:///tmp/lo-profile")
+    lo_profile="$(mktemp -d /tmp/lo-profile.XXXXXX)"
+    mkdir -p "$lo_profile/user"
+    if [ -f /etc/sera-toolbox/libreoffice/registrymodifications.xcu ]; then
+      cp /etc/sera-toolbox/libreoffice/registrymodifications.xcu \
+        "$lo_profile/user/"
+    fi
+    lo_binds+=(--bind "$lo_profile" /tmp/lo-profile)
     ;;
   ffmpeg)
     extra+=(-nostdin -protocol_whitelist file,pipe,crypto,data)
@@ -48,7 +58,17 @@ case "$tool" in
   ffprobe)
     extra+=(-protocol_whitelist file,pipe,crypto,data)
     ;;
+  weasyprint|sera-weasyprint|sera-pymupdf)
+    # Helpers live in libexec but import from the image venv.
+    venv_binds+=(--ro-bind /opt/hermes/.venv /opt/hermes/.venv)
+    ;;
 esac
+cleanup() {
+  if [ -n "${lo_profile:-}" ]; then
+    rm -rf "$lo_profile"
+  fi
+}
+trap cleanup EXIT
 if [ "$tool" = ffmpeg ] || [ "$tool" = ffprobe ]; then
   filtered=()
   skip_next=0
@@ -82,6 +102,7 @@ import sys, zipfile
 from pathlib import Path
 max_ratio = float(__import__("os").environ.get("SERA_SANDBOX_ZIP_RATIO", "100"))
 max_uncomp = int(__import__("os").environ.get("SERA_SANDBOX_ZIP_MAX_BYTES", str(64 * 1024 * 1024)))
+max_members = int(__import__("os").environ.get("SERA_SANDBOX_ZIP_MAX_MEMBERS", "4096"))
 for arg in sys.argv[1:]:
     p = Path(arg)
     if not p.is_file() or not zipfile.is_zipfile(p):
@@ -89,7 +110,11 @@ for arg in sys.argv[1:]:
     with zipfile.ZipFile(p) as z:
         raw = 0
         comp = 0
+        members = 0
         for info in z.infolist():
+            members += 1
+            if members > max_members:
+                sys.exit(3)
             name = info.filename
             if name.startswith("/") or any(part == ".." for part in name.split("/")):
                 sys.exit(2)
@@ -115,21 +140,48 @@ case "$cwd" in
     ;;
 esac
 
-# Per-tool wall clocks. Caller SERA_SANDBOX_TIMEOUT still wins.
+# Workload profiles (plan 5e). Caller SERA_SANDBOX_TIMEOUT / _AS_BYTES win.
 case "$tool" in
-  file|exiftool|identify|pdfinfo)
+  file|exiftool|identify|pdfinfo|heif-info)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-30}"
     as_bytes="${SERA_SANDBOX_AS_BYTES:-536870912}"
     ;;
-  tesseract|ocrmypdf|soffice|libreoffice|pandoc)
+  pdftotext|pdftoppm|qpdf|gs|ghostscript)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-1073741824}"
+    ;;
+  tesseract|ocrmypdf)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-180}"
     as_bytes="${SERA_SANDBOX_AS_BYTES:-2147483648}"
+    ;;
+  soffice|libreoffice|pandoc|weasyprint|sera-weasyprint|sera-pymupdf)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-180}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-2147483648}"
+    ;;
+  ffmpeg|ffprobe)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-1073741824}"
+    ;;
+  unzip|7z|7za|bsdtar)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-60}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-1073741824}"
     ;;
   *)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
     as_bytes="${SERA_SANDBOX_AS_BYTES:-1073741824}"
     ;;
 esac
+# Process cap without --unshare-pid (nested Docker EPERM on procfs).
+# Inherited by bwrap child. 64 is enough for receipt python + the tool.
+ulimit -u "${SERA_SANDBOX_NPROC:-64}" 2>/dev/null || true
+# Dedicated writable output bind. cwd is RO when it is not the out dir.
+fs_binds=()
+if [ "$(pwd -P)" = "$(cd "$out_dir" && pwd -P)" ]; then
+  fs_binds+=(--bind "$cwd" "$cwd")
+else
+  fs_binds+=(--ro-bind "$cwd" "$cwd" --bind "$out_dir" "$out_dir")
+fi
+
 start_ns="$(date +%s%N)"
 tmp_receipt="$(mktemp /tmp/sera-bwrap.XXXXXX.json)"
 tmp_before="$(mktemp /tmp/sera-bwrap.XXXXXX.before)"
@@ -211,8 +263,9 @@ env -i \
     --ro-bind-try /var/lib/ghostscript /var/lib/ghostscript \
     --ro-bind-try /var/lib/tesseract-ocr /var/lib/tesseract-ocr \
     --ro-bind-try /var/lib/libreoffice /var/lib/libreoffice \
-    --bind "$cwd" "$cwd" \
-    --bind "$out_dir" "$out_dir" \
+    "${venv_binds[@]}" \
+    "${lo_binds[@]}" \
+    "${fs_binds[@]}" \
     --chdir "$cwd" \
     -- "$real" "${extra[@]}" "$@" \
   || status=$?

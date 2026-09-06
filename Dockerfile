@@ -540,6 +540,8 @@ COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
 COPY --chmod=0755 docker/mcp-shim.sh /opt/hermes/bin/mcp
 COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
 COPY --chmod=0755 docker/sera-toolbox/wrap /opt/hermes/docker/sera-toolbox/wrap
+COPY --chmod=0755 docker/sera-toolbox/helpers/ /opt/hermes/docker/sera-toolbox/helpers/
+COPY docker/sera-toolbox/libreoffice/ /etc/sera-toolbox/libreoffice/
 COPY --chmod=0755 docker/sera-toolbox/install-wrappers.sh /opt/hermes/docker/sera-toolbox/install-wrappers.sh
 COPY --chmod=0755 docker/sera-toolbox/install-network-bins.sh /opt/hermes/docker/sera-toolbox/install-network-bins.sh
 COPY --chmod=0755 docker/sera-toolbox/smoke.sh /opt/hermes/docker/sera-toolbox/smoke.sh

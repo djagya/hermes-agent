@@ -53,12 +53,14 @@ do_prune() {
   fi
 }
 
+full=0
 case "${1:-}" in
   --prune-dry-run) do_prune 1; exit 0 ;;
   --prune) do_prune 0; exit "$fail" ;;
+  --full) full=1 ;;
   ""|--check) ;;
   *)
-    echo "usage: hermes-image-doctor [--check|--prune-dry-run|--prune]" >&2
+    echo "usage: hermes-image-doctor [--check|--full|--prune-dry-run|--prune]" >&2
     exit 2
     ;;
 esac
@@ -127,7 +129,11 @@ if [ -d "$home" ]; then
       "${HF_HOME:-$home/cache/huggingface}"; do
     if [ -d "$cache_dir" ]; then
       cache_kb="$(du -sk "$cache_dir" 2>/dev/null | awk '{print $1}')"
-      note "cache ${cache_dir} ${cache_kb:-?}KB (no boot prune)"
+      warn_kb="${HERMES_CACHE_WARN_KB:-10485760}"
+      note "cache ${cache_dir} ${cache_kb:-?}KB (no boot prune; ceiling ${warn_kb}KB)"
+      if [ -n "${cache_kb:-}" ] && [ "$cache_kb" -gt "$warn_kb" ]; then
+        note "WARN cache ${cache_dir} exceeds ${warn_kb}KB ceiling"
+      fi
     else
       note "cache ${cache_dir} absent (stage2 seeds it)"
     fi
@@ -153,5 +159,21 @@ for name in ("fitz", "weasyprint", "yt_dlp", "ddgs", "fal_client", "faster_whisp
     importlib.import_module(name)
     print("OK   py", name)
 PY
+
+if [ "$full" = 1 ]; then
+  for t in pdftotext soffice convert ffmpeg weasyprint sera-pymupdf; do
+    if command -v "$t" >/dev/null 2>&1; then
+      ok "wrap PATH $t -> $(command -v "$t")"
+    else
+      bad "wrap PATH missing $t"
+    fi
+  done
+  fix="${SERA_GOLDEN_FIXTURES:-/opt/hermes/docker/sera-toolbox/fixtures}"
+  if [ -d "$fix" ] && [ -x /opt/hermes/docker/sera-toolbox/golden-smoke.sh ]; then
+    note "fixtures present; golden-smoke is a separate CI entrypoint (needs bwrap seccomp)"
+  else
+    note "fixtures absent (published runtime); golden-smoke skipped"
+  fi
+fi
 
 exit "$fail"

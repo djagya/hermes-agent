@@ -1,0 +1,29 @@
+#!/opt/hermes/.venv/bin/python3
+"""Local HTML/SVG -> PDF. Refuse URL fetches even inside the sandbox."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+def _refuse_url(url: str, timeout=10, ssl_context=None):  # noqa: ARG001
+    raise RuntimeError(f"refusing URL fetch: {url}")
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 3:
+        print("usage: weasyprint INPUT.html OUTPUT.pdf", file=sys.stderr)
+        return 2
+    src = Path(argv[1])
+    dest = Path(argv[2])
+    if src.suffix.lower() not in {".html", ".htm", ".svg"}:
+        print("sera-weasyprint: only local html/svg", file=sys.stderr)
+        return 2
+    from weasyprint import HTML
+
+    HTML(filename=str(src), url_fetcher=_refuse_url).write_pdf(str(dest))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

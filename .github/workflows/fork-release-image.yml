@@ -110,6 +110,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Record SOURCE_DATE_EPOCH
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+
       # Retry once on transient registry/buildkit failures; same pattern and
       # rationale as upstream docker.yml (docker/setup-buildx-action#510).
       - name: Set up Docker Buildx
@@ -150,6 +153,7 @@ jobs:
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
             HERMES_BUILD_REF=${{ github.ref_name }}
             DEBIAN_SNAPSHOT=${{ env.DEBIAN_SNAPSHOT }}
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
           cache-from: type=gha,scope=fork-amd64
           cache-to: type=gha,mode=max,scope=fork-amd64
 
@@ -243,6 +247,8 @@ jobs:
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/office-external.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/secret-env.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/oversized-output.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/html-fetch.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/zip-members.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh "$IMAGE"
 
       - name: Offline CLI without data mount
@@ -252,6 +258,8 @@ jobs:
           set -euo pipefail
           docker run --rm --network none --entrypoint hermes-image-info \
             "$IMAGE" --json
+          docker run --rm --network none --entrypoint hermes-image-doctor \
+            "$IMAGE" --full
           docker run --rm --network none --entrypoint hermes-image-doctor \
             "$IMAGE" --prune-dry-run
           docker run --rm --network none --entrypoint /opt/hermes/.venv/bin/hermes \
@@ -326,6 +334,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Record SOURCE_DATE_EPOCH
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+
       - name: Set up Docker Buildx
         id: buildx
         continue-on-error: true
@@ -375,6 +386,7 @@ jobs:
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
             HERMES_BUILD_REF=${{ github.ref_name }}
             DEBIAN_SNAPSHOT=${{ env.DEBIAN_SNAPSHOT }}
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
           # BuildKit SLSA provenance + SBOM attached to the image manifest.
           provenance: mode=max
           sbom: true

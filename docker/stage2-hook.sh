@@ -459,7 +459,9 @@ as_hermes mkdir -p \
     "$HERMES_HOME/cache/huggingface" \
     "$HERMES_HOME/pairing" \
     "$HERMES_HOME/platforms/pairing" \
-    "$HERMES_HOME/lazy-packages"
+    "$HERMES_HOME/lazy-packages" \
+    "$HERMES_HOME/hotfixes" \
+    "$HERMES_HOME/state"
 
 # Required-path write probe after remap + seed. Fail closed.
 probe="$HERMES_HOME/.stage2-write-probe"

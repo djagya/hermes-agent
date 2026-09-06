@@ -1,0 +1,42 @@
+#!/opt/hermes/.venv/bin/python3
+"""Sandboxed PyMuPDF helper. extract text or wrap one image as a PDF."""
+from __future__ import annotations
+
+import sys
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        print(
+            "usage: sera-pymupdf extract FILE.pdf | image-pdf IMG OUT.pdf",
+            file=sys.stderr,
+        )
+        return 2
+    import fitz
+
+    cmd = argv[1]
+    if cmd == "extract":
+        doc = fitz.open(argv[2])
+        try:
+            sys.stdout.write("".join(page.get_text() for page in doc))
+        finally:
+            doc.close()
+        return 0
+    if cmd == "image-pdf" and len(argv) == 4:
+        src = fitz.open(argv[2])
+        try:
+            rect = src[0].rect
+            doc = fitz.open()
+            page = doc.new_page(width=rect.width, height=rect.height)
+            page.insert_image(rect, filename=argv[2])
+            doc.save(argv[3])
+            doc.close()
+        finally:
+            src.close()
+        return 0
+    print("sera-pymupdf: unknown command", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

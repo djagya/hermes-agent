@@ -53,4 +53,31 @@ for t in "${tools[@]}"; do
   installed=$((installed + 1))
 done
 
+# Python parsers: helpers are the real bits. PATH names go through wrap.
+# Venv console scripts sit ahead of /usr/local/bin on image PATH, so
+# replace those too or WeasyPrint stays unsandboxed.
+helpers_dir=/opt/hermes/docker/sera-toolbox/helpers
+if [ -d "$helpers_dir" ]; then
+  for helper in sera-weasyprint sera-pymupdf; do
+    src="${helpers_dir}/${helper}"
+    if [ ! -x "$src" ]; then
+      echo "sera-toolbox: skip missing helper ${helper}" >&2
+      missing=$((missing + 1))
+      continue
+    fi
+    cp -L -p "$src" "${libexec}/${helper}"
+    ln -sfn "$wrap" "/usr/local/bin/${helper}"
+    installed=$((installed + 1))
+  done
+  if [ -x "${libexec}/sera-weasyprint" ]; then
+    printf '%s\n' "${libexec}/sera-weasyprint" > "${libexec}/weasyprint.origin"
+    rm -f "${libexec}/weasyprint"
+    ln -sfn "$wrap" /usr/local/bin/weasyprint
+    if [ -e /opt/hermes/.venv/bin/weasyprint ]; then
+      ln -sfn "$wrap" /opt/hermes/.venv/bin/weasyprint
+    fi
+    installed=$((installed + 1))
+  fi
+fi
+
 echo "sera-toolbox: wrapped=${installed} missing=${missing}"
