@@ -30,10 +30,54 @@ env:
   IMAGE_NAME: ghcr.io/djagya/hermes-agent
 
 jobs:
+  lint:
+    if: github.repository == 'djagya/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: hadolint
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/hadolint \
+            https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+          echo '56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010  /tmp/hadolint' | sha256sum -c -
+          chmod +x /tmp/hadolint
+          /tmp/hadolint Dockerfile
+
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/actionlint.tgz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          # Published checksum from the v1.7.12 release checksums.txt.
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  /tmp/actionlint.tgz' | sha256sum -c -
+          tar -C /tmp -xzf /tmp/actionlint.tgz actionlint
+          /tmp/actionlint -color
+
+      - name: zizmor
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user zizmor==1.30.0
+          export PATH="$HOME/.local/bin:$PATH"
+          zizmor .github/workflows
+
+      - name: gitleaks
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/gitleaks.tgz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz
+          echo 'a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb  /tmp/gitleaks.tgz' | sha256sum -c -
+          tar -C /tmp -xzf /tmp/gitleaks.tgz gitleaks
+          /tmp/gitleaks detect --redact
+
   # Build the image and run the docker integration suite against it.
   # This job runs branch code, so it stays secret-free; publishing happens
   # in the separate environment-gated job below.
   build-test:
+    needs: [lint]
     if: github.repository == 'djagya/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 240
@@ -118,7 +162,15 @@ jobs:
         env:
           IMAGE: ${{ env.IMAGE_NAME }}:test
         run: |
-          docker run --rm --entrypoint /opt/hermes/docker/sera-toolbox/smoke.sh "$IMAGE"
+          set -euo pipefail
+          docker run --rm --network none \
+            --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
+            --entrypoint /opt/hermes/docker/sera-toolbox/smoke.sh \
+            "$IMAGE"
+          docker run --rm --network none \
+            --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
+            --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/zip-slip.sh \
+            "$IMAGE"
 
       - name: Install uv (for docker tests)
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0

@@ -30,9 +30,31 @@ fi
 
 python3 - <<'PY'
 import importlib
-for name in ("fitz", "weasyprint", "yt_dlp"):
+for name in ("fitz", "weasyprint", "yt_dlp", "ddgs", "fal_client", "faster_whisper"):
     importlib.import_module(name)
     print("OK py", name)
+try:
+    import pillow_heif
+    print("OK py pillow_heif")
+except ImportError:
+    print("MISSING py pillow_heif")
+    raise SystemExit(1)
 PY
+
+if ! hermes-image-info --json >/tmp/image-info.json; then
+  echo "hermes-image-info failed" >&2
+  fail=1
+fi
+if ! hermes-image-doctor; then
+  echo "hermes-image-doctor failed" >&2
+  fail=1
+fi
+
+# sqlite CLI must be the fixed 3.53 build, not Debian 3.46.
+sqlite_ver="$(sqlite3 -version | awk '{print $1}')"
+case "$sqlite_ver" in
+  3.53.*) echo "OK sqlite $sqlite_ver" ;;
+  *) echo "BAD sqlite $sqlite_ver (want 3.53.x)" >&2; fail=1 ;;
+esac
 
 exit "$fail"

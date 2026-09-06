@@ -58,10 +58,17 @@ FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07
 # published container and writable state belongs under /opt/data.
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false
+ENV UV_NO_PROGRESS=1
 
 # Store Playwright browsers outside the volume mount so the build-time
-# install survives the /opt/data volume overlay at runtime.
+# install survives the /opt/data volume overlay at runtime. Child npm/pip
+# must not fetch a second browser tree into /opt/data.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 # Install system dependencies in one layer, clear APT cache.
 # tini was previously PID 1 to reap orphaned zombie processes (MCP stdio
@@ -82,14 +89,14 @@ RUN apt-get -o Acquire::Retries=3 update && \
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     bubblewrap \
-    file jq sqlite3 zip unzip p7zip-full zstd \
+    file jq zip unzip p7zip-full zstd \
     poppler-utils qpdf ghostscript \
     tesseract-ocr tesseract-ocr-eng ocrmypdf \
     imagemagick \
     pandoc \
     libreoffice-writer libreoffice-calc \
     libimage-exiftool-perl libheif1 libheif-examples \
-    fonts-noto-core fonts-liberation \
+    fonts-noto-core fonts-noto-color-emoji fonts-liberation \
     iproute2 bind9-dnsutils lsof psmisc rclone \
     shellcheck \
     libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info && \
@@ -99,7 +106,9 @@ RUN apt-get -o Acquire::Retries=3 update && \
 # public library name stable so both the system interpreter and the uv-created
 # venv resolve the replacement without changing Python import paths.
 COPY --from=sqlite_build /opt/sqlite-fixed/lib/libsqlite3.so.3.53.4 /usr/local/lib/
-RUN ln -sf libsqlite3.so.3.53.4 /usr/local/lib/libsqlite3.so.0 && \
+COPY --from=sqlite_build /opt/sqlite-fixed/bin/sqlite3 /usr/local/bin/sqlite3
+RUN chmod 0755 /usr/local/bin/sqlite3 && \
+    ln -sf libsqlite3.so.3.53.4 /usr/local/lib/libsqlite3.so.0 && \
     ln -sf libsqlite3.so.3.53.4 /usr/local/lib/libsqlite3.so && \
     printf '/usr/local/lib\n' > /etc/ld.so.conf.d/000-sqlite-fixed.conf && \
     ldconfig && \
@@ -318,10 +327,12 @@ RUN uv pip install --no-cache-dir --no-deps -e "."
 RUN uv pip install --no-cache-dir \
     "PyMuPDF==1.25.5" \
     "pymupdf4llm==0.0.17" \
-    "weasyprint==65.1" \
+    "weasyprint==69.0" \
     "ddgs==9.5.5" \
     "yt-dlp==2025.10.14" \
-    "faster-whisper==1.1.1" \
+    "faster-whisper==1.2.1" \
+    "fal-client==0.13.1" \
+    "pillow-heif==1.7.0" \
     "ruff==0.12.12"
 
 RUN npm install -g --omit=dev markdownlint-cli2@0.18.1 && npm cache clean --force
@@ -430,7 +441,7 @@ ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 # check. (A separate launcher hardening is tracked independently.)
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
 ENV HERMES_HOME=/opt/data
-ENV HERMES_WRITE_SAFE_ROOT=/opt/data
+ENV HERMES_WRITE_SAFE_ROOT=/opt/data:/opt/vault:/tmp
 ENV HERMES_DISABLE_LAZY_INSTALLS=1
 # The published image seals /opt/hermes (root-owned, read-only) so a runtime
 # lazy install can't mutate the agent's own venv and brick it. But opt-in
@@ -463,10 +474,16 @@ COPY --chmod=0755 docker/sera-toolbox/wrap /opt/hermes/docker/sera-toolbox/wrap
 COPY --chmod=0755 docker/sera-toolbox/install-wrappers.sh /opt/hermes/docker/sera-toolbox/install-wrappers.sh
 COPY --chmod=0755 docker/sera-toolbox/install-network-bins.sh /opt/hermes/docker/sera-toolbox/install-network-bins.sh
 COPY --chmod=0755 docker/sera-toolbox/smoke.sh /opt/hermes/docker/sera-toolbox/smoke.sh
+COPY --chmod=0755 docker/sera-toolbox/hermes-image-info.sh /usr/local/bin/hermes-image-info
+COPY --chmod=0755 docker/sera-toolbox/hermes-image-doctor.sh /usr/local/bin/hermes-image-doctor
+COPY --chmod=0755 docker/sera-toolbox/write-toolchain-manifest.sh /opt/hermes/docker/sera-toolbox/write-toolchain-manifest.sh
+COPY --chmod=0755 docker/sera-toolbox/adversarial/zip-slip.sh /opt/hermes/docker/sera-toolbox/adversarial/zip-slip.sh
+COPY docker/sera-toolbox/seccomp-bwrap.json /opt/hermes/docker/sera-toolbox/seccomp-bwrap.json
 COPY docker/sera-toolbox/ImageMagick/ /etc/sera-toolbox/ImageMagick/
 RUN /opt/hermes/docker/sera-toolbox/install-wrappers.sh
 # TARGETARCH already declared for s6-overlay.
 RUN /opt/hermes/docker/sera-toolbox/install-network-bins.sh
+RUN /opt/hermes/docker/sera-toolbox/write-toolchain-manifest.sh
 
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported
 # the venv bin onto PATH; Architecture B's main-wrapper.sh does the
@@ -481,7 +498,9 @@ RUN /opt/hermes/docker/sera-toolbox/install-network-bins.sh
 # every other consumer.
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
-VOLUME [ "/opt/data" ]
+# Do not declare VOLUME /opt/data — that creates anonymous state on
+# `docker run` without -v. Compose bind-mounts /opt/data explicitly.
+# Gateway boots refuse a missing mount when HERMES_REQUIRE_DATA_MOUNT=1.
 
 # The image ENTRYPOINT is a tiny dispatcher rather than `/init` directly.
 # When the image really owns PID 1 (normal Docker / Podman), the dispatcher

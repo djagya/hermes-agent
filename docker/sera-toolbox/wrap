@@ -35,7 +35,7 @@ case "$tool" in
     ;;
 esac
 
-# Reject archive-traversal args before entering the sandbox.
+# Reject archive-traversal args and zip-slip members before the sandbox.
 case "$tool" in
   unzip|7z|7za|bsdtar)
     for arg in "$@"; do
@@ -46,9 +46,34 @@ case "$tool" in
           ;;
       esac
     done
+    if ! python3 - "$@" <<'PY'
+import sys, zipfile
+from pathlib import Path
+for arg in sys.argv[1:]:
+    p = Path(arg)
+    if not p.is_file() or not zipfile.is_zipfile(p):
+        continue
+    with zipfile.ZipFile(p) as z:
+        for name in z.namelist():
+            if name.startswith("/") or any(part == ".." for part in name.split("/")):
+                sys.exit(2)
+PY
+    then
+      echo "sera-toolbox: refusing zip-slip or absolute archive member" >&2
+      exit 2
+    fi
     ;;
 esac
 
+# Never treat the child-HOME / runtime root as a document cwd.
+case "$cwd" in
+  /opt/data|/opt/data/home|/opt/data/home/*)
+    echo "sera-toolbox: refusing cwd ${cwd} (secrets/runtime root)" >&2
+    exit 2
+    ;;
+esac
+
+timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
 start_ns="$(date +%s%N)"
 tmp_receipt="$(mktemp /tmp/sera-bwrap.XXXXXX.json)"
 # shellcheck disable=SC2016
@@ -62,6 +87,7 @@ env -i \
   LANG="${LANG:-C.UTF-8}" \
   LC_ALL="${LC_ALL:-C.UTF-8}" \
   MAGICK_CONFIGURE_PATH=/etc/sera-toolbox/ImageMagick \
+  timeout --signal=KILL "$timeout_s" \
   bwrap \
     --unshare-net \
     --unshare-pid \
@@ -69,6 +95,7 @@ env -i \
     --unshare-ipc \
     --die-with-parent \
     --new-session \
+    --nproc 64 \
     --tmpfs /tmp \
     --dir /tmp/home \
     --ro-bind /usr /usr \

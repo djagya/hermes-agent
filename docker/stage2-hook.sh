@@ -85,6 +85,34 @@ fi
 # is a no-op if the dir already exists. (#18482, salvages #18488)
 mkdir -p "$HERMES_HOME"
 
+# Release B: refuse boot when the data volume is too tight for a
+# config/DB migration. Override with HERMES_MIN_FREE_KB (default 2 GiB).
+min_free_kb="${HERMES_MIN_FREE_KB:-2097152}"
+avail_kb="$(df -Pk "$HERMES_HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
+avail_inodes="$(df -Pi "$HERMES_HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
+if [ -z "${avail_kb:-}" ]; then
+    echo "[stage2] ERROR: cannot measure free space on $HERMES_HOME" >&2
+    exit 1
+fi
+if [ "$avail_kb" -lt "$min_free_kb" ]; then
+    echo "[stage2] ERROR: $HERMES_HOME has ${avail_kb}KB free; need ${min_free_kb}KB" >&2
+    exit 1
+fi
+if [ -z "${avail_inodes:-}" ] || [ "$avail_inodes" -lt "${HERMES_MIN_FREE_INODES:-10000}" ]; then
+    echo "[stage2] ERROR: $HERMES_HOME has ${avail_inodes:-0} inodes free" >&2
+    exit 1
+fi
+tmp_min_kb="${HERMES_MIN_TMP_FREE_KB:-262144}"
+tmp_avail_kb="$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $4}')"
+if [ -z "${tmp_avail_kb:-}" ] || [ "$tmp_avail_kb" -lt "$tmp_min_kb" ]; then
+    echo "[stage2] ERROR: /tmp has ${tmp_avail_kb:-0}KB free; need ${tmp_min_kb}KB" >&2
+    exit 1
+fi
+if [ "${HERMES_REQUIRE_DATA_MOUNT:-}" = "1" ] && ! mountpoint -q "$HERMES_HOME"; then
+    echo "[stage2] ERROR: $HERMES_HOME is not an explicit bind/named mount. Use docker compose or docker run -v …:${HERMES_HOME}" >&2
+    exit 1
+fi
+
 # Numeric UID/GID validation: must be digits only, non-root, 1-65534.
 # NAS hosts such as Unraid commonly use low non-root IDs (99:100).
 validate_uid_gid() {
@@ -395,6 +423,17 @@ as_hermes mkdir -p \
     "$HERMES_HOME/platforms/pairing" \
     "$HERMES_HOME/lazy-packages"
 
+# Required-path write probe after remap + seed. Fail closed.
+probe="$HERMES_HOME/.stage2-write-probe"
+if ! as_hermes sh -c "umask 002; : > \"$probe\" && rm -f \"$probe\""; then
+    echo "[stage2] ERROR: hermes cannot write $HERMES_HOME after remap" >&2
+    exit 1
+fi
+if ! as_hermes sh -c 'umask 002; : > /tmp/.stage2-tmp-probe && rm -f /tmp/.stage2-tmp-probe'; then
+    echo "[stage2] ERROR: hermes cannot write /tmp" >&2
+    exit 1
+fi
+
 # --- Install-method stamp ---
 # The 'docker' stamp is baked into the immutable install tree at
 # /opt/hermes/.install_method (see Dockerfile), NOT written here into
@@ -693,5 +732,14 @@ if [ -z "${AGENT_BROWSER_EXECUTABLE_PATH:-}" ] && \
         echo "[stage2] Warning: no Chromium binary under $PLAYWRIGHT_BROWSERS_PATH; browser tool may fail"
     fi
 fi
+
+rev="$(cat /opt/hermes/.hermes_build_sha 2>/dev/null || echo unknown)"
+estop="off"
+[ -f "$HERMES_HOME/ESTOP" ] && estop="on"
+mounted="no"
+mountpoint -q "$HERMES_HOME" 2>/dev/null && mounted="yes"
+profiles=0
+[ -d "$HERMES_HOME/profiles" ] && profiles="$(find "$HERMES_HOME/profiles" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+echo "[stage2] banner revision=${rev} uid=$(id -u hermes) gid=$(id -g hermes) profiles=${profiles} mount=${mounted} disk=${avail_kb}KB estop=${estop}"
 
 echo "[stage2] Setup complete; starting user services"
