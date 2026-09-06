@@ -58,7 +58,7 @@ done
 # replace those too or WeasyPrint stays unsandboxed.
 helpers_dir=/opt/hermes/docker/sera-toolbox/helpers
 if [ -d "$helpers_dir" ]; then
-  for helper in sera-weasyprint sera-pymupdf; do
+  for helper in sera-weasyprint sera-pymupdf sera-nproc-probe; do
     src="${helpers_dir}/${helper}"
     if [ ! -x "$src" ]; then
       echo "sera-toolbox: skip missing helper ${helper}" >&2

@@ -223,3 +223,85 @@ def test_offline_boot_with_data_mount_leaves_opt_hermes(
             capture_output=True,
             timeout=20,
         )
+
+
+def test_offline_gateway_with_data_mount_migrates(
+    built_image: str, container_name: str,
+) -> None:
+    """Plan 5c: --network none + /opt/data + gateway run migrates without fetches."""
+    host = Path(tempfile.mkdtemp(prefix="hermes-offline-gw-"))
+    try:
+        subprocess.run(
+            [
+                "docker", "run", "-d", "--name", container_name,
+                "--network", "none",
+                "-e", "HERMES_REQUIRE_DATA_MOUNT=1",
+                "-v", f"{host}:/opt/data",
+                built_image, "gateway", "run",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        wait_for_container_ready(container_name, deadline_s=120)
+
+        end = time.monotonic() + 90
+        state = ""
+        while time.monotonic() < end:
+            r = docker_exec_sh(
+                container_name,
+                "/command/s6-svstat /run/service/gateway-default",
+                timeout=10,
+            )
+            state = r.stdout + r.stderr
+            if r.returncode == 0 and "up" in r.stdout:
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError(
+                "offline mounted gateway-default never came up:\n" + state
+            )
+
+        logs = subprocess.run(
+            ["docker", "logs", container_name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        combined = logs.stdout + logs.stderr
+        for needle in FORBIDDEN_BOOT_LOG:
+            assert needle not in combined, (
+                f"offline mounted gateway log contained {needle!r}:\n"
+                f"{combined[-4000:]}"
+            )
+
+        seeded = docker_exec_sh(
+            container_name,
+            "test -f /opt/data/config.yaml && "
+            "test -d /opt/data/hotfixes && "
+            "test -s /run/s6/container_environment/AGENT_BROWSER_EXECUTABLE_PATH && "
+            "echo GW_OK",
+            timeout=10,
+        )
+        assert "GW_OK" in seeded.stdout, (
+            f"mounted offline gateway incomplete: "
+            f"{seeded.stdout} {seeded.stderr}"
+        )
+    finally:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            timeout=15,
+        )
+        subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{host}:/clean",
+                "--entrypoint", "sh", built_image,
+                "-c",
+                "chown -R 0:0 /clean 2>/dev/null; "
+                "rm -rf /clean/* /clean/.* 2>/dev/null; true",
+            ],
+            capture_output=True,
+            timeout=20,
+        )

@@ -142,7 +142,7 @@ esac
 
 # Workload profiles (plan 5e). Caller SERA_SANDBOX_TIMEOUT / _AS_BYTES win.
 case "$tool" in
-  file|exiftool|identify|pdfinfo|heif-info)
+  file|exiftool|identify|pdfinfo|heif-info|sera-nproc-probe)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-30}"
     as_bytes="${SERA_SANDBOX_AS_BYTES:-536870912}"
     ;;

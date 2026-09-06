@@ -446,10 +446,10 @@ RUN mkdir -p /opt/hermes/bin && \
 # every published image has it.
 ARG HERMES_GIT_SHA=
 # Fork builds override these so the baked provenance marker names the image
-# that was actually published (e.g. ghcr.io/djagya/hermes-agent) and the ref
-# it was built from (release branch or tag). Defaults keep upstream builds
-# byte-compatible with the previous hardcoded marker.
-ARG HERMES_IMAGE_NAME=nousresearch/hermes-agent
+# that was actually published and the ref it was built from. Default is
+# this fork's GHCR name so a local build without --build-arg still
+# identifies as image-managed on ghcr.io/djagya/hermes-agent, not Hub.
+ARG HERMES_IMAGE_NAME=ghcr.io/djagya/hermes-agent
 ARG HERMES_BUILD_REF=
 ARG SOURCE_DATE_EPOCH=
 # Baked into image config so `docker image inspect` (and the monolith
@@ -462,7 +462,7 @@ RUN set -eu; \
         printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
     fi; \
     mkdir -p /etc/hermes; \
-    HERMES_GIT_SHA="${HERMES_GIT_SHA}" HERMES_IMAGE_NAME="${HERMES_IMAGE_NAME}" HERMES_BUILD_REF="${HERMES_BUILD_REF}" SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); payload = {"schema": 1, "deployment_kind": "image", "manager": "docker", "image": os.environ.get("HERMES_IMAGE_NAME") or "nousresearch/hermes-agent", "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}; ref = os.environ.get("HERMES_BUILD_REF"); epoch = os.environ.get("SOURCE_DATE_EPOCH"); payload.update({"ref": ref} if ref else {}); payload.update({"source_date_epoch": epoch} if epoch else {}); marker.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+    HERMES_GIT_SHA="${HERMES_GIT_SHA}" HERMES_IMAGE_NAME="${HERMES_IMAGE_NAME}" HERMES_BUILD_REF="${HERMES_BUILD_REF}" SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); payload = {"schema": 1, "deployment_kind": "image", "manager": "docker", "image": os.environ.get("HERMES_IMAGE_NAME") or "ghcr.io/djagya/hermes-agent", "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}; ref = os.environ.get("HERMES_BUILD_REF"); epoch = os.environ.get("SOURCE_DATE_EPOCH"); payload.update({"ref": ref} if ref else {}); payload.update({"source_date_epoch": epoch} if epoch else {}); marker.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 COPY docker/sera-toolbox/managed-config.yaml /etc/hermes/config.yaml
 RUN chmod 0444 /etc/hermes/config.yaml
 
@@ -645,7 +645,7 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/command:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 ARG HERMES_GIT_SHA=
-ARG HERMES_IMAGE_NAME=nousresearch/hermes-agent
+ARG HERMES_IMAGE_NAME=ghcr.io/djagya/hermes-agent
 ARG HERMES_BUILD_REF=
 LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
       org.opencontainers.image.revision="${HERMES_GIT_SHA}"

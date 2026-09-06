@@ -207,10 +207,29 @@ else:
             --entrypoint hermes-image-doctor "$IMAGE" --check >/dev/null || true
           cache_bytes="$(du -sb "$scratch" | awk '{print $1}')"
           rm -rf "$scratch"
-          echo "largest_layer_bytes=$largest cold_ms=$cold_ms warm_ms=$warm_ms rss_kb=$rss_kb cache_bytes=$cache_bytes"
+          shut_home="$(mktemp -d)"
+          gw="$(docker run -d --network none \
+            -e HERMES_REQUIRE_DATA_MOUNT=1 \
+            -v "$shut_home:/opt/data" \
+            "$IMAGE" gateway run)"
+          for _ in $(seq 1 90); do
+            if docker exec "$gw" /command/s6-svstat /run/service/gateway-default 2>/dev/null | grep -q up; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec -d "$gw" sleep 15
+          shut_start="$(date +%s%N)"
+          docker stop -t 90 "$gw" >/dev/null
+          shut_end="$(date +%s%N)"
+          shutdown_ms=$(( (shut_end - shut_start) / 1000000 ))
+          docker rm -f "$gw" >/dev/null
+          rm -rf "$shut_home"
+          echo "largest_layer_bytes=$largest cold_ms=$cold_ms warm_ms=$warm_ms rss_kb=$rss_kb cache_bytes=$cache_bytes shutdown_ms=$shutdown_ms"
           IMAGE_BYTES="$bytes" LARGEST_LAYER_BYTES="$largest" \
             COLD_HELP_MS="$cold_ms" WARM_HELP_MS="$warm_ms" \
             IDLE_RSS_KB="$rss_kb" CACHE_WRITE_BYTES="$cache_bytes" \
+            SHUTDOWN_MS="$shutdown_ms" \
             python3 docker/sera-toolbox/check-image-budget.py
 
       - name: Named SPDX and CycloneDX SBOMs
@@ -317,6 +336,7 @@ else:
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/oversized-output.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/html-fetch.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/zip-members.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/fork-bomb.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh "$IMAGE"
 
       - name: Offline CLI without data mount

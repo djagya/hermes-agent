@@ -3,7 +3,7 @@
 
 Null max_* means record-only for that metric. IMAGE_BYTES is required.
 Optional env: LARGEST_LAYER_BYTES, COLD_HELP_MS, WARM_HELP_MS,
-IDLE_RSS_KB, CACHE_WRITE_BYTES.
+IDLE_RSS_KB, CACHE_WRITE_BYTES, SHUTDOWN_MS.
 """
 from __future__ import annotations
 
@@ -68,6 +68,7 @@ def main() -> int:
         ("max_warm_help_ms", _env_int("WARM_HELP_MS")),
         ("max_idle_rss_kb", _env_int("IDLE_RSS_KB")),
         ("max_offline_cache_write_bytes", _env_int("CACHE_WRITE_BYTES")),
+        ("max_shutdown_ms", _env_int("SHUTDOWN_MS")),
     )
     for key, value in extras:
         ok = _gate(budget, key, value) and ok
