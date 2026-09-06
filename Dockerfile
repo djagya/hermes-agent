@@ -349,13 +349,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY web/ web/
 COPY ui-tui/ ui-tui/
 COPY apps/shared/ apps/shared/
-RUN cd web && npm run build && \
+RUN --mount=type=cache,target=/root/.npm \
+    cd web && npm run build && \
     cd ../ui-tui && npm run build && \
     cd /opt/hermes && npm prune --omit=dev --include-workspace-root \
       --workspace=web \
       --workspace=hermes-tui \
       --workspace=@hermes/ink \
-      --workspace=@hermes/shared
+      --workspace=@hermes/shared && \
+    # prune drops @playwright/test (dev). Runtime still needs the CLI
+    # for `install-deps` (OS libs) and must not npx-download it.
+    npm install --omit=dev --no-audit --no-fund --no-save playwright@1.62.1
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
@@ -675,7 +679,9 @@ COPY --from=builder /usr/bin/tini /usr/bin/tini
 COPY --chmod=0755 docker/sera-toolbox/hermes-healthcheck.sh /usr/local/bin/hermes-healthcheck
 
 RUN ldconfig && \
-    cd /opt/hermes && /usr/local/bin/npx --no-install playwright install-deps chromium && \
+    cd /opt/hermes && \
+    test -x node_modules/.bin/playwright && \
+    ./node_modules/.bin/playwright install-deps chromium && \
     mkdir -p /opt/data && \
     test ! -x /usr/bin/gcc && \
     test ! -x /usr/bin/docker
