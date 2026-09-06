@@ -247,6 +247,10 @@ COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
 # apps/shared/ is copied IN FULL because web/package.json references it as a
 # `file:` workspace dependency (same pattern as hermes-ink above).
 COPY apps/shared/ apps/shared/
+# Manifests only — desktop/bootstrap/tests-js stay uninstalled.
+COPY apps/desktop/package.json apps/desktop/
+COPY apps/bootstrap-installer/package.json apps/bootstrap-installer/
+COPY tests-js/package.json tests-js/
 
 # `npm_config_install_links=false` forces npm to install `file:` deps as
 # symlinks instead of copies.  This is the default since npm 10+, which is
@@ -260,12 +264,16 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
-# Root `npm ci` is deferred: package-lock.json describes the full
-# monorepo (incl. apps/*) but this image only installs root/web/ui-tui.
-# A lock-strict ci fails on that partial workspace. Keep npm install
-# until a dedicated web/ui lock or workspace prune exists.
+# Lock-strict install of image workspaces only. Unused workspaces
+# (desktop / bootstrap-installer / tests-js) have package.json on disk
+# so the lock validates, but are not in the --workspace list — no Electron.
 RUN --mount=type=cache,target=/root/.npm \
-    npm install --prefer-offline --no-audit --fetch-retries=5 && \
+    npm ci --include-workspace-root \
+      --workspace=web \
+      --workspace=hermes-tui \
+      --workspace=@hermes/ink \
+      --workspace=@hermes/shared \
+      --no-audit --fetch-retries=5 && \
     for i in 1 2 3; do \
         npx playwright install --with-deps chromium --only-shell && break || \
         { [ "$i" = 3 ] && exit 1; echo "playwright install failed (attempt $i); retrying in 10s"; sleep 10; }; \
