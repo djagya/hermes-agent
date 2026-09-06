@@ -31,7 +31,8 @@ cwd="$(pwd -P)"
 out_dir="${SERA_SANDBOX_OUT:-$cwd}"
 mkdir -p "$out_dir"
 
-# Tool-specific hardened flags. Extra caller flags still apply.
+# Tool-specific hardened flags. Extra caller flags still apply
+# except ffmpeg/ffprobe protocol_whitelist — wrap forces file-only.
 extra=()
 case "$tool" in
   gs|ghostscript)
@@ -42,9 +43,28 @@ case "$tool" in
             "-env:UserInstallation=file:///tmp/lo-profile")
     ;;
   ffmpeg)
-    extra+=(-nostdin)
+    extra+=(-nostdin -protocol_whitelist file,pipe,crypto,data)
+    ;;
+  ffprobe)
+    extra+=(-protocol_whitelist file,pipe,crypto,data)
     ;;
 esac
+if [ "$tool" = ffmpeg ] || [ "$tool" = ffprobe ]; then
+  filtered=()
+  skip_next=0
+  for arg in "$@"; do
+    if [ "$skip_next" = 1 ]; then
+      skip_next=0
+      continue
+    fi
+    case "$arg" in
+      -protocol_whitelist=*) continue ;;
+      -protocol_whitelist) skip_next=1; continue ;;
+    esac
+    filtered+=("$arg")
+  done
+  set -- "${filtered[@]}"
+fi
 
 # Reject archive-traversal args and zip-slip members before the sandbox.
 case "$tool" in
