@@ -49,6 +49,9 @@ out = {
         "home": os.environ.get("HOME", ""),
         "hermes_home": os.environ.get("HERMES_HOME", ""),
         "xdg_config_home": os.environ.get("XDG_CONFIG_HOME", ""),
+        "xdg_cache_home": os.environ.get("XDG_CACHE_HOME", ""),
+        "uv_cache_dir": os.environ.get("UV_CACHE_DIR", ""),
+        "hf_home": os.environ.get("HF_HOME", ""),
         "write_safe_root": os.environ.get("HERMES_WRITE_SAFE_ROOT", ""),
     },
 }
@@ -67,6 +70,9 @@ echo "node    $node_ver"
 echo "sqlite  $sqlite_ver"
 echo "arch    $arch"
 echo "uid/gid ${uid}:${gid}"
+echo "cache   ${XDG_CACHE_HOME:-unset}"
+echo "uv      ${UV_CACHE_DIR:-unset}"
+echo "hf      ${HF_HOME:-unset}"
 echo
 echo "=== toolbox ==="
 for c in bwrap file sqlite3 jq pdftotext qpdf gs tesseract convert pandoc soffice \

@@ -5,9 +5,14 @@
 # Hub index digest for debian:13.4 (2026-05-08). Pin both stages so CI
 # cannot silently float onto a newer 13.4 rebuild.
 FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS sqlite_build
+# Hub index date for this debian:13.4 digest. Pin apt so CI cannot float
+# onto a later trixie rebuild of the same tag.
+ARG DEBIAN_SNAPSHOT=20260508T000000Z
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
-RUN apt-get -o Acquire::Retries=3 update && \
+COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
+RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         build-essential ca-certificates curl && \
     rm -rf /var/lib/apt/lists/* && \
@@ -75,6 +80,7 @@ FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07
 # published container and writable state belongs under /opt/data.
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONFAULTHANDLER=1
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -86,6 +92,14 @@ ENV UV_NO_PROGRESS=1
 # must not fetch a second browser tree into /opt/data.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# One persisted cache root per class. Child HOME stays /opt/data/home;
+# these env vars stop uv/HF from splitting into /opt/data/.cache vs
+# /opt/data/home/.cache. Do not auto-prune at boot.
+ENV XDG_CACHE_HOME=/opt/data/cache
+ENV UV_CACHE_DIR=/opt/data/cache/uv
+ENV HF_HOME=/opt/data/cache/huggingface
+ENV TRANSFORMERS_CACHE=/opt/data/cache/huggingface
+ENV HUGGINGFACE_HUB_CACHE=/opt/data/cache/huggingface
 
 # Install system dependencies in one layer, clear APT cache.
 # tini was previously PID 1 to reap orphaned zombie processes (MCP stdio
@@ -94,7 +108,10 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 # replaces tini with s6-overlay's /init (PID 1 = s6-svscan), which reaps
 # zombies non-blockingly on SIGCHLD and additionally supervises the main
 # hermes process, the dashboard, and per-profile gateways.
-RUN apt-get -o Acquire::Retries=3 update && \
+ARG DEBIAN_SNAPSHOT=20260508T000000Z
+COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
+RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
@@ -244,6 +261,10 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
+# Root `npm ci` is deferred: package-lock.json describes the full
+# monorepo (incl. apps/*) but this image only installs root/web/ui-tui.
+# A lock-strict ci fails on that partial workspace. Keep npm install
+# until a dedicated web/ui lock or workspace prune exists.
 RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
     for i in 1 2 3; do \
         npx playwright install --with-deps chromium --only-shell && break || \
@@ -571,6 +592,7 @@ FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONFAULTHANDLER=1
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -578,6 +600,11 @@ ENV NPM_CONFIG_UPDATE_NOTIFIER=false
 ENV UV_NO_PROGRESS=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV XDG_CACHE_HOME=/opt/data/cache
+ENV UV_CACHE_DIR=/opt/data/cache/uv
+ENV HF_HOME=/opt/data/cache/huggingface
+ENV TRANSFORMERS_CACHE=/opt/data/cache/huggingface
+ENV HUGGINGFACE_HUB_CACHE=/opt/data/cache/huggingface
 ENV npm_config_install_links=false
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
@@ -593,7 +620,10 @@ ARG HERMES_BUILD_REF=
 LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
       org.opencontainers.image.revision="${HERMES_GIT_SHA}"
 
-RUN apt-get -o Acquire::Retries=3 update && \
+ARG DEBIAN_SNAPSHOT=20260508T000000Z
+COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
+RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 \
     ripgrep ffmpeg libffi8 libolm3 libatomic1 procps git openssh-client xz-utils \

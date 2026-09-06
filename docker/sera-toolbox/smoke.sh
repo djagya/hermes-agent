@@ -77,4 +77,18 @@ case "$sqlite_ver" in
   *) echo "BAD sqlite $sqlite_ver (want 3.53.x)" >&2; fail=1 ;;
 esac
 
+if ! grep -q 'snapshot.debian.org/archive/debian/20260508T000000Z' \
+      /etc/apt/sources.list.d/debian.sources; then
+  echo "apt sources not pinned to Debian snapshot 20260508T000000Z" >&2
+  fail=1
+fi
+
+case "${XDG_CACHE_HOME:-}:${UV_CACHE_DIR:-}:${HF_HOME:-}" in
+  /opt/data/cache:/opt/data/cache/uv:/opt/data/cache/huggingface)
+    echo "OK cache roots" ;;
+  *)
+    echo "BAD cache roots XDG_CACHE_HOME=${XDG_CACHE_HOME:-} UV_CACHE_DIR=${UV_CACHE_DIR:-} HF_HOME=${HF_HOME:-}" >&2
+    fail=1 ;;
+esac
+
 exit "$fail"

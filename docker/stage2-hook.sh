@@ -419,6 +419,9 @@ as_hermes mkdir -p \
     "$HERMES_HOME/plans" \
     "$HERMES_HOME/workspace" \
     "$HERMES_HOME/home" \
+    "$HERMES_HOME/cache" \
+    "$HERMES_HOME/cache/uv" \
+    "$HERMES_HOME/cache/huggingface" \
     "$HERMES_HOME/pairing" \
     "$HERMES_HOME/platforms/pairing" \
     "$HERMES_HOME/lazy-packages"

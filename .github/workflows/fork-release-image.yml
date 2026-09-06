@@ -113,8 +113,21 @@ jobs:
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
             HERMES_BUILD_REF=${{ github.ref_name }}
+            DEBIAN_SNAPSHOT=20260508T000000Z
           cache-from: type=gha,scope=fork-amd64
           cache-to: type=gha,mode=max,scope=fork-amd64
+
+      - name: Record image size budget
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:test
+        run: |
+          set -euo pipefail
+          bytes="$(docker image inspect --format '{{.Size}}' "$IMAGE")"
+          echo "image_bytes=$bytes"
+          echo "image_mib=$((bytes / 1024 / 1024))"
+          docker history --format '{{.Size}}\t{{.CreatedBy}}' "$IMAGE" | head -40
+          # First accepted B digest sets the fail-on-regression budget.
+          # Record only until that digest exists.
 
       - name: Assert image SHA labels and provenance
         env:
@@ -287,6 +300,7 @@ jobs:
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
             HERMES_BUILD_REF=${{ github.ref_name }}
+            DEBIAN_SNAPSHOT=20260508T000000Z
           # BuildKit SLSA provenance + SBOM attached to the image manifest.
           provenance: mode=max
           sbom: true

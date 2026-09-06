@@ -39,6 +39,17 @@ if [ -d "$home" ]; then
   avail_kb="$(df -Pk "$home" 2>/dev/null | awk 'NR==2 {print $4}')"
   inodes="$(df -Pi "$home" 2>/dev/null | awk 'NR==2 {print $4}')"
   note "disk ${avail_kb:-?}KB free, ${inodes:-?} inodes free on $home"
+  for cache_dir in \
+      "${XDG_CACHE_HOME:-$home/cache}" \
+      "${UV_CACHE_DIR:-$home/cache/uv}" \
+      "${HF_HOME:-$home/cache/huggingface}"; do
+    if [ -d "$cache_dir" ]; then
+      cache_kb="$(du -sk "$cache_dir" 2>/dev/null | awk '{print $1}')"
+      note "cache ${cache_dir} ${cache_kb:-?}KB (no boot prune)"
+    else
+      note "cache ${cache_dir} absent (stage2 seeds it)"
+    fi
+  done
 else
   bad "$home missing"
 fi
