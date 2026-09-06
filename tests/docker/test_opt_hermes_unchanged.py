@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import time
+from pathlib import Path
 
 from tests.docker.conftest import docker_exec_sh, wait_for_container_ready
 
@@ -137,3 +139,87 @@ def test_offline_gateway_run_starts_without_downloads(
         f"browser path missing after offline gateway boot: "
         f"{browser.stdout} {browser.stderr}"
     )
+
+
+def test_offline_boot_with_data_mount_leaves_opt_hermes(
+    built_image: str, container_name: str,
+) -> None:
+    """Plan 5c: --network none + explicit /opt/data mount, no /opt/hermes drift.
+
+    Complements the no-volume case: stage2 must seed a fresh home and
+    migrate without apt/pip/uv/npm/Playwright downloads.
+    """
+    host = Path(tempfile.mkdtemp(prefix="hermes-rehearsal-"))
+    try:
+        subprocess.run(
+            [
+                "docker", "run", "-d", "--name", container_name,
+                "--network", "none",
+                "-e", "HERMES_REQUIRE_DATA_MOUNT=1",
+                "-v", f"{host}:/opt/data",
+                built_image, "sleep", "infinity",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        wait_for_container_ready(container_name, deadline_s=120)
+
+        diff = subprocess.run(
+            ["docker", "diff", container_name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        hermes_hits = [
+            line for line in diff.stdout.splitlines()
+            if "/opt/hermes" in line
+        ]
+        assert hermes_hits == [], (
+            "/opt/hermes changed during offline mounted boot:\n"
+            + "\n".join(hermes_hits)
+        )
+
+        logs = subprocess.run(
+            ["docker", "logs", container_name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        combined = logs.stdout + logs.stderr
+        for needle in FORBIDDEN_BOOT_LOG:
+            assert needle not in combined, (
+                f"offline mounted boot log contained {needle!r}:\n"
+                f"{combined[-4000:]}"
+            )
+
+        seeded = docker_exec_sh(
+            container_name,
+            "test -f /opt/data/config.yaml && "
+            "test -d /opt/data/hotfixes && "
+            "test -d /opt/data/state && "
+            "echo HOME_OK",
+            timeout=10,
+        )
+        assert "HOME_OK" in seeded.stdout, (
+            f"fresh home not seeded: {seeded.stdout} {seeded.stderr}"
+        )
+    finally:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            timeout=15,
+        )
+        subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{host}:/clean",
+                "--entrypoint", "sh", built_image,
+                "-c",
+                "chown -R 0:0 /clean 2>/dev/null; "
+                "rm -rf /clean/* /clean/.* 2>/dev/null; true",
+            ],
+            capture_output=True,
+            timeout=20,
+        )
