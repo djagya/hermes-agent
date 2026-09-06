@@ -75,6 +75,26 @@ RUN apt-get -o Acquire::Retries=3 update && \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
+# Release B toolbox (Sera document/media + unix + lint). Separate layer so
+# the compiler line above stays cached. No sudo. tesseract-ocr-eng only —
+# no full language packs. LibreOffice is Writer+Calc only.
+# Parsers are relocated to libexec after COPY . . (see install-wrappers.sh).
+RUN apt-get -o Acquire::Retries=3 update && \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+    bubblewrap \
+    file jq sqlite3 zip unzip p7zip-full zstd \
+    poppler-utils qpdf ghostscript \
+    tesseract-ocr tesseract-ocr-eng ocrmypdf \
+    imagemagick \
+    pandoc \
+    libreoffice-writer libreoffice-calc \
+    libimage-exiftool-perl libheif1 libheif-examples \
+    fonts-noto-core fonts-liberation \
+    iproute2 bind9-dnsutils lsof psmisc \
+    shellcheck \
+    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info && \
+    rm -rf /var/lib/apt/lists/*
+
 # Prefer the fixed SQLite over Debian's vulnerable libsqlite3.so.0. Keep the
 # public library name stable so both the system interpreter and the uv-created
 # venv resolve the replacement without changing Python import paths.
@@ -293,6 +313,19 @@ COPY --link --chmod=a+rX,go-w . .
 # resolution or downloads.
 RUN uv pip install --no-cache-dir --no-deps -e "."
 
+# Release B Python toolbox. Pinned; not in uv.lock. Models for
+# faster-whisper stay under /opt/data (lazy), not the image.
+RUN uv pip install --no-cache-dir \
+    "PyMuPDF==1.25.5" \
+    "pymupdf4llm==0.0.17" \
+    "weasyprint==65.1" \
+    "ddgs==9.5.5" \
+    "yt-dlp==2025.10.14" \
+    "faster-whisper==1.1.1" \
+    "ruff==0.12.12"
+
+RUN npm install -g --omit=dev markdownlint-cli2@0.18.1 && npm cache clean --force
+
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and
 # read-only for the hermes user (go-w from the --chmod above).
@@ -426,6 +459,11 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 # the opt-out env var (HERMES_DOCKER_EXEC_AS_ROOT=1).
 COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
 COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
+COPY --chmod=0755 docker/sera-toolbox/wrap /opt/hermes/docker/sera-toolbox/wrap
+COPY --chmod=0755 docker/sera-toolbox/install-wrappers.sh /opt/hermes/docker/sera-toolbox/install-wrappers.sh
+COPY --chmod=0755 docker/sera-toolbox/smoke.sh /opt/hermes/docker/sera-toolbox/smoke.sh
+COPY docker/sera-toolbox/ImageMagick/ /etc/sera-toolbox/ImageMagick/
+RUN /opt/hermes/docker/sera-toolbox/install-wrappers.sh
 
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported
 # the venv bin onto PATH; Architecture B's main-wrapper.sh does the

@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# PATH wrapper: run a libexec parser inside bubblewrap.
+# Real binary: /usr/libexec/sera-toolbox/<basename>
+# No unsandboxed fallback. Network tools are not installed as wrappers.
+set -euo pipefail
+
+tool="$(basename "$0")"
+real="/usr/libexec/sera-toolbox/${tool}"
+if [ ! -x "$real" ]; then
+  echo "sera-toolbox: missing ${real}" >&2
+  exit 127
+fi
+
+if ! command -v bwrap >/dev/null 2>&1; then
+  echo "sera-toolbox: bubblewrap not installed" >&2
+  exit 127
+fi
+
+cwd="$(pwd -P)"
+out_dir="${SERA_SANDBOX_OUT:-$cwd}"
+mkdir -p "$out_dir"
+
+# Tool-specific hardened flags. Extra caller flags still apply.
+extra=()
+case "$tool" in
+  gs|ghostscript)
+    extra+=(-dSAFER -dNOPAUSE)
+    ;;
+  soffice|libreoffice)
+    extra+=(--headless --norestore --nolockcheck --nofirststartwizard
+            "-env:UserInstallation=file:///tmp/lo-profile")
+    ;;
+  ffmpeg|ffprobe)
+    extra+=(-nostdin)
+    ;;
+esac
+
+# Reject archive-traversal args before entering the sandbox.
+case "$tool" in
+  unzip|7z|7za|bsdtar)
+    for arg in "$@"; do
+      case "$arg" in
+        /*|*".."*)
+          echo "sera-toolbox: refusing absolute or parent-traversal path: ${arg}" >&2
+          exit 2
+          ;;
+      esac
+    done
+    ;;
+esac
+
+start_ns="$(date +%s%N)"
+tmp_receipt="$(mktemp /tmp/sera-bwrap.XXXXXX.json)"
+# shellcheck disable=SC2016
+status=0
+# env -i: no secrets, no Docker/SSH/MCP, no HERMES_HOME.
+# cwd + out_dir only. tmpfs HOME/tmp. no network.
+env -i \
+  PATH=/usr/libexec/sera-toolbox:/usr/bin:/bin \
+  HOME=/tmp/home \
+  TMPDIR=/tmp \
+  LANG="${LANG:-C.UTF-8}" \
+  LC_ALL="${LC_ALL:-C.UTF-8}" \
+  MAGICK_CONFIGURE_PATH=/etc/sera-toolbox/ImageMagick \
+  bwrap \
+    --unshare-net \
+    --unshare-pid \
+    --unshare-uts \
+    --unshare-ipc \
+    --die-with-parent \
+    --new-session \
+    --tmpfs /tmp \
+    --dir /tmp/home \
+    --ro-bind /usr /usr \
+    --ro-bind /lib /lib \
+    --ro-bind-try /lib64 /lib64 \
+    --ro-bind /bin /bin \
+    --ro-bind-try /sbin /sbin \
+    --ro-bind /etc/sera-toolbox /etc/sera-toolbox \
+    --ro-bind-try /etc/fonts /etc/fonts \
+    --ro-bind-try /usr/share/fonts /usr/share/fonts \
+    --ro-bind-try /etc/ImageMagick-7 /etc/ImageMagick-7 \
+    --ro-bind-try /etc/ImageMagick-6 /etc/ImageMagick-6 \
+    --bind "$cwd" "$cwd" \
+    --bind "$out_dir" "$out_dir" \
+    --chdir "$cwd" \
+    -- "$real" "${extra[@]}" "$@" \
+  || status=$?
+
+end_ns="$(date +%s%N)"
+elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+python3 - "$tool" "$status" "$elapsed_ms" "$tmp_receipt" "$@" <<'PY'
+import hashlib, json, sys, time
+from pathlib import Path
+tool, status, elapsed_ms, dest = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+args = sys.argv[5:]
+paths = []
+for a in args:
+    p = Path(a)
+    if p.is_file():
+        h = hashlib.sha256(p.read_bytes()).hexdigest()
+        paths.append({"path": str(p), "sha256": h, "bytes": p.stat().st_size})
+receipt = {
+    "tool": tool,
+    "exit": status,
+    "elapsed_ms": elapsed_ms,
+    "ts": int(time.time()),
+    "files": paths,
+}
+Path(dest).write_text(json.dumps(receipt, separators=(",", ":")) + "\n", encoding="utf-8")
+print(json.dumps({"sera_sandbox_receipt": dest, **receipt}, separators=(",", ":")))
+PY
+
+exit "$status"
