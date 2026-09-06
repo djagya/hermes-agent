@@ -106,8 +106,17 @@ env -i \
     --die-with-parent \
     --new-session \
     "${bwrap_extra[@]}" \
+    --proc /proc \
+    --dev /dev \
     --tmpfs /tmp \
+    --tmpfs /run \
     --dir /tmp/home \
+    --ro-bind-try /etc/passwd /etc/passwd \
+    --ro-bind-try /etc/group /etc/group \
+    --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf \
+    --ro-bind-try /etc/hosts /etc/hosts \
+    --ro-bind-try /etc/localtime /etc/localtime \
+    --ro-bind-try /etc/machine-id /etc/machine-id \
     --ro-bind /usr /usr \
     --ro-bind /lib /lib \
     --ro-bind-try /lib64 /lib64 \

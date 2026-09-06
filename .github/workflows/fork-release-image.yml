@@ -197,22 +197,28 @@ jobs:
           IMAGE: ${{ env.IMAGE_NAME }}:test
         run: |
           set -euo pipefail
-          docker run --rm --network none \
-            --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
-            --entrypoint /opt/hermes/docker/sera-toolbox/smoke.sh \
-            "$IMAGE"
-          docker run --rm --network none \
-            --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
-            --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/zip-slip.sh \
-            "$IMAGE"
-          docker run --rm --network none \
-            --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
-            --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/no-network.sh \
-            "$IMAGE"
-          docker run --rm --network none \
-            --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
-            --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh \
-            "$IMAGE"
+          # Ubuntu 24.04 (GHA + the box) sets
+          # kernel.apparmor_restrict_unprivileged_userns=1. Unconfined
+          # processes then cannot create user namespaces, so bwrap dies
+          # with "Creating new namespace failed: Operation not permitted"
+          # even when seccomp allows unshare. Not privileged. Not
+          # seccomp=unconfined. docker-default AppArmor also denies mount.
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if sysctl kernel.unprivileged_userns_clone >/dev/null 2>&1; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          run_bwrap() {
+            docker run --rm --network none \
+              --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
+              --security-opt apparmor=unconfined \
+              "$@"
+          }
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/smoke.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/zip-slip.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/no-network.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh "$IMAGE"
 
       - name: Offline CLI without data mount
         env:

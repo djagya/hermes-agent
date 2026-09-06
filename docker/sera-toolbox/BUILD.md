@@ -18,9 +18,13 @@ docker buildx build \
   -f Dockerfile \
   .
 
-# Toolbox + golden + adversarial (needs the monolith seccomp profile).
+# Toolbox + golden + adversarial. Ubuntu 24.04 needs userns +
+# apparmor=unconfined (docker-default denies mount). Never privileged
+# or seccomp=unconfined.
+#   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 docker run --rm --network none \
   --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \
+  --security-opt apparmor=unconfined \
   --entrypoint /opt/hermes/docker/sera-toolbox/smoke.sh \
   ghcr.io/djagya/hermes-agent:local
 ```
