@@ -66,7 +66,8 @@ ARG HIMALAYA_REV=b1f6dece32c3afc97d44adeb148bf87e89fde140
 ARG HIMALAYA_SHA256=6c99cabff4c9367d53d52537e2cec311c9dbbaff30edde6ff045437e9d60496b
 RUN curl -fsSL --retry 3 -o /tmp/himalaya.tar.gz \
         "https://github.com/pimalaya/himalaya/archive/${HIMALAYA_REV}.tar.gz" && \
-    printf '%s  %s\n' "${HIMALAYA_SHA256}" /tmp/himalaya.tar.gz | sha256sum -c - && \
+    printf '%s  %s\n' "${HIMALAYA_SHA256}" /tmp/himalaya.tar.gz > /tmp/himalaya.sha256 && \
+    sha256sum -c /tmp/himalaya.sha256 && \
     tar -C /tmp -xzf /tmp/himalaya.tar.gz && \
     rustc --version && \
     cd "/tmp/himalaya-${HIMALAYA_REV}" && \
