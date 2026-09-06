@@ -1,2 +1,23 @@
-# Documented, expiring exceptions only. Empty means fail-closed on
-# fixable CRITICAL/HIGH. Add a CVE per line with a comment + expiry.
+# Documented, expiring exceptions. Fail-closed otherwise.
+# Refresh or drop on the next pin-refresh after 2026-10-06.
+
+# Hermes npm lock (MCP SDK, tar, undici, js-yaml, brace-expansion).
+# Not a toolbox pin; rebase/lock bump is a separate carryover.
+CVE-2025-66414 exp:2026-10-06
+CVE-2026-0621 exp:2026-10-06
+CVE-2026-25536 exp:2026-10-06
+CVE-2026-13149 exp:2026-10-06
+CVE-2026-14257 exp:2026-10-06
+CVE-2026-69152 exp:2026-10-06
+CVE-2026-69192 exp:2026-10-06
+CVE-2026-59869 exp:2026-10-06
+CVE-2026-59873 exp:2026-10-06
+CVE-2026-59874 exp:2026-10-06
+CVE-2026-73566 exp:2026-10-06
+CVE-2026-12151 exp:2026-10-06
+GHSA-5p4m-2wfm-xmqj exp:2026-10-06
+
+# uv 0.11.6 image binary (quinn-proto / rustls-webpki). Bump uv image
+# on pin-refresh; digest not moved in this smoke-hardening pass.
+GHSA-4w2j-m93h-cj5j exp:2026-10-06
+GHSA-82j2-j2ch-gfr8 exp:2026-10-06

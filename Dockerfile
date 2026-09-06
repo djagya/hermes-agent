@@ -8,7 +8,7 @@
 FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS sqlite_build
 # Hub index date for this debian:13.4 digest. Pin apt so CI cannot float
 # onto a later trixie rebuild of the same tag.
-ARG DEBIAN_SNAPSHOT=20260508T000000Z
+ARG DEBIAN_SNAPSHOT=20260905T000000Z
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
@@ -16,6 +16,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         build-essential ca-certificates curl && \
     (curl -fsSL --retry 1 --retry-all-errors --connect-timeout 15 --max-time 60 \
@@ -105,12 +106,13 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 # replaces tini with s6-overlay's /init (PID 1 = s6-svscan), which reaps
 # zombies non-blockingly on SIGCHLD and additionally supervises the main
 # hermes process, the dashboard, and per-profile gateways.
-ARG DEBIAN_SNAPSHOT=20260508T000000Z
+ARG DEBIAN_SNAPSHOT=20260905T000000Z
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils
 
@@ -121,6 +123,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     bubblewrap \
     file jq zip unzip p7zip-full zstd \
@@ -386,7 +389,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     "pymupdf4llm==0.0.17" \
     "weasyprint==69.0" \
     "ddgs==9.5.5" \
-    "yt-dlp==2025.10.14" \
+    "yt-dlp==2026.08.19" \
+    "tornado==6.5.8" \
     "faster-whisper==1.2.1" \
     "fal-client==0.13.1" \
     "pillow-heif==1.5.0" \
@@ -642,12 +646,13 @@ ARG HERMES_BUILD_REF=
 LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
       org.opencontainers.image.revision="${HERMES_GIT_SHA}"
 
-ARG DEBIAN_SNAPSHOT=20260508T000000Z
+ARG DEBIAN_SNAPSHOT=20260905T000000Z
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 \
     ripgrep ffmpeg libffi8 libolm3 libatomic1 procps git openssh-client xz-utils \
