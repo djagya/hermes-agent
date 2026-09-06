@@ -28,6 +28,10 @@ concurrency:
 
 env:
   IMAGE_NAME: ghcr.io/djagya/hermes-agent
+  # Must match every Dockerfile `ARG DEBIAN_SNAPSHOT=` default. Build-args
+  # override the Dockerfile; leaving May here after a Sept bump rebuilt
+  # stale apt and failed smoke/Trivy.
+  DEBIAN_SNAPSHOT: 20260905T000000Z
 
 jobs:
   lint:
@@ -117,6 +121,15 @@ jobs:
         if: steps.buildx.outcome == 'failure'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
+      - name: Assert Debian snapshot matches Dockerfile
+        run: |
+          set -euo pipefail
+          defaults="$(awk -F= '/^ARG DEBIAN_SNAPSHOT=/{print $2}' Dockerfile | sort -u)"
+          if [ "$defaults" != "${DEBIAN_SNAPSHOT}" ]; then
+            echo "ERROR: Dockerfile ARG DEBIAN_SNAPSHOT ($defaults) != workflow ${DEBIAN_SNAPSHOT}" >&2
+            exit 1
+          fi
+
       - name: Build image (amd64)
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
@@ -134,7 +147,7 @@ jobs:
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
             HERMES_BUILD_REF=${{ github.ref_name }}
-            DEBIAN_SNAPSHOT=20260508T000000Z
+            DEBIAN_SNAPSHOT=${{ env.DEBIAN_SNAPSHOT }}
           cache-from: type=gha,scope=fork-amd64
           cache-to: type=gha,mode=max,scope=fork-amd64
 
@@ -349,7 +362,7 @@ jobs:
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
             HERMES_BUILD_REF=${{ github.ref_name }}
-            DEBIAN_SNAPSHOT=20260508T000000Z
+            DEBIAN_SNAPSHOT=${{ env.DEBIAN_SNAPSHOT }}
           # BuildKit SLSA provenance + SBOM attached to the image manifest.
           provenance: mode=max
           sbom: true

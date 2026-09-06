@@ -11,6 +11,7 @@ permissions:
 env:
   IMAGE_NAME: ghcr.io/djagya/hermes-agent
   SOURCE_DATE_EPOCH: "1778198400"
+  DEBIAN_SNAPSHOT: 20260905T000000Z
 
 jobs:
   compare:
@@ -40,7 +41,7 @@ jobs:
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
             HERMES_BUILD_REF=${{ github.ref_name }}
-            DEBIAN_SNAPSHOT=20260508T000000Z
+            DEBIAN_SNAPSHOT=${{ env.DEBIAN_SNAPSHOT }}
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
 
       - name: Build B
@@ -57,7 +58,7 @@ jobs:
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
             HERMES_BUILD_REF=${{ github.ref_name }}
-            DEBIAN_SNAPSHOT=20260508T000000Z
+            DEBIAN_SNAPSHOT=${{ env.DEBIAN_SNAPSHOT }}
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
 
       - name: Compare image IDs
