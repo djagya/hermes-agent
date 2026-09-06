@@ -112,6 +112,8 @@ case "$tool" in
 esac
 start_ns="$(date +%s%N)"
 tmp_receipt="$(mktemp /tmp/sera-bwrap.XXXXXX.json)"
+tmp_before="$(mktemp /tmp/sera-bwrap.XXXXXX.before)"
+find "$out_dir" -xdev -type f -print0 2>/dev/null | sort -z > "$tmp_before" || true
 # Debian snapshot bwrap rejected both --nproc and --rlimit-nproc.
 # Detect optional flags; timeout already caps wall clock.
 bwrap_extra=()
@@ -197,6 +199,47 @@ env -i \
 
 end_ns="$(date +%s%N)"
 elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+# Plan 5d: cap new files in the output bind. Pre-existing files stay.
+max_out_bytes="${SERA_SANDBOX_OUT_MAX_BYTES:-268435456}"
+max_out_files="${SERA_SANDBOX_OUT_MAX_FILES:-256}"
+if ! python3 - "$tmp_before" "$out_dir" "$max_out_bytes" "$max_out_files" <<'PY'
+import os, sys
+from pathlib import Path
+before_path, out_dir, max_bytes_s, max_files_s = sys.argv[1:5]
+max_bytes = int(max_bytes_s)
+max_files = int(max_files_s)
+before = set()
+raw = Path(before_path).read_bytes()
+if raw:
+    before.update(p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p)
+new = []
+for dirpath, dirnames, filenames in os.walk(out_dir):
+    dirnames[:] = [d for d in dirnames if d not in (".", "..")]
+    for name in filenames:
+        p = os.path.join(dirpath, name)
+        if p not in before:
+            new.append(p)
+total = 0
+for p in new:
+    try:
+        total += os.path.getsize(p)
+    except OSError:
+        continue
+if len(new) > max_files or total > max_bytes:
+    for p in new:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    sys.exit(3)
+PY
+then
+  echo "sera-toolbox: refusing oversized output (${max_out_bytes} bytes / ${max_out_files} files)" >&2
+  rm -f "$tmp_before"
+  exit 3
+fi
+rm -f "$tmp_before"
 
 python3 - "$tool" "$status" "$elapsed_ms" "$tmp_receipt" "$@" <<'PY'
 import hashlib, json, os, sys, time

@@ -242,6 +242,7 @@ jobs:
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/pdf-external.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/office-external.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/secret-env.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/oversized-output.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh "$IMAGE"
 
       - name: Offline CLI without data mount
