@@ -11,10 +11,27 @@ import shutil
 import subprocess
 from pathlib import Path
 
+SOURCE = {
+    "gh": ("https://github.com/cli/cli", "MIT"),
+    "gitleaks": ("https://github.com/gitleaks/gitleaks", "MIT"),
+    "tirith": ("https://github.com/sheeki03/tirith", "MIT"),
+    "rclone": ("https://github.com/rclone/rclone", "MIT"),
+    "op": ("https://developer.1password.com/docs/cli", "proprietary"),
+    "bwrap": ("https://github.com/containers/bubblewrap", "LGPL-2.0-or-later"),
+    "sqlite3": ("https://sqlite.org", "blessing"),
+    "ffmpeg": ("https://ffmpeg.org", "GPL-2.0-or-later"),
+    "soffice": ("https://www.libreoffice.org", "MPL-2.0"),
+    "weasyprint": ("https://github.com/Kozea/WeasyPrint", "BSD-3-Clause"),
+    "sera-pymupdf": ("https://github.com/pymupdf/PyMuPDF", "AGPL-3.0-or-later"),
+    "hermes": ("https://github.com/djagya/hermes-agent", "MIT"),
+}
+
+
 def ver(cmd):
     exe = shutil.which(cmd)
+    src, lic = SOURCE.get(cmd, (None, None))
     if not exe:
-        return {"name": cmd, "path": None, "version": None}
+        return {"name": cmd, "path": None, "version": None, "source": src, "license": lic}
     try:
         p = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=20)
         text = (p.stdout or p.stderr or "").strip().splitlines()
@@ -22,7 +39,14 @@ def ver(cmd):
     except Exception as exc:  # noqa: BLE001
         version = f"error:{exc}"
     digest = sha256(exe)
-    return {"name": cmd, "path": exe, "version": version, "sha256": digest}
+    return {
+        "name": cmd,
+        "path": exe,
+        "version": version,
+        "sha256": digest,
+        "source": src,
+        "license": lic,
+    }
 
 def sha256(path):
     p = Path(path)

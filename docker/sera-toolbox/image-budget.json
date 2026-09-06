@@ -5,6 +5,11 @@
   "accepted_git_sha": "4341e0fd2db1132f6bdc474f016fcfc24c612999",
   "measured_image_bytes": 4494236259,
   "max_image_bytes": 4943659885,
+  "max_largest_layer_bytes": 2500000000,
+  "max_cold_help_ms": 60000,
+  "max_warm_help_ms": 30000,
+  "max_idle_rss_kb": 1048576,
+  "max_offline_cache_write_bytes": 67108864,
   "max_fixable_critical": 0,
   "max_fixable_high": 0
 }

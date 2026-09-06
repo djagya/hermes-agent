@@ -166,7 +166,70 @@ jobs:
           echo "image_bytes=$bytes"
           echo "image_mib=$((bytes / 1024 / 1024))"
           docker history --format '{{.Size}}\t{{.CreatedBy}}' "$IMAGE" | head -40
-          IMAGE_BYTES="$bytes" python3 docker/sera-toolbox/check-image-budget.py
+          largest="$(docker history --format '{{.Size}}' "$IMAGE" | python3 -c '
+import sys
+def parse(s):
+    s = s.strip()
+    if not s or s in ("0B", "0"):
+        return 0
+    units = (("TB", 10**12), ("GB", 10**9), ("MB", 10**6), ("kB", 1000), ("KB", 1000), ("B", 1))
+    for unit, mul in units:
+        if s.endswith(unit):
+            return int(float(s[: -len(unit)]) * mul)
+    return 0
+print(max(parse(line) for line in sys.stdin))
+')"
+          time_ms() {
+            local start end
+            start="$(date +%s%N)"
+            "$@" >/dev/null
+            end="$(date +%s%N)"
+            echo $(( (end - start) / 1000000 ))
+          }
+          cold_ms="$(time_ms docker run --rm --network none --entrypoint /opt/hermes/.venv/bin/hermes "$IMAGE" --help)"
+          warm_ms="$(time_ms docker run --rm --network none --entrypoint /opt/hermes/.venv/bin/hermes "$IMAGE" --help)"
+          cid="$(docker run -d --network none --entrypoint sleep "$IMAGE" 20)"
+          sleep 2
+          rss_raw="$(docker stats --no-stream --format '{{.MemUsage}}' "$cid" | awk '{print $1}')"
+          docker rm -f "$cid" >/dev/null
+          rss_kb="$(RSS_RAW="$rss_raw" python3 -c '
+import os
+s=os.environ["RSS_RAW"].strip()
+units=(("GiB",1024*1024),("MiB",1024),("KiB",1),("GB",1000000),("MB",1000),("kB",1),("B",1/1024))
+for u,m in units:
+    if s.endswith(u):
+        print(int(float(s[:-len(u)])*m)); break
+else:
+    raise SystemExit("unparsed rss "+s)
+')"
+          scratch="$(mktemp -d)"
+          docker run --rm --network none -v "$scratch:/opt/data" \
+            --entrypoint hermes-image-doctor "$IMAGE" --check >/dev/null || true
+          cache_bytes="$(du -sb "$scratch" | awk '{print $1}')"
+          rm -rf "$scratch"
+          echo "largest_layer_bytes=$largest cold_ms=$cold_ms warm_ms=$warm_ms rss_kb=$rss_kb cache_bytes=$cache_bytes"
+          IMAGE_BYTES="$bytes" LARGEST_LAYER_BYTES="$largest" \
+            COLD_HELP_MS="$cold_ms" WARM_HELP_MS="$warm_ms" \
+            IDLE_RSS_KB="$rss_kb" CACHE_WRITE_BYTES="$cache_bytes" \
+            python3 docker/sera-toolbox/check-image-budget.py
+
+      - name: Named SPDX SBOM
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:test
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/syft.tgz \
+            https://github.com/anchore/syft/releases/download/v1.27.1/syft_1.27.1_linux_amd64.tar.gz
+          echo 'c2cb5867a238baf41adf15f7e01e28cbd886378859eed81e52c080ca0346eefe  /tmp/syft.tgz' | sha256sum -c -
+          tar -C /tmp -xzf /tmp/syft.tgz syft
+          /tmp/syft "$IMAGE" -o spdx-json=hermes-agent.spdx.json
+          python3 docker/sera-toolbox/verify-spdx.py hermes-agent.spdx.json
+
+      - name: Upload SPDX SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hermes-agent-spdx
+          path: hermes-agent.spdx.json
 
       - name: Assert image SHA labels and provenance
         env:

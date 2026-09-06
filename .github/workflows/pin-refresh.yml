@@ -19,7 +19,7 @@ jobs:
         with:
           persist-credentials: true
 
-      - name: Open review-only draft PR with current pins
+      - name: Open review-only draft PR with current vs latest pins
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -27,34 +27,16 @@ jobs:
           stamp="$(date -u +%F)"
           branch="pin-refresh/${stamp}"
           report="docker/sera-toolbox/pin-refresh-report.md"
-          {
-            echo "# Pin refresh ${stamp}"
-            echo
-            echo "Review-only. No unattended merge, publish, or deploy."
-            echo "Fill old vs new versions, release links, SBOM/CVE"
-            echo "delta, and image-size delta before bumping."
-            echo
-            echo "## Accepted budget"
-            echo
-            echo '```json'
-            cat docker/sera-toolbox/image-budget.json
-            echo '```'
-            echo
-            echo "## Dockerfile pins"
-            echo
-            echo '```'
-            grep -E '^(FROM |ARG )' Dockerfile | head -80
-            echo '```'
-          } > "$report"
+          python3 docker/sera-toolbox/pin-refresh.py --apply --report "$report"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$branch"
-          git add "$report"
+          git add "$report" Dockerfile docker/sera-toolbox/install-network-bins.sh
           if git diff --cached --quiet; then
-            echo "report unchanged"
+            echo "pins unchanged"
             exit 0
           fi
-          git commit -m "chore(image): pin-refresh report ${stamp}"
+          git commit -m "chore(image): pin-refresh ${stamp}"
           git push -u origin "$branch"
           gh pr create --draft --title "pin-refresh ${stamp}" \
             --body-file "$report" \
