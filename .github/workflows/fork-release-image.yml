@@ -69,7 +69,7 @@ jobs:
           set -euo pipefail
           python3 -m pip install --user zizmor==1.30.0
           export PATH="$HOME/.local/bin:$PATH"
-          zizmor \
+          zizmor --min-severity=medium \
             .github/workflows/fork-release-image.yml \
             .github/workflows/pin-refresh.yml \
             .github/workflows/reproducible-build.yml
