@@ -7,15 +7,16 @@ trap 'rm -rf "$tmp"' EXIT
 cd "$tmp"
 export SERA_SANDBOX_OUT="$tmp"
 
+fix="${SERA_GOLDEN_FIXTURES:-/opt/hermes/docker/sera-toolbox/fixtures}"
+cp "$fix/hello.md" "$fix/golden-docx.md" "$fix/golden.csv" "$fix/bad.db" \
+   "$fix/golden.pdf" "$fix/golden.wav" "$fix/golden.zip" \
+   "$fix/golden.docx" "$fix/golden.xlsx" "$fix/scan.png" "$fix/scan-in.pdf" .
+
+# Renderer proof: WeasyPrint must still produce a Unicode PDF. Stored
+# golden.pdf is the workflow fixture; this one is generated on purpose.
 python3 - <<'PY'
-from pathlib import Path
-Path("hello.md").write_text("# hi\n\nfixture\n", encoding="utf-8")
 from weasyprint import HTML
-HTML(string="<html><body><p>golden</p></body></html>").write_pdf("golden.pdf")
 HTML(string="<html><body><p>Здравствуй golden 😀</p></body></html>").write_pdf("unicode.pdf")
-import zipfile
-with zipfile.ZipFile("golden.zip", "w") as z:
-    z.writestr("hello.txt", "ok\n")
 PY
 
 pdftotext golden.pdf golden.txt
@@ -41,53 +42,32 @@ print("OK golden pdf/zip/zstd/7z/pymupdf")
 PY
 
 python3 - <<'PY'
-import wave
-
 from PIL import Image
 import pillow_heif
 
 pillow_heif.register_heif_opener()
 Image.new("RGB", (16, 16), (200, 40, 40)).save("golden.heif", format="HEIF")
-
-with wave.open("golden.wav", "w") as w:
-    w.setnchannels(1)
-    w.setsampwidth(2)
-    w.setframerate(8000)
-    w.writeframes(b"\x00\x00" * 800)
-print("OK golden heif/wav written")
+print("OK golden heif written")
 PY
 
 exiftool -s -s -s -FileType golden.heif | grep -Ei 'heif|heic'
 ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 golden.wav >/dev/null
 
-printf 'golden-docx\n' > golden-docx.md
-timeout 90s pandoc golden-docx.md -o golden.docx
 mkdir -p docx-out
 timeout 120s soffice --headless --nologo --nolockcheck --norestore \
   --convert-to pdf --outdir docx-out golden.docx >/dev/null
 pdftotext docx-out/golden.pdf - | grep -q golden-docx
 
-printf 'label,value\ngolden-xlsx,1\n' > golden.csv
+test -f golden.xlsx
+# Recalc/round-trip the stored workbook, not a CSV rebuild.
 mkdir -p xlsx-out
 timeout 120s soffice --headless --nologo --nolockcheck --norestore \
-  --convert-to xlsx --outdir xlsx-out golden.csv >/dev/null
-test -f xlsx-out/golden.xlsx
+  --convert-to csv --outdir xlsx-out golden.xlsx >/dev/null
+grep -q golden-xlsx xlsx-out/golden.csv
 
-python3 - <<'PY'
-from PIL import Image, ImageDraw, ImageFont
-
-im = Image.new("RGB", (420, 90), "white")
-draw = ImageDraw.Draw(im)
-font = ImageFont.truetype(
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 48
-)
-draw.text((12, 18), "GOLDEN", fill="black", font=font)
-im.save("scan.png")
-print("OK golden scan.png")
-PY
 tesseract scan.png stdout -l eng | grep -qi GOLDEN
-# ImageMagick delegates are disabled (no gs). Do not use `convert`
-# to wrap a PNG as PDF — PyMuPDF is the baked path.
+# ImageMagick delegates are disabled (no gs). Rebuild scan-in.pdf via
+# PyMuPDF so the baked renderer is still the proof.
 python3 - <<'PY'
 import fitz
 src = fitz.open("scan.png")
@@ -109,7 +89,6 @@ if ! printf '%s\n' "$ocr_txt" | grep -qi GOLDEN; then
 fi
 echo "OK ocrmypdf searchable pdf"
 
-printf 'not a sqlite database\n' > bad.db
 if sqlite3 bad.db 'PRAGMA integrity_check' >/dev/null 2>&1; then
   echo "malformed sqlite was accepted" >&2
   exit 1

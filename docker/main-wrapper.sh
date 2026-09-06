@@ -13,7 +13,7 @@
 # re-exec and continue directly.
 #
 # Routing:
-#   no args                       → exec `hermes` (the default)
+#   no args                       → `hermes --help` (do not hang)
 #   first arg is an executable    → exec it directly (sleep, bash, sh, …)
 #   first arg is anything else    → exec `hermes <args>` (subcommand passthrough)
 #
@@ -80,7 +80,14 @@ cd /opt/data
 cd "$_hermes_orig_cwd"
 
 if [ $# -eq 0 ]; then
-    drop hermes
+    drop hermes --help
+fi
+
+# Plan 5c: the image also installs the PyPI `mcp` developer CLI via
+# hermes-agent[mcp]. `docker run <image> mcp …` must reach `hermes mcp`
+# (Todoist/ClickUp login, etc.), not that unrelated binary.
+if [ "$1" = "mcp" ]; then
+    drop hermes "$@"
 fi
 
 if command -v "$1" >/dev/null 2>&1; then

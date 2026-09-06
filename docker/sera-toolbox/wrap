@@ -60,17 +60,28 @@ case "$tool" in
     if ! python3 - "$@" <<'PY'
 import sys, zipfile
 from pathlib import Path
+max_ratio = float(__import__("os").environ.get("SERA_SANDBOX_ZIP_RATIO", "100"))
+max_uncomp = int(__import__("os").environ.get("SERA_SANDBOX_ZIP_MAX_BYTES", str(64 * 1024 * 1024)))
 for arg in sys.argv[1:]:
     p = Path(arg)
     if not p.is_file() or not zipfile.is_zipfile(p):
         continue
     with zipfile.ZipFile(p) as z:
-        for name in z.namelist():
+        raw = 0
+        comp = 0
+        for info in z.infolist():
+            name = info.filename
             if name.startswith("/") or any(part == ".." for part in name.split("/")):
                 sys.exit(2)
+            raw += info.file_size
+            comp += info.compress_size
+        if raw > max_uncomp:
+            sys.exit(3)
+        if comp and (raw / comp) > max_ratio:
+            sys.exit(3)
 PY
     then
-      echo "sera-toolbox: refusing zip-slip or absolute archive member" >&2
+      echo "sera-toolbox: refusing zip-slip, bomb, or absolute archive member" >&2
       exit 2
     fi
     ;;
@@ -84,7 +95,21 @@ case "$cwd" in
     ;;
 esac
 
-timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
+# Per-tool wall clocks. Caller SERA_SANDBOX_TIMEOUT still wins.
+case "$tool" in
+  file|exiftool|identify|pdfinfo)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-30}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-536870912}"
+    ;;
+  tesseract|ocrmypdf|soffice|libreoffice|pandoc)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-180}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-2147483648}"
+    ;;
+  *)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-1073741824}"
+    ;;
+esac
 start_ns="$(date +%s%N)"
 tmp_receipt="$(mktemp /tmp/sera-bwrap.XXXXXX.json)"
 # Debian snapshot bwrap rejected both --nproc and --rlimit-nproc.
@@ -96,6 +121,9 @@ case "$bwrap_help" in
 esac
 case "$bwrap_help" in
   *--rlimit-nofile*) bwrap_extra+=(--rlimit-nofile 1024) ;;
+esac
+case "$bwrap_help" in
+  *--rlimit-as*) bwrap_extra+=(--rlimit-as "$as_bytes") ;;
 esac
 # shellcheck disable=SC2016
 status=0

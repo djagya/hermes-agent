@@ -536,6 +536,7 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 # absolute path (/opt/hermes/.venv/bin/hermes). See the shim source for
 # the opt-out env var (HERMES_DOCKER_EXEC_AS_ROOT=1).
 COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
+COPY --chmod=0755 docker/mcp-shim.sh /opt/hermes/bin/mcp
 COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
 COPY --chmod=0755 docker/sera-toolbox/wrap /opt/hermes/docker/sera-toolbox/wrap
 COPY --chmod=0755 docker/sera-toolbox/install-wrappers.sh /opt/hermes/docker/sera-toolbox/install-wrappers.sh
@@ -544,8 +545,7 @@ COPY --chmod=0755 docker/sera-toolbox/smoke.sh /opt/hermes/docker/sera-toolbox/s
 COPY --chmod=0755 docker/sera-toolbox/hermes-image-info.sh /usr/local/bin/hermes-image-info
 COPY --chmod=0755 docker/sera-toolbox/hermes-image-doctor.sh /usr/local/bin/hermes-image-doctor
 COPY --chmod=0755 docker/sera-toolbox/write-toolchain-manifest.sh /opt/hermes/docker/sera-toolbox/write-toolchain-manifest.sh
-COPY --chmod=0755 docker/sera-toolbox/adversarial/zip-slip.sh /opt/hermes/docker/sera-toolbox/adversarial/zip-slip.sh
-COPY --chmod=0755 docker/sera-toolbox/adversarial/no-network.sh /opt/hermes/docker/sera-toolbox/adversarial/no-network.sh
+COPY --chmod=0755 docker/sera-toolbox/adversarial/ /opt/hermes/docker/sera-toolbox/adversarial/
 COPY --chmod=0755 docker/sera-toolbox/golden-smoke.sh /opt/hermes/docker/sera-toolbox/golden-smoke.sh
 COPY docker/sera-toolbox/seccomp-bwrap.json /opt/hermes/docker/sera-toolbox/seccomp-bwrap.json
 COPY docker/sera-toolbox/ImageMagick/ /etc/sera-toolbox/ImageMagick/
@@ -697,3 +697,9 @@ ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
 CMD [ ]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
     CMD hermes-healthcheck
+
+# Test stage: runtime plus golden fixtures. Publish stays `runtime`.
+# Plan 5d: fixtures stay out of the published image unless doctor --full
+# needs them (it does not).
+FROM runtime AS test
+COPY docker/sera-toolbox/fixtures/ /opt/hermes/docker/sera-toolbox/fixtures/

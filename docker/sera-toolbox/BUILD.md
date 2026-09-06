@@ -1,22 +1,24 @@
 # Building the Sera toolbox image
 
 Matches CI in `.github/workflows/fork-release-image.yml`. Published
-target is `runtime`. There is no separate `test` stage — smoke is an
-entrypoint on `runtime`.
+target is `runtime`. `--target test` is runtime plus
+`docker/sera-toolbox/fixtures/` (golden text fixtures). CI
+`build-test` loads `test`; `publish` pushes `runtime`.
 
 ```bash
 # Local load (amd64). Pass the same args CI uses.
+# Smoke/golden: --target test. Pin/publish: --target runtime.
 docker buildx build \
-  --target runtime \
-  --load \
-  --platform linux/amd64 \
-  --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" \
-  --build-arg HERMES_IMAGE_NAME=ghcr.io/djagya/hermes-agent \
-  --build-arg HERMES_BUILD_REF="$(git rev-parse --abbrev-ref HEAD)" \
-  --build-arg DEBIAN_SNAPSHOT=20260905T000000Z \
-  -t ghcr.io/djagya/hermes-agent:local \
-  -f Dockerfile \
-  .
+    --target test \
+    --load \
+    --platform linux/amd64 \
+    --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" \
+    --build-arg HERMES_IMAGE_NAME=ghcr.io/djagya/hermes-agent \
+    --build-arg HERMES_BUILD_REF="$(git rev-parse --abbrev-ref HEAD)" \
+    --build-arg DEBIAN_SNAPSHOT=20260905T000000Z \
+    -t ghcr.io/djagya/hermes-agent:local \
+    -f Dockerfile \
+    .
 
 # Toolbox + golden + adversarial. Ubuntu 24.04 needs userns +
 # apparmor=unconfined (docker-default denies mount). Seccomp must

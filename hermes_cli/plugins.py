@@ -5618,10 +5618,7 @@ class PluginManager:
                         suppressed_until = self._hook_timeout_suppressed_until.get(
                             callback_key
                         )
-                        running = callback_key in self._hook_running_callbacks
-                        if (
-                            suppressed_until is not None and suppressed_until > now
-                        ) or running:
+                        if suppressed_until is not None and suppressed_until > now:
                             logger.warning(
                                 "Hook '%s' callback %s skipped after previous "
                                 "timeout or while still running",
@@ -5633,6 +5630,12 @@ class PluginManager:
                             continue
                         if suppressed_until is not None:
                             self._hook_timeout_suppressed_until.pop(callback_key, None)
+                        # Concurrent in-flight is allowed: the tool executor
+                        # runs parallel tools, each invoking the same
+                        # pre_tool_call callback. Treating "running" as skip
+                        # fail-closes sibling tools with
+                        # "pre_tool_call plugin callback timed out or is still running".
+                        # Only the post-timeout suppression window is exclusive.
                         self._hook_running_callbacks[callback_key] = token
 
                     context = contextvars.copy_context()

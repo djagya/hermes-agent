@@ -114,6 +114,38 @@ if [ "${HERMES_REQUIRE_DATA_MOUNT:-}" = "1" ] && ! mountpoint -q "$HERMES_HOME";
     exit 1
 fi
 
+# Backup headroom: free bytes must cover ~3× live SQLite+WAL (plan 5c).
+# Walk only known DB roots — never cache/model trees.
+sqlite_bytes=0
+_add_sqlite_bytes() {
+    [ -e "$1" ] || return 0
+    if [ -f "$1" ]; then
+        sqlite_bytes=$((sqlite_bytes + $(stat -c %s "$1")))
+        return 0
+    fi
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        sqlite_bytes=$((sqlite_bytes + $(stat -c %s "$f")))
+    done <<EOF
+$(find "$1" \( -name '*.db' -o -name '*.db-wal' -o -name '*.db-shm' \) -type f 2>/dev/null)
+EOF
+}
+_add_sqlite_bytes "$HERMES_HOME/state.db"
+_add_sqlite_bytes "$HERMES_HOME/state.db-wal"
+_add_sqlite_bytes "$HERMES_HOME/state.db-shm"
+_add_sqlite_bytes "$HERMES_HOME/kanban.db"
+_add_sqlite_bytes "$HERMES_HOME/kanban.db-wal"
+_add_sqlite_bytes "$HERMES_HOME/kanban.db-shm"
+_add_sqlite_bytes "$HERMES_HOME/observatory.db"
+_add_sqlite_bytes "$HERMES_HOME/cron"
+_add_sqlite_bytes "$HERMES_HOME/kanban"
+_add_sqlite_bytes "$HERMES_HOME/profiles"
+need_backup_kb=$((sqlite_bytes / 1024 * 3))
+if [ "$need_backup_kb" -gt 0 ] && [ "$avail_kb" -lt "$need_backup_kb" ]; then
+    echo "[stage2] ERROR: $HERMES_HOME has ${avail_kb}KB free; need ${need_backup_kb}KB (3× SQLite+WAL=${sqlite_bytes}B)" >&2
+    exit 1
+fi
+
 # Numeric UID/GID validation: must be digits only, non-root, 1-65534.
 # NAS hosts such as Unraid commonly use low non-root IDs (99:100).
 validate_uid_gid() {
@@ -245,8 +277,10 @@ chown_hermes_tree() {
     if refuse_symlinked_path "recursive chown" "$target"; then
         return 0
     fi
-    chown -R hermes:hermes "$target" 2>/dev/null || \
-        echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
+    if ! chown -R hermes:hermes "$target"; then
+        echo "[stage2] ERROR: chown $target failed" >&2
+        exit 1
+    fi
 }
 
 tree_has_non_hermes_owner() {
@@ -752,6 +786,11 @@ mounted="no"
 mountpoint -q "$HERMES_HOME" 2>/dev/null && mounted="yes"
 profiles=0
 [ -d "$HERMES_HOME/profiles" ] && profiles="$(find "$HERMES_HOME/profiles" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
-echo "[stage2] banner revision=${rev} uid=$(id -u hermes) gid=$(id -g hermes) profiles=${profiles} mount=${mounted} disk=${avail_kb}KB estop=${estop}"
+schema="unknown"
+if [ -f "$HERMES_HOME/config.yaml" ]; then
+    schema="$(awk '/^_config_version:/{print $2; exit}' "$HERMES_HOME/config.yaml" 2>/dev/null || echo unknown)"
+    [ -n "$schema" ] || schema="unknown"
+fi
+echo "[stage2] banner revision=${rev} uid=$(id -u hermes) gid=$(id -g hermes) profiles=${profiles} schema=${schema} mount=${mounted} disk=${avail_kb}KB estop=${estop}"
 
 echo "[stage2] Setup complete; starting user services"

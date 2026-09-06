@@ -25,21 +25,43 @@ hermes_ver="$(hermes --version 2>/dev/null | head -1 || echo unknown)"
 arch="$(uname -m)"
 uid="$(id -u)"
 gid="$(id -g)"
+manifest_hash="missing"
+if [ -f /etc/hermes/toolchain-manifest.json ]; then
+  manifest_hash="$(sha256sum /etc/hermes/toolchain-manifest.json | awk '{print $1}')"
+fi
+policy_hash="missing"
+if [ -f /etc/hermes/config.yaml ]; then
+  policy_hash="$(sha256sum /etc/hermes/config.yaml | awk '{print $1}')"
+fi
+source_epoch="${SOURCE_DATE_EPOCH:-unset}"
+browser_ver="unknown"
+if [ -d /opt/hermes/.playwright ]; then
+  chrome="$(find /opt/hermes/.playwright -type f \( -name chrome -o -name chromium -o -name chrome-headless-shell \) 2>/dev/null | head -1 || true)"
+  if [ -n "${chrome:-}" ] && [ -x "$chrome" ]; then
+    browser_ver="$("$chrome" --version 2>/dev/null || echo "$chrome")"
+  fi
+fi
 
 if [ "$json" -eq 1 ]; then
   PROV="$prov" TOOLS="$tools" \
   PY="$python_ver" NODE="$node_ver" SQLITE="$sqlite_ver" HERMES="$hermes_ver" \
   ARCH="$arch" UID_N="$uid" GID_N="$gid" \
+  MANIFEST_HASH="$manifest_hash" POLICY_HASH="$policy_hash" \
+  SOURCE_EPOCH="$source_epoch" BROWSER="$browser_ver" \
   python3 - <<'PY'
 import json, os
 out = {
     "provenance": json.loads(os.environ["PROV"] or "{}"),
     "toolchain": json.loads(os.environ["TOOLS"] or "{}"),
+    "toolchain_manifest_sha256": os.environ["MANIFEST_HASH"],
+    "managed_policy_sha256": os.environ["POLICY_HASH"],
+    "source_date_epoch": os.environ["SOURCE_EPOCH"],
     "versions": {
         "hermes": os.environ["HERMES"],
         "python": os.environ["PY"],
         "node": os.environ["NODE"],
         "sqlite": os.environ["SQLITE"],
+        "browser": os.environ["BROWSER"],
     },
     "runtime": {
         "arch": os.environ["ARCH"],
@@ -68,8 +90,12 @@ echo "hermes  $hermes_ver"
 echo "python  $python_ver"
 echo "node    $node_ver"
 echo "sqlite  $sqlite_ver"
+echo "browser $browser_ver"
 echo "arch    $arch"
 echo "uid/gid ${uid}:${gid}"
+echo "manifest ${manifest_hash}"
+echo "policy  ${policy_hash}"
+echo "epoch   ${source_epoch}"
 echo "cache   ${XDG_CACHE_HOME:-unset}"
 echo "uv      ${UV_CACHE_DIR:-unset}"
 echo "hf      ${HF_HOME:-unset}"

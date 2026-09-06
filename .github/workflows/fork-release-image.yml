@@ -135,7 +135,9 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          target: runtime
+          # Smoke + golden need the test-stage fixtures. Publish still
+          # targets runtime (no fixtures layer).
+          target: test
           load: true
           platforms: linux/amd64
           tags: ${{ env.IMAGE_NAME }}:test
@@ -235,6 +237,10 @@ jobs:
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/smoke.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/zip-slip.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/no-network.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/high-ratio.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/ffmpeg-concat.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/pdf-external.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/office-external.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh "$IMAGE"
 
       - name: Offline CLI without data mount

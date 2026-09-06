@@ -1,4 +1,4 @@
-# Review-only pin drift check. Never publishes, never merges.
+# Review-only pin drift PR. Never publishes, never merges.
 name: Pin refresh reminder
 
 on:
@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  issues: write
+  contents: write
+  pull-requests: write
 
 jobs:
   remind:
@@ -17,20 +17,38 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          persist-credentials: false
-      - name: Open review issue with current pins
+          persist-credentials: true
+
+      - name: Open review-only draft PR with current pins
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          body="$(mktemp)"
+          stamp="$(date -u +%F)"
+          branch="pin-refresh/${stamp}"
+          report="docker/sera-toolbox/pin-refresh-report.md"
           {
-            echo "Weekly pin review. No unattended merge."
+            echo "# Pin refresh ${stamp}"
+            echo
+            echo "Review-only. No unattended merge, publish, or deploy."
+            echo "Compare old vs new versions, release notes, SBOM/CVE"
+            echo "delta, and image-size delta before bumping."
             echo
             echo '```'
             grep -E '^(FROM |ARG |    ")' Dockerfile | head -80
             echo '```'
-          } > "$body"
-          gh issue create --title "pin-refresh $(date -u +%F)" --body-file "$body" \
-            || echo "issue create failed (permissions?); pins printed above"
-          cat "$body"
+          } > "$report"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add "$report"
+          if git diff --cached --quiet; then
+            echo "report unchanged"
+            exit 0
+          fi
+          git commit -m "chore(image): pin-refresh report ${stamp}"
+          git push -u origin "$branch"
+          gh pr create --draft --title "pin-refresh ${stamp}" \
+            --body-file "$report" \
+            || echo "pr create failed (already open?); report printed above"
+          cat "$report"
