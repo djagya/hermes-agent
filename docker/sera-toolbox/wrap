@@ -95,7 +95,8 @@ env -i \
     --unshare-ipc \
     --die-with-parent \
     --new-session \
-    --nproc 64 \
+    --rlimit-nproc 64 \
+    --rlimit-nofile 1024 \
     --tmpfs /tmp \
     --dir /tmp/home \
     --ro-bind /usr /usr \
@@ -108,6 +109,9 @@ env -i \
     --ro-bind-try /usr/share/fonts /usr/share/fonts \
     --ro-bind-try /etc/ImageMagick-7 /etc/ImageMagick-7 \
     --ro-bind-try /etc/ImageMagick-6 /etc/ImageMagick-6 \
+    --ro-bind-try /etc/libreoffice /etc/libreoffice \
+    --ro-bind-try /etc/ghostscript /etc/ghostscript \
+    --ro-bind-try /var/lib/libreoffice /var/lib/libreoffice \
     --bind "$cwd" "$cwd" \
     --bind "$out_dir" "$out_dir" \
     --chdir "$cwd" \

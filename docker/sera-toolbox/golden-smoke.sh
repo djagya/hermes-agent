@@ -86,7 +86,20 @@ im.save("scan.png")
 print("OK golden scan.png")
 PY
 tesseract scan.png stdout -l eng | grep -qi GOLDEN
-convert scan.png scan-in.pdf
+# ImageMagick delegates are disabled (no gs). Do not use `convert`
+# to wrap a PNG as PDF — PyMuPDF is the baked path.
+python3 - <<'PY'
+import fitz
+src = fitz.open("scan.png")
+rect = src[0].rect
+doc = fitz.open()
+page = doc.new_page(width=rect.width, height=rect.height)
+page.insert_image(rect, filename="scan.png")
+doc.save("scan-in.pdf")
+src.close()
+doc.close()
+print("OK scan-in.pdf via pymupdf")
+PY
 timeout 90s ocrmypdf --language eng --force-ocr scan-in.pdf scan-ocr.pdf
 pdftotext scan-ocr.pdf - | grep -qi GOLDEN
 echo "OK ocrmypdf searchable pdf"
