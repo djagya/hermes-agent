@@ -136,6 +136,7 @@ env -i \
     --ro-bind-try /sbin /sbin \
     --ro-bind /etc/sera-toolbox /etc/sera-toolbox \
     --ro-bind-try /etc/fonts /etc/fonts \
+    --ro-bind-try /var/cache/fontconfig /var/cache/fontconfig \
     --ro-bind-try /usr/share/fonts /usr/share/fonts \
     --ro-bind-try /etc/ImageMagick-7 /etc/ImageMagick-7 \
     --ro-bind-try /etc/ImageMagick-6 /etc/ImageMagick-6 \
@@ -152,7 +153,7 @@ end_ns="$(date +%s%N)"
 elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
 
 python3 - "$tool" "$status" "$elapsed_ms" "$tmp_receipt" "$@" <<'PY'
-import hashlib, json, sys, time
+import hashlib, json, os, sys, time
 from pathlib import Path
 tool, status, elapsed_ms, dest = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 args = sys.argv[5:]
@@ -170,7 +171,11 @@ receipt = {
     "files": paths,
 }
 Path(dest).write_text(json.dumps(receipt, separators=(",", ":")) + "\n", encoding="utf-8")
-print(json.dumps({"sera_sandbox_receipt": dest, **receipt}, separators=(",", ":")))
+# Never print the receipt on stdout. This wrapper is a PATH stand-in
+# for the real tool; JSON on stdout breaks `tool | grep -q` (pipefail
+# + BrokenPipeError) and pollutes `$(file …)` captures. File only.
+if os.environ.get("SERA_SANDBOX_VERBOSE") == "1":
+    print(json.dumps({"sera_sandbox_receipt": dest, **receipt}, separators=(",", ":")), file=sys.stderr)
 PY
 
 exit "$status"
