@@ -19,8 +19,9 @@ docker buildx build \
   .
 
 # Toolbox + golden + adversarial. Ubuntu 24.04 needs userns +
-# apparmor=unconfined (docker-default denies mount). Never privileged
-# or seccomp=unconfined.
+# apparmor=unconfined (docker-default denies mount). Seccomp must
+# allow clone/clone3 (Docker default blocks CLONE_NEWUSER / clone3).
+# Never privileged or seccomp=unconfined.
 #   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 docker run --rm --network none \
   --security-opt seccomp=docker/sera-toolbox/seccomp-bwrap.json \

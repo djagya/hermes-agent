@@ -12,6 +12,7 @@ need=(
   gh gitleaks tirith rclone op himalaya
   ss dig lsof fuser
   s6-svstat
+  hermes-healthcheck
 )
 
 fail=0

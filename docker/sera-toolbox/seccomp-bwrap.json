@@ -675,8 +675,8 @@
    "names": [
     "clone3"
    ],
-   "action": "SCMP_ACT_ERRNO",
-   "errnoRet": 38,
+   "action": "SCMP_ACT_ALLOW",
+   "comment": "Override Docker default clone3→ENOSYS without CAP_SYS_ADMIN. bwrap needs a real clone3/userns, not the glibc clone fallback.",
    "excludes": {
     "caps": [
      "CAP_SYS_ADMIN"
@@ -831,6 +831,8 @@
   },
   {
    "names": [
+    "clone",
+    "clone3",
     "unshare",
     "setns",
     "mount",
@@ -846,14 +848,7 @@
     "mount_setattr"
    ],
    "action": "SCMP_ACT_ALLOW",
-   "comment": "bubblewrap user/mount/net ns; hermes cap_drop ALL so the CAP_SYS_ADMIN rule never matches. Not seccomp=unconfined."
-  },
-  {
-   "names": [
-    "clone3"
-   ],
-   "action": "SCMP_ACT_ALLOW",
-   "comment": "bwrap may clone3 for user ns; still no privileged=true"
+   "comment": "bubblewrap user/mount/net ns. Docker default clone mask blocks CLONE_NEWUSER without CAP_SYS_ADMIN; clone3 default is ENOSYS. Not privileged, not seccomp=unconfined."
   }
  ]
 }

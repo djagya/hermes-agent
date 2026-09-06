@@ -567,7 +567,9 @@ ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
 # Do not declare VOLUME /opt/data — that creates anonymous state on
 # `docker run` without -v. Compose bind-mounts /opt/data explicitly.
-# Gateway boots refuse a missing mount when HERMES_REQUIRE_DATA_MOUNT=1.
+# Do not ENV HERMES_REQUIRE_DATA_MOUNT=1 here: default entrypoint always
+# runs stage2, so a baked default would break `docker run --help` /
+# image-info without -v. Compose sets the flag for gateway boots.
 
 # The image ENTRYPOINT is a tiny dispatcher rather than `/init` directly.
 # When the image really owns PID 1 (normal Docker / Podman), the dispatcher
@@ -688,3 +690,5 @@ RUN ldconfig && \
 
 ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
 CMD [ ]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+    CMD hermes-healthcheck
