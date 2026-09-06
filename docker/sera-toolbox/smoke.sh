@@ -120,4 +120,19 @@ case "$(uname -m):$tirith_file" in
 esac
 tirith --version >/dev/null
 
+# Network CLIs must ship with no baked credentials.
+for p in \
+  /root/.config/op /root/.op \
+  /root/.config/rclone /root/.config/rclone/rclone.conf \
+  /opt/data/home/.config/op /opt/data/home/.op \
+  /opt/data/home/.config/rclone /opt/data/.config/rclone; do
+  if [ -e "$p" ]; then
+    echo "baked secret path in image: $p" >&2
+    fail=1
+  fi
+done
+rclone version >/dev/null
+op --version >/dev/null
+echo "OK op/rclone secret-free"
+
 exit "$fail"

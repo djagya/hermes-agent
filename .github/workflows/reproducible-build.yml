@@ -1,0 +1,76 @@
+# Manual experiment: build the same commit twice with a fixed epoch.
+# Exact digest equality is desired, not a release blocker.
+name: Reproducible build experiment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/djagya/hermes-agent
+  SOURCE_DATE_EPOCH: "1778198400"
+
+jobs:
+  compare:
+    if: github.repository == 'djagya/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build A
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          load: true
+          platforms: linux/amd64
+          no-cache: true
+          tags: ${{ env.IMAGE_NAME }}:repro-a
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+            HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
+            HERMES_BUILD_REF=${{ github.ref_name }}
+            DEBIAN_SNAPSHOT=20260508T000000Z
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+
+      - name: Build B
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          load: true
+          platforms: linux/amd64
+          no-cache: true
+          tags: ${{ env.IMAGE_NAME }}:repro-b
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+            HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
+            HERMES_BUILD_REF=${{ github.ref_name }}
+            DEBIAN_SNAPSHOT=20260508T000000Z
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+
+      - name: Compare image IDs
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          id_a="$(docker image inspect --format '{{.Id}}' "$IMAGE:repro-a")"
+          id_b="$(docker image inspect --format '{{.Id}}' "$IMAGE:repro-b")"
+          echo "id_a=$id_a"
+          echo "id_b=$id_b"
+          if [ "$id_a" = "$id_b" ]; then
+            echo "reproducible: image IDs match"
+          else
+            echo "not reproducible yet (not a release blocker)"
+            docker history --format '{{.Size}}\t{{.CreatedBy}}' "$IMAGE:repro-a" | head -20
+            docker history --format '{{.Size}}\t{{.CreatedBy}}' "$IMAGE:repro-b" | head -20
+          fi

@@ -12,6 +12,7 @@ from pathlib import Path
 Path("hello.md").write_text("# hi\n\nfixture\n", encoding="utf-8")
 from weasyprint import HTML
 HTML(string="<html><body><p>golden</p></body></html>").write_pdf("golden.pdf")
+HTML(string="<html><body><p>Здравствуй golden 😀</p></body></html>").write_pdf("unicode.pdf")
 import zipfile
 with zipfile.ZipFile("golden.zip", "w") as z:
     z.writestr("hello.txt", "ok\n")
@@ -19,6 +20,9 @@ PY
 
 pdftotext golden.pdf golden.txt
 grep -q golden golden.txt
+pdftotext unicode.pdf unicode.txt
+grep -q 'Здравствуй' unicode.txt
+test "$(wc -c < unicode.pdf)" -gt "$(wc -c < golden.pdf)"
 
 unzip -l golden.zip | grep -q hello.txt
 zstd -q golden.zip -o golden.zip.zst
