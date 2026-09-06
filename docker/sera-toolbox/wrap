@@ -158,6 +158,8 @@ env -i \
     --ro-bind-try /etc/ImageMagick-6 /etc/ImageMagick-6 \
     --ro-bind-try /etc/libreoffice /etc/libreoffice \
     --ro-bind-try /etc/ghostscript /etc/ghostscript \
+    --ro-bind-try /var/lib/ghostscript /var/lib/ghostscript \
+    --ro-bind-try /var/lib/tesseract-ocr /var/lib/tesseract-ocr \
     --ro-bind-try /var/lib/libreoffice /var/lib/libreoffice \
     --bind "$cwd" "$cwd" \
     --bind "$out_dir" "$out_dir" \

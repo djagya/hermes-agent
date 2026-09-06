@@ -101,7 +101,12 @@ doc.close()
 print("OK scan-in.pdf via pymupdf")
 PY
 timeout 90s ocrmypdf --language eng --force-ocr scan-in.pdf scan-ocr.pdf
-pdftotext scan-ocr.pdf - | grep -qi GOLDEN
+ocr_txt="$(pdftotext scan-ocr.pdf - || true)"
+if ! printf '%s\n' "$ocr_txt" | grep -qi GOLDEN; then
+  echo "FAIL ocrmypdf pdftotext missed GOLDEN:" >&2
+  printf '%s\n' "$ocr_txt" >&2
+  exit 1
+fi
 echo "OK ocrmypdf searchable pdf"
 
 printf 'not a sqlite database\n' > bad.db
