@@ -90,6 +90,13 @@ esac
 status=0
 # env -i: no secrets, no Docker/SSH/MCP, no HERMES_HOME.
 # cwd + out_dir only. tmpfs HOME/tmp. no network.
+# Nested Docker: --unshare-pid + --proc remounts procfs and EPERMs
+# because the container /proc is masked (kernel refuses a "revealing"
+# procfs in the child userns). Do not unmask / systempaths=unconfined
+# / privileged / seccomp=unconfined. Bind the container /proc and /dev
+# instead. PID isolation stays the Hermes container's, not a nested
+# pid ns. PATH puts libexec first so ocrmypdf/soffice spawn real
+# parsers, not these wrappers (no nested bwrap).
 env -i \
   PATH=/usr/libexec/sera-toolbox:/usr/bin:/bin \
   HOME=/tmp/home \
@@ -102,14 +109,14 @@ env -i \
   bwrap \
     --unshare-user \
     --unshare-net \
-    --unshare-pid \
     --unshare-uts \
     --unshare-ipc \
     --die-with-parent \
     --new-session \
     "${bwrap_extra[@]}" \
-    --proc /proc \
-    --dev /dev \
+    --ro-bind /proc /proc \
+    --dev-bind /dev /dev \
+    --ro-bind-try /sys /sys \
     --tmpfs /tmp \
     --tmpfs /var/tmp \
     --tmpfs /run \
@@ -120,6 +127,8 @@ env -i \
     --ro-bind-try /etc/hosts /etc/hosts \
     --ro-bind-try /etc/localtime /etc/localtime \
     --ro-bind-try /etc/machine-id /etc/machine-id \
+    --ro-bind-try /etc/magic /etc/magic \
+    --ro-bind-try /etc/magic.mgc /etc/magic.mgc \
     --ro-bind /usr /usr \
     --ro-bind /lib /lib \
     --ro-bind-try /lib64 /lib64 \

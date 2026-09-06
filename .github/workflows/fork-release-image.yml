@@ -203,6 +203,9 @@ jobs:
           # with "Creating new namespace failed: Operation not permitted"
           # even when seccomp allows unshare. Not privileged. Not
           # seccomp=unconfined. docker-default AppArmor also denies mount.
+          # Do not add systempaths=unconfined / unmask=ALL: wrap binds
+          # container /proc instead of remounting procfs (masked /proc
+          # + --unshare-pid is the "Can't mount proc" failure).
           if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
