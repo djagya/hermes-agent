@@ -121,5 +121,45 @@ def test_empty_preview_binds_empty_allowlist(monkeypatch, capsys):
     assert prune_calls[0]["orphan_allowlist"] == set()
 
 
+def test_prune_defaults_follow_checkpoint_config(monkeypatch, capsys):
+    import hermes_cli.checkpoints as checkpoints_cli
+    import hermes_cli.config as config
+
+    prune_calls: list = []
+    _patch_checkpoint_manager(monkeypatch, _V2_ORPHAN_ONLY_STATUS, prune_calls)
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"checkpoints": {"retention_days": 9, "max_total_size_mb": 1024}},
+    )
+
+    rc = checkpoints_cli.cmd_prune(_ns(
+        retention_days=None,
+        max_size_mb=None,
+        keep_orphans=True,
+    ))
+
+    assert rc == 0
+    assert prune_calls[0]["retention_days"] == 9
+    assert prune_calls[0]["max_total_size_mb"] == 1024
+
+
+def test_prune_returns_failure_when_hard_cap_is_not_satisfied(monkeypatch, capsys):
+    import hermes_cli.checkpoints as checkpoints_cli
+    import tools.checkpoint_manager as ckpt_mgr
+
+    monkeypatch.setattr(ckpt_mgr, "store_status", lambda: _V2_ORPHAN_ONLY_STATUS)
+    monkeypatch.setattr(
+        ckpt_mgr,
+        "prune_checkpoints",
+        lambda **kwargs: _prune_result(cap_satisfied=0),
+    )
+
+    rc = checkpoints_cli.cmd_prune(_ns(keep_orphans=True))
+
+    assert rc == 2
+    assert "Hard cap was NOT satisfied" in capsys.readouterr().out
+
+
 
 

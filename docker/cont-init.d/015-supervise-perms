@@ -45,8 +45,8 @@ set -eu
 SVC_ROOT=/run/s6-rc/servicedirs
 
 if [ ! -d "$SVC_ROOT" ]; then
-    echo "[supervise-perms] $SVC_ROOT not present; skipping"
-    exit 0
+    echo "[supervise-perms] ERROR: $SVC_ROOT not present" >&2
+    exit 1
 fi
 
 for svc in "$SVC_ROOT"/*; do
@@ -63,8 +63,10 @@ for svc in "$SVC_ROOT"/*; do
 
     # supervise/ tree — needed by s6-svstat / s6-svc.
     if [ -d "$svc/supervise" ]; then
-        chown -R hermes:hermes "$svc/supervise" 2>/dev/null || \
-            echo "[supervise-perms] could not chown $svc/supervise"
+        if ! chown -R hermes:hermes "$svc/supervise"; then
+            echo "[supervise-perms] ERROR: could not chown $svc/supervise" >&2
+            exit 1
+        fi
         # 0710 = group searchable. ``s6-svstat`` only needs to openat
         # status, not list the dir, but giving the hermes group +x is
         # the minimum that lets group members access the contents.
@@ -80,8 +82,10 @@ for svc in "$SVC_ROOT"/*; do
 
     # Top-level event/ dir — s6-svlisten1 / s6-svwait subscribe here.
     if [ -d "$svc/event" ]; then
-        chown hermes:hermes "$svc/event" 2>/dev/null || \
-            echo "[supervise-perms] could not chown $svc/event"
+        if ! chown hermes:hermes "$svc/event"; then
+            echo "[supervise-perms] ERROR: could not chown $svc/event" >&2
+            exit 1
+        fi
         # Preserve s6's 03730 mode (setgid + g+rwx + sticky).
         chmod 03730 "$svc/event" 2>/dev/null || true
     fi

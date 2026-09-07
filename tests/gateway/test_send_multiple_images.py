@@ -114,6 +114,70 @@ class TestTelegramMultiImage:
         assert call_kwargs["chat_id"] == 12345
         assert len(call_kwargs["media"]) == 3
 
+    def test_local_group_uses_attached_input_file(self, adapter, tmp_path):
+        """Local album files use multipart attachments, not file:// payloads."""
+        import telegram
+
+        image = tmp_path / "local.png"
+        image.write_bytes(b"png")
+        telegram.InputFile = MagicMock(
+            side_effect=lambda fh, attach=False: {"fh": fh, "attach": attach}
+        )
+        telegram.InputMediaPhoto = MagicMock(
+            side_effect=lambda media, caption=None: {"media": media, "caption": caption}
+        )
+
+        _run(adapter.send_multiple_images("12345", [(str(image), "local")]))
+
+        telegram.InputFile.assert_called_once()
+        assert telegram.InputFile.call_args.kwargs["attach"] is True
+        sent = adapter._bot.send_media_group.call_args.kwargs["media"]
+        assert sent[0]["media"]["attach"] is True
+
+    def test_strict_native_group_verifies_one_shared_receipt(self, adapter):
+        import telegram
+
+        images = [(f"https://x.com/{i}.png", "") for i in range(3)]
+        telegram.InputMediaPhoto = MagicMock(
+            side_effect=lambda media, caption=None: {"media": media, "caption": caption}
+        )
+        adapter._bot.send_media_group = AsyncMock(
+            return_value=[
+                MagicMock(message_id=i, media_group_id="album-1")
+                for i in range(3)
+            ]
+        )
+
+        _run(
+            adapter.send_multiple_images(
+                "12345",
+                images,
+                metadata={"_require_native_media_group": True},
+            )
+        )
+
+        adapter._bot.send_media_group.assert_awaited_once()
+
+    def test_strict_native_group_rejects_partial_receipt(self, adapter):
+        import telegram
+
+        images = [(f"https://x.com/{i}.png", "") for i in range(2)]
+        telegram.InputMediaPhoto = MagicMock(
+            side_effect=lambda media, caption=None: {"media": media, "caption": caption}
+        )
+        adapter._bot.send_media_group = AsyncMock(
+            return_value=[MagicMock(message_id=1, media_group_id="album-1")]
+        )
+
+        with pytest.raises(RuntimeError, match="acknowledged 1/2"):
+            _run(
+                adapter.send_multiple_images(
+                    "12345",
+                    images,
+                    metadata={"_require_native_media_group": True},
+                )
+            )
+
     def test_batch_over_10_chunks(self, adapter):
         """15 photos → two send_media_group calls (10 + 5)."""
         import telegram

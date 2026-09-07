@@ -12,13 +12,25 @@ from __future__ import annotations
 import subprocess
 
 
-def test_no_args_starts_hermes(built_image: str) -> None:
-    """``docker run <image>`` should start hermes cleanly.
+def test_no_args_prints_usage(built_image: str) -> None:
+    """``docker run <image>`` with no args must print usage and exit.
 
-    We invoke ``--version`` so the call exits without needing a configured
-    model. Exit code may be 0 (printed version) or 1 (config bootstrapping
-    failure on a fresh volume), but never a stack trace.
+    Plan 5c: empty CMD used to exec interactive ``hermes`` and hang.
     """
+    r = subprocess.run(
+        ["docker", "run", "--rm", built_image],
+        capture_output=True, text=True, timeout=30,
+    )
+    combined = (r.stdout + r.stderr).lower()
+    assert r.returncode in (0, 1, 2), (
+        f"Unexpected exit {r.returncode}: stderr={r.stderr!r}"
+    )
+    assert "traceback" not in combined
+    assert "usage" in combined or "hermes" in combined
+
+
+def test_version_flag_passthrough(built_image: str) -> None:
+    """``docker run <image> --version`` exits without a stack trace."""
     r = subprocess.run(
         ["docker", "run", "--rm", built_image, "--version"],
         capture_output=True, text=True, timeout=60,
@@ -27,6 +39,22 @@ def test_no_args_starts_hermes(built_image: str) -> None:
         f"Unexpected exit {r.returncode}: stderr={r.stderr!r}"
     )
     assert "Traceback" not in r.stderr
+
+
+def test_mcp_does_not_hit_developer_cli(built_image: str) -> None:
+    """``docker run <image> mcp …`` must reach ``hermes mcp``, not PyPI ``mcp``.
+
+    Plan 5c: hermes-agent[mcp] installs an unrelated developer CLI on PATH.
+    """
+    r = subprocess.run(
+        ["docker", "run", "--rm", built_image, "mcp", "--help"],
+        capture_output=True, text=True, timeout=60,
+    )
+    combined = (r.stdout + r.stderr).lower()
+    assert "traceback" not in combined
+    assert "hermes" in combined or "login" in combined or "mcp" in combined
+    # Developer SDK CLI talks about FastMCP / stdio servers, not Hermes auth.
+    assert "fastmcp" not in combined
 
 
 def test_chat_subcommand_passthrough(built_image: str) -> None:

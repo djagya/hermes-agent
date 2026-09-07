@@ -1,0 +1,9 @@
+# Image-owned managed scope. Leaf keys here win over user config.yaml
+# and `hermes config set` refuses them. Filesystem mode is the v1 lock
+# (root-owned, non-writable by hermes). Do not put secrets here.
+memory:
+  write_approval: false
+skills:
+  write_approval: false
+approvals:
+  cron_mode: deny

@@ -1,14 +1,24 @@
+# syntax=docker/dockerfile:1
 # Debian 13 still ships SQLite 3.46.1, which contains the upstream WAL-reset
 # corruption bug. Build a pinned shared library for the runtime image instead
 # of relying on a distro backport that trixie does not currently provide.
 # See #70480 and https://sqlite.org/wal.html#walresetbug.
-FROM debian:13.4 AS sqlite_build
+# Hub index digest for debian:13.4 (2026-05-08). Pin both stages so CI
+# cannot silently float onto a newer 13.4 rebuild.
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS sqlite_build
+# Hub index date for this debian:13.4 digest. Pin apt so CI cannot float
+# onto a later trixie rebuild of the same tag.
+ARG DEBIAN_SNAPSHOT=20260907T000000Z
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
-RUN apt-get -o Acquire::Retries=3 update && \
+COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
+    apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         build-essential ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/* && \
     (curl -fsSL --retry 1 --retry-all-errors --connect-timeout 15 --max-time 60 \
         -o /tmp/sqlite.tar.gz \
         "https://sqlite.org/2026/sqlite-autoconf-${SQLITE_AUTOCONF_VERSION}.tar.gz" || \
@@ -49,17 +59,45 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # 2.41) runtime.  Bumping to a new Node major is a one-line ARG change; see
 # #4977.
 FROM node:26-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS node_source
-FROM debian:13.4
+
+# Live himalaya is v2.0.0 rev b1f6dece with +gmail +msgraph +native-tls
+# +vendored (not the stock pimalaya install.sh tarball).
+FROM rust:1-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS himalaya_build
+ARG HIMALAYA_REV=b1f6dece32c3afc97d44adeb148bf87e89fde140
+ARG HIMALAYA_SHA256=6c99cabff4c9367d53d52537e2cec311c9dbbaff30edde6ff045437e9d60496b
+RUN curl -fsSL --retry 3 -o /tmp/himalaya.tar.gz \
+        "https://github.com/pimalaya/himalaya/archive/${HIMALAYA_REV}.tar.gz" && \
+    printf '%s  %s\n' "${HIMALAYA_SHA256}" /tmp/himalaya.tar.gz > /tmp/himalaya.sha256 && \
+    sha256sum -c /tmp/himalaya.sha256 && \
+    tar -C /tmp -xzf /tmp/himalaya.tar.gz && \
+    rustc --version && \
+    cd "/tmp/himalaya-${HIMALAYA_REV}" && \
+    cargo build --release --locked --features native-tls,vendored && \
+    install -m 0755 target/release/himalaya /usr/local/bin/himalaya.real && \
+    /usr/local/bin/himalaya.real --version
+# Builder keeps compilers so uv/matrix/python-olm can build wheels.
+# Final published target is `runtime` (last stage) — no gcc/docker-cli.
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS builder
 
 # Disable Python stdout buffering to ensure logs are printed immediately.
 # Do not write .pyc files at runtime: /opt/hermes is immutable in the
 # published container and writable state belongs under /opt/data.
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONFAULTHANDLER=1
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false
+ENV UV_NO_PROGRESS=1
 
 # Store Playwright browsers outside the volume mount so the build-time
-# install survives the /opt/data volume overlay at runtime.
+# install survives the /opt/data volume overlay at runtime. Child npm/pip
+# must not fetch a second browser tree into /opt/data.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# Runtime cache roots live on the `runtime` stage only. Setting them
+# here would make `uv sync` write into /opt/data during the image build.
 
 # Install system dependencies in one layer, clear APT cache.
 # tini was previously PID 1 to reap orphaned zombie processes (MCP stdio
@@ -68,16 +106,45 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # replaces tini with s6-overlay's /init (PID 1 = s6-svscan), which reaps
 # zombies non-blockingly on SIGCHLD and additionally supervises the main
 # hermes process, the dashboard, and per-profile gateways.
-RUN apt-get -o Acquire::Retries=3 update && \
+ARG DEBIAN_SNAPSHOT=20260907T000000Z
+COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
+    apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
-    rm -rf /var/lib/apt/lists/*
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils
+
+# Release B toolbox (Sera document/media + unix + lint). Separate layer so
+# the compiler line above stays cached. No sudo. tesseract-ocr-eng only —
+# no full language packs. LibreOffice is Writer+Calc only.
+# Parsers are relocated to libexec after COPY . . (see install-wrappers.sh).
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends && \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+    bubblewrap \
+    file jq zip unzip p7zip-full zstd libarchive-tools \
+    poppler-utils qpdf ghostscript \
+    tesseract-ocr tesseract-ocr-eng ocrmypdf \
+    imagemagick \
+    pandoc \
+    libreoffice-writer libreoffice-calc \
+    libimage-exiftool-perl libheif1 libheif-examples \
+    fonts-noto-core fonts-noto-color-emoji fonts-liberation \
+    iproute2 bind9-dnsutils lsof psmisc rclone \
+    shellcheck \
+    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info
 
 # Prefer the fixed SQLite over Debian's vulnerable libsqlite3.so.0. Keep the
 # public library name stable so both the system interpreter and the uv-created
 # venv resolve the replacement without changing Python import paths.
 COPY --from=sqlite_build /opt/sqlite-fixed/lib/libsqlite3.so.3.53.4 /usr/local/lib/
-RUN ln -sf libsqlite3.so.3.53.4 /usr/local/lib/libsqlite3.so.0 && \
+COPY --from=sqlite_build /opt/sqlite-fixed/bin/sqlite3 /usr/local/bin/sqlite3
+RUN chmod 0755 /usr/local/bin/sqlite3 && \
+    ln -sf libsqlite3.so.3.53.4 /usr/local/lib/libsqlite3.so.0 && \
     ln -sf libsqlite3.so.3.53.4 /usr/local/lib/libsqlite3.so && \
     printf '/usr/local/lib\n' > /etc/ld.so.conf.d/000-sqlite-fixed.conf && \
     ldconfig && \
@@ -183,6 +250,10 @@ COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
 # apps/shared/ is copied IN FULL because web/package.json references it as a
 # `file:` workspace dependency (same pattern as hermes-ink above).
 COPY apps/shared/ apps/shared/
+# Manifests only — desktop/bootstrap/tests-js stay uninstalled.
+COPY apps/desktop/package.json apps/desktop/
+COPY apps/bootstrap-installer/package.json apps/bootstrap-installer/
+COPY tests-js/package.json tests-js/
 
 # `npm_config_install_links=false` forces npm to install `file:` deps as
 # symlinks instead of copies.  This is the default since npm 10+, which is
@@ -196,12 +267,20 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
-RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
+# Lock-strict install of image workspaces only. Unused workspaces
+# (desktop / bootstrap-installer / tests-js) have package.json on disk
+# so the lock validates, but are not in the --workspace list — no Electron.
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --include-workspace-root \
+      --workspace=web \
+      --workspace=hermes-tui \
+      --workspace=@hermes/ink \
+      --workspace=@hermes/shared \
+      --no-audit --fetch-retries=5 && \
     for i in 1 2 3; do \
         npx playwright install --with-deps chromium --only-shell && break || \
         { [ "$i" = 3 ] && exit 1; echo "playwright install failed (attempt $i); retrying in 10s"; sleep 10; }; \
-    done && \
-    npm cache clean --force
+    done
 
 # ---------- Photon iMessage sidecar deps (baked, NS-606) ----------
 # The photon plugin's Node sidecar needs its own node_modules
@@ -215,9 +294,9 @@ COPY plugins/platforms/photon/sidecar/package.json \
      plugins/platforms/photon/sidecar/package-lock.json \
      plugins/platforms/photon/sidecar/patch-spectrum-mixed-attachments.mjs \
      plugins/platforms/photon/sidecar/
-RUN cd plugins/platforms/photon/sidecar && \
-    npm ci --no-audit --fetch-retries=5 && \
-    npm cache clean --force
+RUN --mount=type=cache,target=/root/.npm \
+    cd plugins/platforms/photon/sidecar && \
+    npm ci --no-audit --fetch-retries=5
 
 # ---------- Layer-cached Python dependency install ----------
 # Copy only pyproject.toml + uv.lock so the Python dep resolve + wheel
@@ -264,7 +343,8 @@ RUN cd plugins/platforms/photon/sidecar && \
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
@@ -272,8 +352,17 @@ RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra 
 COPY web/ web/
 COPY ui-tui/ ui-tui/
 COPY apps/shared/ apps/shared/
-RUN cd web && npm run build && \
-    cd ../ui-tui && npm run build
+RUN --mount=type=cache,target=/root/.npm \
+    cd web && npm run build && \
+    cd ../ui-tui && npm run build && \
+    cd /opt/hermes && npm prune --omit=dev --include-workspace-root \
+      --workspace=web \
+      --workspace=hermes-tui \
+      --workspace=@hermes/ink \
+      --workspace=@hermes/shared && \
+    # prune drops @playwright/test (dev). Runtime still needs the CLI
+    # for `install-deps` (OS libs) and must not npx-download it.
+    npm install --omit=dev --no-audit --no-fund --no-save playwright@1.62.1
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
@@ -289,7 +378,31 @@ COPY --link --chmod=a+rX,go-w . .
 # Link hermes-agent itself (editable). Deps are already installed in the
 # cached layer above; `--no-deps` makes this a fast egg-link creation with no
 # resolution or downloads.
-RUN uv pip install --no-cache-dir --no-deps -e "."
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-deps -e "."
+
+# Release B Python toolbox. Pinned; not in uv.lock. Models for
+# faster-whisper stay under /opt/data (lazy), not the image.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --refresh \
+    "PyMuPDF==1.25.5" \
+    "pymupdf4llm==0.0.17" \
+    "weasyprint==69.0" \
+    "python-docx==1.2.0" \
+    "openpyxl==3.1.5" \
+    "ddgs==9.5.5" \
+    "yt-dlp==2026.08.19" \
+    "tornado==6.5.8" \
+    "faster-whisper==1.2.1" \
+    "fal-client==0.13.1" \
+    "pillow-heif==1.5.0" \
+    "ruff==0.12.12"
+
+RUN --mount=type=cache,target=/root/.npm \
+    npm install -g --omit=dev \
+        markdownlint-cli2@0.18.1 \
+        @hauptsache.net/clickup-mcp@1.8.0 \
+        caldav-mcp@0.10.0
 
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and
@@ -311,7 +424,11 @@ RUN mkdir -p /opt/hermes/bin && \
 # `s6-setuidgid hermes` in its run script. If HERMES_UID is unset, services
 # run as the default hermes user (UID 10000).
 
-# ---------- Bake build-time git revision ----------
+# ---------- Bake image provenance + build-time git revision ----------
+# The versioned, non-secret provenance marker is the authoritative runtime
+# signal that this filesystem came from an immutable image.  It deliberately
+# lives outside both /opt/hermes (which operators sometimes bind-mount as a
+# checkout) and /opt/data (the mutable HERMES_HOME volume).
 # .dockerignore excludes .git, so `git rev-parse HEAD` from inside the
 # container always returns nothing — meaning `hermes dump` reports
 # "(unknown)" and the startup banner drops its `· upstream <sha>` suffix.
@@ -324,14 +441,32 @@ RUN mkdir -p /opt/hermes/bin && \
 # banner.get_git_banner_state() try the baked SHA first, then fall back
 # to live `git rev-parse` for source installs (unchanged behaviour).
 #
-# The arg is optional — local `docker build` without --build-arg simply
-# omits the file, and the runtime falls back to live-git lookup.  CI
+# The arg is optional — local `docker build` without --build-arg omits the
+# SHA file (and records a null provenance revision), so build-info falls back
+# to live-git lookup.  CI
 # (.github/workflows/docker.yml) passes ${{ github.sha }} so
 # every published image has it.
 ARG HERMES_GIT_SHA=
-RUN if [ -n "${HERMES_GIT_SHA}" ]; then \
+# Fork builds override these so the baked provenance marker names the image
+# that was actually published and the ref it was built from. Default is
+# this fork's GHCR name so a local build without --build-arg still
+# identifies as image-managed on ghcr.io/djagya/hermes-agent, not Hub.
+ARG HERMES_IMAGE_NAME=ghcr.io/djagya/hermes-agent
+ARG HERMES_BUILD_REF=
+ARG SOURCE_DATE_EPOCH=
+# Baked into image config so `docker image inspect` (and the monolith
+# post-pull verifier) can bind the bytes to the triggering git SHA
+# without starting the container. Empty when built without --build-arg.
+LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
+      org.opencontainers.image.revision="${HERMES_GIT_SHA}"
+RUN set -eu; \
+    if [ -n "${HERMES_GIT_SHA}" ]; then \
         printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
-    fi
+    fi; \
+    mkdir -p /etc/hermes; \
+    HERMES_GIT_SHA="${HERMES_GIT_SHA}" HERMES_IMAGE_NAME="${HERMES_IMAGE_NAME}" HERMES_BUILD_REF="${HERMES_BUILD_REF}" SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); payload = {"schema": 1, "deployment_kind": "image", "manager": "docker", "image": os.environ.get("HERMES_IMAGE_NAME") or "ghcr.io/djagya/hermes-agent", "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}; ref = os.environ.get("HERMES_BUILD_REF"); epoch = os.environ.get("SOURCE_DATE_EPOCH"); payload.update({"ref": ref} if ref else {}); payload.update({"source_date_epoch": epoch} if epoch else {}); marker.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+COPY docker/sera-toolbox/managed-config.yaml /etc/hermes/config.yaml
+RUN chmod 0444 /etc/hermes/config.yaml
 
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.
@@ -376,7 +511,7 @@ ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 # check. (A separate launcher hardening is tracked independently.)
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
 ENV HERMES_HOME=/opt/data
-ENV HERMES_WRITE_SAFE_ROOT=/opt/data
+ENV HERMES_WRITE_SAFE_ROOT=/opt/data:/opt/vault:/tmp
 ENV HERMES_DISABLE_LAZY_INSTALLS=1
 # The published image seals /opt/hermes (root-owned, read-only) so a runtime
 # lazy install can't mutate the agent's own venv and brick it. But opt-in
@@ -404,7 +539,30 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 # absolute path (/opt/hermes/.venv/bin/hermes). See the shim source for
 # the opt-out env var (HERMES_DOCKER_EXEC_AS_ROOT=1).
 COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
+COPY --chmod=0755 docker/mcp-shim.sh /opt/hermes/bin/mcp
 COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
+COPY --chmod=0755 docker/sera-toolbox/wrap /opt/hermes/docker/sera-toolbox/wrap
+COPY --chmod=0755 docker/sera-toolbox/check-archive-members.py /opt/hermes/docker/sera-toolbox/check-archive-members.py
+COPY --chmod=0755 docker/sera-toolbox/disk-gate.sh /opt/hermes/docker/sera-toolbox/disk-gate.sh
+COPY --chmod=0755 docker/sera-toolbox/helpers/ /opt/hermes/docker/sera-toolbox/helpers/
+COPY docker/sera-toolbox/libreoffice/ /etc/sera-toolbox/libreoffice/
+COPY --chmod=0755 docker/sera-toolbox/install-wrappers.sh /opt/hermes/docker/sera-toolbox/install-wrappers.sh
+COPY --chmod=0755 docker/sera-toolbox/install-network-bins.sh /opt/hermes/docker/sera-toolbox/install-network-bins.sh
+COPY --chmod=0755 docker/sera-toolbox/smoke.sh /opt/hermes/docker/sera-toolbox/smoke.sh
+COPY --chmod=0755 docker/sera-toolbox/start-baked-mcp.sh /opt/hermes/docker/sera-toolbox/start-baked-mcp.sh
+COPY --chmod=0755 docker/sera-toolbox/hermes-image-info.sh /usr/local/bin/hermes-image-info
+COPY --chmod=0755 docker/sera-toolbox/hermes-image-doctor.sh /usr/local/bin/hermes-image-doctor
+COPY --chmod=0755 docker/sera-toolbox/write-toolchain-manifest.sh /opt/hermes/docker/sera-toolbox/write-toolchain-manifest.sh
+COPY --chmod=0755 docker/sera-toolbox/adversarial/ /opt/hermes/docker/sera-toolbox/adversarial/
+COPY --chmod=0755 docker/sera-toolbox/golden-smoke.sh /opt/hermes/docker/sera-toolbox/golden-smoke.sh
+COPY docker/sera-toolbox/seccomp-bwrap.json /opt/hermes/docker/sera-toolbox/seccomp-bwrap.json
+COPY docker/sera-toolbox/ImageMagick/ /etc/sera-toolbox/ImageMagick/
+RUN /opt/hermes/docker/sera-toolbox/install-wrappers.sh
+# TARGETARCH already declared for s6-overlay.
+RUN /opt/hermes/docker/sera-toolbox/install-network-bins.sh
+COPY --from=himalaya_build /usr/local/bin/himalaya.real /usr/local/bin/himalaya.real
+COPY --chmod=0755 docker/sera-toolbox/himalaya-guard.sh /usr/local/bin/himalaya
+RUN /opt/hermes/docker/sera-toolbox/write-toolchain-manifest.sh
 
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported
 # the venv bin onto PATH; Architecture B's main-wrapper.sh does the
@@ -419,7 +577,11 @@ COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-di
 # every other consumer.
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
-VOLUME [ "/opt/data" ]
+# Do not declare VOLUME /opt/data — that creates anonymous state on
+# `docker run` without -v. Compose bind-mounts /opt/data explicitly.
+# Do not ENV HERMES_REQUIRE_DATA_MOUNT=1 here: default entrypoint always
+# runs stage2, so a baked default would break `docker run --help` /
+# image-info without -v. Compose sets the flag for gateway boots.
 
 # The image ENTRYPOINT is a tiny dispatcher rather than `/init` directly.
 # When the image really owns PID 1 (normal Docker / Podman), the dispatcher
@@ -455,3 +617,101 @@ VOLUME [ "/opt/data" ]
 # intercepted by /init's POSIX shell.
 ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
 CMD [ ]
+
+# ---------- runtime (published target) ----------
+# Compilers and docker-cli stay in `builder` only. Hermes has no Docker
+# socket; shipping docker-cli just adds attack surface.
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS runtime
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONFAULTHANDLER=1
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false
+ENV NPM_CONFIG_CACHE=/opt/data/cache/npm
+ENV UV_NO_PROGRESS=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV XDG_CACHE_HOME=/opt/data/cache
+ENV XDG_CONFIG_HOME=/opt/data/.config
+ENV UV_CACHE_DIR=/opt/data/cache/uv
+ENV HERMES_MODEL_ROOT=/opt/data/models
+ENV HF_HOME=/opt/data/models/huggingface
+ENV TRANSFORMERS_CACHE=/opt/data/models/huggingface
+ENV HUGGINGFACE_HUB_CACHE=/opt/data/models/huggingface
+ENV npm_config_install_links=false
+ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
+ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
+ENV HERMES_HOME=/opt/data
+ENV HERMES_CHILD_HOME=/opt/data/home
+ENV HERMES_WRITE_SAFE_ROOT=/opt/data:/opt/vault:/tmp
+ENV HERMES_DISABLE_LAZY_INSTALLS=1
+ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
+ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/command:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+ARG HERMES_GIT_SHA=
+ARG HERMES_IMAGE_NAME=ghcr.io/djagya/hermes-agent
+ARG HERMES_BUILD_REF=
+LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
+      org.opencontainers.image.revision="${HERMES_GIT_SHA}"
+
+ARG DEBIAN_SNAPSHOT=20260907T000000Z
+COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
+    apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends && \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+    ca-certificates curl iputils-ping python3 python-is-python3 \
+    ripgrep ffmpeg libffi8 libolm3 libatomic1 procps git openssh-client xz-utils \
+    bubblewrap \
+    file jq zip unzip p7zip-full zstd libarchive-tools \
+    poppler-utils qpdf ghostscript \
+    tesseract-ocr tesseract-ocr-eng ocrmypdf \
+    imagemagick \
+    pandoc \
+    libreoffice-writer libreoffice-calc \
+    libimage-exiftool-perl libheif1 libheif-examples \
+    fonts-noto-core fonts-noto-color-emoji fonts-liberation \
+    iproute2 bind9-dnsutils lsof psmisc rclone \
+    shellcheck \
+    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info
+
+RUN useradd -u 10000 -m -d /opt/data hermes
+
+COPY --from=builder /opt/hermes /opt/hermes
+COPY --from=builder /usr/local /usr/local
+COPY --from=builder /usr/libexec/sera-toolbox /usr/libexec/sera-toolbox
+COPY --from=builder /etc/hermes /etc/hermes
+COPY --from=builder /etc/sera-toolbox /etc/sera-toolbox
+COPY --from=builder /etc/cont-init.d /etc/cont-init.d
+COPY --from=builder /etc/s6-overlay /etc/s6-overlay
+COPY --from=builder /etc/ld.so.conf.d/000-sqlite-fixed.conf /etc/ld.so.conf.d/000-sqlite-fixed.conf
+COPY --from=builder /init /init
+COPY --from=builder /command /command
+COPY --from=builder /package /package
+COPY --from=builder /usr/bin/tini /usr/bin/tini
+COPY --chmod=0755 docker/sera-toolbox/hermes-healthcheck.sh /usr/local/bin/hermes-healthcheck
+COPY docker/sera-toolbox/hermes-path.sh /etc/profile.d/hermes-path.sh
+
+RUN ldconfig && \
+    cd /opt/hermes && \
+    test -x node_modules/.bin/playwright && \
+    ./node_modules/.bin/playwright install-deps chromium && \
+    mkdir -p /opt/data && \
+    test ! -x /usr/bin/gcc && \
+    test ! -x /usr/bin/docker
+
+ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
+CMD [ ]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+    CMD hermes-healthcheck
+
+# Test stage: runtime plus golden fixtures. Publish stays `runtime`.
+# Plan 5d: fixtures stay out of the published image unless doctor --full
+# needs them (it does not).
+FROM runtime AS test
+COPY docker/sera-toolbox/fixtures/ /opt/hermes/docker/sera-toolbox/fixtures/

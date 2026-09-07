@@ -1,0 +1,44 @@
+# Review-only pin drift PR. Never publishes, never merges.
+name: Pin refresh reminder
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  remind:
+    if: github.repository == 'djagya/hermes-agent'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: true
+
+      - name: Open review-only draft PR with current vs latest pins
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          stamp="$(date -u +%F)"
+          branch="pin-refresh/${stamp}"
+          report="docker/sera-toolbox/pin-refresh-report.md"
+          python3 docker/sera-toolbox/pin-refresh.py --apply --report "$report"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add "$report" Dockerfile docker/sera-toolbox/install-network-bins.sh
+          if git diff --cached --quiet; then
+            echo "pins unchanged"
+            exit 0
+          fi
+          git commit -m "chore(image): pin-refresh ${stamp}"
+          git push -u origin "$branch"
+          gh pr create --draft --title "pin-refresh ${stamp}" \
+            --body-file "$report" \
+            || echo "pr create failed (already open?); report printed above"
+          cat "$report"

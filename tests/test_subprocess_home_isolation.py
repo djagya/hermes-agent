@@ -29,11 +29,14 @@ class TestGetSubprocessHome:
         monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
         monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
         monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_CHILD_HOME", raising=False)
 
     def _container_mode(self, monkeypatch):
         monkeypatch.setattr(hermes_constants, "is_container", lambda: True)
         monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
         monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_CHILD_HOME", raising=False)
+        monkeypatch.delenv("HERMES_CHILD_HOME", raising=False)
 
 
 
@@ -57,6 +60,18 @@ class TestGetSubprocessHome:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         from hermes_constants import get_subprocess_home
         assert get_subprocess_home() == str(profile_home)
+
+    def test_container_child_home_env_wins(self, tmp_path, monkeypatch):
+        self._container_mode(monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        default_home = hermes_home / "home"
+        default_home.mkdir(parents=True)
+        child_home = tmp_path / "child-home"
+        child_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_CHILD_HOME", str(child_home))
+        from hermes_constants import get_subprocess_home
+        assert get_subprocess_home() == str(child_home)
 
     def test_returns_profile_specific_path(self, tmp_path, monkeypatch):
         """Explicit profile mode keeps the old per-profile HOME behavior."""
@@ -253,6 +268,89 @@ class TestProfileBootstrap:
         from hermes_cli.profiles import create_profile
         profile_dir = create_profile("testbot", no_alias=True)
         assert (profile_dir / "home").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# apply_subprocess_home_env() cache roots
+# ---------------------------------------------------------------------------
+
+class TestApplySubprocessHomeCacheRoots:
+    """Container children keep caches on HERMES_HOME, not HOME/.cache."""
+
+    def test_container_fills_missing_cache_roots_from_image_env(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "data"
+        child = hermes_home / "home"
+        child.mkdir(parents=True)
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_CHILD_HOME", str(child))
+        monkeypatch.setenv("XDG_CACHE_HOME", "/opt/data/cache")
+        monkeypatch.setenv("UV_CACHE_DIR", "/opt/data/cache/uv")
+        monkeypatch.setenv("HF_HOME", "/opt/data/cache/huggingface")
+        monkeypatch.delenv("TRANSFORMERS_CACHE", raising=False)
+        monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+
+        env = {"HOME": str(hermes_home), "HERMES_HOME": str(hermes_home)}
+        hermes_constants.apply_subprocess_home_env(env)
+
+        assert env["HOME"] == str(child)
+        assert env["XDG_CACHE_HOME"] == "/opt/data/cache"
+        assert env["UV_CACHE_DIR"] == "/opt/data/cache/uv"
+        assert env["HF_HOME"] == "/opt/data/cache/huggingface"
+        assert env["TRANSFORMERS_CACHE"] == "/opt/data/cache/huggingface"
+        assert env["HF_HOME"] != str(child / ".cache" / "huggingface")
+
+    def test_does_not_invent_cache_roots_without_image_env(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "data"
+        child = hermes_home / "home"
+        child.mkdir(parents=True)
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_CHILD_HOME", str(child))
+        for key in (
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "UV_CACHE_DIR",
+            "NPM_CONFIG_CACHE",
+            "HF_HOME",
+            "TRANSFORMERS_CACHE",
+            "HUGGINGFACE_HUB_CACHE",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        env = {"HOME": str(hermes_home), "HERMES_HOME": str(hermes_home)}
+        hermes_constants.apply_subprocess_home_env(env)
+        assert "XDG_CACHE_HOME" not in env
+        assert "HF_HOME" not in env
+
+    def test_container_keeps_image_cache_env(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "data"
+        child = hermes_home / "home"
+        child.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        env = {
+            "HOME": str(hermes_home),
+            "HERMES_HOME": str(hermes_home),
+            "XDG_CACHE_HOME": "/custom/cache",
+            "HF_HOME": "/custom/hf",
+        }
+        hermes_constants.apply_subprocess_home_env(env)
+        assert env["XDG_CACHE_HOME"] == "/custom/cache"
+        assert env["HF_HOME"] == "/custom/hf"
+        assert env["TRANSFORMERS_CACHE"] == "/custom/hf"
+
+    def test_host_does_not_invent_cache_roots(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+        hermes_home = tmp_path / "hermes"
+        (hermes_home / "home").mkdir(parents=True)
+        real_home = tmp_path / "real"
+        real_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        env = {"HOME": str(real_home), "HERMES_HOME": str(hermes_home)}
+        hermes_constants.apply_subprocess_home_env(env)
+        assert "XDG_CACHE_HOME" not in env
+        assert env["HOME"] == str(real_home)
 
 
 # ---------------------------------------------------------------------------

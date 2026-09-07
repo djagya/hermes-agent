@@ -277,6 +277,62 @@ class TestDocumentDownloadBlock:
         event = adapter.handle_message.call_args[0][0]
         assert "could not be downloaded" in (event.text or "")
 
+    @pytest.mark.asyncio
+    async def test_voice_cache_retries_get_file_and_download_then_succeeds(self, adapter):
+        """Transient failures in either read leg get three total attempts."""
+        failed_download = _make_file_obj()
+        failed_download.download_as_bytearray = AsyncMock(
+            side_effect=OSError("Telegram read interrupted")
+        )
+        successful_download = _make_file_obj(b"OggS recovered voice")
+
+        msg = _make_message()
+        msg.voice = MagicMock()
+        msg.voice.file_size = 100
+        msg.voice.get_file = AsyncMock(
+            side_effect=[
+                OSError("Telegram connect timeout"),
+                failed_download,
+                successful_download,
+            ]
+        )
+        update = _make_update(msg)
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.sleep", new_callable=AsyncMock
+        ) as sleep:
+            await adapter._handle_media_message(update, MagicMock())
+
+        assert msg.voice.get_file.await_count == 3
+        assert sleep.await_count == 2
+        msg.reply_text.assert_not_awaited()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_types == ["audio/ogg"]
+        assert len(event.media_urls) == 1
+
+    @pytest.mark.asyncio
+    async def test_voice_cache_surfaces_failure_after_three_network_attempts(self, adapter):
+        """The failure notice remains after the retry budget is exhausted."""
+        msg = _make_message()
+        msg.voice = MagicMock()
+        msg.voice.file_size = 100
+        msg.voice.get_file = AsyncMock(
+            side_effect=OSError("Telegram connect timeout")
+        )
+        update = _make_update(msg)
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.sleep", new_callable=AsyncMock
+        ) as sleep:
+            await adapter._handle_media_message(update, MagicMock())
+
+        assert msg.voice.get_file.await_count == 3
+        assert sleep.await_count == 2
+        msg.reply_text.assert_awaited_once()
+        adapter.handle_message.assert_called_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert "could not be downloaded" in (event.text or "")
+
 
 class TestVideoDownloadBlock:
     @pytest.mark.asyncio

@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+# PATH wrapper: run a libexec parser inside bubblewrap.
+# Real binary: /usr/libexec/sera-toolbox/<basename>
+# No unsandboxed fallback. Network tools are not installed as wrappers.
+set -euo pipefail
+
+# Do not call /usr/bin/rm from this script. Nested wrap (ImageMagick
+# execs /usr/local/bin/file) runs here inside the parent bwrap, where
+# `rm` can 127 and replace the oversized-output exit 3.
+drop_path() {
+  # Prefer distro python. PATH python3 is often the venv, which is
+  # not bound inside a nested wrap and must not be deleted by a
+  # botched `/` size walk.
+  local py=/usr/bin/python3
+  [ -x "$py" ] || py="$(command -v python3 || true)"
+  [ -n "$py" ] || return 0
+  "$py" -c '
+import os, shutil, sys
+for p in sys.argv[1:]:
+    if not p or not os.path.lexists(p):
+        continue
+    if os.path.isdir(p) and not os.path.islink(p):
+        shutil.rmtree(p, ignore_errors=True)
+    else:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+' "$@"
+}
+
+tool="$(basename "$0")"
+real="/usr/libexec/sera-toolbox/${tool}"
+origin="${real}.origin"
+if [ -f "$origin" ]; then
+  real="$(tr -d '\n' < "$origin")"
+fi
+case "$real" in
+  /usr/*|/bin/*|/opt/hermes/*|/usr/libexec/sera-toolbox/*) ;;
+  *)
+    echo "sera-toolbox: refuse origin ${real}" >&2
+    exit 127
+    ;;
+esac
+if [ ! -x "$real" ]; then
+  echo "sera-toolbox: missing ${real}" >&2
+  exit 127
+fi
+# ImageMagick execs /usr/local/bin/file by absolute path. That wrap
+# must not start a second bwrap (or walk `/` as the output dir).
+if [ "${SERA_SANDBOX_INNER:-}" = 1 ]; then
+  exec "$real" "$@"
+fi
+
+if ! command -v bwrap >/dev/null 2>&1; then
+  echo "sera-toolbox: bubblewrap not installed" >&2
+  exit 127
+fi
+
+cwd="$(pwd -P)"
+out_dir="${SERA_SANDBOX_OUT:-$cwd}"
+# Image WORKDIR is `/`. Never bind or size-walk `/` — that both
+# leaks the container and can delete /opt/hermes after a refuse.
+case "$out_dir" in
+  /|/opt|/opt/hermes|/usr|/usr/local|/bin|/sbin)
+    out_dir="$(mktemp -d /tmp/sera-out.XXXXXX)"
+    ;;
+esac
+mkdir -p "$out_dir"
+
+# Tool-specific hardened flags. Extra caller flags still apply
+# except ffmpeg/ffprobe protocol_whitelist — wrap forces file-only.
+extra=()
+lo_binds=()
+venv_binds=()
+lo_profile=""
+case "$tool" in
+  gs|ghostscript)
+    extra+=(-dSAFER -dNOPAUSE)
+    ;;
+  soffice|libreoffice)
+    # Disposable profile + MacroSecurityLevel 3. Do not pass --safe-mode:
+    # that is LibreOffice crash-recovery UI, not headless convert.
+    extra+=(--headless --norestore --nolockcheck --nofirststartwizard --nologo
+            "-env:UserInstallation=file:///tmp/lo-profile")
+    lo_profile="$(mktemp -d /tmp/lo-profile.XXXXXX)"
+    mkdir -p "$lo_profile/user"
+    if [ -f /etc/sera-toolbox/libreoffice/registrymodifications.xcu ]; then
+      cp /etc/sera-toolbox/libreoffice/registrymodifications.xcu \
+        "$lo_profile/user/"
+    fi
+    lo_binds+=(--bind "$lo_profile" /tmp/lo-profile)
+    ;;
+  ffmpeg)
+    extra+=(-nostdin -protocol_whitelist file,pipe,crypto,data)
+    ;;
+  ffprobe)
+    extra+=(-protocol_whitelist file,pipe,crypto,data)
+    ;;
+  weasyprint|sera-weasyprint|sera-pymupdf)
+    # Helpers live in libexec but import from the image venv.
+    venv_binds+=(--ro-bind /opt/hermes/.venv /opt/hermes/.venv)
+    ;;
+esac
+cleanup() {
+  if [ -n "${lo_profile:-}" ]; then
+    drop_path "$lo_profile"
+  fi
+}
+trap cleanup EXIT
+if [ "$tool" = ffmpeg ] || [ "$tool" = ffprobe ]; then
+  filtered=()
+  skip_next=0
+  for arg in "$@"; do
+    if [ "$skip_next" = 1 ]; then
+      skip_next=0
+      continue
+    fi
+    case "$arg" in
+      -protocol_whitelist=*) continue ;;
+      -protocol_whitelist) skip_next=1; continue ;;
+    esac
+    filtered+=("$arg")
+  done
+  set -- "${filtered[@]}"
+fi
+
+# Reject archive-traversal args and zip-slip members before the sandbox.
+case "$tool" in
+  unzip|7z|7za|bsdtar)
+    for arg in "$@"; do
+      case "$arg" in
+        /*|*".."*)
+          echo "sera-toolbox: refusing absolute or parent-traversal path: ${arg}" >&2
+          exit 2
+          ;;
+      esac
+    done
+    if ! python3 /opt/hermes/docker/sera-toolbox/check-archive-members.py "$@"; then
+      echo "sera-toolbox: refusing zip-slip, bomb, or absolute archive member" >&2
+      exit 2
+    fi
+    ;;
+esac
+
+# Never treat the child-HOME / runtime root as a document cwd.
+case "$cwd" in
+  /opt/data|/opt/data/home|/opt/data/home/*)
+    echo "sera-toolbox: refusing cwd ${cwd} (secrets/runtime root)" >&2
+    exit 2
+    ;;
+esac
+
+# Workload profiles (plan 5e). Caller SERA_SANDBOX_TIMEOUT / _AS_BYTES win.
+nproc_default=64
+case "$tool" in
+  file|exiftool|identify|pdfinfo|heif-info|sera-nproc-probe)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-30}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-536870912}"
+    ;;
+  pdftotext|pdftoppm|pdffonts|pdfimages|qpdf|gs|ghostscript|convert|magick|mogrify|heif-convert)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-1073741824}"
+    ;;
+  tesseract|ocrmypdf)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-180}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-2147483648}"
+    nproc_default=512
+    ;;
+  soffice|libreoffice|pandoc|weasyprint|sera-weasyprint|sera-pymupdf)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-180}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-2147483648}"
+    nproc_default=512
+    ;;
+  ffmpeg|ffprobe)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-1073741824}"
+    ;;
+  unzip|7z|7za|bsdtar)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-60}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-1073741824}"
+    ;;
+  *)
+    timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
+    as_bytes="${SERA_SANDBOX_AS_BYTES:-1073741824}"
+    ;;
+esac
+# Process cap without --unshare-pid (nested Docker EPERM on procfs).
+# Do NOT ulimit -u in this parent: RLIMIT_NPROC is per-UID. On a
+# busy hermes box the user already has >>64 processes, so a parent
+# ulimit -u 64 makes wrap itself fail to fork (live 7z: "Resource
+# temporarily unavailable"). Cap only inside bwrap: --rlimit-nproc
+# plus the inner `ulimit -u` after uid map.
+nproc_lim="${SERA_SANDBOX_NPROC:-$nproc_default}"
+chmod a+rwx "$out_dir" 2>/dev/null || true
+if [ -n "${lo_profile:-}" ]; then
+  chmod -R a+rwx "$lo_profile" 2>/dev/null || true
+fi
+# Dedicated writable output bind. cwd is RO when it is not the out dir.
+# Never bind `/` (image WORKDIR) — system paths are already mounted.
+fs_binds=()
+if [ "$cwd" != "/" ]; then
+  if [ "$(pwd -P)" = "$(cd "$out_dir" && pwd -P)" ]; then
+    fs_binds+=(--bind "$cwd" "$cwd")
+  else
+    fs_binds+=(--ro-bind "$cwd" "$cwd" --bind "$out_dir" "$out_dir")
+  fi
+else
+  fs_binds+=(--bind "$out_dir" "$out_dir")
+fi
+
+start_ns="$(date +%s%N)"
+tmp_receipt="$(mktemp /tmp/sera-bwrap.XXXXXX.json)"
+tmp_before="$(mktemp /tmp/sera-bwrap.XXXXXX.before)"
+find "$out_dir" -xdev -type f -print0 2>/dev/null | sort -z > "$tmp_before" || true
+# Debian snapshot bwrap rejected both --nproc and --rlimit-nproc.
+# Detect optional flags; timeout already caps wall clock.
+bwrap_extra=()
+bwrap_help="$(bwrap --help 2>&1 || true)"
+case "$bwrap_help" in
+  *--rlimit-nproc*) bwrap_extra+=(--rlimit-nproc "$nproc_lim") ;;
+esac
+case "$bwrap_help" in
+  *--cap-drop*) bwrap_extra+=(--cap-drop ALL) ;;
+esac
+home_perms=()
+case "$bwrap_help" in
+  *--perms*) home_perms=(--perms 0777) ;;
+esac
+case "$bwrap_help" in
+  *--rlimit-nofile*) bwrap_extra+=(--rlimit-nofile 1024) ;;
+esac
+case "$bwrap_help" in
+  *--rlimit-as*) bwrap_extra+=(--rlimit-as "$as_bytes") ;;
+esac
+# CPU seconds track the wall-clock profile. Parent must not ulimit -t
+# (same per-UID trap as nproc). Inner bwrap only.
+cpu_sec="${SERA_SANDBOX_CPU:-$timeout_s}"
+case "$bwrap_help" in
+  *--rlimit-cpu*) bwrap_extra+=(--rlimit-cpu "$cpu_sec") ;;
+esac
+# Bounded tmpfs. --size applies to the next --tmpfs. Parent must not
+# grow /tmp unbounded on a zip bomb that passed member checks.
+tmpfs_bytes="${SERA_SANDBOX_TMPFS_BYTES:-268435456}"
+tmpfs_tmp=(--tmpfs /tmp)
+tmpfs_vartmp=(--tmpfs /var/tmp)
+tmpfs_run=(--tmpfs /run)
+case "$bwrap_help" in
+  *--size*)
+    tmpfs_tmp=(--size "$tmpfs_bytes" --tmpfs /tmp)
+    tmpfs_vartmp=(--size "$tmpfs_bytes" --tmpfs /var/tmp)
+    tmpfs_run=(--size "$tmpfs_bytes" --tmpfs /run)
+    ;;
+esac
+# shellcheck disable=SC2016
+status=0
+# Unprivileged wrap can only map its own uid. --uid 65534 from
+# root still maps to host uid 0, which ignores RLIMIT_NPROC —
+# CI fork-bomb therefore runs as hermes (10000).
+bwrap_user=()
+if [ "$(id -u)" -eq 0 ]; then
+  bwrap_user=(--uid 65534 --gid 65534)
+fi
+# env -i: no secrets, no Docker/SSH/MCP, no HERMES_HOME.
+# cwd + out_dir only. tmpfs HOME/tmp. no network.
+# Nested Docker: --unshare-pid + --proc remounts procfs and EPERMs
+# because the container /proc is masked (kernel refuses a "revealing"
+# procfs in the child userns). Do not unmask / systempaths=unconfined
+# / privileged / seccomp=unconfined. Bind the container /proc and /dev
+# instead. PID isolation stays the Hermes container's, not a nested
+# pid ns. PATH puts libexec first so ocrmypdf/soffice spawn real
+# parsers, not these wrappers (no nested bwrap).
+env -i \
+  PATH=/usr/libexec/sera-toolbox:/usr/bin:/bin \
+  HOME=/tmp/home \
+  TMPDIR=/tmp \
+  XDG_CACHE_HOME=/tmp/home/.cache \
+  XDG_CONFIG_HOME=/tmp/home/.config \
+  FONTCONFIG_PATH=/etc/fonts \
+  SERA_SANDBOX_INNER=1 \
+  LANG="${LANG:-C.UTF-8}" \
+  LC_ALL="${LC_ALL:-C.UTF-8}" \
+  MAGICK_CONFIGURE_PATH=/etc/sera-toolbox/ImageMagick \
+  SAL_USE_VCLPLUGIN=svp \
+  timeout --signal=KILL "$timeout_s" \
+  bwrap \
+    --unshare-user \
+    "${bwrap_user[@]}" \
+    --unshare-net \
+    --unshare-uts \
+    --unshare-ipc \
+    --die-with-parent \
+    --new-session \
+    "${bwrap_extra[@]}" \
+    --ro-bind /proc /proc \
+    --dev-bind /dev /dev \
+    --ro-bind-try /sys /sys \
+    "${tmpfs_tmp[@]}" \
+    "${tmpfs_vartmp[@]}" \
+    "${tmpfs_run[@]}" \
+    "${home_perms[@]}" \
+    --dir /tmp/home \
+    "${home_perms[@]}" \
+    --dir /tmp/home/.cache \
+    "${home_perms[@]}" \
+    --dir /tmp/home/.config \
+    --ro-bind-try /etc/passwd /etc/passwd \
+    --ro-bind-try /etc/group /etc/group \
+    --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf \
+    --ro-bind-try /etc/hosts /etc/hosts \
+    --ro-bind-try /etc/localtime /etc/localtime \
+    --ro-bind-try /etc/machine-id /etc/machine-id \
+    --ro-bind-try /etc/magic /etc/magic \
+    --ro-bind-try /etc/magic.mgc /etc/magic.mgc \
+    --ro-bind-try /etc/alternatives /etc/alternatives \
+    --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache \
+    --ro-bind-try /etc/ld.so.conf /etc/ld.so.conf \
+    --ro-bind-try /etc/ld.so.conf.d /etc/ld.so.conf.d \
+    --ro-bind-try /etc/papersize /etc/papersize \
+    --ro-bind /usr /usr \
+    --ro-bind /lib /lib \
+    --ro-bind-try /lib64 /lib64 \
+    --ro-bind /bin /bin \
+    --ro-bind-try /sbin /sbin \
+    --ro-bind /etc/sera-toolbox /etc/sera-toolbox \
+    --ro-bind-try /etc/fonts /etc/fonts \
+    --ro-bind-try /var/cache/fontconfig /var/cache/fontconfig \
+    --ro-bind-try /usr/share/fonts /usr/share/fonts \
+    --ro-bind-try /etc/ImageMagick-7 /etc/ImageMagick-7 \
+    --ro-bind-try /etc/ImageMagick-6 /etc/ImageMagick-6 \
+    --ro-bind-try /etc/libreoffice /etc/libreoffice \
+    --ro-bind-try /etc/ghostscript /etc/ghostscript \
+    --ro-bind-try /var/lib/ghostscript /var/lib/ghostscript \
+    --ro-bind-try /var/lib/tesseract-ocr /var/lib/tesseract-ocr \
+    --ro-bind-try /var/lib/libreoffice /var/lib/libreoffice \
+    "${venv_binds[@]}" \
+    "${lo_binds[@]}" \
+    "${fs_binds[@]}" \
+    --chdir "$cwd" \
+    -- /bin/bash -c 'ulimit -u "$1" || exit 127; shift; exec "$@"' \
+    sera-rlimit "$nproc_lim" "$real" "${extra[@]}" "$@" \
+  || status=$?
+
+end_ns="$(date +%s%N)"
+elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+# Plan 5d: cap new files in the output bind. Pre-existing files stay.
+max_out_bytes="${SERA_SANDBOX_OUT_MAX_BYTES:-268435456}"
+max_out_files="${SERA_SANDBOX_OUT_MAX_FILES:-256}"
+if ! python3 - "$tmp_before" "$out_dir" "$max_out_bytes" "$max_out_files" <<'PY'
+import os, sys
+from pathlib import Path
+before_path, out_dir, max_bytes_s, max_files_s = sys.argv[1:5]
+max_bytes = int(max_bytes_s)
+max_files = int(max_files_s)
+before = set()
+raw = Path(before_path).read_bytes()
+if raw:
+    before.update(p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p)
+new = []
+for dirpath, dirnames, filenames in os.walk(out_dir):
+    dirnames[:] = [d for d in dirnames if d not in (".", "..")]
+    for name in filenames:
+        p = os.path.join(dirpath, name)
+        if p not in before:
+            new.append(p)
+total = 0
+for p in new:
+    try:
+        total += os.path.getsize(p)
+    except OSError:
+        continue
+if len(new) > max_files or total > max_bytes:
+    for p in new:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    sys.exit(3)
+PY
+then
+  echo "sera-toolbox: refusing oversized output (${max_out_bytes} bytes / ${max_out_files} files)" >&2
+  drop_path "$tmp_before" || true
+  exit 3
+fi
+python3 - "$tool" "$status" "$elapsed_ms" "$tmp_receipt" "$tmp_before" "$out_dir" \
+  "$real" "$timeout_s" "$as_bytes" "$nproc_lim" "${cpu_sec:-$timeout_s}" \
+  "${tmpfs_bytes:-268435456}" "$max_out_bytes" "$max_out_files" "$@" <<'PY'
+import hashlib, json, os, sys, time
+from pathlib import Path
+
+def file_rec(p: Path) -> dict:
+    data = p.read_bytes()
+    return {"path": str(p), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+
+tool, status, elapsed_ms, dest = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+before_path, out_dir, real = sys.argv[5], sys.argv[6], sys.argv[7]
+timeout_s, as_bytes, nproc_lim, cpu_sec, tmpfs_bytes, max_out_bytes, max_out_files = (
+    sys.argv[8:15]
+)
+args = sys.argv[15:]
+inputs = []
+for a in args:
+    p = Path(a)
+    if p.is_file():
+        inputs.append(file_rec(p))
+before = set()
+raw = Path(before_path).read_bytes()
+if raw:
+    before.update(p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p)
+outputs = []
+for dirpath, dirnames, filenames in os.walk(out_dir):
+    dirnames[:] = [d for d in dirnames if d not in (".", "..")]
+    for name in filenames:
+        p = Path(dirpath) / name
+        if str(p) not in before:
+            try:
+                outputs.append(file_rec(p))
+            except OSError:
+                continue
+receipt = {
+    "tool": tool,
+    "version": real,
+    "exit": status,
+    "elapsed_ms": elapsed_ms,
+    "ts": int(time.time()),
+    "limits": {
+        "timeout_s": int(timeout_s),
+        "as_bytes": int(as_bytes),
+        "nproc": int(nproc_lim),
+        "cpu_s": int(cpu_sec),
+        "tmpfs_bytes": int(tmpfs_bytes),
+        "out_max_bytes": int(max_out_bytes),
+        "out_max_files": int(max_out_files),
+    },
+    "inputs": inputs,
+    "outputs": outputs,
+}
+Path(dest).write_text(json.dumps(receipt, separators=(",", ":")) + "\n", encoding="utf-8")
+# Never print the receipt on stdout. This wrapper is a PATH stand-in
+# for the real tool; JSON on stdout breaks `tool | grep -q` (pipefail
+# + BrokenPipeError) and pollutes `$(file …)` captures. File only.
+if os.environ.get("SERA_SANDBOX_VERBOSE") == "1":
+    print(json.dumps({"sera_sandbox_receipt": dest, **receipt}, separators=(",", ":")), file=sys.stderr)
+PY
+drop_path "$tmp_before" || true
+
+exit "$status"

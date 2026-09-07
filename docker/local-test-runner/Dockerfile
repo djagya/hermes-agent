@@ -20,7 +20,7 @@ RUN uv sync --locked --python 3.11 --no-install-project \
     && sha256sum uv.lock | cut -d' ' -f1 > /opt/test-env/uv.lock.sha256
 
 COPY docker/local-test-runner/runner.py /opt/hermes-test-runner/runner.py
-RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin runner \
+RUN /usr/sbin/useradd --uid 1000 --create-home --shell /usr/sbin/nologin runner \
     && mkdir -p /spool /work /tmp \
     && chown -R 1000:1000 /spool /work /tmp /opt/hermes-test-runner
 

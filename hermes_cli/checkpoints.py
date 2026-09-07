@@ -101,8 +101,19 @@ def cmd_list(args: argparse.Namespace) -> int:
 def cmd_prune(args: argparse.Namespace) -> int:
     from tools.checkpoint_manager import prune_checkpoints, store_status
 
-    retention_days = args.retention_days
-    max_size_mb = args.max_size_mb
+    from .config import load_config
+
+    checkpoint_config = (load_config().get("checkpoints") or {})
+    retention_days = (
+        args.retention_days
+        if args.retention_days is not None
+        else int(checkpoint_config.get("retention_days", 7))
+    )
+    max_size_mb = (
+        args.max_size_mb
+        if args.max_size_mb is not None
+        else int(checkpoint_config.get("max_total_size_mb", 500))
+    )
     delete_orphans = not args.keep_orphans
 
     # When set, restricts orphan deletion to exactly the identities shown in
@@ -165,7 +176,12 @@ def cmd_prune(args: argparse.Namespace) -> int:
     print(f"Deleted stale:   {result['deleted_stale']}")
     print(f"Errors:          {result['errors']}")
     print(f"Bytes reclaimed: {_fmt_bytes(result['bytes_freed'])}")
-    return 0
+    if result.get("projects_evicted_for_cap"):
+        print(f"Cap evictions:   {result['projects_evicted_for_cap']} project(s)")
+    if result.get("cap_satisfied", 1) == 0:
+        print("Hard cap was NOT satisfied; see checkpoint-manager errors.")
+        return 2
+    return 2 if result["errors"] else 0
 
 
 def _confirm(prompt: str) -> bool:
@@ -253,11 +269,12 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         "prune",
         help="Delete orphan/stale checkpoints and GC the store",
     )
-    p_prune.add_argument("--retention-days", type=int, default=7,
-                         help="Drop projects whose last_touch is older than N days (default 7)")
-    p_prune.add_argument("--max-size-mb", type=int, default=500,
-                         help="After orphan/stale prune, drop oldest commits "
-                              "per project until total size <= this (default 500)")
+    p_prune.add_argument("--retention-days", type=int, default=None,
+                         help="Drop projects whose last_touch is older than N days "
+                              "(default: checkpoints.retention_days, normally 7)")
+    p_prune.add_argument("--max-size-mb", type=int, default=None,
+                         help="Hard physical store cap after pruning "
+                              "(default: checkpoints.max_total_size_mb, normally 500)")
     p_prune.add_argument("--keep-orphans", action="store_true",
                          help="Skip deleting projects whose workdir no longer exists")
     p_prune.add_argument("-f", "--force", action="store_true",

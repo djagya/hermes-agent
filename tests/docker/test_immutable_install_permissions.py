@@ -6,9 +6,15 @@ import textwrap
 
 
 def test_container_sets_hosted_write_policy_env(built_image: str) -> None:
+    # Image default must include vault + tmp; compose pins the same
+    # value. A /opt/data-only root denies vault file tools (plan 5c).
     script = (
+        'printf "HERMES_HOME=%s\\n" "$HERMES_HOME"; '
+        'printf "HERMES_WRITE_SAFE_ROOT=%s\\n" "$HERMES_WRITE_SAFE_ROOT"; '
+        'printf "HERMES_DISABLE_LAZY_INSTALLS=%s\\n" "$HERMES_DISABLE_LAZY_INSTALLS"; '
+        'printf "PYTHONDONTWRITEBYTECODE=%s\\n" "$PYTHONDONTWRITEBYTECODE"; '
         'test "$HERMES_HOME" = "/opt/data" && '
-        'test "$HERMES_WRITE_SAFE_ROOT" = "/opt/data" && '
+        'test "$HERMES_WRITE_SAFE_ROOT" = "/opt/data:/opt/vault:/tmp" && '
         'test "$HERMES_DISABLE_LAZY_INSTALLS" = "1" && '
         'test "$PYTHONDONTWRITEBYTECODE" = "1"'
     )
@@ -18,7 +24,7 @@ def test_container_sets_hosted_write_policy_env(built_image: str) -> None:
         text=True,
         timeout=60,
     )
-    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.returncode == 0, (result.stdout + result.stderr)[-2000:]
 
 
 def test_hermes_user_cannot_modify_install_but_can_write_data(built_image: str) -> None:

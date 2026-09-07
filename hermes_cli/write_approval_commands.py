@@ -38,6 +38,11 @@ def _fmt_pending_list(subsystem: str) -> str:
     for r in records:
         origin = r.get("origin", "foreground")
         tag = " [auto]" if origin == "background_review" else ""
+        state = r.get("state", "pending")
+        if state == "applying":
+            tag += " [applying — recovery required]"
+        if r.get("legacy_schema"):
+            tag += " [legacy — restage required]"
         lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
     where = "/{s} approve <id>".format(s=subsystem)
     lines.append("")
@@ -57,6 +62,7 @@ def handle_pending_subcommand(
     *,
     memory_store=None,
     set_mode_fn=None,
+    refresh_skill_runtime: bool = True,
 ) -> Optional[str]:
     """Dispatch a /memory or /skills subcommand.
 
@@ -85,10 +91,18 @@ def handle_pending_subcommand(
         return _fmt_pending_list(subsystem)
 
     if sub in {"approve", "apply"}:
-        return _approve(subsystem, rest, memory_store)
+        return _approve(
+            subsystem,
+            rest,
+            memory_store,
+            refresh_skill_runtime=refresh_skill_runtime,
+        )
 
     if sub in {"reject", "deny", "drop"}:
         return _reject(subsystem, rest)
+
+    if sub == "resolve":
+        return _resolve_applying(subsystem, rest)
 
     if sub == "diff" and subsystem == wa.SKILLS:
         return _diff(rest)
@@ -105,7 +119,13 @@ def _resolve_one(subsystem: str, rest: List[str]):
     return rest[0], None
 
 
-def _approve(subsystem: str, rest: List[str], memory_store) -> str:
+def _approve(
+    subsystem: str,
+    rest: List[str],
+    memory_store,
+    *,
+    refresh_skill_runtime: bool = True,
+) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
         return err or f"Usage: /{subsystem} approve <id>"
@@ -124,12 +144,21 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
     applied, failed = 0, []
     for rec in targets:
-        ok, msg = _apply_one(subsystem, rec, memory_store)
+        pending_id = rec["id"]
+        ok, msg = wa.apply_pending_record(
+            subsystem,
+            pending_id,
+            lambda current, _subsystem=subsystem: _apply_one(
+                _subsystem,
+                current,
+                memory_store,
+                refresh_skill_runtime=refresh_skill_runtime,
+            ),
+        )
         if ok:
-            wa.discard_pending(subsystem, rec["id"])
             applied += 1
         else:
-            failed.append(f"{rec['id']}: {msg}")
+            failed.append(f"{pending_id}: {msg}")
 
     out = [f"Approved {applied} {subsystem} write(s)."]
     if failed:
@@ -138,7 +167,13 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     return "\n".join(out)
 
 
-def _apply_one(subsystem: str, rec, memory_store):
+def _apply_one(
+    subsystem: str,
+    rec,
+    memory_store,
+    *,
+    refresh_skill_runtime: bool = True,
+):
     payload = rec.get("payload", {})
     try:
         if subsystem == wa.MEMORY:
@@ -149,7 +184,13 @@ def _apply_one(subsystem: str, rec, memory_store):
             return bool(result.get("success")), result.get("error", "")
         else:
             from tools.skill_manager_tool import apply_skill_pending
-            result = json.loads(apply_skill_pending(payload))
+            result = json.loads(
+                apply_skill_pending(
+                    payload,
+                    refresh_runtime=refresh_skill_runtime,
+                    emit_lifecycle=refresh_skill_runtime,
+                )
+            )
             return bool(result.get("success")), result.get("error", "")
     except Exception as e:
         return False, str(e)
@@ -161,13 +202,42 @@ def _reject(subsystem: str, rest: List[str]) -> str:
         return err or f"Usage: /{subsystem} reject <id>"
     if target.lower() == "all":
         n = 0
+        quarantined = []
         for rec in wa.list_pending(subsystem):
+            if rec.get("state", "pending") == "applying":
+                quarantined.append(rec["id"])
+                continue
             if wa.discard_pending(subsystem, rec["id"]):
                 n += 1
-        return f"Rejected {n} pending {subsystem} write(s)."
+        out = [f"Rejected {n} pending {subsystem} write(s)."]
+        if quarantined:
+            out.append(
+                "Not rejected; target reconciliation required for applying "
+                "record(s): " + ", ".join(quarantined)
+            )
+        return "\n".join(out)
+    rec = wa.get_pending(subsystem, target)
+    if rec and rec.get("state", "pending") == "applying":
+        return (
+            f"Pending {subsystem} write '{target}' is in applying state; "
+            "reconcile its target before discarding the approval evidence."
+        )
     if wa.discard_pending(subsystem, target):
         return f"Rejected pending {subsystem} write '{target}'."
     return f"No pending {subsystem} write with id '{target}'."
+
+
+def _resolve_applying(subsystem: str, rest: List[str]) -> str:
+    if len(rest) != 2 or rest[1] not in {"applied", "not-applied"}:
+        return (
+            f"Usage: /{subsystem} resolve <id> applied|not-applied "
+            "(only after inspecting the target)"
+        )
+    pending_id, resolution = rest
+    ok, message = wa.resolve_applying(subsystem, pending_id, resolution)
+    if ok:
+        return f"Resolved pending {subsystem} write '{pending_id}': {message}."
+    return f"Could not resolve pending {subsystem} write '{pending_id}': {message}."
 
 
 def _diff(rest: List[str]) -> str:

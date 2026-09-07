@@ -132,6 +132,88 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_review_rejection_is_actionable(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        implementation = kb.get_task(conn, worker_env)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            worker_env,
+            summary="ready for review",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, worker_env)
+        assert review is not None
+    finally:
+        conn.close()
+
+    rejected = json.loads(
+        kt._handle_complete(
+            {
+                "summary": "conditional result",
+                "metadata": {"verdict": "CONDITIONAL PASS"},
+            }
+        )
+    )
+    assert "error" in rejected
+    assert "still in-flight" in rejected["error"]
+    assert "kanban_request_changes" in rejected["error"]
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_claimed_review_accepts_exact_pass(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        implementation = kb.get_task(conn, worker_env)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            worker_env,
+            summary="ready for approval",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, worker_env)
+        assert review is not None
+    finally:
+        conn.close()
+
+    completed = json.loads(
+        kt._handle_complete(
+            {
+                "summary": "approved",
+                "metadata": {"verdict": "PASS", "tests": "green"},
+            }
+        )
+    )
+    assert completed["ok"] is True
+    assert completed["task_id"] == worker_env
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "done"
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.metadata == {"verdict": "PASS", "tests": "green"}
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
