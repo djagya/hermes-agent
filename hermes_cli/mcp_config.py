@@ -402,19 +402,21 @@ def _probe_single_server(
 
 
 def _oauth_tokens_present(name: str) -> bool:
-    """Return True if an OAuth token file exists on disk for ``name``.
+    """Return True if a durable OAuth grant exists on disk for ``name``.
 
     Used after ``hermes mcp login`` to distinguish a genuine authentication
     from a probe that succeeded only because the server allowed
-    initialize/tools-list without auth (so no token was ever acquired).
+    initialize/tools-list without auth (so no token was ever acquired), or
+    from a finite-lived access token that cannot refresh noninteractively.
     """
     try:
         from tools.mcp_oauth import HermesTokenStorage
-        return HermesTokenStorage(name).has_cached_tokens()
+        return HermesTokenStorage(name).has_durable_tokens()
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("Could not check OAuth tokens for '%s': %s", name, exc)
-        # Be permissive on unexpected errors: don't block a real success.
-        return True
+        # Commissioning must fail closed: an unreadable grant is not proof of
+        # durable noninteractive authentication.
+        return False
 
 
 def _unwrap_exception_group(exc: BaseException) -> Exception:
@@ -869,8 +871,9 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         # Verify a token actually landed on disk before claiming success.
         if not _oauth_tokens_present(name):
             _warning(
-                "Server responded, but no OAuth token was obtained — "
-                "authentication did not complete."
+                "Server responded, but no durable OAuth grant was obtained — "
+                "authentication did not complete or the finite-lived access "
+                "token has no refresh token."
             )
             print()
             _info(

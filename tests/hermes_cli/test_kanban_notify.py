@@ -1,5 +1,6 @@
 import asyncio
 import pytest
+import yaml
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +34,53 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["thread_id"] == "topic1"
     assert subs[0]["user_id"] == "user1"
     assert subs[0]["notifier_profile"] == "default"
+
+
+def test_fixed_notify_target_covers_create_and_rewrites_subscribe(kanban_home):
+    """Every creation/subscription surface converges on operator policy."""
+    (kanban_home / "config.yaml").write_text(
+        yaml.safe_dump({
+            "kanban": {
+                "fixed_notify_target": {
+                    "enabled": True,
+                    "platform": "telegram",
+                    "chat_id": "-1003892608742",
+                    "thread_id": "36822",
+                    "chat_type": "group",
+                    "notifier_profile": "default",
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="fixed route", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="wrong-chat",
+            thread_id="wrong-thread",
+            user_id="wrong-user",
+            user_id_alt="wrong-alt",
+            notifier_profile="wrong-profile",
+            delivery_mode="wake",
+        )
+        subs = kb.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "-1003892608742"
+    assert subs[0]["thread_id"] == "36822"
+    assert subs[0]["chat_type"] == "group"
+    assert subs[0]["notifier_profile"] == "default"
+    assert subs[0]["delivery_mode"] == "wake"
+    assert subs[0]["user_id"] is None
+    assert subs[0]["user_id_alt"] is None
 
 
 def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):

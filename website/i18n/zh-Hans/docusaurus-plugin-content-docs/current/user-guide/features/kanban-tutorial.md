@@ -190,7 +190,10 @@ kanban_request_review(
 )
 
 # --- Reviewer：批准 ---
-kanban_complete(summary="review passed; acceptance criteria verified")
+kanban_complete(
+    summary="review passed; acceptance criteria verified",
+    metadata={"verdict": "PASS"},
+)
 # → done
 ```
 

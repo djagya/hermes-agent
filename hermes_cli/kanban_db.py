@@ -1589,10 +1589,21 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
-    # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
-    # the PRAGMA explicitly so it is observable and survives future wrapper
-    # changes. Parameter binding is not supported for PRAGMA assignments.
-    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    try:
+        # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
+        # the PRAGMA explicitly so it is observable and survives future wrapper
+        # changes. Parameter binding is not supported for PRAGMA assignments.
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    except BaseException:
+        # A half-open connection abandoned here would leak its fd AND leave a
+        # stale entry in the connect_tracked live-connection registry (which
+        # only clears on close), permanently blocking byte-level probes of
+        # this database file. Close before re-raising.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
     return conn
 
 
@@ -3115,6 +3126,28 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         _check_file_length_invariant(conn)
 
 
+@contextlib.contextmanager
+def _write_txn_raise_after_commit(conn: sqlite3.Connection):
+    """Commit an auditable rejection before surfacing its domain error.
+
+    ``defer(error)`` records one exception. A normal exit from the body commits
+    through :func:`write_txn`, then raises that exception. Transaction or commit
+    failures take precedence and are never hidden by the deferred error.
+    """
+    deferred_error: Optional[Exception] = None
+
+    def defer(error: Exception) -> None:
+        nonlocal deferred_error
+        if deferred_error is not None:
+            raise RuntimeError("only one post-commit exception may be deferred")
+        deferred_error = error
+
+    with write_txn(conn):
+        yield defer
+    if deferred_error is not None:
+        raise deferred_error
+
+
 # ---------------------------------------------------------------------------
 # ID generation
 # ---------------------------------------------------------------------------
@@ -3393,6 +3426,8 @@ def create_task(
             )
         skills_list = cleaned
 
+    fixed_notify_target = _fixed_notify_target()
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -3406,6 +3441,12 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            if fixed_notify_target:
+                add_notify_sub(
+                    conn,
+                    task_id=row["id"],
+                    **fixed_notify_target,
+                )
             return row["id"]
 
     now = int(time.time())
@@ -3555,6 +3596,20 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if fixed_notify_target:
+                    _insert_notify_sub(
+                        conn,
+                        task_id=task_id,
+                        delivery_metadata={
+                            key: value
+                            for key, value in {
+                                "thread_id": fixed_notify_target.get("thread_id"),
+                                "chat_type": fixed_notify_target.get("chat_type"),
+                            }.items()
+                            if value
+                        } or None,
+                        **fixed_notify_target,
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -5349,6 +5404,108 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class NonPassingVerdictError(ValueError):
+    """Raised when review completion lacks an exact ``PASS`` verdict.
+
+    The task is left in-flight and an auditable rejection event is committed
+    before this exception reaches the caller.
+    """
+
+    def __init__(self, verdict: str, task_id: str):
+        self.verdict = verdict
+        self.task_id = task_id
+        super().__init__(
+            "review completion blocked: metadata.verdict must normalize to "
+            f"exactly 'PASS'; received {verdict!r}"
+        )
+
+
+def _normalize_completion_verdict(metadata: Optional[dict]) -> str:
+    """Return the normalized review verdict from completion metadata."""
+    if not isinstance(metadata, dict) or "verdict" not in metadata:
+        return "MISSING"
+    raw = metadata.get("verdict")
+    if not isinstance(raw, str):
+        return "INVALID"
+    normalized = raw.strip().upper()
+    return normalized or "MISSING"
+
+
+def _completion_review_context(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int],
+) -> Optional[tuple[str, Optional[int], bool]]:
+    """Resolve current completion ownership and whether it is a review.
+
+    ``None`` means the task/run is not currently eligible for completion.
+    Review identity is durable: a parked review task is review work directly,
+    a claimed reviewer run is recognized by its ``source_status`` event, and a
+    reviewer escalation remains review work while parked in ``blocked``.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in {"running", "ready", "blocked", "review"}:
+        return None
+    current_run_id = row["current_run_id"]
+    if expected_run_id is not None and (
+        current_run_id is None or int(current_run_id) != int(expected_run_id)
+    ):
+        return None
+    is_review = (
+        row["status"] == "review"
+        or (
+            row["status"] == "running"
+            and current_run_id is not None
+            and _retry_status_for_run(conn, task_id, int(current_run_id)) == "review"
+        )
+        or (
+            row["status"] == "blocked"
+            and _resume_status_from_events(conn, task_id) == "review"
+        )
+    )
+    return str(row["status"]), current_run_id, is_review
+
+
+def _enforce_completion_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    expected_run_id: Optional[int],
+) -> bool:
+    """Fail closed when durable review work lacks an exact PASS verdict.
+
+    Returns ``False`` for an ineligible/stale completion target. A semantic
+    rejection commits its own event and then raises
+    :class:`NonPassingVerdictError`, leaving task state untouched.
+    """
+    rejected: Optional[str] = None
+    with write_txn(conn):
+        context = _completion_review_context(conn, task_id, expected_run_id)
+        if context is None:
+            return False
+        _, current_run_id, is_review = context
+        verdict = _normalize_completion_verdict(metadata)
+        if is_review and verdict != "PASS":
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_nonpassing_verdict",
+                {
+                    "verdict": verdict,
+                    "source_status": "review",
+                },
+                run_id=current_run_id,
+            )
+            rejected = verdict
+    if rejected is not None:
+        raise NonPassingVerdictError(rejected, task_id)
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5373,9 +5530,12 @@ def complete_task(
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
     When ``summary`` is omitted we fall back to ``result`` so single-run
-    callers do not have to pass both. ``metadata`` is a free-form dict
-    (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers
-    are encouraged to use it for structured handoff facts.
+    callers do not have to pass both. ``metadata`` remains a free-form dict
+    (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers are
+    encouraged to use it for structured handoff facts. When the durable task
+    context identifies review work, ``metadata.verdict`` must normalize to
+    exact ``PASS``; rejection commits an audit event and raises
+    :class:`NonPassingVerdictError` without changing task or dependency state.
 
     ``created_cards`` is an optional list of task ids the completing
     worker claims to have created. Each id is verified against
@@ -5396,6 +5556,18 @@ def complete_task(
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
+        return False
+
+    # Semantic review gate. Validate run ownership before recording any
+    # rejection so a stale worker cannot write a false verdict event. Review
+    # tasks (parked or actively claimed) require metadata.verdict=PASS;
+    # ordinary completions preserve the existing free-form metadata contract.
+    if not _enforce_completion_verdict(
+        conn,
+        task_id,
+        metadata,
+        expected_run_id=expected_run_id,
+    ):
         return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -5428,17 +5600,37 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    completion_is_review = False
+    with _write_txn_raise_after_commit(conn) as raise_after_commit:
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
         if not _parents_satisfied(conn, task_id):
             return False
-        prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        prior_status = prior["status"] if prior else None
+        # The review lane can change after the preflight check (for example, a
+        # concurrent request_review can land while prose artifacts are staged).
+        # Resolve it again under the same write lock as the final UPDATE.
+        context = _completion_review_context(conn, task_id, expected_run_id)
+        if context is None:
+            return False
+        _, current_run_id, completion_is_review = context
+        verdict = _normalize_completion_verdict(metadata)
+        if completion_is_review and verdict != "PASS":
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_nonpassing_verdict",
+                {
+                    "verdict": verdict,
+                    "source_status": "review",
+                },
+                run_id=current_run_id,
+            )
+            # A normal return commits the rejection event; the wrapper then
+            # overrides this pending return with the same actionable exception
+            # used by the ordinary preflight path.
+            raise_after_commit(NonPassingVerdictError(verdict, task_id))
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5499,16 +5691,20 @@ def complete_task(
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
         if run_id is None and (
-            summary or metadata or result or prior_status == "review"
+            summary or metadata or result or completion_is_review
         ):
             synth_summary = summary if summary is not None else result
             synth_metadata = metadata
-            if prior_status == "review" and not synth_summary and not synth_metadata:
-                synth_summary = "Review approved without additional evidence."
-                synth_metadata = {
-                    "source_status": "review",
-                    "approval": "manual",
-                }
+            if completion_is_review:
+                if not synth_summary:
+                    synth_summary = "Review approved without additional evidence."
+                synth_metadata = dict(metadata or {})
+                synth_metadata.update(
+                    {
+                        "source_status": "review",
+                        "approval": "manual",
+                    }
+                )
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",
@@ -5520,7 +5716,7 @@ def complete_task(
         # second SQL round-trip. First line only, 400 char cap — the
         # full summary stays on the run row.
         event_summary = summary if summary is not None else result
-        if prior_status == "review" and not event_summary:
+        if completion_is_review and not event_summary:
             event_summary = "Review approved without additional evidence."
         _ev_lines = (event_summary or "").strip().splitlines()
         ev_summary = _ev_lines[0][:400] if _ev_lines else ""
@@ -11382,6 +11578,145 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     }
 
 
+def _fixed_notify_target() -> Optional[dict[str, Any]]:
+    """Return the install-wide Kanban notification target, when configured.
+
+    The target is operator policy, not a caller preference: every task is born
+    subscribed to it and every later subscription request converges on the same
+    route.  Resolving it at the DB seam covers CLI, dashboard, cron, slash
+    commands, and agent tools without duplicating policy in those callers.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        kanban = config.get("kanban") if isinstance(config, Mapping) else None
+        raw = (
+            kanban.get("fixed_notify_target", {})
+            if isinstance(kanban, Mapping)
+            else {}
+        )
+    except Exception:
+        return None
+    if not isinstance(raw, Mapping) or not raw.get("enabled"):
+        return None
+    platform = str(raw.get("platform") or "").strip().lower()
+    chat_id = str(raw.get("chat_id") or "").strip()
+    if not platform or not chat_id:
+        _log.warning(
+            "kanban.fixed_notify_target is enabled but platform/chat_id is missing"
+        )
+        return None
+    return {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": str(raw.get("thread_id") or "").strip() or None,
+        "chat_type": str(raw.get("chat_type") or "").strip() or None,
+        "notifier_profile": (
+            str(raw.get("notifier_profile") or "").strip() or None
+        ),
+    }
+
+
+def _insert_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+    chat_type: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    delivery_mode: Optional[str] = None,
+    delivery_metadata: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Insert or refresh one subscription inside the caller's transaction."""
+    insert_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else (
+        # api_server is stateless: its wake self-post is the delivery.
+        "notify+wake" if platform == "api_server" else "notify"
+    )
+    insert_chat_type = chat_type or "dm"
+    metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+             chat_type, notifier_profile, delivery_mode, delivery_metadata,
+             created_at, last_event_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+        """,
+        (
+            task_id,
+            platform,
+            chat_id,
+            thread_id or "",
+            user_id,
+            user_id_alt,
+            insert_chat_type,
+            notifier_profile,
+            insert_mode,
+            metadata_json,
+            int(time.time()),
+            task_id,
+        ),
+    )
+    if chat_type:
+        # Explicit chat_type is last-write-wins on re-subscribe.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET chat_type = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (chat_type, task_id, platform, chat_id, thread_id or ""),
+        )
+    if user_id_alt:
+        # Self-heal legacy rows created before alternate IDs were tracked.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET user_id_alt = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+               AND (user_id_alt IS NULL OR user_id_alt = '')
+            """,
+            (user_id_alt, task_id, platform, chat_id, thread_id or ""),
+        )
+    if notifier_profile:
+        # Self-heal legacy rows that predate notifier ownership.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET notifier_profile = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+               AND (notifier_profile IS NULL OR notifier_profile = '')
+            """,
+            (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+        )
+    if delivery_mode in _NOTIFY_DELIVERY_MODES:
+        # Explicit delivery_mode is last-write-wins on re-subscribe.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET delivery_mode = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (delivery_mode, task_id, platform, chat_id, thread_id or ""),
+        )
+    if metadata_json:
+        # Refresh the routing anchor for duplicate subscriptions.
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET delivery_metadata = ?
+             WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+            """,
+            (metadata_json, task_id, platform, chat_id, thread_id or ""),
+        )
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -11396,124 +11731,44 @@ def add_notify_sub(
     delivery_mode: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread).
+    """Register a terminal-state notification route for ``task_id``.
 
-    ``user_id_alt`` records the originating source's platform-specific stable
-    alt ID (Signal UUID, Feishu union_id, ...) alongside ``user_id``. Active-wake
-    replay must reproduce it so the woken turn's ``build_session_key`` matches
-    the original event's — ``build_session_key`` prefers ``user_id_alt`` over
-    ``user_id`` (gateway/session.py), so replaying only ``user_id`` would key a
-    wake into a different session whenever the two diverge for this source.
-
-    ``chat_type`` records the originating source's chat type; the active-wake
-    delivery modes replay it so the woken turn resolves the operator's real
-    channel. ``None`` keeps an existing row's value.
-
-    ``delivery_mode`` (see ``_NOTIFY_DELIVERY_MODES``) selects how the
-    kanban-notifier reacts to a terminal event for this subscription. ``None``
-    leaves an existing row's mode untouched (and inserts the ``"notify"``
-    default for a fresh row); an explicit value is last-write-wins, so an
-    operator can intentionally re-subscribe to change the mode (e.g.
-    ``notify`` -> ``wake``). An unknown value falls back to ``"notify"``.
-    New subscriptions start "caught up": ``last_event_id`` snaps to the
-    task's current ``MAX(task_events.id)`` at creation instead of the
-    schema default 0. A cursor of 0 on an already-active task made the
-    gateway notifier replay every historical terminal event on its next
-    tick — and with many stale subs, a single boot-time burst of 100+
-    messages (issue #29905). Subscribers only want events that occur
-    AFTER they subscribe; the gateway/tool auto-subscribe paths run at
-    task creation, where the snapshot is 0 anyway.
+    When ``kanban.fixed_notify_target`` is enabled, caller-supplied routing is
+    canonicalized here.  Delivery mode remains a caller choice; source identity
+    is cleared because an install-wide operator route is not owned by the
+    originating user/session.
     """
-    insert_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else (
-        # api_server is stateless: the adapter has no send() — the wake
-        # self-post IS the delivery on that path (see gateway/wake.py and
-        # test_kanban_notifier_apiserver_wake). A plain-'notify' default
-        # would leave those subscriptions with no delivery mechanism at
-        # all, regressing the pre-delivery_mode behavior where a task
-        # carrying a session_id always woke. Explicit modes still win.
-        "notify+wake" if platform == "api_server" else "notify"
-    )
-    insert_chat_type = chat_type or "dm"
-    now = int(time.time())
-    metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
+    fixed_target = _fixed_notify_target()
+    if fixed_target:
+        platform = str(fixed_target["platform"])
+        chat_id = str(fixed_target["chat_id"])
+        thread_id = fixed_target.get("thread_id")
+        chat_type = fixed_target.get("chat_type")
+        notifier_profile = fixed_target.get("notifier_profile")
+        user_id = None
+        user_id_alt = None
+        delivery_metadata = {
+            key: value
+            for key, value in {
+                "thread_id": thread_id,
+                "chat_type": chat_type,
+            }.items()
+            if value
+        } or None
     with write_txn(conn):
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-                 chat_type, notifier_profile, delivery_mode, delivery_metadata,
-                 created_at, last_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
-            """,
-            (
-                task_id,
-                platform,
-                chat_id,
-                thread_id or "",
-                user_id,
-                user_id_alt,
-                insert_chat_type,
-                notifier_profile,
-                insert_mode,
-                metadata_json,
-                now,
-                task_id,
-            ),
+        _insert_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            user_id_alt=user_id_alt,
+            chat_type=chat_type,
+            notifier_profile=notifier_profile,
+            delivery_mode=delivery_mode,
+            delivery_metadata=delivery_metadata,
         )
-        if chat_type:
-            # Explicit chat_type is last-write-wins on re-subscribe.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET chat_type = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                """,
-                (chat_type, task_id, platform, chat_id, thread_id or ""),
-            )
-        if user_id_alt:
-            # Self-heal legacy rows created before alternate IDs were tracked.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET user_id_alt = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (user_id_alt IS NULL OR user_id_alt = '')
-                """,
-                (user_id_alt, task_id, platform, chat_id, thread_id or ""),
-            )
-        if notifier_profile:
-            # Self-heal legacy rows that predate notifier ownership.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
-            )
-        if delivery_mode in _NOTIFY_DELIVERY_MODES:
-            # Explicit delivery_mode is last-write-wins on re-subscribe.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET delivery_mode = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                """,
-                (delivery_mode, task_id, platform, chat_id, thread_id or ""),
-            )
-        if metadata_json:
-            # Refresh the routing anchor for duplicate subscriptions.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET delivery_metadata = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                """,
-                (metadata_json, task_id, platform, chat_id, thread_id or ""),
-            )
 
 
 def _notify_profile_filter(

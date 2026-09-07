@@ -7,8 +7,8 @@
 # (and in main-wrapper.sh) via s6-setuidgid, not here.
 #
 # Wired into the image as /etc/cont-init.d/01-hermes-setup by the
-# Dockerfile. The shim at docker/entrypoint.sh forwards to this script
-# so external references to docker/entrypoint.sh still work.
+# Dockerfile. The shim at docker/entrypoint.sh runs this script, then
+# execs main-wrapper.sh so a hard-coded old ENTRYPOINT still runs CMD.
 #
 # NB: cont-init.d scripts run with no arguments — the user's CMD args
 # are NOT visible here. That's fine: we use Architecture B (s6-overlay
@@ -16,6 +16,7 @@
 # stdin/stdout/stderr access and handles arg parsing there.
 
 set -eu
+umask 002
 
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
 INSTALL_DIR="/opt/hermes"
@@ -84,6 +85,22 @@ fi
 # denied` and the cont-init hook exits non-zero. Idempotent — `mkdir -p`
 # is a no-op if the dir already exists. (#18482, salvages #18488)
 mkdir -p "$HERMES_HOME"
+
+# Release B: refuse boot when the data volume is too tight for a
+# config/DB migration. Override with HERMES_MIN_FREE_KB (default 2 GiB).
+# Logic + 3× SQLite/WAL + SELECT 1 openability live in disk-gate.sh.
+avail_kb="$(df -Pk "$HERMES_HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
+DISK_GATE="/opt/hermes/docker/sera-toolbox/disk-gate.sh"
+if [ ! -f "$DISK_GATE" ]; then
+    echo "[stage2] ERROR: missing $DISK_GATE" >&2
+    exit 1
+fi
+# Run via sh: image COPY --chmod=a+rX only keeps +x if git already had it.
+sh "$DISK_GATE" --check "$HERMES_HOME" || exit 1
+if [ "${HERMES_REQUIRE_DATA_MOUNT:-}" = "1" ] && ! mountpoint -q "$HERMES_HOME"; then
+    echo "[stage2] ERROR: $HERMES_HOME is not an explicit bind/named mount. Use docker compose or docker run -v …:${HERMES_HOME}" >&2
+    exit 1
+fi
 
 # Numeric UID/GID validation: must be digits only, non-root, 1-65534.
 # NAS hosts such as Unraid commonly use low non-root IDs (99:100).
@@ -216,8 +233,10 @@ chown_hermes_tree() {
     if refuse_symlinked_path "recursive chown" "$target"; then
         return 0
     fi
-    chown -R hermes:hermes "$target" 2>/dev/null || \
-        echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
+    if ! chown -R hermes:hermes "$target"; then
+        echo "[stage2] ERROR: chown $target failed" >&2
+        exit 1
+    fi
 }
 
 tree_has_non_hermes_owner() {
@@ -247,7 +266,9 @@ if [ "$needs_chown" = true ]; then
     # Hermes-owned subdirs: recursive chown is safe here because these are
     # created and managed exclusively by hermes (see the s6-setuidgid mkdir
     # -p block below for the canonical list).
-    for sub in cron sessions logs hooks memories skills skins plans workspace home profiles pairing platforms/pairing lazy-packages; do
+    # $HERMES_HOME/home is child HOME and can hold huge caches. Top-level
+    # owner/mode + write-probe only (ensure_required_root after seed).
+    for sub in cron sessions logs hooks memories skills skins plans workspace profiles pairing platforms/pairing lazy-packages; do
         if [ -e "$HERMES_HOME/$sub" ] && tree_has_non_hermes_owner "$HERMES_HOME/$sub"; then
             chown_hermes_tree "$HERMES_HOME/$sub"
         fi
@@ -306,7 +327,8 @@ if [ -d "$HERMES_HOME/logs/gateways" ]; then
     if refuse_symlinked_path "chown" "$HERMES_HOME/logs/gateways"; then
         :
     else
-        chown hermes:hermes "$HERMES_HOME/logs/gateways" 2>/dev/null || true
+        chown hermes:hermes "$HERMES_HOME/logs/gateways" 2>/dev/null || \
+            echo "[stage2] Warning: chown $HERMES_HOME/logs/gateways failed (rootless?) — write-probe will decide"
     fi
 fi
 
@@ -391,9 +413,97 @@ as_hermes mkdir -p \
     "$HERMES_HOME/plans" \
     "$HERMES_HOME/workspace" \
     "$HERMES_HOME/home" \
+    "$HERMES_HOME/cache" \
+    "$HERMES_HOME/cache/uv" \
+    "$HERMES_HOME/cache/npm" \
+    "$HERMES_HOME/cache/huggingface" \
+    "$HERMES_HOME/models" \
     "$HERMES_HOME/pairing" \
     "$HERMES_HOME/platforms/pairing" \
-    "$HERMES_HOME/lazy-packages"
+    "$HERMES_HOME/lazy-packages" \
+    "$HERMES_HOME/hotfixes" \
+    "$HERMES_HOME/state" \
+    "$HERMES_HOME/profiles"
+
+# Disposable caches only. Never tag $HERMES_HOME/cache, models, or
+# huggingface — restic --exclude-caches would then skip durable models.
+write_cachedir_tag() {
+    dir="$1"
+    [ -d "$dir" ] || return 0
+    if [ -f "$dir/CACHEDIR.TAG" ]; then
+        return 0
+    fi
+    as_hermes sh -c "printf '%s\n' \
+        'Signature: 8a477f597d28d172789f06886806bc55' \
+        '# This file is a cache directory tag created by hermes.' \
+        '# For information about cache directory tags, see:' \
+        '#	https://bford.info/cachedir/spec.html' \
+        > \"$dir/CACHEDIR.TAG\"" \
+        || echo "[stage2] Warning: cannot write $dir/CACHEDIR.TAG — continuing"
+}
+write_cachedir_tag "$HERMES_HOME/cache/uv"
+write_cachedir_tag "$HERMES_HOME/cache/npm"
+
+# Required-path write probe after remap + seed. Fail closed.
+probe="$HERMES_HOME/.stage2-write-probe"
+if ! as_hermes sh -c "umask 002; : > \"$probe\" && rm -f \"$probe\""; then
+    echo "[stage2] ERROR: hermes cannot write $HERMES_HOME after remap" >&2
+    exit 1
+fi
+if ! as_hermes sh -c 'umask 002; : > /tmp/.stage2-tmp-probe && rm -f /tmp/.stage2-tmp-probe'; then
+    echo "[stage2] ERROR: hermes cannot write /tmp" >&2
+    exit 1
+fi
+
+# Required roots: top-level owner/mode + write probe. Never -R on
+# cache/model/home trees. Symlink → exit (not warn-and-continue).
+# Top-level $HERMES_HOME chown above stays warn-on-rootless.
+ensure_required_root() {
+    target="$1"
+    if path_has_symlink_component "$target"; then
+        echo "[stage2] ERROR: required path $target is a symlink" >&2
+        exit 1
+    fi
+    if [ ! -d "$target" ]; then
+        echo "[stage2] ERROR: required path $target missing after seed" >&2
+        exit 1
+    fi
+    chown hermes:hermes "$target" 2>/dev/null || \
+        echo "[stage2] Warning: top-level chown $target failed (rootless?) — write-probe will decide"
+    chmod u+rwx "$target" 2>/dev/null || true
+    root_probe="$target/.stage2-write-probe"
+    if ! as_hermes sh -c "umask 002; : > \"$root_probe\" && rm -f \"$root_probe\""; then
+        echo "[stage2] ERROR: hermes cannot write required path $target" >&2
+        exit 1
+    fi
+}
+for root in \
+    "$HERMES_HOME/home" \
+    "$HERMES_HOME/cache" \
+    "$HERMES_HOME/cache/uv" \
+    "$HERMES_HOME/cache/npm" \
+    "$HERMES_HOME/cache/huggingface" \
+    "$HERMES_HOME/models" \
+    "$HERMES_HOME/state" \
+    "$HERMES_HOME/hotfixes" \
+    "$HERMES_HOME/logs" \
+    "$HERMES_HOME/logs/gateways" \
+    "$HERMES_HOME/profiles"
+do
+    ensure_required_root "$root"
+done
+
+# Durable model root. Live HF trees stay under cache/huggingface
+# (~30 GB). Expose them at models/huggingface without a move.
+# Do not ensure_required_root the link — that helper refuses symlinks.
+if [ -d "$HERMES_HOME/cache/huggingface" ] && [ ! -e "$HERMES_HOME/models/huggingface" ]; then
+    ln -s "$HERMES_HOME/cache/huggingface" "$HERMES_HOME/models/huggingface" \
+        || echo "[stage2] Warning: cannot link models/huggingface — continuing"
+fi
+if [ ! -e "$HERMES_HOME/models/huggingface" ]; then
+    mkdir -p "$HERMES_HOME/models/huggingface"
+    chown hermes:hermes "$HERMES_HOME/models/huggingface" 2>/dev/null || true
+fi
 
 # --- Install-method stamp ---
 # The 'docker' stamp is baked into the immutable install tree at
@@ -556,8 +666,19 @@ fi
 # after first-boot seeding and before supervised gateway services start.
 # Set HERMES_SKIP_CONFIG_MIGRATION=1 for controlled/manual migrations.
 if [ -f "$HERMES_HOME/config.yaml" ]; then
-    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
-        || echo "[stage2] Warning: docker_config_migrate.py failed; continuing"
+    if [ "${HERMES_SKIP_CONFIG_MIGRATION:-}" = "1" ]; then
+        echo "[stage2] HERMES_SKIP_CONFIG_MIGRATION=1; skipping docker_config_migrate.py"
+        # Plan 5c: hatch is inspection-only. Healthcheck must stay not-ready.
+        if ! refuse_symlinked_path "skip-marker" "$HERMES_HOME/.migration-skipped"; then
+            : > "$HERMES_HOME/.migration-skipped"
+            chown hermes:hermes "$HERMES_HOME/.migration-skipped" 2>/dev/null || true
+            chmod 644 "$HERMES_HOME/.migration-skipped"
+        fi
+    else
+        rm -f "$HERMES_HOME/.migration-skipped"
+        s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
+            || { echo "[stage2] ERROR: docker_config_migrate.py failed" >&2; exit 1; }
+    fi
 fi
 
 # auth.json: bootstrap from env on first boot only. Same semantics as the
@@ -642,8 +763,19 @@ fi
 # the python binary's own bin-stub already sets up (sys.path is rooted
 # at the venv's site-packages by virtue of running .venv/bin/python).
 if [ -d "$INSTALL_DIR/skills" ]; then
-    as_hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" \
-        || echo "[stage2] Warning: skills_sync.py failed; continuing"
+    if [ "${HERMES_SKIP_SKILLS_SYNC:-}" = "1" ]; then
+        echo "[stage2] HERMES_SKIP_SKILLS_SYNC=1; skipping skills_sync.py"
+        # Plan 5c: hatch is inspection-only. Healthcheck must stay not-ready.
+        if ! refuse_symlinked_path "skip-marker" "$HERMES_HOME/.skills-sync-skipped"; then
+            : > "$HERMES_HOME/.skills-sync-skipped"
+            chown hermes:hermes "$HERMES_HOME/.skills-sync-skipped" 2>/dev/null || true
+            chmod 644 "$HERMES_HOME/.skills-sync-skipped"
+        fi
+    else
+        rm -f "$HERMES_HOME/.skills-sync-skipped"
+        as_hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" \
+            || { echo "[stage2] ERROR: skills_sync.py failed" >&2; exit 1; }
+    fi
 fi
 
 # --- Discover agent-browser's Chromium binary ---
@@ -693,5 +825,24 @@ if [ -z "${AGENT_BROWSER_EXECUTABLE_PATH:-}" ] && \
         echo "[stage2] Warning: no Chromium binary under $PLAYWRIGHT_BROWSERS_PATH; browser tool may fail"
     fi
 fi
+
+rev="$(cat /opt/hermes/.hermes_build_sha 2>/dev/null || echo unknown)"
+estop="off"
+[ -f "$HERMES_HOME/ESTOP" ] && estop="on"
+mounted="no"
+mountpoint -q "$HERMES_HOME" 2>/dev/null && mounted="yes"
+profiles=0
+[ -d "$HERMES_HOME/profiles" ] && profiles="$(find "$HERMES_HOME/profiles" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+schema="unknown"
+if [ -f "$HERMES_HOME/config.yaml" ]; then
+    schema="$(awk '/^_config_version:/{print $2; exit}' "$HERMES_HOME/config.yaml" 2>/dev/null || echo unknown)"
+    [ -n "$schema" ] || schema="unknown"
+fi
+migrate="ok"
+[ -f "$HERMES_HOME/.migration-in-progress" ] && migrate="in-progress"
+[ -f "$HERMES_HOME/.migration-skipped" ] && migrate="skipped"
+skills="ok"
+[ -f "$HERMES_HOME/.skills-sync-skipped" ] && skills="skipped"
+echo "[stage2] banner revision=${rev} uid=$(id -u hermes) gid=$(id -g hermes) profiles=${profiles} schema=${schema} migrate=${migrate} skills=${skills} mount=${mounted} disk=${avail_kb}KB estop=${estop}"
 
 echo "[stage2] Setup complete; starting user services"

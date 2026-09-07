@@ -58,6 +58,7 @@ htmlcov/
 
 # Documentation
 *.md
+!README.md
 
 # Runtime data (bind-mounted at /opt/data; must not leak into build context)
 data/
@@ -73,9 +74,13 @@ runtime/
 # Desktop app source (Tauri/Electron); never installed in the container.
 # apps/shared is the dashboard↔desktop websocket helper and is linked from
 # web/package.json as a file: workspace dep — keep it in the build context.
+# Extra workspace package.json files exist only so lock-strict `npm ci`
+# can see every workspace the root lock describes.
 apps/
 !apps/shared/
 !apps/shared/**
+!apps/desktop/package.json
+!apps/bootstrap-installer/package.json
 
 # Test suite — not shipped in production images
 tests/

@@ -79,6 +79,15 @@ def test_verdicts_route_through_distinct_terminal_actions(skill_text: str) -> No
     assert "Request changes" in quick_reference
     assert "`kanban_request_changes`" in quick_reference
     assert "Escalate" in quick_reference and "`kanban_block`" in quick_reference
+    assert 'metadata={"verdict": "PASS"}' in quick_reference
+
+
+def test_approval_procedure_carries_kernel_verdict(skill_text: str) -> None:
+    approve = skill_text.split("#### Approve", 1)[1].split(
+        "#### Request changes", 1
+    )[0]
+    assert '"verdict": "PASS"' in approve
+    assert "kernel-enforced" in approve
 
 
 def test_review_lenses_vary_per_round(skill_text: str) -> None:
