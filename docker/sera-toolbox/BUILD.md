@@ -52,10 +52,10 @@ leaf — v0.21 has no supported managed-config key for it; do not
 invent precedence. `approvals.mode` / `deny` and
 `telegram.allowed_chats` stay in user config.
 
-ClickUp 1.8.0 and `caldav-mcp` 0.10.0 are baked. Live hooks are
-`npx --no-install` (fail-closed if the package dir is missing).
-`smoke.sh` starts both with `start-baked-mcp.sh` (registry
-`http://127.0.0.1:9`). iCloud is `caldav-mcp`; there is no
+ClickUp 1.8.0 and `caldav-mcp` 0.10.0 are baked. `start-baked-mcp.sh`
+execs the baked bin (no `npx` — `npx pkg@ver` still hits the
+registry). `smoke.sh` starts both with the registry blocked
+(`http://127.0.0.1:9`). iCloud is `caldav-mcp`; there is no
 icloud-named package.
 Live identity already uses native URL-only Todoist
 (`https://ai.todoist.net/mcp`). Do not put `mcp-remote` back.

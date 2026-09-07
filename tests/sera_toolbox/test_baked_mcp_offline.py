@@ -14,8 +14,10 @@ class BakedMcpOffline(unittest.TestCase):
     def test_helper_blocks_registry_and_uses_npx_no_install(self) -> None:
         text = HELPER.read_text(encoding="utf-8")
         self.assertIn('NPM_CONFIG_REGISTRY="http://127.0.0.1:9"', text)
-        self.assertIn("npx --no-install", text)
+        self.assertIn("/usr/local/lib/node_modules/", text)
         self.assertIn("timeout", text)
+        self.assertIn("--exec", text)
+        self.assertNotIn("npx --no-install", text)
         self.assertNotIn("npx -y", text)
         self.assertNotIn("npx --yes", text)
 

@@ -133,8 +133,8 @@ for mcp in \
   fi
 done
 
-# Plan 5c: start the same npx --no-install hooks the identity wrappers
-# exec, with the registry blocked. iCloud is caldav-mcp (no icloud-named pkg).
+# Plan 5c: start baked MCP bins with the registry blocked. iCloud is
+# caldav-mcp (no icloud-named pkg). Do not use npx pkg@ver.
 start_mcp=/opt/hermes/docker/sera-toolbox/start-baked-mcp.sh
 if [ ! -x "$start_mcp" ]; then
   echo "MISSING $start_mcp" >&2
