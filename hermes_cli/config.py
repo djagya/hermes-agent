@@ -2910,10 +2910,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     """Remove the given dotted leaf keys from a nested config dict.
 
-    Returns ``(pruned_cfg, set_of_stripped_keys_that_were_present)``. Used by
-    ``save_config`` to drop managed-scope leaves before persisting, so a bulk
-    write never writes a user value that would lose to the managed layer on the
-    next load. Only keys actually present in ``cfg`` are reported as stripped.
+    Returns ``(pruned_cfg, set_of_stripped_keys_that_were_present)``.
+    Only keys actually present in ``cfg`` are reported as stripped.
     """
     stripped: set = set()
     for dotted in dotted_keys:
@@ -4046,6 +4044,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        user_config: Dict[str, Any] = {}
 
         if user_sig is not None:
             try:
@@ -4058,8 +4057,6 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         agent_user_config["max_turns"] = user_config["max_turns"]
                     user_config["agent"] = agent_user_config
                     user_config.pop("max_turns", None)
-
-                config = _deep_merge(config, user_config)
             except Exception as e:
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
@@ -4100,14 +4097,11 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                             lkg_copy, _empty_env,
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
+                user_config = {}
 
-        normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-        expanded = _expand_env_vars(normalized)
-        # Managed scope wins at the leaf. Applied AFTER user expansion so a user
-        # ${VAR} cannot shadow a managed literal: managed values are expanded only
-        # against the process environment, never against user-config-defined refs.
-        # This deliberately inverts the usual env-over-config precedence for the
-        # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
+        # Managed scope seeds missing leaves. Order is defaults → managed →
+        # user so a present user leaf wins and schema defaults cannot shadow
+        # a managed seed the user omitted. Unset restores the seed.
         managed_config = managed_scope.load_managed_config()
         if managed_config:
             # Normalize the managed overlay through the same canonicalization as
@@ -4121,8 +4115,11 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             if isinstance(managed_normalized.get("model"), str):
                 managed_normalized = dict(managed_normalized)
                 managed_normalized["model"] = {"default": managed_normalized["model"]}
-            managed_expanded = _expand_env_vars(managed_normalized)
-            expanded = _deep_merge(expanded, managed_expanded)
+            config = _deep_merge(config, managed_normalized)
+        if user_config:
+            config = _deep_merge(config, user_config)
+        normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+        expanded = _expand_env_vars(normalized)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
@@ -4253,22 +4250,6 @@ def save_config(
         if is_managed():
             managed_error("save configuration")
             return
-        # Managed scope: strip any leaf the managed layer pins, so a bulk write
-        # (wizard / programmatic save) never persists a user value that would
-        # silently lose to managed on the next load. Single-key `config set`
-        # hard-rejects (see set_config_value); this is the mechanical safety net
-        # for bulk writes so the unmanaged remainder still lands.
-        from hermes_cli import managed_scope
-
-        managed_keys = managed_scope.managed_config_keys()
-        if managed_keys:
-            config, _stripped = _strip_dotted_keys(copy.deepcopy(config), managed_keys)
-            if _stripped:
-                print(
-                    f"Note: {len(_stripped)} managed setting(s) were not saved "
-                    f"(managed by your administrator): {', '.join(sorted(_stripped))}",
-                    file=sys.stderr,
-                )
         from utils import atomic_yaml_write
 
         ensure_hermes_home()
@@ -4993,8 +4974,9 @@ def show_config():
     print(color("│              ⚕ Hermes Configuration                    │", Colors.CYAN))
     print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
 
-    # Managed scope: surface that some settings are administrator-pinned so the
-    # user understands why their config.yaml value may not be the effective one.
+    # Managed scope: surface administrator seeds so the user knows which
+    # missing leaves are filled from /etc/hermes. User config.yaml wins
+    # when set; managed .env keys stay refused.
     from hermes_cli import managed_scope
 
     _managed_keys = managed_scope.managed_config_keys()
@@ -5003,19 +4985,19 @@ def show_config():
         _managed_dir = managed_scope.get_managed_dir()
         print()
         print(color(
-            f"  ⚷ Some settings are managed by your administrator ({_managed_dir}) "
-            f"and cannot be changed",
+            f"  ⚷ Some settings have administrator seeds ({_managed_dir}). "
+            f"`hermes config set` writes config.yaml and wins; unset falls back.",
             Colors.YELLOW,
             Colors.BOLD,
         ))
         if _managed_keys:
             print(color(
-                f"    Managed config keys: {', '.join(sorted(_managed_keys))}",
+                f"    Managed config seeds: {', '.join(sorted(_managed_keys))}",
                 Colors.YELLOW,
             ))
         if _managed_env:
             print(color(
-                f"    Managed env keys: {', '.join(sorted(_managed_env))}",
+                f"    Managed env keys (not live-settable): {', '.join(sorted(_managed_env))}",
                 Colors.YELLOW,
             ))
 
@@ -5817,22 +5799,6 @@ def set_config_value(key: str, value: str, force: bool = False):
             file=sys.stderr,
         )
         sys.exit(1)
-    # Managed scope guard (D2): a key pinned by the managed layer cannot be set by
-    # the user — the next load would override it anyway. Hard-reject and name the
-    # source. Distinct from is_managed() above (the package-manager write-lock).
-    # Env-shaped keys (API keys / tokens) route to save_env_value below, which has
-    # its own managed-env-key guard; this catches the config.yaml keys.
-    from hermes_cli import managed_scope
-
-    if managed_scope.is_key_managed(key):
-        managed_dir = managed_scope.get_managed_dir()
-        src = (managed_dir / "config.yaml") if managed_dir else "the managed scope"
-        print(
-            f"Cannot set '{key}': it is managed by your administrator ({src}) "
-            f"and cannot be changed. Contact your administrator to modify it.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
     # Check if it's an API key (goes to .env)
     if _is_env_config_key(key):
         # Unified lifecycle: also rotates any config.yaml mirror of the old
@@ -6079,20 +6045,6 @@ def unset_config_value(key: str):
     if is_managed():
         managed_error("unset configuration values")
         return
-    # Managed scope guard: a key pinned by the managed layer cannot be unset by
-    # the user — the next load would reinstate it anyway (mirrors set_config_value).
-    from hermes_cli import managed_scope
-
-    if managed_scope.is_key_managed(key):
-        managed_dir = managed_scope.get_managed_dir()
-        src = (managed_dir / "config.yaml") if managed_dir else "the managed scope"
-        print(
-            f"Cannot unset '{key}': it is managed by your administrator ({src}) "
-            f"and cannot be changed. Contact your administrator to modify it.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     if _is_env_config_key(key):
         # Unified lifecycle: prune env-seeded credential_pool entries and
         # model-cache rows too, so `hermes config unset <KEY>` fully removes

@@ -553,6 +553,7 @@ def load_cli_config() -> Dict[str, Any]:
     # overwrite env vars that were already set by .env -- only a user's config
     # file should be authoritative.
     _file_has_terminal_config = False
+    file_config = {}
 
     # Load from file if exists
     if config_path.exists():
@@ -615,17 +616,14 @@ def load_cli_config() -> Dict[str, Any]:
     from hermes_cli.config import _expand_env_vars
     defaults = _expand_env_vars(defaults)
 
-    # Managed scope: overlay administrator-pinned values LAST so they win over
-    # the user's config here too. cli.py builds its config independently of
-    # hermes_cli.config._load_config_impl (which has its own managed merge), so
-    # without this the entire interactive CLI/TUI surface — skin, display prefs,
-    # etc. read from CLI_CONFIG — would silently ignore managed scope while
-    # `hermes config`/`doctor`/guards (which use load_config) honor it. The
-    # shared helper mirrors _load_config_impl (env-only expansion, root-model
-    # normalization, leaf-merge) and is fail-open.
+    # Managed scope: seed leaves the user omitted. Pass the raw user
+    # document so CLI schema defaults do not shadow those seeds. A present
+    # user leaf wins. cli.py builds its config independently of
+    # hermes_cli.config._load_config_impl, so without this the TUI/CLI
+    # surface would ignore managed seeds.
     from hermes_cli import managed_scope
 
-    defaults = managed_scope.apply_managed_overlay(defaults)
+    defaults = managed_scope.apply_managed_overlay(defaults, user_raw=file_config)
 
     # Apply terminal config to environment variables (so terminal_tool picks them up)
     terminal_config = defaults.get("terminal", {})

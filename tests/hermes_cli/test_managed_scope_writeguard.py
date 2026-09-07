@@ -1,4 +1,4 @@
-"""Write-guard tests — managed keys can't be set/removed by the user."""
+"""Write-guard tests — managed config seeds are live-settable; managed env is not."""
 import pytest
 
 
@@ -23,16 +23,43 @@ def homes(tmp_path, monkeypatch):
     return home, managed
 
 
-def test_config_set_managed_key_rejected(homes, capsys):
-    from hermes_cli.config import set_config_value
+def test_config_set_managed_key_writes_user_yaml_and_wins(homes):
+    from hermes_cli.config import set_config_value, load_config, cfg_get
+    import hermes_cli.config as cfg
 
-    with pytest.raises(SystemExit) as exc:
-        set_config_value("model.default", "user/override")
-    assert exc.value.code != 0
-    captured = capsys.readouterr()
-    assert "managed" in (captured.out + captured.err).lower()
+    home, _ = homes
+    set_config_value("model.default", "user/override")
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert cfg_get(load_config(), "model", "default") == "user/override"
+    assert "user/override" in (home / "config.yaml").read_text(encoding="utf-8")
 
 
+def test_config_unset_managed_key_falls_back_to_seed(homes):
+    from hermes_cli.config import (
+        set_config_value,
+        unset_config_value,
+        load_config,
+        cfg_get,
+    )
+    import hermes_cli.config as cfg
+
+    set_config_value("model.default", "user/override")
+    unset_config_value("model.default")
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert cfg_get(load_config(), "model", "default") == "managed/model"
+
+
+def test_save_config_keeps_user_override_of_managed_leaf(homes):
+    from hermes_cli.config import save_config, load_config, cfg_get, read_raw_config
+    import hermes_cli.config as cfg
+
+    save_config({"model": {"default": "user/saved"}})
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert cfg_get(load_config(), "model", "default") == "user/saved"
+    assert read_raw_config().get("model", {}).get("default") == "user/saved"
 
 
 # ── env write guards ─────────────────────────────────────────────────────────
@@ -63,10 +90,3 @@ def test_save_env_value_managed_key_rejected(env_homes, capsys):
     env_path = get_env_path()
     body = env_path.read_text() if env_path.exists() else ""
     assert "user.example" not in body
-
-
-
-
-# ── bulk save strips managed leaves ──────────────────────────────────────────
-
-
