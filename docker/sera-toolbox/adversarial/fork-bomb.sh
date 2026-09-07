@@ -18,4 +18,9 @@ if [ "$status" -eq 0 ]; then
   cat err >&2 || true
   exit 1
 fi
+if ! grep -q 'fork failed after' err; then
+  echo "FAIL process cap did not refuse forks (exit=$status)" >&2
+  cat err >&2 || true
+  exit 1
+fi
 echo "OK process cap blocked fork bomb (exit=$status)"

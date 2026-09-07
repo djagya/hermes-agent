@@ -259,6 +259,13 @@ case "$bwrap_help" in
 esac
 # shellcheck disable=SC2016
 status=0
+# Unprivileged wrap can only map its own uid. --uid 65534 from
+# root still maps to host uid 0, which ignores RLIMIT_NPROC —
+# CI fork-bomb therefore runs as hermes (10000).
+bwrap_user=()
+if [ "$(id -u)" -eq 0 ]; then
+  bwrap_user=(--uid 65534 --gid 65534)
+fi
 # env -i: no secrets, no Docker/SSH/MCP, no HERMES_HOME.
 # cwd + out_dir only. tmpfs HOME/tmp. no network.
 # Nested Docker: --unshare-pid + --proc remounts procfs and EPERMs
@@ -280,8 +287,7 @@ env -i \
   timeout --signal=KILL "$timeout_s" \
   bwrap \
     --unshare-user \
-    --uid 65534 \
-    --gid 65534 \
+    "${bwrap_user[@]}" \
     --unshare-net \
     --unshare-uts \
     --unshare-ipc \
