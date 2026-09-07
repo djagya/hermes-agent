@@ -14,15 +14,27 @@ cp "$fix/hello.md" "$fix/golden-docx.md" "$fix/golden.csv" "$fix/bad.db" \
 
 # Renderer proof: wrapped WeasyPrint must still produce a Unicode PDF.
 # Stored golden.pdf is the workflow fixture; this one is generated.
-printf '%s\n' '<html><body><p>Здравствуй golden 😀</p></body></html>' > unicode.html
+# charset + encoding=utf-8: disk HTML otherwise defaults to Latin-1.
+# Noto Sans is the baked Cyrillic face (plan 5b fonts).
+printf '%s\n' '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<style>body{font-family:"Noto Sans","Liberation Sans",sans-serif}</style>
+</head><body><p>Здравствуй golden 😀</p></body></html>' > unicode.html
 weasyprint unicode.html unicode.pdf
 test -s unicode.pdf || { echo "FAIL weasyprint wrote empty unicode.pdf" >&2; exit 1; }
 echo "OK weasyprint unicode.pdf bytes=$(wc -c < unicode.pdf)"
+if command -v pdffonts >/dev/null 2>&1; then
+  pdffonts unicode.pdf | tee unicode.fonts >&2
+  grep -Eiq 'Noto|Liberation' unicode.fonts || {
+    echo "FAIL unicode.pdf missing Noto/Liberation" >&2
+    exit 1
+  }
+  echo "OK unicode.pdf fonts recorded"
+fi
 
-pdftotext golden.pdf golden.txt || { echo "FAIL pdftotext golden.pdf" >&2; exit 1; }
+pdftotext -enc UTF-8 golden.pdf golden.txt || { echo "FAIL pdftotext golden.pdf" >&2; exit 1; }
 grep -q golden golden.txt || { echo "FAIL golden.pdf text missing"; cat golden.txt >&2; exit 1; }
 echo "OK pdftotext golden.pdf"
-pdftotext unicode.pdf unicode.txt || { echo "FAIL pdftotext unicode.pdf" >&2; exit 1; }
+pdftotext -enc UTF-8 unicode.pdf unicode.txt || { echo "FAIL pdftotext unicode.pdf" >&2; exit 1; }
 grep -q 'Здравствуй' unicode.txt || { echo "FAIL unicode.pdf text missing"; cat unicode.txt >&2; exit 1; }
 test "$(wc -c < unicode.pdf)" -gt "$(wc -c < golden.pdf)"
 echo "OK pdftotext unicode.pdf"

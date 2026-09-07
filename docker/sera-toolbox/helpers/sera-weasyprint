@@ -21,7 +21,12 @@ def main(argv: list[str]) -> int:
         return 2
     from weasyprint import HTML
 
-    HTML(filename=str(src), url_fetcher=_refuse_url).write_pdf(str(dest))
+    # Disk HTML has no HTTP charset hint; WeasyPrint then defaults to
+    # Latin-1 and stores UTF-8 bytes as WinAnsi (Cyrillic becomes
+    # mojibake). Local Sera documents are UTF-8.
+    HTML(filename=str(src), encoding="utf-8", url_fetcher=_refuse_url).write_pdf(
+        str(dest)
+    )
     return 0
 
 
