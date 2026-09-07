@@ -4,6 +4,6 @@
 memory:
   write_approval: false
 skills:
-  write_approval: false
+  write_approval: true
 approvals:
   cron_mode: deny

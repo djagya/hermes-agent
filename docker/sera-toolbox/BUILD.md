@@ -46,8 +46,8 @@ Runtime writes go to `/opt/data/cache/npm` (`NPM_CONFIG_CACHE`) and
 `/opt/data/cache/uv`. Those are bind-mount state, not image layers.
 
 Managed scope (`/etc/hermes/config.yaml`) locks
-`memory.write_approval`, `skills.write_approval`, and
-`approvals.cron_mode`. Residual (deferred): no command allowlist
+`memory.write_approval` (off), `skills.write_approval` (on), and
+`approvals.cron_mode` (deny). Residual (deferred): no command allowlist
 leaf — v0.21 has no supported managed-config key for it; do not
 invent precedence. `approvals.mode` / `deny` and
 `telegram.allowed_chats` stay in user config.
