@@ -288,10 +288,14 @@ jobs:
           IMAGE: ${{ env.IMAGE_NAME }}:test
         run: |
           set -euo pipefail
+          # Default doctor only. --full runs golden-smoke (bwrap);
+          # that already ran under run_bwrap in "Sera toolbox smoke".
+          # This job proves help/info/doctor work with --network none
+          # and no data mount / no userns.
           docker run --rm --network none --entrypoint hermes-image-info \
             "$IMAGE" --json
           docker run --rm --network none --entrypoint hermes-image-doctor \
-            "$IMAGE" --full
+            "$IMAGE"
           docker run --rm --network none --entrypoint hermes-image-doctor \
             "$IMAGE" --prune-dry-run
           docker run --rm --network none --entrypoint /opt/hermes/.venv/bin/hermes \
