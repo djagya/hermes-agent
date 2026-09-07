@@ -209,8 +209,14 @@ case "$tool" in
     ;;
 esac
 # Process cap without --unshare-pid (nested Docker EPERM on procfs).
-# Inherited by bwrap child. 64 is enough for receipt python + the tool.
-ulimit -u "${SERA_SANDBOX_NPROC:-64}" 2>/dev/null || true
+# userns-root ignores RLIMIT_NPROC; drop to nobody inside bwrap.
+# ulimit still applies when wrap itself is unprivileged.
+nproc_lim="${SERA_SANDBOX_NPROC:-64}"
+ulimit -u "$nproc_lim" 2>/dev/null || true
+chmod a+rwx "$out_dir" 2>/dev/null || true
+if [ -n "${lo_profile:-}" ]; then
+  chmod -R a+rwx "$lo_profile" 2>/dev/null || true
+fi
 # Dedicated writable output bind. cwd is RO when it is not the out dir.
 # Never bind `/` (image WORKDIR) — system paths are already mounted.
 fs_binds=()
@@ -233,7 +239,14 @@ find "$out_dir" -xdev -type f -print0 2>/dev/null | sort -z > "$tmp_before" || t
 bwrap_extra=()
 bwrap_help="$(bwrap --help 2>&1 || true)"
 case "$bwrap_help" in
-  *--rlimit-nproc*) bwrap_extra+=(--rlimit-nproc 64) ;;
+  *--rlimit-nproc*) bwrap_extra+=(--rlimit-nproc "$nproc_lim") ;;
+esac
+case "$bwrap_help" in
+  *--cap-drop*) bwrap_extra+=(--cap-drop ALL) ;;
+esac
+home_perms=()
+case "$bwrap_help" in
+  *--perms*) home_perms=(--perms 0777) ;;
 esac
 case "$bwrap_help" in
   *--rlimit-nofile*) bwrap_extra+=(--rlimit-nofile 1024) ;;
@@ -264,6 +277,8 @@ env -i \
   timeout --signal=KILL "$timeout_s" \
   bwrap \
     --unshare-user \
+    --uid 65534 \
+    --gid 65534 \
     --unshare-net \
     --unshare-uts \
     --unshare-ipc \
@@ -276,6 +291,7 @@ env -i \
     --tmpfs /tmp \
     --tmpfs /var/tmp \
     --tmpfs /run \
+    "${home_perms[@]}" \
     --dir /tmp/home \
     --ro-bind-try /etc/passwd /etc/passwd \
     --ro-bind-try /etc/group /etc/group \
