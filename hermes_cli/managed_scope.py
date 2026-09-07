@@ -1,15 +1,17 @@
-"""Managed scope — IT-pushed, user-immutable config & env layer.
+"""Managed scope — IT-pushed config & env seed layer.
 
-A system-level directory (default ``/etc/hermes``, root-owned and not
-user-writable) supplies ``config.yaml`` and ``.env`` values that WIN over the
-user's ``~/.hermes/config.yaml`` and ``~/.hermes/.env`` on a per-leaf-key basis.
+A system-level directory (default ``/etc/hermes``, root-owned) supplies
+``config.yaml`` and ``.env`` values that FILL leaves the user has not set.
+A present user ``~/.hermes/config.yaml`` leaf wins; ``hermes config unset``
+drops the user leaf and the seed returns. Managed ``.env`` secrets stay
+refused — those are not live-settable.
 
 This is DISTINCT from ``hermes_cli.config.is_managed()`` / ``HERMES_MANAGED``,
 which is a coarse package-manager write-lock (declarative-distro / formula
-installs). That lock blocks all mutation; this layer injects specific immutable
-values. The two are independent and may coexist.
+installs). That lock blocks all mutation; this layer seeds specific values.
+The two are independent and may coexist.
 
-v1 enforcement is filesystem permissions only — see
+v1 enforcement for secrets is filesystem permissions only — see
 ``docs/design/managed-scope.md`` §7. v1 is Linux/POSIX-first; ``get_managed_dir()``
 is the single seam for adding macOS / Windows native locations later.
 
@@ -134,21 +136,45 @@ def load_managed_env() -> Dict[str, str]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def apply_managed_overlay(config: dict) -> dict:
-    """Overlay administrator-pinned config values on top of an already-built dict.
+def _omit_present_leaves(managed: dict, user: dict) -> dict:
+    """Managed leaves the user document did not set.
+
+    A key present on the user side wins, including a user ``${VAR}`` that
+    expands later. YAML ``null`` against a managed dict is treated as
+    absent (same as ``_deep_merge`` ignoring a None override of a dict).
+    """
+    out: dict = {}
+    for key, value in managed.items():
+        if key not in user:
+            out[key] = value
+            continue
+        user_val = user[key]
+        if user_val is None and isinstance(value, dict):
+            out[key] = value
+            continue
+        if isinstance(value, dict) and isinstance(user_val, dict) and value:
+            nested = _omit_present_leaves(value, user_val)
+            if nested:
+                out[key] = nested
+    return out
+
+
+def apply_managed_overlay(config: dict, *, user_raw: Optional[dict] = None) -> dict:
+    """Seed administrator values for leaves the user did not set.
 
     The single, shared way for any config loader that builds its own dict
     (rather than going through hermes_cli.config.load_config) to honor managed
-    scope. Mirrors hermes_cli.config._load_config_impl's managed merge exactly:
+    scope. Mirrors hermes_cli.config._load_config_impl's managed merge:
 
-      * expand the managed config's ``${VAR}`` refs against the PROCESS env only
-        (never user-config-defined refs), so a user cannot shadow a managed
-        literal via a ${VAR} they control;
+      * expand the managed config's ``${VAR}`` refs against the PROCESS env;
       * normalize the managed config's root ``model`` key (a bare ``model: x/y``
         string is promoted to ``model.default``) so it can't clobber the dict
         shape callers expect;
-      * leaf-level deep-merge managed ON TOP, so managed wins per-leaf while
-        sibling keys stay user-controlled.
+      * seed only missing leaves, so a present user leaf wins while siblings
+        the user omitted still take the managed value.
+
+    When *config* is already defaults+user (cli.py), pass the raw user
+    document as ``user_raw`` so schema defaults do not shadow managed seeds.
 
     Fail-open: returns ``config`` unchanged if no managed scope is present or on
     any error — managed scope must never break a caller's startup. Mutates and
@@ -171,7 +197,13 @@ def apply_managed_overlay(config: dict) -> dict:
         if isinstance(managed_expanded.get("model"), str):
             managed_expanded = dict(managed_expanded)
             managed_expanded["model"] = {"default": managed_expanded["model"]}
-        return _deep_merge(config, managed_expanded)
+        presence = user_raw if user_raw is not None else config
+        if not isinstance(presence, dict):
+            presence = {}
+        seeds = _omit_present_leaves(managed_expanded, presence)
+        if not seeds:
+            return config
+        return _deep_merge(config, seeds)
     except Exception:  # noqa: BLE001 — overlay must never break a caller
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config
