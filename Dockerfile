@@ -8,7 +8,7 @@
 FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS sqlite_build
 # Hub index date for this debian:13.4 digest. Pin apt so CI cannot float
 # onto a later trixie rebuild of the same tag.
-ARG DEBIAN_SNAPSHOT=20260905T000000Z
+ARG DEBIAN_SNAPSHOT=20260907T000000Z
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
@@ -106,7 +106,7 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 # replaces tini with s6-overlay's /init (PID 1 = s6-svscan), which reaps
 # zombies non-blockingly on SIGCHLD and additionally supervises the main
 # hermes process, the dashboard, and per-profile gateways.
-ARG DEBIAN_SNAPSHOT=20260905T000000Z
+ARG DEBIAN_SNAPSHOT=20260907T000000Z
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -650,7 +650,7 @@ ARG HERMES_BUILD_REF=
 LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
       org.opencontainers.image.revision="${HERMES_GIT_SHA}"
 
-ARG DEBIAN_SNAPSHOT=20260905T000000Z
+ARG DEBIAN_SNAPSHOT=20260907T000000Z
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \

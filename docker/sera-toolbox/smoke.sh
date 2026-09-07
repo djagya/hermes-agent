@@ -134,12 +134,12 @@ case "$sqlite_ver" in
   *) echo "BAD sqlite $sqlite_ver (want 3.53.x)" >&2; fail=1 ;;
 esac
 
-if ! grep -q 'snapshot.debian.org/archive/debian/20260905T000000Z' \
+if ! grep -q 'snapshot.debian.org/archive/debian/20260907T000000Z' \
       /etc/apt/sources.list.d/debian.sources ||
-   ! grep -q 'snapshot.debian.org/archive/debian-security/20260905T000000Z' \
+   ! grep -q 'snapshot.debian.org/archive/debian-security/20260907T000000Z' \
       /etc/apt/sources.list.d/debian.sources ||
    ! grep -q 'trixie-security' /etc/apt/sources.list.d/debian.sources; then
-  echo "apt sources missing Debian snapshot 20260905T000000Z main/updates/security" >&2
+  echo "apt sources missing Debian snapshot 20260907T000000Z main/updates/security" >&2
   fail=1
 fi
 

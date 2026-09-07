@@ -15,7 +15,7 @@ docker buildx build \
     --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" \
     --build-arg HERMES_IMAGE_NAME=ghcr.io/djagya/hermes-agent \
     --build-arg HERMES_BUILD_REF="$(git rev-parse --abbrev-ref HEAD)" \
-    --build-arg DEBIAN_SNAPSHOT=20260905T000000Z \
+    --build-arg DEBIAN_SNAPSHOT=20260907T000000Z \
     -t ghcr.io/djagya/hermes-agent:local \
     -f Dockerfile \
     .
