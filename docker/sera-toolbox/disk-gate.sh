@@ -98,6 +98,17 @@ open_sqlite() {
         echo "[disk-gate] ERROR: sqlite3 missing; cannot preflight $db" >&2
         return 1
     fi
+    # Some sqlite3 CLIs initialize a tiny/invalid file as a new DB
+    # (exit 0) and would mutate a corrupt live file. Require the
+    # magic header before SELECT 1.
+    hdr="$(dd if="$db" bs=16 count=1 2>/dev/null || true)"
+    case "$hdr" in
+        "SQLite format 3"*) ;;
+        *)
+            echo "[disk-gate] ERROR: cannot open SQLite $db" >&2
+            return 1
+            ;;
+    esac
     if ! sqlite3 "$db" "SELECT 1;" >/dev/null 2>&1; then
         echo "[disk-gate] ERROR: cannot open SQLite $db" >&2
         return 1
@@ -163,6 +174,7 @@ self_test() {
         echo "self-test: expected open pass on valid state.db" >&2
         return 1
     }
+    rm -f "$tmp/state.db-wal" "$tmp/state.db-shm"
     printf 'not-a-db\n' > "$tmp/state.db"
     if db_open_check "$tmp" 2>/dev/null; then
         echo "self-test: expected open fail on garbage state.db" >&2
