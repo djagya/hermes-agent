@@ -178,6 +178,7 @@ case "$cwd" in
 esac
 
 # Workload profiles (plan 5e). Caller SERA_SANDBOX_TIMEOUT / _AS_BYTES win.
+nproc_default=64
 case "$tool" in
   file|exiftool|identify|pdfinfo|heif-info|sera-nproc-probe)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-30}"
@@ -190,10 +191,12 @@ case "$tool" in
   tesseract|ocrmypdf)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-180}"
     as_bytes="${SERA_SANDBOX_AS_BYTES:-2147483648}"
+    nproc_default=256
     ;;
   soffice|libreoffice|pandoc|weasyprint|sera-weasyprint|sera-pymupdf)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-180}"
     as_bytes="${SERA_SANDBOX_AS_BYTES:-2147483648}"
+    nproc_default=256
     ;;
   ffmpeg|ffprobe)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
@@ -211,7 +214,7 @@ esac
 # Process cap without --unshare-pid (nested Docker EPERM on procfs).
 # userns-root ignores RLIMIT_NPROC; drop to nobody inside bwrap.
 # ulimit still applies when wrap itself is unprivileged.
-nproc_lim="${SERA_SANDBOX_NPROC:-64}"
+nproc_lim="${SERA_SANDBOX_NPROC:-$nproc_default}"
 ulimit -u "$nproc_lim" 2>/dev/null || true
 chmod a+rwx "$out_dir" 2>/dev/null || true
 if [ -n "${lo_profile:-}" ]; then
@@ -326,7 +329,8 @@ env -i \
     "${lo_binds[@]}" \
     "${fs_binds[@]}" \
     --chdir "$cwd" \
-    -- "$real" "${extra[@]}" "$@" \
+    -- /bin/bash -c 'ulimit -u "$1" || exit 127; shift; exec "$@"' \
+    sera-rlimit "$nproc_lim" "$real" "${extra[@]}" "$@" \
   || status=$?
 
 end_ns="$(date +%s%N)"
