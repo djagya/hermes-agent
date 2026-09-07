@@ -98,6 +98,13 @@ open_sqlite() {
         echo "[disk-gate] ERROR: sqlite3 missing; cannot preflight $db" >&2
         return 1
     fi
+    # Empty file = not initialized yet (docker-exec touch / first
+    # boot). Hermes creates the schema later. Non-empty without the
+    # magic header is corrupt.
+    sz="$(file_bytes "$db")"
+    if [ "$sz" = 0 ]; then
+        return 0
+    fi
     # Some sqlite3 CLIs initialize a tiny/invalid file as a new DB
     # (exit 0) and would mutate a corrupt live file. Require the
     # magic header before SELECT 1.
@@ -185,6 +192,12 @@ self_test() {
         echo "self-test: expected open pass when state.db missing" >&2
         return 1
     }
+    : > "$tmp/state.db"
+    db_open_check "$tmp" || {
+        echo "self-test: expected open pass on empty state.db" >&2
+        return 1
+    }
+    rm -f "$tmp/state.db"
     dd if=/dev/zero of="$tmp/state.db" bs=1024 count=4 >/dev/null 2>&1
     mkdir -p "$tmp/profiles/stay"
     dd if=/dev/zero of="$tmp/profiles/stay/state.db" bs=1024 count=4 >/dev/null 2>&1
