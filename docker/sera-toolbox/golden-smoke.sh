@@ -22,14 +22,16 @@ printf '%s\n' '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
 weasyprint unicode.html unicode.pdf
 test -s unicode.pdf || { echo "FAIL weasyprint wrote empty unicode.pdf" >&2; exit 1; }
 echo "OK weasyprint unicode.pdf bytes=$(wc -c < unicode.pdf)"
-if command -v pdffonts >/dev/null 2>&1; then
-  pdffonts unicode.pdf | tee unicode.fonts >&2
-  grep -Eiq 'Noto|Liberation' unicode.fonts || {
-    echo "FAIL unicode.pdf missing Noto/Liberation" >&2
-    exit 1
-  }
-  echo "OK unicode.pdf fonts recorded"
-fi
+command -v pdffonts >/dev/null 2>&1 || {
+  echo "FAIL pdffonts missing" >&2
+  exit 1
+}
+pdffonts unicode.pdf | tee unicode.fonts >&2
+grep -Eiq 'Noto|Liberation' unicode.fonts || {
+  echo "FAIL unicode.pdf missing Noto/Liberation" >&2
+  exit 1
+}
+echo "OK unicode.pdf fonts recorded"
 
 pdftotext -enc UTF-8 golden.pdf golden.txt || { echo "FAIL pdftotext golden.pdf" >&2; exit 1; }
 grep -q golden golden.txt || { echo "FAIL golden.pdf text missing"; cat golden.txt >&2; exit 1; }

@@ -108,9 +108,13 @@ def parse_net_bins() -> dict[str, str]:
     text = NET_BINS.read_text(encoding="utf-8")
     gh = re.search(r"cli/releases/download/v([0-9.]+)/", text)
     gl = re.search(r"gitleaks/releases/download/v([0-9.]+)/", text)
+    ti = re.search(r"tirith/releases/download/v([0-9.]+)/", text)
+    op = re.search(r"op2/pkg/v([0-9.]+)/", text)
     return {
         "gh": gh.group(1) if gh else "",
         "gitleaks": gl.group(1) if gl else "",
+        "tirith": ti.group(1) if ti else "",
+        "op": op.group(1) if op else "",
     }
 
 
@@ -242,6 +246,51 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         errors.append(f"gitleaks: {exc}")
         row("gitleaks", bins["gitleaks"], "", "https://github.com/gitleaks/gitleaks/releases")
+
+    try:
+        ti_new, ti_url = gh_latest_tag("sheeki03/tirith")
+        row("tirith", bins["tirith"], ti_new, ti_url)
+        if args.apply and ti_new and ti_new != bins["tirith"]:
+            amd = sha256_url(
+                f"https://github.com/sheeki03/tirith/releases/download/v{ti_new}/tirith-x86_64-unknown-linux-gnu.tar.gz"
+            )
+            arm = sha256_url(
+                f"https://github.com/sheeki03/tirith/releases/download/v{ti_new}/tirith-aarch64-unknown-linux-gnu.tar.gz"
+            )
+            text = NET_BINS.read_text(encoding="utf-8")
+            text = text.replace(
+                f"v{bins['tirith']}/tirith-", f"v{ti_new}/tirith-"
+            )
+            text = re.sub(
+                rf'(ti_url="https://github.com/sheeki03/tirith/releases/download/v{re.escape(ti_new)}/tirith-x86_64-unknown-linux-gnu.tar.gz"\n    ti_sha=")[0-9a-f]+(")',
+                rf"\g<1>{amd}\2",
+                text,
+                count=1,
+            )
+            text = re.sub(
+                rf'(ti_url="https://github.com/sheeki03/tirith/releases/download/v{re.escape(ti_new)}/tirith-aarch64-unknown-linux-gnu.tar.gz"\n    ti_sha=")[0-9a-f]+(")',
+                rf"\g<1>{arm}\2",
+                text,
+                count=1,
+            )
+            NET_BINS.write_text(text, encoding="utf-8")
+            applied.append(f"tirith {bins['tirith']} -> {ti_new}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"tirith: {exc}")
+        row("tirith", bins["tirith"], "", "https://github.com/sheeki03/tirith/releases")
+
+    try:
+        # 1Password CLI is not on GitHub releases. Report current pin;
+        # apply stays manual (checksummed cache.agilebits.com URLs).
+        row(
+            "op",
+            bins["op"],
+            bins["op"],
+            "https://app-updates.agilebits.com/product_history/CLI2",
+        )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"op: {exc}")
+        row("op", bins.get("op", ""), "", "https://developer.1password.com/docs/cli")
 
     try:
         uv_ver, uv_url = gh_latest_tag("astral-sh/uv")

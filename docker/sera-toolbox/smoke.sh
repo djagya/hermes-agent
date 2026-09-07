@@ -4,7 +4,7 @@ set -euo pipefail
 
 need=(
   bwrap file jq sqlite3 zip unzip 7z zstd
-  pdftotext qpdf gs tesseract ocrmypdf
+  pdftotext pdffonts pdfimages qpdf gs tesseract ocrmypdf
   convert pandoc soffice
   ffmpeg ffprobe exiftool
   shellcheck ruff markdownlint-cli2
@@ -28,6 +28,14 @@ done
 # Wrappers must not be the raw /usr/bin copy.
 if [ "$(command -v pdftotext)" != "/usr/local/bin/pdftotext" ]; then
   echo "pdftotext not wrapped: $(command -v pdftotext)" >&2
+  fail=1
+fi
+if [ "$(command -v pdffonts)" != "/usr/local/bin/pdffonts" ]; then
+  echo "pdffonts not wrapped: $(command -v pdffonts)" >&2
+  fail=1
+fi
+if [ "$(command -v pdfimages)" != "/usr/local/bin/pdfimages" ]; then
+  echo "pdfimages not wrapped: $(command -v pdfimages)" >&2
   fail=1
 fi
 
@@ -119,6 +127,16 @@ if command -v gcc >/dev/null 2>&1; then
 fi
 if command -v docker >/dev/null 2>&1; then
   echo "docker must not be in runtime image: $(command -v docker)" >&2
+  fail=1
+fi
+for leftover in sudo g++ make cmake; do
+  if command -v "$leftover" >/dev/null 2>&1; then
+    echo "$leftover must not be in runtime image: $(command -v "$leftover")" >&2
+    fail=1
+  fi
+done
+if dpkg -s python3-dev >/dev/null 2>&1; then
+  echo "python3-dev must not be installed in runtime image" >&2
   fail=1
 fi
 

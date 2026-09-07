@@ -11,7 +11,7 @@ mkdir -p "$libexec"
 
 # Document/media parsers only. gh/himalaya/rclone/op/yt-dlp stay unsandboxed.
 tools=(
-  pdftotext pdfinfo pdftoppm qpdf gs ghostscript
+  pdftotext pdfinfo pdftoppm pdffonts pdfimages qpdf gs ghostscript
   tesseract ocrmypdf
   convert magick identify mogrify
   pandoc soffice

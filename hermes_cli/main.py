@@ -458,6 +458,7 @@ from hermes_cli.subcommands.pause import build_pause_parser
 from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
+from hermes_cli.subcommands.image import build_image_parser
 from hermes_cli.subcommands.verify import build_verify_parser
 from hermes_cli.subcommands.security import build_security_parser
 from hermes_cli.subcommands.approvals import build_approvals_parser
@@ -5894,6 +5895,13 @@ def cmd_doctor(args):
     run_doctor(args)
 
 
+def cmd_image(args):
+    """Image identity / doctor (baked toolbox wrappers)."""
+    from hermes_cli.image_cmd import cmd_image as _cmd_image
+
+    _cmd_image(args)
+
+
 def cmd_verify(args):
     """Detect a project's run recipe and smoke-test it."""
     from hermes_cli.verify_cmd import run_verify_command
@@ -10961,6 +10969,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "status",
         "cron",
         "doctor",
+        "image",
         "config",
         "pairing",
         "skills",
@@ -12407,6 +12416,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
+        "image",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
@@ -13627,6 +13637,7 @@ def main():
     # doctor command  (parser built in hermes_cli/subcommands/doctor.py)
     # =========================================================================
     build_doctor_parser(subparsers, cmd_doctor=cmd_doctor)
+    build_image_parser(subparsers, cmd_image=cmd_image)
 
     # =========================================================================
     # verify command  (parser built in hermes_cli/subcommands/verify.py)

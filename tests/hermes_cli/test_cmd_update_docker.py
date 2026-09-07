@@ -27,11 +27,12 @@ from hermes_cli.main import _cmd_update_check, cmd_update
 # ---------- cmd_update (apply path) ----------
 
 
+@patch("hermes_cli.image_provenance.read_image_provenance", return_value=None)
 @patch("hermes_cli.config.is_managed", return_value=False)
 @patch("hermes_cli.config.detect_install_method", return_value="docker")
 @patch("subprocess.run")
 def test_cmd_update_in_docker_prints_guidance_and_exits(
-    mock_run, _mock_method, _mock_managed, capsys
+    mock_run, _mock_method, _mock_managed, _mock_provenance, capsys
 ):
     """``hermes update`` inside Docker → friendly message + exit 2, no git calls.
 
@@ -65,7 +66,8 @@ def test_cmd_update_in_docker_prints_guidance_and_exits(
 # ---------- format_docker_update_message — content lock ----------
 
 
-def test_format_docker_update_message_contents():
+@patch("hermes_cli.image_provenance.read_image_provenance", return_value=None)
+def test_format_docker_update_message_contents(_mock_provenance):
     """Lock in the high-value content of the Docker update message.
 
     These are the bits a user actually needs to act on; if any of them
@@ -89,3 +91,32 @@ def test_format_docker_update_message_contents():
 
     # Acknowledges that forks exist (build-your-own-image escape hatch).
     assert "fork" in msg.lower() or "Dockerfile" in msg
+
+
+def test_format_docker_update_message_fork_teaches_upgrade_script():
+    """Baked djagya GHCR marker must not teach Hub :latest or compose up."""
+    from hermes_cli.config import format_docker_update_message
+    from hermes_cli.image_provenance import ImageProvenance
+
+    fork = ImageProvenance(
+        schema=1,
+        deployment_kind="image",
+        manager="docker",
+        image="ghcr.io/djagya/hermes-agent",
+        version="0.21.0",
+        revision="a" * 40,
+        marker_path="/etc/hermes/image-provenance.json",
+    )
+    with patch(
+        "hermes_cli.image_provenance.read_image_provenance", return_value=fork
+    ):
+        msg = format_docker_update_message()
+        from hermes_cli.config import recommended_update_command_for_method
+
+        cmd = recommended_update_command_for_method("docker")
+
+    assert "update-stack.sh --upgrade" in msg
+    assert cmd == "./scripts/update-stack.sh --upgrade"
+    assert "nousresearch/hermes-agent:latest" not in msg
+    assert "compose up" not in msg
+    assert "/run/service" in msg

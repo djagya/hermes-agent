@@ -102,6 +102,27 @@ def test_admission_marker_refuses_even_on_git_checkout(tmp_path, monkeypatch):
     assert "docker pull" in refusal.update_command
 
 
+def test_admission_fork_marker_teaches_update_stack(tmp_path, monkeypatch):
+    import hermes_cli.image_provenance as ip
+
+    marker = tmp_path / "image-provenance.json"
+    marker.write_text(json.dumps({
+        "schema": 1,
+        "deployment_kind": "image",
+        "manager": "docker",
+        "image": "ghcr.io/djagya/hermes-agent",
+        "version": "0.21.0",
+        "revision": "b" * 40,
+    }))
+    monkeypatch.setattr(ip, "IMAGE_PROVENANCE_PATH", marker)
+    refusal = evaluate_update_admission(tmp_path)
+    assert refusal is not None
+    assert refusal.code == "image-marker"
+    assert refusal.update_command == "./scripts/update-stack.sh --upgrade"
+    assert "compose up" not in refusal.message
+    assert "nousresearch/hermes-agent:latest" not in refusal.message
+
+
 def test_admission_invalid_marker_fails_closed(tmp_path, monkeypatch):
     import hermes_cli.image_provenance as ip
 

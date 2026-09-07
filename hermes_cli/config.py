@@ -620,12 +620,44 @@ def is_nix_install_method(method: str) -> bool:
     return method == "nix" or method in _NIX_MANAGED_SYSTEMS
 
 
+_FORK_IMAGE = "ghcr.io/djagya/hermes-agent"
+_FORK_UPDATE_CMD = "./scripts/update-stack.sh --upgrade"
+_UPSTREAM_DOCKER_PULL = "docker pull nousresearch/hermes-agent:latest"
+
+
+def _docker_provenance_image() -> Optional[str]:
+    """Return the baked image name, or None when the marker is absent."""
+    try:
+        from hermes_cli.image_provenance import read_image_provenance
+
+        provenance = read_image_provenance()
+    except Exception:
+        return None
+    if provenance is None or not provenance.valid or not provenance.image:
+        return None
+    return provenance.image.strip()
+
+
+def _is_fork_image(image: Optional[str]) -> bool:
+    return bool(image and "djagya/hermes-agent" in image)
+
+
+def _docker_update_command(image: Optional[str] = None) -> str:
+    """One-line remediation for a docker/image-managed install."""
+    image = image if image is not None else _docker_provenance_image()
+    if _is_fork_image(image):
+        return _FORK_UPDATE_CMD
+    if image:
+        return f"docker pull {image}" if ":" in image.split("/")[-1] else f"docker pull {image}:latest"
+    return _UPSTREAM_DOCKER_PULL
+
+
 def recommended_update_command_for_method(method: str) -> str:
     """Return the update command or guidance for a given install method."""
     if is_nix_install_method(method):
         return _NIX_UPDATE_MSG
     if method == "docker":
-        return "docker pull nousresearch/hermes-agent:latest"
+        return _docker_update_command()
     if method == "apt":
         # By contract, the current "apt" install method is the Termux APT
         # distribution. It deliberately uses Termux's `pkg` frontend.
@@ -660,6 +692,9 @@ def recommended_update_command() -> str:
 #   - The right action is ``docker pull`` + restart the container; this
 #     helper spells that out, with notes on tag pinning and config
 #     persistence so users don't get blindsided.
+#
+# Fork images (ghcr.io/djagya/hermes-agent) must not teach Hub :latest
+# or ``docker compose up`` — that wipes /run/service on this install.
 _DOCKER_UPDATE_MESSAGE = """\
 ✗ ``hermes update`` doesn't apply inside the Docker container.
 
@@ -686,14 +721,41 @@ Notes:
   • Running a fork?  Build your own image with this repo's ``Dockerfile``
     and replace the ``docker pull`` step with your build/push pipeline."""
 
+_FORK_DOCKER_UPDATE_MESSAGE = """\
+✗ ``hermes update`` doesn't apply inside the Docker container.
+
+This install is image-managed (ghcr.io/djagya/hermes-agent). There is
+no working tree to pull into. Do not ``docker compose up`` — that
+wipes /run/service.
+
+On the monolith box:
+
+  ./scripts/bump-image-pins.sh --hermes-ref ghcr.io/djagya/hermes-agent:<sha>
+  # review compose.yaml + hermes/release.yaml; keep cutover_status activated
+  ./scripts/update-stack.sh --upgrade
+  ./scripts/register-hermes-s6-writers.sh --start
+
+Verify after:
+
+  docker inspect hermes --format '{{index .Config.Labels "HERMES_GIT_SHA"}}'
+  hermes version
+
+Notes:
+  • Config and sessions live under $HERMES_HOME (/opt/data) and persist.
+  • Durable fixes are fork commit → GHCR digest → pin bump.
+  • Live debug is apply-hermes-hotfix.sh (ephemeral; dies on recreate)."""
+
 
 def format_docker_update_message() -> str:
     """Return the user-facing message for ``hermes update`` inside Docker.
 
     Centralised so ``cmd_update`` (the apply path) and ``_cmd_update_check``
     (the dry-run path) share the same wording.  See ``_DOCKER_UPDATE_MESSAGE``
-    above for the full rationale.
+    above for the full rationale. Fork images teach the monolith upgrade
+    loop, not Hub ``:latest`` or ``compose up``.
     """
+    if _is_fork_image(_docker_provenance_image()):
+        return _FORK_DOCKER_UPDATE_MESSAGE
     return _DOCKER_UPDATE_MESSAGE
 
 
