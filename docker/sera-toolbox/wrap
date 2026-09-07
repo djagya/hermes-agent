@@ -8,7 +8,13 @@ set -euo pipefail
 # execs /usr/local/bin/file) runs here inside the parent bwrap, where
 # `rm` can 127 and replace the oversized-output exit 3.
 drop_path() {
-  python3 -c '
+  # Prefer distro python. PATH python3 is often the venv, which is
+  # not bound inside a nested wrap and must not be deleted by a
+  # botched `/` size walk.
+  local py=/usr/bin/python3
+  [ -x "$py" ] || py="$(command -v python3 || true)"
+  [ -n "$py" ] || return 0
+  "$py" -c '
 import os, shutil, sys
 for p in sys.argv[1:]:
     if not p or not os.path.lexists(p):
@@ -40,6 +46,11 @@ if [ ! -x "$real" ]; then
   echo "sera-toolbox: missing ${real}" >&2
   exit 127
 fi
+# ImageMagick execs /usr/local/bin/file by absolute path. That wrap
+# must not start a second bwrap (or walk `/` as the output dir).
+if [ "${SERA_SANDBOX_INNER:-}" = 1 ]; then
+  exec "$real" "$@"
+fi
 
 if ! command -v bwrap >/dev/null 2>&1; then
   echo "sera-toolbox: bubblewrap not installed" >&2
@@ -48,6 +59,13 @@ fi
 
 cwd="$(pwd -P)"
 out_dir="${SERA_SANDBOX_OUT:-$cwd}"
+# Image WORKDIR is `/`. Never bind or size-walk `/` — that both
+# leaks the container and can delete /opt/hermes after a refuse.
+case "$out_dir" in
+  /|/opt|/opt/hermes|/usr|/usr/local|/bin|/sbin)
+    out_dir="$(mktemp -d /tmp/sera-out.XXXXXX)"
+    ;;
+esac
 mkdir -p "$out_dir"
 
 # Tool-specific hardened flags. Extra caller flags still apply
@@ -194,32 +212,17 @@ esac
 # Inherited by bwrap child. 64 is enough for receipt python + the tool.
 ulimit -u "${SERA_SANDBOX_NPROC:-64}" 2>/dev/null || true
 # Dedicated writable output bind. cwd is RO when it is not the out dir.
+# Never bind `/` (image WORKDIR) — system paths are already mounted.
 fs_binds=()
-if [ "$(pwd -P)" = "$(cd "$out_dir" && pwd -P)" ]; then
-  fs_binds+=(--bind "$cwd" "$cwd")
+if [ "$cwd" != "/" ]; then
+  if [ "$(pwd -P)" = "$(cd "$out_dir" && pwd -P)" ]; then
+    fs_binds+=(--bind "$cwd" "$cwd")
+  else
+    fs_binds+=(--ro-bind "$cwd" "$cwd" --bind "$out_dir" "$out_dir")
+  fi
 else
-  fs_binds+=(--ro-bind "$cwd" "$cwd" --bind "$out_dir" "$out_dir")
+  fs_binds+=(--bind "$out_dir" "$out_dir")
 fi
-
-# Hide PATH wrappers inside the sandbox so ImageMagick `file` (and
-# similar) cannot re-enter wrap. Prefer the libexec real binary.
-wrapper_overrides=()
-for w in /usr/local/bin/*; do
-  [ -L "$w" ] || continue
-  case "$(readlink -f "$w" 2>/dev/null || true)" in
-    */docker/sera-toolbox/wrap)
-      name="$(basename "$w")"
-      if [ -x "/usr/libexec/sera-toolbox/${name}" ]; then
-        wrapper_overrides+=(--ro-bind "/usr/libexec/sera-toolbox/${name}" "$w")
-      elif [ -f "/usr/libexec/sera-toolbox/${name}.origin" ]; then
-        orig="$(tr -d '\n' < "/usr/libexec/sera-toolbox/${name}.origin")"
-        if [ -n "$orig" ] && [ -e "$orig" ]; then
-          wrapper_overrides+=(--ro-bind "$orig" "$w")
-        fi
-      fi
-      ;;
-  esac
-done
 
 start_ns="$(date +%s%N)"
 tmp_receipt="$(mktemp /tmp/sera-bwrap.XXXXXX.json)"
@@ -253,6 +256,7 @@ env -i \
   PATH=/usr/libexec/sera-toolbox:/usr/bin:/bin \
   HOME=/tmp/home \
   TMPDIR=/tmp \
+  SERA_SANDBOX_INNER=1 \
   LANG="${LANG:-C.UTF-8}" \
   LC_ALL="${LC_ALL:-C.UTF-8}" \
   MAGICK_CONFIGURE_PATH=/etc/sera-toolbox/ImageMagick \
@@ -305,7 +309,6 @@ env -i \
     "${venv_binds[@]}" \
     "${lo_binds[@]}" \
     "${fs_binds[@]}" \
-    "${wrapper_overrides[@]}" \
     --chdir "$cwd" \
     -- "$real" "${extra[@]}" "$@" \
   || status=$?
