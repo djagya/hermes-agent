@@ -273,7 +273,7 @@ jobs:
           # RLIMIT_NPROC is ignored. Production runs parsers as
           # hermes (10000).
           run_bwrap -u 10000:10000 --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/fork-bomb.sh "$IMAGE"
-          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh "$IMAGE"
+          run_bwrap -u 10000:10000 --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh "$IMAGE"
 
       - name: Offline CLI without data mount
         env:

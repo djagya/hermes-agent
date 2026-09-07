@@ -16,12 +16,16 @@ cp "$fix/hello.md" "$fix/golden-docx.md" "$fix/golden.csv" "$fix/bad.db" \
 # Stored golden.pdf is the workflow fixture; this one is generated.
 printf '%s\n' '<html><body><p>Здравствуй golden 😀</p></body></html>' > unicode.html
 weasyprint unicode.html unicode.pdf
+test -s unicode.pdf || { echo "FAIL weasyprint wrote empty unicode.pdf" >&2; exit 1; }
+echo "OK weasyprint unicode.pdf bytes=$(wc -c < unicode.pdf)"
 
-pdftotext golden.pdf golden.txt
-grep -q golden golden.txt
-pdftotext unicode.pdf unicode.txt
-grep -q 'Здравствуй' unicode.txt
+pdftotext golden.pdf golden.txt || { echo "FAIL pdftotext golden.pdf" >&2; exit 1; }
+grep -q golden golden.txt || { echo "FAIL golden.pdf text missing"; cat golden.txt >&2; exit 1; }
+echo "OK pdftotext golden.pdf"
+pdftotext unicode.pdf unicode.txt || { echo "FAIL pdftotext unicode.pdf" >&2; exit 1; }
+grep -q 'Здравствуй' unicode.txt || { echo "FAIL unicode.pdf text missing"; cat unicode.txt >&2; exit 1; }
 test "$(wc -c < unicode.pdf)" -gt "$(wc -c < golden.pdf)"
+echo "OK pdftotext unicode.pdf"
 
 unzip -l golden.zip | grep -q hello.txt
 zstd -q golden.zip -o golden.zip.zst

@@ -191,12 +191,12 @@ case "$tool" in
   tesseract|ocrmypdf)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-180}"
     as_bytes="${SERA_SANDBOX_AS_BYTES:-2147483648}"
-    nproc_default=256
+    nproc_default=512
     ;;
   soffice|libreoffice|pandoc|weasyprint|sera-weasyprint|sera-pymupdf)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-180}"
     as_bytes="${SERA_SANDBOX_AS_BYTES:-2147483648}"
-    nproc_default=256
+    nproc_default=512
     ;;
   ffmpeg|ffprobe)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
@@ -279,6 +279,9 @@ env -i \
   PATH=/usr/libexec/sera-toolbox:/usr/bin:/bin \
   HOME=/tmp/home \
   TMPDIR=/tmp \
+  XDG_CACHE_HOME=/tmp/home/.cache \
+  XDG_CONFIG_HOME=/tmp/home/.config \
+  FONTCONFIG_PATH=/etc/fonts \
   SERA_SANDBOX_INNER=1 \
   LANG="${LANG:-C.UTF-8}" \
   LC_ALL="${LC_ALL:-C.UTF-8}" \
@@ -302,6 +305,10 @@ env -i \
     --tmpfs /run \
     "${home_perms[@]}" \
     --dir /tmp/home \
+    "${home_perms[@]}" \
+    --dir /tmp/home/.cache \
+    "${home_perms[@]}" \
+    --dir /tmp/home/.config \
     --ro-bind-try /etc/passwd /etc/passwd \
     --ro-bind-try /etc/group /etc/group \
     --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf \
