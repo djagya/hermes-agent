@@ -96,6 +96,9 @@ jobs:
           fi
           /tmp/gitleaks detect --redact --log-opts="$range"
 
+      - name: sera-toolbox unit tests
+        run: python3 -m unittest discover -s tests/sera_toolbox -v
+
   # Build the image and run the docker integration suite against it.
   # This job runs branch code, so it stays secret-free; publishing happens
   # in the separate environment-gated job below.
@@ -260,11 +263,16 @@ jobs:
           }
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/smoke.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/zip-slip.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/tar-slip.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/imagemagick-url.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/no-network.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/high-ratio.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/high-ratio-7z.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/high-ratio-zstd.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/ffmpeg-concat.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/pdf-external.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/office-external.sh "$IMAGE"
+          run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/office-macro.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/secret-env.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/oversized-output.sh "$IMAGE"
           run_bwrap --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/html-fetch.sh "$IMAGE"

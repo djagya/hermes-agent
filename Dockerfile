@@ -126,7 +126,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     bubblewrap \
-    file jq zip unzip p7zip-full zstd \
+    file jq zip unzip p7zip-full zstd libarchive-tools \
     poppler-utils qpdf ghostscript \
     tesseract-ocr tesseract-ocr-eng ocrmypdf \
     imagemagick \
@@ -388,6 +388,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     "PyMuPDF==1.25.5" \
     "pymupdf4llm==0.0.17" \
     "weasyprint==69.0" \
+    "python-docx==1.2.0" \
+    "openpyxl==3.1.5" \
     "ddgs==9.5.5" \
     "yt-dlp==2026.08.19" \
     "tornado==6.5.8" \
@@ -540,11 +542,14 @@ COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
 COPY --chmod=0755 docker/mcp-shim.sh /opt/hermes/bin/mcp
 COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
 COPY --chmod=0755 docker/sera-toolbox/wrap /opt/hermes/docker/sera-toolbox/wrap
+COPY --chmod=0755 docker/sera-toolbox/check-archive-members.py /opt/hermes/docker/sera-toolbox/check-archive-members.py
+COPY --chmod=0755 docker/sera-toolbox/disk-gate.sh /opt/hermes/docker/sera-toolbox/disk-gate.sh
 COPY --chmod=0755 docker/sera-toolbox/helpers/ /opt/hermes/docker/sera-toolbox/helpers/
 COPY docker/sera-toolbox/libreoffice/ /etc/sera-toolbox/libreoffice/
 COPY --chmod=0755 docker/sera-toolbox/install-wrappers.sh /opt/hermes/docker/sera-toolbox/install-wrappers.sh
 COPY --chmod=0755 docker/sera-toolbox/install-network-bins.sh /opt/hermes/docker/sera-toolbox/install-network-bins.sh
 COPY --chmod=0755 docker/sera-toolbox/smoke.sh /opt/hermes/docker/sera-toolbox/smoke.sh
+COPY --chmod=0755 docker/sera-toolbox/start-baked-mcp.sh /opt/hermes/docker/sera-toolbox/start-baked-mcp.sh
 COPY --chmod=0755 docker/sera-toolbox/hermes-image-info.sh /usr/local/bin/hermes-image-info
 COPY --chmod=0755 docker/sera-toolbox/hermes-image-doctor.sh /usr/local/bin/hermes-image-doctor
 COPY --chmod=0755 docker/sera-toolbox/write-toolchain-manifest.sh /opt/hermes/docker/sera-toolbox/write-toolchain-manifest.sh
@@ -625,15 +630,17 @@ ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false
+ENV NPM_CONFIG_CACHE=/opt/data/cache/npm
 ENV UV_NO_PROGRESS=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV XDG_CACHE_HOME=/opt/data/cache
 ENV XDG_CONFIG_HOME=/opt/data/.config
 ENV UV_CACHE_DIR=/opt/data/cache/uv
-ENV HF_HOME=/opt/data/cache/huggingface
-ENV TRANSFORMERS_CACHE=/opt/data/cache/huggingface
-ENV HUGGINGFACE_HUB_CACHE=/opt/data/cache/huggingface
+ENV HERMES_MODEL_ROOT=/opt/data/models
+ENV HF_HOME=/opt/data/models/huggingface
+ENV TRANSFORMERS_CACHE=/opt/data/models/huggingface
+ENV HUGGINGFACE_HUB_CACHE=/opt/data/models/huggingface
 ENV npm_config_install_links=false
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
@@ -661,7 +668,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     ca-certificates curl iputils-ping python3 python-is-python3 \
     ripgrep ffmpeg libffi8 libolm3 libatomic1 procps git openssh-client xz-utils \
     bubblewrap \
-    file jq zip unzip p7zip-full zstd \
+    file jq zip unzip p7zip-full zstd libarchive-tools \
     poppler-utils qpdf ghostscript \
     tesseract-ocr tesseract-ocr-eng ocrmypdf \
     imagemagick \
@@ -688,6 +695,7 @@ COPY --from=builder /command /command
 COPY --from=builder /package /package
 COPY --from=builder /usr/bin/tini /usr/bin/tini
 COPY --chmod=0755 docker/sera-toolbox/hermes-healthcheck.sh /usr/local/bin/hermes-healthcheck
+COPY docker/sera-toolbox/hermes-path.sh /etc/profile.d/hermes-path.sh
 
 RUN ldconfig && \
     cd /opt/hermes && \

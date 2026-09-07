@@ -2,6 +2,21 @@
 # Cheap compose HEALTHCHECK. No PRAGMA quick_check.
 set -eu
 
+gateway_stat_ok() {
+  # s6-svstat: "up (pid 347 pgid 347) 2618 seconds"
+  case "$1" in
+    up\ \(pid\ [0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  gateway_stat_ok "up (pid 347 pgid 347) 2618 seconds" || exit 1
+  gateway_stat_ok "down (exitcode 0) 10 seconds, normally up" && exit 1
+  gateway_stat_ok "down (not started yet)" && exit 1
+  exit 0
+fi
+
 home="${HERMES_HOME:-/opt/data}"
 
 if [ -f "$home/ESTOP" ]; then
@@ -38,6 +53,16 @@ fi
 
 curl -fsS --max-time 4 http://127.0.0.1:8642/health >/dev/null
 
+# If the default gateway slot exists, it must be up with a PID.
+# s6-overlay always has /run/service — do not treat a missing slot as
+# unhealthy after curl already passed (CLI / slot not registered yet).
 if [ -e /run/service/gateway-default ]; then
-  /command/s6-svstat /run/service/gateway-default >/dev/null
+  st="$(/command/s6-svstat /run/service/gateway-default)" || {
+    echo "healthcheck: s6-svstat failed on gateway-default" >&2
+    exit 1
+  }
+  if ! gateway_stat_ok "$st"; then
+    echo "healthcheck: gateway-default not up: $st" >&2
+    exit 1
+  fi
 fi

@@ -1302,6 +1302,38 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
     return None
 
 
+def _pin_container_cache_roots(env: dict[str, str]) -> None:
+    """Re-apply image cache roots if a sanitizer dropped them.
+
+    Copy from the process environment only. Do not invent paths from
+    ``HERMES_HOME`` — ``is_container()`` can be true on a Linux Docker
+    *host*, and inventing ``XDG_*`` would steal ``~/.cache``.
+    """
+    keys = (
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "UV_CACHE_DIR",
+        "NPM_CONFIG_CACHE",
+        "HF_HOME",
+        "TRANSFORMERS_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
+        "PLAYWRIGHT_BROWSERS_PATH",
+    )
+    for key in keys:
+        if str(env.get(key) or "").strip():
+            continue
+        inherited = str(os.environ.get(key) or "").strip()
+        if inherited:
+            env[key] = inherited
+    hf = str(env.get("HF_HOME") or "").strip()
+    if hf:
+        if not str(env.get("TRANSFORMERS_CACHE") or "").strip():
+            env["TRANSFORMERS_CACHE"] = hf
+        if not str(env.get("HUGGINGFACE_HUB_CACHE") or "").strip():
+            env["HUGGINGFACE_HUB_CACHE"] = hf
+
+
 def apply_subprocess_home_env(env: dict[str, str]) -> None:
     """Apply Hermes' subprocess HOME contract to *env* in-place."""
     real_home = get_real_home(env)
@@ -1310,6 +1342,7 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
     home = get_subprocess_home(env)
     if home:
         env["HOME"] = home
+    _pin_container_cache_roots(env)
 
 
 VALID_REASONING_EFFORTS = (

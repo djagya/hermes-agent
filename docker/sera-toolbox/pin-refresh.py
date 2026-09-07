@@ -66,6 +66,22 @@ def ghcr_digest(image: str, tag: str) -> str:
     return digest
 
 
+def pypi_latest(name: str) -> tuple[str, str]:
+    payload = json.loads(fetch_text(f"https://pypi.org/pypi/{name}/json"))
+    ver = str(payload.get("info", {}).get("version") or "")
+    if not ver:
+        raise RuntimeError(f"no pypi version for {name}")
+    return ver, f"https://pypi.org/project/{name}/{ver}/"
+
+
+def npm_latest(name: str) -> tuple[str, str]:
+    payload = json.loads(fetch_text(f"https://registry.npmjs.org/{name}/latest"))
+    ver = str(payload.get("version") or "")
+    if not ver:
+        raise RuntimeError(f"no npm version for {name}")
+    return ver, f"https://www.npmjs.com/package/{name}/v/{ver}"
+
+
 def dockerhub_digest(image: str, tag: str) -> str:
     url = f"https://hub.docker.com/v2/namespaces/library/repositories/{image}/tags/{tag}"
     payload = json.loads(fetch_text(url))
@@ -101,6 +117,35 @@ def parse_dockerfile() -> dict[str, str]:
         "s6_symlinks": arg("S6_OVERLAY_SYMLINKS_SHA256"),
         "sqlite": arg("SQLITE_AUTOCONF_VERSION"),
         "snapshot": arg("DEBIAN_SNAPSHOT"),
+        "himalaya": arg("HIMALAYA_REV"),
+        "weasyprint": (
+            m.group(1)
+            if (m := re.search(r'"weasyprint==([^"]+)"', text))
+            else ""
+        ),
+        "python_docx": (
+            m.group(1)
+            if (m := re.search(r'"python-docx==([^"]+)"', text))
+            else ""
+        ),
+        "openpyxl": (
+            m.group(1)
+            if (m := re.search(r'"openpyxl==([^"]+)"', text))
+            else ""
+        ),
+        "yt_dlp": (
+            m.group(1)
+            if (m := re.search(r'"yt-dlp==([^"]+)"', text))
+            else ""
+        ),
+        "clickup": (
+            m.group(1)
+            if (m := re.search(r"@hauptsache\.net/clickup-mcp@([0-9.]+)", text))
+            else ""
+        ),
+        "caldav": (
+            m.group(1) if (m := re.search(r"caldav-mcp@([0-9.]+)", text)) else ""
+        ),
     }
 
 
@@ -116,6 +161,81 @@ def parse_net_bins() -> dict[str, str]:
         "tirith": ti.group(1) if ti else "",
         "op": op.group(1) if op else "",
     }
+
+
+def render_report(
+    budget: dict,
+    rows: list[tuple[str, str, str, str]],
+    applied: list[str],
+    errors: list[str],
+) -> str:
+    """PR body: pin table plus last accepted size/CVE/SBOM baseline.
+
+    This job does not rebuild. fork-release-image is the gate that
+    measures a new digest. The body must still carry the last accepted
+    numbers so a reviewer is not told to 'fill them later'.
+    """
+    measured = budget.get("measured_image_bytes")
+    max_bytes = budget.get("max_image_bytes")
+    slack = ""
+    if isinstance(measured, int) and isinstance(max_bytes, int):
+        slack = str(max_bytes - measured)
+    lines = [
+        "# Pin refresh",
+        "",
+        "Review-only. No unattended merge, publish, or deploy.",
+        "This job does not rebuild. Size, CVE policy, and SBOM path",
+        "below are the last accepted `image-budget.json` baseline.",
+        "Do not merge until `fork-release-image` on this branch stays",
+        "green (measure-image-budget, Trivy fixable CRITICAL/HIGH,",
+        "named SPDX/CycloneDX artifact `hermes-agent-sbom`).",
+        "",
+        "## Last accepted image (size / CVE / SBOM)",
+        "",
+        f"- digest: `{budget.get('accepted_digest') or '(unset)'}`",
+        f"- git: `{budget.get('accepted_git_sha') or '(unset)'}`",
+        f"- measured_image_bytes: `{measured}`",
+        f"- max_image_bytes: `{max_bytes}` (slack `{slack or 'n/a'}`)",
+        f"- max_largest_layer_bytes: `{budget.get('max_largest_layer_bytes')}`",
+        f"- max_fixable_critical: `{budget.get('max_fixable_critical')}`",
+        f"- max_fixable_high: `{budget.get('max_fixable_high')}`",
+        "- SBOM: CI artifact `hermes-agent-sbom` on that green run",
+        "  (not baked under `/etc/hermes`).",
+        "- smoke: golden + adversarial in the same job (fail-closed).",
+        "",
+        "## Accepted budget",
+        "",
+        "```json",
+        json.dumps(budget, indent=2, sort_keys=True).rstrip(),
+        "```",
+        "",
+        "## Old vs new",
+        "",
+        "| pin | current | latest | notes |",
+        "|---|---|---|---|",
+    ]
+    for name, old, new, link in rows:
+        status = (
+            "same"
+            if old and old == new
+            else ("bump" if new and not str(new).startswith("(") else "lookup")
+        )
+        ref = f"[release]({link})" if link else ""
+        lines.append(f"| {name} | `{old}` | `{new}` | {status} {ref} |".rstrip())
+    lines.append("")
+    if applied:
+        lines.append("## Applied on this branch")
+        lines.append("")
+        for item in applied:
+            lines.append(f"- {item}")
+        lines.append("")
+    if errors:
+        lines.append("## Lookup errors")
+        lines.append("")
+        for err in errors:
+            lines.append(f"- {err}")
+        lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 def replace_all(path: Path, old: str, new: str) -> int:
@@ -313,43 +433,64 @@ def main() -> int:
     row("sqlite-autoconf", pins["sqlite"], pins["sqlite"], "https://sqlite.org/download.html")
     row("DEBIAN_SNAPSHOT", pins["snapshot"], pins["snapshot"], "https://snapshot.debian.org/")
 
-    budget = (ROOT / "docker/sera-toolbox/image-budget.json").read_text(encoding="utf-8")
-    lines = [
-        "# Pin refresh",
-        "",
-        "Review-only. No unattended merge, publish, or deploy.",
-        "CI on this branch must fill SBOM/CVE delta and image-size",
-        "delta before anyone merges.",
-        "",
-        "## Accepted budget",
-        "",
-        "```json",
-        budget.rstrip(),
-        "```",
-        "",
-        "## Old vs new",
-        "",
-        "| pin | current | latest | notes |",
-        "|---|---|---|---|",
-    ]
-    for name, old, new, link in rows:
-        status = "same" if old and old == new else ("bump" if new and not new.startswith("(") else "lookup")
-        ref = f"[release]({link})" if link else ""
-        lines.append(f"| {name} | `{old}` | `{new}` | {status} {ref} |".rstrip())
-    lines.append("")
-    if applied:
-        lines.append("## Applied on this branch")
-        lines.append("")
-        for item in applied:
-            lines.append(f"- {item}")
-        lines.append("")
-    if errors:
-        lines.append("## Lookup errors")
-        lines.append("")
-        for err in errors:
-            lines.append(f"- {err}")
-        lines.append("")
-    Path(args.report).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Report-only. Himalaya is a pinned git rev + cargo features, not a
+    # release tarball. Pip/npm toolbox pins stay manual so --apply cannot
+    # silently float WeasyPrint/yt-dlp/MCP clients.
+    try:
+        him_new, him_url = gh_latest_tag("pimalaya/himalaya")
+        row("himalaya", pins["himalaya"][:12], him_new, him_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"himalaya: {exc}")
+        row("himalaya", pins["himalaya"][:12], "", "https://github.com/pimalaya/himalaya/releases")
+
+    try:
+        wp_new, wp_url = pypi_latest("weasyprint")
+        row("weasyprint", pins["weasyprint"], wp_new, wp_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"weasyprint: {exc}")
+        row("weasyprint", pins["weasyprint"], "", "https://pypi.org/project/weasyprint/")
+
+    try:
+        dx_new, dx_url = pypi_latest("python-docx")
+        row("python-docx", pins["python_docx"], dx_new, dx_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"python-docx: {exc}")
+        row("python-docx", pins["python_docx"], "", "https://pypi.org/project/python-docx/")
+
+    try:
+        ox_new, ox_url = pypi_latest("openpyxl")
+        row("openpyxl", pins["openpyxl"], ox_new, ox_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"openpyxl: {exc}")
+        row("openpyxl", pins["openpyxl"], "", "https://pypi.org/project/openpyxl/")
+
+    try:
+        yt_new, yt_url = pypi_latest("yt-dlp")
+        row("yt-dlp", pins["yt_dlp"], yt_new, yt_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"yt-dlp: {exc}")
+        row("yt-dlp", pins["yt_dlp"], "", "https://pypi.org/project/yt-dlp/")
+
+    try:
+        cu_new, cu_url = npm_latest("@hauptsache.net/clickup-mcp")
+        row("clickup-mcp", pins["clickup"], cu_new, cu_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"clickup-mcp: {exc}")
+        row("clickup-mcp", pins["clickup"], "", "https://www.npmjs.com/package/@hauptsache.net/clickup-mcp")
+
+    try:
+        cd_new, cd_url = npm_latest("caldav-mcp")
+        row("caldav-mcp", pins["caldav"], cd_new, cd_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"caldav-mcp: {exc}")
+        row("caldav-mcp", pins["caldav"], "", "https://www.npmjs.com/package/caldav-mcp")
+
+    budget = json.loads(
+        (ROOT / "docker/sera-toolbox/image-budget.json").read_text(encoding="utf-8")
+    )
+    Path(args.report).write_text(
+        render_report(budget, rows, applied, errors), encoding="utf-8"
+    )
     print(f"wrote {args.report} applied={applied or 'none'} errors={len(errors)}")
     return 0
 

@@ -79,6 +79,8 @@ case "$tool" in
     extra+=(-dSAFER -dNOPAUSE)
     ;;
   soffice|libreoffice)
+    # Disposable profile + MacroSecurityLevel 3. Do not pass --safe-mode:
+    # that is LibreOffice crash-recovery UI, not headless convert.
     extra+=(--headless --norestore --nolockcheck --nofirststartwizard --nologo
             "-env:UserInstallation=file:///tmp/lo-profile")
     lo_profile="$(mktemp -d /tmp/lo-profile.XXXXXX)"
@@ -134,35 +136,7 @@ case "$tool" in
           ;;
       esac
     done
-    if ! python3 - "$@" <<'PY'
-import sys, zipfile
-from pathlib import Path
-max_ratio = float(__import__("os").environ.get("SERA_SANDBOX_ZIP_RATIO", "100"))
-max_uncomp = int(__import__("os").environ.get("SERA_SANDBOX_ZIP_MAX_BYTES", str(64 * 1024 * 1024)))
-max_members = int(__import__("os").environ.get("SERA_SANDBOX_ZIP_MAX_MEMBERS", "4096"))
-for arg in sys.argv[1:]:
-    p = Path(arg)
-    if not p.is_file() or not zipfile.is_zipfile(p):
-        continue
-    with zipfile.ZipFile(p) as z:
-        raw = 0
-        comp = 0
-        members = 0
-        for info in z.infolist():
-            members += 1
-            if members > max_members:
-                sys.exit(3)
-            name = info.filename
-            if name.startswith("/") or any(part == ".." for part in name.split("/")):
-                sys.exit(2)
-            raw += info.file_size
-            comp += info.compress_size
-        if raw > max_uncomp:
-            sys.exit(3)
-        if comp and (raw / comp) > max_ratio:
-            sys.exit(3)
-PY
-    then
+    if ! python3 /opt/hermes/docker/sera-toolbox/check-archive-members.py "$@"; then
       echo "sera-toolbox: refusing zip-slip, bomb, or absolute archive member" >&2
       exit 2
     fi
@@ -184,7 +158,7 @@ case "$tool" in
     timeout_s="${SERA_SANDBOX_TIMEOUT:-30}"
     as_bytes="${SERA_SANDBOX_AS_BYTES:-536870912}"
     ;;
-  pdftotext|pdftoppm|qpdf|gs|ghostscript)
+  pdftotext|pdftoppm|pdffonts|pdfimages|qpdf|gs|ghostscript|convert|magick|mogrify|heif-convert)
     timeout_s="${SERA_SANDBOX_TIMEOUT:-120}"
     as_bytes="${SERA_SANDBOX_AS_BYTES:-1073741824}"
     ;;
@@ -212,10 +186,12 @@ case "$tool" in
     ;;
 esac
 # Process cap without --unshare-pid (nested Docker EPERM on procfs).
-# userns-root ignores RLIMIT_NPROC; drop to nobody inside bwrap.
-# ulimit still applies when wrap itself is unprivileged.
+# Do NOT ulimit -u in this parent: RLIMIT_NPROC is per-UID. On a
+# busy hermes box the user already has >>64 processes, so a parent
+# ulimit -u 64 makes wrap itself fail to fork (live 7z: "Resource
+# temporarily unavailable"). Cap only inside bwrap: --rlimit-nproc
+# plus the inner `ulimit -u` after uid map.
 nproc_lim="${SERA_SANDBOX_NPROC:-$nproc_default}"
-ulimit -u "$nproc_lim" 2>/dev/null || true
 chmod a+rwx "$out_dir" 2>/dev/null || true
 if [ -n "${lo_profile:-}" ]; then
   chmod -R a+rwx "$lo_profile" 2>/dev/null || true
@@ -256,6 +232,25 @@ case "$bwrap_help" in
 esac
 case "$bwrap_help" in
   *--rlimit-as*) bwrap_extra+=(--rlimit-as "$as_bytes") ;;
+esac
+# CPU seconds track the wall-clock profile. Parent must not ulimit -t
+# (same per-UID trap as nproc). Inner bwrap only.
+cpu_sec="${SERA_SANDBOX_CPU:-$timeout_s}"
+case "$bwrap_help" in
+  *--rlimit-cpu*) bwrap_extra+=(--rlimit-cpu "$cpu_sec") ;;
+esac
+# Bounded tmpfs. --size applies to the next --tmpfs. Parent must not
+# grow /tmp unbounded on a zip bomb that passed member checks.
+tmpfs_bytes="${SERA_SANDBOX_TMPFS_BYTES:-268435456}"
+tmpfs_tmp=(--tmpfs /tmp)
+tmpfs_vartmp=(--tmpfs /var/tmp)
+tmpfs_run=(--tmpfs /run)
+case "$bwrap_help" in
+  *--size*)
+    tmpfs_tmp=(--size "$tmpfs_bytes" --tmpfs /tmp)
+    tmpfs_vartmp=(--size "$tmpfs_bytes" --tmpfs /var/tmp)
+    tmpfs_run=(--size "$tmpfs_bytes" --tmpfs /run)
+    ;;
 esac
 # shellcheck disable=SC2016
 status=0
@@ -300,9 +295,9 @@ env -i \
     --ro-bind /proc /proc \
     --dev-bind /dev /dev \
     --ro-bind-try /sys /sys \
-    --tmpfs /tmp \
-    --tmpfs /var/tmp \
-    --tmpfs /run \
+    "${tmpfs_tmp[@]}" \
+    "${tmpfs_vartmp[@]}" \
+    "${tmpfs_run[@]}" \
     "${home_perms[@]}" \
     --dir /tmp/home \
     "${home_perms[@]}" \
@@ -388,25 +383,58 @@ then
   drop_path "$tmp_before" || true
   exit 3
 fi
-drop_path "$tmp_before" || true
-
-python3 - "$tool" "$status" "$elapsed_ms" "$tmp_receipt" "$@" <<'PY'
+python3 - "$tool" "$status" "$elapsed_ms" "$tmp_receipt" "$tmp_before" "$out_dir" \
+  "$real" "$timeout_s" "$as_bytes" "$nproc_lim" "${cpu_sec:-$timeout_s}" \
+  "${tmpfs_bytes:-268435456}" "$max_out_bytes" "$max_out_files" "$@" <<'PY'
 import hashlib, json, os, sys, time
 from pathlib import Path
+
+def file_rec(p: Path) -> dict:
+    data = p.read_bytes()
+    return {"path": str(p), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+
 tool, status, elapsed_ms, dest = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
-args = sys.argv[5:]
-paths = []
+before_path, out_dir, real = sys.argv[5], sys.argv[6], sys.argv[7]
+timeout_s, as_bytes, nproc_lim, cpu_sec, tmpfs_bytes, max_out_bytes, max_out_files = (
+    sys.argv[8:15]
+)
+args = sys.argv[15:]
+inputs = []
 for a in args:
     p = Path(a)
     if p.is_file():
-        h = hashlib.sha256(p.read_bytes()).hexdigest()
-        paths.append({"path": str(p), "sha256": h, "bytes": p.stat().st_size})
+        inputs.append(file_rec(p))
+before = set()
+raw = Path(before_path).read_bytes()
+if raw:
+    before.update(p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p)
+outputs = []
+for dirpath, dirnames, filenames in os.walk(out_dir):
+    dirnames[:] = [d for d in dirnames if d not in (".", "..")]
+    for name in filenames:
+        p = Path(dirpath) / name
+        if str(p) not in before:
+            try:
+                outputs.append(file_rec(p))
+            except OSError:
+                continue
 receipt = {
     "tool": tool,
+    "version": real,
     "exit": status,
     "elapsed_ms": elapsed_ms,
     "ts": int(time.time()),
-    "files": paths,
+    "limits": {
+        "timeout_s": int(timeout_s),
+        "as_bytes": int(as_bytes),
+        "nproc": int(nproc_lim),
+        "cpu_s": int(cpu_sec),
+        "tmpfs_bytes": int(tmpfs_bytes),
+        "out_max_bytes": int(max_out_bytes),
+        "out_max_files": int(max_out_files),
+    },
+    "inputs": inputs,
+    "outputs": outputs,
 }
 Path(dest).write_text(json.dumps(receipt, separators=(",", ":")) + "\n", encoding="utf-8")
 # Never print the receipt on stdout. This wrapper is a PATH stand-in
@@ -415,5 +443,6 @@ Path(dest).write_text(json.dumps(receipt, separators=(",", ":")) + "\n", encodin
 if os.environ.get("SERA_SANDBOX_VERBOSE") == "1":
     print(json.dumps({"sera_sandbox_receipt": dest, **receipt}, separators=(",", ":")), file=sys.stderr)
 PY
+drop_path "$tmp_before" || true
 
 exit "$status"

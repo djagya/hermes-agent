@@ -13,7 +13,9 @@ ok() { printf 'OK   %s\n' "$*"; }
 days="${HERMES_CACHE_PRUNE_DAYS:-30}"
 home="${HERMES_HOME:-/opt/data}"
 uv_cache="${UV_CACHE_DIR:-$home/cache/uv}"
-hf_home="${HF_HOME:-$home/cache/huggingface}"
+npm_cache="${NPM_CONFIG_CACHE:-$home/cache/npm}"
+hf_home="${HF_HOME:-$home/models/huggingface}"
+model_root="${HERMES_MODEL_ROOT:-$home/models}"
 
 prune_list() {
   local dir="$1"
@@ -23,10 +25,11 @@ prune_list() {
 
 do_prune() {
   local dry="$1"
-  note "cache policy: disposable=$uv_cache durable=$hf_home age>${days}d"
+  note "cache policy: disposable=$uv_cache $npm_cache durable=$hf_home model_root=$model_root age>${days}d"
   if [ "$dry" = 1 ]; then
     note "DRY-RUN disposable candidates:"
     prune_list "$uv_cache"
+    prune_list "$npm_cache"
     if [ "${HERMES_PRUNE_MODELS:-}" = 1 ]; then
       note "DRY-RUN durable model candidates (HERMES_PRUNE_MODELS=1):"
       prune_list "$hf_home"
@@ -39,7 +42,10 @@ do_prune() {
     bad "--prune refused: set HERMES_CACHE_PRUNE=1"
     return 1
   fi
-  prune_list "$uv_cache" | while IFS= read -r f; do
+  {
+    prune_list "$uv_cache"
+    prune_list "$npm_cache"
+  } | while IFS= read -r f; do
     [ -n "$f" ] || continue
     rm -f "$f"
     note "removed $f"
@@ -126,7 +132,8 @@ if [ -d "$home" ]; then
   for cache_dir in \
       "${XDG_CACHE_HOME:-$home/cache}" \
       "${UV_CACHE_DIR:-$home/cache/uv}" \
-      "${HF_HOME:-$home/cache/huggingface}"; do
+      "${NPM_CONFIG_CACHE:-$home/cache/npm}" \
+      "${HF_HOME:-$home/models/huggingface}"; do
     if [ -d "$cache_dir" ]; then
       cache_kb="$(du -sk "$cache_dir" 2>/dev/null | awk '{print $1}')"
       warn_kb="${HERMES_CACHE_WARN_KB:-10485760}"
@@ -138,6 +145,19 @@ if [ -d "$home" ]; then
       note "cache ${cache_dir} absent (stage2 seeds it)"
     fi
   done
+  if [ -f "${XDG_CACHE_HOME:-$home/cache}/CACHEDIR.TAG" ]; then
+    note "WARN ${XDG_CACHE_HOME:-$home/cache}/CACHEDIR.TAG would exclude durable HF from restic --exclude-caches"
+  fi
+  for disposable in "$uv_cache" "$npm_cache"; do
+    if [ -f "$disposable/CACHEDIR.TAG" ]; then
+      ok "disposable CACHEDIR.TAG $disposable"
+    elif [ -d "$disposable" ]; then
+      note "WARN missing CACHEDIR.TAG in $disposable"
+    fi
+  done
+  if [ -f "$hf_home/CACHEDIR.TAG" ]; then
+    note "WARN durable $hf_home has CACHEDIR.TAG (restic would skip models)"
+  fi
 else
   bad "$home missing"
 fi
@@ -155,7 +175,7 @@ fi
 
 python3 - <<'PY' || bad "required python imports failed"
 import importlib
-for name in ("fitz", "weasyprint", "yt_dlp", "ddgs", "fal_client", "faster_whisper"):
+for name in ("fitz", "weasyprint", "docx", "yt_dlp", "ddgs", "fal_client", "faster_whisper"):
     importlib.import_module(name)
     print("OK   py", name)
 PY
@@ -169,8 +189,13 @@ if [ "$full" = 1 ]; then
     fi
   done
   fix="${SERA_GOLDEN_FIXTURES:-/opt/hermes/docker/sera-toolbox/fixtures}"
-  if [ -d "$fix" ] && [ -x /opt/hermes/docker/sera-toolbox/golden-smoke.sh ]; then
-    note "fixtures present; golden-smoke is a separate CI entrypoint (needs bwrap seccomp)"
+  golden=/opt/hermes/docker/sera-toolbox/golden-smoke.sh
+  if [ -d "$fix" ] && [ -x "$golden" ]; then
+    if SERA_GOLDEN_FIXTURES="$fix" "$golden"; then
+      ok "golden-smoke"
+    else
+      bad "golden-smoke failed"
+    fi
   else
     note "fixtures absent (published runtime); golden-smoke skipped"
   fi

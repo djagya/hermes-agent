@@ -3,7 +3,7 @@
 set -euo pipefail
 
 need=(
-  bwrap file jq sqlite3 zip unzip 7z zstd
+  bwrap file jq sqlite3 zip unzip 7z zstd bsdtar
   pdftotext pdffonts pdfimages qpdf gs tesseract ocrmypdf
   convert pandoc soffice
   ffmpeg ffprobe exiftool
@@ -39,9 +39,22 @@ if [ "$(command -v pdfimages)" != "/usr/local/bin/pdfimages" ]; then
   fail=1
 fi
 
+if hermes-healthcheck --self-test; then
+  echo "OK hermes-healthcheck --self-test"
+else
+  echo "BAD hermes-healthcheck --self-test" >&2
+  fail=1
+fi
+if sh /opt/hermes/docker/sera-toolbox/disk-gate.sh --self-test; then
+  echo "OK disk-gate --self-test"
+else
+  echo "BAD disk-gate --self-test" >&2
+  fail=1
+fi
+
 python3 - <<'PY'
 import importlib
-for name in ("fitz", "weasyprint", "yt_dlp", "ddgs", "fal_client", "faster_whisper"):
+for name in ("fitz", "weasyprint", "docx", "openpyxl", "yt_dlp", "ddgs", "fal_client", "faster_whisper"):
     importlib.import_module(name)
     print("OK py", name)
 try:
@@ -54,6 +67,12 @@ PY
 
 if [ ! -f /etc/hermes/config.yaml ]; then
   echo "MISSING /etc/hermes/config.yaml managed policy" >&2
+  fail=1
+fi
+# SPDX/CycloneDX stay CI artifacts. Do not bake them under /etc/hermes.
+if find /etc/hermes -maxdepth 1 \( -name '*spdx*' -o -name '*cdx*' \
+     -o -name '*cyclonedx*' \) | grep -q .; then
+  echo "SPDX/CycloneDX must not be baked under /etc/hermes" >&2
   fail=1
 fi
 if [ ! -x /etc/cont-init.d/01-hermes-setup ]; then
@@ -74,6 +93,9 @@ man = json.loads(Path("/etc/hermes/toolchain-manifest.json").read_text(encoding=
 wanted = {
     "/etc/cont-init.d/01-hermes-setup",
     "/opt/hermes/docker/stage2-hook.sh",
+    "/opt/hermes/docker/sera-toolbox/wrap",
+    "/opt/hermes/docker/sera-toolbox/disk-gate.sh",
+    "/opt/hermes/docker/sera-toolbox/check-archive-members.py",
 }
 recorded = man.get("init_files") or {}
 fail = 0
@@ -110,6 +132,17 @@ for mcp in \
     echo "OK mcp $mcp"
   fi
 done
+
+# Plan 5c: start the same npx --no-install hooks the identity wrappers
+# exec, with the registry blocked. iCloud is caldav-mcp (no icloud-named pkg).
+start_mcp=/opt/hermes/docker/sera-toolbox/start-baked-mcp.sh
+if [ ! -x "$start_mcp" ]; then
+  echo "MISSING $start_mcp" >&2
+  fail=1
+else
+  "$start_mcp" clickup "@hauptsache.net/clickup-mcp@1.8.0" || fail=1
+  "$start_mcp" caldav "caldav-mcp@0.10.0" || fail=1
+fi
 
 if ! hermes-image-info --json >/tmp/image-info.json; then
   echo "hermes-image-info failed" >&2
@@ -161,11 +194,11 @@ if ! grep -q 'snapshot.debian.org/archive/debian/20260907T000000Z' \
   fail=1
 fi
 
-case "${XDG_CACHE_HOME:-}:${UV_CACHE_DIR:-}:${HF_HOME:-}" in
-  /opt/data/cache:/opt/data/cache/uv:/opt/data/cache/huggingface)
+case "${XDG_CACHE_HOME:-}:${UV_CACHE_DIR:-}:${HF_HOME:-}:${HERMES_MODEL_ROOT:-}" in
+  /opt/data/cache:/opt/data/cache/uv:/opt/data/models/huggingface:/opt/data/models)
     echo "OK cache roots" ;;
   *)
-    echo "BAD cache roots XDG_CACHE_HOME=${XDG_CACHE_HOME:-} UV_CACHE_DIR=${UV_CACHE_DIR:-} HF_HOME=${HF_HOME:-}" >&2
+    echo "BAD cache roots XDG_CACHE_HOME=${XDG_CACHE_HOME:-} UV_CACHE_DIR=${UV_CACHE_DIR:-} HF_HOME=${HF_HOME:-} HERMES_MODEL_ROOT=${HERMES_MODEL_ROOT:-}" >&2
     fail=1 ;;
 esac
 
@@ -177,7 +210,57 @@ case "${HERMES_HOME:-}:${HERMES_CHILD_HOME:-}" in
     fail=1 ;;
 esac
 
+if [ ! -f /etc/profile.d/hermes-path.sh ]; then
+  echo "MISSING /etc/profile.d/hermes-path.sh" >&2
+  fail=1
+fi
+login_path="$(bash -lc 'printf %s "$PATH"')"
+nologin_path="$(bash -c 'printf %s "$PATH"')"
+for need in /opt/hermes/bin /opt/hermes/.venv/bin /command; do
+  case ":$login_path:" in
+    *":$need:"*) ;;
+    *) echo "BAD login PATH missing $need: $login_path" >&2; fail=1 ;;
+  esac
+  case ":$nologin_path:" in
+    *":$need:"*) ;;
+    *) echo "BAD non-login PATH missing $need: $nologin_path" >&2; fail=1 ;;
+  esac
+done
+login_umask="$(bash -lc 'umask')"
+nologin_umask="$(bash --noprofile --norc -c '. /etc/profile.d/hermes-path.sh; umask')"
+if [ "$login_umask" != "0002" ]; then
+  echo "BAD login umask $login_umask (want 0002)" >&2
+  fail=1
+elif [ "$nologin_umask" != "0002" ]; then
+  echo "BAD sourced nologin umask $nologin_umask (want 0002)" >&2
+  fail=1
+else
+  echo "OK login PATH + umask 002"
+fi
+
 skip_home="$(mktemp -d)"
+touch "$skip_home/ESTOP"
+if HERMES_HOME="$skip_home" hermes-healthcheck 2>"$skip_home/err"; then
+  echo "FAIL healthcheck ignored ESTOP" >&2
+  fail=1
+elif grep -q 'ESTOP set' "$skip_home/err"; then
+  echo "OK ESTOP not-ready"
+else
+  echo "BAD ESTOP healthcheck: $(cat "$skip_home/err")" >&2
+  fail=1
+fi
+rm -f "$skip_home/ESTOP"
+touch "$skip_home/.migration-in-progress"
+if HERMES_HOME="$skip_home" hermes-healthcheck 2>"$skip_home/err"; then
+  echo "FAIL healthcheck ignored .migration-in-progress" >&2
+  fail=1
+elif grep -q 'migration in progress' "$skip_home/err"; then
+  echo "OK migration-in-progress not-ready"
+else
+  echo "BAD migration-in-progress healthcheck: $(cat "$skip_home/err")" >&2
+  fail=1
+fi
+rm -f "$skip_home/.migration-in-progress"
 touch "$skip_home/.migration-skipped"
 if HERMES_HOME="$skip_home" hermes-healthcheck 2>"$skip_home/err"; then
   echo "FAIL healthcheck ignored .migration-skipped" >&2
@@ -218,17 +301,20 @@ else
   esac
 fi
 
-tirith_bin="$(command -v tirith)"
-tirith_file="$(file "$tirith_bin")"
-echo "tirith file $tirith_file"
-case "$(uname -m):$tirith_file" in
-  x86_64:*x86-64*|x86_64:*x86_64*|aarch64:*ARM*|aarch64:*aarch64*)
-    echo "OK tirith arch" ;;
-  *)
-    echo "BAD tirith architecture: $tirith_file" >&2
-    fail=1 ;;
-esac
-tirith --version >/dev/null
+# Downloaded CLIs: file(1) + --version, not --version alone.
+for name in tirith gh gitleaks op; do
+  bin="$(command -v "$name")"
+  desc="$(file "$bin")"
+  echo "$name file $desc"
+  case "$(uname -m):$desc" in
+    x86_64:*x86-64*|x86_64:*x86_64*|aarch64:*ARM*|aarch64:*aarch64*)
+      echo "OK $name arch" ;;
+    *)
+      echo "BAD $name architecture: $desc" >&2
+      fail=1 ;;
+  esac
+  "$name" --version >/dev/null
+done
 
 # Network CLIs must ship with no baked credentials.
 for p in \

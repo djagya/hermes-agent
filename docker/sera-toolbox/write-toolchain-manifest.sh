@@ -24,6 +24,7 @@ SOURCE = {
     "weasyprint": ("https://github.com/Kozea/WeasyPrint", "BSD-3-Clause"),
     "sera-pymupdf": ("https://github.com/pymupdf/PyMuPDF", "AGPL-3.0-or-later"),
     "hermes": ("https://github.com/djagya/hermes-agent", "MIT"),
+    "bsdtar": ("https://github.com/libarchive/libarchive", "BSD-2-Clause"),
 }
 
 
@@ -59,6 +60,7 @@ tools = [
     "tesseract", "convert", "pandoc", "soffice", "ffmpeg", "exiftool",
     "shellcheck", "ruff", "gh", "gitleaks", "tirith", "rclone", "op",
     "markdownlint-cli2", "hermes", "weasyprint", "sera-pymupdf",
+    "bsdtar",
 ]
 # Plan 5c: record both the cont-init shim and the hook it execs. A
 # service restart does not rerun cont-init; hashes prove the baked
@@ -66,6 +68,14 @@ tools = [
 init_files = {
     "/etc/cont-init.d/01-hermes-setup": sha256("/etc/cont-init.d/01-hermes-setup"),
     "/opt/hermes/docker/stage2-hook.sh": sha256("/opt/hermes/docker/stage2-hook.sh"),
+    "/opt/hermes/docker/sera-toolbox/wrap": sha256("/opt/hermes/docker/sera-toolbox/wrap"),
+    "/opt/hermes/docker/sera-toolbox/disk-gate.sh": sha256("/opt/hermes/docker/sera-toolbox/disk-gate.sh"),
+    "/opt/hermes/docker/sera-toolbox/check-archive-members.py": sha256(
+        "/opt/hermes/docker/sera-toolbox/check-archive-members.py"
+    ),
+    "/opt/hermes/docker/sera-toolbox/start-baked-mcp.sh": sha256(
+        "/opt/hermes/docker/sera-toolbox/start-baked-mcp.sh"
+    ),
 }
 payload = {
     "schema": 1,

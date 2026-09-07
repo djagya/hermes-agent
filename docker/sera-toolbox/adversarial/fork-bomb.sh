@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Process cap must stop a wrap-child fork bomb (ulimit -u, no --unshare-pid).
+# Process cap must stop a wrap-child fork bomb (inner ulimit -u /
+# bwrap --rlimit-nproc, no parent ulimit, no --unshare-pid).
 set -euo pipefail
 
 tmp="$(mktemp -d)"

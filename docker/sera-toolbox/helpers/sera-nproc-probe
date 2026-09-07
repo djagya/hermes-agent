@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Spawn N child sleeps. Used by the fork-bomb adversarial fixture.
 
-Runs inside wrap, so ulimit -u / optional bwrap --rlimit-nproc must
-stop this before N children exist. Exit 0 only if every fork succeeded
-(that is a cap failure). Exit 1 when the OS refuses further forks.
+Runs inside wrap, so the inner ulimit -u / optional bwrap
+--rlimit-nproc must stop this before N children exist. The wrap
+parent must not set ulimit -u (busy hermes UID already exceeds the
+archive cap). Exit 0 only if every fork succeeded (that is a cap
+failure). Exit 1 when the OS refuses further forks.
 """
 from __future__ import annotations
 

@@ -88,61 +88,17 @@ mkdir -p "$HERMES_HOME"
 
 # Release B: refuse boot when the data volume is too tight for a
 # config/DB migration. Override with HERMES_MIN_FREE_KB (default 2 GiB).
-min_free_kb="${HERMES_MIN_FREE_KB:-2097152}"
+# Logic + 3× SQLite/WAL + SELECT 1 openability live in disk-gate.sh.
 avail_kb="$(df -Pk "$HERMES_HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
-avail_inodes="$(df -Pi "$HERMES_HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
-if [ -z "${avail_kb:-}" ]; then
-    echo "[stage2] ERROR: cannot measure free space on $HERMES_HOME" >&2
+DISK_GATE="/opt/hermes/docker/sera-toolbox/disk-gate.sh"
+if [ ! -f "$DISK_GATE" ]; then
+    echo "[stage2] ERROR: missing $DISK_GATE" >&2
     exit 1
 fi
-if [ "$avail_kb" -lt "$min_free_kb" ]; then
-    echo "[stage2] ERROR: $HERMES_HOME has ${avail_kb}KB free; need ${min_free_kb}KB" >&2
-    exit 1
-fi
-if [ -z "${avail_inodes:-}" ] || [ "$avail_inodes" -lt "${HERMES_MIN_FREE_INODES:-10000}" ]; then
-    echo "[stage2] ERROR: $HERMES_HOME has ${avail_inodes:-0} inodes free" >&2
-    exit 1
-fi
-tmp_min_kb="${HERMES_MIN_TMP_FREE_KB:-262144}"
-tmp_avail_kb="$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $4}')"
-if [ -z "${tmp_avail_kb:-}" ] || [ "$tmp_avail_kb" -lt "$tmp_min_kb" ]; then
-    echo "[stage2] ERROR: /tmp has ${tmp_avail_kb:-0}KB free; need ${tmp_min_kb}KB" >&2
-    exit 1
-fi
+# Run via sh: image COPY --chmod=a+rX only keeps +x if git already had it.
+sh "$DISK_GATE" --check "$HERMES_HOME" || exit 1
 if [ "${HERMES_REQUIRE_DATA_MOUNT:-}" = "1" ] && ! mountpoint -q "$HERMES_HOME"; then
     echo "[stage2] ERROR: $HERMES_HOME is not an explicit bind/named mount. Use docker compose or docker run -v …:${HERMES_HOME}" >&2
-    exit 1
-fi
-
-# Backup headroom: free bytes must cover ~3× live SQLite+WAL (plan 5c).
-# Walk only known DB roots — never cache/model trees.
-sqlite_bytes=0
-_add_sqlite_bytes() {
-    [ -e "$1" ] || return 0
-    if [ -f "$1" ]; then
-        sqlite_bytes=$((sqlite_bytes + $(stat -c %s "$1")))
-        return 0
-    fi
-    while IFS= read -r f; do
-        [ -n "$f" ] || continue
-        sqlite_bytes=$((sqlite_bytes + $(stat -c %s "$f")))
-    done <<EOF
-$(find "$1" \( -name '*.db' -o -name '*.db-wal' -o -name '*.db-shm' \) -type f 2>/dev/null)
-EOF
-}
-_add_sqlite_bytes "$HERMES_HOME/state.db"
-_add_sqlite_bytes "$HERMES_HOME/state.db-wal"
-_add_sqlite_bytes "$HERMES_HOME/state.db-shm"
-_add_sqlite_bytes "$HERMES_HOME/kanban.db"
-_add_sqlite_bytes "$HERMES_HOME/kanban.db-wal"
-_add_sqlite_bytes "$HERMES_HOME/kanban.db-shm"
-_add_sqlite_bytes "$HERMES_HOME/observatory.db"
-_add_sqlite_bytes "$HERMES_HOME/cron"
-_add_sqlite_bytes "$HERMES_HOME/kanban"
-_add_sqlite_bytes "$HERMES_HOME/profiles"
-need_backup_kb=$((sqlite_bytes / 1024 * 3))
-if [ "$need_backup_kb" -gt 0 ] && [ "$avail_kb" -lt "$need_backup_kb" ]; then
-    echo "[stage2] ERROR: $HERMES_HOME has ${avail_kb}KB free; need ${need_backup_kb}KB (3× SQLite+WAL=${sqlite_bytes}B)" >&2
     exit 1
 fi
 
@@ -310,7 +266,9 @@ if [ "$needs_chown" = true ]; then
     # Hermes-owned subdirs: recursive chown is safe here because these are
     # created and managed exclusively by hermes (see the s6-setuidgid mkdir
     # -p block below for the canonical list).
-    for sub in cron sessions logs hooks memories skills skins plans workspace home profiles pairing platforms/pairing lazy-packages; do
+    # $HERMES_HOME/home is child HOME and can hold huge caches. Top-level
+    # owner/mode + write-probe only (ensure_required_root after seed).
+    for sub in cron sessions logs hooks memories skills skins plans workspace profiles pairing platforms/pairing lazy-packages; do
         if [ -e "$HERMES_HOME/$sub" ] && tree_has_non_hermes_owner "$HERMES_HOME/$sub"; then
             chown_hermes_tree "$HERMES_HOME/$sub"
         fi
@@ -369,7 +327,8 @@ if [ -d "$HERMES_HOME/logs/gateways" ]; then
     if refuse_symlinked_path "chown" "$HERMES_HOME/logs/gateways"; then
         :
     else
-        chown hermes:hermes "$HERMES_HOME/logs/gateways" 2>/dev/null || true
+        chown hermes:hermes "$HERMES_HOME/logs/gateways" 2>/dev/null || \
+            echo "[stage2] Warning: chown $HERMES_HOME/logs/gateways failed (rootless?) — write-probe will decide"
     fi
 fi
 
@@ -456,12 +415,34 @@ as_hermes mkdir -p \
     "$HERMES_HOME/home" \
     "$HERMES_HOME/cache" \
     "$HERMES_HOME/cache/uv" \
+    "$HERMES_HOME/cache/npm" \
     "$HERMES_HOME/cache/huggingface" \
+    "$HERMES_HOME/models" \
     "$HERMES_HOME/pairing" \
     "$HERMES_HOME/platforms/pairing" \
     "$HERMES_HOME/lazy-packages" \
     "$HERMES_HOME/hotfixes" \
-    "$HERMES_HOME/state"
+    "$HERMES_HOME/state" \
+    "$HERMES_HOME/profiles"
+
+# Disposable caches only. Never tag $HERMES_HOME/cache, models, or
+# huggingface — restic --exclude-caches would then skip durable models.
+write_cachedir_tag() {
+    dir="$1"
+    [ -d "$dir" ] || return 0
+    if [ -f "$dir/CACHEDIR.TAG" ]; then
+        return 0
+    fi
+    as_hermes sh -c "printf '%s\n' \
+        'Signature: 8a477f597d28d172789f06886806bc55' \
+        '# This file is a cache directory tag created by hermes.' \
+        '# For information about cache directory tags, see:' \
+        '#	https://bford.info/cachedir/spec.html' \
+        > \"$dir/CACHEDIR.TAG\"" \
+        || echo "[stage2] Warning: cannot write $dir/CACHEDIR.TAG — continuing"
+}
+write_cachedir_tag "$HERMES_HOME/cache/uv"
+write_cachedir_tag "$HERMES_HOME/cache/npm"
 
 # Required-path write probe after remap + seed. Fail closed.
 probe="$HERMES_HOME/.stage2-write-probe"
@@ -472,6 +453,56 @@ fi
 if ! as_hermes sh -c 'umask 002; : > /tmp/.stage2-tmp-probe && rm -f /tmp/.stage2-tmp-probe'; then
     echo "[stage2] ERROR: hermes cannot write /tmp" >&2
     exit 1
+fi
+
+# Required roots: top-level owner/mode + write probe. Never -R on
+# cache/model/home trees. Symlink → exit (not warn-and-continue).
+# Top-level $HERMES_HOME chown above stays warn-on-rootless.
+ensure_required_root() {
+    target="$1"
+    if path_has_symlink_component "$target"; then
+        echo "[stage2] ERROR: required path $target is a symlink" >&2
+        exit 1
+    fi
+    if [ ! -d "$target" ]; then
+        echo "[stage2] ERROR: required path $target missing after seed" >&2
+        exit 1
+    fi
+    chown hermes:hermes "$target" 2>/dev/null || \
+        echo "[stage2] Warning: top-level chown $target failed (rootless?) — write-probe will decide"
+    chmod u+rwx "$target" 2>/dev/null || true
+    root_probe="$target/.stage2-write-probe"
+    if ! as_hermes sh -c "umask 002; : > \"$root_probe\" && rm -f \"$root_probe\""; then
+        echo "[stage2] ERROR: hermes cannot write required path $target" >&2
+        exit 1
+    fi
+}
+for root in \
+    "$HERMES_HOME/home" \
+    "$HERMES_HOME/cache" \
+    "$HERMES_HOME/cache/uv" \
+    "$HERMES_HOME/cache/npm" \
+    "$HERMES_HOME/cache/huggingface" \
+    "$HERMES_HOME/models" \
+    "$HERMES_HOME/state" \
+    "$HERMES_HOME/hotfixes" \
+    "$HERMES_HOME/logs" \
+    "$HERMES_HOME/logs/gateways" \
+    "$HERMES_HOME/profiles"
+do
+    ensure_required_root "$root"
+done
+
+# Durable model root. Live HF trees stay under cache/huggingface
+# (~30 GB). Expose them at models/huggingface without a move.
+# Do not ensure_required_root the link — that helper refuses symlinks.
+if [ -d "$HERMES_HOME/cache/huggingface" ] && [ ! -e "$HERMES_HOME/models/huggingface" ]; then
+    ln -s "$HERMES_HOME/cache/huggingface" "$HERMES_HOME/models/huggingface" \
+        || echo "[stage2] Warning: cannot link models/huggingface — continuing"
+fi
+if [ ! -e "$HERMES_HOME/models/huggingface" ]; then
+    mkdir -p "$HERMES_HOME/models/huggingface"
+    chown hermes:hermes "$HERMES_HOME/models/huggingface" 2>/dev/null || true
 fi
 
 # --- Install-method stamp ---

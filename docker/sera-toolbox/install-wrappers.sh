@@ -17,7 +17,7 @@ tools=(
   pandoc soffice
   ffmpeg ffprobe
   exiftool heif-convert heif-info
-  unzip 7z 7za
+  unzip 7z 7za bsdtar
   file
 )
 

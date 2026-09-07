@@ -9,8 +9,9 @@ export SERA_SANDBOX_OUT="$tmp"
 
 fix="${SERA_GOLDEN_FIXTURES:-/opt/hermes/docker/sera-toolbox/fixtures}"
 cp "$fix/hello.md" "$fix/golden-docx.md" "$fix/golden.csv" "$fix/bad.db" \
-   "$fix/golden.pdf" "$fix/golden.wav" "$fix/golden.zip" \
-   "$fix/golden.docx" "$fix/golden.xlsx" "$fix/scan.png" "$fix/scan-in.pdf" .
+   "$fix/golden.pdf" "$fix/golden.wav" "$fix/golden.zip" "$fix/golden.zip.zst" \
+   "$fix/golden.7z" "$fix/golden.docx" "$fix/golden.xlsx" "$fix/golden.heif" \
+   "$fix/scan.png" "$fix/scan-in.pdf" .
 
 # Renderer proof: wrapped WeasyPrint must still produce a Unicode PDF.
 # Stored golden.pdf is the workflow fixture; this one is generated.
@@ -42,25 +43,20 @@ test "$(wc -c < unicode.pdf)" -gt "$(wc -c < golden.pdf)"
 echo "OK pdftotext unicode.pdf"
 
 unzip -l golden.zip | grep -q hello.txt
-zstd -q golden.zip -o golden.zip.zst
 zstd -dq golden.zip.zst -o golden.zip.out
 cmp -s golden.zip golden.zip.out
 
-7z a -bd -y golden.7z hello.md >/dev/null
+test -s golden.7z || { echo "FAIL stored golden.7z missing" >&2; exit 1; }
 7z t golden.7z >/dev/null
+7z l golden.7z | grep -q hello.md
+# Encode proof uses a relative name. Wrap refuses absolute archive paths.
+7z a -bd -y roundtrip.7z hello.md >/dev/null
+7z t roundtrip.7z >/dev/null
 
 sera-pymupdf extract golden.pdf | grep -qi golden
 echo "OK golden pdf/zip/zstd/7z/pymupdf"
 
-python3 - <<'PY'
-from PIL import Image
-import pillow_heif
-
-pillow_heif.register_heif_opener()
-Image.new("RGB", (16, 16), (200, 40, 40)).save("golden.heif", format="HEIF")
-print("OK golden heif written")
-PY
-
+test -s golden.heif || { echo "FAIL stored golden.heif missing" >&2; exit 1; }
 exiftool -s -s -s -FileType golden.heif | grep -Ei 'heif|heic'
 ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 golden.wav >/dev/null
 
@@ -75,6 +71,12 @@ mkdir -p xlsx-out
 timeout 120s soffice --headless --nologo --nolockcheck --norestore \
   --convert-to csv --outdir xlsx-out golden.xlsx >/dev/null
 grep -q golden-xlsx xlsx-out/golden.csv
+python3 - <<'PY'
+import openpyxl
+wb = openpyxl.load_workbook("golden.xlsx", data_only=False)
+assert wb.sheetnames, "golden.xlsx has no sheets"
+print("OK openpyxl golden.xlsx", ",".join(wb.sheetnames))
+PY
 
 tesseract scan.png stdout -l eng | grep -qi GOLDEN
 # ImageMagick delegates are disabled (no gs). Rebuild scan-in.pdf via
