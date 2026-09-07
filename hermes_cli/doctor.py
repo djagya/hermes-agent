@@ -1043,8 +1043,8 @@ def managed_scope_check() -> None:
     n_cfg = len(managed_scope.managed_config_keys())
     n_env = len(managed_scope.load_managed_env())
     check_ok(
-        f"Managed scope active: {n_cfg} config key(s), {n_env} env key(s) "
-        f"pinned by {managed_dir}"
+        f"Managed scope active: {n_cfg} config key(s) seeded, {n_env} env "
+        f"key(s) pinned by {managed_dir} (user config.yaml wins when set)"
     )
     if os.environ.get("HERMES_MANAGED_DIR", "").strip():
         check_info(f"managed dir set via HERMES_MANAGED_DIR={managed_dir}")

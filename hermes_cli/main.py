@@ -787,11 +787,10 @@ try:
     _cfg_path = get_hermes_home() / "config.yaml"
     if _cfg_path.exists():
         _early_cfg_raw = _read_raw_early() or {}
-        # Managed scope: overlay administrator-pinned values so a managed
-        # security.redact_secrets / network.force_ipv4 wins here too. This early
-        # bridge reads config.yaml directly (before load_config is usable), so
-        # without the overlay a managed redact_secrets toggle would be ignored.
-        # Fail-open via the shared helper.
+        # Managed scope: seed omitted leaves so a managed
+        # security.redact_secrets / network.force_ipv4 applies when the user
+        # file does not set them. This early bridge reads config.yaml directly
+        # (before load_config is usable). Fail-open via the shared helper.
         try:
             from hermes_cli import managed_scope
             _early_cfg_raw = managed_scope.apply_managed_overlay(_early_cfg_raw)
