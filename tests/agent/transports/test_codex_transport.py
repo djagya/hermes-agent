@@ -39,16 +39,25 @@ class TestCodexTransportBasic:
 
 class TestCodexBuildKwargs:
 
-    def test_900k_context_variant_suffix_stripped_on_wire(self, transport):
+    @pytest.mark.parametrize(
+        ("model", "wire_model"),
+        [
+            ("gpt-6-astra-900k", "gpt-6-astra"),
+            ("gpt-5.6-sol-900k", "gpt-5.6-sol"),
+        ],
+    )
+    def test_900k_context_variant_suffix_stripped_on_wire(
+        self, transport, model, wire_model
+    ):
         """``-900k`` large-context picker variants are Hermes-side aliases —
         the Codex backend only knows the base slug, so build_kwargs must
         strip the suffix from the wire model id."""
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
-            model="gpt-5.6-sol-900k", messages=messages, tools=[],
+            model=model, messages=messages, tools=[],
             params={"is_codex_backend": True},
         )
-        assert kw["model"] == "gpt-5.6-sol"
+        assert kw["model"] == wire_model
 
     def test_base_slug_model_id_unchanged_on_wire(self, transport):
         messages = [{"role": "user", "content": "Hi"}]

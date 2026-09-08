@@ -99,6 +99,7 @@ def test_compression_threshold_for_codex_gpt55() -> None:
 @pytest.mark.parametrize(
     "model",
     [
+        "gpt-6-astra-900k",
         "gpt-5.6-sol-900k",
         "gpt-5.6-terra-900k",
         "gpt-5.6-luna-900k",

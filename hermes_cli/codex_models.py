@@ -13,6 +13,10 @@ import os
 logger = logging.getLogger(__name__)
 
 DEFAULT_CODEX_MODELS: List[str] = [
+    # GPT-6 Astra is advertised as 272K by the Codex account catalog but was
+    # verified live at 900,030 input tokens on Sep 8 2026. The base slug stays
+    # at 272K; _add_context_variants adds the explicit 900K opt-in beside it.
+    "gpt-6-astra",
     # GPT-5.6 series (Sol/Terra/Luna). The public API exposes "-pro"
     # variants, but the ChatGPT Codex OAuth backend rejects them with HTTP 400,
     # so the curated offline fallback must not surface those dead choices.
@@ -92,10 +96,11 @@ def _add_forward_compat_models(model_ids: List[str]) -> List[str]:
 def _add_context_variants(model_ids: List[str]) -> List[str]:
     """Insert ``-900k`` large-context picker variants after eligible base slugs.
 
-    The ChatGPT Codex backend advertises 272K for the gpt-5.4 / gpt-5.6
-    families but accepts ~911K (live-verified Aug 2026). The base slugs keep
-    the cheaper advertised 272K limit by default; each verified slug gets an
-    explicit ``<slug>-900k`` picker entry that opts into the large window.
+    The ChatGPT Codex backend advertises 272K for GPT-6 Astra and the
+    gpt-5.4 / gpt-5.6 families but accepts at least 900K for verified slugs.
+    The base slugs keep the cheaper advertised 272K limit by default; each
+    verified slug gets an explicit ``<slug>-900k`` picker entry that opts into
+    the large window.
     The suffix is Hermes-side only — it is stripped before the model id hits
     the wire (agent/transports/codex.py, agent/auxiliary_client.py).
     """

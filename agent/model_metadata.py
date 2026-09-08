@@ -2494,6 +2494,7 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
 # Used as a fallback when the live probe fails (no token, network error).
 # Longest keys first so substring match picks the most specific entry.
 _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
+    "gpt-6-astra": 272_000,
     "gpt-5.1-codex-max": 272_000,
     "gpt-5.1-codex-mini": 272_000,
     "gpt-5.3-codex": 272_000,
@@ -2523,7 +2524,10 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
 # day: 911,276 input tokens completed OK on gpt-5.6-sol; ~925K+ rejected
 # with ``context_length_exceeded`` (the 1.05M window minus reserved output
 # headroom). gpt-5.6-terra, gpt-5.6-luna, and gpt-5.4 all completed 900,026
-# tokens OK. gpt-5.5 and gpt-5.4-mini still rejected >272K, so their
+# tokens OK. GPT-6 Astra completed 900,030 input tokens on Sep 8 2026 even
+# though its account catalog still advertised 272K and
+# ``supports_experimental_context: false``. gpt-5.5 and gpt-5.4-mini still
+# rejected >272K, so their
 # advertisement is real enforcement and they are NOT listed. 900K keeps
 # ≥11K margin under the observed ceiling and matches the compaction point
 # Codex's own client config documents for the 1M window.
@@ -2550,6 +2554,7 @@ _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES: Dict[str, int] = {
     "gpt-5.6": 900_000,   # sol / terra / luna — all three verified live at 900K
 }
 _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
+    "gpt-6-astra": 900_000,  # verified live at 900,030 input tokens (Sep 8 2026)
     "gpt-5.4": 900_000,   # verified live at 900K; gpt-5.4-mini rejected 500K — excluded
     "gpt-daybreak-blue-latest": 900_000,  # exact Daybreak/Sol alias verified at 911,276
 }
@@ -2568,6 +2573,7 @@ CODEX_CONTEXT_VARIANT_SUFFIX = "-900k"
 # were never probed. Dated snapshots of the routable 5.6 bases are allowed
 # via _CODEX_900K_SNAPSHOT_RE.
 _CODEX_900K_ELIGIBLE_BASES = frozenset({
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
