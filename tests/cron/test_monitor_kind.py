@@ -336,6 +336,55 @@ def test_changed_output_injects_diff(hermes_env, monkeypatch):
     assert "state B" in prompt  # new output included verbatim
 
 
+def test_model_drift_does_not_consume_changed_monitor_output(hermes_env, monkeypatch):
+    """A spend-safety skip must leave changed monitor input replayable.
+
+    The monitor runs before provider/model resolution. If it commits its hash
+    before the drift guard passes, pinning the job later turns the recovery
+    run into ``no_change`` and the changed payload is lost.
+    """
+    from cron.jobs import get_job, update_job
+    from cron.scheduler import run_job
+
+    (hermes_env / "config.yaml").write_text(
+        "model:\n  default: new-model\n", encoding="utf-8"
+    )
+    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
+    update_job(
+        job["id"],
+        {
+            "model_snapshot": "old-model",
+            "provider_snapshot": "test",
+        },
+    )
+    job = get_job(job["id"])
+    assert job is not None
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+
+    success, _doc, _final, error = run_job(job)
+    assert success is False
+    assert error is not None and "drift" in error.lower()
+    assert observed["agent_runs"] == 0
+    stored = get_job(job["id"])
+    assert stored is not None
+    assert stored.get("monitor_state") is None
+
+    # Explicitly pinning the new inference target heals the drift. The exact
+    # same monitor output must still trigger the agent because it was never
+    # successfully admitted past the pre-inference gates.
+    update_job(job["id"], {"model": "new-model", "provider": "test"})
+    job = get_job(job["id"])
+    assert job is not None
+    success, _doc, _final, error = run_job(job)
+    assert success is True
+    assert error is None
+    assert observed["agent_runs"] == 1
+    stored = get_job(job["id"])
+    assert stored is not None
+    assert stored["monitor_state"]["last_output_hash"]
+
+
 def test_hash_persists_across_scheduler_restart(hermes_env, monkeypatch):
     """Suppression state must survive a scheduler restart (module reload)."""
     import importlib
