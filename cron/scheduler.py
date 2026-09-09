@@ -5775,8 +5775,12 @@ def run_job(
     from cron.monitor import check_monitor, job_has_monitor
 
     _monitor_context: Optional[str] = None
+    _pending_monitor_outcome = None
     if job_has_monitor(job):
-        _mon = check_monitor(job)
+        # Evaluate now, but defer the durable hash/snapshot commit until every
+        # pre-inference gate (including provider/model drift) has passed. A
+        # blocked run must leave changed input replayable after remediation.
+        _mon = check_monitor(job, persist=False)
         _mon_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
         if not _mon.ok:
             # Source failure is an ERROR, never a change: alert the user so
@@ -5817,6 +5821,7 @@ def run_job(
         # through the existing per-run context seam and fall through to a
         # normal agent run.
         _monitor_context = _mon.context_block
+        _pending_monitor_outcome = _mon
         if _monitor_context:
             extra_prompt = (
                 f"{_monitor_context}\n\n{extra_prompt}" if extra_prompt else _monitor_context
@@ -6439,6 +6444,15 @@ def run_job(
                     f"This alert is sent once; the job stays skipped until the "
                     f"config is pinned or restored. See #44585."
                 )
+
+        # Detection is admitted only after prompt/config/provider/model gates
+        # pass, but still before AIAgent construction and inference. This keeps
+        # ordinary agent failures from replaying forever without letting a
+        # drift/config safety skip consume the changed monitor payload.
+        if _pending_monitor_outcome is not None:
+            from cron.monitor import commit_monitor
+
+            commit_monitor(job, _pending_monitor_outcome)
 
         fallback_model = get_fallback_chain(_cfg) or None
         credential_pool = None
