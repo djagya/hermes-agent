@@ -230,8 +230,20 @@ def _make_hermes_provider_class() -> Optional[type]:
             from pydantic import ValidationError
 
             try:
+                previous_refresh_token = getattr(
+                    self.context.current_tokens, "refresh_token", None
+                )
                 content = await response.aread()
                 token_response = OAuthToken.model_validate_json(content)
+                # RFC 6749 §6: a refresh response may issue a new refresh
+                # token; when it does, replace the old one. Omission does not
+                # revoke the existing grant, so preserve it across the access-
+                # token rotation. This path is refresh-specific; fresh login
+                # still wipes old state before authorization-code exchange.
+                if token_response.refresh_token is None and previous_refresh_token:
+                    payload = token_response.model_dump(mode="json", exclude_none=True)
+                    payload["refresh_token"] = previous_refresh_token
+                    token_response = OAuthToken.model_validate(payload)
                 self.context.current_tokens = token_response
                 self.context.update_token_expiry(token_response)
                 await self.context.storage.set_tokens(token_response)

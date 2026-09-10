@@ -477,6 +477,96 @@ async def test_manager_token_read_error_does_not_expose_body(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_manager_refresh_preserves_existing_refresh_token_when_omitted(
+    tmp_path, monkeypatch
+):
+    """RFC 6749: an omitted refresh_token means keep the previous one."""
+    from mcp.shared.auth import OAuthToken
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+    assert provider is not None
+    provider.context.current_tokens = OAuthToken.model_validate(
+        {
+            "access_token": "old-access",
+            "token_type": "Bearer",
+            "expires_in": 60,
+            "refresh_token": "durable-refresh",
+        }
+    )
+
+    result = await provider._handle_refresh_response(
+        _fake_response(
+            200,
+            "https://idp.example.com/oauth/token",
+            b'{"access_token":"new-access","token_type":"Bearer","expires_in":3600}',
+        )
+    )
+
+    assert result is True
+    assert provider.context.current_tokens.access_token == "new-access"
+    assert provider.context.current_tokens.refresh_token == "durable-refresh"
+    persisted = json.loads((tmp_path / "mcp-tokens" / "srv.json").read_text())
+    assert persisted["access_token"] == "new-access"
+    assert persisted["refresh_token"] == "durable-refresh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("previous_refresh", "response_refresh", "expected_refresh"),
+    [
+        ("old-refresh", "rotated-refresh", "rotated-refresh"),
+        (None, None, None),
+    ],
+    ids=["new-refresh-replaces-old", "no-previous-does-not-fabricate"],
+)
+async def test_manager_refresh_token_precedence(
+    tmp_path,
+    monkeypatch,
+    previous_refresh,
+    response_refresh,
+    expected_refresh,
+):
+    from mcp.shared.auth import OAuthToken
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+    assert provider is not None
+    previous_payload = {
+        "access_token": "old-access",
+        "token_type": "Bearer",
+        "expires_in": 60,
+    }
+    if previous_refresh is not None:
+        previous_payload["refresh_token"] = previous_refresh
+    provider.context.current_tokens = OAuthToken.model_validate(previous_payload)
+
+    response_payload = {
+        "access_token": "new-access",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+    if response_refresh is not None:
+        response_payload["refresh_token"] = response_refresh
+    result = await provider._handle_refresh_response(
+        _fake_response(
+            200,
+            "https://idp.example.com/oauth/token",
+            json.dumps(response_payload).encode(),
+        )
+    )
+
+    assert result is True
+    assert provider.context.current_tokens.refresh_token == expected_refresh
+    persisted = json.loads((tmp_path / "mcp-tokens" / "srv.json").read_text())
+    assert persisted.get("refresh_token") == expected_refresh
+
+
+@pytest.mark.asyncio
 async def test_manager_malformed_201_refresh_response_clears_tokens(
     tmp_path, monkeypatch, caplog
 ):
