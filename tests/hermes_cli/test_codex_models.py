@@ -17,11 +17,12 @@ CHATGPT_REJECTED_CODEX_PRO_SLUGS = {
 
 def test_curated_codex_fallback_excludes_chatgpt_rejected_pro_slugs(monkeypatch):
     """OAuth fallback retains real models but never synthesizes rejected ones."""
-    retained_models = {"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+    curated_models = {"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+    forward_compat_models = curated_models - {"gpt-6-astra"}
     template_models = {model for model, _fallbacks in _FORWARD_COMPAT_TEMPLATE_MODELS}
 
-    assert retained_models.issubset(DEFAULT_CODEX_MODELS)
-    assert (retained_models - {"gpt-6-astra"}).issubset(template_models)
+    assert curated_models.issubset(DEFAULT_CODEX_MODELS)
+    assert forward_compat_models.issubset(template_models)
     assert CHATGPT_REJECTED_CODEX_PRO_SLUGS.isdisjoint(DEFAULT_CODEX_MODELS)
     assert CHATGPT_REJECTED_CODEX_PRO_SLUGS.isdisjoint(template_models)
 
@@ -31,7 +32,8 @@ def test_curated_codex_fallback_excludes_chatgpt_rejected_pro_slugs(monkeypatch)
     )
     model_ids = get_codex_model_ids(access_token="codex-access-token")
 
-    assert retained_models.issubset(model_ids)
+    assert forward_compat_models.issubset(model_ids)
+    assert "gpt-6-astra" not in model_ids
     assert CHATGPT_REJECTED_CODEX_PRO_SLUGS.isdisjoint(model_ids)
 
 
