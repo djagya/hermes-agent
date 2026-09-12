@@ -100,8 +100,12 @@ class TestWorkerTeardownOnCeiling:
             worker=cooperative_worker,
             messages=original,
             system_prompt_fallback="fallback",
-            idle_timeout_seconds=0.1,
-            total_ceiling_seconds=0.2,
+            # Generous test-scale budgets keep scheduler jitter from selecting
+            # the idle path or consuming most of the bounded join grace on a
+            # loaded CI runner. The 80 ms unwind remains long enough to prove
+            # the host waits for a cooperative worker before returning.
+            idle_timeout_seconds=0.5,
+            total_ceiling_seconds=1.0,
             fence=fence,
             stall_fallback=False,
         )

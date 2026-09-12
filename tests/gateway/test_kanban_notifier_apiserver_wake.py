@@ -136,6 +136,13 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
     assert "done once" in wake_text, "creator wake must carry the worker handoff"
     assert "not a request to decompose" in wake_text.lower()
     assert "do not recreate" in wake_text.lower()
+    assert "not authoritative current state" in wake_text.lower()
+    assert "authoritative current state once" in wake_text.lower()
+    assert "do not poll or rerun unchanged checks" in wake_text.lower()
+    assert "newer transition supersedes this event" in wake_text.lower()
+    assert "root-owned next action" in wake_text.lower()
+    assert "exact unchanged candidate" in wake_text.lower()
+    assert "make no mutation, comment, or follow-up task and stop" in wake_text.lower()
     # The wake self-post IS the delivery on this path (no separate text-ping
     # fallback is attempted for stateless api_server subs) — cursor advances
     # once the wake succeeds.

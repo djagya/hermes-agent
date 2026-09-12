@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -119,7 +120,12 @@ def test_admission_fork_marker_teaches_update_stack(tmp_path, monkeypatch):
     assert refusal is not None
     assert refusal.code == "image-marker"
     assert refusal.update_command == "./scripts/update-stack.sh --upgrade"
-    assert "compose up" not in refusal.message
+    # "compose up" must never appear as a *runnable* remediation step.
+    # Warning against it in prose ("Do not ``docker compose up`` — that
+    # wipes /run/service") is the intended guidance for this fork.
+    assert not re.search(r"(?m)^\s*docker compose\b", refusal.message), (
+        "fork refusal must not present `docker compose` as a runnable step"
+    )
     assert "nousresearch/hermes-agent:latest" not in refusal.message
 
 

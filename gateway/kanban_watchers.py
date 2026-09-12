@@ -32,6 +32,20 @@ _LOCAL_PATH_RE = re.compile(
     r"[A-Za-z]:\\[^\s,;]+)"
 )
 
+_KANBAN_WAKE_DECISION_CONTRACT = (
+    # Deliberately English-only: this line is model-directed guidance and
+    # applies uniformly after every localized wake string (all of which are
+    # English today). It is guidance, not a deterministic authorization
+    # boundary; superseded-event/root-owned-action enforcement lives in code.
+    "Treat this event as a notification, not authoritative current state. "
+    "Read the exact task's authoritative current state once (re-read only on "
+    "read failure or observed change); do not poll or rerun unchanged checks. "
+    "If a newer transition supersedes this event, discard it. Act only if "
+    "current state names a root-owned next action, and reuse valid evidence "
+    "bound to the exact unchanged candidate. Otherwise make no mutation, "
+    "comment, or follow-up task and stop."
+)
+
 
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
@@ -910,6 +924,7 @@ class GatewayKanbanWatchersMixin:
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
                             )
+                            _synth += "\n" + _KANBAN_WAKE_DECISION_CONTRACT
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —

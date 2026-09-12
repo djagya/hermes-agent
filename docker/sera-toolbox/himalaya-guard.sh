@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# shellcheck disable=SC1071  # Python launcher kept at historical .sh source path.
 """Lean safety guard for Himalaya v2.
 
 Public command policy:
@@ -284,7 +285,7 @@ def require_authority(kind: str) -> None:
 
 def load_policy() -> dict:
     try:
-        data = json.loads(POLICY_PATH.read_text())
+        data = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         die(f"cannot read sender policy {POLICY_PATH}: {exc}")
     if not isinstance(data, dict) or not isinstance(data.get("accounts"), dict):
@@ -403,7 +404,7 @@ def jmap_secret(account_policy: dict) -> str:
         die(f"cannot read commissioned JMAP token file: {exc}")
     if path.is_symlink() or not path.is_file() or stat.st_mode & 0o077:
         die("commissioned JMAP token file is missing, symlinked, or too permissive")
-    token = path.read_text().strip()
+    token = path.read_text(encoding="utf-8").strip()
     if not token:
         die("commissioned JMAP token file is empty")
     return token

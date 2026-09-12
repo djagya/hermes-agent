@@ -1119,13 +1119,36 @@ def test_skipped_turn_does_not_finish_another_sessions_matching_task(
 
 
 
-@pytest.mark.parametrize(
-    ("profile_enabled", "managed_enabled"),
-    ((None, True), (False, True), (True, False)),
-)
-def test_managed_config_cannot_override_shared_metrics_consent(
+def test_managed_seed_fills_missing_metrics_consent(tmp_path, monkeypatch):
+    """Consent leaf the profile omits → managed seed fills it (leaf-wins model)."""
+    _assert_managed_consent(
+        tmp_path,
+        monkeypatch,
+        profile_enabled=None,
+        managed_enabled=True,
+    )
+
+
+def test_profile_consent_wins_over_managed_seed(tmp_path, monkeypatch):
+    """A present profile leaf wins over the managed seed, either direction."""
+    _assert_managed_consent(
+        tmp_path,
+        monkeypatch,
+        profile_enabled=False,
+        managed_enabled=True,
+    )
+    _assert_managed_consent(
+        tmp_path,
+        monkeypatch,
+        profile_enabled=True,
+        managed_enabled=False,
+    )
+
+
+def _assert_managed_consent(
     tmp_path,
     monkeypatch,
+    *,
     profile_enabled,
     managed_enabled,
 ):
@@ -1135,8 +1158,8 @@ def test_managed_config_cannot_override_shared_metrics_consent(
         set_hermes_home_override,
     )
 
-    profile = tmp_path / "profile"
-    managed = tmp_path / "managed"
+    profile = tmp_path / f"profile-{profile_enabled}-{managed_enabled}"
+    managed = tmp_path / f"managed-{profile_enabled}-{managed_enabled}"
     profile.mkdir()
     managed.mkdir()
     profile_config = "{}\n"
@@ -1160,9 +1183,15 @@ def test_managed_config_cannot_override_shared_metrics_consent(
 
     token = set_hermes_home_override(profile)
     try:
+        # Leaf-wins: a present profile leaf decides; the seed fills only an
+        # omitted leaf. (relay_shared_metrics.enabled() additionally gates on
+        # the RAW profile leaf, so the managed seed never flips consent on.)
+        expected_leaf = (
+            profile_enabled if profile_enabled is not None else managed_enabled
+        )
         assert (
             config.load_config_readonly()["telemetry"]["shared_metrics"]["enabled"]
-            is managed_enabled
+            is expected_leaf
         )
         assert relay_shared_metrics.enabled() is (profile_enabled is True)
     finally:

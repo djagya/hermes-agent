@@ -70,6 +70,15 @@ class _FakeInputMediaPhoto:
         self.kwargs = kwargs
 
 
+class _FakeInputFile:
+    """Multipart attachment marker for local album files (see #661f423c80)."""
+
+    def __init__(self, obj, filename=None, attach=False):
+        self.obj = obj
+        self.filename = filename
+        self.attach = attach
+
+
 _fake_telegram = types.ModuleType("telegram")
 _fake_telegram.Update = object
 _fake_telegram.Bot = object
@@ -77,6 +86,7 @@ _fake_telegram.Message = object
 _fake_telegram.InlineKeyboardButton = _FakeInlineKeyboardButton
 _fake_telegram.InlineKeyboardMarkup = _FakeInlineKeyboardMarkup
 _fake_telegram.InputMediaPhoto = _FakeInputMediaPhoto
+_fake_telegram.InputFile = _FakeInputFile
 _fake_telegram_error = types.ModuleType("telegram.error")
 _fake_telegram_error.NetworkError = FakeNetworkError
 _fake_telegram_error.BadRequest = FakeBadRequest
