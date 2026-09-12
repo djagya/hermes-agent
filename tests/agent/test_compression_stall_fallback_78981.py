@@ -115,7 +115,15 @@ def test_stalled_summary_attempts_configured_fallback_chain():
 
     try:
         msgs, prompt = _run(
-            worker, chain=[CHAIN_ENTRY], timeouts=timeouts, messages=original
+            worker,
+            chain=[CHAIN_ENTRY],
+            timeouts=timeouts,
+            messages=original,
+            # Keep this fallback-route test on the idle-stall path even when
+            # the CI runner is heavily scheduled. Total-ceiling teardown has
+            # its own dedicated lifecycle tests.
+            idle=0.5,
+            ceiling=2.0,
         )
     finally:
         worker.release.set()
