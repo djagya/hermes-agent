@@ -1,3 +1,4 @@
+# shellcheck shell=sh
 # Login shells reset PATH via /etc/profile. Restore the image contract
 # so login and non-login resolve the same binaries. Sourced, not exec'd.
 # Keep in sync with the runtime Dockerfile ENV PATH.
