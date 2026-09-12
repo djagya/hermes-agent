@@ -53,12 +53,13 @@ def _make_staging_dir(root: Path, name: str = "src", *, manifest: DistributionMa
     """Build a local distribution staging directory (what a git clone would
     contain after .git is removed).
 
-    Lays down a minimal but representative tree: SOUL.md, config.yaml,
+    Lays down a minimal but representative tree: SOUL.md, ARCHITECTURE.md, config.yaml,
     mcp.json, one skill, one cron file, plus the distribution.yaml manifest.
     """
     staged = root / f"staging_{name}"
     staged.mkdir(parents=True, exist_ok=True)
     (staged / "SOUL.md").write_text("I am Source.\n")
+    (staged / "ARCHITECTURE.md").write_text("# Runtime topology\n")
     (staged / "config.yaml").write_text("model:\n  model: gpt-4\n")
     (staged / "mcp.json").write_text('{"servers": {}}\n')
     (staged / "skills").mkdir(exist_ok=True)

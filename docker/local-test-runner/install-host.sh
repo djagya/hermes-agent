@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 umask 077
 
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-REPO=$(CDPATH= cd -- "$HERE/../.." && pwd)
-STATE_ROOT=$(CDPATH= cd -- "$REPO/.." && pwd)/test-runner
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPO=$(CDPATH='' cd -- "$HERE/../.." && pwd)
+STATE_ROOT=$(CDPATH='' cd -- "$REPO/.." && pwd)/test-runner
 SPOOL="$STATE_ROOT/spool"
 
 command -v docker >/dev/null 2>&1 || {

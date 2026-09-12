@@ -9,7 +9,7 @@ printf 'hello\n' > in.txt
 export OP_SERVICE_ACCOUNT_TOKEN=canary-token-do-not-leak
 export GH_TOKEN=canary-token-do-not-leak
 export HERMES_HOME=/opt/data
-SERA_SANDBOX_OUT="$tmp/out"
+export SERA_SANDBOX_OUT="$tmp/out"
 mkdir -p "$tmp/out"
 file in.txt >stdout 2>stderr
 
