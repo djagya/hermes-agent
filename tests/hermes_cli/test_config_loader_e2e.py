@@ -70,9 +70,12 @@ def test_behavioral_read_gets_expansion_and_overlay_while_writeback_stays_raw(
 
     managed_dir = tmp_path / "managed"
     managed_dir.mkdir()
-    # Administrator pins reasoning_effort — must win over the user's "low".
+    # Administrator seeds reasoning_effort; the user file sets its own leaf.
+    # Under the leaf-wins seed model (f5405d53f4) the present user leaf wins
+    # and the seed only fills leaves the user file omits.
     (managed_dir / "config.yaml").write_text(
-        "agent:\n  reasoning_effort: high\n", encoding="utf-8"
+        "agent:\n  reasoning_effort: high\nservice_tier: managed-seed\n",
+        encoding="utf-8",
     )
 
     code = textwrap.dedent(
@@ -94,8 +97,10 @@ def test_behavioral_read_gets_expansion_and_overlay_while_writeback_stays_raw(
         Path(os.environ["E2E_OUT_FILE"]).write_text(json.dumps({
             "behavioral_prompt": cfg.get("custom_prompt"),
             "behavioral_effort": (cfg.get("agent") or {}).get("reasoning_effort"),
+            "behavioral_seed": cfg.get("service_tier"),
             "raw_prompt": raw.get("custom_prompt"),
             "raw_effort": (raw.get("agent") or {}).get("reasoning_effort"),
+            "raw_seed": raw.get("service_tier"),
             "saved": saved,
         }), encoding="utf-8")
         """
@@ -110,9 +115,13 @@ def test_behavioral_read_gets_expansion_and_overlay_while_writeback_stays_raw(
         tmp_path,
     )
 
-    # 1. Behavioral read: ${VAR} expanded + managed overlay applied.
+    # 1. Behavioral read: ${VAR} expanded + managed seed applied leaf-wins.
     assert out["behavioral_prompt"] == "hello world"
-    assert out["behavioral_effort"] == "high"
+    # User leaf wins over the managed seed (f5405d53f4 leaf-wins model).
+    assert out["behavioral_effort"] == "low"
+    # Seed fills a leaf the user file omits; raw view excludes it.
+    assert out["behavioral_seed"] == "managed-seed"
+    assert out["raw_seed"] is None
 
     # 2. Raw primitive: byte-faithful view of the user's file.
     assert out["raw_prompt"] == "hello ${E2E_PROMPT_SUFFIX}"

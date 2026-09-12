@@ -2666,13 +2666,20 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_model, fb_provider, _norm_err,
             )
 
-        # Re-determine api_mode from provider / resolved base URL / model when
-        # the pre-computed pass above landed on the default and the user did
-        # not pin api_mode explicitly. An explicit fb.api_mode (even
-        # "chat_completions") must never be overridden here.
+        # Re-determine api_mode from provider / resolved base URL / model —
+        # but only when the pre-resolve pass above landed on the default.
+        # An explicit fb.api_mode (even "chat_completions") must never be
+        # overridden here, and neither may a mode already derived from the
+        # ORIGINAL base_url hint: resolve_provider_client() may have rewritten
+        # a dual-surface /anthropic base to /v1, so re-detection on the
+        # rewritten client URL would wrongly demote anthropic_messages back
+        # to chat_completions (same loss the pre-resolve pass exists to
+        # prevent). Re-detection is an upgrade path for entries whose hint
+        # was empty/uninformative (e.g. named custom providers that resolve
+        # api.anthropic.com from config, #32243/#49247) — never a demotion.
         fb_base_url = str(fb_client.base_url)
 
-        if not fb_api_mode_explicit:
+        if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
             from hermes_cli.runtime_provider import _fallback_api_mode
 
             fb_api_mode = _fallback_api_mode(fb_provider, fb_base_url, fb_model)

@@ -12,6 +12,30 @@ def _dockerfile_text() -> str:
     return DOCKERFILE.read_text()
 
 
+def _run_blocks(text: str) -> list[list[str]]:
+    """Split a Dockerfile into RUN blocks (logical lines incl. continuations).
+
+    Each block is the list of physical lines from the ``RUN`` keyword until
+    the first line that does not end in a line continuation. Decorative
+    prefixes (``--mount=type=cache ...``, extra ``ARG`` style continuations)
+    therefore don't break block matching — we assert on what a block *does*,
+    not how its continuation lines are laid out.
+    """
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        if re.match(r"\s*RUN\b", line):
+            current = [line]
+            blocks.append(current)
+            if not line.rstrip().endswith("\\"):
+                current = None
+        elif current is not None:
+            current.append(line)
+            if not line.rstrip().endswith("\\"):
+                current = None
+    return blocks
+
+
 def test_dockerfile_makes_opt_hermes_readonly_for_hermes_user() -> None:
     text = _dockerfile_text()
 
@@ -108,9 +132,20 @@ def test_dockerfile_bakes_photon_sidecar_deps() -> None:
     text = _dockerfile_text()
 
     assert "plugins/platforms/photon/sidecar/package-lock.json" in text
-    assert re.search(
-        r"RUN cd plugins/platforms/photon/sidecar && \\\n\s+npm ci", text
-    ), "sidecar deps must be installed with `npm ci` (deterministic, runs postinstall patch)"
+    # The RUN block that cds into the sidecar must run `npm ci`
+    # (deterministic, runs the postinstall patch). Matched at block level so
+    # cache-mount/continuation decoration on the RUN line doesn't matter.
+    sidecar_blocks = [
+        block
+        for block in _run_blocks(text)
+        if any("cd plugins/platforms/photon/sidecar" in line for line in block)
+    ]
+    assert sidecar_blocks, "sidecar deps must be baked in a dedicated RUN block"
+    assert any(
+        re.search(r"\bnpm ci\b", line) for block in sidecar_blocks for line in block
+    ), (
+        "sidecar deps must be installed with `npm ci` (deterministic, runs postinstall patch)"
+    )
     # Immutability contract: never chown the sidecar tree to the runtime user.
     assert not re.search(
         r"chown\s+-R\s+hermes:hermes\s+/opt/hermes/plugins", text

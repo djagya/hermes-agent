@@ -16,6 +16,7 @@ with status 1, without running ``git fetch`` / ``subprocess.run``.
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -118,5 +119,11 @@ def test_format_docker_update_message_fork_teaches_upgrade_script():
     assert "update-stack.sh --upgrade" in msg
     assert cmd == "./scripts/update-stack.sh --upgrade"
     assert "nousresearch/hermes-agent:latest" not in msg
-    assert "compose up" not in msg
+    # "compose up" must never appear as a *runnable* remediation step
+    # (indented command block, like the upstream message teaches). Warning
+    # against it in prose — "Do not ``docker compose up`` — that wipes
+    # /run/service" — is exactly the guidance this fork must give.
+    assert not re.search(r"(?m)^\s*docker compose\b", msg), (
+        "fork guidance must not present `docker compose` as a runnable step"
+    )
     assert "/run/service" in msg

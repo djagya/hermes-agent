@@ -54,7 +54,10 @@ def _isolate_config(monkeypatch, home):
 
 
 
-def test_shared_command_refuses_managed_mode_override(tmp_path, monkeypatch):
+def test_shared_command_set_wins_over_managed_seed(tmp_path, monkeypatch):
+    """approvals.mode is user config (see docker/sera-toolbox/BUILD.md): a
+    managed seed fills the leaf only when the user file omits it, and a live
+    `/approvals <mode>` set writes config.yaml and wins; unset falls back."""
     from hermes_cli import managed_scope
     from hermes_cli.approval_mode import run_approval_mode_command
 
@@ -69,11 +72,13 @@ def test_shared_command_refuses_managed_mode_override(tmp_path, monkeypatch):
 
     result = run_approval_mode_command("off")
 
-    assert result.ok is False
-    assert result.mode == "manual"
-    assert result.changed is False
-    assert "managed" in result.message.lower()
-    assert not (home / "config.yaml").exists()
+    assert result.ok is True
+    assert result.mode == "off"
+    assert result.changed is True
+    assert "Approval mode: off" in result.message
+    # The set must land in the USER yaml (live-set contract), not be refused.
+    user_mode = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert user_mode["approvals"]["mode"] == "off"
 
 
 
