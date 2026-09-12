@@ -125,7 +125,7 @@ MODIFY_VERB_RE = (
 
 # Config-file groups shared by the agent-config persistence tiers below.
 _AGENT_CONFIG_FILES = r'(?:AGENTS\.md|CLAUDE\.md|\.cursorrules|\.clinerules)'
-_HERMES_CONFIG_FILES = r'\.hermes/(?:config\.yaml|SOUL\.md)'
+_HERMES_CONFIG_FILES = r'\.hermes/(?:config\.yaml|SOUL\.md|ARCHITECTURE\.md)'
 # Path prefixes (real files are e.g. .claude/settings.json), so consume any
 # trailing filename characters rather than requiring a clean end-of-word.
 _OTHER_AGENT_CONFIG_FILES = r'\.(?:claude/settings|codex/config)[\w.]*'

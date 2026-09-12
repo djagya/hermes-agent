@@ -45,6 +45,7 @@ from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
 # Context file scanning — detect prompt injection / promptware in AGENTS.md,
 # .cursorrules, SOUL.md before they get injected into the system prompt.
@@ -2190,6 +2191,43 @@ def _truncate_content(
     return head + marker + tail
 
 
+def _load_profile_prompt_file(
+    filename: str,
+    context_length: Optional[int] = None,
+    home_override: "Path | None" = None,
+) -> Optional[str]:
+    """Load one profile-root prompt file from the exact active home.
+
+    Profile prompt files are stable system-prompt inputs.  They must never
+    fall back to another profile when ``home_override`` is available: a
+    multiplexed gateway may build several agents in one process.
+    """
+    try:
+        from hermes_cli.config import ensure_hermes_home
+        ensure_hermes_home()
+    except Exception as e:
+        logger.debug("Could not ensure HERMES_HOME before loading %s: %s", filename, e)
+
+    _home = Path(home_override) if home_override is not None else get_hermes_home()
+    path = _home / filename
+    if not path.exists():
+        return None
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        content = _scan_context_content(content, filename)
+        return _truncate_content(
+            content,
+            filename,
+            context_length=context_length,
+            read_path=str(path),
+        )
+    except Exception as e:
+        logger.debug("Could not read %s from %s: %s", filename, path, e)
+        return None
+
+
 def load_soul_md(
     context_length: Optional[int] = None,
     home_override: "Path | None" = None,
@@ -2206,29 +2244,28 @@ def load_soul_md(
     back to the launch home and reads the wrong profile's SOUL.md (#50233,
     same class as the skills-index leak fixed in #86313).
     """
-    try:
-        from hermes_cli.config import ensure_hermes_home
-        ensure_hermes_home()
-    except Exception as e:
-        logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
+    return _load_profile_prompt_file(
+        "SOUL.md", context_length=context_length, home_override=home_override
+    )
 
-    _home = Path(home_override) if home_override is not None else get_hermes_home()
-    soul_path = _home / "SOUL.md"
-    if not soul_path.exists():
-        return None
-    try:
-        content = soul_path.read_text(encoding="utf-8").strip()
-        if not content:
-            return None
-        content = _scan_context_content(content, "SOUL.md")
-        content = _truncate_content(
-            content, "SOUL.md", context_length=context_length,
-            read_path=str(soul_path),
-        )
-        return content
-    except Exception as e:
-        logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
-        return None
+
+def load_architecture_md(
+    context_length: Optional[int] = None,
+    home_override: "Path | None" = None,
+) -> Optional[str]:
+    """Load the profile's operational architecture contract, if present.
+
+    ``ARCHITECTURE.md`` is deliberately separate from personality (SOUL.md),
+    bounded mutable memory, and cwd-dependent project instructions.  The
+    system-prompt assembler loads it in the stable tier immediately after the
+    identity, including identity-bearing cron runs whose project context is
+    disabled.
+    """
+    return _load_profile_prompt_file(
+        "ARCHITECTURE.md",
+        context_length=context_length,
+        home_override=home_override,
+    )
 
 
 def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:

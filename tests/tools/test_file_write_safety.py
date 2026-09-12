@@ -481,6 +481,11 @@ class TestProtectedInstructionFiles:
         assert not res.get("error"), res
         assert approvals["calls"] == []
 
+    def test_project_architecture_doc_is_not_a_context_file(self, tmp_path, approvals):
+        res = self._write(tmp_path / "ARCHITECTURE.md", "project design")
+        assert not res.get("error"), res
+        assert approvals["calls"] == []
+
     def test_no_human_fails_closed(self, tmp_path):
         # No approval callback registered, not gateway → block, don't hang.
         target = tmp_path / "AGENTS.md"

@@ -21,7 +21,7 @@ RESULTS = SPOOL / "results"
 WORK = Path(os.environ.get("HERMES_TEST_WORK", "/work"))
 LOCK_SHA = Path(
     os.environ.get("HERMES_TEST_LOCK_FILE", "/opt/test-env/uv.lock.sha256")
-).read_text().strip()
+).read_text(encoding="utf-8").strip()
 PYTHON = "/opt/test-env/.venv/bin/python"
 STOP = threading.Event()
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
@@ -48,7 +48,7 @@ def assert_isolation() -> dict:
         Path("/var/run/docker.sock"),
     )
     exposed = [str(path) for path in forbidden if path.exists()]
-    pid1 = Path("/proc/1/comm").read_text().strip()
+    pid1 = Path("/proc/1/comm").read_text(encoding="utf-8").strip()
     if exposed or pid1 == "s6-svscan":
         raise Refusal(f"production boundary exposed: paths={exposed}, pid1={pid1}")
     return {"paths_absent": True, "pid1": pid1, "network_expected": "none"}

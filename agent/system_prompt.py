@@ -9,7 +9,8 @@ fork inherits the cached prompt verbatim.
 
 Three tiers are joined with ``\\n\\n``:
 
-* ``stable``   — identity (SOUL.md or DEFAULT_AGENT_IDENTITY), tool
+* ``stable``   — identity (SOUL.md or DEFAULT_AGENT_IDENTITY), profile
+  architecture (ARCHITECTURE.md when present), tool
   guidance, computer-use guidance, nous subscription block, tool-use
   enforcement guidance + per-model operational guidance,
   alibaba model-name workaround, environment hints, coding guidance,
@@ -485,6 +486,19 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # Operational topology belongs beside identity, not in bounded memory or
+    # cwd-dependent project files.  Use the same profile-home resolution as
+    # SOUL.md so multiplexed gateways cannot leak another profile's channel or
+    # routing contract.  ``load_soul_identity`` intentionally covers cron:
+    # cron disables project context when no workdir is set but still inherits
+    # both profile-level stable files.
+    if agent.load_soul_identity or not agent.skip_context_files:
+        _architecture_content = _r.load_architecture_md(
+            _ctx_len, home_override=_agent_home(agent)
+        )
+        if _architecture_content:
+            stable_parts.append(_architecture_content)
 
     # Pointer to the docs (and, when it exists, the hermes-agent skill) for
     # user questions about Hermes itself. The skill_view() pointer is a

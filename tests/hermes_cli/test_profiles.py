@@ -182,6 +182,7 @@ class TestCreateProfile:
         (default_home / "config.yaml").write_text("model: test")
         (default_home / ".env").write_text("KEY=val")
         (default_home / "SOUL.md").write_text("Be helpful.")
+        (default_home / "ARCHITECTURE.md").write_text("Private topology.")
 
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
@@ -190,6 +191,7 @@ class TestCreateProfile:
         assert cloned_config["model"] == "test"
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
+        assert (profile_dir / "ARCHITECTURE.md").read_text() == "Private topology."
 
 
 
@@ -783,6 +785,7 @@ class TestExportImport:
         (default_dir / "config.yaml").write_text("model: test")
         (default_dir / ".env").write_text("KEY=val")
         (default_dir / "SOUL.md").write_text("Be nice.")
+        (default_dir / "ARCHITECTURE.md").write_text("Private topology.")
         mem_dir = default_dir / "memories"
         mem_dir.mkdir(exist_ok=True)
         (mem_dir / "MEMORY.md").write_text("remember this")
@@ -797,6 +800,7 @@ class TestExportImport:
         assert "default/config.yaml" in names
         assert "default/.env" not in names  # credentials excluded
         assert "default/SOUL.md" in names
+        assert "default/ARCHITECTURE.md" in names
         assert "default/memories/MEMORY.md" in names
 
 

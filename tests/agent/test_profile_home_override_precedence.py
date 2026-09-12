@@ -113,6 +113,9 @@ def test_full_prompt_scoped_to_bot_on_bare_thread(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     (default_home / "SOUL.md").write_text("DEFAULT SOUL", encoding="utf-8")
+    (default_home / "ARCHITECTURE.md").write_text(
+        "DEFAULT ARCHITECTURE", encoding="utf-8"
+    )
 
     bot_home = default_home / "profiles" / "mybot"
     bot_skills = bot_home / "skills" / "general" / "bot-skill"
@@ -122,6 +125,9 @@ def test_full_prompt_scoped_to_bot_on_bare_thread(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     (bot_home / "SOUL.md").write_text("BOT SOUL", encoding="utf-8")
+    (bot_home / "ARCHITECTURE.md").write_text(
+        "BOT ARCHITECTURE", encoding="utf-8"
+    )
 
     # Ambient env resolves to the launch/default home; nothing binds the
     # ContextVar on the build thread.
@@ -144,12 +150,30 @@ def test_full_prompt_scoped_to_bot_on_bare_thread(tmp_path, monkeypatch):
 
     assert "BOT SOUL" in prompt
     assert "DEFAULT SOUL" not in prompt
+    assert "BOT ARCHITECTURE" in prompt
+    assert "DEFAULT ARCHITECTURE" not in prompt
     m = re.search(r"<available_skills>(.*?)</available_skills>", prompt, re.DOTALL)
     skills_block = m.group(1) if m else ""
     assert "bot-skill" in skills_block
     assert "leaky-skill" not in skills_block
     assert "Active Hermes profile: mybot" in prompt
     assert "Active Hermes profile: default" not in prompt
+
+
+def test_architecture_loads_for_identity_only_cron_shape(tmp_path, monkeypatch):
+    """Cron disables cwd context but explicitly carries profile identity."""
+    from agent.system_prompt import build_system_prompt
+
+    home = tmp_path / "cron-profile"
+    home.mkdir()
+    (home / "SOUL.md").write_text("CRON SOUL", encoding="utf-8")
+    (home / "ARCHITECTURE.md").write_text("CRON ARCHITECTURE", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "wrong-home"))
+
+    prompt = build_system_prompt(_agent_for(home))
+
+    assert "CRON SOUL" in prompt
+    assert "CRON ARCHITECTURE" in prompt
 
 
 def test_plugin_session_info_profile_from_agent_home(tmp_path, monkeypatch):
