@@ -13,7 +13,12 @@ server (`guild_id`), channel (`chat_id`), and/or thread (`thread_id`).
 
 This is the inbound counterpart to multiplexing: instead of running N gateways, run one
 gateway and route per-community / per-channel / per-thread to a dedicated profile. Each
-profile keeps fully isolated state (`MEMORY.md`, `USER.md`, `SOUL.md`, sessions, tools).
+profile keeps fully isolated state (`MEMORY.md`, `USER.md`, `SOUL.md`,
+`ARCHITECTURE.md`, sessions, tools). `SOUL.md` owns identity and behavior;
+optional `ARCHITECTURE.md` owns compact operational topology such as channel
+privacy, routing, and canonical state owners. Both are profile-scoped stable
+prompt inputs; unlike project context files, they also load for identity-bearing
+cron runs.
 
 Routing is **platform-generic**: it works for Discord, Telegram, Feishu, Slack, and every
 adapter — not just Discord.

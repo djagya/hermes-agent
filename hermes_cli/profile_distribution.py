@@ -44,13 +44,14 @@ Manifest format (``distribution.yaml`` at the profile root)::
         default: "http://127.0.0.1:8000/sse"
     distribution_owned:      # optional; sensible defaults apply
       - SOUL.md
+      - ARCHITECTURE.md
       - skills/
       - cron/
       - mcp.json
 
 Update semantics:
 
-* Distribution-owned paths (SOUL.md, mcp.json, skills/, cron/,
+* Distribution-owned paths (SOUL.md, ARCHITECTURE.md, mcp.json, skills/, cron/,
   distribution.yaml) are replaced from the new source.
 * ``config.yaml`` is distribution-owned but preserved on update unless
   ``--force-config`` is passed (user overrides typically live here).
@@ -87,6 +88,7 @@ ENV_EXAMPLE_FILENAME = ".env.EXAMPLE"
 # distribution-owned but treated specially on update (see _is_config_like).
 DEFAULT_DIST_OWNED: Tuple[str, ...] = (
     "SOUL.md",
+    "ARCHITECTURE.md",
     "config.yaml",
     "mcp.json",
     "skills",
