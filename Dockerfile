@@ -49,7 +49,7 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # 2.41) runtime.  Bumping to a new Node major is a one-line ARG change; see
 # #4977.
 FROM node:26-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS node_source
-FROM debian:13.4
+FROM debian:13.4 AS runtime
 
 # Disable Python stdout buffering to ensure logs are printed immediately.
 # Do not write .pyc files at runtime: /opt/hermes is immutable in the
@@ -71,6 +71,23 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
+    rm -rf /var/lib/apt/lists/*
+
+# Fork toolbox parsers + bwrap. Separate layer so the compiler line stays cached.
+RUN apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+    bubblewrap \
+    file jq zip unzip p7zip-full zstd libarchive-tools \
+    poppler-utils qpdf ghostscript \
+    tesseract-ocr tesseract-ocr-eng ocrmypdf \
+    imagemagick \
+    pandoc \
+    libreoffice-writer libreoffice-calc \
+    libimage-exiftool-perl libheif1 libheif-examples \
+    fonts-noto-core fonts-noto-color-emoji fonts-liberation \
+    iproute2 bind9-dnsutils lsof psmisc rclone \
+    shellcheck \
+    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info && \
     rm -rf /var/lib/apt/lists/*
 
 # Prefer the fixed SQLite over Debian's vulnerable libsqlite3.so.0. Keep the
@@ -334,12 +351,15 @@ RUN mkdir -p /opt/hermes/bin && \
 # (.github/workflows/docker.yml) passes ${{ github.sha }} so
 # every published image has it.
 ARG HERMES_GIT_SHA=
+ARG HERMES_IMAGE_NAME=ghcr.io/djagya/hermes-agent
+ARG HERMES_BUILD_REF=
+ARG SOURCE_DATE_EPOCH=
 RUN set -eu; \
     if [ -n "${HERMES_GIT_SHA}" ]; then \
         printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
     fi; \
     mkdir -p /etc/hermes; \
-    HERMES_GIT_SHA="${HERMES_GIT_SHA}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": "nousresearch/hermes-agent", "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+    HERMES_GIT_SHA="${HERMES_GIT_SHA}" HERMES_IMAGE_NAME="${HERMES_IMAGE_NAME}" HERMES_BUILD_REF="${HERMES_BUILD_REF}" SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); payload = {"schema": 1, "deployment_kind": "image", "manager": "docker", "image": os.environ.get("HERMES_IMAGE_NAME") or "ghcr.io/djagya/hermes-agent", "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}; ref = os.environ.get("HERMES_BUILD_REF"); epoch = os.environ.get("SOURCE_DATE_EPOCH"); payload.update({"ref": ref} if ref else {}); payload.update({"source_date_epoch": epoch} if epoch else {}); marker.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.
@@ -413,6 +433,28 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 # the opt-out env var (HERMES_DOCKER_EXEC_AS_ROOT=1).
 COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
 COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
+COPY --chmod=0755 docker/sera-toolbox/wrap /opt/hermes/docker/sera-toolbox/wrap
+COPY --chmod=0755 docker/sera-toolbox/check-archive-members.py /opt/hermes/docker/sera-toolbox/check-archive-members.py
+COPY --chmod=0755 docker/sera-toolbox/disk-gate.sh /opt/hermes/docker/sera-toolbox/disk-gate.sh
+COPY --chmod=0755 docker/sera-toolbox/helpers/ /opt/hermes/docker/sera-toolbox/helpers/
+COPY docker/sera-toolbox/libreoffice/ /etc/sera-toolbox/libreoffice/
+COPY --chmod=0755 docker/sera-toolbox/install-wrappers.sh /opt/hermes/docker/sera-toolbox/install-wrappers.sh
+COPY --chmod=0755 docker/sera-toolbox/install-network-bins.sh /opt/hermes/docker/sera-toolbox/install-network-bins.sh
+COPY --chmod=0755 docker/sera-toolbox/smoke.sh /opt/hermes/docker/sera-toolbox/smoke.sh
+COPY --chmod=0755 docker/sera-toolbox/start-baked-mcp.sh /opt/hermes/docker/sera-toolbox/start-baked-mcp.sh
+COPY --chmod=0755 docker/sera-toolbox/hermes-image-info.sh /usr/local/bin/hermes-image-info
+COPY --chmod=0755 docker/sera-toolbox/hermes-image-doctor.sh /usr/local/bin/hermes-image-doctor
+COPY --chmod=0755 docker/sera-toolbox/write-toolchain-manifest.sh /opt/hermes/docker/sera-toolbox/write-toolchain-manifest.sh
+COPY --chmod=0755 docker/sera-toolbox/adversarial/ /opt/hermes/docker/sera-toolbox/adversarial/
+COPY --chmod=0755 docker/sera-toolbox/golden-smoke.sh /opt/hermes/docker/sera-toolbox/golden-smoke.sh
+COPY docker/sera-toolbox/seccomp-bwrap.json /opt/hermes/docker/sera-toolbox/seccomp-bwrap.json
+COPY docker/sera-toolbox/ImageMagick/ /etc/sera-toolbox/ImageMagick/
+COPY --chmod=0755 docker/sera-toolbox/himalaya-guard.sh /usr/local/bin/himalaya
+COPY --chmod=0755 docker/sera-toolbox/hermes-healthcheck.sh /usr/local/bin/hermes-healthcheck
+COPY docker/sera-toolbox/hermes-path.sh /etc/profile.d/hermes-path.sh
+COPY --chmod=0755 docker/sera-toolbox/measure-image-budget.sh /opt/hermes/docker/sera-toolbox/measure-image-budget.sh
+RUN /opt/hermes/docker/sera-toolbox/install-wrappers.sh
+RUN /opt/hermes/docker/sera-toolbox/write-toolchain-manifest.sh
 
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported
 # the venv bin onto PATH; Architecture B's main-wrapper.sh does the
@@ -463,3 +505,8 @@ VOLUME [ "/opt/data" ]
 # intercepted by /init's POSIX shell.
 ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
 CMD [ ]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+    CMD hermes-healthcheck
+
+FROM runtime AS test
+COPY docker/sera-toolbox/fixtures/ /opt/hermes/docker/sera-toolbox/fixtures/

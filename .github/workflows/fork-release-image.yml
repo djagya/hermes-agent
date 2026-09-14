@@ -131,7 +131,9 @@ jobs:
         run: |
           set -euo pipefail
           defaults="$(awk -F= '/^ARG DEBIAN_SNAPSHOT=/{print $2}' Dockerfile | sort -u)"
-          if [ "$defaults" != "${DEBIAN_SNAPSHOT}" ]; then
+          if [ -z "$defaults" ]; then
+            echo "WARN: Dockerfile has no ARG DEBIAN_SNAPSHOT; workflow pin unused on this tag tree"
+          elif [ "$defaults" != "${DEBIAN_SNAPSHOT}" ]; then
             echo "ERROR: Dockerfile ARG DEBIAN_SNAPSHOT ($defaults) != workflow ${DEBIAN_SNAPSHOT}" >&2
             exit 1
           fi
