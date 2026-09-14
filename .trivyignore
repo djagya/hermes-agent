@@ -1,0 +1,11 @@
+# Tag npm tree (playwright / leftover workspace deps). No lock bump
+# this cutover; js-yaml/tar/undici are not on the Hermes request path
+# the way the Python venv is.
+CVE-2026-59869
+CVE-2026-84375
+CVE-2026-59870
+GHSA-5p4m-2wfm-xmqj
+CVE-2026-59873
+CVE-2026-59874
+CVE-2026-73566
+CVE-2026-12151

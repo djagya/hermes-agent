@@ -321,13 +321,7 @@ RUN cd web && npm run build && \
     cd /opt/hermes && \
     # Runtime stage needs the CLI for `install-deps`. Tag npm install
     # may only nest playwright under a workspace; pin it at the root.
-    npm install --omit=dev --no-audit --no-fund --no-save playwright@1.62.1 && \
-    npm pkg set \
-      overrides.js-yaml=4.3.2 \
-      overrides.tar=7.5.21 \
-      overrides.undici=6.27.0 && \
-    npm install --omit=dev --no-audit --no-fund --no-save \
-      js-yaml@4.3.2 tar@7.5.21 undici@6.27.0
+    npm install --omit=dev --no-audit --no-fund --no-save playwright@1.62.1
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
