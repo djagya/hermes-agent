@@ -85,6 +85,21 @@ fi
 # is a no-op if the dir already exists. (#18482, salvages #18488)
 mkdir -p "$HERMES_HOME"
 
+# Refuse boot when the data volume is too tight for a config/DB migration.
+# Override with HERMES_MIN_FREE_KB (default 2 GiB). Logic + 3× SQLite/WAL
+# + SELECT 1 openability live in disk-gate.sh.
+avail_kb="$(df -Pk "$HERMES_HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
+DISK_GATE="/opt/hermes/docker/sera-toolbox/disk-gate.sh"
+if [ ! -f "$DISK_GATE" ]; then
+    echo "[stage2] ERROR: missing $DISK_GATE" >&2
+    exit 1
+fi
+sh "$DISK_GATE" --check "$HERMES_HOME" || exit 1
+if [ "${HERMES_REQUIRE_DATA_MOUNT:-}" = "1" ] && ! mountpoint -q "$HERMES_HOME"; then
+    echo "[stage2] ERROR: $HERMES_HOME is not an explicit bind/named mount. Use docker compose or docker run -v …:${HERMES_HOME}" >&2
+    exit 1
+fi
+
 # Numeric UID/GID validation: must be digits only, non-root, 1-65534.
 # NAS hosts such as Unraid commonly use low non-root IDs (99:100).
 validate_uid_gid() {
@@ -556,8 +571,18 @@ fi
 # after first-boot seeding and before supervised gateway services start.
 # Set HERMES_SKIP_CONFIG_MIGRATION=1 for controlled/manual migrations.
 if [ -f "$HERMES_HOME/config.yaml" ]; then
-    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
-        || echo "[stage2] Warning: docker_config_migrate.py failed; continuing"
+    if [ "${HERMES_SKIP_CONFIG_MIGRATION:-}" = "1" ]; then
+        echo "[stage2] HERMES_SKIP_CONFIG_MIGRATION=1; skipping docker_config_migrate.py"
+        if ! refuse_symlinked_path "skip-marker" "$HERMES_HOME/.migration-skipped"; then
+            : > "$HERMES_HOME/.migration-skipped"
+            chown hermes:hermes "$HERMES_HOME/.migration-skipped" 2>/dev/null || true
+            chmod 644 "$HERMES_HOME/.migration-skipped"
+        fi
+    else
+        rm -f "$HERMES_HOME/.migration-skipped"
+        s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
+            || { echo "[stage2] ERROR: docker_config_migrate.py failed" >&2; exit 1; }
+    fi
 fi
 
 # auth.json: bootstrap from env on first boot only. Same semantics as the

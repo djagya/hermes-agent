@@ -337,6 +337,49 @@ def test_changed_output_injects_diff(hermes_env, monkeypatch):
     assert "state B" in prompt  # new output included verbatim
 
 
+def test_model_drift_does_not_consume_changed_monitor_output(hermes_env, monkeypatch):
+    """A post-monitor setup skip must leave changed monitor input replayable.
+
+    Tag 0.21.2 no longer hard-blocks on model_snapshot drift; the same
+    consume-hash bug exists for any gate after the monitor and before the
+    agent (preflight / blocked setup).
+    """
+    from cron.jobs import get_job
+    from cron.scheduler import run_job
+    import cron.scheduler as sched
+
+    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+    real = sched._resolve_cron_agent_setup
+    calls = {"n": 0}
+
+    def wrap(*args, **kwargs):
+        setup = real(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            setup.blocked = (False, "blocked doc", "", "blocked by drift")
+        return setup
+
+    monkeypatch.setattr(sched, "_resolve_cron_agent_setup", wrap)
+
+    success, _doc, _final, error = run_job(job)
+    assert success is False
+    assert error is not None and "drift" in error.lower()
+    assert observed["agent_runs"] == 0
+    stored = get_job(job["id"])
+    assert stored is not None
+    assert stored.get("monitor_state") is None
+
+    success, _doc, _final, error = run_job(job)
+    assert success is True
+    assert error is None
+    assert observed["agent_runs"] == 1
+    stored = get_job(job["id"])
+    assert stored is not None
+    assert stored["monitor_state"]["last_output_hash"]
+
+
 def test_hash_persists_across_scheduler_restart(hermes_env, monkeypatch):
     """Suppression state must survive a scheduler restart (module reload)."""
     import importlib

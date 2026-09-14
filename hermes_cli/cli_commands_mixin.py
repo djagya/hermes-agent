@@ -2123,6 +2123,14 @@ class CLICommandsMixin:
         if sub == "use" or sub.startswith("use "):
             _browser_use(self, sub.split(None, 1)[1].strip() if " " in sub else "on")
         elif sub.startswith("connect"):
+            from hermes_cli.browser_connect import managed_connect_refusal
+
+            refusal = managed_connect_refusal()
+            if refusal:
+                print()
+                print(f"   ⚠ {refusal}")
+                print()
+                return
             connect_parts = cmd.strip().split(None, 2)  # ["/browser", "connect", "ws://..."]
             url = connect_parts[2].strip() if len(connect_parts) > 2 else DEFAULT_BROWSER_CDP_URL
             _browser_connect(self, url)

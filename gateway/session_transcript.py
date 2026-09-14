@@ -377,26 +377,8 @@ class SessionTranscriptMixin:
         if self._fts_rebuild_attempted:
             return False
         self._fts_rebuild_attempted = True
-        db = self._db
-        if db is None or not hasattr(db, "rebuild_fts"):
-            return False
-        # WAL split-brain guard: skip when a foreign process holds state.db.
-        foreign_holders = None
-        if hasattr(db, "_foreign_state_db_holders"):
-            foreign_holders = db._foreign_state_db_holders()
-        if foreign_holders:
-            logger.warning(
-                "Skipping Session DB FTS rebuild while foreign processes hold the database or "
-                "WAL sidecars (%s); canonical transcript writes remain available.", foreign_holders)
-            return False
-        try:
-            rebuilt = db.rebuild_fts()
-        except Exception as exc:
-            logger.warning("Session DB FTS rebuild failed: %s", exc)
-            return False
-        if rebuilt:
-            logger.warning("Rebuilt %d Session DB FTS index(es) after append corruption", rebuilt)
-        return rebuilt > 0
+        logger.warning("Session DB FTS one-shot rebuild is disabled on this fork.")
+        return False
 
     def _clear_dirty_transcript(self, session_id: str) -> None:
         """Drop queued pending messages so a rewrite/rewind doesn't re-insert them."""

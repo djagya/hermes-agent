@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Spawn N child sleeps. Used by the fork-bomb adversarial fixture.
+
+Runs inside wrap, so the inner ulimit -u / optional bwrap
+--rlimit-nproc must stop this before N children exist. The wrap
+parent must not set ulimit -u (busy hermes UID already exceeds the
+archive cap). Exit 0 only if every fork succeeded (that is a cap
+failure). Exit 1 when the OS refuses further forks.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import time
+
+
+def main(argv: list[str]) -> int:
+    count = int(argv[1]) if len(argv) > 1 else 80
+    children: list[int] = []
+    try:
+        for _ in range(count):
+            pid = os.fork()
+            if pid == 0:
+                time.sleep(30)
+                os._exit(0)
+            children.append(pid)
+    except OSError as exc:
+        print(f"fork failed after {len(children)}: {exc}", file=sys.stderr)
+        for pid in children:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        return 1
+    print(f"spawned {len(children)}", file=sys.stderr)
+    for pid in children:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

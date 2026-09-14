@@ -87,7 +87,17 @@ def is_camofox_mode() -> bool:
     and never overrides a different stored selection (legacy: with no selection ever
     written, a set ``CAMOFOX_URL`` still activates Camofox). A CDP override (``BROWSER_CDP_URL``
     env or ``browser.cdp_url``, same precedence as ``browser_tool_cdp._get_cdp_override()``) wins.
+
+    Managed browser-control mode never selects Camofox: tools must acquire
+    through the gate or fail closed.
     """
+    try:
+        from tools.browser_control_route import is_managed
+
+        if is_managed():
+            return False
+    except Exception:
+        pass
     if os.getenv("BROWSER_CDP_URL", "").strip() or _config_cdp_url():
         return False
     try:

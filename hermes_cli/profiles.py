@@ -30,7 +30,7 @@ _WARNED_MISSING_ALLOWLIST_ENTRIES: set[tuple[str, ...]] = set()
 _PROFILE_DIRS = ["memories", "sessions", "skills", "skins", "logs", "plans", "workspace", "cron", "home"]
 
 # Files copied during --clone (if they exist in the source).
-_CLONE_CONFIG_FILES = ["config.yaml", ".env", "SOUL.md"]
+_CLONE_CONFIG_FILES = ["config.yaml", ".env", "SOUL.md", "ARCHITECTURE.md"]
 # Subdirectory files copied during --clone: memory files are part of the agent's curated
 # identity, as important as SOUL.md for continuity.
 _CLONE_SUBDIR_FILES = ["memories/MEMORY.md", "memories/USER.md"]
@@ -107,7 +107,7 @@ def _clone_all_copytree_ignore(source_dir: Path):
 # See #58394.
 _DEFAULT_EXPORT_INCLUDE_ROOT = frozenset({
     # Configuration / persona
-    "config.yaml", "SOUL.md", "MEMORY.md", "USER.md", "todo.json",
+    "config.yaml", "SOUL.md", "ARCHITECTURE.md", "MEMORY.md", "USER.md", "todo.json",
     "system_prompt.md", "AGENTS.md", "CLAUDE.md", ".cursorrules",
     # Desktop appearance overlay (written/applied by the desktop app's export/import).
     "desktop.json",

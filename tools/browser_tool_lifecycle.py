@@ -95,6 +95,12 @@ def _emergency_cleanup_all_sessions():
                 _bt._recording_sessions.clear()
     # Lightpanda servers we spawned that fell out of ``_active_sessions``.
     _best_effort("Lightpanda cleanup on exit", _stop_all_lightpanda)
+    try:
+        from tools.browser_control_route import release_all_held_leases
+
+        release_all_held_leases()
+    except Exception as e:
+        _bt.logger.debug("managed lease release on exit failed: %s", e)
     # Safe even if we never used the browser — owner_pid liveness protects daemons
     # owned by other live hermes processes.
     _best_effort("Orphan reap on exit", _reap_orphaned_browser_sessions)
@@ -649,6 +655,16 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     if not session_info:
         _bt.logger.debug("No active session found for task_id: %s", task_id)
         return
+
+    try:
+        from tools.browser_control_route import MANAGED_LEASE_ENV, release_lease
+
+        if session_info.get(MANAGED_LEASE_ENV) or (session_info.get("features") or {}).get(
+            "managed"
+        ):
+            release_lease(session_info)
+    except Exception as e:
+        _bt.logger.debug("managed lease release for task %s: %s", task_id, e)
 
     _bt.logger.debug("Found session for task %s: bb_session_id=%s", task_id, session_info.get("bb_session_id", "unknown"))
     _bt._maybe_stop_recording(task_id)  # saves the file before close

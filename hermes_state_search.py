@@ -1228,27 +1228,11 @@ class SessionSearchMixin:
         """
         self._raise_if_db_corrupt()
         self._raise_if_db_replaced()
-        rebuilt = 0
-        with fts_rebuild_admission(self.db_path) as admitted:
-            if not admitted:
-                logger.warning(
-                    "Deferred in-place FTS rebuild: another process holds the rebuild authority for this state.db.")
-                return 0
-            with self._lock:
-                high_water = self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
-                self._conn.execute(
-                    "INSERT INTO state_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (FTS_TOOL_FULL_CONTENT_HIGH_WATER_KEY, str(high_water)),
-                )
-                for tbl in self._present_fts_tables():
-                    try:
-                        self._conn.execute(f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')")
-                        self._conn.commit()
-                        rebuilt += 1
-                    except sqlite3.OperationalError as exc:
-                        self._conn.rollback()
-                        logger.warning("FTS rebuild failed for %s: %s", tbl, exc)
-        return rebuilt
+        logger.warning(
+            "Live Session DB FTS rebuild is disabled on this fork; "
+            "search stays on existing indexes or LIKE."
+        )
+        return 0
 
     def _merge_fts_incrementally(self, *, max_pages: int, max_commands: Optional[int] = None) -> int:
         """Run bounded FTS5 ``'merge'`` commands against each present index. A positive merge rank

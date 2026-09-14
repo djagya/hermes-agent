@@ -1727,6 +1727,21 @@ class GatewayTurnMixin:
             response = ""
 
         adapter = self._adapter_for_source(source)
+        _interim_media_payloads = agent_result.get("interim_media_responses") or []
+        if (
+            adapter
+            and _interim_media_payloads
+            and not agent_result.get("failed")
+            and not agent_result.get("interrupted")
+            and agent_result.get("completed") is not False
+        ):
+            from gateway.run import _build_interim_media_delivery_payload
+            _media_payload, _cleaned_response = _build_interim_media_delivery_payload(
+                _interim_media_payloads, response, adapter,
+            )
+            if _media_payload:
+                await self._deliver_media_from_response(_media_payload, event, adapter)
+                response = _cleaned_response
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)

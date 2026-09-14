@@ -107,14 +107,39 @@ def load_managed_env() -> Dict[str, str]:
     return _load_managed_file(".env", _ENV_CACHE, _parse_env)
 
 
-def apply_managed_overlay(config: dict) -> dict:
-    """Overlay administrator-pinned config values on top of an already-built dict.
+def _omit_present_leaves(managed: dict, user: dict) -> dict:
+    """Managed leaves the user document did not set.
 
-    ``${VAR}`` refs in the managed config expand against the PROCESS env only, so a user cannot
-    shadow a managed literal via a ref they control; a bare root ``model: x/y`` string is promoted
-    to ``model.default`` so it can't clobber the dict shape callers expect; managed values
-    deep-merge ON TOP per leaf while sibling keys stay user-controlled. Fail-open: returns
-    ``config`` unchanged when no scope is present or on any error. Mutates and returns ``config``.
+    A key present on the user side wins, including a user ``${VAR}`` that
+    expands later. YAML ``null`` against a managed dict is treated as
+    absent (same as ``_deep_merge`` ignoring a None override of a dict).
+    """
+    out: dict = {}
+    for key, value in managed.items():
+        if key not in user:
+            out[key] = value
+            continue
+        user_val = user[key]
+        if user_val is None and isinstance(value, dict):
+            out[key] = value
+            continue
+        if isinstance(value, dict) and isinstance(user_val, dict) and value:
+            nested = _omit_present_leaves(value, user_val)
+            if nested:
+                out[key] = nested
+    return out
+
+
+def apply_managed_overlay(config: dict, *, user_raw: dict | None = None) -> dict:
+    """Seed administrator values for leaves the user did not set.
+
+    ``${VAR}`` refs in the managed config expand against the PROCESS env;
+    a bare root ``model: x/y`` string is promoted to ``model.default``;
+    only missing leaves are seeded so a present user leaf wins. When
+    *config* is already defaults+user, pass the raw user document as
+    ``user_raw`` so schema defaults do not shadow managed seeds.
+    Fail-open: returns ``config`` unchanged when no scope is present or
+    on any error. Mutates and returns ``config``.
     """
     try:
         managed = load_managed_config()
@@ -129,7 +154,13 @@ def apply_managed_overlay(config: dict) -> dict:
         if isinstance(managed_expanded.get("model"), str):
             managed_expanded = dict(managed_expanded)
             managed_expanded["model"] = {"default": managed_expanded["model"]}
-        return _deep_merge(config, managed_expanded)
+        presence = user_raw if user_raw is not None else config
+        if not isinstance(presence, dict):
+            presence = {}
+        seeds = _omit_present_leaves(managed_expanded, presence)
+        if not seeds:
+            return config
+        return _deep_merge(config, seeds)
     except Exception:  # noqa: BLE001 — overlay must never break a caller
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config

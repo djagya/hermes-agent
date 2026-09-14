@@ -8,14 +8,25 @@ existing skills (bundled, hub, user) are modified in place. Layout:
 """
 
 import contextvars as _ctxvars
+import hashlib
 import json
-from contextlib import suppress
+import os
+from contextlib import contextmanager, suppress
 import logging
 import re
 import shutil
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+try:  # POSIX
+    import fcntl as _skill_fcntl
+except ImportError:  # pragma: no cover
+    _skill_fcntl = None
+try:  # Windows
+    import msvcrt as _skill_msvcrt
+except ImportError:  # pragma: no cover
+    _skill_msvcrt = None
 
 import yaml
 
@@ -577,6 +588,200 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
 _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
     "skill_gate_bypass", default=False)
 
+_skill_write_lock_active: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
+    "skill_write_lock_active", default=False
+)
+_skill_write_thread_lock = threading.RLock()
+
+
+@contextmanager
+def _skill_write_lock():
+    """Serialize profile skill writes across threads and processes."""
+    if _skill_write_lock_active.get():
+        yield
+        return
+
+    with _skill_write_thread_lock:
+        lock_dir = get_hermes_home() / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(lock_dir, 0o700)
+        lock_path = lock_dir / "skill-write.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        locked = False
+        token = None
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            if _skill_fcntl is not None:
+                _skill_fcntl.flock(fd, _skill_fcntl.LOCK_EX)
+            elif _skill_msvcrt is not None:  # pragma: no cover
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                    os.fsync(fd)
+                os.lseek(fd, 0, os.SEEK_SET)
+                getattr(_skill_msvcrt, "locking")(
+                    fd, getattr(_skill_msvcrt, "LK_LOCK"), 1
+                )
+            else:  # pragma: no cover
+                raise RuntimeError("no supported cross-process skill-write lock")
+            locked = True
+            token = _skill_write_lock_active.set(True)
+            yield
+        finally:
+            if token is not None:
+                _skill_write_lock_active.reset(token)
+            if locked:
+                if _skill_fcntl is not None:
+                    _skill_fcntl.flock(fd, _skill_fcntl.LOCK_UN)
+                elif _skill_msvcrt is not None:  # pragma: no cover
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    getattr(_skill_msvcrt, "locking")(
+                        fd, getattr(_skill_msvcrt, "LK_UNLCK"), 1
+                    )
+            os.close(fd)
+
+
+def _skill_tree_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    if not path.exists():
+        return "ABSENT"
+    for child in sorted(item for item in path.rglob("*") if item.is_file()):
+        relative = child.relative_to(path).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        raw = child.read_bytes()
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def _skill_write_target_state(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve the exact mutation target and its current preimage digest."""
+    action = str(payload.get("action", ""))
+    name = str(payload.get("name", ""))
+    category = payload.get("category")
+    file_path = payload.get("file_path")
+    found = _find_skill(name)
+
+    if action == "create":
+        target = _resolve_skill_dir(name, category)
+        kind = "tree"
+    else:
+        if not found:
+            raise ValueError(f"Skill '{name}' is no longer available; restage the write.")
+        skill_dir = Path(found["path"])
+        if action == "delete":
+            target = skill_dir
+            kind = "tree"
+        elif action in {"patch", "write_file", "remove_file"} and file_path:
+            error = _validate_file_path(str(file_path))
+            if error:
+                raise ValueError(error)
+            resolved, err = _resolve_supporting_file(skill_dir, str(file_path))
+            if err or resolved is None:
+                raise ValueError(
+                    (err or {}).get("error") if isinstance(err, dict) else (err or "cannot resolve staged skill target")
+                )
+            target = resolved
+            kind = "file"
+        else:
+            target = skill_dir / "SKILL.md"
+            kind = "file"
+
+    exists = target.exists()
+    if kind == "tree":
+        digest = _skill_tree_sha256(target)
+    else:
+        digest = hashlib.sha256(target.read_bytes()).hexdigest() if exists else "ABSENT"
+    return {
+        "version": 1,
+        "target_path": str(target.resolve(strict=False)),
+        "target_kind": kind,
+        "exists": exists,
+        "sha256": digest,
+    }
+
+
+def _skill_batch_target_state(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Snapshot every skill tree a staged batch would touch."""
+    operations = payload.get("operations")
+    if not isinstance(operations, list) or not operations:
+        raise ValueError("Pending batch write has malformed operations; restage it.")
+    default = str(payload.get("name") or "")
+    names: List[str] = []
+    for op in operations:
+        if not isinstance(op, dict):
+            raise ValueError("Pending batch write has a malformed operation; restage it.")
+        name = str(op.get("name") or default or "")
+        if not name:
+            raise ValueError("Pending batch write names no skill; restage it.")
+        if name not in names:
+            names.append(name)
+
+    targets = []
+    for name in names:
+        found = _find_skill(name)
+        if found:
+            target = Path(found["path"])
+        else:
+            target = _resolve_skill_dir(name, payload.get("category"))
+        exists = target.exists()
+        digest = _skill_tree_sha256(target) if exists else "ABSENT"
+        targets.append(
+            {
+                "name": name,
+                "target_path": str(target.resolve(strict=False)),
+                "target_kind": "tree",
+                "exists": exists,
+                "sha256": digest,
+            }
+        )
+    return {"version": 1, "target_kind": "batch", "targets": targets}
+
+
+def build_skill_write_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Public staging helper used by the skill tool and bounded plugins."""
+    clean = {key: value for key, value in payload.items() if not key.startswith("_")}
+    if str(clean.get("action", "")) == "batch":
+        return _skill_batch_target_state(clean)
+    return _skill_write_target_state(clean)
+
+
+def _verify_skill_write_guard(payload: Dict[str, Any]) -> None:
+    guard = payload.get("_write_guard")
+    if not isinstance(guard, dict) or guard.get("version") != 1:
+        raise ValueError("Pending skill write has no supported base-state guard; restage it.")
+    clean = {key: value for key, value in payload.items() if not key.startswith("_")}
+    if guard.get("target_kind") == "batch" or str(clean.get("action", "")) == "batch":
+        current = _skill_batch_target_state(clean)
+        if current.get("targets") != guard.get("targets"):
+            raise ValueError(
+                "Pending skill write is stale: target changed after staging; inspect and restage."
+            )
+        return
+    current = _skill_write_target_state(clean)
+    for key in ("target_path", "target_kind", "exists", "sha256"):
+        if current.get(key) != guard.get(key):
+            raise ValueError(
+                "Pending skill write is stale: target changed after staging; inspect and restage."
+            )
+
+
+def stage_skill_write(
+    payload: Dict[str, Any], *, summary: str, origin: str, stage_context: Dict[str, Any] | None = None
+) -> Dict[str, Any]:
+    """Stage one guarded skill mutation and return its durable pending receipt."""
+    from tools import write_approval as wa
+
+    with _skill_write_lock():
+        staged_payload = dict(payload)
+        if stage_context:
+            staged_payload["_stage_context"] = dict(stage_context)
+        staged_payload["_write_guard"] = build_skill_write_guard(staged_payload)
+        return wa.stage_write(
+            wa.SKILLS, staged_payload, summary=summary, origin=origin
+        )
+
 
 def _run_write_gate(build_staging):
     """Shared write gate: None to proceed, else a JSON tool result (blocked/staged).
@@ -592,7 +797,10 @@ def _run_write_gate(build_staging):
     if decision.blocked:
         return tool_error(decision.message, success=False)
     payload, gist = build_staging(wa)
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    try:
+        record = stage_skill_write(payload, summary=gist, origin=wa.current_origin())
+    except Exception as exc:
+        return tool_error(str(exc), success=False)
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"],
                        "gist": gist, "message": decision.message}, ensure_ascii=False)
 
@@ -623,12 +831,35 @@ def _skill_manage_from(payload: Dict[str, Any], **extra) -> str:
 
 
 def apply_skill_pending(payload: Dict[str, Any]) -> str:
-    """Replay a staged skill write, bypassing the gate (the /skills approve handler)."""
-    token = _skill_gate_bypass.set(True)
+    """Replay a staged skill write under a live one-shot approval capability."""
     try:
-        return _skill_manage_from(payload)
-    finally:
-        _skill_gate_bypass.reset(token)
+        with _skill_write_lock():
+            _verify_skill_write_guard(payload)
+            clean = {
+                key: value for key, value in payload.items() if not key.startswith("_")
+            }
+            from tools import write_approval as wa
+
+            if not wa.consume_pending_apply_capability(wa.SKILLS, payload):
+                return tool_error(
+                    "Pending skill write must be applied through its live approval record.",
+                    success=False,
+                )
+            token = _skill_gate_bypass.set(True)
+            try:
+                raw = _skill_manage_from(clean)
+            finally:
+                _skill_gate_bypass.reset(token)
+    except Exception as exc:
+        return tool_error(str(exc), success=False)
+
+    try:
+        result = json.loads(raw)
+    except Exception:
+        return raw
+    if result.get("success"):
+        result["pending_guard_verified"] = True
+    return json.dumps(result, ensure_ascii=False)
 
 
 # Sync push debounce: a burst of skill_manage writes collapses into one push on a daemon timer.
@@ -749,32 +980,33 @@ def skill_manage(
     args = dict(content=content, category=category, file_path=file_path, file_content=file_content,
                 old_string=old_string, new_string=new_string, replace_all=replace_all,
                 absorbed_into=absorbed_into)
-    if (gate_result := _apply_skill_write_gate(action, name, **args)) is not None:
-        return gate_result
-    # Ledger pre-capture: telemetry, not a gate — failures must NEVER block the mutation. delete
-    # destroys the whole package (consolidation may have re-homed support files first), so
-    # complete it from the newest curator backup or a restore is hollow.
-    # Audit ledger (tracker #79686 P3): capture the pre-mutation state of the skill directory so every
-    # mutation — any actor — lands in the append-only JSONL ledger with before/after blobs.
-    _ledger_before = None
-    with suppress(Exception):
-        from tools import skill_ledger as _ledger
-        _pre = _find_skill(name)
-        _ledger_before = _ledger.capture_before(
-            _pre["path"] if _pre else None, complete_package=(action == "delete"), skill=name)
-    for arg, missing, message in _REQUIRED_ARGS.get(action, ()):
-        if missing(args[arg]):
-            return tool_error(message, success=False)
-    handler = _ACTION_HANDLERS.get(action, lambda a: _err(
-        f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"))
-    result = handler({"name": name, **args})
-    if isinstance(result, str):
-        return result  # tool_error JSON for argument-shape problems (patch)
-    if result.get("success"):
-        _record_success(
-            action, name, result, file_path=file_path, absorbed_into=absorbed_into,
-            task_id=task_id, session_id=session_id, ledger_before=_ledger_before)
-    return json.dumps(result, ensure_ascii=False)
+    with _skill_write_lock():
+        if (gate_result := _apply_skill_write_gate(action, name, **args)) is not None:
+            return gate_result
+        # Ledger pre-capture: telemetry, not a gate — failures must NEVER block the mutation. delete
+        # destroys the whole package (consolidation may have re-homed support files first), so
+        # complete it from the newest curator backup or a restore is hollow.
+        # Audit ledger (tracker #79686 P3): capture the pre-mutation state of the skill directory so every
+        # mutation — any actor — lands in the append-only JSONL ledger with before/after blobs.
+        _ledger_before = None
+        with suppress(Exception):
+            from tools import skill_ledger as _ledger
+            _pre = _find_skill(name)
+            _ledger_before = _ledger.capture_before(
+                _pre["path"] if _pre else None, complete_package=(action == "delete"), skill=name)
+        for arg, missing, message in _REQUIRED_ARGS.get(action, ()):
+            if missing(args[arg]):
+                return tool_error(message, success=False)
+        handler = _ACTION_HANDLERS.get(action, lambda a: _err(
+            f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"))
+        result = handler({"name": name, **args})
+        if isinstance(result, str):
+            return result  # tool_error JSON for argument-shape problems (patch)
+        if result.get("success"):
+            _record_success(
+                action, name, result, file_path=file_path, absorbed_into=absorbed_into,
+                task_id=task_id, session_id=session_id, ledger_before=_ledger_before)
+        return json.dumps(result, ensure_ascii=False)
 
 
 # --- OpenAI Function-Calling Schema -------------------------------------------

@@ -899,6 +899,20 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
 # Audio routing is centralized in gateway.platforms.base.should_send_media_as_audio().
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
 _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
+_TELEGRAM_ALBUM_IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp'})
+
+
+def _requires_native_image_album(media_files: list, visible_text: str) -> bool:
+    """Whether Telegram must preserve this media-only result as one album."""
+    return bool(
+        len(media_files) > 1
+        and not (visible_text or "").strip()
+        and all(
+            not is_voice
+            and _sched.Path(media_path).suffix.lower() in _TELEGRAM_ALBUM_IMAGE_EXTS
+            for media_path, is_voice in media_files
+        )
+    )
 
 
 def _send_media_via_adapter(
@@ -923,6 +937,60 @@ def _send_media_via_adapter(
             dropped = True
         if dropped:
             errors.append(f"attachment dropped by media path policy: {raw_path}")
+
+    platform_key = str(getattr(platform, "value", platform) or "").lower()
+    require_native_group = bool(metadata and metadata.get("_require_native_media_group"))
+    album_paths = [
+        path
+        for path, is_voice in media_files
+        if not is_voice and _sched.Path(path).suffix.lower() in _TELEGRAM_ALBUM_IMAGE_EXTS
+    ]
+    if (
+        platform_key == "telegram"
+        and len(album_paths) >= 2
+        and callable(getattr(adapter, "send_multiple_images", None))
+    ):
+        album_payload = [
+            (_sched.Path(path).resolve().as_uri(), "")
+            for path in album_paths
+        ]
+        try:
+            future = safe_schedule_threadsafe(
+                adapter.send_multiple_images(
+                    chat_id=chat_id,
+                    images=album_payload,
+                    metadata=metadata,
+                ),
+                loop,
+            )
+            if future is None:
+                errors.append("cannot send Telegram image album: gateway loop unavailable")
+                if require_native_group:
+                    album_set = set(album_paths)
+                    media_files = [item for item in media_files if item[0] not in album_set]
+            else:
+                result = future.result(timeout=_script._get_media_send_timeout())
+                if result and not getattr(result, "success", True):
+                    errors.append(
+                        f"failed to send Telegram image album: {getattr(result, 'error', 'unknown')}"
+                    )
+                    if require_native_group:
+                        album_set = set(album_paths)
+                        media_files = [item for item in media_files if item[0] not in album_set]
+                else:
+                    album_set = set(album_paths)
+                    media_files = [item for item in media_files if item[0] not in album_set]
+        except Exception as exc:
+            errors.append(
+                f"failed to send Telegram image album: {str(exc) or type(exc).__name__}"
+            )
+            if require_native_group:
+                album_set = set(album_paths)
+                media_files = [item for item in media_files if item[0] not in album_set]
+    elif platform_key == "telegram" and len(album_paths) >= 2 and require_native_group:
+        errors.append("native Telegram image album unavailable on live adapter")
+        album_set = set(album_paths)
+        media_files = [item for item in media_files if item[0] not in album_set]
 
     route_platform = platform if platform is not None else getattr(adapter, "platform", None)
     for media_path, _is_voice in media_files:
@@ -1413,7 +1481,13 @@ def _deliver_via_live_adapter(
         # payload is already assumed delivered (#38922). Record the skipped attachments so the drop is
         # visible rather than silently lost.
         if adapter_ok and not timed_out and media_files:
-            _live_send_media(t, media_metadata, media_files, delivery_errors)
+            routed = dict(media_metadata or {})
+            if (
+                _requires_native_image_album(media_files, text_to_send)
+                and str(getattr(t.platform, "value", t.platform) or "").lower() == "telegram"
+            ):
+                routed["_require_native_media_group"] = True
+            _live_send_media(t, routed, media_files, delivery_errors)
         elif timed_out and media_files:
             _note_target_error(
                 job,

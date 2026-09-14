@@ -1267,6 +1267,16 @@ class TelegramAdapter(BasePlatformAdapter):
         """Whether rich delivery is allowed (``rich_messages`` opt-in)."""
         return bool(getattr(self, "_rich_messages_enabled", True))
 
+    def _exceeds_legacy_message_limit(self, content: str) -> bool:
+        """Whether classic MarkdownV2 delivery would require chunking.
+
+        Check both raw and formatted payloads: MarkdownV2 escaping can push a
+        raw-under-limit reply beyond Telegram's 4096 UTF-16-unit limit.
+        """
+        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+            return True
+        return utf16_len(self.format_message(content)) > self.MAX_MESSAGE_LENGTH
+
     def _rich_content_ok(self, content: str) -> bool:
         """Shape checks shared by rich sends and rich drafts (non-blank, no Desktop crash/garble
         shapes, under the cap, async-capable bot)."""
@@ -1283,7 +1293,10 @@ class TelegramAdapter(BasePlatformAdapter):
             self._rich_delivery_enabled()
             and not getattr(self, "_rich_send_disabled", False)
             and content and content.strip()
-            and self._needs_rich_rendering(content)
+            and (
+                self._needs_rich_rendering(content)
+                or self._exceeds_legacy_message_limit(content)
+            )
             and self._rich_content_ok(content))
 
     def _should_attempt_rich(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
@@ -4651,7 +4664,9 @@ class TelegramAdapter(BasePlatformAdapter):
     async def send_multiple_images(
         self, chat_id: str, images: List[tuple], metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
         """Send images as Telegram albums (``send_media_group``, 10 per chunk). Animated GIFs can't join a
-        media group (need ``send_animation``) so they go via the base per-image path, as does a failed chunk."""
+        media group (need ``send_animation``) so they go via the base per-image path, as does a failed chunk.
+        Callers that set ``_require_native_media_group`` fail closed and verify one shared ``media_group_id``."""
+        require_native_group = bool(metadata and metadata.get("_require_native_media_group"))
         if not self._bot:
             return SendResult(success=False, error="Not connected")
         if not images:
@@ -4659,6 +4674,8 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             from telegram import InputMediaPhoto
         except Exception as exc:  # pragma: no cover - missing SDK
+            if require_native_group:
+                return SendResult(success=False, error="Telegram media-group types are unavailable")
             logger.warning("[%s] InputMediaPhoto unavailable, falling back to per-image send: %s", self.name, exc)
             return await super().send_multiple_images(chat_id, images, metadata, human_delay)
         is_anim = lambda url: not url.startswith("file://") and self._is_animation_url(url)  # noqa: E731
@@ -4666,6 +4683,8 @@ class TelegramAdapter(BasePlatformAdapter):
         photos = [img for img in images if not is_anim(img[0])]
         delivered = False
         if animations:
+            if require_native_group:
+                return SendResult(success=False, error="animations cannot be included in a native photo album")
             anim_result = await super().send_multiple_images(chat_id, animations, metadata, human_delay=human_delay)
             delivered = anim_result.success
         if not photos:
@@ -4684,6 +4703,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     if image_url.startswith("file://"):
                         local_path = _unquote(image_url[7:])
                         if not os.path.exists(local_path):
+                            if require_native_group:
+                                return SendResult(success=False, error=f"missing image: {local_path}")
                             logger.warning("[%s] Skipping missing image in media group: %s", self.name, local_path)
                             continue
                         source = open(local_path, "rb")
@@ -4699,11 +4720,26 @@ class TelegramAdapter(BasePlatformAdapter):
                         with contextlib.suppress(Exception):
                             fh.seek(0)
 
-                await self._send_with_dm_topic_reply_anchor_retry(
+                sent = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_media_group, {**send_kwargs, "media": media}, metadata, reply_to_id,
                     "media group", reset_media=_reset_opened_files)
+                if require_native_group:
+                    receipts = list(sent or [])
+                    if len(receipts) != len(media):
+                        return SendResult(
+                            success=False,
+                            error=f"Telegram album receipt count mismatch: expected {len(media)}, got {len(receipts)}",
+                        )
+                    group_ids = {getattr(receipt, "media_group_id", None) for receipt in receipts}
+                    if None in group_ids or len(group_ids) != 1:
+                        return SendResult(
+                            success=False,
+                            error="Telegram album receipts did not share one media_group_id",
+                        )
                 delivered = True
             except Exception as e:
+                if require_native_group:
+                    return SendResult(success=False, error=str(e))
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s", self.name,
                     chunk_idx + 1, len(chunks), _redact_telegram_error_text(e), exc_info=True)
@@ -5527,12 +5563,23 @@ class TelegramAdapter(BasePlatformAdapter):
             event.media_types = []
             self._attach_cached(event, cached, cached.context_note(), "[Telegram] Cached observed group %s at %s")
 
-    def _attach_cached(self, event: MessageEvent, cached, note: str, log_fmt: str) -> None:
+    def _attach_cached(self, event: MessageEvent, cached, note: str, log_fmt: str,
+                       *, source_msg: Any = None) -> None:
         """Append a cached attachment to the event (message type follows the kind only for the first one)."""
         event.media_urls.append(cached.path)
         event.media_types.append(cached.media_type)
         if len(event.media_urls) == 1 and cached.kind in self._CACHED_KIND_TO_MESSAGE_TYPE:
-            event.message_type = self._CACHED_KIND_TO_MESSAGE_TYPE[cached.kind]
+            # Preserve Telegram voice-note semantics for replied-to media. The
+            # gateway transcribes VOICE but not generic AUDIO, so collapsing a
+            # replied voice note to AUDIO bypasses configured STT.
+            if (
+                cached.kind == "audio"
+                and source_msg is not None
+                and getattr(source_msg, "voice", None) is not None
+            ):
+                event.message_type = MessageType.VOICE
+            else:
+                event.message_type = self._CACHED_KIND_TO_MESSAGE_TYPE[cached.kind]
         event.text = self._append_observed_note(event.text, note)
         logger.info(log_fmt, cached.kind, cached.path)
 
@@ -5545,7 +5592,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if status == "ok":
             self._attach_cached(
                 event, cached, f"[Replied-to {cached.kind} '{cached.display_name}' saved at: {cached.path}]",
-                "[Telegram] Cached replied-to %s at %s")
+                "[Telegram] Cached replied-to %s at %s", source_msg=reply_msg)
 
     def _observed_media_source(self, msg: Message):
         """Return (telegram_file_source, filename, mime, default_kind) or Nones."""

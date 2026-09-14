@@ -884,6 +884,8 @@ class TurnRunner:
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
                 return
+            if text:
+                ctx.interim_media_responses.append(text)
             if stts is not None:
                 # Flush accepted deltas; completed commentary is a separate speech segment.
                 stts.on_delta(None)
@@ -1775,6 +1777,7 @@ class TurnRunner:
             "compression_deferred": result.get("compression_deferred", False),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
+            "interim_media_responses": list(ctx.interim_media_responses),
             **usage,
         }
         if not final_response:

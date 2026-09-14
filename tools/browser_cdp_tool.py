@@ -103,9 +103,13 @@ def _run_async(coro):
 
 def _resolve_cdp_endpoint() -> str:
     """Normalized CDP WebSocket URL via ``browser_tool_cdp._get_cdp_override``, or ""."""
+    from tools.browser_control_route import ManagedBrowserError
+    from tools.browser_tool_cdp import _get_cdp_override  # type: ignore[import-not-found]
+
     try:
-        from tools.browser_tool_cdp import _get_cdp_override  # type: ignore[import-not-found]
         return (_get_cdp_override() or "").strip()
+    except ManagedBrowserError:
+        raise
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("browser_cdp: failed to resolve CDP endpoint: %s", exc)
         return ""
@@ -276,7 +280,14 @@ def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id:
     if not _WS_AVAILABLE:
         return tool_error("The 'websockets' Python package is required but not installed. "
                           "Install it with: pip install websockets")
-    endpoint = _resolve_cdp_endpoint()
+    try:
+        endpoint = _resolve_cdp_endpoint()
+    except Exception as exc:
+        from tools.browser_control_route import ManagedBrowserError
+
+        if isinstance(exc, ManagedBrowserError):
+            return tool_error(str(exc))
+        raise
     if not endpoint:
         return tool_error("No CDP endpoint is available. Run '/browser connect' to attach to a running Chrome, "
                           "Brave, Chromium, or Edge browser, or set 'browser.cdp_url' in config.yaml. The Camofox "

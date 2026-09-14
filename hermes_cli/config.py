@@ -2131,22 +2131,28 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
     return lkg_copy
 
 
-def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], Any]:
-    """Apply the managed-scope overlay; returns ``(merged, managed_config_or_falsy)``.
-    Managed wins at the leaf and is applied AFTER user expansion so a user ``${VAR}`` cannot shadow
-    a managed literal: managed values expand only against the process environment. This
-    deliberately inverts the usual env-over-config precedence for the keys the managed layer pins
-    (docs/design/managed-scope.md §4.1)."""
+def _merge_managed_overlay(
+    expanded: Dict[str, Any], user_raw: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Any]:
+    """Seed managed-scope leaves the user document omitted.
+
+    User yaml wins at a present leaf (including ``${VAR}``). Managed values
+    expand only against the process environment. Schema defaults in
+    *expanded* must not shadow seeds — pass the raw user document.
+    """
     managed_config = managed_scope.load_managed_config()
     if not managed_config:
         return expanded, managed_config
-    # Same canonicalization as the user config BEFORE merging (parity with
-    # managed_scope.apply_managed_overlay) so the merged result never exposes a nested dict.
     managed_normalized = _normalize_root_model_keys(managed_config)
     if isinstance(managed_normalized.get("model"), str):
         managed_normalized = dict(managed_normalized)
         managed_normalized["model"] = {"default": managed_normalized["model"]}
-    return _deep_merge(expanded, _expand_env_vars(managed_normalized)), managed_config
+    managed_expanded = _expand_env_vars(managed_normalized)
+    presence = user_raw if isinstance(user_raw, dict) else {}
+    seeds = managed_scope._omit_present_leaves(managed_expanded, presence)
+    if not seeds:
+        return expanded, managed_config
+    return _deep_merge(expanded, seeds), managed_config
 
 
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
@@ -2169,6 +2175,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        user_raw: Dict[str, Any] = {}
 
         if user_sig is not None:
             try:
@@ -2182,6 +2189,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     user_config["agent"] = agent_user_config
                     user_config.pop("max_turns", None)
 
+                user_raw = user_config
                 config = _deep_merge(config, user_config)
             except Exception as e:
                 lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
@@ -2189,7 +2197,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
         normalized = _canonicalize_config(config)
-        expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
+        expanded, managed_config = _merge_managed_overlay(
+            _expand_env_vars(normalized), user_raw=user_raw
+        )
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # The cache stores its own deepcopy so load_config() callers can mutate freely while
@@ -2253,16 +2263,7 @@ _FALLBACK_COMMENT = """
 
 
 def _strip_managed_keys_for_save(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Drop every leaf the managed layer pins (bulk safety net; single-key ``config set``
-    hard-rejects) and tell the user what was not saved."""
-    managed_keys = managed_scope.managed_config_keys()
-    if not managed_keys:
-        return config
-    config, _stripped = _strip_dotted_keys(copy.deepcopy(config), managed_keys)
-    if _stripped:
-        print(
-            f"Note: {len(_stripped)} managed setting(s) were not saved "
-            f"(managed by your administrator): {', '.join(sorted(_stripped))}", file=sys.stderr)
+    """User overrides of managed config leaves are saved; they win on the next load."""
     return config
 
 
@@ -3319,14 +3320,9 @@ def _redirect_platform_display_key(key: str) -> tuple[str, Optional[str]]:
 
 
 def _exit_if_key_managed(key: str, action: str) -> None:
-    """A key pinned by the managed layer cannot be set/unset (the next load would reinstate it):
-    hard-reject and name the source. Distinct from ``is_managed()``; env-shaped keys route to the
-    .env writers, which carry their own guard."""
-    if managed_scope.is_key_managed(key):
-        print(
-            f"Cannot {action} '{key}': it is managed by your administrator ({_managed_source('config.yaml')}) "
-            f"and cannot be changed. Contact your administrator to modify it.", file=sys.stderr)
-        sys.exit(1)
+    """Config leaves are live-settable; managed .env refuse lives on the env writers."""
+    del key, action
+    return
 
 
 def _guard_section_overwrite(key: str, value: Any, user_config: Dict[str, Any], force: bool) -> str:

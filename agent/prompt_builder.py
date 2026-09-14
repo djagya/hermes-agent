@@ -1481,6 +1481,40 @@ def load_soul_md(context_length: Optional[int] = None, home_override: "Path | No
         return None
 
 
+def load_architecture_md(
+    context_length: Optional[int] = None,
+    home_override: "Path | None" = None,
+) -> Optional[str]:
+    """Load the profile's operational architecture contract, if present.
+
+    ``ARCHITECTURE.md`` is separate from personality (SOUL.md), bounded
+    memory, and cwd-dependent project instructions. The system-prompt
+    assembler loads it immediately after identity, including identity-bearing
+    cron runs whose project context is disabled.
+    """
+    try:
+        from hermes_cli.config import ensure_hermes_home
+        ensure_hermes_home()
+    except Exception as e:
+        logger.debug("Could not ensure HERMES_HOME before loading ARCHITECTURE.md: %s", e)
+    path = (Path(home_override) if home_override is not None else get_hermes_home()) / "ARCHITECTURE.md"
+    if not path.exists():
+        return None
+    try:
+        content = (_read_text_with_timeout(path) or "").strip()
+        if not content:
+            return None
+        return _truncate_content(
+            _scan_context_content(content, "ARCHITECTURE.md"),
+            "ARCHITECTURE.md",
+            context_length=context_length,
+            read_path=str(path),
+        )
+    except Exception as e:
+        logger.debug("Could not read ARCHITECTURE.md from %s: %s", path, e)
+        return None
+
+
 def _read_context_file(path: Path) -> str:
     """Stripped text of *path*; "" when missing, empty or unreadable (logged at debug)."""
     if not path.exists():

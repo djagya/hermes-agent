@@ -151,6 +151,13 @@ def _resolve_cloud_provider_uncached() -> Optional[CloudBrowserProvider]:
 def _is_local_mode() -> bool:
     """Return True when the browser tool will use a local browser backend."""
     _bt = _origin()
+    try:
+        from tools.browser_control_route import is_managed
+
+        if is_managed():
+            return False
+    except Exception:
+        pass
     return not _cdp._get_cdp_override_raw() and _get_cloud_provider() is None
 
 
@@ -213,6 +220,13 @@ def _should_inject_engine(engine: str) -> bool:
 
 def _auto_local_for_private_urls() -> bool:
     """``browser.auto_local_for_private_urls`` (default True), cached: route private/LAN URLs to a local sidecar even with a cloud provider."""
+    try:
+        from tools.browser_control_route import is_managed
+
+        if is_managed():
+            return False
+    except Exception:
+        pass
     _bt = _origin()
     return _memo(
         _bt, "_auto_local_for_private_urls_resolved", "_cached_auto_local_for_private_urls",

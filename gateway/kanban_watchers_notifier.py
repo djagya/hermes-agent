@@ -27,6 +27,20 @@ def _kbn():
     from hermes_cli import kanban_db_notify
     return kanban_db_notify
 
+_KANBAN_WAKE_DECISION_CONTRACT = (
+    # Deliberately English-only: this line is model-directed guidance and
+    # applies uniformly after every localized wake string (all of which are
+    # English today). It is guidance, not a deterministic authorization
+    # boundary; superseded-event/root-owned-action enforcement lives in code.
+    "Treat this event as a notification, not authoritative current state. "
+    "Read the exact task's authoritative current state once (re-read only on "
+    "read failure or observed change); do not poll or rerun unchanged checks. "
+    "If a newer transition supersedes this event, discard it. Act only if "
+    "current state names a root-owned next action, and reuse valid evidence "
+    "bound to the exact unchanged candidate. Otherwise make no mutation, "
+    "comment, or follow-up task and stop."
+)
+
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
@@ -481,6 +495,7 @@ class _KanbanNotification:
         if self.wake_review_detail:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
+        self.synth += "\n" + _KANBAN_WAKE_DECISION_CONTRACT
 
     def _log_woke(self) -> None:
         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",

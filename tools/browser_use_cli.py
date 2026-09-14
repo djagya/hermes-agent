@@ -405,7 +405,14 @@ def _resolve_local_engine_cdp(env: dict, task_id: Optional[str], session_name: s
     return _resolve_managed_chromium_cdp(env, task_id, session_name)
 
 
-def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = "") -> Optional[str]:
+def _resolve_backend_cdp(
+    env: dict,
+    task_id: Optional[str],
+    session_name: str = "",
+    mode: str = "",
+    identity: str = "",
+    qa_targets: Optional[List[str]] = None,
+) -> Optional[str]:
     """Point the harness at the configured backend's CDP endpoint; error string on failure.
 
     Precedence: (1) ``BU_CDP_WS``/``BU_CDP_URL`` already in env (operator override); (2) ``BROWSER_CDP_URL``
@@ -415,7 +422,25 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
     (never the harness's own discovery of the user's installed Chrome); (5) BU direct-API configs → None:
     the CLI reaches BU cloud natively (BU_AUTOSPAWN). ``session_name`` (BU_NAME) keys the session cache so
     each name gets its OWN browser — what makes named sessions concurrent-safe.
+
+    When ``HERMES_BROWSER_CONTROL_URL`` or ``browser.control_url`` is set
+    (monolith managed mode), this function does not consult ambient CDP
+    overrides or local/cloud fallbacks. See ``tools/browser_control_route.py``.
     """
+    try:
+        from tools.browser_control_route import is_managed, resolve_managed_cdp
+    except Exception:
+        is_managed = lambda: False  # noqa: E731
+        resolve_managed_cdp = None
+    if is_managed():
+        return resolve_managed_cdp(
+            env,
+            task_id,
+            session_name,
+            mode=mode,
+            identity=identity,
+            qa_targets=qa_targets,
+        )
     if _has_cdp_env(env):
         return None
     try:
@@ -502,11 +527,29 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
         logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
 
 
-def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool) -> Optional[str]:
+def _route_backend(
+    env: dict,
+    session: str,
+    task_id: Optional[str],
+    local: bool,
+    mode: str = "",
+    identity: str = "",
+    qa_targets: Optional[List[str]] = None,
+) -> Optional[str]:
     """Resolve where the harness connects; returns an error string or None. Real-profile consent runs
     BEFORE provider resolution so a hit short-circuits the cloud path via the BU_CDP_* env contract. Named
     sessions compose with the backend: BU_NAME namespaces the harness daemon (IPC socket, log, pid) and on
     provider backends additionally keys its own cloud browser."""
+    try:
+        from tools.browser_control_route import is_managed as _control_is_managed
+    except Exception:
+        _control_is_managed = lambda: False  # noqa: E731
+    if _control_is_managed():
+        if local:
+            return "scope_denied: managed browser mode refuses local=true / real-profile"
+        return _resolve_backend_cdp(
+            env, task_id, session_name=session, mode=mode, identity=identity, qa_targets=qa_targets,
+        )
     rp_err = _resolve_real_profile_cdp(env, force_local=local)
     if rp_err:
         return rp_err
@@ -514,7 +557,9 @@ def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool)
     if local and not _has_cdp_env(env) and not _real_profile_consented():
         return ("local=true was requested but browser.use_real_profile is off. Enable it in config.yaml "
                 "(browser.use_real_profile: true) or the desktop Settings → Browser section, then retry.")
-    return _resolve_backend_cdp(env, task_id, session_name=session)
+    return _resolve_backend_cdp(
+        env, task_id, session_name=session, mode=mode, identity=identity, qa_targets=qa_targets,
+    )
 
 
 def _group_popen_kwargs() -> dict:
@@ -579,7 +624,8 @@ def _run_cli_killing_process_group(cmd, code, env, timeout):
 
 
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
-                 task_id: Optional[str] = None, local: bool = False):
+                 task_id: Optional[str] = None, local: bool = False,
+                 mode: str = "", identity: str = "", qa_targets: Optional[List[str]] = None):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
     if not code or not code.strip():
@@ -601,7 +647,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
                               "dashes, or underscores (e.g. 'r7k2').")
         env["BU_NAME"] = session
-    route_err = _route_backend(env, session, task_id, bool(local))
+    route_err = _route_backend(
+        env, session, task_id, bool(local), mode=mode, identity=identity, qa_targets=qa_targets,
+    )
     if route_err:
         return tool_error(route_err)
     _attach_vault_supervisor(env, task_id)
@@ -618,7 +666,15 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
     # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no local
     # Chrome/CDP endpoint is reachable (their API key authenticates it)
-    if "BU_AUTOSPAWN" not in env and is_legacy_browser_use_cloud_config(_read_browser_cfg()):
+    try:
+        from tools.browser_control_route import is_managed as _spawn_is_managed
+    except Exception:
+        _spawn_is_managed = lambda: False  # noqa: E731
+    if (
+        not _spawn_is_managed()
+        and "BU_AUTOSPAWN" not in env
+        and is_legacy_browser_use_cloud_config(_read_browser_cfg())
+    ):
         env["BU_AUTOSPAWN"] = "1"
 
     timeout = _clamp_timeout(timeout_s)
@@ -729,6 +785,39 @@ def _dynamic_schema_overrides() -> dict:
                             "accounts, their sessions. No-op when the backend is already local. Default false."),
         }
         overrides["parameters"] = {**BROWSER_EXEC_SCHEMA["parameters"], "properties": props}
+    try:
+        from tools.browser_control_route import is_managed as _schema_is_managed
+    except Exception:
+        _schema_is_managed = lambda: False  # noqa: E731
+    if _schema_is_managed():
+        props = dict(
+            (overrides.get("parameters") or BROWSER_EXEC_SCHEMA["parameters"])["properties"]
+        )
+        props["mode"] = {
+            "type": "string",
+            "enum": ["research", "qa"],
+            "description": (
+                "Slot mode. research = ephemeral isolated Chrome. qa = "
+                "registered-app grant only. Default research."
+            ),
+            "default": "research",
+        }
+        props["identity"] = {
+            "type": "string",
+            "description": (
+                "Persistent slot identity chosen from the task, not the site: "
+                "work:<org>, shopping, or sensitive. Omit for research slots."
+            ),
+        }
+        props["qa_targets"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "QA hostnames/URLs that must match a dedicated registered app. "
+                "Shared proxies are refused."
+            ),
+        }
+        overrides["parameters"] = {**BROWSER_EXEC_SCHEMA["parameters"], "properties": props}
     return overrides
 
 
@@ -763,6 +852,9 @@ registry.register(
         code=args.get("code", ""), session=args.get("session", "") or "",
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S), task_id=kw.get("task_id"),
         local=bool(args.get("local", False)),
+        mode=args.get("mode", "") or "",
+        identity=args.get("identity", "") or "",
+        qa_targets=args.get("qa_targets"),
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,

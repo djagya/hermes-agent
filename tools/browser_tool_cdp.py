@@ -47,6 +47,16 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return raw
 
 
+def _is_managed_browser() -> bool:
+    """True when monolith browser-control is configured (fail-closed mode)."""
+    try:
+        from tools.browser_control_route import is_managed
+
+        return is_managed()
+    except Exception:
+        return False
+
+
 def _get_cdp_override_raw() -> str:
     """Return the *configured* CDP override without any network I/O.
 
@@ -54,7 +64,12 @@ def _get_cdp_override_raw() -> str:
     gates (check_fns, ``_is_local_mode`` / ``_is_local_backend``, ``hermes doctor``) MUST use this, not
     :func:`_get_cdp_override`: its 10s HTTP discovery against a stale ``cdp_url`` would stall every startup's
     schema build with no error.
+
+    Managed mode never reports an ambient override (no I/O). Acquisition
+    goes through :func:`tools.browser_control_route.managed_cdp_or_error`.
     """
+    if _is_managed_browser():
+        return ""
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     return env_override or _origin()._browser_cfg("cdp_url", "", lambda v: str(v or "").strip(), "browser.cdp_url from config")
 
@@ -66,6 +81,15 @@ def _get_cdp_override() -> str:
     :func:`_get_cdp_override_raw`.
     """
     _bt = _origin()
+    if _is_managed_browser():
+        from tools.browser_control_route import ManagedBrowserError, managed_cdp_or_error
+
+        url, err = managed_cdp_or_error()
+        if err:
+            raise ManagedBrowserError(err)
+        if not url:
+            return ""
+        return _resolve_cdp_override(url)
     return _resolve_cdp_override(raw) if (raw := _get_cdp_override_raw()) else ""
 
 

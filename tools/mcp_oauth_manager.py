@@ -396,6 +396,23 @@ class MCPOAuthManager:
             logger.warning("MCP OAuth '%s': awaiting 401 handler failed: %s", server_name, exc)
             return False
 
+    def clear_cached_providers(self) -> int:
+        """Drop every in-process provider while preserving OAuth files.
+
+        A full MCP shutdown also replaces the dedicated asyncio event loop.
+        OAuth providers are not safe to carry across that boundary.
+        """
+        with self._entries_lock:
+            count = len(self._entries)
+            self._entries.clear()
+        if count:
+            logger.info(
+                "MCP OAuth: cleared %d in-process provider cache entr%s",
+                count,
+                "y" if count == 1 else "ies",
+            )
+        return count
+
 
 _MANAGER: Optional[MCPOAuthManager] = None
 _MANAGER_LOCK = threading.Lock()

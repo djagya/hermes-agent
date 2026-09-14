@@ -719,7 +719,14 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                     "cloud for public URLs; set browser.auto_local_for_private_urls: false to disable)",
                     url, type(_cloud._get_cloud_provider()).__name__ if _cloud._get_cloud_provider() else "none")
 
-    session_info = _session._get_session_info(nav_session_key)
+    try:
+        session_info = _session._get_session_info(nav_session_key)
+    except Exception as e:
+        from tools.browser_control_route import ManagedBrowserError
+
+        if isinstance(e, ManagedBrowserError):
+            return json.dumps({"success": False, "error": str(e)})
+        raise
     is_first_nav = session_info.get("_first_nav", True)
     if is_first_nav:
         session_info["_first_nav"] = False

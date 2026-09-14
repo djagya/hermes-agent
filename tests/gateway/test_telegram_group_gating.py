@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
-from gateway.platforms.event import MessageType
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 
@@ -939,3 +939,65 @@ def test_human_reply_unaffected_by_bots_require_mention():
         gated._should_process_message(_group_message("replying", reply_to_bot=True))
         is True
     )
+
+
+def _empty_text_event():
+    return MessageEvent(
+        text="continue",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100",
+            chat_type="group",
+            user_id="111",
+            user_name="Alice",
+        ),
+        media_urls=[],
+        media_types=[],
+    )
+
+
+def test_replied_voice_keeps_voice_semantics_for_gateway_stt(monkeypatch):
+    async def _run():
+        adapter = _make_adapter()
+        cached = SimpleNamespace(
+            path="/tmp/replied-voice.ogg",
+            media_type="audio/ogg",
+            kind="audio",
+            display_name="voice.ogg",
+        )
+        async def _download(_msg, _what):
+            return "ok", cached
+        monkeypatch.setattr(adapter, "_download_observed_media", _download)
+        msg = SimpleNamespace(reply_to_message=SimpleNamespace(voice=object(), audio=None))
+        event = _empty_text_event()
+        await adapter._cache_replied_media(msg, event)
+        from gateway.run import _event_media_is_stt_input
+        assert event.message_type == MessageType.VOICE
+        assert event.media_urls == [cached.path]
+        assert _event_media_is_stt_input(event, 0) is True
+        assert "[Replied-to audio 'voice.ogg' saved at:" in event.text
+
+    asyncio.run(_run())
+
+
+def test_replied_audio_file_remains_non_stt_audio(monkeypatch):
+    async def _run():
+        adapter = _make_adapter()
+        cached = SimpleNamespace(
+            path="/tmp/replied-audio.mp3",
+            media_type="audio/mpeg",
+            kind="audio",
+            display_name="recording.mp3",
+        )
+        async def _download(_msg, _what):
+            return "ok", cached
+        monkeypatch.setattr(adapter, "_download_observed_media", _download)
+        msg = SimpleNamespace(reply_to_message=SimpleNamespace(voice=None, audio=object()))
+        event = _empty_text_event()
+        await adapter._cache_replied_media(msg, event)
+        from gateway.run import _event_media_is_stt_input
+        assert event.message_type == MessageType.AUDIO
+        assert _event_media_is_stt_input(event, 0) is False
+
+    asyncio.run(_run())

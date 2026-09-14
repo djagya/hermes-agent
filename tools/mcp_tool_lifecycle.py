@@ -156,6 +156,10 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
         if not servers_snapshot:
             clear_selected_status()
         _clear_connect_cooldowns(None if scope is None else selected_status)
+    # Immediately before the loop stop: providers own asyncio locks created
+    # on the loop we are about to replace. Disk tokens stay.
+    from tools.mcp_oauth_manager import get_manager
+    get_manager().clear_cached_providers()
     _loop._stop_mcp_loop(only_if_idle=scope is not None)
 
 

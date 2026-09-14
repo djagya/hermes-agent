@@ -33,6 +33,22 @@ logger = logging.getLogger(__name__)
 DEFAULT_BROWSER_CDP_PORT = 9222
 DEFAULT_BROWSER_CDP_URL = f"http://127.0.0.1:{DEFAULT_BROWSER_CDP_PORT}"
 
+MANAGED_CONNECT_REFUSAL = (
+    "managed browser mode: connect is disabled; slots are owned by browser-control"
+)
+
+
+def managed_connect_refusal() -> str | None:
+    """Return the connect-disabled message when browser-control is configured."""
+    try:
+        from tools.browser_control_route import is_managed
+
+        if is_managed():
+            return MANAGED_CONNECT_REFUSAL
+    except Exception:
+        return None
+    return None
+
 
 @dataclass(frozen=True)
 class _Browser:
@@ -886,6 +902,10 @@ def launch_chrome_debug(
     exit code + stderr tail and the next is tried."""
     system = system or platform.system()
     result = ChromeDebugLaunch()
+    refusal = managed_connect_refusal()
+    if refusal:
+        logger.info("browser debug launch refused: %s", refusal)
+        return result
     candidates = get_chrome_debug_candidates(system)
     if not candidates:
         logger.info("browser debug launch: no Chromium-family binary found (system=%s)", system)
