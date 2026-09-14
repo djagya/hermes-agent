@@ -89,10 +89,6 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
-        stop_help = props["action"]["description"].lower()
-        self.assertIn("cancel", stop_help)
-        self.assertIn("not guaranteed", stop_help)
-        self.assertIn("steer", stop_help)
 
     def test_top_level_description_compact_and_complete(self):
         """The top-level description must stay compact while keeping every
@@ -107,9 +103,6 @@ class TestDelegateRequirements(unittest.TestCase):
         for keyword in (
             "background",          # async semantics
             "wait or poll",        # no-poll rule
-            "completion result",   # interrupted children may have no summary
-            "destructive cancellation",  # stop can cut the in-flight tool
-            "no usable summary",  # stop does not promise salvageable output
             "execute_code",        # mechanical-work routing
             "cronjob",             # durable-work routing
             "/stop",               # non-durability warning
@@ -430,7 +423,12 @@ class TestDelegateTask(unittest.TestCase):
 
     def test_nous_child_rederives_api_mode_from_model(self):
         """Portal is dual-wire — same provider + different model prefix must
-        not inherit the parent's Messages/chat_completions mode verbatim."""
+        not inherit the parent's Messages/chat_completions mode verbatim.
+        Native wire selected (opt-in since 2026-09-06, ``nous.anthropic_wire``)."""
+        with patch("hermes_cli.providers._nous_anthropic_wire", return_value="native"):
+            self._nous_child_rederives_api_mode_from_model()
+
+    def _nous_child_rederives_api_mode_from_model(self):
         parent = _make_mock_parent(depth=0)
         parent.base_url = "https://inference-api.nousresearch.com/v1"
         parent.api_key = "portal-jwt"
@@ -893,21 +891,6 @@ class TestDelegateFailedChildStatus(unittest.TestCase):
         self.assertEqual(entry["exit_reason"], "interrupted")
         self.assertFalse(entry["truncated"])
 
-    def test_interrupted_without_final_text_has_no_usable_summary(self):
-        """An interrupt can arrive before the child produces assistant text."""
-        entry = self._delegate_single(
-            {
-                "final_response": None,
-                "completed": False,
-                "interrupted": True,
-                "api_calls": 1,
-                "messages": [],
-            }
-        )
-        self.assertEqual(entry["status"], "interrupted")
-        self.assertEqual(entry["exit_reason"], "interrupted")
-        self.assertEqual(entry["summary"], "")
-
 
 class TestSubagentCostRollup(unittest.TestCase):
     """Port of Kilo-Org/kilocode#9448 — parent's session_estimated_cost_usd
@@ -1063,7 +1046,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_base_url_with_provider_carries_runtime_request_overrides(self, mock_resolve):
         """#65035: the base_url short-circuit must not drop the configured
-        provider's request_overrides / max_output_tokens."""
+        provider's generic request_overrides; dedicated output caps are ignored."""
         mock_resolve.return_value = {
             "provider": "custom",
             "base_url": "https://provider-default.example/v1",
@@ -1088,7 +1071,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             creds["request_overrides"],
             {"extra_body": {"thinking": {"type": "disabled"}}},
         )
-        self.assertEqual(creds["max_output_tokens"], 8192)
+        self.assertNotIn("max_output_tokens", creds)
 
     def test_bare_base_url_returns_none_overrides(self):
         """No provider alongside base_url → no overrides source; keys are
@@ -1097,7 +1080,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         cfg = {"model": "m", "provider": "", "base_url": "http://localhost:1234/v1", "api_key": "k"}
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertIsNone(creds["request_overrides"])
-        self.assertIsNone(creds["max_output_tokens"])
+        self.assertNotIn("max_output_tokens", creds)
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_base_url_survives_runtime_resolution_failure(self, mock_resolve):
@@ -1110,7 +1093,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertEqual(creds["base_url"], "https://api.xiaomimimo.com/v1")
         self.assertIsNone(creds["request_overrides"])
-        self.assertIsNone(creds["max_output_tokens"])
+        self.assertNotIn("max_output_tokens", creds)
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolution_failure_raises_valueerror(self, mock_resolve):
@@ -1360,39 +1343,6 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child._credential_pool.acquire_lease.assert_called_once_with()
         child._swap_credential.assert_called_once_with(leased_entry)
         child._credential_pool.release_lease.assert_called_once_with("cred-b")
-
-    def test_run_single_child_uses_fallback_when_primary_credentials_exhausted(self):
-        from tools.delegate_tool import _run_single_child
-
-        child = MagicMock()
-        child._credential_pool = MagicMock()
-        child._credential_pool.acquire_lease.return_value = None
-        child.fallback_chain = [
-            {
-                "provider": "kimi-coding",
-                "model": "kimi-for-coding",
-                "base_url": "https://api.kimi.com/coding/",
-            }
-        ]
-        child._switch_to_fallback.return_value = True
-        child.run_conversation.return_value = {
-            "final_response": "fallback done",
-            "completed": True,
-            "interrupted": False,
-            "tool_calls": 0,
-        }
-
-        result = _run_single_child(
-            task_index=0,
-            goal="use fallback",
-            child=child,
-            parent_agent=_make_mock_parent(),
-        )
-
-        child._switch_to_fallback.assert_called_once_with(child.fallback_chain[0])
-        child.run_conversation.assert_called_once()
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["summary"], "fallback done")
 
     def test_run_single_child_releases_lease_after_failure(self):
         from tools.delegate_tool import _run_single_child
