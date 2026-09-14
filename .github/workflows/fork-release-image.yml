@@ -31,7 +31,7 @@ env:
   # Must match every Dockerfile `ARG DEBIAN_SNAPSHOT=` default. Build-args
   # override the Dockerfile; leaving May here after a Sept bump rebuilt
   # stale apt and failed smoke/Trivy.
-  DEBIAN_SNAPSHOT: 20260907T000000Z
+  DEBIAN_SNAPSHOT: 20260914T000000Z
 
 jobs:
   lint:
@@ -349,6 +349,8 @@ jobs:
             --skip-files usr/local/bin/op \
             --skip-files usr/local/bin/gh \
             --skip-files usr/local/bin/gitleaks \
+            --skip-files usr/local/bin/uv \
+            --skip-files usr/local/bin/uvx \
             "$IMAGE"
 
       - name: Install uv (for docker tests)
