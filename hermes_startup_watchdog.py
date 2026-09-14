@@ -70,9 +70,9 @@ _CPU_PROGRESS_MIN_S = 1.0
 _MAX_CPU_EXTENSIONS = 3
 
 # Per-call clamp on progress leases; a phase that needs longer renews (the
-# renewal is the liveness evidence). 15min covers the observed worst-case
-# single migration step on multi-GB state.db files with margin.
-_MAX_LEASE_S = 900.0
+# renewal is the liveness evidence). 0.21.2 first boot can CREATE INDEX on a
+# 19G+ state.db — 600s/900s is below that, so the clamp must allow 3600s.
+_MAX_LEASE_S = 3600.0
 
 # Bounded wait for the lifecycle-ledger helper thread (import lock may be
 # held by the wedged main thread).

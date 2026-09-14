@@ -5,8 +5,18 @@ Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt
 import contextlib
 import os
 from typing import Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from tools.browser_tool_origin import origin_module as _origin
+
+
+def _cdp_version_url(discovery_url: str) -> str:
+    """``/json/version`` path, preserving ``?tok=``. ``endswith`` misses query strings."""
+    parts = urlsplit(discovery_url)
+    path = parts.path or "/"
+    if not path.endswith("/json/version"):
+        path = path.rstrip("/") + "/json/version"
+    return urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
 
 
 def _resolve_cdp_override(cdp_url: str) -> str:
@@ -28,7 +38,7 @@ def _resolve_cdp_override(cdp_url: str) -> str:
         if not (raw.count(":") == 2 and raw.rstrip("/").rsplit(":", 1)[-1].isdigit() and "/" not in raw.split(":", 2)[-1]):
             return raw
         discovery_url = ("http://" if lowered.startswith("ws://") else "https://") + raw.split("://", 1)[1]
-    version_url = discovery_url if discovery_url.lower().endswith("/json/version") else discovery_url.rstrip("/") + "/json/version"
+    version_url = _cdp_version_url(discovery_url)
 
     san = _bt._sanitize_url_for_logs
     try:
@@ -47,6 +57,16 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return raw
 
 
+def _is_managed_browser() -> bool:
+    """True when monolith browser-control is configured (fail-closed mode)."""
+    try:
+        from tools.browser_control_route import is_managed
+
+        return is_managed()
+    except Exception:
+        return False
+
+
 def _get_cdp_override_raw() -> str:
     """Return the *configured* CDP override without any network I/O.
 
@@ -54,7 +74,12 @@ def _get_cdp_override_raw() -> str:
     gates (check_fns, ``_is_local_mode`` / ``_is_local_backend``, ``hermes doctor``) MUST use this, not
     :func:`_get_cdp_override`: its 10s HTTP discovery against a stale ``cdp_url`` would stall every startup's
     schema build with no error.
+
+    Managed mode never reports an ambient override (no I/O). Acquisition
+    goes through :func:`tools.browser_control_route.managed_cdp_or_error`.
     """
+    if _is_managed_browser():
+        return ""
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     return env_override or _origin()._browser_cfg("cdp_url", "", lambda v: str(v or "").strip(), "browser.cdp_url from config")
 
@@ -66,6 +91,15 @@ def _get_cdp_override() -> str:
     :func:`_get_cdp_override_raw`.
     """
     _bt = _origin()
+    if _is_managed_browser():
+        from tools.browser_control_route import ManagedBrowserError, managed_cdp_or_error
+
+        url, err = managed_cdp_or_error()
+        if err:
+            raise ManagedBrowserError(err)
+        if not url:
+            return ""
+        return _resolve_cdp_override(url)
     return _resolve_cdp_override(raw) if (raw := _get_cdp_override_raw()) else ""
 
 

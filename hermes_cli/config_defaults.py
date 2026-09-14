@@ -399,6 +399,11 @@ DEFAULT_CONFIG = {
         # With a cloud provider, auto-spawn local Chromium for LAN/localhost URLs instead
         "auto_local_for_private_urls": True,
         "cdp_url": "",  # persistent CDP endpoint for attaching to an existing Chromium/Chrome
+        # Infrastructure URL for monolith browser-control. Compose
+        # HERMES_BROWSER_CONTROL_URL wins when set; this leaf is the
+        # config.yaml home. Empty = unmanaged (upstream). disabled:// =
+        # managed fail-closed. http(s):// = managed via control.
+        "control_url": "",
         # Consent to browse with the user's REAL logins locally: runs on a Hermes-managed SNAPSHOT
         # of the ACTIVE default-Chromium profile (Local State -> profile.last_used; cookies, logins,
         # prefs copied and re-synced per fresh session) driven by Hermes' packaged Chromium. The

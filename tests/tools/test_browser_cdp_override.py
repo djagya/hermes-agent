@@ -11,7 +11,36 @@ HTTP_URL = f"http://{HOST}:{PORT}"
 VERSION_URL = f"{HTTP_URL}/json/version"
 
 
+class TestCdpVersionUrl:
+    def test_appends_json_version_and_keeps_query(self):
+        from tools.browser_tool_cdp import _cdp_version_url
+
+        assert (
+            _cdp_version_url("http://172.30.2.2:8790/slot/research-1/cdp?tok=abc")
+            == "http://172.30.2.2:8790/slot/research-1/cdp/json/version?tok=abc"
+        )
+
+    def test_does_not_duplicate_json_version_when_query_present(self):
+        from tools.browser_tool_cdp import _cdp_version_url
+
+        raw = "http://172.30.2.2:8790/slot/research-1/cdp/json/version?tok=abc"
+        assert _cdp_version_url(raw) == raw
+
+
 class TestResolveCdpOverride:
+    def test_keeps_query_when_discovering_json_version(self):
+        from tools.browser_tool_cdp import _resolve_cdp_override
+
+        raw = "http://cdp.example/slot/x/json/version?tok=not-a-real-token"
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+
+        with patch("requests.get", return_value=response) as mock_get:
+            assert _resolve_cdp_override(raw) == WS_URL
+
+        mock_get.assert_called_once_with(raw, timeout=10)
+
     def test_keeps_full_devtools_websocket_url(self):
         from tools.browser_tool_cdp import _resolve_cdp_override
 
@@ -324,6 +353,14 @@ class TestCDPSupervisorStartErrorRedaction:
             assert "p4ssw0rd" not in str(exc)
         else:
             raise AssertionError("start() did not re-raise the start error")
+
+
+class TestCdpReconnectHandshakeRace:
+    def test_first_reconnect_is_debug_not_warning(self):
+        from tools.browser_supervisor import _cdp_reconnect_is_handshake_race
+
+        assert _cdp_reconnect_is_handshake_race(1) is True
+        assert _cdp_reconnect_is_handshake_race(2) is False
 
 
 class TestRedactCdpErrorText:

@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "note": "Last published B.3 digest e3391400e / sha256:d63fc555. CI run 34107241626 measured 4494315525 bytes (4286 MiB) on the test-stage image. max_image_bytes is first-B 4341e0fd plus 10% slack. Live B.2 unpacked size on the box is smaller (docker inspect Size) because layer accounting differs from the CI test target. Trivy still fails the job on any fixable CRITICAL/HIGH.",
+  "accepted_digest": "sha256:d63fc55532a760f7981baa6de696d44ed8dd778c60f0aa707f703c3f7ca24c30",
+  "accepted_git_sha": "e3391400e6c04dc30c0bebe2c797f0f07ca0ef09",
+  "measured_image_bytes": 4494315525,
+  "max_image_bytes": 4943659885,
+  "max_largest_layer_bytes": 2500000000,
+  "max_cold_help_ms": 60000,
+  "max_warm_help_ms": 30000,
+  "max_idle_rss_kb": 1048576,
+  "max_offline_cache_write_bytes": 67108864,
+  "max_shutdown_ms": 90000,
+  "max_fixable_critical": 0,
+  "max_fixable_high": 0
+}

@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""Build a review-only pin-refresh report and optionally apply bumps.
+
+Never merges, publishes, or deploys. Lookups that fail stay in the
+report as errors; --apply skips those pins.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import ssl
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+DOCKERFILE = ROOT / "Dockerfile"
+NET_BINS = ROOT / "docker/sera-toolbox/install-network-bins.sh"
+UA = "djagya-hermes-agent-pin-refresh/1"
+
+
+def fetch(url: str, timeout: int = 30) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        return resp.read()
+
+
+def fetch_text(url: str) -> str:
+    return fetch(url).decode("utf-8", "replace")
+
+
+def gh_latest_tag(repo: str) -> tuple[str, str]:
+    payload = json.loads(fetch_text(f"https://api.github.com/repos/{repo}/releases/latest"))
+    tag = str(payload.get("tag_name") or "").lstrip("v")
+    html = str(payload.get("html_url") or f"https://github.com/{repo}/releases")
+    if not tag:
+        raise RuntimeError(f"no latest tag for {repo}")
+    return tag, html
+
+
+def ghcr_digest(image: str, tag: str) -> str:
+    token_url = (
+        f"https://ghcr.io/token?service=ghcr.io&scope=repository:{image}:pull"
+    )
+    token = json.loads(fetch_text(token_url)).get("token") or ""
+    if not token:
+        raise RuntimeError(f"no ghcr token for {image}")
+    req = urllib.request.Request(
+        f"https://ghcr.io/v2/{image}/manifests/{tag}",
+        headers={
+            "User-Agent": UA,
+            "Authorization": f"Bearer {token}",
+            "Accept": (
+                "application/vnd.oci.image.index.v1+json, "
+                "application/vnd.docker.distribution.manifest.list.v2+json"
+            ),
+        },
+    )
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+        digest = str(resp.headers.get("Docker-Content-Digest") or "")
+    if not digest.startswith("sha256:"):
+        raise RuntimeError(f"no digest for ghcr.io/{image}:{tag}")
+    return digest
+
+
+def pypi_latest(name: str) -> tuple[str, str]:
+    payload = json.loads(fetch_text(f"https://pypi.org/pypi/{name}/json"))
+    ver = str(payload.get("info", {}).get("version") or "")
+    if not ver:
+        raise RuntimeError(f"no pypi version for {name}")
+    return ver, f"https://pypi.org/project/{name}/{ver}/"
+
+
+def npm_latest(name: str) -> tuple[str, str]:
+    payload = json.loads(fetch_text(f"https://registry.npmjs.org/{name}/latest"))
+    ver = str(payload.get("version") or "")
+    if not ver:
+        raise RuntimeError(f"no npm version for {name}")
+    return ver, f"https://www.npmjs.com/package/{name}/v/{ver}"
+
+
+def dockerhub_digest(image: str, tag: str) -> str:
+    url = f"https://hub.docker.com/v2/namespaces/library/repositories/{image}/tags/{tag}"
+    payload = json.loads(fetch_text(url))
+    digest = str(payload.get("digest") or "")
+    if not digest.startswith("sha256:"):
+        raise RuntimeError(f"no digest for {image}:{tag}")
+    return digest
+
+
+def sha256_url(url: str) -> str:
+    data = fetch(url, timeout=120)
+    return hashlib.sha256(data).hexdigest()
+
+
+def parse_dockerfile() -> dict[str, str]:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    def arg(name: str) -> str:
+        m = re.search(rf"^ARG {re.escape(name)}=(.+)$", text, re.M)
+        return m.group(1).strip() if m else ""
+
+    debian = re.search(r"FROM debian:13\.4@(sha256:[0-9a-f]+)", text)
+    node = re.search(r"FROM node:26-bookworm-slim@(sha256:[0-9a-f]+)", text)
+    uv = re.search(r"FROM ghcr.io/astral-sh/uv:([^@\s]+)@(sha256:[0-9a-f]+)", text)
+    return {
+        "debian_digest": debian.group(1) if debian else "",
+        "node_digest": node.group(1) if node else "",
+        "uv_tag": uv.group(1) if uv else "",
+        "uv_digest": uv.group(2) if uv else "",
+        "s6": arg("S6_OVERLAY_VERSION"),
+        "s6_noarch": arg("S6_OVERLAY_NOARCH_SHA256"),
+        "s6_amd64": arg("S6_OVERLAY_X86_64_SHA256"),
+        "s6_arm64": arg("S6_OVERLAY_AARCH64_SHA256"),
+        "s6_symlinks": arg("S6_OVERLAY_SYMLINKS_SHA256"),
+        "sqlite": arg("SQLITE_AUTOCONF_VERSION"),
+        "snapshot": arg("DEBIAN_SNAPSHOT"),
+        "himalaya": arg("HIMALAYA_REV"),
+        "weasyprint": (
+            m.group(1)
+            if (m := re.search(r'"weasyprint==([^"]+)"', text))
+            else ""
+        ),
+        "python_docx": (
+            m.group(1)
+            if (m := re.search(r'"python-docx==([^"]+)"', text))
+            else ""
+        ),
+        "openpyxl": (
+            m.group(1)
+            if (m := re.search(r'"openpyxl==([^"]+)"', text))
+            else ""
+        ),
+        "yt_dlp": (
+            m.group(1)
+            if (m := re.search(r'"yt-dlp==([^"]+)"', text))
+            else ""
+        ),
+        "clickup": (
+            m.group(1)
+            if (m := re.search(r"@hauptsache\.net/clickup-mcp@([0-9.]+)", text))
+            else ""
+        ),
+        "caldav": (
+            m.group(1) if (m := re.search(r"caldav-mcp@([0-9.]+)", text)) else ""
+        ),
+    }
+
+
+def parse_net_bins() -> dict[str, str]:
+    text = NET_BINS.read_text(encoding="utf-8")
+    gh = re.search(r"cli/releases/download/v([0-9.]+)/", text)
+    gl = re.search(r"gitleaks/releases/download/v([0-9.]+)/", text)
+    ti = re.search(r"tirith/releases/download/v([0-9.]+)/", text)
+    op = re.search(r"op2/pkg/v([0-9.]+)/", text)
+    return {
+        "gh": gh.group(1) if gh else "",
+        "gitleaks": gl.group(1) if gl else "",
+        "tirith": ti.group(1) if ti else "",
+        "op": op.group(1) if op else "",
+    }
+
+
+def render_report(
+    budget: dict,
+    rows: list[tuple[str, str, str, str]],
+    applied: list[str],
+    errors: list[str],
+) -> str:
+    """PR body: pin table plus last accepted size/CVE/SBOM baseline.
+
+    This job does not rebuild. fork-release-image is the gate that
+    measures a new digest. The body must still carry the last accepted
+    numbers so a reviewer is not told to 'fill them later'.
+    """
+    measured = budget.get("measured_image_bytes")
+    max_bytes = budget.get("max_image_bytes")
+    slack = ""
+    if isinstance(measured, int) and isinstance(max_bytes, int):
+        slack = str(max_bytes - measured)
+    lines = [
+        "# Pin refresh",
+        "",
+        "Review-only. No unattended merge, publish, or deploy.",
+        "This job does not rebuild. Size, CVE policy, and SBOM path",
+        "below are the last accepted `image-budget.json` baseline.",
+        "Do not merge until `fork-release-image` on this branch stays",
+        "green (measure-image-budget, Trivy fixable CRITICAL/HIGH,",
+        "named SPDX/CycloneDX artifact `hermes-agent-sbom`).",
+        "",
+        "## Last accepted image (size / CVE / SBOM)",
+        "",
+        f"- digest: `{budget.get('accepted_digest') or '(unset)'}`",
+        f"- git: `{budget.get('accepted_git_sha') or '(unset)'}`",
+        f"- measured_image_bytes: `{measured}`",
+        f"- max_image_bytes: `{max_bytes}` (slack `{slack or 'n/a'}`)",
+        f"- max_largest_layer_bytes: `{budget.get('max_largest_layer_bytes')}`",
+        f"- max_fixable_critical: `{budget.get('max_fixable_critical')}`",
+        f"- max_fixable_high: `{budget.get('max_fixable_high')}`",
+        "- SBOM: CI artifact `hermes-agent-sbom` on that green run",
+        "  (not baked under `/etc/hermes`).",
+        "- smoke: golden + adversarial in the same job (fail-closed).",
+        "",
+        "## Accepted budget",
+        "",
+        "```json",
+        json.dumps(budget, indent=2, sort_keys=True).rstrip(),
+        "```",
+        "",
+        "## Old vs new",
+        "",
+        "| pin | current | latest | notes |",
+        "|---|---|---|---|",
+    ]
+    for name, old, new, link in rows:
+        status = (
+            "same"
+            if old and old == new
+            else ("bump" if new and not str(new).startswith("(") else "lookup")
+        )
+        ref = f"[release]({link})" if link else ""
+        lines.append(f"| {name} | `{old}` | `{new}` | {status} {ref} |".rstrip())
+    lines.append("")
+    if applied:
+        lines.append("## Applied on this branch")
+        lines.append("")
+        for item in applied:
+            lines.append(f"- {item}")
+        lines.append("")
+    if errors:
+        lines.append("## Lookup errors")
+        lines.append("")
+        for err in errors:
+            lines.append(f"- {err}")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def replace_all(path: Path, old: str, new: str) -> int:
+    if not old or old == new:
+        return 0
+    text = path.read_text(encoding="utf-8")
+    if old not in text:
+        return 0
+    path.write_text(text.replace(old, new), encoding="utf-8")
+    return text.count(old)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--report", required=True)
+    parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args()
+
+    pins = parse_dockerfile()
+    bins = parse_net_bins()
+    rows: list[tuple[str, str, str, str]] = []
+    errors: list[str] = []
+    applied: list[str] = []
+
+    def row(name: str, old: str, new: str, link: str) -> None:
+        rows.append((name, old, new or "(lookup failed)", link))
+
+    try:
+        debian_new = dockerhub_digest("debian", "13.4")
+        row("debian:13.4", pins["debian_digest"], debian_new, "https://hub.docker.com/_/debian")
+        if args.apply and debian_new and debian_new != pins["debian_digest"]:
+            n = replace_all(DOCKERFILE, pins["debian_digest"], debian_new)
+            if n:
+                applied.append(f"debian digest x{n}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"debian: {exc}")
+        row("debian:13.4", pins["debian_digest"], "", "")
+
+    try:
+        node_new = dockerhub_digest("node", "26-bookworm-slim")
+        row("node:26-bookworm-slim", pins["node_digest"], node_new, "https://hub.docker.com/_/node")
+        if args.apply and node_new and node_new != pins["node_digest"]:
+            n = replace_all(DOCKERFILE, pins["node_digest"], node_new)
+            if n:
+                applied.append(f"node digest x{n}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"node: {exc}")
+        row("node:26-bookworm-slim", pins["node_digest"], "", "")
+
+    try:
+        s6_new, s6_url = gh_latest_tag("just-containers/s6-overlay")
+        row("s6-overlay", pins["s6"], s6_new, s6_url)
+        if args.apply and s6_new and s6_new != pins["s6"]:
+            base = f"https://github.com/just-containers/s6-overlay/releases/download/v{s6_new}"
+            noarch = sha256_url(f"{base}/s6-overlay-noarch.tar.xz")
+            amd64 = sha256_url(f"{base}/s6-overlay-x86_64.tar.xz")
+            arm64 = sha256_url(f"{base}/s6-overlay-aarch64.tar.xz")
+            sym = sha256_url(f"{base}/s6-overlay-symlinks-noarch.tar.xz")
+            text = DOCKERFILE.read_text(encoding="utf-8")
+            text = text.replace(f"S6_OVERLAY_VERSION={pins['s6']}", f"S6_OVERLAY_VERSION={s6_new}")
+            text = text.replace(pins["s6_noarch"], noarch)
+            text = text.replace(pins["s6_amd64"], amd64)
+            text = text.replace(pins["s6_arm64"], arm64)
+            text = text.replace(pins["s6_symlinks"], sym)
+            DOCKERFILE.write_text(text, encoding="utf-8")
+            applied.append(f"s6-overlay {pins['s6']} -> {s6_new}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"s6: {exc}")
+        row("s6-overlay", pins["s6"], "", "https://github.com/just-containers/s6-overlay/releases")
+
+    try:
+        gh_new, gh_url = gh_latest_tag("cli/cli")
+        row("gh", bins["gh"], gh_new, gh_url)
+        if args.apply and gh_new and gh_new != bins["gh"]:
+            amd = sha256_url(
+                f"https://github.com/cli/cli/releases/download/v{gh_new}/gh_{gh_new}_linux_amd64.tar.gz"
+            )
+            arm = sha256_url(
+                f"https://github.com/cli/cli/releases/download/v{gh_new}/gh_{gh_new}_linux_arm64.tar.gz"
+            )
+            text = NET_BINS.read_text(encoding="utf-8")
+            text = text.replace(f"v{bins['gh']}/gh_{bins['gh']}_", f"v{gh_new}/gh_{gh_new}_")
+            # After URL rewrite, sha is still old. Patch amd64 then arm64.
+            text = re.sub(
+                rf'(gh_url="https://github.com/cli/cli/releases/download/v{re.escape(gh_new)}/gh_{re.escape(gh_new)}_linux_amd64.tar.gz"\n    gh_sha=")[0-9a-f]+(")',
+                rf"\g<1>{amd}\2",
+                text,
+                count=1,
+            )
+            text = re.sub(
+                rf'(gh_url="https://github.com/cli/cli/releases/download/v{re.escape(gh_new)}/gh_{re.escape(gh_new)}_linux_arm64.tar.gz"\n    gh_sha=")[0-9a-f]+(")',
+                rf"\g<1>{arm}\2",
+                text,
+                count=1,
+            )
+            NET_BINS.write_text(text, encoding="utf-8")
+            applied.append(f"gh {bins['gh']} -> {gh_new}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"gh: {exc}")
+        row("gh", bins["gh"], "", "https://github.com/cli/cli/releases")
+
+    try:
+        gl_new, gl_url = gh_latest_tag("gitleaks/gitleaks")
+        row("gitleaks", bins["gitleaks"], gl_new, gl_url)
+        if args.apply and gl_new and gl_new != bins["gitleaks"]:
+            amd = sha256_url(
+                f"https://github.com/gitleaks/gitleaks/releases/download/v{gl_new}/gitleaks_{gl_new}_linux_x64.tar.gz"
+            )
+            arm = sha256_url(
+                f"https://github.com/gitleaks/gitleaks/releases/download/v{gl_new}/gitleaks_{gl_new}_linux_arm64.tar.gz"
+            )
+            text = NET_BINS.read_text(encoding="utf-8")
+            text = text.replace(f"v{bins['gitleaks']}/gitleaks_{bins['gitleaks']}_", f"v{gl_new}/gitleaks_{gl_new}_")
+            text = re.sub(
+                rf'(gl_url="https://github.com/gitleaks/gitleaks/releases/download/v{re.escape(gl_new)}/gitleaks_{re.escape(gl_new)}_linux_x64.tar.gz"\n    gl_sha=")[0-9a-f]+(")',
+                rf"\g<1>{amd}\2",
+                text,
+                count=1,
+            )
+            text = re.sub(
+                rf'(gl_url="https://github.com/gitleaks/gitleaks/releases/download/v{re.escape(gl_new)}/gitleaks_{re.escape(gl_new)}_linux_arm64.tar.gz"\n    gl_sha=")[0-9a-f]+(")',
+                rf"\g<1>{arm}\2",
+                text,
+                count=1,
+            )
+            NET_BINS.write_text(text, encoding="utf-8")
+            applied.append(f"gitleaks {bins['gitleaks']} -> {gl_new}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"gitleaks: {exc}")
+        row("gitleaks", bins["gitleaks"], "", "https://github.com/gitleaks/gitleaks/releases")
+
+    try:
+        ti_new, ti_url = gh_latest_tag("sheeki03/tirith")
+        row("tirith", bins["tirith"], ti_new, ti_url)
+        if args.apply and ti_new and ti_new != bins["tirith"]:
+            amd = sha256_url(
+                f"https://github.com/sheeki03/tirith/releases/download/v{ti_new}/tirith-x86_64-unknown-linux-gnu.tar.gz"
+            )
+            arm = sha256_url(
+                f"https://github.com/sheeki03/tirith/releases/download/v{ti_new}/tirith-aarch64-unknown-linux-gnu.tar.gz"
+            )
+            text = NET_BINS.read_text(encoding="utf-8")
+            text = text.replace(
+                f"v{bins['tirith']}/tirith-", f"v{ti_new}/tirith-"
+            )
+            text = re.sub(
+                rf'(ti_url="https://github.com/sheeki03/tirith/releases/download/v{re.escape(ti_new)}/tirith-x86_64-unknown-linux-gnu.tar.gz"\n    ti_sha=")[0-9a-f]+(")',
+                rf"\g<1>{amd}\2",
+                text,
+                count=1,
+            )
+            text = re.sub(
+                rf'(ti_url="https://github.com/sheeki03/tirith/releases/download/v{re.escape(ti_new)}/tirith-aarch64-unknown-linux-gnu.tar.gz"\n    ti_sha=")[0-9a-f]+(")',
+                rf"\g<1>{arm}\2",
+                text,
+                count=1,
+            )
+            NET_BINS.write_text(text, encoding="utf-8")
+            applied.append(f"tirith {bins['tirith']} -> {ti_new}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"tirith: {exc}")
+        row("tirith", bins["tirith"], "", "https://github.com/sheeki03/tirith/releases")
+
+    try:
+        # 1Password CLI is not on GitHub releases. Report current pin;
+        # apply stays manual (checksummed cache.agilebits.com URLs).
+        row(
+            "op",
+            bins["op"],
+            bins["op"],
+            "https://app-updates.agilebits.com/product_history/CLI2",
+        )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"op: {exc}")
+        row("op", bins.get("op", ""), "", "https://developer.1password.com/docs/cli")
+
+    try:
+        uv_ver, uv_url = gh_latest_tag("astral-sh/uv")
+        uv_new_tag = f"{uv_ver}-python3.13-trixie"
+        uv_new_digest = ghcr_digest("astral-sh/uv", uv_new_tag)
+        row("uv image", f"{pins['uv_tag']}@{pins['uv_digest']}", f"{uv_new_tag}@{uv_new_digest}", uv_url)
+        if args.apply and (
+            uv_new_tag != pins["uv_tag"] or uv_new_digest != pins["uv_digest"]
+        ):
+            text = DOCKERFILE.read_text(encoding="utf-8")
+            old = f"ghcr.io/astral-sh/uv:{pins['uv_tag']}@{pins['uv_digest']}"
+            new = f"ghcr.io/astral-sh/uv:{uv_new_tag}@{uv_new_digest}"
+            if old in text:
+                DOCKERFILE.write_text(text.replace(old, new), encoding="utf-8")
+                applied.append(f"uv {pins['uv_tag']} -> {uv_new_tag}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"uv: {exc}")
+        row("uv image", f"{pins['uv_tag']}@{pins['uv_digest']}", "", "https://github.com/astral-sh/uv/pkgs/container/uv")
+
+    row("sqlite-autoconf", pins["sqlite"], pins["sqlite"], "https://sqlite.org/download.html")
+    row("DEBIAN_SNAPSHOT", pins["snapshot"], pins["snapshot"], "https://snapshot.debian.org/")
+
+    # Report-only. Himalaya is a pinned git rev + cargo features, not a
+    # release tarball. Pip/npm toolbox pins stay manual so --apply cannot
+    # silently float WeasyPrint/yt-dlp/MCP clients.
+    try:
+        him_new, him_url = gh_latest_tag("pimalaya/himalaya")
+        row("himalaya", pins["himalaya"][:12], him_new, him_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"himalaya: {exc}")
+        row("himalaya", pins["himalaya"][:12], "", "https://github.com/pimalaya/himalaya/releases")
+
+    try:
+        wp_new, wp_url = pypi_latest("weasyprint")
+        row("weasyprint", pins["weasyprint"], wp_new, wp_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"weasyprint: {exc}")
+        row("weasyprint", pins["weasyprint"], "", "https://pypi.org/project/weasyprint/")
+
+    try:
+        dx_new, dx_url = pypi_latest("python-docx")
+        row("python-docx", pins["python_docx"], dx_new, dx_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"python-docx: {exc}")
+        row("python-docx", pins["python_docx"], "", "https://pypi.org/project/python-docx/")
+
+    try:
+        ox_new, ox_url = pypi_latest("openpyxl")
+        row("openpyxl", pins["openpyxl"], ox_new, ox_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"openpyxl: {exc}")
+        row("openpyxl", pins["openpyxl"], "", "https://pypi.org/project/openpyxl/")
+
+    try:
+        yt_new, yt_url = pypi_latest("yt-dlp")
+        row("yt-dlp", pins["yt_dlp"], yt_new, yt_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"yt-dlp: {exc}")
+        row("yt-dlp", pins["yt_dlp"], "", "https://pypi.org/project/yt-dlp/")
+
+    try:
+        cu_new, cu_url = npm_latest("@hauptsache.net/clickup-mcp")
+        row("clickup-mcp", pins["clickup"], cu_new, cu_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"clickup-mcp: {exc}")
+        row("clickup-mcp", pins["clickup"], "", "https://www.npmjs.com/package/@hauptsache.net/clickup-mcp")
+
+    try:
+        cd_new, cd_url = npm_latest("caldav-mcp")
+        row("caldav-mcp", pins["caldav"], cd_new, cd_url)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"caldav-mcp: {exc}")
+        row("caldav-mcp", pins["caldav"], "", "https://www.npmjs.com/package/caldav-mcp")
+
+    budget = json.loads(
+        (ROOT / "docker/sera-toolbox/image-budget.json").read_text(encoding="utf-8")
+    )
+    Path(args.report).write_text(
+        render_report(budget, rows, applied, errors), encoding="utf-8"
+    )
+    print(f"wrote {args.report} applied={applied or 'none'} errors={len(errors)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

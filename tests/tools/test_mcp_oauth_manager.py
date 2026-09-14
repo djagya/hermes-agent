@@ -62,6 +62,34 @@ def test_manager_restore_entry_preserves_newer_concurrent_entry(tmp_path, monkey
     assert manager.get_or_build_provider("shared", "https://new.example", {}) is new_provider
     assert new_provider is not old_provider
 
+
+def test_clear_cached_providers_rebuilds_without_deleting_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    token_file = token_dir / "srv.json"
+    token_file.write_text(
+        '{"access_token":"TOKEN","token_type":"Bearer","expires_in":3600}'
+    )
+    manager = MCPOAuthManager()
+    with manager._entries_lock:
+        manager._entries[manager._key("srv")] = object()
+    assert manager.clear_cached_providers() == 1
+    assert token_file.exists()
+    assert manager._entries == {}
+
+
+def test_clear_cached_providers_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    manager = MCPOAuthManager()
+    assert manager.clear_cached_providers() == 0
+    assert manager.clear_cached_providers() == 0
+
+
 pytest.importorskip(
     "mcp.client.auth.oauth2",
     reason="MCP SDK 1.26.0+ required for OAuth support",

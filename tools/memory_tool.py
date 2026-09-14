@@ -5,6 +5,7 @@ mid-session writes hit disk but never change the prompt (prefix cache intact).
 Single `memory` tool: add/replace/remove or a batch `operations` list."""
 
 import copy
+import hashlib
 import json
 import logging
 from contextvars import ContextVar
@@ -61,7 +62,22 @@ def load_on_disk_store() -> "MemoryStore":
     return store
 
 
-def _gate_or_stage(summary: str, detail: str, payload: Dict[str, Any]) -> Optional[str]:
+def _build_memory_write_guard(store: "MemoryStore", target: str) -> Dict[str, Any]:
+    """Snapshot the exact target bytes under the store's mutation lock."""
+    path = store._path_for(target)
+    with store._file_lock(path):
+        try:
+            if path.exists():
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            else:
+                digest = "ABSENT"
+        except (OSError, IOError) as exc:
+            raise RuntimeError(f"Cannot stage memory write from unreadable target: {path}") from exc
+    return {"target": target, "expected_sha256": digest}
+
+
+def _gate_or_stage(summary: str, detail: str, payload: Dict[str, Any],
+                   store: "MemoryStore") -> Optional[str]:
     """JSON tool-result string when the write must NOT proceed (blocked or staged
     for approval), None to proceed. Fails open if the gate module can't load."""
     try:
@@ -73,6 +89,8 @@ def _gate_or_stage(summary: str, detail: str, payload: Dict[str, Any]) -> Option
         return None
     if decision.blocked:
         return tool_error(decision.message, success=False)
+    payload = dict(payload)
+    payload["_write_guard"] = _build_memory_write_guard(store, payload.get("target", "memory"))
     record = wa.stage_write(wa.MEMORY, payload, summary=f"{summary}: {detail[:120]}", origin=wa.current_origin())
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"], "message": decision.message},
                       ensure_ascii=False)
@@ -97,15 +115,20 @@ def _batch_op_line(op: Dict[str, Any]) -> str:
 
 
 def _apply_write_gate(action: str, target: str, content: Optional[str], old_text: Optional[str],
-                      operations: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+                      operations: Optional[List[Dict[str, Any]]] = None,
+                      store: Optional["MemoryStore"] = None) -> Optional[str]:
     """Gate one mutating op, or (``operations`` set) a whole batch as a single unit."""
+    if store is None:
+        return tool_error("Memory store unavailable for write approval.", success=False)
     label = "user profile" if target == "user" else "memory"
     if operations is not None:
         return _gate_or_stage(f"apply {len(operations)} op(s) to {label}",
                               "\n".join(_batch_op_line(op) for op in operations),
-                              {"action": "batch", "target": target, "operations": operations})
+                              {"action": "batch", "target": target, "operations": operations},
+                              store)
     return _gate_or_stage(*_STORE_ACTIONS[action][1](label, content, old_text),
-                          {"action": action, "target": target, "content": content, "old_text": old_text})
+                          {"action": action, "target": target, "content": content, "old_text": old_text},
+                          store)
 
 
 def _validate_single_op(store, action, target, content, old_text) -> Optional[str]:
@@ -129,7 +152,8 @@ def _validate_single_op(store, action, target, content, old_text) -> Optional[st
 _BG_DELETE_ACTIONS = ("replace", "remove")
 
 
-def _background_delete_gate(action, operations, target="memory", content=None, old_text=None) -> Optional[str]:
+def _background_delete_gate(action, operations, target="memory", content=None, old_text=None,
+                            store=None) -> Optional[str]:
     """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
     stays available (it is all any review prompt asks for), while ``replace``/``remove`` —
     single or inside a batch — are never applied unattended. The op is staged in the pending
@@ -151,6 +175,8 @@ def _background_delete_gate(action, operations, target="memory", content=None, o
               else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
     try:
         from tools import write_approval as wa
+        if store is not None:
+            payload["_write_guard"] = _build_memory_write_guard(store, target)
         record = wa.stage_write(
             wa.MEMORY, payload,
             summary=(f"background review consolidation ({'batch' if operations is not None else action} "
@@ -187,19 +213,19 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        denied = _background_delete_gate(action, operations, target)
+        denied = _background_delete_gate(action, operations, target, store=store)
         if denied is not None:
             return denied
         # Approval gate: stages (background/gateway) or prompts inline (CLI); off by default.
-        gate_result = _apply_write_gate("batch", target, None, None, operations)
+        gate_result = _apply_write_gate("batch", target, None, None, operations, store=store)
         if gate_result is not None:
             return gate_result
         return json.dumps(store.apply_batch(target, operations), ensure_ascii=False)
     if action not in _STORE_ACTIONS:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
     invalid = (_validate_single_op(store, action, target, content, old_text)
-               or _background_delete_gate(action, None, target, content, old_text)
-               or _apply_write_gate(action, target, content, old_text))
+               or _background_delete_gate(action, None, target, content, old_text, store=store)
+               or _apply_write_gate(action, target, content, old_text, store=store))
     if invalid is not None:
         return invalid
     return json.dumps(_STORE_ACTIONS[action][0](store, target, content, old_text), ensure_ascii=False)
@@ -252,11 +278,58 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     target_error = _memory_target_error(store, target)
     if target_error is not None:
         return target_error
+    guard = payload.get("_write_guard")
+    if not isinstance(guard, dict):
+        return {
+            "success": False,
+            "error": "Pending memory write has no base-state guard; inspect and restage it.",
+            "target": target,
+        }
+    if guard.get("target") != target:
+        return {
+            "success": False,
+            "error": "Pending memory write guard targets a different store; inspect and restage it.",
+            "target": target,
+        }
+    expected_sha256 = guard.get("expected_sha256")
+    if not (
+        expected_sha256 == "ABSENT"
+        or (
+            isinstance(expected_sha256, str)
+            and len(expected_sha256) == 64
+            and all(char in "0123456789abcdef" for char in expected_sha256)
+        )
+    ):
+        return {
+            "success": False,
+            "error": "Pending memory write has a malformed base-state guard; inspect and restage it.",
+            "target": target,
+        }
+    guard_error = store._pending_guard_error(target, expected_sha256)
+    if guard_error is not None:
+        return guard_error
+    content = payload.get("content") or ""
+    old_text = payload.get("old_text") or ""
+    if action not in {"add", "replace", "remove", "batch"}:
+        return {"success": False, "error": f"Unknown staged action '{action}'.", "target": target}
+    from tools import write_approval as wa
+    if not wa.consume_pending_apply_capability(wa.MEMORY, payload):
+        return {
+            "success": False,
+            "error": "Pending memory write must be applied through its live approval record.",
+            "target": target,
+        }
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
-    if action not in _STORE_ACTIONS:
-        return {"success": False, "error": f"Unknown staged action '{action}'."}
-    return _STORE_ACTIONS[action][0](store, target, payload.get("content") or "", payload.get("old_text") or "")
+        return store.apply_batch(
+            target, payload.get("operations") or [], expected_sha256=expected_sha256
+        )
+    if action == "add":
+        return store.add(target, content, expected_sha256=expected_sha256)
+    if action == "replace":
+        return store.replace(target, old_text, content, expected_sha256=expected_sha256)
+    if action == "remove":
+        return store.remove(target, old_text, expected_sha256=expected_sha256)
+    raise AssertionError("validated staged memory action was not dispatched")
 
 
 MEMORY_SCHEMA = {

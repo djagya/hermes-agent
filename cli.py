@@ -472,6 +472,7 @@ def load_cli_config() -> Dict[str, Any]:
 
     # Only a file's terminal section may overwrite terminal env vars already set by .env.
     _file_has_terminal_config = False
+    file_config: Dict[str, Any] = {}
 
     if config_path.exists():
         try:
@@ -489,11 +490,12 @@ def load_cli_config() -> Dict[str, Any]:
     from hermes_cli.config import _expand_env_vars
     defaults = _expand_env_vars(defaults)
 
-    # Administrator-pinned (managed scope) values overlay LAST; cli.py builds its config
-    # independently of hermes_cli.config, so this keeps parity with `hermes config`. Fail-open.
+    # Seed omitted managed-scope leaves last; cli.py builds its config independently of
+    # hermes_cli.config, so this keeps parity with `hermes config`. A present user leaf
+    # wins. Fail-open.
     from hermes_cli import managed_scope
 
-    defaults = managed_scope.apply_managed_overlay(defaults)
+    defaults = managed_scope.apply_managed_overlay(defaults, user_raw=file_config)
 
     _mirror_config_to_env(defaults, _file_has_terminal_config)
 

@@ -140,7 +140,7 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
         def _staging(wa):
             acts = ", ".join(op["action"] for op in operations)
             gist = f"batch({len(operations)} ops: {acts}) on {', '.join(sorted(set(names)))}"
-            return {"action": "batch", "operations": operations}, gist
+            return {"action": "batch", "name": default_name, "operations": operations}, gist
         staged = _smt._run_write_gate(_staging)
         if staged is not None:
             return staged

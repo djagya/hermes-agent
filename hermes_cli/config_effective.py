@@ -6,10 +6,10 @@ cron model pinning) — so nine surfaces used to hand-roll raw-read → overlay 
 differing orders and none of them replayed the model-key canonicalization or the last-known-good
 recovery ``load_config()`` gained. This module is that one primitive.
 
-Order matches ``_load_config_impl``: the user layer is expanded BEFORE the managed overlay so a
+Order matches ``_load_config_impl``: the user layer is expanded BEFORE the managed seed so a
 managed ``${VAR}`` resolves against the process environment only (``apply_managed_overlay``
-expands it) and can never be re-resolved through a profile's secret scope
-(docs/design/managed-scope.md §4.1). ``read_user_config_raw`` stays the write-back primitive.
+expands it) and can never be re-resolved through a profile's secret scope. A present user
+leaf wins; omitted leaves take the seed. ``read_user_config_raw`` stays the write-back primitive.
 """
 
 from __future__ import annotations
@@ -30,8 +30,12 @@ _EFFECTIVE_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, 
 
 
 def _effective(raw: Dict[str, Any]) -> Dict[str, Any]:
-    expanded = _config._expand_env_vars(raw)
-    merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {})
+    presence = raw if isinstance(raw, dict) else {}
+    expanded = _config._expand_env_vars(presence)
+    merged = managed_scope.apply_managed_overlay(
+        expanded if isinstance(expanded, dict) else {},
+        user_raw=presence,
+    )
     return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
 
 

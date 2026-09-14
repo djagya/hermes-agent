@@ -244,7 +244,37 @@ def _create_cloud_session_or_fallback(task_id: str, provider) -> Dict[str, Any]:
 
 def _create_session_for_key(task_id: str, force_local: bool) -> Dict[str, Any]:
     """Fresh session for ``task_id`` (runs OUTSIDE the lock: cloud mode makes a network call).
-    Precedence: CDP override > hybrid local sidecar (never real-profile) > cloud > local."""
+    Precedence: managed control > CDP override > hybrid local sidecar (never real-profile) > cloud > local."""
+    try:
+        from tools.browser_control_route import (
+            MANAGED_LEASE_ENV,
+            MANAGED_TOKEN_ENV,
+            ManagedBrowserError,
+            is_managed,
+            managed_cdp_or_error,
+        )
+    except Exception:
+        is_managed = lambda: False  # noqa: E731
+        ManagedBrowserError = RuntimeError  # type: ignore[misc,assignment]
+    if is_managed():
+        if force_local:
+            raise ManagedBrowserError(
+                "scope_denied: managed browser mode; use browser_exec"
+            )
+        hold: Dict[str, str] = {}
+        url, err = managed_cdp_or_error(hold, task_id=str(task_id))
+        if err:
+            raise ManagedBrowserError(err)
+        if not url:
+            raise ManagedBrowserError("unavailable: managed control returned no CDP")
+        session_info = _create_cdp_session(task_id, url)
+        session_info = dict(session_info)
+        feats = dict(session_info.get("features") or {})
+        feats["managed"] = True
+        session_info["features"] = feats
+        session_info[MANAGED_LEASE_ENV] = hold.get(MANAGED_LEASE_ENV, "")
+        session_info[MANAGED_TOKEN_ENV] = hold.get(MANAGED_TOKEN_ENV, "")
+        return session_info
     cdp_override = _cdp._get_cdp_override()
     if cdp_override and not force_local:
         return _create_cdp_session(task_id, cdp_override)
@@ -572,6 +602,10 @@ def _run_browser_command(
     try:
         session_info = _get_session_info(task_id)
     except Exception as e:
+        from tools.browser_control_route import ManagedBrowserError
+
+        if isinstance(e, ManagedBrowserError):
+            return {"success": False, "error": str(e)}
         _bt.logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
         return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
     # Cleanup stops the supervisor before closing the backend; keep it stopped.

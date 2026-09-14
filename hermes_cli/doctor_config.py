@@ -17,6 +17,32 @@ def _has_provider_env_config(content: str) -> bool:
     return any(key in content for key in _PROVIDER_ENV_HINTS)
 
 
+def _onepassword_env_map(config: dict | None = None) -> dict:
+    """``secrets.onepassword.env`` mapping only. Never resolves refs or dumps values."""
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+            config = load_config()
+        except Exception:
+            return {}
+    secrets = config.get("secrets") if isinstance(config, dict) else None
+    op = (secrets or {}).get("onepassword") if isinstance(secrets, dict) else None
+    if not isinstance(op, dict):
+        return {}
+    env = op.get("env")
+    return env if isinstance(env, dict) else {}
+
+
+def _has_provider_onepassword_mapping(config: dict | None = None) -> bool:
+    """True when a provider hint key is mapped in ``secrets.onepassword.env``."""
+    from hermes_cli.doctor import _PROVIDER_ENV_HINTS
+    env = _onepassword_env_map(config)
+    return any(
+        key in _PROVIDER_ENV_HINTS and isinstance(ref, str) and ref.strip()
+        for key, ref in env.items()
+    )
+
+
 # Legacy config keys still read for back-compat: warn-only with the modern replacement, never auto-migrated
 # (migrations live in config.py). (section, key, replacement)
 _DEPRECATED_CONFIG_KEYS: tuple[tuple[str, str, str], ...] = (
@@ -134,6 +160,7 @@ def _check_env_file(should_fix: bool, f: Finding) -> None:
     from hermes_cli.doctor import HERMES_HOME, PROJECT_ROOT, _DHH
     managed_scope_check()
     env_path = HERMES_HOME / '.env'
+    has_op = _has_provider_onepassword_mapping()
     if env_path.exists():
         check_ok(f"{_DHH}/.env file exists")
         # UTF-8 first; latin-1 fallback for Windows Notepad/cp1252 files (matches env_loader._load_dotenv_with_fallback).
@@ -141,8 +168,15 @@ def _check_env_file(should_fix: bool, f: Finding) -> None:
             content = env_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             content = env_path.read_text(encoding="latin-1")
-        if not check_bool(_has_provider_env_config(content), "API key or custom endpoint configured", f"No API key found in {_DHH}/.env"):
+        has_env = _has_provider_env_config(content)
+        if has_env:
+            check_ok("API key or custom endpoint configured (.env)")
+        elif has_op:
+            check_ok("Provider credentials mapped via 1Password (secrets.onepassword.env)")
+        elif not check_bool(False, "API key or custom endpoint configured", f"No API key found in {_DHH}/.env"):
             f.issues.append("Run 'hermes setup' to configure API keys")
+    elif has_op:
+        check_ok("Provider credentials mapped via 1Password (secrets.onepassword.env)")
     elif (PROJECT_ROOT / '.env').exists():  # project root as fallback
         check_ok(".env file exists (in project directory)")
     else:
