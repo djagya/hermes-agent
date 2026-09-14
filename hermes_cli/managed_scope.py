@@ -113,12 +113,32 @@ def _parse_managed_env(path: Path) -> Dict[str, str]:
     return load_env_file(path)
 
 
+def _user_presence(user: dict) -> dict:
+    """Canonicalize raw user yaml so omit sees the same leaves load_config promotes.
+
+    Root ``max_turns`` becomes ``agent.max_turns``. A bare ``model: id`` string
+    marks ``model.default`` present so a seed ``model.provider`` cannot clobber
+    a shorthand default.
+    """
+    presence = dict(user)
+    if "max_turns" in presence:
+        agent = presence.get("agent")
+        agent = dict(agent) if isinstance(agent, dict) else {}
+        if agent.get("max_turns") is None:
+            agent["max_turns"] = presence["max_turns"]
+        presence["agent"] = agent
+        presence.pop("max_turns", None)
+    model = presence.get("model")
+    if isinstance(model, str):
+        presence["model"] = {"default": model}
+    return presence
+
+
 def _omit_present_leaves(managed: dict, user: dict) -> dict:
     """Managed leaves the user document did not set.
 
     A key present on the user side wins, including a user ``${VAR}`` that
-    expands later. YAML ``null`` against a managed dict is treated as
-    absent (same as ``_deep_merge`` ignoring a None override of a dict).
+    expands later. YAML ``null`` is treated as absent (same as ``unset``).
     """
     out: dict = {}
     for key, value in managed.items():
@@ -126,7 +146,7 @@ def _omit_present_leaves(managed: dict, user: dict) -> dict:
             out[key] = value
             continue
         user_val = user[key]
-        if user_val is None and isinstance(value, dict):
+        if user_val is None:
             out[key] = value
             continue
         if isinstance(value, dict) and isinstance(user_val, dict) and value:
@@ -163,6 +183,8 @@ def apply_managed_overlay(config: dict, *, user_raw: Optional[dict] = None) -> d
         presence = user_raw if user_raw is not None else config
         if not isinstance(presence, dict):
             presence = {}
+        else:
+            presence = _user_presence(presence)
         seeds = _omit_present_leaves(managed_expanded, presence)
         if not seeds:
             return config

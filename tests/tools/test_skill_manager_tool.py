@@ -1252,3 +1252,38 @@ class TestLocalSeraAuthor:
         assert result["success"] is True, result.get("error")
         fm, _ = parse_frontmatter((tmp_path / "hub-skill" / "SKILL.md").read_text())
         assert fm.get("author") == "Hub Maintainer"
+
+    def test_imported_author_omission_is_restored(self, tmp_path):
+        imported = VALID_SKILL_CONTENT.replace("description:", "author: Hermes Agent\ndescription:")
+        with _skill_dir(tmp_path):
+            skill = tmp_path / "imported" / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text(imported, encoding="utf-8")
+            result = _edit_skill(
+                "imported",
+                VALID_SKILL_CONTENT.replace("Do the thing.", "Do the patched thing."),
+            )
+        assert result["success"] is True, result.get("error")
+        fm, _ = parse_frontmatter((tmp_path / "imported" / "SKILL.md").read_text())
+        assert fm.get("author") == "Hermes Agent"
+
+    def test_patch_skill_md_file_path_cannot_change_sera_author(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _patch_skill(
+                "my-skill", "author: Sera", "author: Other", file_path="SKILL.md",
+            )
+        assert result["success"] is False
+        assert "Cannot change author" in result["error"]
+        fm, _ = parse_frontmatter((tmp_path / "my-skill" / "SKILL.md").read_text())
+        assert fm.get("author") == "Sera"
+
+    def test_write_file_skill_md_cannot_change_sera_author(self, tmp_path):
+        changed = VALID_SKILL_CONTENT_2.replace("description:", "author: Other\ndescription:")
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _write_file("my-skill", "SKILL.md", changed)
+        assert result["success"] is False
+        assert "Cannot change author" in result["error"]
+        fm, _ = parse_frontmatter((tmp_path / "my-skill" / "SKILL.md").read_text())
+        assert fm.get("author") == "Sera"

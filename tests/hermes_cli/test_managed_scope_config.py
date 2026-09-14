@@ -48,6 +48,15 @@ def test_user_write_approval_beats_managed_seed(homes):
     assert load_user_config_effective(home / "config.yaml")["skills"]["write_approval"] is True
 
 
+def test_root_max_turns_beats_managed_agent_max_turns(homes):
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "max_turns: 12\n")
+    _write(managed / "config.yaml", "agent:\n  max_turns: 99\n")
+    assert cfg_get(load_config(), "agent", "max_turns") == 12
+
+
 def test_user_scalar_beats_managed_seed(homes):
     from hermes_cli.config import load_config, cfg_get
 

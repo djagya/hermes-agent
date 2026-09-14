@@ -193,21 +193,32 @@ def _inject_frontmatter_author(content: str, author: str) -> str:
     return content[:insert_at] + f"\nauthor: {author}" + content[insert_at:]
 
 
+def _is_skill_md_target(file_path: Optional[str]) -> bool:
+    """True when the write target is the skill root SKILL.md (default or explicit path)."""
+    if not file_path:
+        return True
+    parts = Path(file_path).parts
+    return bool(parts) and parts[-1] == "SKILL.md" and len(parts) in (1, 2)
+
+
 def _is_user_local_skill(name: str) -> bool:
-    """True for agent-created skills in the profile tree. Hub/bundled/external skip the Sera guard."""
+    """True for agent-created skills in the profile tree. Hub/bundled/external skip the Sera guard.
+
+    Classification errors fail closed: do not treat unknown origin as user-local, or a
+    hub/external skill would get a forged Sera author.
+    """
     try:
         from tools.skill_usage import is_bundled, is_hub_installed, is_external_skill_path
     except Exception:
-        return True
-    if is_hub_installed(name) or is_bundled(name):
         return False
-    found = _find_skill(name)
-    if found:
-        try:
-            if is_external_skill_path(found["path"]):
-                return False
-        except Exception:
-            return True
+    try:
+        if is_hub_installed(name) or is_bundled(name):
+            return False
+        found = _find_skill(name)
+        if found and is_external_skill_path(found["path"]):
+            return False
+    except Exception:
+        return False
     return True
 
 
@@ -240,9 +251,9 @@ def apply_local_author_policy(
         return content, None
     existing_author = _frontmatter_author(existing) if existing else None
     new_author = _frontmatter_author(content)
-    if existing_author and existing_author != LOCAL_SKILL_AUTHOR:
+    if existing_author:
         if new_author is None:
-            return content, None
+            return _inject_frontmatter_author(content, existing_author), None
         if new_author != existing_author:
             return content, (
                 f"Cannot change author on skill {name!r} (target class: user-local, "
@@ -579,9 +590,9 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
         return _err(match_error) | {"file_preview": _clip(content, 500, "...")}
     if err := _validate_content_size(new_content, label=target_label):
         return _err(err)
-    if not file_path and (err := _validate_frontmatter(new_content)):
+    if _is_skill_md_target(file_path) and (err := _validate_frontmatter(new_content)):
         return _err(f"Patch would break SKILL.md structure: {err}")
-    if not file_path:
+    if _is_skill_md_target(file_path):
         new_content, author_error = apply_local_author_policy(
             "patch", name, new_content, existing=content)
         if author_error:
@@ -651,6 +662,18 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     skill_dir, guard = _locate_for_write(name, "write_file", " Create it first with action='create'.")
     if guard:
         return guard
+    if _is_skill_md_target(file_path):
+        if err := _validate_frontmatter(file_content):
+            return _err(err)
+        existing = None
+        skill_md = skill_dir / "SKILL.md"
+        if skill_md.exists():
+            with suppress(OSError):
+                existing = skill_md.read_text(encoding="utf-8")
+        file_content, author_error = apply_local_author_policy(
+            "edit" if existing else "create", name, file_content, existing=existing)
+        if author_error:
+            return _err(author_error)
     target, err = _resolve_supporting_file(skill_dir, file_path)
     if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
         return guard
@@ -1090,13 +1113,23 @@ def skill_manage(
         content, author_error = apply_local_author_policy("create", name, content)
         if author_error:
             return tool_error(author_error, success=False)
-    elif action in {"edit", "patch"} and content and (action == "edit" or not file_path):
+    elif action == "edit" and content:
         existing = None
         found = _find_skill(name)
         if found:
             with suppress(OSError):
                 existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
         content, author_error = apply_local_author_policy(action, name, content, existing=existing)
+        if author_error:
+            return tool_error(author_error, success=False)
+    elif action == "write_file" and file_content is not None and _is_skill_md_target(file_path):
+        existing = None
+        found = _find_skill(name)
+        if found:
+            with suppress(OSError):
+                existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
+        file_content, author_error = apply_local_author_policy(
+            "edit" if existing else "create", name, file_content, existing=existing)
         if author_error:
             return tool_error(author_error, success=False)
     # Approval gate: skills are too large to review inline, so they always stage regardless

@@ -200,10 +200,19 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
         if not servers_snapshot:
             clear_selected_status()
         _clear_connect_cooldowns(None if scope is None and names is None else selected_status)
-    # Immediately before the loop stop: providers own asyncio locks created
-    # on the loop we are about to replace. Disk tokens stay.
+    # Providers own asyncio locks created on the MCP loop. Full replace
+    # drops every in-process provider (disk tokens stay). A names/scope
+    # prune must not wipe sibling servers still running on this loop.
     from tools.mcp_oauth_manager import get_manager
-    get_manager().clear_cached_providers()
+    manager = get_manager()
+    if scope is None and names is None:
+        manager.clear_cached_providers()
+    else:
+        to_evict = set(names or ())
+        for key in selected:
+            to_evict.add(_key_name(key))
+        for name in to_evict:
+            manager.evict(name, hermes_home=scope)
     _loop._stop_mcp_loop(only_if_idle=scope is not None or names is not None)
 
 

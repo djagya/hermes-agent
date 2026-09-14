@@ -17,28 +17,38 @@ def _has_provider_env_config(content: str) -> bool:
     return any(key in content for key in _PROVIDER_ENV_HINTS)
 
 
-def _onepassword_env_map(config: dict | None = None) -> dict:
-    """``secrets.onepassword.env`` mapping only. Never resolves refs or dumps values."""
+def _onepassword_section(config: dict | None = None) -> dict:
+    """Raw ``secrets.onepassword`` mapping. Never resolves refs or dumps values."""
     if config is None:
         try:
-            from hermes_cli.config import load_config
-            config = load_config()
+            from hermes_cli.config import read_user_config_raw
+            config = read_user_config_raw()
         except Exception:
             return {}
     secrets = config.get("secrets") if isinstance(config, dict) else None
     op = (secrets or {}).get("onepassword") if isinstance(secrets, dict) else None
-    if not isinstance(op, dict):
-        return {}
-    env = op.get("env")
+    return op if isinstance(op, dict) else {}
+
+
+def _onepassword_env_map(config: dict | None = None) -> dict:
+    """``secrets.onepassword.env`` mapping only. Never resolves refs or dumps values."""
+    env = _onepassword_section(config).get("env")
     return env if isinstance(env, dict) else {}
 
 
 def _has_provider_onepassword_mapping(config: dict | None = None) -> bool:
-    """True when a provider hint key is mapped in ``secrets.onepassword.env``."""
+    """True when 1Password is enabled and a provider hint key has an ``op://`` ref."""
     from hermes_cli.doctor import _PROVIDER_ENV_HINTS
-    env = _onepassword_env_map(config)
+    section = _onepassword_section(config)
+    if section.get("enabled") is False:
+        return False
+    env = section.get("env")
+    if not isinstance(env, dict):
+        return False
     return any(
-        key in _PROVIDER_ENV_HINTS and isinstance(ref, str) and ref.strip()
+        key in _PROVIDER_ENV_HINTS
+        and isinstance(ref, str)
+        and ref.strip().startswith("op://")
         for key, ref in env.items()
     )
 

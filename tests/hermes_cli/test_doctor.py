@@ -96,6 +96,25 @@ class TestProviderOnePasswordMapping:
         assert _has_provider_onepassword_mapping({}) is False
         assert _has_provider_onepassword_mapping({"secrets": {"onepassword": {"enabled": True}}}) is False
 
+    def test_disabled_onepassword_is_not_a_mapping(self):
+        from hermes_cli.doctor_config import _has_provider_onepassword_mapping
+
+        cfg = {
+            "secrets": {
+                "onepassword": {
+                    "enabled": False,
+                    "env": {"OPENAI_API_KEY": "op://Vault/Item/password"},
+                }
+            }
+        }
+        assert _has_provider_onepassword_mapping(cfg) is False
+
+    def test_non_op_ref_is_not_a_mapping(self):
+        from hermes_cli.doctor_config import _has_provider_onepassword_mapping
+
+        cfg = {"secrets": {"onepassword": {"env": {"OPENAI_API_KEY": "${OPENAI_API_KEY}"}}}}
+        assert _has_provider_onepassword_mapping(cfg) is False
+
 
 class TestDoctorToolAvailabilitySummary:
     def test_missing_api_key_summary_ignores_disabled_toolsets(self, monkeypatch):

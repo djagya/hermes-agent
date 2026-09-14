@@ -2178,7 +2178,8 @@ def _merge_managed_overlay(
         managed_normalized["model"] = {"default": managed_normalized["model"]}
     managed_expanded = _expand_env_vars(managed_normalized)
     presence = user_raw if isinstance(user_raw, dict) else {}
-    seeds = managed_scope._omit_present_leaves(managed_expanded, presence)
+    seeds = managed_scope._omit_present_leaves(
+        managed_expanded, managed_scope._user_presence(presence))
     if not seeds:
         return expanded, managed_config
     return _deep_merge(expanded, seeds), managed_config

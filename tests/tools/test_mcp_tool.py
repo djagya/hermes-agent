@@ -1195,6 +1195,18 @@ class TestShutdown:
             shutdown_mcp_servers()
         manager.clear_cached_providers.assert_called_once_with()
 
+    def test_shutdown_names_evicts_without_clearing_all(self):
+        from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+
+        manager = MagicMock()
+        with patch(
+            "tools.mcp_oauth_manager.get_manager",
+            return_value=manager,
+        ), patch("tools.mcp_tool_loop._stop_mcp_loop"):
+            shutdown_mcp_servers(names={"todoist"})
+        manager.clear_cached_providers.assert_not_called()
+        manager.evict.assert_called_once_with("todoist", hermes_home=None)
+
     def test_shutdown_drains_parked_server_after_bounded_wait_expires(self):
         """The public shutdown path drains a parked server if graceful shutdown stalls.
 
