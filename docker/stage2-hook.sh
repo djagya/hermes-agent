@@ -16,6 +16,7 @@
 # stdin/stdout/stderr access and handles arg parsing there.
 
 set -eu
+umask 002
 
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
 INSTALL_DIR="/opt/hermes"

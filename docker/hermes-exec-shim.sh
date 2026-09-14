@@ -39,6 +39,7 @@
 # state via the hermes CLI. Default is to drop.
 
 set -e
+umask 002
 
 REAL=/opt/hermes/.venv/bin/hermes
 
