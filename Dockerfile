@@ -354,7 +354,6 @@ RUN uv pip install --refresh \
     "fal-client==0.13.1" \
     "pillow-heif==1.5.0" \
     "ruff==0.12.12" \
-    "httpcore2==2.10.0" \
     "httpx2==2.12.0"
 
 RUN npm install -g --omit=dev \
