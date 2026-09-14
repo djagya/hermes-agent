@@ -317,7 +317,11 @@ COPY web/ web/
 COPY ui-tui/ ui-tui/
 COPY apps/shared/ apps/shared/
 RUN cd web && npm run build && \
-    cd ../ui-tui && npm run build
+    cd ../ui-tui && npm run build && \
+    cd /opt/hermes && \
+    # Runtime stage needs the CLI for `install-deps`. Tag npm install
+    # may only nest playwright under a workspace; pin it at the root.
+    npm install --omit=dev --no-audit --no-fund --no-save playwright@1.62.1
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
