@@ -40,7 +40,6 @@ from hermes_cli.profiles import (
     _get_profiles_root,
     _get_default_hermes_home,
     seed_profile_skills,
-    has_bundled_skills_opt_out,
     NO_BUNDLED_SKILLS_MARKER,
     backfill_profile_envs,
     profiles_to_serve,
@@ -182,6 +181,7 @@ class TestCreateProfile:
         (default_home / "config.yaml").write_text("model: test")
         (default_home / ".env").write_text("KEY=val")
         (default_home / "SOUL.md").write_text("Be helpful.")
+        (default_home / "ARCHITECTURE.md").write_text("Private topology.")
 
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
@@ -190,6 +190,22 @@ class TestCreateProfile:
         assert cloned_config["model"] == "test"
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
+        assert (profile_dir / "ARCHITECTURE.md").read_text() == "Private topology."
+
+    def test_clone_all_does_not_copy_cron_jobs(self, profile_env):
+        # Cron jobs are scheduled work bound to the source profile + origin channel; a clone
+        # that inherits jobs.json fires every job twice (two gateways, same job ids).
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("model: test")
+        (default_home / "cron").mkdir()
+        (default_home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{"id": "abc123def456"}]}))
+        (default_home / "cron" / "output").mkdir()
+
+        profile_dir = create_profile("coder", clone_all=True, no_alias=True)
+
+        assert (profile_dir / "cron").is_dir()
+        assert not any((profile_dir / "cron").iterdir())
+        assert yaml.safe_load((profile_dir / "config.yaml").read_text())["model"] == "test"
 
 
 
@@ -210,9 +226,6 @@ class TestNoSkillsOptOut:
         assert marker.is_file(), "expected .no-bundled-skills marker in profile root"
         assert "--no-skills" in marker.read_text()
 
-        # has_bundled_skills_opt_out() agrees
-        assert has_bundled_skills_opt_out(profile_dir) is True
-
         # skills/ dir exists (profile bootstrapping still creates the dir) but
         # contains nothing yet because create_profile itself doesn't seed.
         assert (profile_dir / "skills").is_dir()
@@ -231,7 +244,7 @@ class TestNoSkillsOptOut:
         import subprocess as _sp
 
         profile_dir = create_profile("orchestrator", no_alias=True, no_skills=True)
-        assert has_bundled_skills_opt_out(profile_dir) is True
+        assert (profile_dir / NO_BUNDLED_SKILLS_MARKER).is_file()
 
         # Marker present: the subprocess still runs (essential-only seeding
         # happens inside sync_skills) and its skipped_opt_out flag surfaces.
@@ -254,7 +267,6 @@ class TestNoSkillsOptOut:
 
         # Delete marker → next call is a normal full sync.
         (profile_dir / NO_BUNDLED_SKILLS_MARKER).unlink()
-        assert has_bundled_skills_opt_out(profile_dir) is False
         r2 = seed_profile_skills(profile_dir, quiet=True)
         assert r2 == {"copied": []}
         assert len(called) == 2
@@ -783,6 +795,7 @@ class TestExportImport:
         (default_dir / "config.yaml").write_text("model: test")
         (default_dir / ".env").write_text("KEY=val")
         (default_dir / "SOUL.md").write_text("Be nice.")
+        (default_dir / "ARCHITECTURE.md").write_text("Private topology.")
         mem_dir = default_dir / "memories"
         mem_dir.mkdir(exist_ok=True)
         (mem_dir / "MEMORY.md").write_text("remember this")
@@ -797,6 +810,7 @@ class TestExportImport:
         assert "default/config.yaml" in names
         assert "default/.env" not in names  # credentials excluded
         assert "default/SOUL.md" in names
+        assert "default/ARCHITECTURE.md" in names
         assert "default/memories/MEMORY.md" in names
 
 

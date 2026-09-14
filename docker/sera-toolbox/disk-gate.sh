@@ -30,7 +30,7 @@ EOF
 }
 
 need_backup_kb() {
-    echo $(($1 / 1024 * 3))
+    echo $(($1 * 3 / 1024))
 }
 
 disk_gate_check() {

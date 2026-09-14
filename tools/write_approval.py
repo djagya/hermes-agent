@@ -805,8 +805,10 @@ def current_origin() -> str:
         return "foreground"
 
 
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 def is_background() -> bool:
     return current_origin() == "background_review"
+# ---- END PLUGIN-COMPAT ----
 
 
 # ---------------------------------------------------------------------------
@@ -1010,6 +1012,16 @@ def _frontmatter_description(content: str) -> str:
         return ""
     desc = m.group(1).strip().strip("'\"")
     return desc[:140]
+
+
+def _find_skill_path(name: str) -> Optional[Path]:
+    """Directory of an installed skill, or None if unknown / lookup unavailable."""
+    try:
+        from tools.skill_manager_tool import _find_skill
+    except Exception:
+        return None
+    found = _find_skill(name)
+    return found["path"] if found else None
 
 
 def skill_pending_diff(record: Dict[str, Any]) -> str:

@@ -62,9 +62,6 @@ def test_save_config_keeps_user_override_of_managed_leaf(homes):
     assert read_raw_config().get("model", {}).get("default") == "user/saved"
 
 
-# ── env write guards ─────────────────────────────────────────────────────────
-
-
 @pytest.fixture
 def env_homes(tmp_path, monkeypatch):
     home = tmp_path / "home"

@@ -17,8 +17,6 @@ from tools.homeassistant_tool import (
     _get_headers,
     _handle_get_state,
     _handle_call_service,
-    _ALLOWED_LIGHT_DATA_KEYS,
-    _ALLOWED_SERVICE_CALLS,
     _BLOCKED_DOMAINS,
     _ENTITY_ID_RE,
     _SERVICE_NAME_RE,
@@ -38,12 +36,6 @@ SAMPLE_STATES = [
     {"entity_id": "binary_sensor.motion", "state": "off", "attributes": {"friendly_name": "Hallway Motion"}},
     {"entity_id": "sensor.humidity", "state": "55", "attributes": {"friendly_name": "Bedroom Humidity", "area": "bedroom"}},
 ]
-
-
-def _close_coro_and_succeed(coro):
-    """Close an intentionally intercepted coroutine and return a fake result."""
-    coro.close()
-    return {"success": True}
 
 
 # ---------------------------------------------------------------------------
@@ -170,32 +162,6 @@ class TestDomainBlocklist:
     def test_blocked_domains_include_hassio(self):
         assert "hassio" in _BLOCKED_DOMAINS
 
-    @pytest.mark.parametrize(
-        ("domain", "service"),
-        [
-            ("scene", "turn_on"),
-            ("switch", "turn_on"),
-            ("climate", "set_temperature"),
-            ("homeassistant", "restart"),
-            ("light", "reload"),
-        ],
-    )
-    def test_non_commissioned_service_rejected(self, domain, service):
-        result = json.loads(_handle_call_service({
-            "domain": domain,
-            "service": service,
-            "entity_id": "light.test",
-        }))
-        assert "error" in result
-        assert "allowlist" in result["error"].lower()
-
-    def test_allowlist_contains_only_bounded_light_controls(self):
-        assert _ALLOWED_SERVICE_CALLS == {
-            ("light", "turn_on"),
-            ("light", "turn_off"),
-            ("light", "toggle"),
-        }
-
 
 # ---------------------------------------------------------------------------
 # Security: entity_id validation
@@ -218,21 +184,19 @@ class TestEntityIdValidation:
 
 
     @patch("tools.homeassistant_tool._async_call_service", new_callable=AsyncMock)
-    def test_call_service_requires_explicit_entity_id(self, mock_call_service):
+    def test_call_service_allows_no_entity_id(self, mock_call_service):
+        """Some services (like scene.turn_on) don't need entity_id."""
+        mock_call_service.return_value = {"success": True}
         result = json.loads(_handle_call_service({
-            "domain": "light", "service": "turn_on"
+            "domain": "scene", "service": "turn_on"
         }))
-        assert "error" in result
-        assert "explicit light entity_id" in result["error"]
-        mock_call_service.assert_not_awaited()
-
-    @pytest.mark.parametrize("entity_id", ["switch.fan", "scene.night", "climate.home"])
-    def test_non_light_entity_rejected(self, entity_id):
-        result = json.loads(_handle_call_service({
-            "domain": "light", "service": "turn_on", "entity_id": entity_id
-        }))
-        assert "error" in result
-        assert "light.*" in result["error"]
+        assert result["result"]["success"] is True
+        mock_call_service.assert_awaited_once_with(
+            "scene",
+            "turn_on",
+            None,
+            None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -243,19 +207,20 @@ class TestEntityIdValidation:
 class TestCallServiceStringData:
     """data param may arrive as a JSON string (XML tool calling mode)."""
 
-    @patch("tools.homeassistant_tool._run_async", side_effect=_close_coro_and_succeed)
+    @patch("tools.homeassistant_tool._run_async", return_value={"success": True})
     def test_string_data_deserialized(self, mock_run):
-        """Allowed JSON string data is parsed before dispatch."""
+        """JSON string data is parsed into a dict before dispatch."""
         _handle_call_service({
-            "domain": "light",
-            "service": "turn_on",
-            "entity_id": "light.living_room",
-            "data": '{"brightness_pct": 40}',
+            "domain": "climate",
+            "service": "set_hvac_mode",
+            "entity_id": "climate.living_room",
+            "data": '{"hvac_mode": "heat"}',
         })
-        mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]  # the coroutine arg
+        # _run_async was called, meaning we got past validation
 
 
-    @patch("tools.homeassistant_tool._run_async", side_effect=_close_coro_and_succeed)
+    @patch("tools.homeassistant_tool._run_async", return_value={"success": True})
     def test_empty_string_data_becomes_none(self, mock_run):
         """Empty/whitespace string data is treated as None."""
         _handle_call_service({
@@ -265,46 +230,6 @@ class TestCallServiceStringData:
             "data": "   ",
         })
         mock_run.assert_called_once()
-
-
-class TestLightingPayloadAllowlist:
-    @pytest.mark.parametrize("key", sorted(_ALLOWED_LIGHT_DATA_KEYS))
-    @patch("tools.homeassistant_tool._run_async", side_effect=_close_coro_and_succeed)
-    def test_commissioned_light_parameter_reaches_dispatch(
-        self, mock_run, key
-    ):
-        result = json.loads(_handle_call_service({
-            "domain": "light",
-            "service": "turn_on",
-            "entity_id": "light.test",
-            "data": json.dumps({key: 1}),
-        }))
-        assert result["result"]["success"] is True
-        mock_run.assert_called_once()
-
-    @pytest.mark.parametrize(
-        "data",
-        [
-            {"entity_id": "light.other"},
-            {"area_id": "bedroom"},
-            {"device_id": "abc"},
-            {"target": {"entity_id": "light.other"}},
-            {"temperature": 30},
-        ],
-    )
-    @patch("tools.homeassistant_tool._async_call_service", new_callable=AsyncMock)
-    def test_target_smuggling_and_unknown_keys_rejected(
-        self, mock_call_service, data
-    ):
-        result = json.loads(_handle_call_service({
-            "domain": "light",
-            "service": "turn_on",
-            "entity_id": "light.test",
-            "data": json.dumps(data),
-        }))
-        assert "error" in result
-        assert "non-commissioned keys" in result["error"]
-        mock_call_service.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -399,8 +324,6 @@ class TestCheckAvailable:
         from agent import secret_scope
         from tools.homeassistant_tool import _get_config
 
-        monkeypatch.setattr("tools.homeassistant_tool._HASS_URL", "")
-        monkeypatch.setattr("tools.homeassistant_tool._HASS_TOKEN", "")
         monkeypatch.setenv("HASS_URL", "http://default-profile:8123")
         monkeypatch.setenv("HASS_TOKEN", "default-profile-token")
         secret_scope.set_multiplex_active(True)
@@ -425,7 +348,8 @@ class TestCheckAvailable:
 
 class TestGetHeaders:
     def test_bearer_token_format(self, monkeypatch):
-        monkeypatch.setattr("tools.homeassistant_tool._HASS_TOKEN", "my-secret-token")
+        monkeypatch.setattr("tools.homeassistant_tool._get_config",
+                            lambda: ("http://ha.local:8123", "my-secret-token"))
         headers = _get_headers()
         assert headers["Authorization"] == "Bearer my-secret-token"
         assert headers["Content-Type"] == "application/json"

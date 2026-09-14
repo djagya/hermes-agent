@@ -14,6 +14,8 @@ from gateway.config import Platform
 from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
 
 
 class SoftFailAdapter:
@@ -73,12 +75,12 @@ def _make_runner(adapters):
 
 
 def _create_completed_subscription(platform, chat_id, session_id=None):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn, title="notify once", assignee="worker", session_id=session_id,
         )
-        kb.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
+        kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
         kb.complete_task(conn, tid, summary="done once")
         return tid
     finally:
@@ -86,9 +88,9 @@ def _create_completed_subscription(platform, chat_id, session_id=None):
 
 
 def _unseen_terminal_events(tid, platform, chat_id):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
-        _, events = kb.unseen_events_for_sub(
+        _, events = kbn.unseen_events_for_sub(
             conn,
             task_id=tid,
             platform=platform,
@@ -136,6 +138,13 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
     assert "done once" in wake_text, "creator wake must carry the worker handoff"
     assert "not a request to decompose" in wake_text.lower()
     assert "do not recreate" in wake_text.lower()
+    assert "not authoritative current state" in wake_text.lower()
+    assert "authoritative current state once" in wake_text.lower()
+    assert "do not poll or rerun unchanged checks" in wake_text.lower()
+    assert "newer transition supersedes this event" in wake_text.lower()
+    assert "root-owned next action" in wake_text.lower()
+    assert "exact unchanged candidate" in wake_text.lower()
+    assert "make no mutation, comment, or follow-up task and stop" in wake_text.lower()
     # The wake self-post IS the delivery on this path (no separate text-ping
     # fallback is attempted for stateless api_server subs) — cursor advances
     # once the wake succeeds.
@@ -147,7 +156,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
 ):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-multi.db"))
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn,
@@ -156,7 +165,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
             session_id="worker-session",
         )
         for chat_id in ("origin-a", "origin-b"):
-            kb.add_notify_sub(
+            kbn.add_notify_sub(
                 conn,
                 task_id=tid,
                 platform="api_server",

@@ -192,10 +192,7 @@ kanban_request_review(
 )
 
 # --- Reviewer: approve ---
-kanban_complete(
-    summary="review passed; acceptance criteria verified",
-    metadata={"verdict": "PASS"},
-)
+kanban_complete(summary="review passed; acceptance criteria verified")
 # → done
 ```
 

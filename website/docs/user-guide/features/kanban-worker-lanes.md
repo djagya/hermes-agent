@@ -46,12 +46,34 @@ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <ass
 
 For non-Hermes lanes (registered via a plugin), the plugin supplies its own `spawn_fn` callable that gets `task`, `workspace`, and `board` and returns an optional pid for crash detection.
 
+### Descendant process scope
+
+A task assignment belongs to the dispatcher worker, not to every program it starts.
+Hermes subprocess helpers carry a non-owner fence into shells, execution kernels,
+cron deliveries, hooks, language servers, and ordinary stdio MCP servers. Later
+children remain fenced even when a script removes the inherited task ID: CLI and
+tool mutations are rejected, rather than treating that script as an orchestrator.
+Board/database routing and workspace paths are retained. Descendants can read an
+existing board without running schema migrations; its owner must initialize it.
+
+The dispatcher explicitly grants a newly assigned worker its own scope. The managed
+Hermes-tools MCP endpoint can likewise act for its supervising worker, while the
+executor's ordinary shell children remain fenced. Workers may only perform lifecycle
+handoffs and attach files to their assigned task; `unblock` remains orchestrator-only.
+Cross-task comments and follow-up task creation retain their existing behavior.
+
+Integration authors spawning code should use
+`agent.delegation_context.delegated_child_subprocess_env` at the actual spawn, after
+merging environment overrides. It preserves the caller's credential/profile policy.
+This is cooperative runtime scoping, **not OS confinement**: it does not prevent
+arbitrary code from deliberately erasing lineage metadata or opening SQLite directly.
+
 ### 3. A lifecycle terminator
 
 Every claim must end in exactly one of:
 
 - `kanban_complete(summary=..., metadata=...)` — task succeeds, status flips to `done`.
-- `kanban_request_review(summary=..., metadata=..., reviewer=...)` — same-card implementation is complete and enters first-class review; status flips to `review`. The dispatcher loads the bundled `sdlc-review` skill unless `kanban.review_dispatch` is disabled. A reviewer approves with `kanban_complete(metadata={"verdict": "PASS"}, ...)`, returns actionable rework with `kanban_request_changes`, or escalates a genuine external blocker with `kanban_block`.
+- `kanban_request_review(summary=..., metadata=..., reviewer=...)` — same-card implementation is complete and enters first-class review; status flips to `review`. The dispatcher loads the bundled `sdlc-review` skill unless `kanban.review_dispatch` is disabled. A reviewer approves with `kanban_complete`, returns actionable rework with `kanban_request_changes`, or escalates a genuine external blocker with `kanban_block`.
 - `kanban_block(reason=...)` — task waits for human input, status flips to `blocked`. The dispatcher respawns when `kanban_unblock` runs.
 - The worker process exits without a tool call. The kernel reaps it and emits `crashed` (PID died) or `gave_up` (consecutive-failure breaker tripped) or `timed_out` (max_runtime exceeded). This is the failure path; healthy workers don't end here.
 
@@ -61,7 +83,7 @@ The kanban kernel enforces that exactly one of these terminates each run. A work
 
 For code-changing tasks, pick the review model encoded by the task graph:
 
-- **Same-card review:** call `kanban_request_review(summary=..., metadata=..., reviewer=...)`. The task enters `review` without touching block recurrence accounting. The dispatcher claims it with the bundled `sdlc-review` skill by default. The reviewer approves with exact `metadata.verdict: PASS` through `kanban_complete`, calls `kanban_request_changes(reason=...)` to close the review run and route the task back to its original implementer, or blocks only for a genuine external escalation. Missing and non-PASS review verdicts are rejected by the kernel without promoting dependent work.
+- **Same-card review:** call `kanban_request_review(summary=..., metadata=..., reviewer=...)`. The task enters `review` without touching block recurrence accounting. The dispatcher claims it with the bundled `sdlc-review` skill by default. The reviewer approves with `kanban_complete`, calls `kanban_request_changes(reason=...)` to close the review run and route the task back to its original implementer, or blocks only for a genuine external escalation.
 - **Pre-created downstream review/QA/release card:** `kanban_show` lists child IDs; inspect those cards with `kanban_show(task_id=...)` before choosing the terminal action. When a child is the downstream review/QA/release phase, call `kanban_complete` on the implementation phase. It cannot promote until this parent is `done`/`archived`. Do not additionally request same-card review and never sticky-block the parent with `review-required:` — either choice strands or duplicates the downstream lane.
 - **Human-only boards:** set `kanban.review_dispatch: false`. A task can then remain in `review` until a human approves it or uses `reopen-review`/the dashboard to return it to `ready`/`todo`.
 

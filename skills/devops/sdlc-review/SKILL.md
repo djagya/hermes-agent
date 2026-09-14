@@ -1,7 +1,7 @@
 ---
 name: sdlc-review
 description: Review Kanban handoffs and route verified outcomes.
-version: 1.1.1
+version: 1.1.0
 author: Jakub Wolniewicz (@frizikk) + Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -48,7 +48,7 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 
 | Verdict | When | Final action |
 |---|---|---|
-| Approve | Acceptance criteria and verification pass | `kanban_complete` with `metadata={"verdict": "PASS"}` |
+| Approve | Acceptance criteria and verification pass | `kanban_complete` |
 | Request changes | Correctable implementation defects remain | `kanban_comment`, then `kanban_request_changes` |
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
 
@@ -113,14 +113,11 @@ Approve only when the acceptance criteria are satisfied and the evidence is suff
 ```text
 kanban_complete(
     summary="Reviewed and approved. <what was verified>",
-    metadata={"verdict": "PASS", "reviewer_checks": [...]}
+    metadata={"review_outcome": "approved", "reviewer_checks": [...]}
 )
 ```
 
 Include the exact checks that passed and any bounded caveat that does not block acceptance.
-`verdict` is kernel-enforced: only normalized exact `PASS` completes review
-and promotes dependent work. Do not encode conditional approval as a verdict;
-correctable conditions belong in `kanban_request_changes`.
 
 #### Request changes
 

@@ -63,5 +63,3 @@ def test_overlay_user_raw_keeps_schema_defaults_from_shadowing_seed(managed):
     )
     assert out["display"]["skin"] == "charizard"
     assert out["display"]["show_reasoning"] is True
-
-

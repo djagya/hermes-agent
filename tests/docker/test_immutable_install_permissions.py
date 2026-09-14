@@ -7,7 +7,7 @@ import textwrap
 
 def test_container_sets_hosted_write_policy_env(built_image: str) -> None:
     # Image default must include vault + tmp; compose pins the same
-    # value. A /opt/data-only root denies vault file tools (plan 5c).
+    # value. A /opt/data-only root denies vault file tools.
     script = (
         'printf "HERMES_HOME=%s\\n" "$HERMES_HOME"; '
         'printf "HERMES_WRITE_SAFE_ROOT=%s\\n" "$HERMES_WRITE_SAFE_ROOT"; '

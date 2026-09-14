@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# shellcheck disable=SC1071
 """Lean safety guard for Himalaya v2.
 
 Public command policy:

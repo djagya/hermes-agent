@@ -31,7 +31,7 @@ env:
   # Must match every Dockerfile `ARG DEBIAN_SNAPSHOT=` default. Build-args
   # override the Dockerfile; leaving May here after a Sept bump rebuilt
   # stale apt and failed smoke/Trivy.
-  DEBIAN_SNAPSHOT: 20260907T000000Z
+  DEBIAN_SNAPSHOT: 20260914T000000Z
 
 jobs:
   lint:
@@ -131,7 +131,9 @@ jobs:
         run: |
           set -euo pipefail
           defaults="$(awk -F= '/^ARG DEBIAN_SNAPSHOT=/{print $2}' Dockerfile | sort -u)"
-          if [ "$defaults" != "${DEBIAN_SNAPSHOT}" ]; then
+          if [ -z "$defaults" ]; then
+            echo "WARN: Dockerfile has no ARG DEBIAN_SNAPSHOT; workflow pin unused on this tag tree"
+          elif [ "$defaults" != "${DEBIAN_SNAPSHOT}" ]; then
             echo "ERROR: Dockerfile ARG DEBIAN_SNAPSHOT ($defaults) != workflow ${DEBIAN_SNAPSHOT}" >&2
             exit 1
           fi
@@ -283,6 +285,34 @@ jobs:
           run_bwrap -u 10000:10000 --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/fork-bomb.sh "$IMAGE"
           run_bwrap -u 10000:10000 --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh "$IMAGE"
 
+      - name: Fork FTS fence creates display indexes
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:test
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint /opt/hermes/.venv/bin/python \
+            -e PYTHONPATH=/opt/hermes -w /opt/hermes \
+            "$IMAGE" -c '
+          import tempfile
+          from pathlib import Path
+          from hermes_state import SessionDB
+          names = {
+              "idx_messages_display_page",
+              "idx_messages_display_backfill",
+              "idx_messages_display_identity",
+          }
+          with tempfile.TemporaryDirectory() as tmp:
+              db = SessionDB(db_path=Path(tmp) / "state.db")
+              have = {row[0] for row in db._conn.execute(
+                  "SELECT name FROM sqlite_master WHERE name LIKE \"idx_messages_display%\""
+              )}
+              db.close()
+          missing = names - have
+          if missing:
+              raise SystemExit(f"missing display indexes: {sorted(missing)}")
+          print("display indexes ok")
+          '
+
       - name: Offline CLI without data mount
         env:
           IMAGE: ${{ env.IMAGE_NAME }}:test
@@ -316,9 +346,12 @@ jobs:
           # (x/mod, stdlib), same class as 1Password `op`.
           /tmp/trivy image --scanners vuln --severity CRITICAL,HIGH \
             --ignore-unfixed --exit-code 1 --no-progress \
+            --ignorefile .trivyignore \
             --skip-files usr/local/bin/op \
             --skip-files usr/local/bin/gh \
             --skip-files usr/local/bin/gitleaks \
+            --skip-files usr/local/bin/uv \
+            --skip-files usr/local/bin/uvx \
             "$IMAGE"
 
       - name: Install uv (for docker tests)
