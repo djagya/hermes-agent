@@ -15,16 +15,31 @@ name: Fork Release Image (GHCR)
 on:
   push:
     branches: ['release/**']
+    # Proven from Dockerfile COPY + .dockerignore: these trees never enter
+    # the image, and fork-release jobs do not test them. workflow_dispatch
+    # still rebuilds on demand.
+    paths-ignore:
+      - 'website/**'
+      - 'docs/**'
+      - 'nix/**'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'packaging/**'
+      - 'plans/**'
+      - '.plans/**'
+      - 'assets/**'
+      - 'infographic/**'
+      - '**/*.md'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Never cancel an in-flight release build: every release-branch push gets its
-# own image so the digest trail stays complete.
+# Newest candidate on a release branch wins. A superseded in-flight bake
+# cannot publish a stale digest after a later push already started.
 concurrency:
   group: fork-image-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   IMAGE_NAME: ghcr.io/djagya/hermes-agent
@@ -160,7 +175,6 @@ jobs:
             DEBIAN_SNAPSHOT=${{ env.DEBIAN_SNAPSHOT }}
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
           cache-from: type=gha,scope=fork-amd64
-          cache-to: type=gha,mode=max,scope=fork-amd64
 
       - name: Record image size budget
         env:
@@ -192,6 +206,7 @@ jobs:
           path: |
             hermes-agent.spdx.json
             hermes-agent.cdx.json
+          retention-days: 7
 
       - name: Assert image SHA labels and provenance
         env:

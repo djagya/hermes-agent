@@ -33,6 +33,7 @@ jobs:
   # flake inputs. On push the classifier fails open and every lane is true.
   detect:
     name: Detect affected areas
+    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -49,11 +50,12 @@ jobs:
   flake-check:
     name: nix flake check
     needs: [detect]
-    if: needs.detect.outputs.nix == 'true'
+    if: github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.nix == 'true'
     # The build compiles the package and its whole dependency closure, so this
     # takes minutes and not seconds when the cache misses. `nix flake check`
     # builds 21 checks, and --max-jobs defaults to the core count. It uses the
-    # wider runner with no more configuration.
+    # wider runner with no more configuration. This job is upstream-only;
+    # the fork never starts it.
     runs-on: ubuntu-latest-32-core
     timeout-minutes: 60
     steps:
