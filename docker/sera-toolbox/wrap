@@ -192,14 +192,24 @@ esac
 # temporarily unavailable"). Cap only inside bwrap: --rlimit-nproc
 # plus the inner `ulimit -u` after uid map.
 nproc_lim="${SERA_SANDBOX_NPROC:-$nproc_default}"
-# Root wrap remaps to nobody (65534). Never world-chmod the caller's cwd
-# (that made /opt/vault 0777). Give nobody a dedicated out dir instead.
-# hermes-uid wrap can write its own cwd; skip chmod there.
+# Root wrap remaps to nobody (65534). World-chmod only disposable
+# scratch (/tmp). Never chmod the caller's live cwd (that made
+# /opt/vault 0777). hermes-uid wrap can write its own cwd; skip.
+_sera_scratch() {
+  case "$1" in
+    /tmp|/tmp/*|/var/tmp|/var/tmp/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 if [ "$(id -u)" -eq 0 ]; then
-  if [ "$(cd "$out_dir" && pwd -P)" = "$cwd" ]; then
+  out_abs="$(cd "$out_dir" && pwd -P)"
+  if [ "$out_abs" = "$cwd" ] && ! _sera_scratch "$cwd"; then
     out_dir="$(mktemp -d /tmp/sera-out.XXXXXX)"
+    out_abs="$(cd "$out_dir" && pwd -P)"
   fi
-  chmod a+rwx "$out_dir" 2>/dev/null || true
+  if _sera_scratch "$out_abs"; then
+    chmod a+rwx "$out_dir" 2>/dev/null || true
+  fi
   if [ -n "${lo_profile:-}" ]; then
     chmod -R a+rwx "$lo_profile" 2>/dev/null || true
   fi
