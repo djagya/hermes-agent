@@ -474,7 +474,8 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def apply_pending_record(subsystem: str, pending_id: str, callback):
+def apply_pending_record(subsystem: str, pending_id: str, callback,
+                         expected_payload_sha256: Optional[str] = None):
     """Durably claim, apply, and consume one live pending record.
 
     The subsystem lock is held only for state transitions, never while target
@@ -483,9 +484,23 @@ def apply_pending_record(subsystem: str, pending_id: str, callback):
     callback may then acquire the target's own lock without creating a reverse
     ``pending -> target`` lock order. We re-lock and verify the same claim before
     restoring or consuming it.
+
+    ``expected_payload_sha256`` binds the call to the exact reviewed payload:
+    inside the claim lock, before any state transition, the live record's
+    canonical payload digest must equal it, or nothing is claimed and the
+    record is left untouched. Callers that reviewed a record (the reconcile /
+    approval surfaces) must always pass it; a record swapped in under the same
+    id can then never be claimed under an earlier decision. ``None`` preserves
+    the legacy unbound behaviour.
     """
     if subsystem not in _SUBSYSTEMS or not _valid_pending_id(pending_id):
         return False, "invalid pending record identity"
+    if expected_payload_sha256 is not None and (
+        not isinstance(expected_payload_sha256, str)
+        or len(expected_payload_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_payload_sha256)
+    ):
+        return False, "invalid expected_payload_sha256: must be a 64-character hex digest"
 
     def _verify_live_claim(directory: Path) -> tuple[Path, Dict[str, Any]]:
         path = directory / f"{pending_id}.json"
@@ -526,6 +541,19 @@ def apply_pending_record(subsystem: str, pending_id: str, callback):
                 pending_id,
                 require_current_schema=True,
             )
+            # Reviewed-identity binding: compare the caller's reviewed digest
+            # with the live record inside the claim lock, before any state
+            # transition. A mismatch leaves the record untouched in pending
+            # state — neither claim nor consumption may proceed.
+            if (
+                expected_payload_sha256 is not None
+                and record.get("payload_sha256") != expected_payload_sha256
+            ):
+                return False, (
+                    "pending record payload does not match the reviewed digest "
+                    "(payload_sha256 mismatch); refusing to claim a substituted "
+                    "record under the earlier decision"
+                )
             if record.get("state", "pending") != "pending":
                 return False, (
                     "pending record is quarantined in applying state; reconcile "
@@ -611,9 +639,25 @@ def apply_pending_record(subsystem: str, pending_id: str, callback):
         return False, str(exc)
 
 
-def discard_pending(subsystem: str, pending_id: str) -> bool:
-    """Delete a pending record, but never discard an uncertain apply marker."""
+def discard_pending(subsystem: str, pending_id: str,
+                    expected_payload_sha256: Optional[str] = None) -> bool:
+    """Delete a pending record, but never discard an uncertain apply marker.
+
+    With ``expected_payload_sha256``, the exact live record's canonical payload
+    digest must match inside the lock or nothing is deleted — a record swapped
+    in under the same id survives an earlier rejection decision.
+    """
     if subsystem not in _SUBSYSTEMS or not _valid_pending_id(pending_id):
+        return False
+    if expected_payload_sha256 is not None and (
+        not isinstance(expected_payload_sha256, str)
+        or len(expected_payload_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_payload_sha256)
+    ):
+        logger.error(
+            "Refusing discard of pending %s/%s: invalid expected_payload_sha256",
+            subsystem, pending_id,
+        )
         return False
     try:
         with _pending_lock(subsystem) as d:
@@ -627,6 +671,15 @@ def discard_pending(subsystem: str, pending_id: str) -> bool:
                         "Refusing to discard quarantined pending record: %s/%s",
                         subsystem,
                         pending_id,
+                    )
+                    return False
+                if (
+                    expected_payload_sha256 is not None
+                    and record.get("payload_sha256") != expected_payload_sha256
+                ):
+                    logger.warning(
+                        "Refusing discard of pending %s/%s: payload_sha256 does "
+                        "not match the reviewed digest", subsystem, pending_id,
                     )
                     return False
                 path.unlink()

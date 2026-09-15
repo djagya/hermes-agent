@@ -7,9 +7,19 @@ import logging
 import posixpath
 import shutil
 import tempfile
+from contextlib import suppress
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger("tools.skill_manager_tool")
+
+# Declared shape of the atomic batch contract implemented here, read by
+# tools/skill_manager_batch reviewers (pending-skill-review reconciler): snapshot
+# -> ordered apply -> rollback on returned failure OR raised exception, with
+# snapshot evidence retained when rollback itself fails. This declares the
+# ordinary in-process guarantees only; abrupt process/power loss is a separate
+# recovery boundary and is NOT covered by this version.
+BATCH_ATOMIC_CONTRACT_VERSION = 2
 
 _BATCH_OP_ACTIONS = {"create", "patch", "write_file", "remove_file"}
 _BATCH_MAX_OPS = 20
@@ -150,13 +160,26 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
         shutil.rmtree(snap_root, ignore_errors=True)
         return tool_error(snap_err, success=False)
     # Single-op path with the gate bypassed (the batch already cleared/staged it).
+    # Atomicity contract: any op that returns a failure OR raises rolls back every
+    # already-applied op before returning. Rollback itself may fail; then the
+    # snapshot directory is deliberately kept as recovery evidence and the batch
+    # reports the failed skills. This is ordinary in-process exception atomicity —
+    # a crash or power loss mid-op is NOT covered by it.
     results = []
     rollback_failed = False
+    batch_error: Optional[BaseException] = None
     token = _smt._skill_gate_bypass.set(True)
     try:
         for i, op in enumerate(operations):
-            raw = _smt._skill_manage_from({**op, "name": names[i], "operations": None},
-                                          task_id=task_id, session_id=session_id)
+            try:
+                raw = _smt._skill_manage_from({**op, "name": names[i], "operations": None},
+                                              task_id=task_id, session_id=session_id)
+            except BaseException as exc:  # noqa: BLE001 — any raise aborts the batch
+                # Never let a rollback failure mask the original op exception.
+                with suppress(Exception):
+                    note, rollback_failed = _rollback(snapshots, _smt._find_skill)
+                batch_error = exc
+                break
             try:
                 parsed = json.loads(raw)
             except Exception:  # noqa: BLE001
@@ -178,6 +201,10 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
                             "file_path": op.get("file_path"), "success": True})
     finally:
         _smt._skill_gate_bypass.reset(token)
+        if batch_error is not None:
+            # Re-raise the op exception after the gate reset; the outer caller
+            # (e.g. the pending-apply callback) sees the real failure.
+            raise batch_error
         if rollback_failed:
             # Keep the snapshots so the operator can still recover by hand.
             logger.warning("skill_manage batch rollback failed, snapshots kept at %s", snap_root)
