@@ -95,7 +95,7 @@ def handle_pending_subcommand(
                         expected_payload_sha256=expected_payload_sha256)
 
     if sub in {"reject", "deny", "drop"}:
-        return _reject(subsystem, rest)
+        return _reject(subsystem, rest, expected_payload_sha256=expected_payload_sha256)
 
     if sub == "resolve":
         return _resolve_applying(subsystem, rest)
@@ -187,10 +187,12 @@ def _apply_one(subsystem: str, rec, memory_store):
         return False, str(e)
 
 
-def _reject(subsystem: str, rest: List[str]) -> str:
+def _reject(subsystem: str, rest: List[str], expected_payload_sha256: Optional[str] = None) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
         return err or f"Usage: /{subsystem} reject <id>"
+    if target.lower() == "all" and expected_payload_sha256 is not None:
+        return "expected_payload_sha256 cannot be combined with reject 'all'."
     if target.lower() == "all":
         n = 0
         quarantined = []
@@ -217,8 +219,8 @@ def _reject(subsystem: str, rest: List[str]) -> str:
         )
     # Exact-discard surface: with the reviewed digest bound, a record swapped
     # in under the same id is never consumed by an earlier rejection decision.
-    if wa.discard_pending(subsystem, target,
-                          expected_payload_sha256=rec.get("payload_sha256")):
+    expected = expected_payload_sha256 if expected_payload_sha256 is not None else rec.get("payload_sha256")
+    if wa.discard_pending(subsystem, target, expected_payload_sha256=expected):
         return f"Rejected pending {subsystem} write '{target}'."
     return (
         f"Pending {subsystem} write '{target}' changed on disk (payload_sha256 "

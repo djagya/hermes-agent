@@ -57,6 +57,12 @@ def _canonical_payload_sha256(payload):
     ).hexdigest()
 
 
+def _apply_memory(record, store):
+    from tools.memory_tool import apply_memory_pending
+    result = apply_memory_pending(record["payload"], store)
+    return bool(result.get("success")), result.get("error", "")
+
+
 def _stage_memory_add(store, content, target="user"):
     from tools import write_approval as wa
     from tools.memory_tool import _build_memory_write_guard
@@ -121,6 +127,7 @@ def test_batch_raised_exception_rolls_back_and_propagates(hermes_home, monkeypat
 
     monkeypatch.setattr(smt, "_patch_skill", boom)
 
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "skill_batch_*")))
     with pytest.raises(OSError, match="injected disk failure"):
         smt.skill_manage(
             action="", name="",
@@ -135,6 +142,7 @@ def test_batch_raised_exception_rolls_back_and_propagates(hermes_home, monkeypat
     # Op 1's mutation is rolled back, and the batch gate bypass is restored.
     assert "one" in _read(alpha) and "two" not in _read(alpha)
     assert smt._skill_gate_bypass.get() is False
+    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "skill_batch_*"))) == before
 
 
 def test_batch_rollback_failure_keeps_snapshot_evidence(hermes_home, monkeypatch):
@@ -211,7 +219,7 @@ def test_apply_claim_rejects_substituted_payload_before_claiming(hermes_home):
     record = _stage_memory_add(store, "reviewed entry")
 
     ok, msg = wa.apply_pending_record(
-        wa.MEMORY, record["id"], lambda current: (True, "applied"),
+        wa.MEMORY, record["id"], lambda current: _apply_memory(current, store),
         expected_payload_sha256="0" * 64,
     )
     assert ok is False
@@ -223,7 +231,7 @@ def test_apply_claim_rejects_substituted_payload_before_claiming(hermes_home):
 
     # The exact reviewed digest still applies and consumes the record.
     ok2, msg2 = wa.apply_pending_record(
-        wa.MEMORY, record["id"], lambda current: (True, "applied"),
+        wa.MEMORY, record["id"], lambda current: _apply_memory(current, store),
         expected_payload_sha256=record["payload_sha256"],
     )
     assert ok2 is True, msg2
@@ -240,7 +248,7 @@ def test_apply_claim_rejects_malformed_expected_digest(hermes_home):
     record = _stage_memory_add(store, "entry")
     for bad in ("short", "0x" + "0" * 62, "Z" * 64):
         ok, msg = wa.apply_pending_record(
-            wa.MEMORY, record["id"], lambda current: (True, "applied"),
+            wa.MEMORY, record["id"], lambda current: _apply_memory(current, store),
             expected_payload_sha256=bad,
         )
         assert ok is False
@@ -298,7 +306,7 @@ def test_same_id_substitution_is_never_claimed_under_reviewed_digest(hermes_home
         handle.write("\n")
 
     ok, msg = wa.apply_pending_record(
-        wa.MEMORY, pending_id, lambda current: (True, "applied"),
+        wa.MEMORY, pending_id, lambda current: _apply_memory(current, store),
         expected_payload_sha256=reviewed_digest,
     )
     assert ok is False
@@ -347,7 +355,7 @@ def test_legacy_callers_without_keyword_are_unchanged(hermes_home):
     store.load_from_disk()
     record = _stage_memory_add(store, "legacy apply")
     ok, msg = wa.apply_pending_record(
-        wa.MEMORY, record["id"], lambda current: (True, "applied"))
+        wa.MEMORY, record["id"], lambda current: _apply_memory(current, store))
     assert ok is True, msg
     assert store.user_entries == ["legacy apply"]
 
@@ -417,3 +425,29 @@ def test_handle_bound_approve_mismatch_reports_without_applying(hermes_home):
     live = wa.get_pending(wa.MEMORY, record["id"])
     assert live is not None and live.get("state", "pending") == "pending"
     wa.discard_pending(wa.MEMORY, record["id"])
+
+
+@pytest.mark.parametrize("verb", ["reject", "deny", "drop"])
+def test_bound_reject_cannot_consume_substituted_payload(hermes_home, verb):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+
+    store = MemoryStore()
+    store.load_from_disk()
+    record = _stage_memory_add(store, "reviewed")
+    out = handle_pending_subcommand(wa.MEMORY, [verb, record["id"]],
+                                   expected_payload_sha256="0" * 64)
+    assert "rejected nothing" in out
+    assert wa.get_pending(wa.MEMORY, record["id"]) is not None
+    out = handle_pending_subcommand(wa.MEMORY, [verb, record["id"]],
+                                   expected_payload_sha256=record["payload_sha256"])
+    assert "Rejected pending" in out
+    assert wa.get_pending(wa.MEMORY, record["id"]) is None
+
+
+def test_bound_reject_all_refused(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    assert "cannot be combined" in handle_pending_subcommand(
+        wa.MEMORY, ["reject", "all"], expected_payload_sha256="0" * 64)
