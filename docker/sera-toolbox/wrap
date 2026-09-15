@@ -192,9 +192,17 @@ esac
 # temporarily unavailable"). Cap only inside bwrap: --rlimit-nproc
 # plus the inner `ulimit -u` after uid map.
 nproc_lim="${SERA_SANDBOX_NPROC:-$nproc_default}"
-chmod a+rwx "$out_dir" 2>/dev/null || true
-if [ -n "${lo_profile:-}" ]; then
-  chmod -R a+rwx "$lo_profile" 2>/dev/null || true
+# Root wrap remaps to nobody (65534). Never world-chmod the caller's cwd
+# (that made /opt/vault 0777). Give nobody a dedicated out dir instead.
+# hermes-uid wrap can write its own cwd; skip chmod there.
+if [ "$(id -u)" -eq 0 ]; then
+  if [ "$(cd "$out_dir" && pwd -P)" = "$cwd" ]; then
+    out_dir="$(mktemp -d /tmp/sera-out.XXXXXX)"
+  fi
+  chmod a+rwx "$out_dir" 2>/dev/null || true
+  if [ -n "${lo_profile:-}" ]; then
+    chmod -R a+rwx "$lo_profile" 2>/dev/null || true
+  fi
 fi
 # Dedicated writable output bind. cwd is RO when it is not the out dir.
 # Never bind `/` (image WORKDIR) — system paths are already mounted.

@@ -292,6 +292,36 @@ def test_builtin_get_cdp_override_raw_hides_ambient_in_managed(monkeypatch):
     assert bt_cdp._get_cdp_override_raw() == ""
 
 
+def test_is_managed_browser_fails_closed_on_probe_error(monkeypatch):
+    import tools.browser_tool_cdp as bt_cdp
+
+    def boom():
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr("tools.browser_control_route.is_managed", boom)
+    monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
+    assert bt_cdp._is_managed_browser() is True
+    assert bt_cdp._get_cdp_override_raw() == ""
+
+
+def test_create_session_fails_closed_when_route_import_breaks(monkeypatch):
+    import importlib
+    import sys
+
+    import tools.browser_tool_session as session
+
+    monkeypatch.delenv("HERMES_BROWSER_CONTROL_URL", raising=False)
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+    real = sys.modules["tools.browser_control_route"]
+    sys.modules["tools.browser_control_route"] = None
+    try:
+        with pytest.raises(RuntimeError, match="refusing local/cloud fallback"):
+            session._create_session_for_key("task-nav", force_local=False)
+    finally:
+        sys.modules["tools.browser_control_route"] = real
+        importlib.reload(session)
+
+
 def test_builtin_session_refuses_cdp_url_override_in_managed(monkeypatch):
     import tools.browser_tool as browser_tool
     import tools.browser_tool_lifecycle as lifecycle

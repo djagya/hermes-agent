@@ -64,7 +64,7 @@ def _is_managed_browser() -> bool:
 
         return is_managed()
     except Exception:
-        return False
+        return True
 
 
 def _get_cdp_override_raw() -> str:
