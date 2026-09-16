@@ -30,9 +30,12 @@ import hermes_state_common
 from hermes_state import SessionDB
 from hermes_state_common import FTS_STALE_KEY, _FTS_TRIGGERS
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32", reason="POSIX flock child-process harness"
-)
+# Fork FTS fence: live rebuild/admission machinery is disabled on this fork; the fenced
+# contract is owned by tests/state/test_fts_fork_fence.py (module-level skip).
+pytestmark = [
+    pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock child-process harness"),
+    pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)"),
+]
 
 
 _HOLD_LOCK_SCRIPT = """

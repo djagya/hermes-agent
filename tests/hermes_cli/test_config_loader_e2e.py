@@ -70,9 +70,11 @@ def test_behavioral_read_gets_expansion_and_overlay_while_writeback_stays_raw(
 
     managed_dir = tmp_path / "managed"
     managed_dir.mkdir()
-    # Administrator pins reasoning_effort — must win over the user's "low".
+    # Managed seed: fills leaves the user omitted, never overrides a present
+    # user leaf (fork f5405d53f4). The seed below exercises the "user omitted
+    # the leaf on the RAW document the TUI backend reads" path.
     (managed_dir / "config.yaml").write_text(
-        "agent:\n  reasoning_effort: high\n", encoding="utf-8"
+        "gateway:\n  log_level: debug\n", encoding="utf-8"
     )
 
     code = textwrap.dedent(
@@ -94,6 +96,7 @@ def test_behavioral_read_gets_expansion_and_overlay_while_writeback_stays_raw(
         Path(os.environ["E2E_OUT_FILE"]).write_text(json.dumps({
             "behavioral_prompt": cfg.get("custom_prompt"),
             "behavioral_effort": (cfg.get("agent") or {}).get("reasoning_effort"),
+            "behavioral_seed": ((cfg.get("gateway") or {}).get("log_level")),
             "raw_prompt": raw.get("custom_prompt"),
             "raw_effort": (raw.get("agent") or {}).get("reasoning_effort"),
             "saved": saved,
@@ -110,9 +113,11 @@ def test_behavioral_read_gets_expansion_and_overlay_while_writeback_stays_raw(
         tmp_path,
     )
 
-    # 1. Behavioral read: ${VAR} expanded + managed overlay applied.
+    # 1. Behavioral read: ${VAR} expanded + managed seed fills omitted leaves;
+    #    the user's present leaf stays theirs (fork seed semantics, f5405d53f4).
     assert out["behavioral_prompt"] == "hello world"
-    assert out["behavioral_effort"] == "high"
+    assert out["behavioral_effort"] == "low"
+    assert out["behavioral_seed"] == "debug"
 
     # 2. Raw primitive: byte-faithful view of the user's file.
     assert out["raw_prompt"] == "hello ${E2E_PROMPT_SUFFIX}"

@@ -230,29 +230,36 @@ class TestSkillManageBatch(unittest.TestCase):
             blocked = False
             message = "staged for review"
 
-        staged = {}
-
-        def fake_stage_write(area, payload, summary=None, origin=None):
-            staged.update(payload=payload, summary=summary)
-            return {"id": "pend_1"}
-
         import tools.write_approval as wa
 
-        with _patch.object(wa, "evaluate_gate", return_value=_Decision()), \
-             _patch.object(wa, "stage_write", side_effect=fake_stage_write):
+        with _patch.object(wa, "evaluate_gate", return_value=_Decision()):
             r = self._call("probe", [
                 {"action": "create", "content": SK.format(n="probe")},
                 {"action": "write_file", "file_path": "references/a.md",
                  "file_content": "a"},
             ])
         self.assertTrue(r.get("staged"), r)
-        self.assertEqual(staged["payload"]["action"], "batch")
-        self.assertEqual(len(staged["payload"]["operations"]), 2)
-        self.assertIn("2 ops", staged["summary"])
-        # Replay applies the batch (gate bypassed inside).
-        out = json.loads(self.smt.apply_skill_pending(staged["payload"]))
-        self.assertTrue(out["success"], out)
-        self.assertEqual(out["operations_applied"], 2)
+        pending = wa.list_pending(wa.SKILLS)
+        self.assertEqual(len(pending), 1, pending)
+        record = pending[0]
+        self.assertEqual(record["payload"]["action"], "batch")
+        self.assertEqual(len(record["payload"]["operations"]), 2)
+        self.assertIn("2 ops", record["summary"])
+        self.assertEqual(
+            record["payload"].get("_write_guard", {}).get("target_kind"), "batch"
+        )
+
+        def apply_current(current):
+            result = json.loads(self.smt.apply_skill_pending(current["payload"]))
+            return bool(result.get("success")), result.get("error", "")
+
+        ok, message = wa.apply_pending_record(
+            wa.SKILLS, record["id"], apply_current
+        )
+        self.assertTrue(ok, message)
+        base = os.path.join(self.home, "skills", "probe")
+        self.assertTrue(os.path.exists(os.path.join(base, "SKILL.md")))
+        self.assertTrue(os.path.exists(os.path.join(base, "references", "a.md")))
 
 
 if __name__ == "__main__":

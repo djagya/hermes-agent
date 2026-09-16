@@ -23,10 +23,20 @@ def _install_telegram_mock(monkeypatch: pytest.MonkeyPatch, bot_factory: MagicMo
     parse_mode = SimpleNamespace(MARKDOWN_V2="MarkdownV2", HTML="HTML")
     constants_mod = SimpleNamespace(ParseMode=parse_mode)
     _MessageEntity = lambda **_kw: SimpleNamespace(**_kw)
+
+    class _InputMediaPhoto:
+        def __init__(self, media=None, **_kw):
+            self.media = media
+
     telegram_mod = SimpleNamespace(
         Bot=bot_factory,
         MessageEntity=_MessageEntity,
         constants=constants_mod,
+        # The >=2 image album path imports these from the telegram module.
+        InputFile=lambda file_obj, filename=None, attach=False: SimpleNamespace(
+            file=file_obj, filename=filename
+        ),
+        InputMediaPhoto=_InputMediaPhoto,
     )
     monkeypatch.setitem(sys.modules, "telegram", telegram_mod)
     monkeypatch.setitem(sys.modules, "telegram.constants", constants_mod)
@@ -38,6 +48,12 @@ def _make_bot() -> MagicMock:
     bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=2))
     bot.send_video = AsyncMock(return_value=SimpleNamespace(message_id=3))
     bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=4))
+    bot.send_media_group = AsyncMock(
+        return_value=[
+            SimpleNamespace(message_id=5, media_group_id="g1"),
+            SimpleNamespace(message_id=6, media_group_id="g1"),
+        ]
+    )
     return bot
 
 
@@ -99,9 +115,12 @@ def test_multi_file_keeps_separate_text(monkeypatch: pytest.MonkeyPatch) -> None
         assert res["success"] is True
         # Ambiguous caption→file association: text stays a separate message.
         bot.send_message.assert_awaited()
-        assert bot.send_photo.await_count == 2
-        for call in bot.send_photo.await_args_list:
-            assert not call.kwargs.get("caption")
+        # Two captionable images route through the album path (one media group),
+        # not individual send_photo calls.
+        bot.send_media_group.assert_awaited_once()
+        media_arg = bot.send_media_group.await_args.kwargs.get("media")
+        assert media_arg is not None and len(media_arg) == 2
+        bot.send_photo.assert_not_awaited()
     finally:
         os.unlink(img)
         os.unlink(img2)
