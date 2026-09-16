@@ -1715,6 +1715,43 @@ class GatewayTurnMixin:
         # trigger a rebuild next turn (destroying prompt caching).
         await self._refresh_agent_cache_message_count(session_key, sid)
 
+    @staticmethod
+    def _hmwa_final_assistant_row_id(agent_result: Dict[str, Any], agent_messages: List[Dict[str, Any]],
+                                     history: List[Dict[str, Any]]) -> Optional[int]:
+        """The durable row id of THIS turn's final assistant message, from the persist
+        marker the SessionDB flush stamped on the live dict. Only an exact persisted
+        identity counts: a caller that cannot prove which row is the final answer gets
+        ``None`` and the turn simply carries no delivery receipt — never a guess by
+        content, timestamp, or "latest assistant row"."""
+        if agent_result.get("agent_persisted") is False:
+            return None  # not persisted through the marked flush path; no durable row id
+        history_len = agent_result.get("history_offset", len(history))
+        new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
+        candidates = new_messages or agent_messages
+        for msg in reversed(candidates):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            row_id = msg.get("_row_id")
+            if isinstance(row_id, int) and row_id > 0:
+                return row_id
+        return None
+
+    def _hmwa_stamp_delivery_target(self, event, source, session_entry,
+                                    agent_result, agent_messages) -> None:
+        """Give the outbound final send its correlation target: the session id and the
+        durable assistant row id this turn just persisted, read via the persist marker
+        (never re-matched later). Telegram adapters additionally cache the public chat
+        handle when one is known so private coordinates never have to be guessed."""
+        try:
+            row_id = self._hmwa_final_assistant_row_id(agent_result, agent_messages,
+                                                       agent_result.get("messages") or [])
+            if row_id is None:
+                return
+            event._delivery_session_id = session_entry.session_id
+            event._delivery_row_id = row_id
+        except Exception:
+            logger.debug("delivery target stamp failed", exc_info=True)
+
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
@@ -2037,6 +2074,7 @@ class GatewayTurnMixin:
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
             )
+            self._hmwa_stamp_delivery_target(event, source, session_entry, agent_result, agent_messages)
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,

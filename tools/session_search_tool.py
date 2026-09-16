@@ -155,6 +155,14 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None,
     entry.update({k: m.get(k) for k in ("tool_name", "tool_calls", "tool_call_id") if m.get(k)})
     if anchor_id is not None and m.get("id") == anchor_id:
         entry["anchor"] = True
+    # Direct platform link from a stored delivery receipt (assistant rows, confirmed
+    # sends only). Legacy rows and receipts without enough truth render no link.
+    delivery = m.get("platform_delivery")
+    if delivery:
+        from gateway.platforms.telegram_link import telegram_message_link
+        link = _quiet(telegram_message_link, None, "telegram link render failed", delivery)
+        if link:
+            entry["platform_url"] = link
     if max_content_len and content and len(content) > max_content_len:
         entry.update(content=content[:max_content_len] + "…", content_truncated=True,
                      original_content_chars=len(content))
