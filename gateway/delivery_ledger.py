@@ -260,6 +260,25 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def record_delivery_receipt(db, *, session_id: str, row_id: int,
+                            receipt: Dict[str, Any]) -> int:
+    """Persist a confirmed delivery receipt onto the exact assistant row (best-effort).
+
+    Called ONLY on a confirmed successful platform ACK (``SendResult.success`` with ids);
+    pending/attempting/failed rows must never produce a receipt, so the caller is the
+    same bracket that flips the ledger row to ``delivered``. Ledger failures never block
+    a send; this write is equally best-effort and re-raises nothing. Returns rows changed
+    (0 = refused, unknown row, or already recorded — write-once, see
+    ``SessionDB.set_message_delivery``)."""
+    try:
+        if not isinstance(receipt, dict) or not receipt.get("message_ids"):
+            return 0
+        return int(db.set_message_delivery(session_id, row_id, receipt) or 0)
+    except Exception:
+        logger.debug("delivery receipt write failed", exc_info=True)
+        return 0
+
+
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
     """Return an unsent runtime claim to ``failed`` without spending an attempt.
 

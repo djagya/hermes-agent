@@ -414,7 +414,12 @@ CREATE TABLE IF NOT EXISTS messages (
     display_kind TEXT,
     display_metadata TEXT,
     display_identity BLOB,
-    display_order INTEGER
+    display_order INTEGER,
+    -- Outbound delivery receipt (JSON) written ONLY after a confirmed platform ACK:
+    -- {platform, chat_id, thread_id, message_ids[], chat_kind, chat_handle, delivered_at}.
+    -- Written via SessionDB.set_message_delivery (row-addressed, idempotent); NULL on
+    -- legacy rows and every send without a confirmed receipt — never backfilled by guess.
+    platform_delivery TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
