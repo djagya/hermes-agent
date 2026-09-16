@@ -90,7 +90,11 @@ class _StalledSummaryWorker:
             fence.finish_commit()
 
 
-def _run(worker, *, chain, timeouts, messages, idle=0.05, ceiling=0.2):
+# Idle/ceiling budgets: deliberately generous. This fence test pins ORDERING
+# (stall -> retry with the pinned fallback route), not scheduler latency; on an
+# 8-worker loaded CI runner a 0.05/0.2s budget starved the runner thread and the
+# retry attempt never started within the ceiling.
+def _run(worker, *, chain, timeouts, messages, idle=0.5, ceiling=2.0):
     with _patch_chain(chain):
         return run_compress_context_with_progress_timeout(
             worker=worker,

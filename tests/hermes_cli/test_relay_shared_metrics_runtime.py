@@ -15,6 +15,9 @@ from typing import Any
 import pytest
 
 from hermes_cli import lifecycle, plugins
+# Import the DEFINING module: the hermes_cli.observability.relay_runtime path is a
+# PLUGIN-COMPAT star-import stub whose names are copies — monkeypatching them would
+# never reach agent.relay_runtime, which is what production reads.
 from agent import relay_runtime
 from hermes_cli.observability import relay_shared_metrics
 from hermes_cli.plugins import PluginManager
@@ -24,12 +27,6 @@ class _Request:
     def __init__(self, headers: dict[str, Any], content: dict[str, Any]) -> None:
         self.headers = headers
         self.content = content
-
-
-class _ToolExecutionResult:
-    def __init__(self, result: Any, annotation: Any = None) -> None:
-        self.result = result
-        self.annotation = annotation
 
 
 class _Relay:
@@ -46,6 +43,19 @@ class _Relay:
             Agent="agent", Function="function", Tool="tool"
         )
         self.LLMRequest = _Request
+        # The real binding carries a plugin-configuration surface and the
+        # tool-call result type; Hermes' preflight reads relay.plugin.report()
+        # (None = no foreign plugin config) and the metrics subscriber builds
+        # relay.ToolExecutionResult(fields) on every tool close.
+        self.plugin = SimpleNamespace(report=lambda: None)
+
+        class _ToolExecutionResult(dict):
+            """Subscriptable stand-in: the real result type exposes tool-call
+            fields by key, and the metrics tests read them directly."""
+
+            def __init__(self, fields: dict[str, Any]) -> None:
+                super().__init__(fields)
+
         self.ToolExecutionResult = _ToolExecutionResult
         self.scope = SimpleNamespace(
             push=self._scope_push,
@@ -182,13 +192,11 @@ class _Relay:
     def _tool_call_end(
         self,
         handle: Any,
-        result: _ToolExecutionResult,
+        result: dict[str, Any],
         **kwargs: Any,
     ) -> None:
-        assert isinstance(result, _ToolExecutionResult)
-        payload = result.result
         start = self._tool_starts.pop(handle)
-        self.events.append(("tool.call_end", handle, payload, kwargs))
+        self.events.append(("tool.call_end", handle, result, kwargs))
         event = SimpleNamespace(
             kind="scope",
             category="tool",
@@ -200,7 +208,7 @@ class _Relay:
                 **kwargs["metadata"],
                 "otel.status_code": "OK",
             },
-            data=payload,
+            data=result,
         )
         for callback in list(self._callbacks.values()):
             callback(event)
@@ -745,8 +753,6 @@ def test_real_binding_correlates_plugin_approval_denial_to_tool_metric(
 ):
     from hermes_cli.observability.shared_metrics import SharedMetricsStore
     from tools import approval
-    import tools.approval_prompt as approval_prompt
-    import tools.approval_context as approval_context
 
     assert real_binding_runtime._native is not None
     base = {
@@ -767,12 +773,9 @@ def test_real_binding_correlates_plugin_approval_denial_to_tool_metric(
     monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
     monkeypatch.setattr(approval, "is_approved", lambda *args: False)
     monkeypatch.setattr(approval, "get_current_session_key", lambda: "session-key")
-    monkeypatch.setattr(approval_context, "get_current_session_key", lambda: "session-key")
     monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
     monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
-    monkeypatch.setattr(approval_context, "_is_gateway_approval_context", lambda: False)
     monkeypatch.setattr(approval, "prompt_dangerous_approval", lambda *args, **kwargs: "deny")
-    monkeypatch.setattr(approval_prompt, "prompt_dangerous_approval", lambda *args, **kwargs: "deny")
 
     lifecycle.invoke_hook("on_session_start", **base)
     lifecycle.invoke_hook("pre_llm_call", **base, messages=["sensitive-prompt"])
@@ -982,6 +985,8 @@ def test_core_runtime_is_fail_open_without_a_published_binding(monkeypatch, capl
         tool_name="terminal",
         args={"command": "true"},
     ) == {"command": "true"}
+    runtime = relay_runtime.get_runtime(create=False)
+    assert runtime is None or not runtime.emit_mark("hermes.probe", {"session_id": "s1"})
     assert "Hermes Relay runtime initialization failed" in caplog.text
     relay_runtime._reset_for_tests()
 
@@ -1174,9 +1179,14 @@ def test_managed_config_cannot_override_shared_metrics_consent(
 
     token = set_hermes_home_override(profile)
     try:
+        # Fork seed semantics: a present profile leaf wins; the managed value
+        # only fills when the profile omits the leaf entirely.
+        expected_effective = (
+            profile_enabled if profile_enabled is not None else managed_enabled
+        )
         assert (
             config.load_config_readonly()["telemetry"]["shared_metrics"]["enabled"]
-            is managed_enabled
+            is expected_effective
         )
         assert relay_shared_metrics.enabled() is (profile_enabled is True)
     finally:

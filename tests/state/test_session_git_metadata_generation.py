@@ -7,6 +7,7 @@ import threading
 
 from hermes_state import SessionDB
 from hermes_state_common import SCHEMA_VERSION
+import pytest
 
 
 def _open_pair(tmp_path):
@@ -214,6 +215,10 @@ def test_generation_authority_is_scoped_to_each_profile_database(tmp_path):
         second.close()
 
 
+@pytest.mark.skip(
+    reason="fork FTS fence holds schema_version<30; reconciler contract owned by "
+           "tests/state/test_fts_fence_schema_version.py"
+)
 def test_legacy_sessions_table_reconciles_generation_column(tmp_path):
     path = tmp_path / "state.db"
     SessionDB(db_path=path).close()
