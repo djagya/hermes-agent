@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -19,6 +20,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Event
+
+_log = logging.getLogger(__name__)
 
 
 # Notifier reaction to a terminal event: "notify" = passive adapter.send only
@@ -64,6 +67,100 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     return {str(key): value for key, value in data.items() if isinstance(value, _SCALAR_TYPES)}
 
 
+def _fixed_notify_target() -> Optional[dict[str, Any]]:
+    """Return the install-wide Kanban notification target, when configured.
+
+    The target is operator policy, not a caller preference: every task is born
+    subscribed to it and every later subscription request converges on the same
+    route.  Resolving it at the DB seam covers CLI, dashboard, cron, slash
+    commands, and agent tools without duplicating policy in those callers.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        kanban = config.get("kanban") if isinstance(config, Mapping) else None
+        raw = (
+            kanban.get("fixed_notify_target", {})
+            if isinstance(kanban, Mapping)
+            else {}
+        )
+    except Exception:
+        return None
+    if not isinstance(raw, Mapping) or not raw.get("enabled"):
+        return None
+    platform = str(raw.get("platform") or "").strip().lower()
+    chat_id = str(raw.get("chat_id") or "").strip()
+    if not platform or not chat_id:
+        _log.warning(
+            "kanban.fixed_notify_target is enabled but platform/chat_id is missing"
+        )
+        return None
+    return {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": str(raw.get("thread_id") or "").strip() or None,
+        "chat_type": str(raw.get("chat_type") or "").strip() or None,
+        "notifier_profile": (
+            str(raw.get("notifier_profile") or "").strip() or None
+        ),
+    }
+
+
+def _insert_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+    chat_type: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    delivery_mode: Optional[str] = None,
+    delivery_metadata: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Insert or refresh one subscription inside the caller's transaction."""
+    valid_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else None
+    # api_server is stateless: the adapter has no send(), the wake self-post IS
+    # the delivery. A plain 'notify' default would leave those subs with no
+    # delivery mechanism at all. Explicit modes still win.
+    insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
+    metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
+    key = _sub_key(task_id, platform, chat_id, thread_id)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+             chat_type, notifier_profile, delivery_mode, delivery_metadata,
+             created_at, last_event_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+        """,
+        (
+            *key, user_id, user_id_alt, chat_type or "dm", notifier_profile,
+            insert_mode, metadata_json, int(time.time()), task_id,
+        ),
+    )
+    # chat_type / delivery_mode / delivery_metadata are last-write-wins;
+    # user_id_alt and notifier_profile only self-heal legacy rows lacking one.
+    for column, value, fill_only in (
+        ("chat_type", chat_type, False),
+        ("user_id_alt", user_id_alt, True),
+        ("notifier_profile", notifier_profile, True),
+        ("delivery_mode", valid_mode, False),
+        ("delivery_metadata", metadata_json, False),
+    ):
+        if not value:
+            continue
+        guard = f" AND ({column} IS NULL OR {column} = '')" if fill_only else ""
+        conn.execute(
+            f"UPDATE kanban_notify_subs SET {column} = ? " + _SUB_KEY_WHERE + guard,
+            (value, *key),
+        )
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -88,45 +185,43 @@ def add_notify_sub(
     untouched, an explicit valid value is last-write-wins, unknown falls back
     to ``"notify"``. New subs start caught up (``last_event_id`` =
     ``MAX(task_events.id)``) so the notifier never replays history at boot.
+
+    When ``kanban.fixed_notify_target`` is enabled, caller-supplied routing is
+    canonicalized here.  Delivery mode remains a caller choice; source identity
+    is cleared because an install-wide operator route is not owned by the
+    originating user/session.
     """
-    valid_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else None
-    # api_server is stateless: the adapter has no send(), the wake self-post IS
-    # the delivery. A plain 'notify' default would leave those subs with no
-    # delivery mechanism at all. Explicit modes still win.
-    insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
-    metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
-    key = _sub_key(task_id, platform, chat_id, thread_id)
+    fixed_target = _fixed_notify_target()
+    if fixed_target:
+        platform = str(fixed_target["platform"])
+        chat_id = str(fixed_target["chat_id"])
+        thread_id = fixed_target.get("thread_id")
+        chat_type = fixed_target.get("chat_type")
+        notifier_profile = fixed_target.get("notifier_profile")
+        user_id = None
+        user_id_alt = None
+        delivery_metadata = {
+            key: value
+            for key, value in {
+                "thread_id": thread_id,
+                "chat_type": chat_type,
+            }.items()
+            if value
+        } or None
     with _kb.write_txn(conn):
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-                 chat_type, notifier_profile, delivery_mode, delivery_metadata,
-                 created_at, last_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
-            """,
-            (
-                *key, user_id, user_id_alt, chat_type or "dm", notifier_profile,
-                insert_mode, metadata_json, int(time.time()), task_id,
-            ),
+        _insert_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            user_id_alt=user_id_alt,
+            chat_type=chat_type,
+            notifier_profile=notifier_profile,
+            delivery_mode=delivery_mode,
+            delivery_metadata=delivery_metadata,
         )
-        # chat_type / delivery_mode / delivery_metadata are last-write-wins;
-        # user_id_alt and notifier_profile only self-heal legacy rows lacking one.
-        for column, value, fill_only in (
-            ("chat_type", chat_type, False),
-            ("user_id_alt", user_id_alt, True),
-            ("notifier_profile", notifier_profile, True),
-            ("delivery_mode", valid_mode, False),
-            ("delivery_metadata", metadata_json, False),
-        ):
-            if not value:
-                continue
-            guard = f" AND ({column} IS NULL OR {column} = '')" if fill_only else ""
-            conn.execute(
-                f"UPDATE kanban_notify_subs SET {column} = ? " + _SUB_KEY_WHERE + guard,
-                (value, *key),
-            )
 
 
 def _notify_profile_filter(

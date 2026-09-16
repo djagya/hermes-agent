@@ -1,5 +1,6 @@
 import asyncio
 import pytest
+import yaml
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,88 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["thread_id"] == "topic1"
     assert subs[0]["user_id"] == "user1"
     assert subs[0]["notifier_profile"] == "default"
+
+
+_FIXED_NOTIFY_CONFIG = {
+    "kanban": {
+        "fixed_notify_target": {
+            "enabled": True,
+            "platform": "telegram",
+            "chat_id": "-1003892608742",
+            "thread_id": "36822",
+            "chat_type": "group",
+            "notifier_profile": "default",
+        }
+    }
+}
+
+
+def _enable_fixed_notify_target(home: Path) -> None:
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(_FIXED_NOTIFY_CONFIG), encoding="utf-8",
+    )
+
+
+def _assert_fixed_notify_sub(sub: dict, *, delivery_mode: str) -> None:
+    assert sub["platform"] == "telegram"
+    assert sub["chat_id"] == "-1003892608742"
+    assert sub["thread_id"] == "36822"
+    assert sub["chat_type"] == "group"
+    assert sub["notifier_profile"] == "default"
+    assert sub["delivery_mode"] == delivery_mode
+    assert sub["user_id"] is None
+    assert sub["user_id_alt"] is None
+
+
+def test_fixed_notify_target_covers_create_and_rewrites_subscribe(kanban_home):
+    """Every creation/subscription surface converges on operator policy."""
+    _enable_fixed_notify_target(kanban_home)
+
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="fixed route", assignee="worker")
+        kbn.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="wrong-chat",
+            thread_id="wrong-thread",
+            user_id="wrong-user",
+            user_id_alt="wrong-alt",
+            notifier_profile="wrong-profile",
+            delivery_mode="wake",
+        )
+        subs = kbn.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    _assert_fixed_notify_sub(subs[0], delivery_mode="wake")
+
+
+def test_fixed_notify_target_covers_idempotent_recreate(kanban_home):
+    """An idempotency-key hit re-subscribes the existing task to the fixed
+    target instead of returning it uncovered."""
+    _enable_fixed_notify_target(kanban_home)
+
+    conn = kbc.connect()
+    try:
+        first = kb.create_task(
+            conn, title="fixed route", assignee="worker",
+            idempotency_key="fixed-route-key",
+        )
+        # Second create with the same key returns the existing task.
+        second = kb.create_task(
+            conn, title="fixed route", assignee="worker",
+            idempotency_key="fixed-route-key",
+        )
+        subs = kbn.list_notify_subs(conn, first)
+    finally:
+        conn.close()
+
+    assert second == first
+    assert len(subs) == 1
+    _assert_fixed_notify_sub(subs[0], delivery_mode="notify")
 
 
 def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
