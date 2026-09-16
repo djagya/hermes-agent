@@ -43,6 +43,17 @@ class _Relay:
             Agent="agent", Function="function", Tool="tool"
         )
         self.LLMRequest = _Request
+        # The real binding carries a plugin-configuration surface and the
+        # tool-call result type; Hermes' preflight reads relay.plugin.report()
+        # (None = no foreign plugin config) and the metrics subscriber builds
+        # relay.ToolExecutionResult(fields) on every tool close.
+        self.plugin = SimpleNamespace(report=lambda: None)
+
+        class _ToolExecutionResult:
+            def __init__(self, fields: dict[str, Any]) -> None:
+                self.fields = fields
+
+        self.ToolExecutionResult = _ToolExecutionResult
         self.scope = SimpleNamespace(
             push=self._scope_push,
             pop=self._scope_pop,
@@ -943,7 +954,7 @@ def test_execution_adapters_do_not_create_relay_host_without_a_consumer(
 
     assert result is tool_result
     assert observed_args is tool_args
-    assert relay_runtime.get_host(create=False) is None
+    assert relay_runtime.HOST_REGISTRY.for_profile(create=False) is None
     assert imports == []
 
 
@@ -962,7 +973,7 @@ def test_core_runtime_is_fail_open_without_a_published_binding(monkeypatch, capl
     monkeypatch.setattr(relay_runtime.importlib, "import_module", missing_relay)
 
     assert relay_runtime.get_runtime() is None
-    host = relay_runtime.get_host()
+    host = relay_runtime.HOST_REGISTRY.for_profile()
     assert isinstance(host, relay_runtime.NoopRelayRuntime)
     assert host.profile_key == relay_runtime.current_profile_key()
     assert "nemo_relay" in host.reason
@@ -971,7 +982,8 @@ def test_core_runtime_is_fail_open_without_a_published_binding(monkeypatch, capl
         tool_name="terminal",
         args={"command": "true"},
     ) == {"command": "true"}
-    assert not relay_runtime.emit_mark("hermes.probe", session_id="s1")
+    runtime = relay_runtime.get_runtime(create=False)
+    assert runtime is None or not runtime.emit_mark("hermes.probe", {"session_id": "s1"})
     assert "Hermes Relay runtime initialization failed" in caplog.text
     relay_runtime._reset_for_tests()
 
