@@ -243,6 +243,23 @@ def test_failure_receipts_never_embed_gh_stderr_or_token_material(github, monkey
     # The token VALUE and raw gh stderr never survive; naming the env var is fine.
     assert token not in blob and "gh: " not in blob and "Bad credentials for" not in blob
 
+    # Bare legacy 40-hex credentials carry no denylist prefix, so no stderr
+    # substring may reach the receipt at all (regression: t_488ac3cc finding).
+    legacy = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+
+    def legacy_credential(command, **kwargs):
+        raise subprocess.CalledProcessError(
+            returncode=1, cmd=command, output="",
+            stderr=f"gh: credential {legacy} rejected for api.github.com")
+
+    monkeypatch.setattr(acc.subprocess, "run", legacy_credential)
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "provider_error"
+    assert receipt["detail"] == "GitHub API call failed (rc=1)."
+    assert legacy not in receipt["detail"] and "credential" not in receipt["detail"]
+    blob = json.dumps(receipt)
+    assert legacy not in blob and "api.github.com" not in blob and "gh: " not in blob
+
     def ugly_error(command, **kwargs):
         raise subprocess.CalledProcessError(
             returncode=1, cmd=command, output="",

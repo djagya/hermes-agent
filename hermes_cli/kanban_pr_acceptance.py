@@ -87,9 +87,7 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
     except subprocess.TimeoutExpired:
         raise _GhError("network", "GitHub API request timed out; retry when the network is available.") from None
     except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or "")
-        head = stderr.strip().splitlines()[0] if stderr.strip() else ""
-        low = stderr.lower()
+        low = (exc.stderr or "").lower()
         if exc.returncode == 4 or "gh auth login" in low:
             raise _GhError("auth_unavailable", "gh is not authenticated in this context; run `gh auth login` or set GH_TOKEN via the Hermes secret surface.") from None
         if "rate limit" in low:
@@ -99,11 +97,10 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
         if "http 404" in low:
             raise _GhError("provider_error", "GitHub returned 404 for acceptance evidence; check the repository/PR and the credential's repository access.") from None
         logger.warning("gh api failed for %s (rc=%s); stderr suppressed", endpoint, exc.returncode)
-        low_head = head.lower()
-        safe = head if head and len(head) <= 160 and not any(
-            s in low_head for s in ("ghp_", "gho_", "ghu_", "ghs_", "github_pat_", "token ")) else ""
-        suffix = f" ({safe})" if safe else ""
-        raise _GhError("provider_error", f"GitHub API call failed (rc={exc.returncode}){suffix}.") from None
+        # stderr can echo credential material (bare 40-hex tokens denylists miss),
+        # so the persisted detail is fixed and never contains any stderr substring.
+        detail = f"GitHub API call failed (rc={exc.returncode})."
+        raise _GhError("provider_error", detail) from None
     value = json.loads(result.stdout)
     if isinstance(value, dict) and value.get("errors"):
         if any("Bad credentials" in str(e.get("message", "")) for e in value["errors"] if isinstance(e, dict)):
