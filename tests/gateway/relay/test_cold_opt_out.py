@@ -12,6 +12,14 @@ import yaml
 
 @pytest.mark.parametrize("case", ["native", "url-only", "disabled", "managed", "managed-only", "scoped"])
 def test_cold_fronted_platforms_is_read_only(tmp_path, case):
+    """The ``managed`` case pins the upstream managed-VETO contract
+    (``platforms.relay.enabled: false`` overrides the user's ``true``). This
+    fork deliberately runs managed-SEED semantics (f5405d53f4: "let live set
+    win over managed seed" — a present user leaf wins, managed fills omitted
+    leaves), so under seed semantics the user's explicit enable legitimately
+    fronts the platform. The read-only/no-bootstrap invariants this test
+    exists for still hold in every case, so assert them for ``managed`` too —
+    only the fronted-platform expectation differs."""
     home = tmp_path / "primary"
     home.mkdir()
     scoped = tmp_path / "secondary"
@@ -60,5 +68,9 @@ def test_cold_fronted_platforms_is_read_only(tmp_path, case):
                            cwd=tmp_path, env=env, text=True, capture_output=True, timeout=45)
     assert child.returncode == 0, child.stderr
     observed = json.loads(child.stdout.splitlines()[-1])
-    assert observed == {"fronted": ["slack"] if case == "url-only" else [],
+    # Fork seed semantics: in the "managed" case the user's explicit
+    # platforms.relay.enabled=true wins over the managed seed disable, so the
+    # platform fronts. Upstream's managed-veto expectation expects [] there.
+    fronted_expected = ["slack"] if case in {"url-only", "managed"} else []
+    assert observed == {"fronted": fronted_expected,
                         "bootstrapped": False, "changed_env": {}}

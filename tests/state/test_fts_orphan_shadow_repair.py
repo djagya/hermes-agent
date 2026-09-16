@@ -1,3 +1,4 @@
+import pytest
 """#103840: a ``sqlite3 .recover`` restore re-emits FTS5 shadow tables as ordinary tables
 but cannot re-emit the ``CREATE VIRTUAL TABLE`` row. The next SessionDB open then failed
 in ``_ensure_fts_schema`` with "fts5: error creating shadow table messages_fts_data: table
@@ -8,6 +9,10 @@ shadows must survive untouched.
 import sqlite3
 
 from hermes_state import SessionDB
+
+# Fork FTS fence: this file's subject (live FTS rebuild/admission machinery) is disabled on
+# this fork; the fenced contract is owned by tests/state/test_fts_fork_fence.py.
+pytestmark = pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (tests/state/test_fts_fork_fence.py owns the fenced contract)")
 
 
 def _orphan_family(db_path, family: str) -> None:

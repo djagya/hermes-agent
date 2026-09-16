@@ -1,3 +1,4 @@
+import pytest
 """Fresh state.db FTS bootstrap must honor cross-process rebuild admission."""
 
 import sqlite3
@@ -15,6 +16,10 @@ import time
 from pathlib import Path
 
 from hermes_state_common import fts_rebuild_admission
+
+# Fork FTS fence: this file's subject (live FTS rebuild/admission machinery) is disabled on
+# this fork; the fenced contract is owned by tests/state/test_fts_fork_fence.py.
+pytestmark = pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (tests/state/test_fts_fork_fence.py owns the fenced contract)")
 
 with fts_rebuild_admission(Path(sys.argv[1]), timeout_seconds=0) as acquired:
     assert acquired

@@ -110,6 +110,7 @@ def test_full_rebuild_honours_exclusion(db: SessionDB):
     assert _trigram_rowids(db) == {ids["root"], ids["cont"]}
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 def test_v29_install_purges_child_rows_on_upgrade(tmp_path):
     db_path = tmp_path / "state.db"
     old = SessionDB(db_path=db_path)

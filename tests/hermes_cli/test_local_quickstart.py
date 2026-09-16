@@ -118,9 +118,13 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     assert "Local Models" in r.json()["detail"]
 
 
-def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(client, quickstart_ready, monkeypatch, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
-    Each leg is asserted by its observable call, in order."""
+    Each leg is asserted by its observable call, in order.
+
+    Uses the ``quickstart_ready`` fixture so the catalog fits this machine
+    (CI runners are small: without it the fit/engine preflight 409s before
+    the legs run — that behavior has its own test above)."""
     calls: list[str] = []
 
     # Supply the same supported backend to preflight and the stubbed install;
@@ -179,9 +183,12 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     assert load_config()["local_runtime"]["enabled"] is True
 
 
-def test_quickstart_skips_satisfied_legs(client, monkeypatch):
+def test_quickstart_skips_satisfied_legs(client, quickstart_ready, monkeypatch):
     """Runtime present and model already staged: the response says so and
-    the job goes straight to activation."""
+    the job goes straight to activation.
+
+    Uses ``quickstart_ready`` so preflight finds a fitting variant on small
+    CI runners instead of 409ing."""
     calls: list[str] = []
 
     monkeypatch.setattr(

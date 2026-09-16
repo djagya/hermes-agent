@@ -121,6 +121,7 @@ def db(tmp_path):
         pass
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 class TestRebuildFtsAdmission:
     def test_rebuild_defers_while_another_process_holds_authority(
         self, db, fast_timeout
@@ -151,6 +152,7 @@ class TestRebuildFtsAdmission:
             assert admitted is True
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 class TestSchemaPathAdmission:
     def test_startup_trigger_repair_defers_and_fails_closed(
         self, tmp_path, fast_timeout
@@ -286,6 +288,7 @@ def _orphaned_fork_holder(db_path: Path):
             os.kill(grandchild, signal.SIGKILL)
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 class TestOrphanedHolderStalenessBreak:
     @pytest.mark.live_system_guard_bypass
     def test_rebuild_breaks_lock_of_dead_forker(self, db, fast_timeout):
@@ -368,6 +371,7 @@ os._exit(1)
                 os.kill(grandchild, signal.SIGKILL)
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 class TestNonContentionErrnoFailsFast:
     def test_non_contention_oserror_does_not_wait_out_timeout(
         self, tmp_path, monkeypatch
@@ -494,6 +498,7 @@ class TestNonContentionErrnoFailsFast:
         assert hermes_state_common.is_advisory_lock_contention(exc) is expected
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 class TestDeferredFtsRetryInProcess:
     """Gateway shape (#100108): one SessionDB stays open for days. A deferral
     at open must be recoverable from an in-process periodic tick, with the
