@@ -1179,9 +1179,14 @@ def test_managed_config_cannot_override_shared_metrics_consent(
 
     token = set_hermes_home_override(profile)
     try:
+        # Fork seed semantics: a present profile leaf wins; the managed value
+        # only fills when the profile omits the leaf entirely.
+        expected_effective = (
+            profile_enabled if profile_enabled is not None else managed_enabled
+        )
         assert (
             config.load_config_readonly()["telemetry"]["shared_metrics"]["enabled"]
-            is managed_enabled
+            is expected_effective
         )
         assert relay_shared_metrics.enabled() is (profile_enabled is True)
     finally:
