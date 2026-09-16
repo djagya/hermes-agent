@@ -49,9 +49,12 @@ class _Relay:
         # relay.ToolExecutionResult(fields) on every tool close.
         self.plugin = SimpleNamespace(report=lambda: None)
 
-        class _ToolExecutionResult:
+        class _ToolExecutionResult(dict):
+            """Subscriptable stand-in: the real result type exposes tool-call
+            fields by key, and the metrics tests read them directly."""
+
             def __init__(self, fields: dict[str, Any]) -> None:
-                self.fields = fields
+                super().__init__(fields)
 
         self.ToolExecutionResult = _ToolExecutionResult
         self.scope = SimpleNamespace(

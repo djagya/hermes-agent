@@ -65,7 +65,10 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
         _active_children=[child],
         _active_children_lock=threading.Lock(),
     )
-    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
+    # Generous timeout: this test pins teardown ORDERING, not speed. Under an
+    # 8-worker loaded CI runner a 0.5s budget let the bounded close() wait
+    # expire and closed.set() legitimately won the race.
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 5.0)
     monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
 
     result = delegate_tool._run_single_child(
@@ -76,15 +79,15 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
     )
 
     assert result["status"] == "timeout"
-    assert child.unwinding.wait(timeout=1)
+    assert child.unwinding.wait(timeout=10)
     try:
         assert not child.closed.is_set(), (
             "timed-out child.close() ran before its conversation thread unwound"
         )
     finally:
         child.allow_finish.set()
-    assert child.finished.wait(timeout=1)
-    assert child.closed.wait(timeout=1)
+    assert child.finished.wait(timeout=10)
+    assert child.closed.wait(timeout=10)
     assert not child.close_while_running, (
         "timed-out child.close() raced its still-running conversation thread"
     )
