@@ -28,6 +28,12 @@ from hermes_state import SessionDB
 from hermes_state_common import FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY, LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL, SCHEMA_SQL, _FTS_TRIGGERS
 from hermes_state_dbfile import _concrete_state_db_holder_pids, _is_inactive_orphan_desktop_holder
 
+# Fork FTS fence: live rebuild machinery is disabled on this fork; the fenced contract
+# is owned by tests/state/test_fts_fork_fence.py.
+pytestmark = pytest.mark.skip(
+    reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)"
+)
+
 
 @pytest.fixture
 def db(tmp_path):

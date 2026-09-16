@@ -15,7 +15,11 @@ from typing import Any
 import pytest
 
 from hermes_cli import lifecycle, plugins
-from hermes_cli.observability import relay_runtime, relay_shared_metrics
+# Import the DEFINING module: the hermes_cli.observability.relay_runtime path is a
+# PLUGIN-COMPAT star-import stub whose names are copies — monkeypatching them would
+# never reach agent.relay_runtime, which is what production reads.
+from agent import relay_runtime
+from hermes_cli.observability import relay_shared_metrics
 from hermes_cli.plugins import PluginManager
 
 

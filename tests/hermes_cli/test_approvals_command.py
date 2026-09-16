@@ -9,11 +9,14 @@ from cli import HermesCLI
 from hermes_cli.commands import (
     GATEWAY_KNOWN_COMMANDS,
     SUBCOMMANDS,
-    SlashCommandCompleter,
     gateway_help_lines,
     resolve_command,
-    telegram_bot_commands,
 )
+# SlashCommandCompleter / telegram_bot_commands live in their defining modules;
+# importing them through hermes_cli.commands goes through the PLUGIN-COMPAT
+# lazy table (scripts/check_compat_pointers.py fails CI on in-tree use).
+from hermes_cli.commands_completion import SlashCommandCompleter
+from hermes_cli.commands_platforms import telegram_bot_commands
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
