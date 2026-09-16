@@ -6,7 +6,6 @@ from hermes_cli.browser_connect import (
     MANAGED_CONNECT_REFUSAL,
     launch_chrome_debug,
     managed_connect_refusal,
-    try_launch_chrome_debug,
 )
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 
@@ -54,4 +53,3 @@ def test_launch_chrome_debug_does_not_spawn_when_managed(monkeypatch):
     monkeypatch.setattr("hermes_cli.browser_connect.subprocess.Popen", boom)
     result = launch_chrome_debug(9222, "Linux")
     assert result.launched is False
-    assert try_launch_chrome_debug(9222, "Linux") is False
