@@ -1171,6 +1171,7 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
                 "BLOCKED: execute_code runs arbitrary local Python (including "
                 "subprocess calls that bypass shell-string approval checks). " + ctx.exec_tail,
                 pattern_key=pattern_key, description=description, outcome="blocked",
+                decision_source="unattended", gate_id=pattern_key,
             )
         return _approved()
 
