@@ -716,9 +716,12 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         extra = {"deny_reason": deny_reason} if "reason" in fmt else {}
         # From here the decision is the human gate's (owner choice, timeout, or refusal) —
         # recorded so a result never reads as a guardian decision by implication.
-        return _denied(template.format(description=description, breaker=breaker, **fmt),
-                       pattern_key=pattern_key, description=description,
-                       outcome=outcome, decision_source="human", **extra)
+        result = _denied(template.format(description=description, breaker=breaker, **fmt),
+                         pattern_key=pattern_key, description=description,
+                         outcome=outcome, decision_source="human", **extra)
+        if spec.gate_id:
+            result["gate_id"] = spec.gate_id
+        return result
 
     def grant(choice: str) -> dict:
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
@@ -728,6 +731,10 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             result = _user_approved(session_key, description)
         else:
             result = _approved()
+        # The decision is the human's: recorded so a result log answers WHO
+        # approved without inferring it from absence-of-fields (parity with the
+        # deny path and the smart/unattended results).
+        result["decision_source"] = "human"
         if spec.gate_id:
             result["gate_id"] = spec.gate_id
         return result

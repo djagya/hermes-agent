@@ -18,6 +18,10 @@ import pytest
 import tools.approval_smart as approval_smart
 from agent.redact import redact_sensitive_text
 
+# A secret SHAPE the production redactor actually matches (the ``sk-`` vendor-prefix
+# family, long enough for the head/tail mask). The redactor's own OUTPUT is not
+# key-shaped: a ``«redacted:…»`` marker passes through ``redact_sensitive_text``
+# verbatim, which made the original leak assertion vacuously true (round-1 review).
 SECRET = "sk-live-abcdefABCDEF12345678901234"
 
 
@@ -89,8 +93,18 @@ class TestOutcomeCategories:
 
 class TestObservabilityHygiene:
     def test_redaction_prevents_secret_leak_in_observation_log(self, observations):
-        _parse(f"Bearer {SECRET} then more text")
+        answer = f"Bearer {SECRET} then more text"
+        _parse(answer)
+        # Behavior contract, not a snapshot: the unrecognized-response WARNING
+        # fired (non-vacuous), the secret never survives it — neither whole nor
+        # as a reconstructable body — and the redactor's masked form stands in
+        # for it in the logged snippet.
+        assert "unrecognized_response" in observations.text
         assert SECRET not in observations.text
+        # A middle fragment of the body: present only if the mask leaks more
+        # than head 6 + tail 4, so this fails even if the mask shape changes.
+        assert "cdefABCDEF" not in observations.text
+        assert redact_sensitive_text(answer) in observations.text
 
     def test_decisions_log_at_debug_not_warning(self, caplog):
         caplog.set_level(logging.DEBUG, logger="tools.approval")
