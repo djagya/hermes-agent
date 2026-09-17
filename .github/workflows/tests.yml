@@ -22,10 +22,22 @@ on:
 permissions:
   contents: read
 
-# Cancel in-progress runs for the same ref
+# Event-aware concurrency (same policy as ci.yaml and docker.yml): a PR's
+# repeated pushes collapse per PR, while workflow_dispatch / push full-
+# validation runs queue in their own per-ref group. Neither class may kill
+# the other: the standard flow runs an ordinary PR's CI and an explicit
+# full dispatch on the same branch/head at the same time, and each must
+# preserve its own evidence. A single `tests-<ref>` group with
+# unconditional cancel let the Tests call of a manual full dispatch
+# SIGTERM the same-head PR run's slices mid-suite (live collision: PR run
+# 35211816101 slice 3/8 died at 82.8% with zero test failures when the
+# Tests call of dispatch run 35211892455 started). PR evidence is the
+# merge-gating context; a full dispatch is the pre-upstream receipt — both
+# must survive together. Contract asserted in
+# tests/ci/test_workflow_concurrency.py.
 concurrency:
-  group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   plan:
