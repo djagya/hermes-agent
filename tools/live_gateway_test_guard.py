@@ -207,45 +207,66 @@ def _operator_before(command: str, start: int) -> str | None:
     return "\n" if "\n" in command[len(head):start] else None
 
 
-def _cd_target(args: list[str], cwd: Optional[Path]) -> Optional[Path]:
-    """Directory a ``cd``/``pushd`` would land in (existing dirs only), else None."""
+def _cd_target(args: list[str], cwd: Optional[Path],
+               assignments: Optional[dict[str, str]] = None) -> Optional[Path]:
+    """Directory a ``cd``/``pushd`` would land in (existing dirs only), else None.
+    ``$VAR``/``${VAR}`` targets are substituted from *assignments* — the
+    recorded ``VAR=value`` leads of the same command string (no shell, no env)."""
     index = _consume_options(args, 0)
     if index >= len(args) or args[index] == "-":
         return None
-    target = _normalize_path(args[index], cwd or Path("/"))
+    raw = args[index]
+    if assignments:
+        def _substitute(match: "re.Match[str]") -> str:
+            return assignments.get(match.group(1) or match.group(2), match.group(0))
+        raw = re.sub(r"\$\{(\w+)\}|\$(\w+)", _substitute, raw)
+    target = _normalize_path(raw, cwd or Path("/"))
     if target is not None and target.is_absolute() and target.is_dir():
         return target
     return None
 
 
 def _iter_simple_commands(command: str, depth: int = 0,
-                          cwd: Optional[Path] = None):
+                          cwd: Optional[Path] = None,
+                          assignments: Optional[dict[str, str]] = None):
     """Yield ``(words, scoped_cwd)`` for every simple command, recursing into
     ``sh -c`` payloads. ``scoped_cwd`` tracks ``cd``/``pushd`` across ``&&``,
     ``;`` and newline separators so ``cd <repo> && pytest`` is judged against
-    the repo directory, not the stale session cwd."""
+    the repo directory, not the stale session cwd. ``assignments`` (when a
+    dict is passed) accumulates ``VAR=value`` leads seen so far so a
+    ``cd "$REPO"`` target can be resolved without a shell."""
     if depth > 4:
         return
     starts = sorted(set(_iter_shell_command_starts(command)))
     scoped_cwd = cwd
     pending_cd: Optional[Path] = None
     for start in starts:
-        if pending_cd is not None and _operator_before(command, start) in {"&&", ";", "\n"}:
+        operator = _operator_before(command, start)
+        if pending_cd is not None and operator in {"&&", ";", "\n"}:
             scoped_cwd = pending_cd
-        pending_cd = None
+            # Consume only on a sequence operator: `_iter_shell_command_starts`
+            # also emits bogus starts inside ``${VAR}``/group interiors (the
+            # ``{``/``(`` chars), which must NOT eat the pending cd.
+            pending_cd = None
         words = _words_at(command, start)
-        _, rest = _split_lead(words)
+        lead, rest = _split_lead(words)
+        if assignments is not None:
+            for assignment in lead:
+                name, _, value = assignment.partition("=")
+                if name and value:
+                    assignments[name] = value.strip("'\"")
         if not rest:
             continue
         yield rest, scoped_cwd
         name = _executable_name(rest[0])
         if name in {"cd", "pushd"}:
-            pending_cd = _cd_target(rest[1:], scoped_cwd)
+            pending_cd = _cd_target(rest[1:], scoped_cwd, assignments)
             continue
         if name in _SHELL_EXECUTABLES:
             has_c, payload = _bash_exec_payload(rest[1:])
             if has_c and payload:
-                yield from _iter_simple_commands(payload, depth + 1, scoped_cwd)
+                yield from _iter_simple_commands(payload, depth + 1, scoped_cwd,
+                                                 assignments)
 
 
 # ---- target path resolution ----------------------------------------------------------------
@@ -266,43 +287,45 @@ def _normalize_path(value: str, base: Path) -> Optional[Path]:
         return None
 
 
-def _resolve_run_target(explicit: str | None, workdir: str | None,
-                        cwd: str | None) -> tuple[Optional[Path], bool]:
-    """``(target, resolved)`` — the directory a test run would exercise and
-    whether identity could actually be established.
+def _resolve_run_targets(
+    pairs: list[tuple[str, Optional[str]]],
+) -> list[Path]:
+    """Every target directory the run could exercise, in evaluation order.
 
-    ``explicit`` (a path argument of the runner) wins: ``pytest`` inside a
-    non-Hermes cwd that says ``pytest /opt/data/hermes-agent/tests`` runs
-    Hermes tests. ``cwd`` is probed last because a session cwd often outlives
-    the directory it named.
+    Each pair is ``(value, anchor)``. A value is resolved against its anchor
+    (or ``/`` when None) and kept when it exists on this filesystem; a named
+    test file that does not exist yet contributes its nearest existing
+    ancestor instead (identity from a dry invocation). Values that stay
+    relative with no anchor contribute nothing — identity must be established
+    by a value anchored on THIS filesystem, never guessed.
 
-    Identity is established ONLY by a value anchored on this filesystem: a
-    bare relative target (``pytest tests/`` with no workdir/cwd at all) has no
-    anchor, so it reports unresolved rather than claiming a bogus directory —
-    plain pytest stays allowed (no fail-closed) while Hermes-specific runners
-    fail closed on it.
+    Callers sweep the whole list for Hermes identity: ANY resolvable target
+    inside a Hermes checkout blocks, because the runner's effective rootdir,
+    conftest and plugins come from the checkout it runs in, not from whichever
+    single path argument happened to win.
     """
-    for value, anchor in ((explicit, workdir or cwd),
-                          (workdir, None),
-                          (cwd, None)):
+    resolved: list[Path] = []
+    for value, anchor in pairs:
         if not value:
             continue
         base = Path(os.path.expanduser(anchor)) if anchor else Path("/")
         target = _normalize_path(str(value), base)
-        if target is None:
+        if target is None or not target.is_absolute():
             continue
-        if not target.is_absolute():
-            continue
-        if target.exists():
-            return target, True
-        # A named test file may not exist yet (dry invocation); its nearest
-        # existing ancestor still fixes identity.
-        probe = target
-        while len(probe.parts) > 1:
-            probe = probe.parent
-            if probe.exists():
-                return probe, True
-    return None, False
+        if not target.exists():
+            # A named test file may not exist yet (dry invocation); its nearest
+            # existing ancestor still fixes identity.
+            probe = target
+            while len(probe.parts) > 1:
+                probe = probe.parent
+                if probe.exists():
+                    target = probe
+                    break
+            else:
+                continue
+        if target not in resolved:
+            resolved.append(target)
+    return resolved
 
 
 def hermes_checkout_root(path: Path, depth: int = 0) -> Optional[Path]:
@@ -436,8 +459,9 @@ def _classify_runner(words: list[str]) -> tuple[str, Optional[str]]:
         return "", None
 
     if name == "npm" or name == "pnpm" or name == "yarn" or name == "bun":
-        # `npm test` / `npm run test` in a Hermes checkout drives vitest over
-        # tests that shell out to the python suite (run_tests.sh).
+        # ``npm test`` / ``npm run test`` in a workspace whose package.json
+        # script drives the python suite (the desktop/TUI workspaces shell
+        # out to it); classify it so the target gate can judge the cwd.
         if name == "npm" and args and args[0] == "test":
             return "npm_test", None
         if len(args) >= 2 and args[0] == "run" and args[1].split("=", 1)[0] == "test":
@@ -534,11 +558,13 @@ def classify_live_test_run(
        Hermes-specific runner (``scripts/run_tests.sh``,
        ``run_tests_parallel.py``, or any referenced script whose NAME carries
        ``run_tests``).
-    2. **Target**: the run's target directory — the runner's explicit path
-       argument, else the terminal ``workdir``, else ``cwd`` — resolves into a
-       Hermes checkout. When a Hermes-SPECIFIC runner is invoked and no target
-       can be established, the verdict is blocked (fail closed); ordinary
-       pytest with no resolvable target stays allowed.
+    2. **Target**: EVERY resolvable target the run could exercise — the
+       runner's explicit path arguments (anchored at the cwd each command
+       runs in), ``cd``-derived directories, the terminal ``workdir``, and
+       ``cwd`` — is swept; a run blocks when ANY of them resolves into a
+       Hermes checkout. When a Hermes-SPECIFIC runner is invoked and no
+       target can be established, the verdict is blocked (fail closed);
+       ordinary pytest with no resolvable target stays allowed.
     """
     if not command or not command.strip():
         return VERDICT_ALLOWED, ""
@@ -551,40 +577,66 @@ def classify_live_test_run(
     masked = strip_inert_heredoc_bodies(command)
     normalized = _normalize_command_for_detection(masked)
 
-    explicit_candidates: list[str] = []
+    explicit_by_cwd: dict[str, str] = {}
     kinds: set[str] = set()
-    # A cd-derived target is authoritative: the operator pointed the runner at
-    # that directory IN the command. It outranks the ambient workdir/cwd.
+    # Directories a ``cd``/``pushd`` in the command would land in: they are
+    # authoritative cwd anchors for the runner (the operator pointed the run
+    # at that directory IN the command) and, for a bare runner with no path
+    # argument, the only target the run has.
     cd_targets: list[Path] = []
+    command_assignments: dict[str, str] = {}
     session_cwd = Path(os.path.expanduser(cwd)) if cwd else None
-    for words, scoped_cwd in _iter_simple_commands(normalized, cwd=session_cwd):
+    for words, scoped_cwd in _iter_simple_commands(normalized, cwd=session_cwd,
+                                                   assignments=command_assignments):
         if scoped_cwd is not None and scoped_cwd != session_cwd:
             cd_targets.append(scoped_cwd)
         first = words[0] if words else ""
-        base = scoped_cwd or session_cwd or Path(os.getcwd())
-        if _words_name_existing_script(first, base):
+        # No os.getcwd() fallback: an unknown cwd must stay unknown so the
+        # unresolvable-target contract below is deterministic (the terminal
+        # tool always passes a real cwd; bare API callers mean None).
+        base = scoped_cwd or session_cwd
+        if base is not None and _words_name_existing_script(first, base):
             kind, explicit = _classify_runner_script(words, base)
         else:
             kind, explicit = _classify_runner(words)
         if kind:
             kinds.add(kind)
+            # Anchor the runner's explicit path argument at the cwd the
+            # command itself runs in (a ``cd <repo> && pytest tests/docker``
+            # resolves its argument against <repo>, not the session cwd).
+            # Empty anchor = unresolvable cwd; the resolver treats it as "/",
+            # never as a bogus directory name.
             if explicit:
-                explicit_candidates.append(explicit)
+                explicit_by_cwd.setdefault(explicit, str(base) if base else "")
 
     if not kinds:
         return VERDICT_ALLOWED, ""
 
-    target, resolved = _resolve_run_target(
-        explicit_candidates[0] if explicit_candidates else None, workdir, cwd)
-    if target is None and cd_targets:
-        target, resolved = cd_targets[0], True
+    # ANY resolvable target inside a Hermes checkout blocks: the runner's
+    # effective rootdir, conftest and plugins come from the checkout it runs
+    # in, so every candidate is swept — explicit path args (anchored at the
+    # cwd each command runs in), cd-derived dirs, the terminal workdir and
+    # the session cwd. A bogus explicit arg must not wash out a Hermes
+    # workdir, and a bare runner after ``cd <repo>`` must still block.
+    candidate_pairs: list[tuple[str, Optional[str]]] = list(explicit_by_cwd.items())
+    if workdir:
+        candidate_pairs.append((workdir, None))
+    if cwd:
+        candidate_pairs.append((cwd, None))
+    targets = _resolve_run_targets(candidate_pairs)
+    targets.extend(t for t in cd_targets if t not in targets)
 
-    if _target_is_hermes(target):
+    blocked_target: Optional[Path] = next(
+        (t for t in targets if hermes_checkout_root(t) is not None), None)
+    if blocked_target is not None:
         return VERDICT_BLOCKED, (
             "test runner targets the Hermes checkout at "
-            f"{target} (command cwd/workdir resolved inside the live gateway)")
+            f"{blocked_target} (command cwd/workdir resolved inside the live gateway)")
 
-    if "hermes_runner" in kinds and not resolved:
+    # Fail closed ONLY for Hermes-specific runners (they exist nowhere
+    # outside a Hermes checkout, so an unestablishable target is itself
+    # suspicious); ordinary pytest with no resolvable target stays allowed.
+    if "hermes_runner" in kinds and not targets:
         return VERDICT_BLOCKED, (
             "Hermes-specific test runner invoked but its target directory "
             "could not be established; failing closed inside the live gateway")
@@ -592,7 +644,9 @@ def classify_live_test_run(
     return VERDICT_ALLOWED, ""
 
 
-def _words_name_existing_script(word: str, base: Path) -> bool:
+def _words_name_existing_script(word: str, base: Optional[Path]) -> bool:
+    if base is None:
+        return False
     path = _normalize_path(word, base)
     return path is not None and path.is_file()
 
@@ -639,8 +693,11 @@ _PY_SPAWN_FUNCS = frozenset({
     "os.system", "os.popen", "subprocess.run", "subprocess.Popen",
     "subprocess.check_call", "subprocess.check_output", "subprocess.call",
     "subprocess.getoutput", "subprocess.getstatusoutput"})
-_PY_TEST_CALL_RE = re.compile(
-    r"\b(?:python3?(?:\.\d+)*\s+-m\s+)?pytest\b")
+# List-form spawns carry the runner as separately quoted words:
+# subprocess.run(["python", "-m", "pytest", "tests/docker"]). Detection
+# dequotes the line and matches EXACT words, so "pytest-cov" never reads
+# as a pytest invocation.
+_PY_LIST_SPLIT_RE = re.compile(r"[\s,]+")
 _PY_UNittest_RE = re.compile(r"\bunittest\b")
 _PY_RUNNER_RE = re.compile(r"run_tests(?:_parallel)?\.py|run_tests\.sh")
 _MAKE_TEST_RE = re.compile(r"\bmake\s+(?:test|ci)\b")
@@ -695,8 +752,16 @@ def _python_source_test_hit(code: str, child_cwd: str) -> tuple[str, str]:
         comment_only = line.lstrip().startswith("#")
         if not spawn_here or comment_only:
             continue
-        if _PY_TEST_CALL_RE.search(line):
+        # Dequoted exact-word scan: catches BOTH shell-form strings
+        # ("python -m pytest tests/docker") and list-form argv
+        # (["python", "-m", "pytest", "tests/docker"]) — the shell regex
+        # above cannot see list-form joins. "pytest-cov" is not a hit.
+        dequoted = line.replace("'", " ").replace('"', " ")
+        words = {w for w in _PY_LIST_SPLIT_RE.split(dequoted) if w}
+        if "pytest" in words or "py.test" in words:
             hit = "pytest invocation"
+        elif any("run_tests" in w for w in words):
+            hit = "Hermes-specific runner script"
         elif _PY_RUNNER_RE.search(line):
             hit = "Hermes-specific runner script"
         elif _MAKE_TEST_RE.search(line) or (

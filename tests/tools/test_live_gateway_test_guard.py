@@ -86,6 +86,45 @@ class TestBlocksHermesTestRunsInGateway:
         verdict, _ = classify_live_test_run(command, cwd=str(REPO_ROOT))
         assert verdict == VERDICT_BLOCKED
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The incident-shaped bypass: runner + explicit relative path arg
+            # issued AFTER a cd into the checkout. The arg must resolve
+            # against the cd-derived cwd, not the stale session cwd.
+            f"cd {REPO_ROOT} && scripts/run_tests.sh tests/docker",
+            f"cd {REPO_ROOT} && pytest tests/docker",
+            f"cd {REPO_ROOT} && pytest",  # bare runner/pytest after cd
+            # Variable-carried cd targets (assignment lead + $VAR/${VAR}).
+            f'REPO={REPO_ROOT}; cd "$REPO" && pytest tests/docker/',
+            f"REPO={REPO_ROOT}; cd $REPO && pytest tests/docker/",
+            f"REPO={REPO_ROOT}; cd ${{REPO}} && pytest",
+            # Subshell group.
+            f"(cd {REPO_ROOT} && pytest)",
+        ],
+    )
+    def test_cd_into_repo_then_runner_blocked(self, command):
+        verdict, _ = classify_live_test_run(command, cwd="/opt/data/other-project")
+        assert verdict == VERDICT_BLOCKED
+
+    def test_any_resolvable_hermes_target_blocks(self):
+        """A bogus explicit path arg must not wash out a Hermes workdir:
+        the sweep blocks when ANY candidate target resolves into a
+        Hermes checkout (rootdir/conftest come from the checkout)."""
+        verdict, _ = classify_live_test_run(
+            "pytest -c /tmp/other/pyproject.toml", workdir=str(REPO_ROOT),
+            cwd="/opt/data/other-project")
+        assert verdict == VERDICT_BLOCKED
+
+    def test_classifier_ignores_ambient_getcwd(self, monkeypatch):
+        """No os.getcwd() fallback: with cwd=None the verdict must not
+        depend on the process's own working directory."""
+        import os
+
+        monkeypatch.setattr(os, "getcwd", lambda: str(REPO_ROOT))
+        verdict, _ = classify_live_test_run("pytest tests/")
+        assert verdict == VERDICT_ALLOWED
+
     def test_workdir_pointing_into_repo_blocked(self):
         verdict, _ = classify_live_test_run("pytest", workdir=str(REPO_ROOT))
         assert verdict == VERDICT_BLOCKED
@@ -236,6 +275,27 @@ class TestExecuteCodeChokePoint:
         verdict, _ = guard.check_live_gateway_test_script(
             "import subprocess\nsubprocess.run(['bash', 'scripts/run_tests.sh', '-q'])")
         assert verdict == VERDICT_BLOCKED
+
+    def test_script_list_form_pytest_blocked(self, gateway_on, monkeypatch):
+        """List-form argv carries the runner as separately quoted words;
+        the shell regex cannot see it. Dequoted exact-word matching must."""
+        monkeypatch.setattr(guard, "_script_child_cwd", lambda: str(REPO_ROOT))
+        verdict, _ = guard.check_live_gateway_test_script(
+            'import subprocess\nsubprocess.run(["python", "-m", "pytest", "tests/docker"])')
+        assert verdict == VERDICT_BLOCKED
+
+    def test_script_pytest_cov_not_a_hit(self, gateway_on, monkeypatch):
+        """'pytest-cov' is not a pytest invocation (exact-word match)."""
+        monkeypatch.setattr(guard, "_script_child_cwd", lambda: str(REPO_ROOT))
+        verdict, _ = guard.check_live_gateway_test_script(
+            "import subprocess\nsubprocess.run(['pytest-cov', '--version'])")
+        assert verdict == VERDICT_ALLOWED
+
+    def test_script_comment_only_pytest_allowed(self, gateway_on, monkeypatch):
+        monkeypatch.setattr(guard, "_script_child_cwd", lambda: str(REPO_ROOT))
+        verdict, _ = guard.check_live_gateway_test_script(
+            "# pytest\nprint('hello')")
+        assert verdict == VERDICT_ALLOWED
 
     def test_mention_without_spawn_allowed(self, gateway_on, monkeypatch):
         monkeypatch.setattr(guard, "_script_child_cwd", lambda: str(REPO_ROOT))
