@@ -543,12 +543,21 @@ class GatewayBusySessionMixin:
     async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:
         """Interrupt mode: abort in-flight tool calls; the agent loop exits at its next check point."""
         from gateway.run import _build_media_placeholder
+        # Stamp supersession BEFORE any transcription wait: once this event's clip STT begins, the
+        # drain path can sit minutes on the shared in-flight task, so the finished turn's final must
+        # be suppressible without waiting for it (see ``_run_agent_queued_followup``).
+        event._gateway_interrupt_requested = True
         try:
             _interrupt_text = event.text
             _media_urls = getattr(event, "media_urls", None) or []
             if self._pending_event_audio_paths(event):
-                _interrupt_text, _ = await self._transcribe_and_echo_pending_voice(
-                    event, adapter, event.source, event.text or "", log_context="Voice-busy-interrupt",
+                # Receipt fix: do NOT hold the interrupt (and the ack behind it) on the clip's STT —
+                # a 10-minute voice used to delay both by the full transcription. Start the shared
+                # background transcription instead (per-clip single-flight; echo owned there) and
+                # interrupt with the caption now; the queued event's follow-up turn joins the same
+                # in-flight STT in _prepare_inbound_message_text.
+                self._start_pending_voice_stt(
+                    event, adapter, event.source, log_context="Voice-busy-interrupt",
                 )
             elif not _interrupt_text and _media_urls:
                 _interrupt_text = _build_media_placeholder(event)

@@ -1618,6 +1618,35 @@ class GatewayInboundMixin:
         model supports native vision; the caller consumes that buffer at ``run_conversation``."""
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         message_text = (event._gateway_pending_stt_text if _pending_stt_prepared else event.text) or ""
+        if not _pending_stt_prepared and (audio_paths := self._pending_event_audio_paths(event)):
+            # The clip may already be transcribing in the background (drain-path receipt fix: the
+            # finished turn's answer was delivered while this ran). Join the SAME per-clip work for
+            # this turn's input — single-flight keeps it one STT call, and echo ownership stays with
+            # the background claim (none is made here). No in-flight task, or one that failed (its
+            # clip entry reset itself): transcribe inline via the normal choke point, exactly as the
+            # cold path would — echo-once, failure notes and provider fallback all apply unchanged.
+            clips = pending_audio_clips(event)
+            clip_tasks = [
+                clips[path].task for path in audio_paths
+                if clips[path].task is not None and not clips[path].task.done()
+            ]
+            _stt_failed = False
+            if clip_tasks:
+                await asyncio.wait(clip_tasks)
+                _stt_failed = any(
+                    task.cancelled() or task.exception() is not None
+                    for task in clip_tasks if task.done()
+                )
+            if _stt_failed or not hasattr(event, "_gateway_pending_stt_text"):
+                message_text = await self._transcribe_and_echo_pending_voice(
+                    event, self._adapter_for_source(source), source, event.text or "",
+                    log_context="Voice-prepare",
+                ) or message_text
+            else:
+                message_text = getattr(event, "_gateway_pending_stt_text", None) or message_text
+            # The cache attr may have just been published above; recompute so media classification
+            # below treats the STT-eligible paths as prepared instead of transcribing them again.
+            _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         # Prefer the caller's resolved session key so this write key matches the consume key at the
         # run_conversation site; derive it here only for tests and legacy standalone callers.
         session_key = session_key or self._session_key_for_source(source)
@@ -2086,3 +2115,38 @@ class GatewayInboundMixin:
         except Exception as trans_exc:
             logger.warning("%s transcription failed: %s", log_context, trans_exc)
             return text, []
+
+    def _start_pending_voice_stt(
+        self, event, adapter, source, *, log_context: str, metadata=_UNSET,
+    ) -> "asyncio.Task | None":
+        """Start this event's clip transcription as a tracked background task; never await it.
+
+        Receipt/ordering fix: delivery proceeds while a long clip transcribes. Echo ownership is
+        claimed inside the task (one echo per clip, gateway/pending_audio.py); the transcription
+        result stays cached on the event so the follow-up turn's ``_prepare_inbound_message_text``
+        joins the in-flight work instead of duplicating it. The task is registered on
+        ``adapter._background_tasks`` (the canonical container; cancelled by shutdown) so it
+        cannot outlive the gateway. Returns the task (test/observability handle)."""
+        if not self._pending_event_audio_paths(event):
+            return None
+
+        async def _run() -> None:
+            try:
+                await self._transcribe_and_echo_pending_voice(
+                    event, adapter, source, event.text or "", log_context=log_context,
+                    metadata=metadata,
+                )
+            except asyncio.CancelledError:
+                # A cancelled waiter must not cancel the shared clip task (asyncio.shield owns
+                # that); this wrapper unwinding is all that happens here.
+                raise
+            except Exception as stt_exc:
+                logger.warning("%s background transcription failed: %s", log_context, stt_exc)
+
+        task = asyncio.create_task(_run())
+        try:
+            adapter._background_tasks.add(task)
+            task.add_done_callback(adapter._background_tasks.discard)
+        except AttributeError:
+            pass
+        return task

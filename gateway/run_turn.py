@@ -3444,7 +3444,20 @@ class GatewayTurnMixin:
             elif pending_event:
                 # Transcribe audio BEFORE it becomes the next user turn (real transcript, not a path).
                 _pending_text = pending_event.text or ""
-                if self._pending_event_audio_paths(pending_event):
+                if self._pending_event_audio_paths(pending_event) and not hasattr(
+                    pending_event, "_gateway_pending_stt_text"
+                ):
+                    # Deliver the FIRST answer before this clip's STT: a 10-minute voice queued behind a
+                    # finished turn must not hold the completed response hostage for its own transcription
+                    # (per-clip single-flight in gateway/pending_audio.py makes the shared clip work idempotent,
+                    # so the slow transcribe runs beside delivery instead of in front of it).
+                    pending = _pending_text or _build_media_placeholder(pending_event)
+                    self._start_pending_voice_stt(
+                        pending_event, adapter, source, log_context="Voice-drain",
+                        metadata={"thread_id": source.thread_id} if source.thread_id else None,
+                    )
+                elif self._pending_event_audio_paths(pending_event):
+                    # Already transcribed (warm cache from the busy/interrupt path): use it.
                     pending, _ = await self._transcribe_and_echo_pending_voice(
                         pending_event, adapter, source, _pending_text, log_context="Voice-drain",
                         metadata={"thread_id": source.thread_id} if source.thread_id else None,
@@ -3461,7 +3474,12 @@ class GatewayTurnMixin:
             logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
         # Safety net: a pending slash command is never passed to the agent as user input.
-        if pending and pending.strip().startswith("/"):
+        # Exception: an audio-carrying event whose CAPTION starts with "/" is a voice note, not a
+        # command dispatch (the drain's receipt fix makes the caption the pending text) — dropping
+        # it would lose the clip; the follow-up turn consumes it as media+caption via the event.
+        if pending and pending.strip().startswith("/") and not (
+            pending_event is not None and self._pending_event_audio_paths(pending_event)
+        ):
             _pending_cmd_word = pending.strip().split(None, 1)[0][1:].lower()
             if _pending_cmd_word:
                 with suppress(Exception):
@@ -3567,8 +3585,23 @@ class GatewayTurnMixin:
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
 
-        # Interrupted: discard the response ("Operation interrupted." is noise).
-        if not result.get("interrupted"):
+        # Interrupted: discard the response ("Operation interrupted." is noise). A queued follow-up
+        # that requested the interrupt (stamped by ``_interrupt_running_agent_for_busy_event``
+        # before its own STT wait) must also suppress the finished turn's final: that answer
+        # predates the superseding message this follow-up carries, and the follow-up turn answers
+        # with the full question + transcript instead.
+        _followup_interrupted_turn = bool(
+            pending_event is not None
+            and getattr(pending_event, "_gateway_interrupt_requested", False)
+            and not result.get("interrupted")
+        )
+        if _followup_interrupted_turn:
+            logger.info(
+                "Queued follow-up for session %s: suppressing final completed after its interrupt "
+                "request — the follow-up turn supersedes it.",
+                turn_ctx.session_key or "?",
+            )
+        elif not result.get("interrupted"):
             await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
 
         updated_history = result.get("messages", history)
