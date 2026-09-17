@@ -205,6 +205,19 @@ The terminal tool integrates a dangerous-command approval system defined in `too
 
 5. **Permanent allowlist** — the "allow permanently" option writes the pattern to `config.yaml`'s `command_allowlist`, persisting across sessions.
 
+## The live-gateway test guard
+
+Inside a **supervised gateway process** (the `hermes gateway run` service, including per-profile s6/systemd/launchd services), `terminal` and `execute_code` refuse commands that would run the Hermes project's own test suite against a Hermes checkout: `pytest`/`python -m pytest`/`unittest`, `make test`, `npm test`, and the Hermes-specific runners (`scripts/run_tests.sh`, `scripts/run_tests_parallel.py`) — including wrapped forms (`env CI=1 bash scripts/run_tests.sh`, `sudo pytest`, `timeout 300 pytest`, `sh -c '...'`) and commands that `cd` into a checkout first. The classifier is `tools/live_gateway_test_guard.py`; enforcement sits in `tools/terminal_tool_guards.py::live_gateway_test_block` (wired into `_pre_exec_block`, so both foreground and background commands are covered) and in `tools/approval.py::check_execute_code_guard` (whole-script gate).
+
+Two questions decide the verdict:
+
+1. **Runner** — does the command invoke a test runner (after wrapper peeling, quoting/ANSI/IFS normalization, `sh -c` recursion, and inert-heredoc masking)?
+2. **Target** — does the run's target directory (the runner's explicit path argument, the `workdir` parameter, the `cd`-derived directory, or the session cwd) resolve into a Hermes checkout: the running source root, its `.worktrees/*`, or any directory whose `pyproject.toml` declares `name = "hermes-agent"`?
+
+A Hermes-specific runner with **no resolvable target fails closed** (blocked); ordinary `pytest` with no resolvable target stays allowed. Both gates together keep the incident class closed while ordinary local test runs outside the Hermes repo are unaffected — and outside a supervised gateway (plain CLI, dev checkouts) nothing is ever blocked.
+
+Why: on 2026-09-17 a release card ran the Hermes suite with the terminal tool inside a production gateway container; `tests/docker` lifecycle tests sent real SIGTERM to the s6 `gateway-default` service three times. The suite's own signal handling (and Docker lifecycle fixtures) assume an isolated environment; inside the gateway they reach the live service tree. Prompt-level policy cannot hold here (profiles are isolated islands by design), so the boundary is enforced in code, fail-closed, at the shared choke point. Run Hermes tests through exact-head GitHub CI or a separate disposable container with isolated PID/service namespaces. Operators can turn the guard off per profile with `hermes config set terminal.block_live_gateway_tests false` (default `true`; no-op outside a supervised gateway).
+
 ## Terminal/runtime environments
 
 The terminal system supports multiple backends:

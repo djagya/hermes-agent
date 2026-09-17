@@ -28,7 +28,7 @@ _TOOL_LEVEL_DEFAULTS: Dict[str, Any] = {
     "cwd": ".", "ssh_host": "", "ssh_user": "", "ssh_port": 22, "ssh_key": "",
     "docker_orphan_reaper": True, "docker_persist_across_processes": True,
     "sandbox_dir": "", "lifetime_seconds": 300, "docker_shared_container_key": "",
-    "home_mode": "auto",
+    "home_mode": "auto", "block_live_gateway_tests": True,
 }
 
 

@@ -243,6 +243,31 @@ def gateway_lifecycle_block(
     return None
 
 
+def live_gateway_test_block(
+    *,
+    command: str,
+    env: Any = None,
+    env_type: str,
+    cwd: str,
+    workdir: Optional[str],
+    session_key: str,
+) -> Optional[str]:
+    """Block Hermes-repo test execution inside the live supervised gateway.
+
+    The 2026-09-17 incident: a release card ran the Hermes suite via the
+    terminal tool inside the production gateway container; docker lifecycle
+    tests SIGTERM'd the real ``gateway-default`` s6 service three times.
+    Gated on the supervised-gateway probe (a CLI / unsupervised ``hermes``
+    run keeps local tests — CI-parity instructions depend on them). Runs for
+    BOTH foreground and background commands because both reach this module
+    from ``terminal_tool._pre_exec_block`` before any spawn. Never raises:
+    an evaluation failure blocks (fail closed), per the task contract.
+    """
+    from tools.live_gateway_test_guard import hermes_live_test_block
+
+    return hermes_live_test_block(command=command, env_type=env_type, cwd=cwd, workdir=workdir)
+
+
 def self_repo_block(
     *,
     command: str,

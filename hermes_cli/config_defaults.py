@@ -344,6 +344,12 @@ DEFAULT_CONFIG = {
         # Keep a long-lived bash shell across execute() calls so cwd/env/shell variables survive.
         # Applies to non-local backends (SSH); local is opt-in via TERMINAL_LOCAL_PERSISTENT env.
         "persistent_shell": True,
+        # Live-gateway test guard (2026-09-17): inside a supervised gateway
+        # process, refuse terminal/execute_code commands that run the Hermes
+        # test suite against a Hermes checkout — lifecycle tests SIGTERM'd the
+        # real s6 gateway service. Default on; the guard is a no-op outside a
+        # supervised gateway (CLI/dev checkouts keep local test runs).
+        "block_live_gateway_tests": True,
     },
 
     "web": {

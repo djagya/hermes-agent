@@ -1078,6 +1078,24 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     pattern_key = "execute_code"
     description = _EXECUTE_CODE_DESCRIPTION
 
+    # Live-gateway Hermes-test floor (the 2026-09-17 incident): a script can
+    # ``os.system("python -m pytest tests/docker")`` and SIGTERM the real
+    # gateway service even though the script as a whole is approvable. Mirrors
+    # the terminal_tool guard; the supervised-gateway gate lives inside
+    # check_live_gateway_test_script so CLI keeps local tests.
+    from tools.live_gateway_test_guard import check_live_gateway_test_script
+    _lg_verdict, _lg_reason = check_live_gateway_test_script(code)
+    if _lg_verdict == "blocked":
+        return _denied(
+            "BLOCKED: this execute_code script would run the Hermes test "
+            f"suite inside the live gateway ({_lg_reason}). Tests in the "
+            "Hermes repo signal lifecycle handlers (s6/service trees) and "
+            "have SIGTERM'd the running gateway-default service. Run them "
+            "through exact-head GitHub CI or an isolated disposable "
+            "container — never inside this gateway process.",
+            pattern_key=pattern_key, description=description, outcome="blocked",
+        )
+
     # Isolated backends already sandbox the child. vercel_sandbox has no host-bind concept so it stays always-skipped.
     if env_type == "vercel_sandbox":
         return _approved()
