@@ -1618,32 +1618,21 @@ class GatewayInboundMixin:
         model supports native vision; the caller consumes that buffer at ``run_conversation``."""
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         message_text = (event._gateway_pending_stt_text if _pending_stt_prepared else event.text) or ""
-        if not _pending_stt_prepared and (audio_paths := self._pending_event_audio_paths(event)):
+        if not _pending_stt_prepared and self._pending_event_audio_paths(event):
             # The clip may already be transcribing in the background (drain-path receipt fix: the
-            # finished turn's answer was delivered while this ran). Join the SAME per-clip work for
-            # this turn's input — single-flight keeps it one STT call, and echo ownership stays with
-            # the background claim (none is made here). No in-flight task, or one that failed (its
-            # clip entry reset itself): transcribe inline via the normal choke point, exactly as the
-            # cold path would — echo-once, failure notes and provider fallback all apply unchanged.
-            clips = pending_audio_clips(event)
-            clip_tasks = [
-                clips[path].task for path in audio_paths
-                if clips[path].task is not None and not clips[path].task.done()
-            ]
-            _stt_failed = False
-            if clip_tasks:
-                await asyncio.wait(clip_tasks)
-                _stt_failed = any(
-                    task.cancelled() or task.exception() is not None
-                    for task in clip_tasks if task.done()
-                )
-            if _stt_failed or not hasattr(event, "_gateway_pending_stt_text"):
-                message_text = await self._transcribe_and_echo_pending_voice(
-                    event, self._adapter_for_source(source), source, event.text or "",
-                    log_context="Voice-prepare",
-                ) or message_text
+            # finished turn's answer was delivered while this ran). The canonical per-clip entry
+            # point joins that same in-flight work in-band, reuses a warm cache, or starts a cold
+            # transcription — one STT call per clip either way (gateway/pending_audio.py); it must
+            # not depend on background state existing. Echo ownership stays with whichever path
+            # claims it (the cold inbound path has never echoed). A raise from a failed shared
+            # task keeps the caption and falls through to the cold-path classification below,
+            # whose inline enrichment retries honestly (notes + provider fallback).
+            try:
+                _prepared_text, _prepared_transcripts = await self._transcribe_pending_audio_event_once(event)
+            except Exception as prep_exc:
+                logger.warning("Pending voice STT join failed: %s", prep_exc)
             else:
-                message_text = getattr(event, "_gateway_pending_stt_text", None) or message_text
+                message_text = _prepared_text if _prepared_text is not None else (event.text or "")
             # The cache attr may have just been published above; recompute so media classification
             # below treats the STT-eligible paths as prepared instead of transcribing them again.
             _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
