@@ -1683,6 +1683,12 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
                 existing.message_type = MessageType.PHOTO
             elif existing_type == MessageType.TEXT and event.message_type != MessageType.TEXT:
                 existing.message_type = event.message_type
+            # The retained event must keep the absorbed event's supersession semantics: whichever
+            # side carried the interrupt request (usually the older one — stamped by the busy
+            # interrupt handler before its own STT wait) keeps it, or the finished turn's stale
+            # final would deliver after the interruption the merged event itself caused.
+            if getattr(event, "_gateway_interrupt_requested", False):
+                existing._gateway_interrupt_requested = True
             # Rebuild the caption/transcript view while retaining shared clip work and echoes.
             for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
                 if hasattr(existing, attr):

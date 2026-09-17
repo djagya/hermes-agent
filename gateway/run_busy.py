@@ -540,12 +540,31 @@ class GatewayBusySessionMixin:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
 
+    @staticmethod
+    def _stamp_busy_interrupt_supersession(
+        event: MessageEvent, running_agent: Any, effective_mode: str, redirected: bool,
+    ) -> bool:
+        """True when this busy event will interrupt the running turn; stamps the event's
+        supersession flag so the finished turn's stale final is suppressible. MUST be called
+        BEFORE the event is queued/merged: ``merge_pending_message_event`` transfers the flag
+        onto the retained event, so stamping after the merge loses it on the absorbed object."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        will_interrupt = (
+            effective_mode == "interrupt" and not redirected
+            and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
+        )
+        if will_interrupt:
+            event._gateway_interrupt_requested = True
+        return will_interrupt
+
     async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:
         """Interrupt mode: abort in-flight tool calls; the agent loop exits at its next check point."""
         from gateway.run import _build_media_placeholder
         # Stamp supersession BEFORE any transcription wait: once this event's clip STT begins, the
         # drain path can sit minutes on the shared in-flight task, so the finished turn's final must
-        # be suppressible without waiting for it (see ``_run_agent_queued_followup``).
+        # be suppressible without waiting for it (see ``_run_agent_queued_followup``). The busy flow
+        # stamps even earlier via ``_stamp_busy_interrupt_supersession`` (pre-merge); this remains
+        # the guarantee for direct callers whose event was not queued through that flow.
         event._gateway_interrupt_requested = True
         try:
             _interrupt_text = event.text
@@ -714,6 +733,12 @@ class GatewayBusySessionMixin:
         running_agent = _busy_state.turn.agent if _busy_state else None
         _steer = await self._resolve_busy_steer_or_redirect(event, session_key, effective_mode, running_agent)
         effective_mode, redirected = _steer.effective_mode, _steer.redirected
+        # Stamp supersession BEFORE queueing: the event may be merged into a retained head
+        # below, and merge_pending_message_event transfers the flag onto the retained event —
+        # stamped after the merge it would land on the absorbed object and be lost. The
+        # returned predicate also drives the interrupt call below.
+        will_interrupt_busy_turn = self._stamp_busy_interrupt_supersession(
+            event, running_agent, effective_mode, redirected)
         # Queue as the next turn — skipped after a successful steer/redirect (the text is already in
         # the run and must NOT replay). FIFO gives each text its own turn (raw merge would join them).
         if not _steer.steered and not redirected:
@@ -730,10 +755,7 @@ class GatewayBusySessionMixin:
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
         is_redirect_mode = effective_mode == "interrupt" and redirected
-        if (
-            effective_mode == "interrupt" and not redirected
-            and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
-        ):
+        if will_interrupt_busy_turn:
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
 
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never

@@ -194,22 +194,23 @@ async def test_voice_followup_that_interrupted_suppresses_stale_final(runner_env
     voice._gateway_pending_stt_text = '"actual new question"'
     voice._gateway_pending_stt_transcripts = ["actual new question"]
 
+    original_history = [
+        {"role": "user", "content": "older task: what is the swap deadline"},
+        {"role": "assistant", "content": "please send the missing material"},
+    ]
     result = {
         "final_response": "please send the missing material",
-        # Nonempty original-question history: the superseded turn's user row that must survive
-        # into the follow-up turn (question + transcript preservation acceptance criterion).
-        "messages": [
-            {"role": "user", "content": "older task: what is the swap deadline"},
-            {"role": "assistant", "content": "please send the missing material"},
-        ],
+        # The superseded turn's real history: the original question that must survive
+        # into the follow-up turn (question + transcript preservation criterion).
+        "messages": original_history,
         "interrupted": False,
     }
     turn_ctx = _turn_ctx(source, result)
 
-    followup_messages = []
+    followup_calls = []
 
     async def fake_run_agent(**kwargs):
-        followup_messages.append(kwargs.get("message"))
+        followup_calls.append(kwargs)
         return {"final_response": "fresh answer", "messages": [], "interrupted": False}
 
     monkeypatch.setattr(runner, "_run_agent", fake_run_agent)
@@ -217,22 +218,24 @@ async def test_voice_followup_that_interrupted_suppresses_stale_final(runner_env
     merged = await runner._run_agent_queued_followup(
         turn_ctx, adapter, "", voice, None, result, None)
     assert adapter.send.await_count == 0  # no stale final, no duplicate echo
-    assert followup_messages == ['"actual new question"']
+    assert [call["message"] for call in followup_calls] == ['"actual new question"']
     assert merged.get("final_response") == "fresh answer"
     assert calls == []  # warm cache reused; no second transcription
-    # Question + transcript preservation: the follow-up message carries BOTH the retained
-    # original question (nonempty history is what reaches the real next turn) and the clip's
-    # transcript exactly once — not one at the expense of the other.
-    assert result["messages"] and result["messages"][-1]["role"] == "user"
-    assert "older task: what is the swap deadline" in result["messages"][-1]["content"]
-    assert followup_messages[0].count("actual new question") == 1
+    # Question + transcript preservation: the follow-up turn runs with the FULL preserved
+    # history — the original question survives beside the new transcript, not instead of it.
+    assert len(followup_calls) == 1
+    carried_history = followup_calls[0]["history"]
+    assert [m["content"] for m in carried_history] == [
+        "older task: what is the swap deadline", "please send the missing material",
+    ]
+    assert followup_calls[0]["message"].count("actual new question") == 1
 
 
 @pytest.mark.asyncio
 async def test_interrupt_receipt_then_drain_single_flight(runner_env, monkeypatch, tmp_path):
     """Interrupt receipt must be immediate (no STT wait) and the clip must transcribe
-    exactly once across the interrupt handler, the drain and the follow-up turn.
-    RED on base: the receipt handler blocks on STT before interrupt() returns.
+    exactly once across the interrupt handler, the busy merge route and the follow-up
+    turn. RED on base: the receipt handler blocks on STT before interrupt() returns.
     """
     runner, adapter = runner_env
     entered, release, calls = _blocking_stt(monkeypatch, "shared clip words")
@@ -255,40 +258,47 @@ async def test_interrupt_receipt_then_drain_single_flight(runner_env, monkeypatc
     assert agent.interrupts == [""]
     assert voice._gateway_interrupt_requested is True
 
-    # REAL merge route: a second incoming voice (no flag of its own) merges into the stamped
-    # event. The retained event must keep the supersession semantics — merge_pending_message_event
-    # may retain the OLDER event, so the flag must survive the merge, not live on the incoming one.
-    incoming = _voice_event(source, _clip_file(tmp_path, name="clip-b"))
+    # REAL busy queue route, in production order: the stamped event is merged into a
+    # retained head event that has no flag of its own (a follow-up queued first). The
+    # supersession semantics must transfer onto the RETAINED event — merge may keep the
+    # OLDER event, so the flag must survive the merge, not live on the absorbed object.
+    head = _voice_event(source, _clip_file(tmp_path, name="clip-head"))
+    runner._queue_or_replace_pending_event("conversation", head)
+    assert adapter._pending_messages["conversation"] is head
     from gateway.platforms.base import merge_pending_message_event
-    merge_pending_message_event(adapter._pending_messages, "conversation", incoming)
-    assert adapter._pending_messages["conversation"] is voice  # the stamped event was retained
-    assert voice._gateway_interrupt_requested is True
+    merge_pending_message_event(adapter._pending_messages, "conversation", voice)
+    assert adapter._pending_messages["conversation"] is head  # the OLDER event was retained
+    assert head._gateway_interrupt_requested is True  # flag transferred by the merge
+    assert Counter(head.media_urls) == Counter([head.media_urls[0], voice.media_urls[0]])
 
     # The post-turn drain must not block on STT either.
     pending_event, pending = await asyncio.wait_for(
         runner._run_agent_drain_pending({"interrupted": True}, adapter, source, "conversation"), 5)
-    assert pending_event is voice
+    assert pending_event is head
 
     release.set()
     await asyncio.gather(*adapter._background_tasks)
-    # One clip, one provider call, one echo, and a warm cache for the follow-up turn.
-    assert Counter(calls) == Counter([voice.media_urls[0]])  # clip-b never reaches STT: it was
-    # merged INTO the retained event, not queued behind it (media-merge semantics on this route).
+    # One provider call per clip: the absorbed clip joins the shared in-flight task the
+    # interrupt path started; the head clip transcribes exactly once.
+    assert Counter(calls) == Counter([voice.media_urls[0], head.media_urls[0]])
     delivered = [call.args[1] for call in adapter.send.await_args_list]
-    assert delivered == ['🎙️ "shared clip words"']
+    assert Counter(delivered) == Counter(['🎙️ "shared clip words"', '🎙️ "shared clip words"'])
+    # Warm cache for the follow-up turn: both transcripts join the turn input, no new STT.
     message_text = await runner._prepare_profile_scoped_inbound_message_text(
-        event=voice, source=source, history=[], session_key="conversation")
-    assert "shared clip words" in message_text
-    assert Counter(calls) == Counter([voice.media_urls[0]])  # join, not a second transcription
-    assert len([call for call in adapter.send.await_args_list]) == 1
+        event=head, source=source, history=[], session_key="conversation")
+    assert Counter(calls) == Counter([voice.media_urls[0], head.media_urls[0]])
+    assert message_text.count("shared clip words") == 2
+    assert adapter.send.await_count == 2  # the two echoes only; warm prep added none
 
 
 @pytest.mark.asyncio
 async def test_cold_inbound_voice_without_background_state(runner_env, monkeypatch, tmp_path):
     """Cold-path safety: an ordinary FIRST inbound voice event (no background STT task, no clip
     state — the scheduled-background wrapper has never run) must transcribe exactly once through
-    the canonical entry point and hand the model a real string. RED before the fix:
-    _prepare_inbound_message_text indexed clip state that did not exist (KeyError).
+    the canonical entry point, hand the model a real string, and keep the caller-side transcript
+    echo (the clip ledger makes it exactly-once). RED before the fixes: the prep indexed clip
+    state that did not exist (KeyError); after the entry-point repair the echo was lost
+    (send.await_count 0 — the transcript reached the model but never the chat).
     """
     runner, adapter = runner_env
     _unused_event, calls = _instant_stt(monkeypatch, "cold clip words")
@@ -305,34 +315,49 @@ async def test_cold_inbound_voice_without_background_state(runner_env, monkeypat
     assert "cold clip words" in message_text
     assert "please check this" in message_text  # caption preserved beside the transcript
     assert Counter(calls) == Counter([voice.media_urls[0]])
-    # Cold inbound has never echoed: the transcript reaches the model, not the chat.
-    assert adapter.send.await_count == 0
+    # Cold inbound echoes once: the user can verify STT quality exactly as the base
+    # inbound pipeline always did.
+    delivered = [call.args[1] for call in adapter.send.await_args_list]
+    assert delivered == ['🎙️ "cold clip words"']
 
 
 @pytest.mark.asyncio
-async def test_followup_prep_before_background_task_starts(runner_env, monkeypatch, tmp_path):
-    """The drained follow-up turn can reach input preparation BEFORE the background STT wrapper
-    has started the clip (no clips dict, no task yet): preparation must start/await the work via
-    the canonical entry point, publish the cache, and return the exact transcript STRING — never
-    the raw (text, transcripts) tuple the wrapper returns.
-    RED before the fix: tuple assignment made message_text a tuple (contract break).
+async def test_followup_prep_joins_inflight_clip_returns_string_once(runner_env, monkeypatch, tmp_path):
+    """A follow-up turn's input preparation arriving while the clip's shared STT task is still
+    IN FLIGHT (no completed cache yet) must join that task via the canonical entry point,
+    publish the cache, and return the exact transcript STRING — never the raw
+    (text, transcripts) tuple the wrapper returns — and the transcript must echo exactly once
+    across the prep claim and the background claim. RED on base: the prep had no STT join at
+    all (empty text); RED mid-history: tuple assignment broke the string contract.
     """
     runner, adapter = runner_env
     _unused_event, calls = _instant_stt(monkeypatch, "early join words")
 
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
     voice = _voice_event(source, _clip_file(tmp_path))
+    # The shared clip work exists but has NOT completed: an in-flight task created by the
+    # receipt path before the follow-up turn reached input preparation.
+    loop = asyncio.get_running_loop()
+    inflight = loop.create_future()
+    voice._gateway_pending_stt_clips = {
+        voice.media_urls[0]: PendingAudioClip(task=inflight)}
 
-    message_text = await asyncio.wait_for(
+    prep = asyncio.ensure_future(
         runner._prepare_profile_scoped_inbound_message_text(
-            event=voice, source=source, history=[], session_key="conversation"), 5)
+            event=voice, source=source, history=[], session_key="conversation"))
+    await asyncio.sleep(0)  # let prep reach the shielded await
+    inflight.set_result(('"early join words"', ["early join words"]))
+    message_text = await asyncio.wait_for(prep, 5)
     # The regression: assert the STRING contract, not just "contains".
     assert isinstance(message_text, str)
     assert message_text.startswith('"early join words"')
-    # Cache published by this call: the later background completion cannot double-echo.
+    # Cache published by this call: the later background claim cannot double-echo.
     assert getattr(voice, "_gateway_pending_stt_text", None) == message_text
-    assert Counter(calls) == Counter([voice.media_urls[0]])
-    assert adapter.send.await_count == 0  # no echo on this path
+    assert Counter(calls) == Counter([voice.media_urls[0]])  # joined, not restarted
+    # Exactly one echo across prep + background: the clip ledger is the once-guard.
+    await asyncio.gather(*adapter._background_tasks)
+    delivered = [call.args[1] for call in adapter.send.await_args_list]
+    assert delivered == ['🎙️ "early join words"']
 
 
 @pytest.mark.asyncio

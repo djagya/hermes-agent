@@ -1633,6 +1633,16 @@ class GatewayInboundMixin:
                 logger.warning("Pending voice STT join failed: %s", prep_exc)
             else:
                 message_text = _prepared_text if _prepared_text is not None else (event.text or "")
+                # Echo ownership belongs to the background claim on receipt-fixed routes, but this
+                # entry point is also the COLD ordinary-inbound path — there no background wrapper
+                # exists, so the caller-side echo-once contract (the base-mode behavior
+                # ``_enrich_inbound_voice`` preserves, and the upstream entry suite asserts with
+                # echo=True) would silently die. The clip ledger makes it exactly-once.
+                await self._echo_pending_stt_transcripts_once(
+                    event, self._adapter_for_source(source), source, _prepared_transcripts,
+                    metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                    log_context="Voice-prepare",
+                )
             # The cache attr may have just been published above; recompute so media classification
             # below treats the STT-eligible paths as prepared instead of transcribing them again.
             _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
