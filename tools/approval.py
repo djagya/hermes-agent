@@ -559,6 +559,12 @@ class _GateSpec:
     cli_timeout: str          # {breaker}
     cli_denied: str           # {description}{breaker}
     smart_log: str            # {command}{description}{session_key}
+    # Correlation tag recorded on every result of this gate (``decision_source``),
+    # so a result log answers WHO decided without guessing from absence-of-fields:
+    # "smart" = guardian LLM, "human" = the operator or owner, "unattended" = an
+    # unattended-context mode, "prefilter" = a hardline/deny/allowlist resolution
+    # before any gate ran.
+    gate_id: str = ""
 
 
 _STOP_COMMAND = (
@@ -586,6 +592,7 @@ _COMMAND_GATE = _GateSpec(
                 + " Silence is not consent.{breaker}",
     cli_denied="BLOCKED: User denied this command." + _STOP_COMMAND + "{breaker}",
     smart_log="Smart approval: auto-approved '{command}' ({description})",
+    gate_id="command",
 )
 _EXECUTE_CODE_GATE = _GateSpec(
     noun="code", transport=True, user_approved=True, redact_cli=True, pending_keys=True,
@@ -605,6 +612,7 @@ _EXECUTE_CODE_GATE = _GateSpec(
         "'{description}'). Do NOT retry — the user has explicitly rejected it.{breaker}"
     ),
     smart_log="Smart approval: auto-approved execute_code for session {session_key}",
+    gate_id="execute_code",
 )
 # Plugin-escalated tool calls / protected writes: no transport, no breaker,
 # no user_approved marker (parity with the historical gate).
@@ -621,6 +629,7 @@ _ACTION_GATE = _GateSpec(
         "'{description}'). Do NOT retry — the user has explicitly rejected it."
     ),
     smart_log="",
+    gate_id="action",
 )
 
 
@@ -640,20 +649,28 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
     if verdict == "approve":
         _reset_denials(session_key)
         logger.debug(spec.smart_log.format(command=command[:60], description=description, session_key=session_key))
-        return {"approved": True, "message": None, "smart_approved": True, "description": description}, False
+        result = {"approved": True, "message": None, "smart_approved": True, "description": description,
+                  "decision_source": "smart"}
+        if spec.gate_id:
+            result["gate_id"] = spec.gate_id
+        return result, False
     if verdict != "deny":
         return None, False
     _record_denial(session_key)
     if human_present:
         return None, True
-    return {
+    result = {
         # Unattended programmatic platforms (webhook/msgraph_webhook/ api_server): respect unattended_mode
         # config. Resolves instantly — never a pending approval nobody can answer (#37284, #87509).
         "approved": False,
         "message": (f"BLOCKED by smart approval: {description}. The command was assessed as genuinely "
                     f"dangerous. Do NOT retry.{_denial_breaker_addendum(session_key)}"),
         "smart_denied": True,
-    }, True
+        "decision_source": "smart",
+    }
+    if spec.gate_id:
+        result["gate_id"] = spec.gate_id
+    return result, True
 
 
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
@@ -686,17 +703,23 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             breaker = _denial_breaker_addendum(session_key)
         deny_reason = fmt.pop("deny_reason", None)
         extra = {"deny_reason": deny_reason} if "reason" in fmt else {}
+        # From here the decision is the human gate's (owner choice, timeout, or refusal) —
+        # recorded so a result never reads as a guardian decision by implication.
         return _denied(template.format(description=description, breaker=breaker, **fmt),
                        pattern_key=pattern_key, description=description,
-                       outcome=outcome, **extra)
+                       outcome=outcome, decision_source="human", **extra)
 
     def grant(choice: str) -> dict:
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
         if not smart_denied:
             _persist_choice(session_key, choice, warnings)
         if spec.user_approved:
-            return _user_approved(session_key, description)
-        return _approved()
+            result = _user_approved(session_key, description)
+        else:
+            result = _approved()
+        if spec.gate_id:
+            result["gate_id"] = spec.gate_id
+        return result
 
     if spec.transport:
         attempt = _present_with_selected_transport(
