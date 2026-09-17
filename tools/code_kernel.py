@@ -750,9 +750,11 @@ def execute_in_session_kernel(
     exec_start = time.monotonic()
     kernel, state_reset = _acquire_kernel(key, reset)
     try:
-        return _run_cell(kernel, key, code, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
-                         sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
-                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset)
+        result = _run_cell(kernel, key, code, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
+                           sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
+                           is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset)
+        _record_cell_for_provenance(key[0], code)
+        return result
     finally:
         with _REGISTRY.lock:
             kernel.attached -= 1
@@ -762,6 +764,22 @@ def execute_in_session_kernel(
             orphaned = kernel.attached == 0 and _KERNELS.get(key) is not kernel
         if orphaned:
             kernel.teardown()
+
+
+def _record_cell_for_provenance(owner: str, code: str) -> None:
+    """Feed one settled cell to the host-side helper-provenance registry (best-effort).
+
+    The registry powers bounded, redacted context for the approval gate when a later
+    cell calls helpers defined in earlier ones. Never raises: provenance is context,
+    not control flow.
+    """
+    if not owner or not code:
+        return
+    try:
+        from tools.approval_provenance import record_cell
+        record_cell(owner, code)
+    except Exception:
+        logger.debug("cell provenance recording failed", exc_info=True)
 
 
 def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, child_python: str,

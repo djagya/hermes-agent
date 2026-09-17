@@ -204,6 +204,39 @@ _BINARY_MAGICS = (
 )
 
 
+# --- scan verdict taxonomy --------------------------------------------------------------------
+#
+# A guard can observe three different things and collapsing them into one boolean is what
+# mislabeled a >1 MiB JSON data file as a gateway-restart attempt: (a) an observed dangerous
+# operation, (b) an oversized/indeterminate referenced file that was refused WITHOUT being
+# scanned (nothing dangerous observed), and (c) a scan budget exhausted before coverage
+# completed (nothing dangerous observed). (b)/(c) must still fail closed — an unscanned
+# referenced script could hide a lifecycle command — but the diagnostic must not claim a
+# lifecycle command was seen. (Internal approval false-positive diagnosis, Sept 2026.)
+
+class LifecycleScanVerdict:
+    """Typed outcome of a bounded lifecycle scan (see module docstring for the taxonomy)."""
+
+    __slots__ = ("kind", "detail")
+
+    def __init__(self, kind: str, detail: str = "") -> None:
+        self.kind = kind
+        self.detail = detail
+
+    @property
+    def blocked(self) -> bool:
+        return self.kind != "clean"
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"LifecycleScanVerdict({self.kind!r}, {self.detail!r})"
+
+
+CLEAN_SCAN = "clean"
+BLOCKED_SCAN = "blocked"
+INCONCLUSIVE_OVERSIZE_SCAN = "inconclusive_oversize"
+INCONCLUSIVE_BUDGET_SCAN = "inconclusive_budget"
+
+
 # --- profile identity -------------------------------------------------------------------------
 
 def _current_profile_name() -> Optional[str]:
@@ -901,61 +934,121 @@ def _read_script_for_scanning(script_path: str) -> str:
     return script_text or ""
 
 
+def _classify_discovered_reference(
+    path: Path, unsafe: bool, scanned: bool
+) -> LifecycleScanVerdict:
+    """Turn one discovered reference's read outcome into the typed verdict.
+
+    ``scanned``: the content actually entered the lifecycle scan. When it did, the
+    boolean result is authoritative (a hit is BLOCKED, a miss CLEAN). When it did not
+    (oversized/indeterminate — refused BEFORE any scan), the verdict is the honest
+    INCONCLUSIVE kind: fail closed, but never claim a lifecycle command was observed.
+    No suffix or content-shape exemption exists: every discovered executable reference
+    keeps its pre-existing treatment regardless of extension or contents.
+    """
+    if scanned:
+        if unsafe:
+            return LifecycleScanVerdict(BLOCKED_SCAN)
+        return LifecycleScanVerdict(CLEAN_SCAN)
+    detail = ""
+    try:
+        size = path.stat().st_size
+        if size > _MAX_REFERENCED_SCRIPT_BYTES:
+            detail = f"{size} bytes"
+    except OSError:
+        pass
+    return LifecycleScanVerdict(INCONCLUSIVE_OVERSIZE_SCAN, detail or str(path))
+
+
 # --- recursive walk ---------------------------------------------------------------------------
 
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
-) -> bool:
+) -> LifecycleScanVerdict:
     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
     if not budget.charge_text(command):
-        return _budget_exhausted("text", depth)
+        _budget_exhausted("text", depth)  # WARNING log for operators; verdict below is typed
+        return LifecycleScanVerdict(
+            INCONCLUSIVE_BUDGET_SCAN,
+            "scan budget exhausted before coverage completed; no lifecycle command observed",
+        )
     if _direct_lifecycle_scan(command):
-        return True
+        return LifecycleScanVerdict(BLOCKED_SCAN, "direct text scan matched a lifecycle command")
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
-        return True
+        return LifecycleScanVerdict(
+            INCONCLUSIVE_BUDGET_SCAN,
+            f"reference depth exceeded {_MAX_REFERENCED_SCRIPT_DEPTH}; no lifecycle command observed",
+        )
 
-    def recurse(text: str, cwd: Optional[str]) -> bool:
+    def recurse(text: str, cwd: Optional[str]) -> LifecycleScanVerdict:
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
             read_remote_script=read_remote_script,
         )
 
     for payload in _iter_shell_command_payloads(command):
-        if recurse(payload, cwd):
-            return True
+        verdict = recurse(payload, cwd)
+        if verdict.blocked:
+            return verdict
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    # Discovery runs on the heredoc-masked text: a provably inert quoted-heredoc body is DATA
+    # for this shell level (the stripper fails open on any ambiguity), so a path that appears
+    # only inside such a body is not a script this shell would execute. A >1 MiB JSON path
+    # merely printed by a Python heredoc must not turn the guard into a "gateway restart"
+    # refusal (reference discovery, not the direct scan, produced it). The
+    # direct scans above already apply the same fail-open masking. Every reference discovered
+    # OUTSIDE such bodies keeps its pre-existing treatment — read and scanned regardless of
+    # suffix, contents, or size (oversized/indeterminate still fails closed, now typed as
+    # inconclusive instead of claiming a lifecycle command was observed).
+    from tools.shell_heredoc import strip_inert_heredoc_bodies
+
+    discovery_text = strip_inert_heredoc_bodies(command)
+    for script_path in _iter_referenced_shell_scripts(discovery_text, cwd=cwd):
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
         if _on_cloud_path(script_path):
-            return True
+            return LifecycleScanVerdict(
+                BLOCKED_SCAN, "referenced script lives on a cloud-synced FileProvider path"
+            )
         resolved = _resolve_lenient(script_path)
         if resolved in visited:
             continue
         if not budget.charge_path():
-            return _budget_exhausted("paths", depth)
+            _budget_exhausted("paths", depth)  # WARNING log for operators; verdict below is typed
+            return LifecycleScanVerdict(
+                INCONCLUSIVE_BUDGET_SCAN,
+                "unique-path budget exhausted before coverage completed; no lifecycle command observed",
+            )
         visited.add(resolved)
         # Never read more than the walk can still afford to tokenize; a file larger than the
         # remainder fails closed exactly like an oversized one.
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
-            return True
+            # Read refused (oversized/indeterminate/live SQLite connection) — the content was
+            # NOT scanned. Fail closed with the honest kind: nothing dangerous was observed.
+            return _classify_discovered_reference(resolved, unsafe=True, scanned=False)
         if script_text is None and read_remote_script is not None:
             # Local path missing; the remote backend's output crosses the same trust boundary as a
             # local read — sanitize identically (binary skip + size fail-closed).
             if not budget.charge_remote_read():
-                return _budget_exhausted("remote reads", depth)
+                _budget_exhausted("remote reads", depth)  # WARNING log; verdict below is typed
+                return LifecycleScanVerdict(
+                    INCONCLUSIVE_BUDGET_SCAN,
+                    "remote-read budget exhausted before coverage completed; "
+                    "no lifecycle command observed",
+                )
             script_text, unsafe = _sanitize_remote_script_text(
                 read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
             )
             if unsafe:
-                return True
+                return _classify_discovered_reference(resolved, unsafe=True, scanned=False)
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's directory, not the cwd.
-        if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd):
-            return True
-    return False
+        verdict = recurse(script_text, _resolve_script_directory(str(resolved)) or cwd)
+        if verdict.blocked:
+            return verdict
+    return LifecycleScanVerdict(CLEAN_SCAN)
 
 
 def contains_gateway_lifecycle_command_or_referenced_script(
@@ -972,6 +1065,31 @@ def contains_gateway_lifecycle_command_or_referenced_script(
     boundary instead of per-syscall: a guard crash propagates out of ``tools/terminal_tool.py`` and breaks
     every terminal command until the gateway restarts (#77780, #78256), which is strictly worse than either
     verdict.
+
+    Callers that need to know WHY (observed lifecycle command vs. inconclusive
+    oversized/indeterminate vs. budget exhaustion) use
+    :func:`classify_gateway_lifecycle_scan` instead — a ``True`` here does not always
+    mean a lifecycle command was observed.
+    """
+    return classify_gateway_lifecycle_scan(
+        command, cwd=cwd, read_remote_script=read_remote_script
+    ).blocked
+
+
+def classify_gateway_lifecycle_scan(
+    command: str, *, cwd: Optional[str] = None,
+    read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+) -> LifecycleScanVerdict:
+    """Typed scan verdict: ``blocked`` plus an honest ``kind``/``detail``.
+
+    Same walk as :func:`contains_gateway_lifecycle_command_or_referenced_script` (which is
+    exactly ``.blocked`` of this), preserving its never-raises contract: an unexpected walk
+    failure logs and falls back to the direct scans. Kinds:
+    ``blocked`` — a lifecycle/submit command was OBSERVED (direct scan, referenced script, or
+    payload recursion); ``inconclusive_oversize`` — a discovered reference was refused before
+    being scanned (oversized/indeterminate), so coverage is incomplete but nothing dangerous
+    was observed; ``inconclusive_budget`` — the walk budget/depth was exhausted before
+    coverage completed, nothing dangerous observed.
     """
     try:
         return _contains_unsafe_gateway_action(
@@ -985,10 +1103,47 @@ def contains_gateway_lifecycle_command_or_referenced_script(
             exc_info=True,
         )
         try:
-            return _direct_lifecycle_scan(command)
+            if _direct_lifecycle_scan(command):
+                return LifecycleScanVerdict(BLOCKED_SCAN, "direct text scan matched (fallback path)")
         except Exception:
             # If even the data-argument masker fails, fall to raw regex + submit scan: stay total.
-            return contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(command)
+            try:
+                if contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(command):
+                    return LifecycleScanVerdict(BLOCKED_SCAN, "direct text scan matched (last-resort fallback)")
+            except Exception:
+                pass
+            return LifecycleScanVerdict(
+                INCONCLUSIVE_BUDGET_SCAN, "walk and fallback scans failed; refusing"
+            )
+        return LifecycleScanVerdict(CLEAN_SCAN)
+
+
+def _lifecycle_block_message(verdict: LifecycleScanVerdict) -> str:
+    """Refusal text attributed to what the scan actually observed: a blocked verdict says a
+    lifecycle command was found; an inconclusive one says coverage was incomplete WITHOUT
+    claiming a gateway-restart command was seen (the misattribution that made a >1 MiB JSON
+    data file read as a restart attempt)."""
+    if verdict.kind == INCONCLUSIVE_OVERSIZE_SCAN:
+        return (
+            "Blocked: a script referenced by this job could not be scanned "
+            f"({verdict.detail}). The guard refuses files it cannot fully scan, so the "
+            "job cannot be verified safe; no lifecycle command was found in what was "
+            "scanned. Move large data files out of executed paths or reduce their size "
+            "and recreate the job."
+        )
+    if verdict.kind == INCONCLUSIVE_BUDGET_SCAN:
+        return (
+            "Blocked: the gateway lifecycle scan could not complete "
+            f"({verdict.detail}). The job cannot be verified safe; no lifecycle command "
+            "was found in what was scanned. Simplify the job's scripts and recreate it."
+        )
+    return (
+        "Blocked: cron job contains a gateway lifecycle command or persistent "
+        "launchctl submit operation. This is blocked to prevent agent-driven "
+        "SIGTERM-respawn loops under launchd/systemd supervision "
+        "(#30719). Run `hermes gateway restart` from a shell outside "
+        "the running gateway instead."
+    )
 
 
 def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None) -> None:
@@ -1028,18 +1183,19 @@ def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None)
         # The direct command regex below still scans the full text, so a literal `hermes gateway restart`
         # embedded in a .py script is still blocked. See #77131, #78398.
         if not _LifecycleScanBudget().charge_text(combined):
-            unsafe = _budget_exhausted("text", 0)
+            verdict = LifecycleScanVerdict(
+                INCONCLUSIVE_BUDGET_SCAN,
+                "text budget exhausted before the scan; no lifecycle command observed",
+            )
         else:
-            unsafe = _lifecycle_command_scan_with_data_exemption(combined)
+            verdict = (
+                LifecycleScanVerdict(BLOCKED_SCAN, "direct text scan matched a lifecycle command")
+                if _lifecycle_command_scan_with_data_exemption(combined)
+                else LifecycleScanVerdict(CLEAN_SCAN)
+            )
     else:
-        unsafe = contains_gateway_lifecycle_command_or_referenced_script(
+        verdict = classify_gateway_lifecycle_scan(
             combined, cwd=_resolve_script_directory(script) if script else None
         )
-    if unsafe:
-        raise GatewayLifecycleBlocked(
-            "Blocked: cron job contains a gateway lifecycle command or persistent "
-            "launchctl submit operation. This is blocked to prevent agent-driven "
-            "SIGTERM-respawn loops under launchd/systemd supervision "
-            "(#30719). Run `hermes gateway restart` from a shell outside "
-            "the running gateway instead."
-        )
+    if verdict.blocked:
+        raise GatewayLifecycleBlocked(_lifecycle_block_message(verdict))

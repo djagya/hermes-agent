@@ -204,7 +204,9 @@ def gateway_lifecycle_block(
         return None
     from cron.lifecycle_guard import (
         _MAX_REFERENCED_SCRIPT_BYTES,
-        contains_gateway_lifecycle_command_or_referenced_script,
+        INCONCLUSIVE_BUDGET_SCAN,
+        INCONCLUSIVE_OVERSIZE_SCAN,
+        classify_gateway_lifecycle_scan,
         contains_launchctl_submit_command,
         lifecycle_scan_root_within_budget,
     )
@@ -227,11 +229,37 @@ def gateway_lifecycle_block(
     guard_cwd = _resolve_command_cwd(
         workdir=workdir, default_cwd=guard_cwd_base, session_key=session_key, env_type=env_type,
     )
-    if contains_gateway_lifecycle_command_or_referenced_script(
+    # Typed verdicts, not a bare boolean: an inconclusive scan (oversized or
+    # budget-limited reference that was refused WITHOUT being scanned) must fail
+    # closed WITHOUT surfacing the restart-implying refusal text — the cron path
+    # already words this honestly ("no lifecycle command was found in what was
+    # scanned"), and the terminal surface is the same guard, not a different one.
+    # The observed-block message keeps its exact prior text.
+    verdict = classify_gateway_lifecycle_scan(
         command,
         cwd=guard_cwd,
         read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
-    ):
+    )
+    if verdict.kind == INCONCLUSIVE_OVERSIZE_SCAN:
+        logger.warning("Lifecycle scan inconclusive (oversized reference: %s); failing closed", verdict.detail)
+        return _blocked_json(
+            "Blocked: a script referenced by this command could not be scanned "
+            f"({verdict.detail}). The guard refuses files it cannot fully scan, so the "
+            "command cannot be verified safe; no lifecycle command or referenced "
+            "script was found in what was scanned. Move large data files out of "
+            "executed paths or reduce their size and run the command again.",
+            "error",
+        )
+    if verdict.kind == INCONCLUSIVE_BUDGET_SCAN:
+        logger.warning("Lifecycle scan inconclusive (budget exhausted); failing closed")
+        return _blocked_json(
+            "Blocked: the gateway lifecycle scan could not complete "
+            f"({verdict.detail}). The command cannot be verified safe; no lifecycle "
+            "command or referenced script was found in what was scanned. Simplify "
+            "the command and try again.",
+            "error",
+        )
+    if verdict.blocked:
         return _blocked_json(
             "Blocked: command or referenced script cannot restart, stop, or "
             "uninstall the gateway from inside the gateway process. The gateway would "

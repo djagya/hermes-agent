@@ -7,7 +7,8 @@ order the runtime guard (``check_all_command_guards``) applies them:
 1. container-skip gate (isolated backends bypass all guards), 2. hardline blocklist (never
 bypassable, fires before yolo/off), 3. sudo-stdin guard (unconditional), 4. user ``approvals.deny``
 rules (fire before yolo/off), 5. yolo / ``approvals.mode: off`` bypass, 6. permanent
-``command_allowlist``, 7. dangerous-pattern detection (would prompt).
+``command_allowlist``, 7. dangerous-pattern detection (enters the approval gate; the gate's own
+outcome — guardian, prompt, or unattended mode — is NOT simulated).
 """
 
 from __future__ import annotations
@@ -103,14 +104,16 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
     if approval_floors._command_matches_permanent_allowlist(command):
         return result("allow", detail="matches command_allowlist in config.yaml (permanently approved)")
 
-    # 7. Dangerous-pattern detection → would prompt.
+    # 7. Dangerous-pattern detection → enters the approval gate.
     is_dangerous, pattern_key, description = approval_detection.detect_dangerous_command(command)
     if is_dangerous:
         return result(
             "ask-approval", rule=description,
-            detail="matches a dangerous-command pattern; the runtime would "
-                   f"raise an interactive approval prompt (pattern key: "
-                   f"{pattern_key!r})",
+            detail="matches a dangerous-command pattern; the runtime passes this command "
+                   f"to the approval gate (pattern key: {pattern_key!r}). This dry-run stops "
+                   "here — it does NOT simulate the gate's outcome: under approvals.mode=smart "
+                   "the guardian LLM may resolve it without a prompt, an interactive session "
+                   "would prompt, and unattended contexts follow their configured mode.",
         )
 
     return result("allow", detail="no guard matched; would run without a prompt")

@@ -223,3 +223,18 @@ class TestOutputAndWiring:
         assert rc == 0
         assert "ls -la" in out
         assert "-- ls" not in out
+
+
+class TestGateOutcomeWording:
+    def test_ask_approval_does_not_claim_a_prompt_will_fire(self, isolated_approvals,
+                                                            capsys):
+        """The dry-run observes prefilter classification only: it must NOT claim
+        the runtime would raise an interactive prompt (smart mode may resolve the
+        command in the gate without one)."""
+        rc = at.approvals_test_command(_args(["rm", "-rf", "~/project/build"]))
+        out = capsys.readouterr().out
+        assert rc == 2
+        assert "ask-approval" in out
+        assert "would raise an interactive approval prompt" not in out
+        assert "approval gate" in out
+        assert "does NOT simulate" in out
