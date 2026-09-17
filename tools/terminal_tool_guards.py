@@ -245,9 +245,9 @@ def gateway_lifecycle_block(
         return _blocked_json(
             "Blocked: a script referenced by this command could not be scanned "
             f"({verdict.detail}). The guard refuses files it cannot fully scan, so the "
-            "command cannot be verified safe; no lifecycle command was found in what "
-            "was scanned. Move large data files out of executed paths or reduce their "
-            "size and run the command again.",
+            "command cannot be verified safe; no lifecycle command or referenced "
+            "script was found in what was scanned. Move large data files out of "
+            "executed paths or reduce their size and run the command again.",
             "error",
         )
     if verdict.kind == INCONCLUSIVE_BUDGET_SCAN:
@@ -255,7 +255,8 @@ def gateway_lifecycle_block(
         return _blocked_json(
             "Blocked: the gateway lifecycle scan could not complete "
             f"({verdict.detail}). The command cannot be verified safe; no lifecycle "
-            "command was found in what was scanned. Simplify the command and try again.",
+            "command or referenced script was found in what was scanned. Simplify "
+            "the command and try again.",
             "error",
         )
     if verdict.blocked:

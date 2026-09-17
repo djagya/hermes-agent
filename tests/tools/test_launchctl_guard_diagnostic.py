@@ -72,7 +72,7 @@ def test_inconclusive_oversize_reference_does_not_imply_restart(tmp_path, monkey
     result = json.loads(blocked)
     assert result["exit_code"] == 1
     assert "could not be scanned" in result["error"]
-    assert "no lifecycle command was found" in result["error"]
+    assert "no lifecycle command or referenced script was found" in result["error"]
     assert "cannot restart, stop, or uninstall" not in result["error"]
 
 
