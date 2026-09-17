@@ -3,6 +3,16 @@ name: JS Tests
 
 on:
   workflow_call:
+    inputs:
+      workspaces:
+        description: >-
+          JSON array of npm workspace dirs to check (from the classifier's
+          frontend_workspaces output). '[]' or empty = all workspaces —
+          fail-open is deliberate: an unmapped frontend change must run
+          everything, never nothing.
+        type: string
+        required: false
+        default: ''
 
 jobs:
   workspaces:
@@ -50,6 +60,8 @@ jobs:
         with:
           command: npm ci --ignore-scripts
       - id: set-matrix
+        env:
+          SELECTED_WORKSPACES: ${{ inputs.workspaces }}
         run: |
           node -e '
             const { execSync } = require("child_process");
@@ -58,8 +70,31 @@ jobs:
               console.error("::error::Workspace discovery produced an empty package list — refusing to emit a zero-length matrix (would skip all JS/TS checks silently).");
               process.exit(1);
             }
+            // Workspace selection: empty/unparseable input selects everything
+            // (fail-open). A non-empty selection that matches NO workspace is
+            // a hard error — that is a zero-job escape, not a skip.
+            let selected = [];
+            const raw = (process.env.SELECTED_WORKSPACES || "").trim();
+            if (raw) {
+              try { selected = JSON.parse(raw); } catch { selected = []; }
+              if (!Array.isArray(selected)) selected = [];
+            }
+            let wanted = pkgs;
+            if (selected.length > 0) {
+              wanted = pkgs.filter(p => selected.includes(p.location));
+              const known = new Set(pkgs.map(p => p.location));
+              const unknown = selected.filter(w => !known.has(w));
+              if (unknown.length > 0) {
+                console.error("::warning::selected workspace(s) not present in this checkout: " + unknown.join(", "));
+              }
+              if (wanted.length === 0) {
+                console.error("::error::workspace selection " + raw + " matched no workspace — refusing a zero-job JS lane.");
+                process.exit(1);
+              }
+              console.log("selected workspaces: " + wanted.map(p => p.location).join(", "));
+            }
             const checks = [];
-            for (const pkg of pkgs) {
+            for (const pkg of wanted) {
               const scripts = pkg.scripts || {};
               const subs = Object.keys(scripts).filter(s => /^check:.+$/.test(s));
               if (subs.length > 0) {
@@ -71,7 +106,7 @@ jobs:
               }
             }
             if (checks.length === 0) {
-              console.error("::error::No check scripts found in any workspace package.");
+              console.error("::error::No check scripts found in the selected workspace package(s).");
               process.exit(1);
             }
             process.stdout.write("checks=" + JSON.stringify(checks) + "\n");
