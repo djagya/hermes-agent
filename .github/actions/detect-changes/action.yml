@@ -2,14 +2,24 @@ name: Detect affected areas
 description: >-
   Classify a PR's changed files into CI work lanes (python, frontend, site,
   scan, deps, mcp_catalog) so the orchestrator can conditionally call only
-  the sub-workflows a PR can affect. Outputs are always "true" on push/dispatch
-  events and fail open (everything "true") when the diff cannot be computed.
+  the sub-workflows a PR can affect. Outputs fail open (everything "true",
+  selectors at their broadest) when the diff cannot be computed. Push events
+  stay fail-open UNLESS the caller opts into selective-on-push (the fork's
+  ci.yaml does; upstream's nix.yml/docker.yml keep the always-full default).
 
 inputs:
   github-token:
     description: Token for the GitHub API (gh CLI). Pass steps.app-token.outputs.token from the calling workflow.
     required: false
     default: ${{ github.token }}
+  selective-on-push:
+    description: >-
+      On push events, classify the pushed diff (github.event.before...sha)
+      instead of failing open. Any comparison failure still fails open.
+      workflow_dispatch is never affected: dispatch is the explicit
+      full-validation mode.
+    required: false
+    default: 'false'
 
 outputs:
   python:
@@ -63,6 +73,21 @@ outputs:
   ci_review_files:
     description: JSON list of CI-sensitive files changed by the pull request.
     value: ${{ steps.classify.outputs.ci_review_files }}
+  py_scope:
+    description: full | selective | none — how much of the pytest suite the Python lane runs.
+    value: ${{ steps.classify.outputs.py_scope }}
+  py_roots:
+    description: JSON candidate groups for scripts/ci/select_test_roots.py (selective scope).
+    value: ${{ steps.classify.outputs.py_roots }}
+  frontend_workspaces:
+    description: JSON list of npm workspaces to check ([] = all, fail-open).
+    value: ${{ steps.classify.outputs.frontend_workspaces }}
+  os_tests:
+    description: Run the macOS/Windows OS-marked test lanes.
+    value: ${{ steps.classify.outputs.os_tests }}
+  mode:
+    description: full when the classifier failed open, else selective. Audit surface.
+    value: ${{ steps.classify.outputs.mode }}
 
 runs:
   using: composite
@@ -81,46 +106,90 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        PUSH_HEAD: ${{ github.sha }}
+        SELECTIVE_ON_PUSH: ${{ inputs.selective-on-push }}
       run: |
         set -euo pipefail
 
-        # Only pull_request events are gated. Other events (push, release,
-        # dispatch) leave CHANGED empty, so the classifier fails open and every
-        # lane runs. Post-merge / on-demand validation is never weakened.
+        compare_files() {
+          # $1 = base SHA, $2 = head SHA. Retried: a rate-limit blip or
+          # eventual-consistency 404 on a freshly-pushed HEAD would otherwise
+          # silently fall open (all lanes run — safe, but wasteful and it
+          # masks the API failure).
+          #
+          # `.files[]?` (null-safe): with --paginate, a comparison more than
+          # 100 commits long paginates, and pages after the first carry
+          # `files: null` — bare `.files[]` makes jq die with "cannot iterate
+          # over: null", which fails every retry and forces the fail-open
+          # path (seen on stacked PRs). The full file list (up to the API's
+          # 300-file cap) is on page one.
+          local changed=""
+          for i in 1 2 3; do
+            if changed="$(gh api \
+              --paginate \
+              "repos/${REPO}/compare/$1...$2" \
+              --jq '.files[]?.filename')"; then
+              printf '%s' "$changed"
+              return 0
+            fi
+            if [ "$i" = 3 ]; then
+              return 1
+            fi
+            echo "::warning::compare API failed (attempt $i); retrying in 10s"
+            sleep 10
+          done
+        }
+
+        CHANGED=""
         if [ "$EVENT_NAME" = "pull_request" ]; then
           # Use the compare endpoint with the pinned base/head SHAs from the
           # event payload instead of the "current PR files" endpoint. The SHAs
           # are frozen at trigger time, so the file list is deterministic even
           # if the PR receives a new push between trigger and detect.
-          #
-          # Retried: a rate-limit blip or eventual-consistency 404 on a
-          # freshly-pushed HEAD would otherwise silently fall open (all lanes
-          # run — safe, but wasteful and it masks the API failure).
-          #
-          # `.files[]?` (null-safe): with --paginate, a PR more than 100
-          # commits ahead of its merge-base paginates the compare, and pages
-          # after the first carry `files: null` — bare `.files[]` makes jq
-          # die with "cannot iterate over: null", which fails every retry
-          # and forces the fail-open path (seen on stacked PRs). The full
-          # file list (up to the API's 300-file cap) is on page one.
-          CHANGED=""
-          for i in 1 2 3; do
-            if CHANGED="$(gh api \
-              --paginate \
-              "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-              --jq '.files[]?.filename')"; then
-              break
-            fi
-            if [ "$i" = 3 ]; then
-              echo "::warning::compare API failed after 3 attempts — failing open (all lanes run)"
+          if ! CHANGED="$(compare_files "$BASE_SHA" "$HEAD_SHA")"; then
+            echo "::warning::compare API failed after 3 attempts — failing open (all lanes run)"
+            CHANGED=""
+          fi
+        elif [ "$EVENT_NAME" = "push" ] && [ "$SELECTIVE_ON_PUSH" = "true" ]; then
+          # Fork minute optimization (ci.yaml opts in; upstream's nix/docker
+          # callers keep the fail-open default): classify the pushed diff so
+          # post-merge validation runs only the affected lanes. Any failure —
+          # including a force-push/branch-recreation all-zero `before` SHA —
+          # fails open to the full run.
+          case "$PUSH_BEFORE" in
+            *[!0]*) : ;;
+            *) PUSH_BEFORE="" ;;
+          esac
+          if [ -n "$PUSH_BEFORE" ]; then
+            if ! CHANGED="$(compare_files "$PUSH_BEFORE" "$PUSH_HEAD")"; then
+              echo "::warning::push compare failed after 3 attempts — failing open (all lanes run)"
               CHANGED=""
-              break
             fi
-            echo "::warning::compare API failed (attempt $i); retrying in 10s"
-            sleep 10
-          done
+          else
+            echo "::warning::no usable push 'before' SHA — failing open (all lanes run)"
+          fi
         fi
+        # workflow_dispatch and every other event keep CHANGED empty: the
+        # classifier fails open and every lane runs. Dispatch IS the explicit
+        # full-validation mode.
 
         echo "Changed files:"
         printf '%s\n' "${CHANGED:-(none)}"
-        printf '%s\n' "${CHANGED:-}" | python3 scripts/ci/classify_changes.py
+        printf '%s\n' "${CHANGED:-}" | python3 scripts/ci/classify_changes.py | tee /tmp/classify-out.txt
+
+        # Audit surface: the run page records which mode and lanes the
+        # classifier selected, so a green run can be checked for
+        # green-by-subtraction after the fact.
+        {
+          echo "## Change classification"
+          echo ""
+          echo "- event: \`$EVENT_NAME\`"
+          echo "- mode: \`$(grep '^mode=' /tmp/classify-out.txt | cut -d= -f2)\`"
+          echo "- py_scope: \`$(grep '^py_scope=' /tmp/classify-out.txt | cut -d= -f2)\`"
+          echo "- changed files: $(printf '%s\n' "${CHANGED:-}" | grep -c . || true)"
+          echo ""
+          echo '```'
+          cat /tmp/classify-out.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"

@@ -45,10 +45,16 @@ DEFAULT = {
     "rust": True,
     "mcp_catalog": False,
     "ci_review": True,
+    # Fail-open: full suite, all workspaces, both OS lanes, mode=full.
+    "py_scope": "full",
+    "py_roots": json.dumps([["tests"]]),
+    "frontend_workspaces": json.dumps([]),
+    "os_tests": True,
+    "mode": "full",
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None, py_full=None, py_roots=None, workspaces=None, os_tests=False, mode="selective") -> dict[str, object]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
     #
@@ -57,6 +63,20 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
     # flake bundles the compiled ui-tui. Pass either explicitly to override.
     _python_prod = python if python_prod is None else python_prod
     _product = _python_prod or frontend
+    # py_full defaults to python: a Python-relevant change runs the FULL suite
+    # unless the case explicitly proves a selective root set (py_roots).
+    if py_full is None:
+        py_full = python
+    if not python:
+        py_scope = "none"
+        roots_json = json.dumps([])
+    elif py_full:
+        py_scope = "full"
+        roots_json = json.dumps([["tests"]])
+    else:
+        py_scope = "selective"
+        assert py_roots is not None, "selective cases must state their root groups"
+        roots_json = json.dumps(py_roots)
     return {
         "python": python,
         "python_prod": _python_prod,
@@ -74,6 +94,12 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "rust": rust,
         "mcp_catalog": mcp_catalog,
         "ci_review": ci_review,
+        "py_scope": py_scope,
+        "py_roots": roots_json,
+        # Empty list = all workspaces (fail-open encoding).
+        "frontend_workspaces": json.dumps(workspaces or []),
+        "os_tests": os_tests,
+        "mode": mode,
     }
 
 
@@ -82,10 +108,17 @@ CASES = {
     "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
     # pyproject.toml declares the pytest markers the OS lanes select on, so it
     # also re-arms the desktop_updater integration tests (fail-open).
-    "dep manifest → python": (["pyproject.toml"], _lanes(python=True, scan=True, deps=True, uv_lock=True, desktop_updater=True)),
-    "uv.lock → python": (["uv.lock"], _lanes(python=True, uv_lock=True)),
-    "ts package → frontend": (["apps/desktop/src/app.tsx"], _lanes(frontend=True)),
-    "ui-tui → frontend": (["ui-tui/src/entry.ts"], _lanes(frontend=True)),
+    "dep manifest → python": (["pyproject.toml"], _lanes(python=True, scan=True, deps=True, uv_lock=True, desktop_updater=True, os_tests=True)),
+    "uv.lock → python": (["uv.lock"], _lanes(python=True, uv_lock=True, os_tests=True)),
+    "ts package → frontend": (
+        ["apps/desktop/src/app.tsx"],
+        _lanes(frontend=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
+    ),
+    "ui-tui → frontend": (["ui-tui/src/entry.ts"], _lanes(frontend=True, workspaces=["ui-tui"])),
+    "ui-tui package → umbrella + package": (
+        ["ui-tui/packages/hermes-ink/src/x.ts"],
+        _lanes(frontend=True, workspaces=["ui-tui", "ui-tui/packages/hermes-ink"]),
+    ),
     # Lockfile bump shifts every TS package's tree, but not the Python suite.
     "root lockfile → frontend, not python": (["package-lock.json"], _lanes(frontend=True, npm_lock=True)),
     "nested lockfile → npm_lock": (["website/package-lock.json"], _lanes(site=True, npm_lock=True)),
@@ -96,29 +129,35 @@ CASES = {
     # otherwise shows up as a blocking "uv.lock out of sync" red X.
     "docs → no uv_lock": (
         ["website/docs/developer-guide/plugins/index.md"],
-        _lanes(python=True, site=True),
+        _lanes(python=True, site=True, py_full=False, py_roots=[["tests/website/"]]),
     ),
-    "frontend → no uv_lock": (["apps/desktop/src/store/profile.ts"], _lanes(frontend=True)),
+    "frontend → no uv_lock": (
+        ["apps/desktop/src/store/profile.ts"],
+        _lanes(frontend=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
+    ),
     # The published CIMD document is asserted about by the Python suite, so a
     # lone edit there must not skip the lane that would catch a bad edit.
     "cimd document → python + site": (
         ["website/static/oauth/client-metadata.json"],
-        _lanes(python=True, site=True),
+        _lanes(python=True, site=True, py_full=False, py_roots=[["tests/website/"]]),
     ),
     # A new docs page must reach llms.txt, and the generator that puts it there
     # has its own tests. Skipping Python on either is how the index drifted to
     # 53% coverage while every PR stayed green.
     "docs page → python + site": (
         ["website/docs/user-guide/bot-mode.md"],
-        _lanes(python=True, site=True),
+        _lanes(python=True, site=True, py_full=False, py_roots=[["tests/website/"]]),
     ),
     "docs generator → python + site": (
         ["website/scripts/generate-llms-txt.py"],
-        _lanes(python=True, scan=True, site=True),
+        _lanes(python=True, scan=True, site=True, py_full=False, py_roots=[["tests/website/test_generate-llms-txt*.py", "tests/test_generate-llms-txt*.py", "tests/website/"]]),
     ),
     # SKILL.md reads like docs, but the skill-doc tests read skills/, so a
     # skill edit must still run Python.
-    "skill md → python + site": (["skills/github/SKILL.md"], _lanes(python=True, site=True)),
+    "skill md → python + site": (
+        ["skills/github/SKILL.md"],
+        _lanes(python=True, site=True, py_full=False, py_roots=[["tests/skills/"]]),
+    ),
     "dockerfile → docker meta": (["Dockerfile"], _lanes(docker_meta=True)),
     # Only the flake reads these, so they run nix alone. No Python test opens
     # them, unlike pyproject.toml and uv.lock below.
@@ -126,23 +165,29 @@ CASES = {
     "flake.nix → nix only": (["flake.nix"], _lanes(nix=True)),
     "flake.lock → nix only": (["flake.lock"], _lanes(nix=True)),
     # A flake-only file must not mask a Python change beside it.
-    "nix + python → both": (["nix/checks.nix", "agent/x.py"], _lanes(python=True, scan=True)),
+    "nix + python → both": (
+        ["nix/checks.nix", "agent/x.py"],
+        _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/agent/test_x*.py", "tests/test_x*.py", "tests/agent/"]]),
+    ),
     # Nine checks run the built binary, so product Python is a nix input even
     # when the diff touches no file under nix/.
-    "product python → nix": (["hermes_cli/config.py"], _lanes(python=True, scan=True)),
+    "product python → nix": (
+        ["hermes_cli/config.py"],
+        _lanes(python=True, scan=True, os_tests=True, py_full=False, py_roots=[["tests/hermes_cli/test_config*.py", "tests/test_config*.py", "tests/hermes_cli/"]]),
+    ),
     # tests/ is not packaged, so the built binary cannot change.
     "tests-only → no nix": (
         ["tests/agent/test_foo.py"],
-        _lanes(python=True, python_prod=False, scan=True),
+        _lanes(python=True, python_prod=False, scan=True, py_full=False, py_roots=[["tests/agent/test_foo.py"]]),
     ),
     # Prose cannot change the closure or the binary.
     "docs-only → no nix": (["README.md"], _lanes()),
     # install.ps1 is a shell script Python never imports, but it's also not
     # provably prose, so python stays on (fail-open) alongside the Windows lane.
-    "install.ps1 → installer": (["scripts/install.ps1"], _lanes(python=True, installer=True)),
+    "install.ps1 → installer": (["scripts/install.ps1"], _lanes(python=True, installer=True, os_tests=True)),
     "installer test → installer": (
         ["scripts/tests/test-install-ps1-longpath.ps1"],
-        _lanes(python=True, installer=True),
+        _lanes(python=True, installer=True, os_tests=True),
     ),
     "python source alone → no installer lane": (["run_agent.py"], _lanes(python=True, scan=True)),
     # The Windows desktop-update hand-off is a PowerShell integration surface:
@@ -151,21 +196,21 @@ CASES = {
     # files change — not on every hermes_state.py PR.
     "windows.ps1 → desktop_updater": (
         ["scripts/desktop-update/windows.ps1"],
-        _lanes(python=True, desktop_updater=True),
+        _lanes(python=True, desktop_updater=True, os_tests=True),
     ),
     # The shipped updater page is exercised by the desktop Electron suite;
     # a page-only change must run that suite as well as the server tests.
     "updater ui.html → frontend + desktop_updater": (
         ["scripts/desktop-update/ui.html"],
-        _lanes(python=True, frontend=True, desktop_updater=True),
+        _lanes(python=True, frontend=True, desktop_updater=True, workspaces=["apps/desktop"], os_tests=True),
     ),
     "desktop-update test → desktop_updater": (
         ["tests/test_desktop_update_windows_progress.py"],
-        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True),
+        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, os_tests=True, py_full=False, py_roots=[["tests/test_desktop_update_windows_progress.py"]]),
     ),
     "updater-process.ts → desktop_updater": (
         ["apps/desktop/electron/updater-process.ts"],
-        _lanes(frontend=True, desktop_updater=True),
+        _lanes(frontend=True, desktop_updater=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
     ),
     "python source alone → no desktop_updater lane": (["hermes_state.py"], _lanes(python=True, scan=True)),
     # `.rs` lives under apps/, so it matches `frontend` too. That lane builds
@@ -173,62 +218,65 @@ CASES = {
     # the ONLY lane a Rust change ran, and the crate's tests never executed.
     "rust source → rust": (
         ["apps/bootstrap-installer/src-tauri/src/powershell.rs"],
-        _lanes(frontend=True, rust=True),
+        _lanes(frontend=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     "cargo lockfile → rust": (
         ["apps/bootstrap-installer/src-tauri/Cargo.lock"],
-        _lanes(frontend=True, rust=True),
+        _lanes(frontend=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     # Non-.rs files in the crate still change what cargo builds.
     "tauri config → rust": (
         ["apps/bootstrap-installer/src-tauri/tauri.conf.json"],
-        _lanes(frontend=True, rust=True),
+        _lanes(frontend=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     "ts source alone → no rust lane": (
         ["apps/bootstrap-installer/src/main.tsx"],
-        _lanes(frontend=True),
+        _lanes(frontend=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     # Unknown top-level file keeps Python on rather than risk a silent skip.
     "unknown toplevel → python": (["Makefile"], _lanes(python=True)),
-    "mixed docs+python → python": (["README.md", "agent/x.py"], _lanes(python=True, scan=True)),
-    "mixed docs+frontend → frontend": (["README.md", "apps/x.tsx"], _lanes(frontend=True)),
+    "mixed docs+python → python": (
+        ["README.md", "agent/x.py"],
+        _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/agent/test_x*.py", "tests/test_x*.py", "tests/agent/"]]),
+    ),
+    "mixed docs+frontend → frontend": (["README.md", "apps/x.tsx"], _lanes(frontend=True, os_tests=True)),
     # tests-only diffs: pytest lanes stay ON, product jobs (Desktop E2E,
     # Docker) gate on python_prod and skip.
     "tests-only → python without python_prod": (
         ["tests/agent/test_foo.py"],
-        _lanes(python=True, python_prod=False, scan=True),
+        _lanes(python=True, python_prod=False, scan=True, py_full=False, py_roots=[["tests/agent/test_foo.py"]]),
     ),
     # conftest.py owns the _OS_MARKS skip logic, so it re-arms the
     # desktop_updater integration tests too (fail-open).
     "conftest → python + desktop_updater": (
         ["tests/conftest.py"],
-        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True),
+        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, os_tests=True),
     ),
     "tests + prod source → both lanes": (
         ["tests/agent/test_foo.py", "agent/x.py"],
-        _lanes(python=True, scan=True),
+        _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/agent/test_foo.py"], ["tests/agent/test_x*.py", "tests/test_x*.py", "tests/agent/"]]),
     ),
     # Runner infrastructure is NOT tests-only — a bad runner edit can mask
     # real failures, so it keeps the conservative full lane set.
     "test runner script → python_prod stays on": (
         ["scripts/run_tests_parallel.py"],
-        _lanes(python=True, scan=True),
+        _lanes(python=True, scan=True, os_tests=True),
     ),
     # Supply-chain lanes
     ".pth file → scan": (["evil.pth"], _lanes(python=True, scan=True)),
-    "setup.py → scan": (["setup.py"], _lanes(python=True, scan=True)),
+    "setup.py → scan": (["setup.py"], _lanes(python=True, scan=True, os_tests=True)),
     "mcp catalog manifest → mcp_catalog": (
         ["optional-mcps/foo/manifest.yaml"],
         _lanes(python=True, mcp_catalog=True),
     ),
     "mcp_catalog.py → mcp_catalog": (
         ["hermes_cli/mcp_catalog.py"],
-        _lanes(python=True, scan=True, mcp_catalog=True),
+        _lanes(python=True, scan=True, mcp_catalog=True, os_tests=True, py_full=False, py_roots=[["tests/hermes_cli/test_mcp_catalog*.py", "tests/test_mcp_catalog*.py", "tests/hermes_cli/"]]),
     ),
     # CI-sensitive files require explicit review label.
     "eslint config → ci_review": (
         ["apps/desktop/eslint.config.mjs"],
-        _lanes(frontend=True, ci_review=True),
+        _lanes(frontend=True, ci_review=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
     ),
     "shared eslint config → ci_review": (
         ["eslint.config.shared.mjs"],
@@ -236,23 +284,55 @@ CASES = {
     ),
     "ui-tui eslint config → ci_review": (
         ["ui-tui/eslint.config.mjs"],
-        _lanes(frontend=True, ci_review=True),
+        _lanes(frontend=True, ci_review=True, workspaces=["ui-tui"]),
     ),
     "web eslint config → ci_review": (
         ["web/eslint.config.js"],
-        _lanes(frontend=True, ci_review=True),
+        _lanes(frontend=True, ci_review=True, workspaces=["web"]),
     ),
     "shared package eslint config → ci_review": (
         ["apps/shared/eslint.config.mjs"],
-        _lanes(frontend=True, ci_review=True),
+        _lanes(frontend=True, ci_review=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
     ),
     "bootstrap-installer eslint config → ci_review": (
         ["apps/bootstrap-installer/eslint.config.mjs"],
-        _lanes(frontend=True, ci_review=True),
+        _lanes(frontend=True, ci_review=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     "prettier config → ci_review": (
         [".prettierrc"],
         _lanes(python=True, ci_review=True),
+    ),
+    # Selective-scope fixtures: a subsystem-local change runs its mirrored
+    # subtree (+ twin globs) instead of all ~4000 files, and pays no OS-lane
+    # minutes when the OS-marked suites exercise none of its subjects.
+    "cron module → tests/cron only, no OS lanes": (
+        ["cron/jobs.py"],
+        _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/cron/test_jobs*.py", "tests/test_jobs*.py", "tests/cron/"]]),
+    ),
+    "gateway module → gateway + relay subtrees": (
+        ["gateway/run.py"],
+        _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/gateway/test_run*.py", "tests/relay/test_run*.py", "tests/test_run*.py", "tests/gateway/", "tests/relay/"]]),
+    ),
+    "acp adapter → acp subtrees": (
+        ["acp_adapter/server.py"],
+        _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/acp_adapter/test_server*.py", "tests/acp/test_server*.py", "tests/test_server*.py", "tests/acp_adapter/", "tests/acp/"]]),
+    ),
+    # tui_gateway has no mirrored test subtree; no honest mapping → full suite.
+    # (It IS an OS-marked surface — the desktop/TUI process topology differs
+    # per host — so the OS lanes stay armed.)
+    "tui_gateway → full suite": (["tui_gateway/server.py"], _lanes(python=True, scan=True, os_tests=True)),
+    # A root-level hub module is imported by everything: full suite.
+    "hub module → full suite": (["model_tools.py"], _lanes(python=True, scan=True)),
+    # tests/fakes and tests/fixtures reshape collection for the whole suite.
+    "tests/fakes → full suite": (
+        ["tests/fakes/fake_gateway.py"],
+        _lanes(python=True, python_prod=False, scan=True),
+    ),
+    # A change mixing a mapped file and an unmapped one fails open to full —
+    # selective coverage is only as strong as its weakest file.
+    "mapped + unmapped → full suite": (
+        ["agent/x.py", "tui_gateway/server.py"],
+        _lanes(python=True, scan=True, os_tests=True),
     ),
     "workflow yml → ci_review (also fail-open all)": (
         [".github/workflows/typecheck.yml"],
@@ -265,7 +345,7 @@ CASES = {
     # Normal desktop source doesn't trigger ci_review.
     "desktop src → no ci_review": (
         ["apps/desktop/src/app.tsx"],
-        _lanes(frontend=True),
+        _lanes(frontend=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
     ),
     # Fail open: CI-config / empty / blank diffs run everything.
     ".github change → all": ([".github/workflows/tests.yml"], DEFAULT),
