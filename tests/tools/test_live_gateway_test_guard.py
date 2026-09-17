@@ -304,15 +304,28 @@ class TestProfileDriftGuard:
 # ---------------------------------------------------------------------------
 
 
-def test_classifier_is_pure(monkeypatch):
-    """A guard that shells out would itself be a live-gateway hazard: assert
-    the module never imports subprocess and never uses __import__ tricks."""
+def test_classifier_never_spawns():
+    """A guard that shells out would itself be a live-gateway hazard: the
+    module must never import subprocess or CALL os.system/popen-style
+    executors (detection-table STRINGS naming them are data, not calls —
+    AST keeps the two apart, unlike substring matching)."""
+    import ast
     import inspect
 
-    source = inspect.getsource(guard)
-    assert "import subprocess" not in source
-    assert "os.system" not in source
-    assert "popen" not in source.lower()
+    tree = ast.parse(inspect.getsource(guard))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert "subprocess" not in imported
+    assert not any(name in imported for name in ("pty", "sh"))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in {"system", "popen", "Popen", "spawn", "spawnl"}:
+                pytest.fail(f"guard performs a process-spawning call: ast line {node.lineno}")
 
 
 def test_parser_budget_failure_closed():

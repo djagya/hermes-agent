@@ -207,9 +207,6 @@ def _operator_before(command: str, start: int) -> str | None:
     return "\n" if "\n" in command[len(head):start] else None
 
 
-_CD_TARGET_RE = re.compile(r"^(?:cd|pushd)$")
-
-
 def _cd_target(args: list[str], cwd: Optional[Path]) -> Optional[Path]:
     """Directory a ``cd``/``pushd`` would land in (existing dirs only), else None."""
     index = _consume_options(args, 0)
