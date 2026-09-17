@@ -493,9 +493,11 @@ def _with_timeout_notice(stdout_text: str, timeout_msg: str) -> str:
     return stdout_text + f"\n\n⏰ {timeout_msg}" if stdout_text else f"⏰ {timeout_msg}"
 
 
-def _error_result(error: str, *, tool_calls_made: int = 0, duration: float = 0) -> str:
-    return json.dumps({"status": "error", "error": error, "tool_calls_made": tool_calls_made,
-                       "duration_seconds": duration}, ensure_ascii=False)
+def _error_result(error: str, *, tool_calls_made: int = 0, duration: float = 0, **extra) -> str:
+    payload = {"status": "error", "error": error, "tool_calls_made": tool_calls_made,
+               "duration_seconds": duration}
+    payload.update(extra)
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _remote_failure(exc: BaseException, exec_start: float, tool_calls_made: int) -> str:
@@ -709,7 +711,15 @@ def execute_code(
     from tools.approval import check_execute_code_guard
     _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(_env_config))
     if not _guard.get("approved", False):
-        return _error_result(_guard.get("message") or "execute_code blocked by approval guard.")
+        # Decision-source correlation: carry WHO decided (guardian vs. human vs. unattended
+        # mode) and the gate id into the tool result, so post-incident reads answer "was this
+        # a guardian escalation or the user's denial" without guessing from field absence.
+        _correlation = {
+            key: _guard[key] for key in ("decision_source", "gate_id", "outcome")
+            if _guard.get(key) is not None
+        }
+        return _error_result(_guard.get("message") or "execute_code blocked by approval guard.",
+                             **_correlation)
     # Clear a stale interrupt bit that landed during the blocking approval-wait so it can't
     # kill the just-approved run on the first poll. A genuine post-clear interrupt re-sets it.
     if _guard.get("user_approved"):

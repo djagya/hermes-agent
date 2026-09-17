@@ -267,6 +267,13 @@ def clear_session(session_key: str) -> None:
             getattr(importlib.import_module(module), shutdown)(session_key)
         except Exception:
             pass
+    # Helper provenance is derived from the session's kernel cells; when the kernel dies the
+    # definitions no longer describe anything live.
+    try:
+        from tools.approval_provenance import forget_session
+        forget_session(session_key)
+    except Exception:
+        pass
 
 
 def is_session_yolo_enabled(session_key: str) -> bool:
@@ -559,6 +566,12 @@ class _GateSpec:
     cli_timeout: str          # {breaker}
     cli_denied: str           # {description}{breaker}
     smart_log: str            # {command}{description}{session_key}
+    # Correlation tag recorded on every result of this gate (``decision_source``),
+    # so a result log answers WHO decided without guessing from absence-of-fields:
+    # "smart" = guardian LLM, "human" = the operator or owner, "unattended" = an
+    # unattended-context mode, "prefilter" = a hardline/deny/allowlist resolution
+    # before any gate ran.
+    gate_id: str = ""
 
 
 _STOP_COMMAND = (
@@ -586,6 +599,7 @@ _COMMAND_GATE = _GateSpec(
                 + " Silence is not consent.{breaker}",
     cli_denied="BLOCKED: User denied this command." + _STOP_COMMAND + "{breaker}",
     smart_log="Smart approval: auto-approved '{command}' ({description})",
+    gate_id="command",
 )
 _EXECUTE_CODE_GATE = _GateSpec(
     noun="code", transport=True, user_approved=True, redact_cli=True, pending_keys=True,
@@ -605,6 +619,7 @@ _EXECUTE_CODE_GATE = _GateSpec(
         "'{description}'). Do NOT retry — the user has explicitly rejected it.{breaker}"
     ),
     smart_log="Smart approval: auto-approved execute_code for session {session_key}",
+    gate_id="execute_code",
 )
 # Plugin-escalated tool calls / protected writes: no transport, no breaker,
 # no user_approved marker (parity with the historical gate).
@@ -621,12 +636,13 @@ _ACTION_GATE = _GateSpec(
         "'{description}'). Do NOT retry — the user has explicitly rejected it."
     ),
     smart_log="",
+    gate_id="action",
 )
 
 
 def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: str,
                 pattern_keys: list[str], session_key: str, *,
-                human_present: bool) -> tuple[dict | None, bool]:
+                human_present: bool, provenance: str = "") -> tuple[dict | None, bool]:
     """Guardian-LLM step -> ``(result, smart_denied_for_owner)``: a result ends the gate;
     ``smart_denied_for_owner`` means an interactive owner may still override the DENY for this
     one operation (once/deny only, nothing persists).
@@ -636,31 +652,41 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
     counts toward the denial breaker even when an owner may override it. ESCALATE follows the
     normal, potentially persistent manual behavior.
     """
-    verdict = _smart_verdict(command, description, pattern_key, pattern_keys, session_key)
+    verdict = _smart_verdict(command, description, pattern_key, pattern_keys, session_key,
+                             provenance)
     if verdict == "approve":
         _reset_denials(session_key)
         logger.debug(spec.smart_log.format(command=command[:60], description=description, session_key=session_key))
-        return {"approved": True, "message": None, "smart_approved": True, "description": description}, False
+        result = {"approved": True, "message": None, "smart_approved": True, "description": description,
+                  "decision_source": "smart"}
+        if spec.gate_id:
+            result["gate_id"] = spec.gate_id
+        return result, False
     if verdict != "deny":
         return None, False
     _record_denial(session_key)
     if human_present:
         return None, True
-    return {
+    result = {
         # Unattended programmatic platforms (webhook/msgraph_webhook/ api_server): respect unattended_mode
         # config. Resolves instantly — never a pending approval nobody can answer (#37284, #87509).
         "approved": False,
         "message": (f"BLOCKED by smart approval: {description}. The command was assessed as genuinely "
                     f"dangerous. Do NOT retry.{_denial_breaker_addendum(session_key)}"),
         "smart_denied": True,
-    }, True
+        "decision_source": "smart",
+    }
+    if spec.gate_id:
+        result["gate_id"] = spec.gate_id
+    return result, True
 
 
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], warnings: list[tuple],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
                     is_ask: bool, smart: bool = False,
-                    permanent_capable: bool = True, pending_body=None) -> dict:
+                    permanent_capable: bool = True, pending_body=None,
+                    provenance: str = "") -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``warnings`` are the ``(key, _, is_tirith)`` tuples :func:`_persist_choice` stores on
@@ -668,13 +694,15 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     allowlisted (pure-tirith prompts); a smart-DENY owner override reduces every surface to
     once/deny and persists nothing. ``pending_body`` is a thunk, built only once a human is
     actually asked, so a smart APPROVE never pays for redacting a large script.
+    ``provenance`` is bounded kernel-helper context shown to the guardian and to the human.
     """
     from agent.redact import redact_sensitive_text
 
     smart_denied = False
     if smart:
         result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
-                                           session_key, human_present=is_cli or is_gateway or is_ask)
+                                           session_key, human_present=is_cli or is_gateway or is_ask,
+                                           provenance=provenance)
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
@@ -686,17 +714,30 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             breaker = _denial_breaker_addendum(session_key)
         deny_reason = fmt.pop("deny_reason", None)
         extra = {"deny_reason": deny_reason} if "reason" in fmt else {}
-        return _denied(template.format(description=description, breaker=breaker, **fmt),
-                       pattern_key=pattern_key, description=description,
-                       outcome=outcome, **extra)
+        # From here the decision is the human gate's (owner choice, timeout, or refusal) —
+        # recorded so a result never reads as a guardian decision by implication.
+        result = _denied(template.format(description=description, breaker=breaker, **fmt),
+                         pattern_key=pattern_key, description=description,
+                         outcome=outcome, decision_source="human", **extra)
+        if spec.gate_id:
+            result["gate_id"] = spec.gate_id
+        return result
 
     def grant(choice: str) -> dict:
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
         if not smart_denied:
             _persist_choice(session_key, choice, warnings)
         if spec.user_approved:
-            return _user_approved(session_key, description)
-        return _approved()
+            result = _user_approved(session_key, description)
+        else:
+            result = _approved()
+        # The decision is the human's: recorded so a result log answers WHO
+        # approved without inferring it from absence-of-fields (parity with the
+        # deny path and the smart/unattended results).
+        result["decision_source"] = "human"
+        if spec.gate_id:
+            result["gate_id"] = spec.gate_id
+        return result
 
     if spec.transport:
         attempt = _present_with_selected_transport(
@@ -1060,6 +1101,46 @@ _EXECUTE_CODE_DESCRIPTION = (
 )
 
 
+def _undefined_name_provenance(code: str, session_key: str) -> str:
+    """Bounded provenance for names the current cell USES but does not define.
+
+    The persistent kernel keeps state across cells, so the guardian (and the human
+    prompt) sees calls to helpers whose definitions live in earlier cells. The host
+    parses those cells (AST-only — nothing is evaluated, see
+    :mod:`tools.approval_provenance`) and reports, for each such name, whether a
+    definition exists, whether it was redefined, and what its body does. Bounded to
+    the first few names per cell and force-redacted.
+    """
+    try:
+        from tools import approval_provenance as prov
+
+        undefined = prov.undefined_names_in_cell(code)
+        if not undefined:
+            return ""
+        parts = []
+        for name in undefined[:5]:
+            classification = prov.classify_name(session_key, name)
+            if classification == prov.UNKNOWN:
+                if name in {"print", "len", "range", "open", "str", "int", "float",
+                            "list", "dict", "set", "tuple", "json", "os", "sys",
+                            "re", "time", "math", "sorted", "sum", "enumerate"}:
+                    continue  # builtin/stdlib import in an earlier cell — nothing to add
+                description = "(no recorded definition in this session's kernel)"
+            else:
+                description = prov.describe_name(session_key, name, code) or ""
+            parts.append(f"- {name}: {classification}: {description}")
+        if not parts:
+            return ""
+        return (
+            "\n\nContext from earlier cells of this session's persistent kernel "
+            "(definitions recorded from executed cells; statically parsed, never "
+            "evaluated; comments stripped; may be incomplete):\n" + "\n".join(parts)
+        )
+    except Exception:
+        logger.debug("helper provenance context failed", exc_info=True)
+        return ""
+
+
 def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = False) -> dict:
     """Approve an execute_code script before its child process is spawned.
 
@@ -1097,6 +1178,7 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
                 "BLOCKED: execute_code runs arbitrary local Python (including "
                 "subprocess calls that bypass shell-string approval checks). " + ctx.exec_tail,
                 pattern_key=pattern_key, description=description, outcome="blocked",
+                decision_source="unattended", gate_id=pattern_key,
             )
         return _approved()
 
@@ -1117,16 +1199,31 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     if is_approved(session_key, pattern_key):
         return _approved()
 
+    # Persistent-kernel provenance: the guardian and the human see what helper names
+    # used by this cell were defined in earlier cells (AST-parsed, bounded, redacted).
+    provenance = _undefined_name_provenance(code, session_key)
+
     # Smart mode: an APPROVE only suppresses the redundant whole-script prompt; the per-call terminal() guards still
     # run independently. The gateway renders the pending payload to Discord/Slack, so the script body is redacted for
     # display; the raw code is what gets assessed and run.
     from agent.redact import redact_sensitive_text
+
+    def pending_body_with_provenance() -> str:
+        body = f"**Code:**\n```python\n{redact_sensitive_text(code)}\n```"
+        if provenance:
+            body += (
+                "\n**Kernel helper context (statically parsed, may be incomplete):**\n```\n"
+                f"{redact_sensitive_text(provenance, force=True)}\n```"
+            )
+        return body
+
     return _human_decision(
         _EXECUTE_CODE_GATE, command=command, description=description, pattern_key=pattern_key,
         pattern_keys=[pattern_key], warnings=[(pattern_key, None, False)], session_key=session_key,
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
         smart=approval_mode == "smart",
-        pending_body=lambda: f"**Code:**\n```python\n{redact_sensitive_text(code)}\n```",
+        pending_body=pending_body_with_provenance,
+        provenance=provenance,
     )
 
 
