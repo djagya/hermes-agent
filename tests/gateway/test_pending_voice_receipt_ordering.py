@@ -327,37 +327,43 @@ async def test_followup_prep_joins_inflight_clip_returns_string_once(runner_env,
     IN FLIGHT (no completed cache yet) must join that task via the canonical entry point,
     publish the cache, and return the exact transcript STRING — never the raw
     (text, transcripts) tuple the wrapper returns — and the transcript must echo exactly once
-    across the prep claim and the background claim. RED on base: the prep had no STT join at
-    all (empty text); RED mid-history: tuple assignment broke the string contract.
+    across the prep claim and the background claim. The background work is started through the
+    REAL receipt-path wrapper (``_start_pending_voice_stt``) against an event-controlled provider,
+    so the single provider invocation with two concurrent consumers is proven, not assumed.
+    RED on base: the prep had no STT join at all (empty text); RED mid-history: tuple assignment
+    broke the string contract.
     """
     runner, adapter = runner_env
-    _unused_event, calls = _instant_stt(monkeypatch, "early join words")
+    entered, release, calls = _blocking_stt(monkeypatch, "early join words")
 
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
     voice = _voice_event(source, _clip_file(tmp_path))
-    # The shared clip work exists but has NOT completed: an in-flight task created by the
-    # receipt path before the follow-up turn reached input preparation.
-    loop = asyncio.get_running_loop()
-    inflight = loop.create_future()
-    voice._gateway_pending_stt_clips = {
-        voice.media_urls[0]: PendingAudioClip(task=inflight)}
+    # The REAL receipt path starts the shared per-clip work: the provider is genuinely invoked
+    # (and blocks on the event) before the follow-up turn reaches input preparation.
+    runner._start_pending_voice_stt(voice, adapter, source, log_context="Voice-busy-interrupt")
+    await asyncio.wait_for(asyncio.to_thread(entered.wait), 5)
 
+    # The follow-up turn's preparation arrives while that STT is still unresolved: it must join
+    # the SAME shared task (one provider call), never restart the clip.
     prep = asyncio.ensure_future(
         runner._prepare_profile_scoped_inbound_message_text(
             event=voice, source=source, history=[], session_key="conversation"))
-    await asyncio.sleep(0)  # let prep reach the shielded await
-    inflight.set_result(('"early join words"', ["early join words"]))
+    await asyncio.sleep(0)  # let prep reach the shared-task await
+    assert not prep.done()
+    release.set()
     message_text = await asyncio.wait_for(prep, 5)
+    await asyncio.gather(*adapter._background_tasks)
     # The regression: assert the STRING contract, not just "contains".
     assert isinstance(message_text, str)
     assert message_text.startswith('"early join words"')
-    # Cache published by this call: the later background claim cannot double-echo.
+    # ONE actual provider call with two concurrent consumers (background claim + prep join).
+    assert Counter(calls) == Counter([voice.media_urls[0]])
+    # Cache published by the shared work: the two claims cannot double-echo.
     assert getattr(voice, "_gateway_pending_stt_text", None) == message_text
-    assert Counter(calls) == Counter([voice.media_urls[0]])  # joined, not restarted
-    # Exactly one echo across prep + background: the clip ledger is the once-guard.
-    await asyncio.gather(*adapter._background_tasks)
     delivered = [call.args[1] for call in adapter.send.await_args_list]
     assert delivered == ['🎙️ "early join words"']
+    # Cleanup ownership: the background wrapper finished and left no tracked task behind.
+    assert not adapter._background_tasks
 
 
 @pytest.mark.asyncio

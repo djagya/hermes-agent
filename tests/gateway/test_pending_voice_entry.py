@@ -260,7 +260,13 @@ async def test_telegram_voice_followups_reach_model_once(case, echo, busy_text_m
                 if busy_text_mode == "queue":
                     assert added_text in pending.text
                 else:
-                    assert any(added_text in redirect for redirect in WaitingModel.redirects)
+                    # Interrupt mode supersedes the buffered text: the voice receipt interrupts
+                    # FIRST (immediate receipt), so the flush's redirect is refused — with the
+                    # buffered text a redirect would steer a turn the user superseded. The text
+                    # still reaches the model exactly once, carried on the superseding pending
+                    # voice event (merge semantics) instead of the refused redirect.
+                    assert not any(added_text in redirect for redirect in WaitingModel.redirects)
+                    assert added_text in pending.text
                 stt_release.set()
                 transport.echo_release.set()
                 await asyncio.wait_for(voice_task, 10)
@@ -268,7 +274,10 @@ async def test_telegram_voice_followups_reach_model_once(case, echo, busy_text_m
                 if case != "active_a":
                     await app.process_update(update(app.bot, 2, voice="voice-a"))
                     assert len(adapter._pending_messages) == 1
-                assert calls == ["A"]
+                # Async admission: the receipt fix deliberately does NOT hold process_update on
+                # the queued clip's STT, so the single provider call happens on the background
+                # task. Await the causal event, not the old blocking timing.
+                await until(lambda: calls == ["A"])
                 voice_task = asyncio.create_task(app.process_update(update(app.bot, 3, voice="voice-b")))
                 if case == "inflight_b":
                     await until(stt_entered.is_set)
