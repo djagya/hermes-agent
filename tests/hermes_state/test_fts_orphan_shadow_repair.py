@@ -5,6 +5,15 @@ already exists". Only families whose vtable row is absent may be repaired; a hea
 shadows must survive untouched.
 """
 
+# Fork FTS fence: this file's subject (live FTS rebuild/admission machinery) is disabled
+# on this fork; the fenced contract is owned by tests/state/test_fts_fork_fence.py.
+import pytest
+
+pytestmark = pytest.mark.skip(
+    reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)"
+)
+
+
 import sqlite3
 
 from hermes_state import SessionDB

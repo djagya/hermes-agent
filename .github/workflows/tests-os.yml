@@ -44,9 +44,16 @@ on:
 permissions:
   contents: read
 
+# Event-aware concurrency (same policy as tests.yml / ci.yaml / docker.yml):
+# PR runs collapse per PR; workflow_dispatch / push full-validation runs
+# queue in their own per-ref group. Neither class may kill the other — a
+# manual full dispatch and the same-head PR's CI must each preserve their
+# own evidence (the tests.yml header documents the live collision that
+# motivates this). Contract asserted in
+# tests/ci/test_workflow_concurrency.py.
 concurrency:
-  group: tests-os-${{ github.ref }}
-  cancel-in-progress: true
+  group: tests-os-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   os-tests:
@@ -61,7 +68,7 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            runner: windows-latest
             marker: windows_only
     steps:
       - name: Checkout code

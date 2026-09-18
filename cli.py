@@ -490,9 +490,12 @@ def load_cli_config() -> Dict[str, Any]:
     from hermes_cli.config import _expand_env_vars
     defaults = _expand_env_vars(defaults)
 
-    # Seed omitted managed-scope leaves last; cli.py builds its config independently of
-    # hermes_cli.config, so this keeps parity with `hermes config`. A present user leaf
-    # wins. Fail-open.
+    # Managed scope: seed leaves the user omitted. Pass the raw user document
+    # so CLI schema defaults do not shadow those seeds. A present user leaf
+    # wins; unset falls back to the seed (live `config set` writes the user
+    # file and wins). cli.py builds its config independently of
+    # hermes_cli.config._load_config_impl, so without this the TUI/CLI
+    # surface would ignore managed seeds.
     from hermes_cli import managed_scope
 
     defaults = managed_scope.apply_managed_overlay(defaults, user_raw=file_config)

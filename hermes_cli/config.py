@@ -2170,8 +2170,6 @@ def _merge_managed_overlay(
     managed_config = managed_scope.load_managed_config()
     if not managed_config:
         return expanded, managed_config
-    # Same canonicalization as the user config BEFORE merging (parity with
-    # managed_scope.apply_managed_overlay) so the merged result never exposes a nested dict.
     managed_normalized = _normalize_root_model_keys(managed_config)
     if isinstance(managed_normalized.get("model"), str):
         managed_normalized = dict(managed_normalized)

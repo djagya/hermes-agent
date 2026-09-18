@@ -10,6 +10,23 @@ name: CI
 # ``push:`` / ``pull_request:`` triggers of their own — everything flows
 # through this file.
 #
+# FORK MINUTE POLICY (djagya/hermes-agent): ordinary PRs and pushes to main
+# run SELECTIVE CI — the classifier (scripts/ci/classify_changes.py) maps the
+# changed files to affected lanes, pytest subtrees, npm workspaces, and OS
+# lanes, and everything else is skipped. Selective mode is fail-closed to
+# broad: an unrecognized change runs the FULL suite, never nothing.
+#
+# BEFORE OPENING AN UPSTREAM (NousResearch) PR, run the full matrix manually:
+#
+#     gh workflow run ci.yaml --ref <branch>            # or: Actions → CI →
+#                                                       # Run workflow → branch
+#
+# A workflow_dispatch run always executes every lane, all 8 test slices, and
+# both OS lanes, and prints a "Change classification" summary (mode: full) on
+# the detect job's run page. Link that run in the upstream PR body as the
+# full-validation receipt. Push-to-main runs are selective post-merge
+# verification; the dispatch run is the pre-upstream gate.
+#
 # SECURITY: this workflow runs PR-controlled actions, workflows, and code.
 # Do not add ``secrets: inherit`` or GitHub App credentials here. Trusted
 # main-only automation uses protected environments in its own workflows.
@@ -18,6 +35,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+    # Manual full validation. No inputs: dispatch ALWAYS runs the complete
+    # matrix, so the evidence can never be a half-run by accident.
 
 permissions:
   contents: read
@@ -32,8 +52,16 @@ concurrency:
 jobs:
   # ─────────────────────────────────────────────────────────────────────
   # detect: run the classifier once. Every downstream job reads its outputs
-  # to decide whether to run. On push/dispatch the classifier fails open
-  # (all lanes true) so post-merge validation is never weakened.
+  # to decide whether to run — and, for the Python/JS/OS lanes, HOW MUCH to
+  # run (py_scope/py_roots, frontend_workspaces, os_tests).
+  #
+  # Fail-open matrix:
+  #   pull_request     — classify the pinned base...head diff.
+  #   push (main)      — selective post-merge verification: classify the
+  #                      pushed before...sha diff; any comparison failure
+  #                      fails open to full.
+  #   workflow_dispatch — ALWAYS full: the manual pre-upstream-PR gate.
+  #   classifier failure/empty diff/.github change — full, every lane.
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
@@ -55,6 +83,11 @@ jobs:
       mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
       ci_review: ${{ steps.classify.outputs.ci_review }}
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
+      py_scope: ${{ steps.classify.outputs.py_scope }}
+      py_roots: ${{ steps.classify.outputs.py_roots }}
+      frontend_workspaces: ${{ steps.classify.outputs.frontend_workspaces }}
+      os_tests: ${{ steps.classify.outputs.os_tests }}
+      mode: ${{ steps.classify.outputs.mode }}
       event_name: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -65,6 +98,7 @@ jobs:
           sparse-checkout: scripts/ci/classify_changes.py
           sparse-checkout-cone-mode: false
           github-token: ${{ github.token }}
+          selective-on-push: 'true'
 
   # ─────────────────────────────────────────────────────────────────────
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
@@ -75,15 +109,22 @@ jobs:
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests.yml
+    with:
+      scope: ${{ needs.detect.outputs.py_scope }}
+      roots: ${{ needs.detect.outputs.py_roots }}
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
   # the OS-marked tests it collects are skipped there by design (see the
   # `_OS_MARKS` comment in tests/conftest.py) — this is where they run.
-  # Same `python` lane gate: if no Python changed, neither runs.
+  # Gated on the os_tests lane: armed by the platform surfaces those suites
+  # actually exercise (tools/, hermes_cli/, scripts/, apps/, installer and
+  # desktop-updater files, manifests, conftest) and by fail-open/full mode.
+  # An agent/gateway/cron-only change pays no 10x macOS minutes on ordinary
+  # PRs; full dispatch and fail-open always run both lanes.
   tests-os:
     name: OS-specific tests
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    if: needs.detect.outputs.python == 'true' && needs.detect.outputs.os_tests == 'true'
     uses: ./.github/workflows/tests-os.yml
     with:
       # The Windows lane spawns the real desktop-update hand-off script
@@ -104,6 +145,8 @@ jobs:
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
     uses: ./.github/workflows/js-tests.yml
+    with:
+      workspaces: ${{ needs.detect.outputs.frontend_workspaces }}
 
   installer-tests:
     name: Installer tests
@@ -221,8 +264,15 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when some deps were skipped. Only actual ``failure`` /
+  # ``cancelled`` results cause it to fail; intentional ``skipped`` results
+  # (lanes the classifier turned off) are treated as neutral.
+  #
+  # Zero-job escape guard: a lane the classifier SELECTED must produce a
+  # real job result — if the lane output is 'true' but the job reports
+  # 'skipped' (a broken gate expression, an undeclared output, a workflow
+  # parse failure), that is a fail, not a pass. See
+  # tests/ci/test_classify_changes.py for the lane/output wiring invariants.
   #
   # Branch protection should require ONLY this check.
   #
@@ -274,15 +324,59 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          detect = needs.get('detect', {})
+          detect_out = detect.get('outputs', {}) or {}
+          event = detect_out.get('event_name', '')
+          failed = [name for name, info in needs.items() if info['result'] in ('failure', 'cancelled')]
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
               print(f'{icon} {name}: {result}')
+
+          # Lane ⇒ job consistency. When the classifier armed a lane, the
+          # corresponding sub-workflow must have produced a real verdict —
+          # 'skipped' here means the gate expression or output wiring is
+          # broken, and treating it as neutral would be green-by-subtraction.
+          # PR-only lanes are checked only on pull_request events. The
+          # e2e-desktop job is deliberately disabled (if: false) and osv /
+          # review-labels / ci-timings have independent triggers, so none of
+          # them appear here.
+          selected = lambda lane: detect_out.get(lane) == 'true'
+          lane_jobs = []
+          if selected('python'):
+              lane_jobs += ['tests', 'lint', 'contributor-check']
+          if selected('python') and selected('os_tests'):
+              lane_jobs += ['tests-os']
+          if selected('frontend'):
+              lane_jobs += ['js-tests']
+          if selected('site'):
+              lane_jobs += ['docs-site']
+          if selected('installer'):
+              lane_jobs += ['installer-tests']
+          if selected('rust'):
+              lane_jobs += ['rust-tests']
+          if selected('uv_lock'):
+              lane_jobs += ['uv-lockfile']
+          if selected('docker_meta'):
+              lane_jobs += ['docker-lint']
+          if event == 'pull_request':
+              lane_jobs += ['history-check']
+              if selected('npm_lock'):
+                  lane_jobs += ['lockfile-diff']
+              if selected('scan') or selected('deps'):
+                  lane_jobs += ['supply-chain']
+          for job in lane_jobs:
+              result = needs.get(job, {}).get('result')
+              if result != 'success':
+                  print(f'::error::lane-selected job {job!r} reported {result!r} '
+                        f'instead of success — refusing green-by-subtraction')
+                  if job not in failed:
+                      failed.append(job)
+
           if failed:
               print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
               sys.exit(1)
-          print('All checks passed (or were skipped)')
+          print('All checks passed (or were intentionally skipped by the classifier)')
           "
 
   # ─────────────────────────────────────────────────────────────────────
@@ -298,7 +392,7 @@ jobs:
   ci-timings:
     name: CI timing report
     needs: [all-checks-pass]
-    if: always()
+    if: always() && github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

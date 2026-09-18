@@ -111,6 +111,7 @@ def test_deferred_rebuild_does_not_reintroduce_cron(db: SessionDB):
     assert _trigram_rowids(db) == {cli_id}
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 def test_existing_external_layout_rebuilds_trigram_on_upgrade(tmp_path):
     db_path = tmp_path / "state.db"
     old = SessionDB(db_path=db_path)
@@ -145,6 +146,7 @@ def test_existing_external_layout_rebuilds_trigram_on_upgrade(tmp_path):
         migrated.close()
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 def test_install_already_at_v28_still_gets_the_cron_exclusion_migration(tmp_path):
     """The migration gate must fire for installs that were on main's v28.
 
@@ -213,6 +215,7 @@ def test_v1_tool_calls_layout_is_left_for_optimize_storage(tmp_path):
         migrated.close()
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 def test_partial_upgrade_view_does_not_skip_historical_rebuild(tmp_path):
     db_path = tmp_path / "state.db"
     old = SessionDB(db_path=db_path)

@@ -855,6 +855,7 @@ def test_repair_honors_configured_delete_mode(tmp_path, monkeypatch):
 # ── #98924 companion: recovery surface beyond the probe fix (#98935) ───────
 
 # The probe itself is fixed in #98935; this test must not depend on it.
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 def test_fts_recovery_includes_vtables_that_raise_decode_errors(tmp_path):
     """Drop-and-recreate recovery must include corrupt vtables whose probe
     raises UnicodeDecodeError, not only sqlite3.DatabaseError (#98924)."""

@@ -36,6 +36,29 @@ Lanes:
   and only the TypeScript matrix ran.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
 
+Selective-execution lanes (fork CI minute optimization — the Python lane is
+the dominant cost, so "python=true" is no longer license to run all ~4000
+test files on 8 runners):
+
+* ``py_scope``    — ``full`` | ``selective`` | ``none``. ``full`` runs the
+  whole suite (8 slices); ``selective`` runs only the resolved test roots in
+  ``py_roots``; ``none`` when the python lane is off.
+* ``py_roots``    — JSON array of candidate groups, one per changed
+  Python-relevant file. Each group is tried against the repo tree by
+  ``scripts/ci/select_test_roots.py``: exact-twin test globs PLUS the mirrored
+  subsystem subtree (union, deduped). Resolution failure of the whole set
+  fails closed to ``full`` — never to zero.
+* ``frontend_workspaces`` — JSON array of npm workspace dirs whose
+  ``check*`` scripts must run. Empty array = all workspaces (fail-open).
+* ``os_tests``    — run the macOS/Windows lanes (10x/2x minute weight). Armed
+  by the platform surfaces those suites actually exercise (tools/, hermes_cli/,
+  scripts/, apps/, installer/desktop-updater, manifest/conftest) or fail-open;
+  a gateway/agent/cron-only change skips them on ordinary PRs. Full dispatch
+  and push fail-open still run them.
+* ``mode``        — ``full`` when the classifier failed open (empty diff,
+  ``.github/`` change, push/dispatch without a computable diff), else
+  ``selective``. Surfaced in the detect job summary for audit.
+
 Docker is not a lane — it builds on push-to-main and release only,
 never per-PR.
 
@@ -147,6 +170,74 @@ _DESKTOP_UPDATER_FILES = {
 _RUST_PATHS = ("apps/bootstrap-installer/src-tauri/",)
 _RUST_FILENAMES = {"Cargo.toml", "Cargo.lock"}
 
+# ── Selective-execution mapping ─────────────────────────────────────────────
+# Source prefix → mirrored test subtree(s). The resolver
+# (scripts/ci/select_test_roots.py) runs the UNION of the exact-twin test
+# globs and every mirrored subtree that exists — the subtree is the coverage
+# backbone, twins only add cross-directory hits (e.g. tools/foo.py also has
+# tests/test_foo.py at the top level). Over-inclusion is the safe direction;
+# anything not provably mapped fails open to the full suite.
+_PY_TEST_SUBTREES = {
+    "agent/": ("tests/agent/",),
+    "gateway/": ("tests/gateway/", "tests/relay/"),
+    "hermes_cli/": ("tests/hermes_cli/",),
+    "tools/": ("tests/tools/",),
+    "cron/": ("tests/cron/",),
+    "plugins/": ("tests/plugins/",),
+    "skills/": ("tests/skills/",),
+    "optional-skills/": ("tests/skills/",),
+    "scripts/ci/": ("tests/ci/",),
+    "evals/": ("tests/evals/",),
+    "acp_adapter/": ("tests/acp_adapter/", "tests/acp/"),
+    # Python-asserted site trees (see _PY_RELEVANT_SITE) → their tiny suite.
+    "website/docs/": ("tests/website/",),
+    "website/scripts/": ("tests/website/",),
+    "website/static/oauth/": ("tests/website/",),
+}
+
+# Changes here reshape the whole suite's collection or the runner itself, so
+# they always fail open to the full suite regardless of where they live.
+_PY_FULL_PREFIXES = ("tests/fakes/", "tests/fixtures/")
+_PY_FULL_FILES = {"tests/conftest.py"}
+
+# npm workspace selection for the JS lane. Anything frontend-relevant that is
+# not listed here (root package.json / package-lock.json, eslint configs at
+# unknown paths, ...) selects ALL workspaces — fail-open is the empty list.
+_FRONTEND_WORKSPACE_MAP = {
+    "apps/desktop/": ("apps/desktop", "apps/shared"),
+    # apps/desktop imports apps/shared, so a shared change must re-check it.
+    "apps/shared/": ("apps/shared", "apps/desktop"),
+    "apps/bootstrap-installer/": ("apps/bootstrap-installer",),
+    "web/": ("web",),
+    "tests-js/": ("tests-js",),
+    "ui-tui/": ("ui-tui",),
+}
+_FRONTEND_FILE_WORKSPACES = {
+    # Shipped updater page, exercised by the desktop Electron suite.
+    "scripts/desktop-update/ui.html": ("apps/desktop",),
+}
+
+# Surfaces the macOS/Windows-only suites (see scripts/ci/list_os_marked_tests.py
+# and the _OS_MARKS block in tests/conftest.py) actually exercise: terminal
+# backends, CLI process/update machinery, installer + desktop-update scripts,
+# the desktop Electron shell. An agent/gateway/cron/plugins-only change runs
+# no OS-marked subject, so paying the 10x macOS minute weight there is waste.
+_OS_SOURCE_PREFIXES = (
+    "tools/",
+    "hermes_cli/",
+    "scripts/",
+    "apps/",
+    "tui_gateway/",
+)
+_OS_TEST_PREFIXES = (
+    "tests/tools/",
+    "tests/hermes_cli/",
+    "tests/desktop/",
+    "tests/computer_use/",
+    "tests/install/",
+)
+_OS_FILES = {"pyproject.toml", "uv.lock", "setup.py", "tests/conftest.py"}
+
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
         return False
@@ -217,13 +308,101 @@ def _is_ci_review(p: str) -> bool:
     return os.path.basename(p).startswith("eslint.config.")
 
 
+def _py_root_group(p: str) -> list[str] | None:
+    """Candidate test roots covering a change to ``p``, or None for full-suite.
+
+    A group lists glob-capable candidates the resolver expands against the
+    repo tree; the union of everything that exists is what runs. Returning
+    None means "this file can affect anything" — the caller fails open to
+    the full suite. Only ever reached for files that are NOT
+    ``_py_irrelevant``.
+    """
+    if p in _PY_FULL_FILES or p.startswith(_PY_FULL_PREFIXES):
+        return None
+    if p.startswith("tests/"):
+        # A test file's coverage is itself. conftest/fakes/fixtures are
+        # handled above; runner infrastructure under scripts/ never lands
+        # here (it is not under tests/).
+        return [p]
+    subtrees: tuple[str, ...] | None = None
+    for prefix, mapped in _PY_TEST_SUBTREES.items():
+        if p.startswith(prefix):
+            subtrees = mapped
+            break
+    if subtrees is None:
+        # Root-level hub modules (run_agent.py, cli.py, model_tools.py,
+        # hermes_state*.py, ...), scripts/ outside ci/, tui_gateway/, and
+        # anything unrecognized are imported broadly enough that no subtree
+        # is honest coverage — run everything.
+        return None
+    group: list[str] = []
+    if p.endswith(".py"):
+        stem = os.path.basename(p)[:-3]
+        # Facade/sibling families (hermes_state.py + hermes_state_*.py) share
+        # test stems, so the twin glob carries a trailing '*'.
+        for subtree in subtrees:
+            group.append(f"{subtree}test_{stem}*.py")
+        group.append(f"tests/test_{stem}*.py")
+    group.extend(subtrees)
+    return group
+
+
+def _frontend_workspaces(files: list[str]) -> list[str] | None:
+    """Workspaces whose check scripts a frontend change can affect.
+
+    Returns None when any frontend-relevant file is unmapped — the empty-list
+    output (all workspaces) is the fail-open encoding, so None collapses to
+    it in the caller.
+    """
+    selected: set[str] = set()
+    for f in files:
+        frontend_relevant = (
+            f.startswith(_FRONTEND) or f in _ROOT_NPM or f in _FRONTEND_FILES
+        )
+        if not frontend_relevant:
+            continue
+        if f in _ROOT_NPM:
+            return None
+        mapped: tuple[str, ...] | None = _FRONTEND_FILE_WORKSPACES.get(f)
+        if mapped is None:
+            for prefix, workspaces in _FRONTEND_WORKSPACE_MAP.items():
+                if f.startswith(prefix):
+                    mapped = workspaces
+                    break
+        if mapped is None:
+            return None
+        selected.update(mapped)
+        # A package under ui-tui/packages/<pkg>/ runs its own checks beside
+        # the ui-tui umbrella package.
+        if f.startswith("ui-tui/packages/"):
+            parts = f.split("/")
+            if len(parts) > 2 and parts[2]:
+                selected.add(f"ui-tui/packages/{parts[2]}")
+    return sorted(selected)
+
+
+def _is_os_surface(p: str) -> bool:
+    base = os.path.basename(p).lower()
+    return (
+        p.startswith(_OS_SOURCE_PREFIXES)
+        or p.startswith(_OS_TEST_PREFIXES)
+        or p in _OS_FILES
+        or "windows" in base
+        or "macos" in base
+    )
+
+
 def ci_review_files(files: list[str]) -> list[str]:
     """Return the CI-sensitive paths that need maintainer review."""
     return sorted({f.strip() for f in files if f.strip() and _is_ci_review(f.strip())})
 
 
-def classify(files: list[str]) -> dict[str, bool]:
-    """Map changed paths to ``{lane: should_run}``."""
+def classify(files: list[str]) -> dict[str, object]:
+    """Map changed paths to ``{lane: should_run}`` plus selection outputs.
+
+    Boolean lanes gate sub-workflows; string lanes (``py_scope``, ``py_roots``,
+    ``frontend_workspaces``, ``mode``) steer how the gated work executes.
+    """
     files = [f.strip() for f in files if f.strip()]
     python = any(not _py_irrelevant(f) for f in files)
     python_prod = any(not _py_irrelevant(f) and not _py_test_only(f) for f in files)
@@ -234,8 +413,50 @@ def classify(files: list[str]) -> dict[str, bool]:
     deps = any(f == "pyproject.toml" for f in files)
     npm_lock = any(f.split("/")[-1] == "package-lock.json" for f in files)
     docker_meta = any(f.startswith(_DOCKER_META) for f in files)
-    
-    ret = {
+    # Fail-open trigger: no diff to classify, or CI itself changed — every
+    # lane runs and every selector is at its broadest.
+    fail_open = not files or any(f.startswith(".github/") for f in files)
+
+    # Selective Python scope: any python-relevant file without an honest
+    # subtree mapping pulls the whole suite back in.
+    py_groups: list[list[str]] = []
+    py_full = True
+    if python and not fail_open:
+        py_full = False
+        for f in files:
+            if _py_irrelevant(f):
+                continue
+            group = _py_root_group(f)
+            if group is None:
+                py_full = True
+                py_groups = []
+                break
+            py_groups.append(group)
+    if not python:
+        py_scope: str = "none"
+        py_roots: list[list[str]] = []
+    elif py_full:
+        py_scope = "full"
+        py_roots = [["tests"]]
+    else:
+        py_scope = "selective"
+        py_roots = py_groups
+
+    workspaces = _frontend_workspaces(files)
+    if fail_open or not frontend or workspaces is None:
+        # Empty array = all workspaces (fail-open encoding).
+        frontend_workspaces: list[str] = []
+    else:
+        frontend_workspaces = workspaces
+
+    os_tests = (
+        fail_open
+        or any(_is_os_surface(f) for f in files)
+        or any(_is_installer(f) for f in files)
+        or any(_is_desktop_updater(f) for f in files)
+    )
+
+    ret: dict[str, object] = {
         "python": python,
         "python_prod": python_prod,
         "docker": docker_meta or python_prod or frontend,
@@ -251,9 +472,14 @@ def classify(files: list[str]) -> dict[str, bool]:
         "rust": any(_is_rust(f) for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
-        "nix": python_prod or frontend or any(_is_nix(f) for f in files)
+        "nix": python_prod or frontend or any(_is_nix(f) for f in files),
+        "py_scope": py_scope,
+        "py_roots": json.dumps(py_roots),
+        "frontend_workspaces": json.dumps(frontend_workspaces),
+        "os_tests": os_tests,
+        "mode": "full" if fail_open else "selective",
     }
-    if not files or any(f.startswith(".github/") for f in files):
+    if fail_open:
         ret["python"] = True
         ret["python_prod"] = True
         ret["docker"] = True
@@ -269,6 +495,10 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["rust"] = True
         ret["nix"] = True
         ret["ci_review"] = True
+        ret["py_scope"] = "full"
+        ret["py_roots"] = json.dumps([["tests"]])
+        ret["frontend_workspaces"] = json.dumps([])
+        ret["os_tests"] = True
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
     return ret
@@ -342,7 +572,10 @@ def main() -> int:
             files = recovered
     lanes = classify(files)
     out = "\n".join([
-        *(f"{key}={str(value).lower()}" for key, value in lanes.items()),
+        *(
+            f"{key}={str(value).lower() if isinstance(value, bool) else value}"
+            for key, value in lanes.items()
+        ),
         f"ci_review_files={json.dumps(ci_review_files(files))}",
     ])
     if dest := os.environ.get("GITHUB_OUTPUT"):

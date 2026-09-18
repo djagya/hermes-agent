@@ -1249,6 +1249,11 @@ def create_task(
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
+    from hermes_cli.kanban_db_notify import (
+        _fixed_notify_target,
+        _insert_notify_sub,
+        add_notify_sub,
+    )
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
@@ -1286,6 +1291,8 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
+    fixed_notify_target = _fixed_notify_target()
+
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
@@ -1295,6 +1302,12 @@ def create_task(
             "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
         ).fetchone()
         if row:
+            if fixed_notify_target:
+                add_notify_sub(
+                    conn,
+                    task_id=row["id"],
+                    **fixed_notify_target,
+                )
             return row["id"]
 
     now = int(time.time())
@@ -1376,6 +1389,20 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if fixed_notify_target:
+                    _insert_notify_sub(
+                        conn,
+                        task_id=task_id,
+                        delivery_metadata={
+                            key: value
+                            for key, value in {
+                                "thread_id": fixed_notify_target.get("thread_id"),
+                                "chat_type": fixed_notify_target.get("chat_type"),
+                            }.items()
+                            if value
+                        } or None,
+                        **fixed_notify_target,
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

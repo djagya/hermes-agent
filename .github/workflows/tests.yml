@@ -2,26 +2,85 @@ name: Tests
 
 on:
   workflow_call:
+    inputs:
+      scope:
+        description: >-
+          full | selective — from the classifier's py_scope. 'full' runs the
+          whole suite on 8 slices; 'selective' runs only the resolved test
+          roots. Resolution failure inside the plan job fails closed to full.
+        type: string
+        required: false
+        default: 'full'
+      roots:
+        description: >-
+          JSON candidate groups from the classifier's py_roots output
+          (selective scope only). Consumed by scripts/ci/select_test_roots.py.
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
-# Cancel in-progress runs for the same ref
+# Event-aware concurrency (same policy as ci.yaml and docker.yml): a PR's
+# repeated pushes collapse per PR, while workflow_dispatch / push full-
+# validation runs queue in their own per-ref group. Neither class may kill
+# the other: the standard flow runs an ordinary PR's CI and an explicit
+# full dispatch on the same branch/head at the same time, and each must
+# preserve its own evidence. A single `tests-<ref>` group with
+# unconditional cancel let the Tests call of a manual full dispatch
+# SIGTERM the same-head PR run's slices mid-suite (live collision: PR run
+# 35211816101 slice 3/8 died at 82.8% with zero test failures when the
+# Tests call of dispatch run 35211892455 started). PR evidence is the
+# merge-gating context; a full dispatch is the pre-upstream receipt — both
+# must survive together. Contract asserted in
+# tests/ci/test_workflow_concurrency.py.
 concurrency:
-  group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  plan:
+    name: Plan test scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Resolve selective roots into a slice plan
+        id: plan
+        env:
+          PY_SCOPE: ${{ inputs.scope }}
+          PY_ROOTS: ${{ inputs.roots }}
+        run: python3 scripts/ci/select_test_roots.py
+
   test:
-    name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
+    name: Run tests (${{ matrix.slice }})
+    needs: plan
+    # This fork has no larger-runner fleet: `*-NN-core` labels are billed even
+    # on public repos and would queue for hours. The whole file-isolated suite
+    # is therefore distributed across standard free runners via the test
+    # runner's duration-aware --slice mode (each job discovers the suite under
+    # the plan's roots, then runs only its duration-balanced slice).
     #
-    # 96 cores clear the floor that the slowest single test file sets (about
-    # 82s). A second slice divides work that is already at that floor, and
-    # adds a second setup.
-    runs-on: ubuntu-latest-96-core
+    # Full scope = eight slices of tests/ (proven green on this exact shape:
+    # fork run 34709435220, 2026-09-12, 0 failed files across all 8 slices).
+    # Selective scope = the classifier's resolved roots over 1-8 slices.
+    #
+    # A later rewrite that pre-computed slices in a separate generate job and
+    # passed `--files` regressed: every slice re-ran the whole suite under 8
+    # workers and failed in clusters (runs 35015645842, 35039223145). The plan
+    # job here passes only ROOTS (via HERMES_TEST_PATHS) — each slice job
+    # re-discovers and re-slices the identical set itself, so no file list
+    # crosses a job boundary. Do not reintroduce `--files`.
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -87,39 +146,23 @@ jobs:
         # re-download, keeping the persisted cache small and fast to restore.
         run: uv cache prune --ci
 
-      - name: Run tests
+      - name: Run tests (slice ${{ matrix.slice }})
         # Per-file isolation via scripts/run_tests.sh: each test file runs
-        # in its own freshly-spawned `python -m pytest <file>` subprocess
-        # with bounded parallelism. No xdist, no shared workers, no
-        # module-level state leakage between files.
-        #
-        # No --files: the runner discovers the suite itself. The discovered
-        # set is identical to the list the removed matrix job used to pass in.
+        # in its own freshly-spawned `python -m pytest <file>` subprocess.
+        # Each slice job discovers the plan's roots itself and runs only its
+        # own duration-balanced slice — no pre-computed file lists.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          scripts/run_tests.sh --slice "${{ matrix.slice }}"
         env:
-          # This is the maximum number of test FILES that run together.
-          # run_tests_parallel.py starts one pytest subprocess for each file
-          # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # default is cpu_count*2, which is 192 here.
-          #
-          # Measured on this runner (96-core EPYC 7763, 377GB). Whole suite,
-          # two repetitions for each value. See run 32549672063:
-          #
-          #     workers   x cores   mean
-          #        48       0.5x    138s
-          #        96       1.0x    126s   <- fastest
-          #       144       1.5x    132s
-          #       192       2.0x    132s
-          #       240       2.5x    140s
-          #       288       3.0x    142s
-          #
-          # One worker for each core wins. The curve is shallow: 126s to 142s
-          # across a 6x range. The suite has sufficient concurrency at this
-          # size. The remaining time is the slowest files plus the setup.
-          # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
+          # Discovery roots resolved by the plan job (full scope: "tests").
+          # run_tests.sh forwards this into the hermetic runner env, where it
+          # becomes the --paths default.
+          HERMES_TEST_PATHS: ${{ matrix.paths }}
+          # Match concurrency to the available runner. Eight workers on the
+          # standard 4-core host keep each slice moving without the pathological
+          # contention caused by hard-coding the upstream fleet's 96 workers.
+          HERMES_TEST_WORKERS: 8
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
@@ -149,30 +192,18 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
         with:
-          # Pin the uv version: unpinned, setup-uv resolves "latest" by
-          # fetching a manifest from raw.githubusercontent.com on EVERY job —
-          # a transient fetch failure fails the whole job (2026-07-28 slice-5
-          # incident). Pinned, the binary downloads directly; no manifest hop.
           version: "0.9.28"
-          # Persist uv's download/wheel cache (~/.cache/uv) across runs.
-          # Keyed on the dependency manifests, so the cache is reused until
-          # pyproject.toml or uv.lock changes. `uv sync` still runs every
-          # time, but resolves from the warm cache instead of re-downloading
-          # and re-building wheels.
           enable-cache: true
           cache-dependency-glob: |
             pyproject.toml
             uv.lock
 
       - name: Set up Python 3.11
-        run: uv python install 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
 
       - name: Install dependencies
-        # `uv sync --locked` installs the exact pinned set from uv.lock (and
-        # fails if the lock is out of sync with pyproject.toml), giving a
-        # reproducible env. It also creates .venv itself, so no separate
-        # `uv venv` step is needed.
-        #
         # Same extras as the test job's sync above: the hermetic test env
         # forbids mid-run pip installs (HERMES_DISABLE_LAZY_INSTALLS=1 in
         # tests/conftest.py), so lazy-install SDKs exercised by tests must be

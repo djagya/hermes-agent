@@ -2244,6 +2244,7 @@ class TestReconcileColumnsErrorHandling:
         assert "last_read_at" in cols
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 class TestFtsRebuildLoopWithoutTrigram:
     """A trigram-less SQLite build must not re-index the store on every open.
 
@@ -3881,6 +3882,7 @@ class TestFTS5ToolCallMigration:
             session_db.close()
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
 class TestFTSExternalContentMigration:
     """v23 migration: inline-mode FTS tables (v11-v22) are rebuilt as
     external-content tables, and role='tool' rows are excluded from the
