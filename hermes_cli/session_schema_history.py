@@ -236,6 +236,7 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
             ('+', 'display_identity', 'display_metadata'),
             ('+', 'display_order', 'display_identity'),
         )),
+        ('16 2026-09-16T00:13Z a419f2b6c7', (('+', 'platform_delivery', 'display_order'),)),
         ),
     ),
     "session_model_usage": _TableHistory(

@@ -138,6 +138,21 @@ def _append_session_messages(lines: List[str], session: Dict[str, Any], *, headi
         else:
             label = {"user": "User", "assistant": "Assistant"}.get(role, role.title())
             lines += [f"{marker} {label}{suffix}", "", text, ""]
+            if platform_url := _platform_message_url(message):
+                lines += [f"[View on platform]({platform_url})", ""]
+
+
+def _platform_message_url(message: Dict[str, Any]) -> Optional[str]:
+    """Direct platform link from a stored delivery receipt; ``None`` when the row
+    carries no receipt or the receipt lacks enough truth to build one (never guessed)."""
+    receipt = message.get("platform_delivery")
+    if not receipt:
+        return None
+    try:
+        from gateway.platforms.telegram_link import telegram_message_link
+        return telegram_message_link(receipt)
+    except Exception:
+        return None
 
 
 def _messages(session: Dict[str, Any]) -> List[Dict[str, Any]]:

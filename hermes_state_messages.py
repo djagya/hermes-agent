@@ -682,6 +682,35 @@ class SessionMessagesMixin:
             "AND role = 'user' AND active = 1 AND content IS ?",
             (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
 
+    def set_message_delivery(
+        self, session_id: str, row_id: int, delivery: Optional[Dict[str, Any]]
+    ) -> int:
+        """Persist the outbound delivery receipt onto ONE known durable assistant row.
+
+        Row-addressed like :meth:`set_message_api_content`: the caller passes the
+        ``_row_id`` stamped on the live message dict at persist time, so the receipt
+        cannot drift onto a neighbouring row. Idempotent and write-once: a row that
+        already carries a receipt is left untouched (a redelivery sweep re-reporting
+        success must never overwrite the first confirmed receipt with a different
+        one). ``active = 1`` and ``role = 'assistant'`` stay as guards so an archived
+        or user-role row is never silently branded. Returns rows changed (0 = refused
+        or already recorded).
+
+        ``delivery`` is the canonical receipt dict — platform, chat_id, thread_id,
+        message_ids (send order, primary LAST), chat_kind/chat_handle when known,
+        delivered_at (epoch seconds) — encoded as ``platform_delivery`` JSON. Only a
+        CONFIRMED platform ACK may call this; pending/attempting/failed sends do not.
+        """
+        if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
+            return 0
+        if not isinstance(delivery, dict) or not delivery:
+            return 0
+        encoded = json.dumps(delivery, ensure_ascii=False, sort_keys=True)
+        return self._write_rowcount(
+            "UPDATE messages SET platform_delivery = ? WHERE id = ? AND session_id = ? "
+            "AND role = 'assistant' AND active = 1 AND platform_delivery IS NULL",
+            (encoded, row_id, session_id))
+
     def _display_dedupe_key(self, row) -> Tuple[Any, ...]:
         """Historical display identity, including normalized live content from user handoff carriers."""
         dedupe_content = row["content"]
@@ -764,6 +793,10 @@ class SessionMessagesMixin:
                 msg["tool_calls"], [], f"Failed to deserialize tool_calls in {warn_context}, falling back to []")
         if msg.get("display_metadata") is not None:
             msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+        if msg.get("platform_delivery"):
+            msg["platform_delivery"] = _json_or(
+                msg["platform_delivery"], None,
+                f"Failed to deserialize platform_delivery in {warn_context}, falling back to None")
         return msg
 
     @staticmethod

@@ -1615,6 +1615,46 @@ _SEND_ERROR_CLASSIFIERS: Tuple[Tuple[str, Callable[[str], bool]], ...] = (
     ("transient", lambda b: _any_in(b, *_RETRYABLE_ERROR_PATTERNS, "connecttimeout")))
 
 
+def build_delivery_receipt(
+    result: "SendResult", *, platform: str, chat_id: Optional[str], thread_id: Optional[str],
+    chat_kind: Optional[str] = None, chat_handle: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Canonical delivery receipt from a SendResult, or ``None`` without a confirmed ACK.
+
+    ``message_ids`` keeps send order with the primary id LAST (``SendResult.message_id``
+    is the LAST id on a split/rich send so later edits target the newest chunk). Only a
+    ``success=True`` result carrying at least one id yields a receipt — pending,
+    attempting, failed, and ACK-less no-op sends must never create one. Rendering a
+    t.me link from the receipt lives at the adapter/presentation seam
+    (:mod:`gateway.platforms.telegram_link`), never here."""
+    if not getattr(result, "success", False):
+        return None
+    message_ids: list = []
+    raw = getattr(result, "raw_response", None)
+    raw_ids = raw.get("message_ids") if isinstance(raw, dict) else None
+    if raw_ids:
+        message_ids.extend(str(mid) for mid in raw_ids if mid is not None and str(mid).strip())
+    for mid in getattr(result, "continuation_message_ids", None) or ():
+        if mid is not None and str(mid).strip() and str(mid) not in message_ids:
+            message_ids.append(str(mid))
+    primary = getattr(result, "message_id", None)
+    if primary is not None and str(primary).strip() and str(primary) not in message_ids:
+        message_ids.append(str(primary))
+    if not message_ids:
+        return None
+    receipt: Dict[str, Any] = {
+        "platform": str(platform),
+        "chat_id": str(chat_id) if chat_id is not None else None,
+        "thread_id": str(thread_id) if thread_id is not None else None,
+        "message_ids": message_ids,
+        "delivered_at": time.time(),
+    }
+    if chat_kind:
+        receipt["chat_kind"] = str(chat_kind)
+    if chat_handle:
+        receipt["chat_handle"] = str(chat_handle)
+    return receipt
+
+
 def classify_send_error(exc: Optional[BaseException], error_text: str = "") -> str:
     """Map a send exception / error string to a :data:`SEND_ERROR_KINDS` value; anything
     unrecognized is ``"unknown"`` so an unclassified failure is never mistaken for a benign one."""
@@ -3961,7 +4001,46 @@ class BasePlatformAdapter(ABC):
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+        await self._persist_delivery_receipt(event, result, delivery_adapter)
         return result, delivery_adapter
+
+    async def _persist_delivery_receipt(
+        self, event: MessageEvent, result: "SendResult", delivery_adapter: "BasePlatformAdapter") -> None:
+        """After a CONFIRMED ACK, persist the delivery coordinates onto the exact
+        assistant row the runner stamped on this event (``_delivery_row_id`` /
+        ``_delivery_session_id``). Best-effort, never raises: history remains
+        correct without the receipt, it just lacks the direct link."""
+        try:
+            row_id = getattr(event, "_delivery_row_id", None)
+            session_id = getattr(event, "_delivery_session_id", None)
+            if not isinstance(row_id, int) or row_id <= 0 or not session_id:
+                return  # runner did not stamp a durable row (slash/ephemeral/codex) — no receipt
+            receipt = build_delivery_receipt(
+                result, platform=str(getattr(self.platform, "value", self.platform)),
+                chat_id=event.source.chat_id, thread_id=getattr(event.source, "thread_id", None),
+                chat_kind=getattr(event, "_delivery_chat_kind", None),
+                chat_handle=getattr(event, "_delivery_chat_handle", None))
+            if receipt is None:
+                return  # failed, ambiguous, or ACK-less send: never fabricate a receipt
+            from gateway.delivery_ledger import record_delivery_receipt
+            await asyncio.to_thread(
+                record_delivery_receipt, self._delivery_session_db(event),
+                session_id=session_id, row_id=row_id, receipt=receipt)
+        except Exception:
+            logger.debug("[%s] delivery receipt persist failed", self.name, exc_info=True)
+
+    def _delivery_session_db(self, event: MessageEvent):
+        """The SessionDB owning the stamped delivery row (None when unresolvable)."""
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "session_store", None) if runner is not None else None
+        if store is not None:
+            db = getattr(store, "_db_for_session_id", None)
+            if callable(db):
+                try:
+                    return db(getattr(event, "_delivery_session_id", None))
+                except Exception:
+                    return None
+        return None
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
