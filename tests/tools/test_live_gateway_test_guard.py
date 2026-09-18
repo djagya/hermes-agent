@@ -87,6 +87,44 @@ class TestBlocksHermesTestRunsInGateway:
         assert verdict == VERDICT_BLOCKED
 
     @pytest.mark.parametrize(
+        "command, cwd",
+        [
+            # Package/project runners must not stop wrapper peeling: the
+            # inner runner is still aimed at this checkout.
+            ("uv run pytest", "REPO"),
+            ("uv run pytest tests/docker", "REPO"),
+            ("uvx pytest", "REPO"),
+            ("uvx pytest tests/docker", "REPO"),
+            ("uv tool run pytest tests/", "REPO"),
+            ("uv run --frozen pytest tests/", "REPO"),
+            ("poetry run pytest", "REPO"),
+            ("poetry run python -m pytest tests/tools/test_x.py", "REPO"),
+            ("pipx run pytest", "REPO"),
+            ("pdm run pytest", "REPO"),
+            ("hatch run pytest", "REPO"),
+            ("hatch run +py=3.12 pytest", "REPO"),
+            ("pipenv run pytest tests/", "REPO"),
+            ("uv run scripts/run_tests.sh -q", "REPO"),
+            ("sudo -u root uv run pytest", "REPO"),
+            # Option operands name the repo even from a foreign cwd.
+            ("uv --directory {repo} run pytest", "OTHER"),
+            ("uv --directory={repo} run pytest", "OTHER"),
+            ("uv run --directory {repo} pytest", "OTHER"),
+            ("poetry -C {repo} run pytest", "OTHER"),
+            # make: -C/--directory operands are the run's repo, not targets.
+            ("make -C {repo} test", "OTHER"),
+            ("make --directory={repo} test", "OTHER"),
+            ("make -C {repo} ci", "OTHER"),
+            ("make -C {repo} -j4 test", "OTHER"),
+        ],
+    )
+    def test_package_runner_and_make_directory_blocked(self, command, cwd):
+        anchored = command.replace("{repo}", str(REPO_ROOT))
+        verdict, _ = classify_live_test_run(
+            anchored, cwd=str(REPO_ROOT) if cwd == "REPO" else "/tmp")
+        assert verdict == VERDICT_BLOCKED
+
+    @pytest.mark.parametrize(
         "command",
         [
             # The incident-shaped bypass: runner + explicit relative path arg
@@ -167,6 +205,40 @@ class TestAllowsNonHermesTestRuns:
 
     def test_make_test_in_other_repo_allowed(self, other_repo):
         verdict, _ = classify_live_test_run("make test", cwd=str(other_repo))
+        assert verdict == VERDICT_ALLOWED
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The same package-runner invocations stay allowed when they are
+            # NOT aimed at a Hermes checkout — ordinary local testing must
+            # not regress.
+            "uv run pytest",
+            "uvx pytest",
+            "uvx pytest tests/",
+            "uv tool run pytest tests/",
+            "uv run --frozen pytest tests/",
+            "poetry run pytest",
+            "poetry run python -m pytest tests/",
+            "pipx run pytest",
+            "pdm run pytest",
+            "hatch run pytest",
+            "hatch run +py=3.12 pytest",
+            "pipenv run pytest tests/",
+            "make -C {repo} test",
+            "make --directory={repo} test",
+        ],
+    )
+    def test_package_runners_in_other_repo_allowed(self, other_repo, command):
+        verdict, _ = classify_live_test_run(
+            command.replace("{repo}", str(other_repo)), cwd=str(other_repo))
+        assert verdict == VERDICT_ALLOWED
+
+    def test_uv_run_pytest_with_unknown_cwd_allowed(self):
+        """No cwd/workdir at all: even a wrapped pytest has no established
+        Hermes identity and must not fail closed (only Hermes-SPECIFIC
+        runners do)."""
+        verdict, _ = classify_live_test_run("uv run pytest tests/")
         assert verdict == VERDICT_ALLOWED
 
     def test_npm_test_in_other_repo_allowed(self, other_repo):

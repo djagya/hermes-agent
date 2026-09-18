@@ -28,7 +28,9 @@ backends with host bind mounts).
 The two closed gates:
   A. The command invokes a Hermes test runner (``pytest``/``python -m pytest``/
      ``unittest``/``make test``/``scripts/run_tests.sh``/``run_tests_parallel.py``,
-     under ``sudo``/``env``/``timeout``/... wrappers and inside ``sh -c`` payloads),
+     under ``sudo``/``env``/``timeout``/... wrappers, package/project runners
+     (``uv run``, ``uvx``, ``poetry/pdm/hatch/pipenv run``, ``pipx run``),
+     ``sh -c`` payloads, and ``make -C/--directory`` repo operands),
      AND the command's own target path — an explicit path argument, the
      terminal ``workdir``, or the command cwd — resolves into a Hermes checkout
      (the running source root, its ``.worktrees/*``, or any checkout whose
@@ -87,7 +89,12 @@ _TEST_FILE_BASENAME_RE = re.compile(
 # option arguments (option attached form already handled by the = split).
 _WRAPPER_WORDS = frozenset({
     "sudo", "env", "exec", "nohup", "setsid", "time", "nice", "stdbuf",
-    "ionice", "command", "builtin", "timeout", "chrt", "taskset"})
+    "ionice", "command", "builtin", "timeout", "chrt", "taskset",
+    # Package/project runners. These STOP generic peeling: their first
+    # positional is a subcommand ("run"), not the wrapped program, so they are
+    # consumed by the package-runner branch below before the generic peel can
+    # misread them (`uv run pytest` would otherwise classify "run" and stop).
+    "uv", "uvx", "poetry", "pipx", "pdm", "hatch", "pipenv"})
 _WRAPPER_OPTIONS_WITH_ARG = {
     "sudo": {"-C", "--chdir", "-c", "--close-from", "-g", "--group", "-h",
              "--host", "-p", "--prompt", "-u", "--user", "-T", "--command-timeout"},
@@ -97,10 +104,23 @@ _WRAPPER_OPTIONS_WITH_ARG = {
     "timeout": {"-k", "--kill-after", "-s", "--signal"},
     "stdbuf": {"-e", "--error", "-i", "--input", "-o", "--output"},
     "ionice": {"-c", "--class", "-n", "--classdata"},
+    # Option operands of package runners often NAME THE TARGET REPO
+    # (`uv --directory <repo> run pytest`, `poetry -C <repo> run pytest`);
+    # consumed operands are collected as target candidates by the caller.
+    "uv": {"-c", "--config", "-p", "--python", "--default-index", "--index",
+           "--index-strategy", "--keyring-provider", "--cache-dir", "-L",
+           "--link-mode", "--project", "--directory"},
+    "poetry": {"-C", "--directory", "-P", "--project-dir", "--project", "--local"},
 }
 # Positional operands each wrapper consumes BEFORE the wrapped program
 # (`timeout 300 pytest`, `chroot /srv sh`, `taskset -c 0,1 pytest`).
 _WRAPPER_POSITIONAL_ARGS = {"chroot": 1, "chrt": 1, "taskset": 1, "timeout": 1}
+# Package runners whose FIRST non-option positional is an ephemeral tool name
+# to strip (`uvx pytest`, `pipx run pytest`) rather than a subcommand.
+_PACKAGE_TOOL_RUNNERS = frozenset({"uvx", "pipx"})
+# Subcommand token that separates these runners from the wrapped program
+# (`uv run pytest`, `hatch run pytest`).
+_PACKAGE_RUN_SUBCOMMANDS = frozenset({"run"})
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 
@@ -126,11 +146,20 @@ def _executable_name(word: str) -> str:
 
 
 def _consume_options(words: list[str], start: int,
-                     options_with_arg: "set[str] | dict[str, set[str]] | None" = None) -> int:
+                     options_with_arg: "set[str] | None" = None) -> int:
     """Index of the first non-option token at/after *start* (``--`` ends options).
     Separate-argument option values (``env -u FOO``) are skipped so ``FOO`` is
     not mistaken for the wrapped program. *options_with_arg* is the option set
     of the CURRENT wrapper (a plain set), not the wrapper table."""
+    return _consume_options_collect(words, start, options_with_arg or set(), None)
+
+
+def _consume_options_collect(words: list[str], start: int,
+                             options_with_arg: "set[str] | None",
+                             collected: "list[str] | None") -> int:
+    """The actual option scanner. When *collected* is a list, every consumed
+    option operand (the ``<repo>`` of ``uv --directory <repo>``) is appended
+    there so the caller can sweep it as a target candidate."""
     options = options_with_arg or set()
     index = start
     while index < len(words) and words[index].startswith("-") and words[index] != "-":
@@ -138,7 +167,15 @@ def _consume_options(words: list[str], start: int,
             return index + 1
         option = words[index].split("=", 1)[0]
         if option in options:
-            index += 2
+            if collected is not None:
+                if "=" in words[index]:
+                    collected.append(words[index].split("=", 1)[1])
+                elif index + 1 < len(words):
+                    collected.append(words[index + 1])
+            # An attached operand (`--directory=<repo>`) is part of THIS
+            # token: consume one word. Only the separate form (`-C <repo>`)
+            # consumes the following token too.
+            index += 1 if "=" in words[index] else 2
         else:
             index += 1
     return index
@@ -173,19 +210,52 @@ def _strip_lead_assignments(words: list[str]) -> list[str]:
     return _split_lead(words)[1]
 
 
-def _peel_wrappers(words: list[str]) -> list[str]:
-    """Peel wrapper executables (sudo/env/timeout/...), their option arguments
-    (``-u root``) and their non-option operand arguments (``timeout 300``), so
-    the wrapped program's name and arguments can be classified."""
+def _peel_wrappers(words: list[str]) -> tuple[list[str], list[str]]:
+    """Peel wrapper executables (sudo/env/timeout/package runners), their
+    option arguments (``-u root``) and their non-option operand arguments
+    (``timeout 300``), so the wrapped program's name and arguments can be
+    classified. Returns ``(rest, option_value_operands)``: the second list
+    carries every consumed option operand — directory-valued ones (``uv
+    --directory <repo>``) name the run's target repo, so the caller adds
+    them to the resolution sweep."""
+    collected: list[str] = []
     rest = words
     for _ in range(8):
         rest = _strip_lead_assignments(rest)
         if not rest:
-            return rest
+            return rest, collected
         name = _executable_name(rest[0])
         if name not in _WRAPPER_WORDS:
-            return rest
-        index = _consume_options(rest, 1, _WRAPPER_OPTIONS_WITH_ARG.get(name, set()))
+            return rest, collected
+        options = _WRAPPER_OPTIONS_WITH_ARG.get(name, set())
+        index = _consume_options_collect(rest, 1, options, collected)
+        if name in _PACKAGE_TOOL_RUNNERS:
+            # `uvx pytest ...` / `pipx run pytest ...`: the first positional
+            # is an ephemeral TOOL NAME plus its command line, not a
+            # subcommand. The wrapper swallows them, so they ride back in
+            # *collected* — nothing a wrapper consumes may escape
+            # classification (``uvx pytest tests/docker`` must still read as
+            # a pytest run).
+            if index < len(rest) and rest[index] in _PACKAGE_RUN_SUBCOMMANDS:
+                index += 1
+            if index < len(rest):
+                collected.extend(rest[index:])
+                index = len(rest)
+        elif index < len(rest) and rest[index] in _PACKAGE_RUN_SUBCOMMANDS:
+            # `uv run`, `poetry run`, `pdm run`, `hatch run`, `pipenv run`:
+            # consume the subcommand token so the wrapped program surfaces.
+            index += 1
+            # Hatch/pdm matrix and env selectors (`+py=3`, `!3.12`) ride
+            # between the subcommand and the wrapped command.
+            while index < len(rest) and rest[index][:1] in {"+", "!", "@"}:
+                index += 1
+        elif (index + 1 < len(rest) and rest[index] == "tool"
+              and rest[index + 1] in _PACKAGE_RUN_SUBCOMMANDS):
+            # `uv tool run pytest` — the spelled-out `uvx` alias.
+            index += 2
+        # Options can follow the run subcommand (`uv run --frozen pytest`,
+        # `pdm run -v pytest`); consume them too, still collecting operands.
+        index = _consume_options_collect(rest, index, options, collected)
         # Positional operands the wrapper itself consumes before the wrapped
         # program: `timeout 300 pytest` runs pytest; `chroot DIR ...` too.
         positionals = _WRAPPER_POSITIONAL_ARGS.get(name, 0)
@@ -193,9 +263,9 @@ def _peel_wrappers(words: list[str]) -> list[str]:
             index += 1
             positionals -= 1
         if index >= len(rest):
-            return []
+            return [], collected
         rest = rest[index:]
-    return rest
+    return rest, collected
 
 
 def _operator_before(command: str, start: int) -> str | None:
@@ -405,19 +475,53 @@ def _target_is_hermes(target: Optional[Path]) -> bool:
 # ---- runner classification -----------------------------------------------------------------
 
 
-def _classify_runner(words: list[str]) -> tuple[str, Optional[str]]:
-    """``(kind, explicit_target)`` for one simple command's words.
+def _classify_runner(words: list[str]) -> tuple[str, Optional[str], list[str]]:
+    """``(kind, explicit_target, extra_targets)`` for one simple command's words.
 
     kind is ``""`` (not a test runner), ``"pytest"`` (pytest-family / unittest
     against the cwd or an explicit path), ``"make_test"``, ``"npm_test"``, or
     ``"hermes_runner"`` (scripts/run_tests.sh + run_tests_parallel.py:
     Hermes-anchored by NAME).
     """
-    peeled = _peel_wrappers(words)
+    peeled, option_operands = _peel_wrappers(words)
     if not peeled:
-        return "", None
+        # No wrapped program survived peeling: the runner word itself was
+        # consumed by an ephemeral-tool runner (`uvx pytest`, `pipx run
+        # pytest`). The tool name IS the classified executable.
+        return "", None, option_operands
     name = _executable_name(peeled[0])
     args = peeled[1:]
+    # Option operands of wrappers can name the run's target repo
+    # (`uv --directory <repo> run pytest`); the caller sweeps them.
+    explicit_targets = list(option_operands)
+    # make: --directory/-C carries a directory operand (attached or separate,
+    # BEFORE or AFTER the targets) that CHANGES the run's repo; its operand
+    # must not be mistaken for a target (`make -C <repo> test`) and must be
+    # found even when it trails (`make test -C <repo>`).
+    if name == "make":
+        consumed: set[int] = set()
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg == "--":
+                break
+            if arg in {"-C", "--directory"}:
+                if index + 1 < len(args):
+                    explicit_targets.append(args[index + 1])
+                    consumed.add(index + 1)
+                consumed.add(index)
+                index += 2
+                continue
+            if arg.startswith("--directory="):
+                explicit_targets.append(arg.split("=", 1)[1])
+            elif arg.startswith("-C") and len(arg) > 2:
+                explicit_targets.append(arg[2:])
+            if arg.startswith("-"):
+                consumed.add(index)
+            index += 1
+        # Leave only the targets: the -C operand itself must never read as
+        # the make target being checked below.
+        args = [a for i, a in enumerate(args) if i not in consumed]
 
     # A shell interpreter runs its first positional script operand: when that
     # operand's NAME is Hermes-anchored (run_tests.sh), the interpreter is
@@ -428,56 +532,56 @@ def _classify_runner(words: list[str]) -> tuple[str, Optional[str]]:
             operand = args[index]
             operand_name = _executable_name(operand)
             if operand_name.endswith(".sh") and "run_tests" in operand_name:
-                return "hermes_runner", _run_tests_sh_target(args[index + 1:])
+                return "hermes_runner", _run_tests_sh_target(args[index + 1:]), explicit_targets
             if "run_tests_parallel" in operand_name:
-                return "hermes_runner", _runner_target_arg(args[index + 1:])
+                return "hermes_runner", _runner_target_arg(args[index + 1:]), explicit_targets
         has_c, payload = _bash_exec_payload(args)
         if not has_c:
-            return "", None
+            return "", None, explicit_targets
 
     if _is_python_invoker(name) and args:
         module = args[0].split("=", 1)[0]
         if module == "-m" and len(args) >= 2:
             invoked = _executable_name(args[1])
             if invoked in _TEST_RUNNER_WORDS:
-                return "pytest", _runner_target_arg(args[2:])
-            return "", None
+                return "pytest", _runner_target_arg(args[2:]), explicit_targets
+            return "", None, explicit_targets
         # python <script.py>: when the script's NAME pins it to the Hermes
         # suite (run_tests_parallel.py), the interpreter is just delivery.
         script_name = _executable_name(args[0])
         if "run_tests_parallel" in script_name:
-            return "hermes_runner", _runner_target_arg(args[1:])
-        return "", None
+            return "hermes_runner", _runner_target_arg(args[1:]), explicit_targets
+        return "", None, explicit_targets
 
     if name in _TEST_RUNNER_WORDS:
-        return "pytest", _runner_target_arg(args)
+        return "pytest", _runner_target_arg(args), explicit_targets
 
     if name == "make":
         first = next((a for a in args if not a.startswith("-")), "")
         if first.split("=", 1)[0] in {"test", "ci"}:
-            return "make_test", None
-        return "", None
+            return "make_test", None, explicit_targets
+        return "", None, explicit_targets
 
     if name == "npm" or name == "pnpm" or name == "yarn" or name == "bun":
         # ``npm test`` / ``npm run test`` in a workspace whose package.json
         # script drives the python suite (the desktop/TUI workspaces shell
         # out to it); classify it so the target gate can judge the cwd.
         if name == "npm" and args and args[0] == "test":
-            return "npm_test", None
+            return "npm_test", None, explicit_targets
         if len(args) >= 2 and args[0] == "run" and args[1].split("=", 1)[0] == "test":
-            return "npm_test", None
-        return "", None
+            return "npm_test", None, explicit_targets
+        return "", None, explicit_targets
 
     if name in {"scripts/run_tests.sh", "run_tests.sh"} or (
             name.endswith(".sh") and "run_tests" in name):
-        return "hermes_runner", _run_tests_sh_target(args)
+        return "hermes_runner", _run_tests_sh_target(args), explicit_targets
 
     if name == "run_tests_parallel.py" or (name.endswith(".py") and "run_tests_parallel" in name):
-        return "hermes_runner", _runner_target_arg(args)
+        return "hermes_runner", _runner_target_arg(args), explicit_targets
 
     # A referenced script is scanned only by name when it lives inside a Hermes
     # checkout and is itself resolvable (callers pass resolved text separately).
-    return "", None
+    return "", None, explicit_targets
 
 
 def _runner_target_arg(args: list[str]) -> Optional[str]:
@@ -520,7 +624,7 @@ def _run_tests_sh_target(args: list[str]) -> Optional[str]:
     return positional
 
 
-def _classify_runner_script(words: list[str], base: Path) -> tuple[str, Optional[str]]:
+def _classify_runner_script(words: list[str], base: Path) -> tuple[str, Optional[str], list[str]]:
     """Classify ``<script> <args>`` where *words[0]* names an existing file.
 
     Only NAME-anchored Hermes runners (``run_tests*``) are claimed here: an
@@ -530,7 +634,7 @@ def _classify_runner_script(words: list[str], base: Path) -> tuple[str, Optional
     """
     path = _normalize_path(words[0], base)
     if path is not None and "run_tests" in path.name:
-        return "hermes_runner", _run_tests_sh_target(words[1:])
+        return "hermes_runner", _run_tests_sh_target(words[1:]), []
     return _classify_runner(words)
 
 
@@ -579,6 +683,10 @@ def classify_live_test_run(
 
     explicit_by_cwd: dict[str, str] = {}
     kinds: set[str] = set()
+    # Operand values of consumed wrapper OPTIONS (``uv --directory <repo>``,
+    # ``make -C <repo>``): they name a repo the run may execute in, so they
+    # join the target sweep even when no runner path argument exists.
+    extra_targets: list[str] = []
     # Directories a ``cd``/``pushd`` in the command would land in: they are
     # authoritative cwd anchors for the runner (the operator pointed the run
     # at that directory IN the command) and, for a bare runner with no path
@@ -596,9 +704,10 @@ def classify_live_test_run(
         # tool always passes a real cwd; bare API callers mean None).
         base = scoped_cwd or session_cwd
         if base is not None and _words_name_existing_script(first, base):
-            kind, explicit = _classify_runner_script(words, base)
+            kind, explicit, extra = _classify_runner_script(words, base)
         else:
-            kind, explicit = _classify_runner(words)
+            kind, explicit, extra = _classify_runner(words)
+        extra_targets.extend(extra)
         if kind:
             kinds.add(kind)
             # Anchor the runner's explicit path argument at the cwd the
@@ -609,16 +718,38 @@ def classify_live_test_run(
             if explicit:
                 explicit_by_cwd.setdefault(explicit, str(base) if base else "")
 
+    # A package runner can CONSUME the runner word itself (``uvx pytest``,
+    # ``pipx run pytest``): the peeled program list comes back empty, so
+    # classify the consumed tool names directly - and sweep any path-ish
+    # arguments that followed the tool name (``uvx pytest tests/docker``).
+    extra_arg = None
+    for operand in extra_targets:
+        operand_name = _executable_name(operand)
+        if operand_name in _TEST_RUNNER_WORDS:
+            kinds.add("pytest")
+        elif (operand in {"tests", "tests/"}
+              or operand.startswith(("tests/", "tests\\"))
+              or "/" in operand or "\\" in operand
+              or operand.endswith((".py", ".ts", ".tsx"))):
+            extra_arg = operand
+    if extra_arg is not None:
+        explicit_by_cwd.setdefault(extra_arg, str(session_cwd) if session_cwd else "")
+
     if not kinds:
         return VERDICT_ALLOWED, ""
 
     # ANY resolvable target inside a Hermes checkout blocks: the runner's
     # effective rootdir, conftest and plugins come from the checkout it runs
     # in, so every candidate is swept — explicit path args (anchored at the
-    # cwd each command runs in), cd-derived dirs, the terminal workdir and
-    # the session cwd. A bogus explicit arg must not wash out a Hermes
-    # workdir, and a bare runner after ``cd <repo>`` must still block.
+    # cwd each command runs in), consumed wrapper-option operands that name
+    # a directory (``uv --directory <repo>``, ``make -C <repo>``), cd-derived
+    # dirs, the terminal workdir and the session cwd. A bogus explicit arg
+    # must not wash out a Hermes workdir, and a bare runner after
+    # ``cd <repo>`` must still block.
     candidate_pairs: list[tuple[str, Optional[str]]] = list(explicit_by_cwd.items())
+    for extra in extra_targets:
+        if extra:
+            candidate_pairs.append((extra, str(session_cwd) if session_cwd else None))
     if workdir:
         candidate_pairs.append((workdir, None))
     if cwd:
