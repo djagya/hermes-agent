@@ -379,6 +379,58 @@ def test_model_drift_does_not_consume_changed_monitor_output(hermes_env, monkeyp
     assert stored is not None
     assert stored["monitor_state"]["last_output_hash"]
 
+    # The recovered observation is committed exactly once: the next identical
+    # tick is suppressed instead of waking the agent again.
+    job = get_job(job["id"])
+    assert job is not None
+    success, doc, final, error = run_job(job)
+    assert success is True
+    assert error is None
+    assert final == sched.SILENT_MARKER
+    assert "no_change" in doc
+    assert observed["agent_runs"] == 1
+
+
+def test_agent_failure_still_consumes_changed_monitor_output(hermes_env, monkeypatch):
+    """Once inference starts, a failure must not replay the same change forever."""
+    from cron.jobs import get_job
+    from cron.scheduler import SILENT_MARKER, run_job
+
+    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+
+    class FailingAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, prompt, *_args, **_kwargs):
+            observed["agent_runs"] += 1
+            raise RuntimeError("inference failed")
+
+        def get_activity_summary(self):
+            return {"seconds_since_activity": 0.0}
+
+    monkeypatch.setattr(sys.modules["run_agent"], "AIAgent", FailingAgent)
+
+    success, _doc, _final, error = run_job(job)
+    assert success is False
+    assert error is not None
+    assert observed["agent_runs"] == 1
+    stored = get_job(job["id"])
+    assert stored is not None
+    assert stored["monitor_state"]["last_output_hash"]
+
+    # The persisted observation suppresses the retry before agent construction.
+    job = get_job(job["id"])
+    assert job is not None
+    success, doc, final, error = run_job(job)
+    assert success is True
+    assert error is None
+    assert final == SILENT_MARKER
+    assert "no_change" in doc
+    assert observed["agent_runs"] == 1
+
 
 def test_hash_persists_across_scheduler_restart(hermes_env, monkeypatch):
     """Suppression state must survive a scheduler restart (module reload)."""
