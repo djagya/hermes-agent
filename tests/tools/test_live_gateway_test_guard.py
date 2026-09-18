@@ -465,3 +465,124 @@ def test_parser_budget_failure_closed():
     huge = "pytest " + "a" * 200_000
     verdict, _ = classify_live_test_run(huge, cwd=str(REPO_ROOT))
     assert verdict == VERDICT_BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# Variable-carried targets at EVERY parsed extraction point (attempt-4 class)
+# ---------------------------------------------------------------------------
+
+
+class TestVariableCarriedTargetsResolve:
+    def test_variable_directory_operands_blocked(self, tmp_path):
+        """`R=<repo>; <runner> --directory/-C/$R ...` must resolve exactly
+        like `cd "$R" && pytest` does — substitution cannot live only at the
+        cd extraction point."""
+        foreign = tmp_path / "elsewhere"
+        foreign.mkdir()
+        commands = [
+            f"R={REPO_ROOT}; uv --directory $R run pytest",
+            f'R={REPO_ROOT}; uv --directory="$R" run pytest',
+            f"R={REPO_ROOT}; uv run --directory $R pytest",
+            f"R={REPO_ROOT}; uv run --project $R pytest",
+            f"R={REPO_ROOT}; poetry --directory $R run pytest",
+            f"R={REPO_ROOT}; make -C $R test",
+            f"R={REPO_ROOT}; make --directory=$R test",
+            f'R={REPO_ROOT}; make -C "$R" test',
+            f"R={REPO_ROOT}; env -C $R pytest",
+            f"R={REPO_ROOT}; sudo --chdir $R pytest",
+            f"A={REPO_ROOT}; R=$A; make -C $R test",  # chained assignments
+        ]
+        for command in commands:
+            verdict, reason = classify_live_test_run(command, cwd=str(foreign))
+            assert verdict == VERDICT_BLOCKED, f"{command}: {reason}"
+
+    def test_variable_runner_words_and_path_args_blocked(self, tmp_path):
+        """The runner word itself, script operands and explicit path args are
+        resolved words too (`P=pytest; $P tests/docker`)."""
+        commands = [
+            f"P=pytest; uv run $P tests/docker",
+            f"P=pytest; $P tests/docker",
+            f"R={REPO_ROOT}; pytest $R/tests",
+            f'R={REPO_ROOT}; pytest "$R"/tests/docker',
+            f"S={REPO_ROOT}/scripts/run_tests.sh; $S",
+            f"S={REPO_ROOT}/scripts/run_tests.sh; bash $S",
+            f'R={REPO_ROOT}; sh -c "uv --directory $R run pytest"',
+        ]
+        for command in commands:
+            verdict, reason = classify_live_test_run(command, cwd=str(tmp_path))
+            assert verdict == VERDICT_BLOCKED, f"{command}: {reason}"
+
+    def test_variable_pointing_elsewhere_stays_allowed(self, tmp_path):
+        """Substitution must not capture ordinary use of variables."""
+        other = tmp_path / "some-project"
+        other.mkdir()
+        commands = [
+            f"R={other}; make -C $R test",
+            f"R={other}; uv --directory $R run pytest",
+            f"A={other}; R=$A; make -C $R test",
+            f"R={other}; pytest $R/tests",
+            "P=ruff; uvx $P check .",
+            "P=ruff; $P check .",
+        ]
+        for command in commands:
+            verdict, _ = classify_live_test_run(command, cwd=str(tmp_path))
+            assert verdict == VERDICT_ALLOWED, command
+
+
+class TestDirectTestFileExecution:
+    def test_python_and_pathed_test_file_blocked(self, tmp_path):
+        """`python tests/test_x.py` EXECUTES the test module; `./<abs>.py`
+        defeats basename matching — both anchor on their own location."""
+        foreign = tmp_path / "elsewhere"
+        foreign.mkdir()
+        commands = [
+            f"python {REPO_ROOT}/tests/tools/test_live_gateway_test_guard.py",
+            f"python3 {REPO_ROOT}/tests/test_guard.py",
+            f"./{REPO_ROOT}/tests/tools/test_live_gateway_test_guard.py",
+            f"cd / && ./{REPO_ROOT}/tests/tools/test_live_gateway_test_guard.py",
+        ]
+        for command in commands:
+            verdict, reason = classify_live_test_run(command, cwd=str(foreign))
+            assert verdict == VERDICT_BLOCKED, f"{command}: {reason}"
+
+    def test_python_dash_c_pytest_main_blocked(self, tmp_path):
+        """`python -c "pytest.main([...]"` runs pytest without the pytest
+        executable appearing as a command word."""
+        foreign = tmp_path / "elsewhere"
+        foreign.mkdir()
+        commands = [
+            f"python -c \"import pytest; pytest.main(['{REPO_ROOT}/tests/docker'])\"",
+            f"cd {REPO_ROOT} && python -c \"import pytest; pytest.main(['tests/docker'])\"",
+        ]
+        for command in commands:
+            verdict, reason = classify_live_test_run(command, cwd=str(foreign))
+            assert verdict == VERDICT_BLOCKED, f"{command}: {reason}"
+
+    def test_direct_non_test_python_allowed(self, tmp_path):
+        """Ordinary python invocations keep working inside the repo."""
+        commands = [
+            f"python {REPO_ROOT}/conftest.py",
+            'python -c "print(\'hello\')"',
+            f"python {tmp_path / 'script.py'}",
+        ]
+        for command in commands:
+            verdict, _ = classify_live_test_run(command, cwd=str(tmp_path))
+            assert verdict == VERDICT_ALLOWED, command
+
+    def test_anchorless_relative_script_operand_keeps_fail_closed(self):
+        """`bash scripts/run_tests.sh` with NO cwd has an unestablishable
+        target; the operand sweep must not invent `/scripts/run_tests.sh`
+        (whose existing ancestor `/` would defeat the fail-closed block)."""
+        for command in ("scripts/run_tests.sh", "python scripts/run_tests_parallel.py",
+                        "bash scripts/run_tests.sh"):
+            verdict, reason = classify_live_test_run(command, cwd=None)
+            assert verdict == VERDICT_BLOCKED, f"{command}: {reason}"
+
+    def test_hermes_runner_script_operand_anchors_identity(self, tmp_path):
+        """The script operand itself joins the sweep: the interpreter form
+        blocks from a foreign cwd exactly like the direct form."""
+        foreign = tmp_path / "elsewhere"
+        foreign.mkdir()
+        command = f"bash {REPO_ROOT}/scripts/run_tests.sh tests/docker"
+        verdict, reason = classify_live_test_run(command, cwd=str(foreign))
+        assert verdict == VERDICT_BLOCKED, reason

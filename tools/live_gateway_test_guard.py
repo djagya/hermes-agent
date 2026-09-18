@@ -277,6 +277,22 @@ def _operator_before(command: str, start: int) -> str | None:
     return "\n" if "\n" in command[len(head):start] else None
 
 
+def _substitute_vars(value: str,
+                    assignments: dict[str, str]) -> str:
+    """Replace ``$VAR``/``${VAR}`` in *value* from recorded assignments.
+
+    Unknown variables stay literal. Used at every parsed extraction point —
+    cd targets AND wrapper-option/make -C operands, path arguments and runner
+    words — so ``R=<repo>; make -C $R test`` resolves exactly like
+    ``cd "$R" && pytest`` does.
+    """
+
+    def _substitute(match: "re.Match[str]") -> str:
+        return assignments.get(match.group(1) or match.group(2), match.group(0))
+
+    return re.sub(r"\$\{(\w+)\}|\$(\w+)", _substitute, value)
+
+
 def _cd_target(args: list[str], cwd: Optional[Path],
                assignments: Optional[dict[str, str]] = None) -> Optional[Path]:
     """Directory a ``cd``/``pushd`` would land in (existing dirs only), else None.
@@ -287,9 +303,7 @@ def _cd_target(args: list[str], cwd: Optional[Path],
         return None
     raw = args[index]
     if assignments:
-        def _substitute(match: "re.Match[str]") -> str:
-            return assignments.get(match.group(1) or match.group(2), match.group(0))
-        raw = re.sub(r"\$\{(\w+)\}|\$(\w+)", _substitute, raw)
+        raw = _substitute_vars(raw, assignments)
     target = _normalize_path(raw, cwd or Path("/"))
     if target is not None and target.is_absolute() and target.is_dir():
         return target
@@ -324,9 +338,20 @@ def _iter_simple_commands(command: str, depth: int = 0,
             for assignment in lead:
                 name, _, value = assignment.partition("=")
                 if name and value:
-                    assignments[name] = value.strip("'\"")
+                    # Substitute NOW, at record time: a chained assignment
+                    # (`A=x; R=$A; make -C $R test`) and a `sh -c "…$R…"`
+                    # payload (which runs with the outer assignments in
+                    # scope) must see the resolved value, not the literal.
+                    assignments[name] = _substitute_vars(value, assignments).strip("'\"")
         if not rest:
             continue
+        if assignments:
+            # Every yielded word is variable-resolved: a runner word
+            # (`P=pytest; $P tests/docker`), a script operand, a wrapper
+            # option operand (`uv --directory $R`), a `make -C $R`
+            # directory and an explicit path argument (`pytest $R/tests`)
+            # must all classify as their resolved spellings.
+            rest = [_substitute_vars(word, assignments) for word in rest]
         yield rest, scoped_cwd
         name = _executable_name(rest[0])
         if name in {"cd", "pushd"}:
@@ -377,6 +402,12 @@ def _resolve_run_targets(
     resolved: list[Path] = []
     for value, anchor in pairs:
         if not value:
+            continue
+        if not anchor and not os.path.isabs(os.path.expanduser(value)):
+            # A relative value with no anchor on THIS filesystem cannot
+            # establish identity; joining it onto "/" would invent a target
+            # (and its existing ancestors), defeating the fail-closed gate
+            # for anchor-less Hermes-specific runner invocations.
             continue
         base = Path(os.path.expanduser(anchor)) if anchor else Path("/")
         target = _normalize_path(str(value), base)
@@ -532,15 +563,36 @@ def _classify_runner(words: list[str]) -> tuple[str, Optional[str], list[str]]:
             operand = args[index]
             operand_name = _executable_name(operand)
             if operand_name.endswith(".sh") and "run_tests" in operand_name:
-                return "hermes_runner", _run_tests_sh_target(args[index + 1:]), explicit_targets
+                # The script operand anchors identity too: `bash
+                # /repo/scripts/run_tests.sh` from a foreign cwd must see
+                # the repo the script lives in, not the session cwd.
+                return ("hermes_runner", _run_tests_sh_target(args[index + 1:]),
+                        explicit_targets + [operand])
             if "run_tests_parallel" in operand_name:
-                return "hermes_runner", _runner_target_arg(args[index + 1:]), explicit_targets
+                return ("hermes_runner", _runner_target_arg(args[index + 1:]),
+                        explicit_targets + [operand])
         has_c, payload = _bash_exec_payload(args)
         if not has_c:
             return "", None, explicit_targets
 
     if _is_python_invoker(name) and args:
         module = args[0].split("=", 1)[0]
+        if module in {"-c", "--command"}:
+            # `python -c "import pytest; pytest.main(['tests/docker'])"`:
+            # the payload IS the test invocation; its quoted tokens carry the
+            # target path the same way argv does. Scan ALL tokens: the
+            # payload's leading `import` must not mask a later path token.
+            payload = " ".join(args[1:])
+            if re.search(r"\bpytest\b", payload) and ".main(" in payload:
+                tokens = [t for t in re.split(r"""['\"\s()\[\],]+""", payload) if t]
+                target = next(
+                    (t for t in tokens
+                     if "/" in t or "\\" in t
+                     or t in {"tests", "tests/"} or t.startswith(("tests/", "tests\\"))
+                     or _TEST_FILE_BASENAME_RE.match(t)),
+                    None)
+                return "pytest", target, explicit_targets
+            return "", None, explicit_targets
         if module == "-m" and len(args) >= 2:
             invoked = _executable_name(args[1])
             if invoked in _TEST_RUNNER_WORDS:
@@ -550,7 +602,14 @@ def _classify_runner(words: list[str]) -> tuple[str, Optional[str], list[str]]:
         # suite (run_tests_parallel.py), the interpreter is just delivery.
         script_name = _executable_name(args[0])
         if "run_tests_parallel" in script_name:
-            return "hermes_runner", _runner_target_arg(args[1:]), explicit_targets
+            # The script operand anchors identity too (absolute script path
+            # from a foreign cwd must see the repo it lives in).
+            return ("hermes_runner", _runner_target_arg(args[1:]),
+                    explicit_targets + [args[0]])
+        if _TEST_FILE_BASENAME_RE.match(script_name):
+            # `python tests/test_x.py` EXECUTES the test module: same target
+            # gate as `pytest tests/test_x.py`.
+            return "pytest", args[0], explicit_targets
         return "", None, explicit_targets
 
     if name in _TEST_RUNNER_WORDS:
@@ -578,6 +637,14 @@ def _classify_runner(words: list[str]) -> tuple[str, Optional[str], list[str]]:
 
     if name == "run_tests_parallel.py" or (name.endswith(".py") and "run_tests_parallel" in name):
         return "hermes_runner", _runner_target_arg(args), explicit_targets
+
+    if name.endswith((".py", ".sh")) and "/" in words[0]:
+        # A pathed executable IS its own target anchor (``/repo/tests/test_x.py``,
+        # ``./repo/scripts/run_tests.sh``): a ``./``/``../`` prefix defeats
+        # cwd-relative script resolution, so anchor identity on the
+        # executable's own location — the repo it lives in is the repo the
+        # run exercises.
+        return "hermes_runner", None, explicit_targets + [words[0]]
 
     # A referenced script is scanned only by name when it lives inside a Hermes
     # checkout and is itself resolvable (callers pass resolved text separately).
@@ -630,11 +697,14 @@ def _classify_runner_script(words: list[str], base: Path) -> tuple[str, Optional
     Only NAME-anchored Hermes runners (``run_tests*``) are claimed here: an
     existing file whose name is a known runner word (``/usr/bin/python3``) is
     NOT enough — its arguments decide (``python3 -m pytest``), so fall back to
-    the generic classifier.
+    the generic classifier. The claimed script's own location joins the
+    target sweep: the interpreter form (``bash /repo/scripts/run_tests.sh``)
+    must anchor identity the same way the direct form (``scripts/run_tests.sh``
+    under the repo cwd) does.
     """
     path = _normalize_path(words[0], base)
     if path is not None and "run_tests" in path.name:
-        return "hermes_runner", _run_tests_sh_target(words[1:]), []
+        return "hermes_runner", _run_tests_sh_target(words[1:]), [str(path)]
     return _classify_runner(words)
 
 
@@ -666,9 +736,15 @@ def classify_live_test_run(
        runner's explicit path arguments (anchored at the cwd each command
        runs in), ``cd``-derived directories, the terminal ``workdir``, and
        ``cwd`` — is swept; a run blocks when ANY of them resolves into a
-       Hermes checkout. When a Hermes-SPECIFIC runner is invoked and no
-       target can be established, the verdict is blocked (fail closed);
-       ordinary pytest with no resolvable target stays allowed.
+       Hermes checkout. Recorded ``VAR=value`` assignments are substituted
+       into every parsed word, so variable-carried spellings
+       (``R=<repo>; make -C $R test``) resolve like their literal forms; a
+       Hermes-specific runner's own script operand anchors identity; direct
+       execution of a test file (``python tests/test_x.py``, ``./x.py``,
+       ``python -c "pytest.main([...]"``) classifies like ``pytest <path>``.
+       When a Hermes-SPECIFIC runner is invoked and no target can be
+       established, the verdict is blocked (fail closed); ordinary pytest
+       with no resolvable target stays allowed.
     """
     if not command or not command.strip():
         return VERDICT_ALLOWED, ""
@@ -717,6 +793,11 @@ def classify_live_test_run(
             # never as a bogus directory name.
             if explicit:
                 explicit_by_cwd.setdefault(explicit, str(base) if base else "")
+            # A pathed executable (``./scripts/x.sh``, ``/repo/tests/test_x.py``)
+            # resolves against the cwd IT runs in — a ``./`` prefix defeats
+            # basename matching — so anchor it at *base*, not the session cwd.
+            if first.endswith((".py", ".sh")) and "/" in first:
+                explicit_by_cwd.setdefault(first, str(base) if base else "")
 
     # A package runner can CONSUME the runner word itself (``uvx pytest``,
     # ``pipx run pytest``): the peeled program list comes back empty, so
