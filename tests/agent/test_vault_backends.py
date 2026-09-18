@@ -20,6 +20,7 @@ import pytest
 
 from agent.vault_backends import unlock as unlock_mod
 from agent.vault_backends.bitwarden import BitwardenLoginBackend
+from agent.vault_backends.onepassword import OnePasswordLoginBackend
 
 # A stand-in `bw` that mimics the three commands the backend uses and the real CLI's password contract
 # (bw 2026.x rejects a piped password: "Master password is required"; it reads --passwordenv <VAR>).
@@ -50,6 +51,22 @@ if argv[:2] == ["get", "password"]:
 sys.exit(2)
 '''
 
+_FAKE_OP = r'''#!/usr/bin/env python3
+import json, os, sys
+log = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "op.log"), "a")
+argv = sys.argv[1:]
+log.write(json.dumps({"argv": argv}) + "\n")
+if argv[:2] == ["item", "list"]:
+    print(json.dumps([{"id": "abc", "title": "Example", "additional_information": "jane@example.com",
+                       "vault": {"id": "vault-123", "name": "Hermes"},
+                       "urls": [{"href": "https://example.com/login"}]}])); sys.exit(0)
+if argv[:2] == ["item", "get"]:
+    if "--vault" not in argv or argv[argv.index("--vault") + 1] != "vault-123":
+        sys.stderr.write("a vault query must be provided when this command is called by a service account\n"); sys.exit(1)
+    print("123456" if "--otp" in argv else "plain sentence nobody would flag 8"); sys.exit(0)
+sys.exit(2)
+'''
+
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="fake bw is a shebang script; the backend under test is host-agnostic")
 
@@ -71,6 +88,31 @@ def _enabled(exe):
     the sibling's own binding — patch both so the fake is the only backend anywhere."""
     backend = BitwardenLoginBackend({"enabled": True, "binary_path": str(exe)})
     return patch("agent.vault_backends.base.enabled_backends", return_value=[backend]), backend
+
+
+def test_onepassword_handles_carry_vault_scope_and_legacy_handles_resolve(tmp_path, monkeypatch):
+    exe = tmp_path / "op"
+    exe.write_text(_FAKE_OP, encoding="utf-8")
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    log = tmp_path / "op.log"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    backend = OnePasswordLoginBackend({"enabled": True, "binary_path": str(exe)})
+    backend._service_token = "service-token"
+
+    listed = backend.list_items()
+    assert [item.id for item in listed] == ["op:vault-123:abc"]
+    legacy_meta = backend.get_meta("op:abc")
+    assert legacy_meta is not None
+    assert legacy_meta.id == "op:vault-123:abc"
+    assert backend.resolve_password("op:vault-123:abc") == "plain sentence nobody would flag 8"
+    assert backend.resolve_password("op:abc") == "plain sentence nobody would flag 8"
+    assert backend.resolve_otp("op:vault-123:abc") == "123456"
+    assert backend.resolve_otp("op:abc") == "123456"
+
+    calls = [json.loads(line)["argv"] for line in log.read_text(encoding="utf-8").splitlines()]
+    get_calls = [call for call in calls if call[:2] == ["item", "get"]]
+    assert get_calls and all("--vault" in call and call[call.index("--vault") + 1] == "vault-123"
+                             for call in get_calls)
 
 
 def test_locked_manager_is_reported_not_prompted_when_headless(fake_bw, monkeypatch):
