@@ -44,13 +44,6 @@ from hermes_cli.web_models import (
     SessionPrScanBody)
 from hermes_cli.web_server_profiles import _hermes_home_scope
 
-# Imported at module load, not inside get_profiles_projects_tree: the sidebar
-# singleflight cache admits ONE scan and the rest wait on its refresh lock, so a
-# cold in-function import (~seconds on CI, ~40 heavy modules) burns the whole
-# admission window before any scan thread starts. Safe from cycles: tui_gateway
-# reaches this router only through lazy in-function imports.
-from tui_gateway import server as gateway_server  # noqa: E402  (heavy import, deliberately late in the block)
-
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
 
@@ -586,6 +579,7 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
     multiply empty lanes by the profile count), and discovery is the one part of the builder
     that writes (policy reconciliation), which a read-only fan-out must not do.
     """
+    from tui_gateway import server as gateway_server
     merged: Dict[str, Dict[str, Any]] = {}
     scoped_session_ids: List[str] = []
     errors: List[Dict[str, str]] = []

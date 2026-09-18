@@ -498,12 +498,14 @@ def _clip(text: str, n: int, ellipsis: str) -> str:
 # --- Core actions -------------------------------------------------------------
 
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
-    if err := (_validate_name(name) or _validate_category(category)
-               or _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
-        return _err(err)
+    # Author policy first: the size budget below measures the bytes that will
+    # actually be persisted (an injected ``author:`` line counts against it).
     content, author_error = apply_local_author_policy("create", name, content)
     if author_error:
         return _err(author_error)
+    if err := (_validate_name(name) or _validate_category(category)
+               or _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
+        return _err(err)
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
     skill_dir = _resolve_skill_dir(name, category)
@@ -528,7 +530,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
-    if err := _validate_frontmatter(content) or _validate_content_size(content):
+    if err := _validate_frontmatter(content):
         return _err(err)
     existing = None
     found = _find_skill(name)
@@ -538,6 +540,9 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     content, author_error = apply_local_author_policy("edit", name, content, existing=existing)
     if author_error:
         return _err(author_error)
+    # Size budget on the final (author-normalized) bytes.
+    if err := _validate_content_size(content):
+        return _err(err)
     skill_dir, guard = _locate_for_write(name, "edit")
     # SKILL.md always exists here (_find_skill requires it), so a blocked scan restores it.
     if guard := guard or _guarded_write(name, skill_dir, skill_dir / "SKILL.md", "edit", "SKILL.md", content):
@@ -590,13 +595,16 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
         return _err(match_error) | {"file_preview": _clip(content, 500, "...")}
     if err := _validate_content_size(new_content, label=target_label):
         return _err(err)
-    if _is_skill_md_target(file_path) and (err := _validate_frontmatter(new_content)):
-        return _err(f"Patch would break SKILL.md structure: {err}")
     if _is_skill_md_target(file_path):
+        if err := _validate_frontmatter(new_content):
+            return _err(f"Patch would break SKILL.md structure: {err}")
         new_content, author_error = apply_local_author_policy(
             "patch", name, new_content, existing=content)
         if author_error:
             return _err(author_error)
+        # Budget re-check on the final (author-normalized) bytes.
+        if err := _validate_content_size(new_content, label=target_label):
+            return _err(err)
     if guard := _guarded_write(name, skill_dir, target, "patch", target_label, new_content):
         return guard
     result = {
@@ -674,6 +682,9 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
             "edit" if existing else "create", name, file_content, existing=existing)
         if author_error:
             return _err(author_error)
+        # Budget re-check on the final (author-normalized) bytes.
+        if err := _validate_content_size(file_content, label=file_path):
+            return _err(err)
     target, err = _resolve_supporting_file(skill_dir, file_path)
     if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
         return guard
@@ -1107,11 +1118,34 @@ def skill_manage(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
     if (preflight := _background_review_preflight(action, name)) is not None:
         return json.dumps(preflight, ensure_ascii=False)
-    # Author normalization is the HANDLERS' job, after their size validation: the size
-    # budget applies to caller bytes (a boundary-sized create must not fail because the
-    # injected author line pushed it over), and the approval gate must stage exactly the
-    # bytes the caller sent so an approved replay re-enters through the same validated
-    # path instead of trusting pre-transformed content.
+    # Normalize author before the approval gate so the staged payload shows the
+    # exact frontmatter that will be written on approval. Handlers re-run the
+    # policy (idempotent on normalized input) and enforce the size budget on
+    # the final bytes; the gate stages post-normalization content so an
+    # approved replay persists exactly the reviewed payload.
+    if action == "create" and content:
+        content, author_error = apply_local_author_policy("create", name, content)
+        if author_error:
+            return tool_error(author_error, success=False)
+    elif action == "edit" and content:
+        existing = None
+        found = _find_skill(name)
+        if found:
+            with suppress(OSError):
+                existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
+        content, author_error = apply_local_author_policy(action, name, content, existing=existing)
+        if author_error:
+            return tool_error(author_error, success=False)
+    elif action == "write_file" and file_content is not None and _is_skill_md_target(file_path):
+        existing = None
+        found = _find_skill(name)
+        if found:
+            with suppress(OSError):
+                existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
+        file_content, author_error = apply_local_author_policy(
+            "edit" if existing else "create", name, file_content, existing=existing)
+        if author_error:
+            return tool_error(author_error, success=False)
     # Approval gate: skills are too large to review inline, so they always stage regardless
     # of origin; bypassed when replaying an approved staged write.
     args = dict(content=content, category=category, file_path=file_path, file_content=file_content,

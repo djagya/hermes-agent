@@ -61,8 +61,10 @@ class TestCreateSkillSizeLimit:
 
 
     def test_create_at_limit(self, isolate_skills):
-        # Content at exactly the limit should succeed
-        frontmatter = "---\nname: edge-skill\ndescription: Edge case\n---\n# Edge\n\n"
+        # Content at exactly the documented limit INCLUDING the injected
+        # 'author: Sera' line (the staging/approval contract pins the
+        # normalized payload) should succeed.
+        frontmatter = "---\nname: edge-skill\ndescription: Edge case\nauthor: Sera\n---\n# Edge\n\n"
         body_budget = MAX_SKILL_CONTENT_CHARS - len(frontmatter)
         content = frontmatter + ("x" * body_budget)
         assert len(content) == MAX_SKILL_CONTENT_CHARS

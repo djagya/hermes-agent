@@ -1,5 +1,6 @@
 """Regression tests for dashboard sidebar scan coalescing."""
 
+import importlib
 import inspect
 import tempfile
 import threading
@@ -19,6 +20,12 @@ class SidebarCacheTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         profiles._sidebar_profile_cache_clear()
         self.addCleanup(profiles._sidebar_profile_cache_clear)
+        # Warm the projects-tree scan's import seam OUTSIDE the singleflight
+        # lock: the cache admits one scan and contenders wait on its refresh
+        # lock, so a cold in-scan import of tui_gateway.server (~seconds on a
+        # cold CI runner) can burn the whole admission window before any scan
+        # thread starts. Keep the router's lazy import; prime it here instead.
+        importlib.import_module("tui_gateway.server")
 
     def test_profile_cache_uses_db_and_wal_fingerprint_and_defensive_copies(self):
         with tempfile.TemporaryDirectory() as root:

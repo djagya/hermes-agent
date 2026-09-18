@@ -851,6 +851,10 @@ def _teardown_tui_server_sessions(mod) -> None:
 
 @pytest.fixture(autouse=True)
 def _reset_tui_gateway_server_state():
+    # Resolve ONCE by reference: a test that swaps sys.modules["tui_gateway.server"]
+    # for a stub (e.g. test_web_server_approvals_broadcast) must not make the
+    # finalizer clear/restore globals on the stub — the snapshot belongs to the
+    # real module object that was present at setup.
     mod = sys.modules.get(_TUI_SERVER_MODULE)
     snapshot = None
     if mod is not None:
@@ -863,7 +867,8 @@ def _reset_tui_gateway_server_state():
 
     yield
 
-    mod = sys.modules.get(_TUI_SERVER_MODULE)
+    if mod is None:
+        mod = sys.modules.get(_TUI_SERVER_MODULE)
     if mod is None:
         return
 
