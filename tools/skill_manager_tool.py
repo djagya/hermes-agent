@@ -174,6 +174,103 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
     return None
 
 
+LOCAL_SKILL_AUTHOR = "Sera"
+
+
+def _frontmatter_author(content: str) -> Optional[str]:
+    frontmatter, _ = _parse_frontmatter(content)
+    if not isinstance(frontmatter, dict) or "author" not in frontmatter:
+        return None
+    return str(frontmatter.get("author") or "").strip()
+
+
+def _inject_frontmatter_author(content: str, author: str) -> str:
+    """Insert ``author`` without reserializing the rest of the YAML block."""
+    end_match = _FRONTMATTER_END_RE.search(content[3:])
+    if not end_match:
+        return content
+    insert_at = 3 + end_match.start()
+    return content[:insert_at] + f"\nauthor: {author}" + content[insert_at:]
+
+
+def _is_skill_md_target(file_path: Optional[str]) -> bool:
+    """True when the write target is the skill root SKILL.md (default or explicit path)."""
+    if not file_path:
+        return True
+    parts = Path(file_path).parts
+    return bool(parts) and parts[-1] == "SKILL.md" and len(parts) in (1, 2)
+
+
+def _is_user_local_skill(name: str) -> bool:
+    """True for agent-created skills in the profile tree. Hub/bundled/external skip the Sera guard.
+
+    Classification errors fail closed: do not treat unknown origin as user-local, or a
+    hub/external skill would get a forged Sera author.
+    """
+    try:
+        from tools.skill_usage import is_bundled, is_hub_installed, is_external_skill_path
+    except Exception:
+        return False
+    try:
+        if is_hub_installed(name) or is_bundled(name):
+            return False
+        found = _find_skill(name)
+        if found and is_external_skill_path(found["path"]):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def apply_local_author_policy(
+    action: str, name: str, content: str, *, existing: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
+    """User-local create/edit/patch: ``author: Sera`` is required. Origin-classified.
+
+    Create with no author injects Sera. An explicit non-Sera author on create fails
+    closed. Edit/patch of a Sera-authored local skill cannot change that author
+    (a missing author is re-injected). Hub, bundled, and external skills keep
+    their authors and stay patchable. Imported local skills keep a non-Sera
+    author and cannot have it rewritten.
+    """
+    if not content:
+        return content, None
+    if action == "create":
+        actual = _frontmatter_author(content)
+        if actual is None:
+            return _inject_frontmatter_author(content, LOCAL_SKILL_AUTHOR), None
+        if actual != LOCAL_SKILL_AUTHOR:
+            return content, (
+                f"User-local skill create requires author '{LOCAL_SKILL_AUTHOR}' "
+                f"(target class: user-local); received author {actual!r}."
+            )
+        return content, None
+    if action not in {"edit", "patch"}:
+        return content, None
+    if name and not _is_user_local_skill(name):
+        return content, None
+    existing_author = _frontmatter_author(existing) if existing else None
+    new_author = _frontmatter_author(content)
+    if existing_author:
+        if new_author is None:
+            return _inject_frontmatter_author(content, existing_author), None
+        if new_author != existing_author:
+            return content, (
+                f"Cannot change author on skill {name!r} (target class: user-local, "
+                f"observed author {existing_author!r})."
+            )
+        return content, None
+    if new_author is None:
+        return _inject_frontmatter_author(content, LOCAL_SKILL_AUTHOR), None
+    if new_author != LOCAL_SKILL_AUTHOR:
+        return content, (
+            f"Cannot change author on user-local Sera-authored skill {name!r} "
+            f"(target class: user-local); required author '{LOCAL_SKILL_AUTHOR}', "
+            f"observed {new_author!r}."
+        )
+    return content, None
+
+
 def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
     if len(content) > MAX_SKILL_CONTENT_CHARS:
         return (
@@ -401,6 +498,11 @@ def _clip(text: str, n: int, ellipsis: str) -> str:
 # --- Core actions -------------------------------------------------------------
 
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+    # Author policy first: the size budget below measures the bytes that will
+    # actually be persisted (an injected ``author:`` line counts against it).
+    content, author_error = apply_local_author_policy("create", name, content)
+    if author_error:
+        return _err(author_error)
     if err := (_validate_name(name) or _validate_category(category)
                or _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
         return _err(err)
@@ -428,7 +530,18 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
-    if err := _validate_frontmatter(content) or _validate_content_size(content):
+    if err := _validate_frontmatter(content):
+        return _err(err)
+    existing = None
+    found = _find_skill(name)
+    if found:
+        with suppress(OSError):
+            existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
+    content, author_error = apply_local_author_policy("edit", name, content, existing=existing)
+    if author_error:
+        return _err(author_error)
+    # Size budget on the final (author-normalized) bytes.
+    if err := _validate_content_size(content):
         return _err(err)
     skill_dir, guard = _locate_for_write(name, "edit")
     # SKILL.md always exists here (_find_skill requires it), so a blocked scan restores it.
@@ -482,8 +595,16 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
         return _err(match_error) | {"file_preview": _clip(content, 500, "...")}
     if err := _validate_content_size(new_content, label=target_label):
         return _err(err)
-    if not file_path and (err := _validate_frontmatter(new_content)):
-        return _err(f"Patch would break SKILL.md structure: {err}")
+    if _is_skill_md_target(file_path):
+        if err := _validate_frontmatter(new_content):
+            return _err(f"Patch would break SKILL.md structure: {err}")
+        new_content, author_error = apply_local_author_policy(
+            "patch", name, new_content, existing=content)
+        if author_error:
+            return _err(author_error)
+        # Budget re-check on the final (author-normalized) bytes.
+        if err := _validate_content_size(new_content, label=target_label):
+            return _err(err)
     if guard := _guarded_write(name, skill_dir, target, "patch", target_label, new_content):
         return guard
     result = {
@@ -549,6 +670,21 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     skill_dir, guard = _locate_for_write(name, "write_file", " Create it first with action='create'.")
     if guard:
         return guard
+    if _is_skill_md_target(file_path):
+        if err := _validate_frontmatter(file_content):
+            return _err(err)
+        existing = None
+        skill_md = skill_dir / "SKILL.md"
+        if skill_md.exists():
+            with suppress(OSError):
+                existing = skill_md.read_text(encoding="utf-8")
+        file_content, author_error = apply_local_author_policy(
+            "edit" if existing else "create", name, file_content, existing=existing)
+        if author_error:
+            return _err(author_error)
+        # Budget re-check on the final (author-normalized) bytes.
+        if err := _validate_content_size(file_content, label=file_path):
+            return _err(err)
     target, err = _resolve_supporting_file(skill_dir, file_path)
     if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
         return guard
@@ -863,7 +999,8 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
 
 
 # Sync push debounce: a burst of skill_manage writes collapses into one push on a daemon timer.
-_sync_push_timer = None
+# One timer per profile home: in a multiplexed process B's write must not cancel A's pending push.
+_sync_push_timers: Dict[str, threading.Timer] = {}
 _sync_push_lock = threading.Lock()
 _SYNC_PUSH_DEBOUNCE_S = 5.0
 
@@ -871,23 +1008,29 @@ _SYNC_PUSH_DEBOUNCE_S = 5.0
 def _maybe_debounced_sync_push(skill_name: str) -> None:
     """Debounced best-effort sync push after a skill write; never blocks the caller. Skills not
     opted into sync do nothing (no auth/network); ``maybe_push_skills`` enforces the access gate."""
-    global _sync_push_timer
     try:
         from tools.skill_usage import is_sync_enabled
         if not is_sync_enabled(skill_name):
             return
     except Exception:
         return
+    from hermes_constants import hermes_home_key
+    home_key = hermes_home_key()
+    # Timer threads start with empty ContextVars; without the scheduling turn's context the push would
+    # resolve the launch profile's home and credentials instead of the writing profile's.
+    ctx = _ctxvars.copy_context()
     def _fire():
         with suppress(Exception):
             from tools.skills_sync_client import maybe_push_skills
             maybe_push_skills(message=f"sync: {skill_name}")
     with _sync_push_lock:
-        if _sync_push_timer is not None:
-            _sync_push_timer.cancel()  # only sets an Event; never raises
-        _sync_push_timer = threading.Timer(_SYNC_PUSH_DEBOUNCE_S, _fire)
-        _sync_push_timer.daemon = True
-        _sync_push_timer.start()
+        pending = _sync_push_timers.get(home_key)
+        if pending is not None:
+            pending.cancel()  # only sets an Event; never raises
+        timer = threading.Timer(_SYNC_PUSH_DEBOUNCE_S, ctx.run, args=(_fire,))
+        timer.daemon = True
+        _sync_push_timers[home_key] = timer
+        timer.start()
 
 
 def _act_patch(a):
@@ -975,6 +1118,34 @@ def skill_manage(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
     if (preflight := _background_review_preflight(action, name)) is not None:
         return json.dumps(preflight, ensure_ascii=False)
+    # Normalize author before the approval gate so the staged payload shows the
+    # exact frontmatter that will be written on approval. Handlers re-run the
+    # policy (idempotent on normalized input) and enforce the size budget on
+    # the final bytes; the gate stages post-normalization content so an
+    # approved replay persists exactly the reviewed payload.
+    if action == "create" and content:
+        content, author_error = apply_local_author_policy("create", name, content)
+        if author_error:
+            return tool_error(author_error, success=False)
+    elif action == "edit" and content:
+        existing = None
+        found = _find_skill(name)
+        if found:
+            with suppress(OSError):
+                existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
+        content, author_error = apply_local_author_policy(action, name, content, existing=existing)
+        if author_error:
+            return tool_error(author_error, success=False)
+    elif action == "write_file" and file_content is not None and _is_skill_md_target(file_path):
+        existing = None
+        found = _find_skill(name)
+        if found:
+            with suppress(OSError):
+                existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
+        file_content, author_error = apply_local_author_policy(
+            "edit" if existing else "create", name, file_content, existing=existing)
+        if author_error:
+            return tool_error(author_error, success=False)
     # Approval gate: skills are too large to review inline, so they always stage regardless
     # of origin; bypassed when replaying an approved staged write.
     args = dict(content=content, category=category, file_path=file_path, file_content=file_content,
@@ -1011,17 +1182,13 @@ def skill_manage(
 
 # --- OpenAI Function-Calling Schema -------------------------------------------
 
-SKILL_MANAGE_SCHEMA = {
-    "name": "skill_manage",
-    # ONE advertised call shape (memory-tool pattern): the call IS an operations
-    # array. The legacy flat shape (top-level action/name/content/...) is still
-    # ACCEPTED for old transcripts and staged-write replay, but not advertised.
-    "description": (
+def _skill_manage_description(create_dir: str) -> str:
+    return (
         "Create, update, or delete skills — your procedural memory for "
         "recurring task types. The call is an operations array (a single "
         "edit is a list of one); it applies atomically — any failure rolls "
         "every touched skill back. Ops: create (full SKILL.md; lands in "
-        f"{_display_create_dir()}; must precede that skill's other "
+        f"{create_dir}; must precede that skill's other "
         "ops), patch (targeted old_string/new_string fix — preferred; "
         "content alone REPLACES the whole file, read it via skill_view() "
         "first), write_file/remove_file (supporting files), delete (sole "
@@ -1031,7 +1198,22 @@ SKILL_MANAGE_SCHEMA = {
         "imperative rule + why, no PR numbers/dates/incident narration, one "
         "rule per lesson, references/ named by topic (extend before adding). "
         "skill_view() shows format conventions."
-    ),
+    )
+
+
+def _skill_manage_schema_overrides() -> dict:
+    """Rebuild the create-dir hint from the ACTIVE profile at every get_definitions(): the
+    multiplexed gateway serves every profile from one process, so a path baked in at import
+    would name the launch profile's skills dir for everyone else (#95685)."""
+    return {"description": _skill_manage_description(_display_create_dir())}
+
+
+SKILL_MANAGE_SCHEMA = {
+    "name": "skill_manage",
+    # ONE advertised call shape (memory-tool pattern): the call IS an operations
+    # array. The legacy flat shape (top-level action/name/content/...) is still
+    # ACCEPTED for old transcripts and staged-write replay, but not advertised.
+    "description": _skill_manage_description("the profile's skills.create_dir"),
     "parameters": {
         "type": "object",
         "properties": {
@@ -1113,7 +1295,8 @@ from tools.registry import registry, tool_error
 registry.register(
     name="skill_manage", toolset="skills", schema=SKILL_MANAGE_SCHEMA, emoji="📝",
     handler=lambda args, **kw: _skill_manage_from(
-        args, task_id=kw.get("task_id"), session_id=kw.get("session_id")))
+        args, task_id=kw.get("task_id"), session_id=kw.get("session_id")),
+    dynamic_schema_overrides=_skill_manage_schema_overrides)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

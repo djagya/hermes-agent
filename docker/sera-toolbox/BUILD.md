@@ -93,7 +93,7 @@ per-UID and starves forks on a busy hermes box; the cap stays
 inside bwrap. Stored golden fixtures include `golden.heif`, `golden.zip.zst`,
 and `golden.7z` (smoke still does a relative-path `7z a`
 round-trip). Lint runs
-`tests/sera_toolbox`. SPDX/CycloneDX stay CI artifacts attached
+`tests/docker`. SPDX/CycloneDX stay CI artifacts attached
 to the digest, not files under `/etc/hermes`.
 
 Reproducible-build experiment (two clean builds, compare IDs) is

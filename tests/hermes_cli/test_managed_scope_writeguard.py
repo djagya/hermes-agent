@@ -11,10 +11,12 @@ def homes(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
     import hermes_cli.config as cfg
-    from hermes_cli import managed_scope
+    from hermes_cli import config_effective, managed_scope
 
     cfg._LOAD_CONFIG_CACHE.clear()
     cfg._RAW_CONFIG_CACHE.clear()
+    config_effective._EFFECTIVE_CACHE.clear()
+    config_effective._LAST_GOOD_USER_RAW.clear()
     managed_scope.invalidate_managed_cache()
     (managed / "config.yaml").write_text(
         "model:\n  default: managed/model\n", encoding="utf-8"

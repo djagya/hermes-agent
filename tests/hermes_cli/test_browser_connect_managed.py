@@ -22,6 +22,17 @@ def test_unmanaged_connect_refusal_is_none(monkeypatch):
     assert managed_connect_refusal() is None
 
 
+def test_managed_connect_refusal_fails_closed_on_probe_error(monkeypatch):
+    monkeypatch.delenv("HERMES_BROWSER_CONTROL_URL", raising=False)
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+
+    def boom():
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr("tools.browser_control_route.is_managed", boom)
+    assert managed_connect_refusal() == MANAGED_CONNECT_REFUSAL
+
+
 def test_handle_browser_connect_refuses_without_writing_env(monkeypatch, capsys):
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_KEY", "secret-key")

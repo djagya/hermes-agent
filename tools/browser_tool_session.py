@@ -253,9 +253,11 @@ def _create_session_for_key(task_id: str, force_local: bool) -> Dict[str, Any]:
             is_managed,
             managed_cdp_or_error,
         )
-    except Exception:
-        is_managed = lambda: False  # noqa: E731
-        ManagedBrowserError = RuntimeError  # type: ignore[misc,assignment]
+    except Exception as exc:
+        raise RuntimeError(
+            "unavailable: managed browser route import failed; "
+            "refusing local/cloud fallback"
+        ) from exc
     if is_managed():
         if force_local:
             raise ManagedBrowserError(

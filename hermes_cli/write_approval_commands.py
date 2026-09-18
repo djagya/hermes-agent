@@ -62,6 +62,7 @@ def handle_pending_subcommand(
     *,
     memory_store=None,
     set_mode_fn=None,
+    expected_payload_sha256: Optional[str] = None,
 ) -> Optional[str]:
     """Dispatch a /memory or /skills subcommand.
 
@@ -90,10 +91,11 @@ def handle_pending_subcommand(
         return _fmt_pending_list(subsystem)
 
     if sub in {"approve", "apply"}:
-        return _approve(subsystem, rest, memory_store)
+        return _approve(subsystem, rest, memory_store,
+                        expected_payload_sha256=expected_payload_sha256)
 
     if sub in {"reject", "deny", "drop"}:
-        return _reject(subsystem, rest)
+        return _reject(subsystem, rest, expected_payload_sha256=expected_payload_sha256)
 
     if sub == "resolve":
         return _resolve_applying(subsystem, rest)
@@ -113,10 +115,17 @@ def _resolve_one(subsystem: str, rest: List[str]):
     return rest[0], None
 
 
-def _approve(subsystem: str, rest: List[str], memory_store) -> str:
+def _approve(subsystem: str, rest: List[str], memory_store,
+             expected_payload_sha256: Optional[str] = None) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
         return err or f"Usage: /{subsystem} approve <id>"
+
+    if target.lower() == "all" and expected_payload_sha256 is not None:
+        return (
+            "expected_payload_sha256 cannot be combined with approve 'all': "
+            "one digest binds exactly one pending record."
+        )
 
     records = wa.list_pending(subsystem)
     if not records:
@@ -133,6 +142,12 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     applied, failed = 0, []
     for rec in targets:
         pending_id = rec["id"]
+        # Root-skill reconciler replay: the digest is always provided (it is the
+        # reviewer's seal); a CLI/gateway caller passes it only for a bound id.
+        expected = (
+            expected_payload_sha256 if expected_payload_sha256 is not None
+            else rec.get("payload_sha256")
+        )
         ok, msg = wa.apply_pending_record(
             subsystem,
             pending_id,
@@ -141,6 +156,7 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
                 current,
                 memory_store,
             ),
+            expected_payload_sha256=expected,
         )
         if ok:
             applied += 1
@@ -171,10 +187,12 @@ def _apply_one(subsystem: str, rec, memory_store):
         return False, str(e)
 
 
-def _reject(subsystem: str, rest: List[str]) -> str:
+def _reject(subsystem: str, rest: List[str], expected_payload_sha256: Optional[str] = None) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
         return err or f"Usage: /{subsystem} reject <id>"
+    if target.lower() == "all" and expected_payload_sha256 is not None:
+        return "expected_payload_sha256 cannot be combined with reject 'all'."
     if target.lower() == "all":
         n = 0
         quarantined = []
@@ -192,14 +210,22 @@ def _reject(subsystem: str, rest: List[str]) -> str:
             )
         return "\n".join(out)
     rec = wa.get_pending(subsystem, target)
-    if rec and rec.get("state", "pending") == "applying":
+    if not rec:
+        return f"No pending {subsystem} write with id '{target}'."
+    if rec.get("state", "pending") == "applying":
         return (
             f"Pending {subsystem} write '{target}' is in applying state; "
             "reconcile its target before discarding the approval evidence."
         )
-    if wa.discard_pending(subsystem, target):
+    # Exact-discard surface: with the reviewed digest bound, a record swapped
+    # in under the same id is never consumed by an earlier rejection decision.
+    expected = expected_payload_sha256 if expected_payload_sha256 is not None else rec.get("payload_sha256")
+    if wa.discard_pending(subsystem, target, expected_payload_sha256=expected):
         return f"Rejected pending {subsystem} write '{target}'."
-    return f"No pending {subsystem} write with id '{target}'."
+    return (
+        f"Pending {subsystem} write '{target}' changed on disk (payload_sha256 "
+        f"mismatch); rejected nothing — re-review it before discarding."
+    )
 
 
 def _resolve_applying(subsystem: str, rest: List[str]) -> str:

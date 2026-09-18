@@ -116,7 +116,6 @@ def test_fork_release_ignores_non_image_paths(missing: str):
         "Dockerfile",
         "docker/",
         "tests/docker",
-        "tests/sera_toolbox",
     ],
 )
 def test_fork_release_does_not_ignore_image_or_test_paths(required: str):

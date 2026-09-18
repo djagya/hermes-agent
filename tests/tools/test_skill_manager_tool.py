@@ -1191,3 +1191,99 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+class TestLocalSeraAuthor:
+    def test_create_injects_sera_when_author_omitted(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill("my-skill", VALID_SKILL_CONTENT)
+        assert result["success"] is True
+        fm, _ = parse_frontmatter((tmp_path / "my-skill" / "SKILL.md").read_text())
+        assert fm.get("author") == "Sera"
+
+    def test_create_rejects_explicit_non_sera_author(self, tmp_path):
+        content = VALID_SKILL_CONTENT.replace("description:", "author: Other\ndescription:")
+        with _skill_dir(tmp_path):
+            result = _create_skill("my-skill", content)
+        assert result["success"] is False
+        assert "user-local" in result["error"]
+        assert "Sera" in result["error"]
+        assert "Other" in result["error"]
+        assert not (tmp_path / "my-skill").exists()
+
+    def test_edit_cannot_change_sera_author(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            changed = VALID_SKILL_CONTENT_2.replace("description:", "author: Other\ndescription:")
+            result = _edit_skill("my-skill", changed)
+        assert result["success"] is False
+        assert "Cannot change author" in result["error"]
+        fm, _ = parse_frontmatter((tmp_path / "my-skill" / "SKILL.md").read_text())
+        assert fm.get("author") == "Sera"
+
+    def test_patch_cannot_change_sera_author(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _patch_skill("my-skill", "author: Sera", "author: Other")
+        assert result["success"] is False
+        assert "Cannot change author" in result["error"]
+        fm, _ = parse_frontmatter((tmp_path / "my-skill" / "SKILL.md").read_text())
+        assert fm.get("author") == "Sera"
+
+    def test_imported_local_author_is_preserved_and_patchable(self, tmp_path):
+        imported = VALID_SKILL_CONTENT.replace("description:", "author: Hermes Agent\ndescription:")
+        with _skill_dir(tmp_path):
+            skill = tmp_path / "imported" / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text(imported, encoding="utf-8")
+            result = _edit_skill("imported", imported.replace("Do the thing.", "Do the patched thing."))
+        assert result["success"] is True, result.get("error")
+        fm, _ = parse_frontmatter((tmp_path / "imported" / "SKILL.md").read_text())
+        assert fm.get("author") == "Hermes Agent"
+        assert "Do the patched thing." in (tmp_path / "imported" / "SKILL.md").read_text()
+
+    def test_hub_skill_author_not_forced(self, tmp_path):
+        hub = VALID_SKILL_CONTENT.replace("description:", "author: Hub Maintainer\ndescription:")
+        with _skill_dir(tmp_path), patch("tools.skill_usage.is_hub_installed", return_value=True):
+            skill = tmp_path / "hub-skill" / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text(hub, encoding="utf-8")
+            result = _edit_skill("hub-skill", hub.replace("Do the thing.", "Do the hub thing."))
+        assert result["success"] is True, result.get("error")
+        fm, _ = parse_frontmatter((tmp_path / "hub-skill" / "SKILL.md").read_text())
+        assert fm.get("author") == "Hub Maintainer"
+
+    def test_imported_author_omission_is_restored(self, tmp_path):
+        imported = VALID_SKILL_CONTENT.replace("description:", "author: Hermes Agent\ndescription:")
+        with _skill_dir(tmp_path):
+            skill = tmp_path / "imported" / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text(imported, encoding="utf-8")
+            result = _edit_skill(
+                "imported",
+                VALID_SKILL_CONTENT.replace("Do the thing.", "Do the patched thing."),
+            )
+        assert result["success"] is True, result.get("error")
+        fm, _ = parse_frontmatter((tmp_path / "imported" / "SKILL.md").read_text())
+        assert fm.get("author") == "Hermes Agent"
+
+    def test_patch_skill_md_file_path_cannot_change_sera_author(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _patch_skill(
+                "my-skill", "author: Sera", "author: Other", file_path="SKILL.md",
+            )
+        assert result["success"] is False
+        assert "Cannot change author" in result["error"]
+        fm, _ = parse_frontmatter((tmp_path / "my-skill" / "SKILL.md").read_text())
+        assert fm.get("author") == "Sera"
+
+    def test_write_file_skill_md_cannot_change_sera_author(self, tmp_path):
+        changed = VALID_SKILL_CONTENT_2.replace("description:", "author: Other\ndescription:")
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _write_file("my-skill", "SKILL.md", changed)
+        assert result["success"] is False
+        assert "Cannot change author" in result["error"]
+        fm, _ = parse_frontmatter((tmp_path / "my-skill" / "SKILL.md").read_text())
+        assert fm.get("author") == "Sera"

@@ -553,6 +553,33 @@ class TestSchemaConversion:
         assert schema["name"] == "mcp__my_server__get_sum"
         assert "-" not in schema["name"]
 
+    def test_long_names_are_clamped_to_64_chars(self):
+        """Portable Agent Plugin names can push mcp__<server>__<tool> past the
+        64-char limit OpenAI-compatible providers enforce on function names
+        (issue #81331). The registry name must be clamped with a stable hash
+        suffix, distinct long names must not collide, and the same inputs
+        must always produce the same shortened name.
+        """
+        from tools.mcp_tool_schema import _convert_mcp_schema, mcp_prefixed_tool_name
+
+        server_name = "agent_plugin_my_server_997167c9__my_server"
+        mcp_tool = _make_mcp_tool(name="reply_communication_todo")
+        schema = _convert_mcp_schema(server_name, mcp_tool)
+
+        assert len(schema["name"]) <= 64
+        assert schema["name"] == mcp_prefixed_tool_name(server_name, "reply_communication_todo")
+
+        other_tool = _make_mcp_tool(name="reply_communication_task")
+        other_schema = _convert_mcp_schema(server_name, other_tool)
+        assert other_schema["name"] != schema["name"]
+        assert len(other_schema["name"]) <= 64
+
+        # Deterministic across repeated calls with the same inputs.
+        assert (
+            mcp_prefixed_tool_name(server_name, "reply_communication_todo")
+            == schema["name"]
+        )
+
 
 # ---------------------------------------------------------------------------
 # Check function
@@ -1167,6 +1194,18 @@ class TestShutdown:
         ), patch("tools.mcp_tool_loop._stop_mcp_loop"):
             shutdown_mcp_servers()
         manager.clear_cached_providers.assert_called_once_with()
+
+    def test_shutdown_names_evicts_without_clearing_all(self):
+        from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+
+        manager = MagicMock()
+        with patch(
+            "tools.mcp_oauth_manager.get_manager",
+            return_value=manager,
+        ), patch("tools.mcp_tool_loop._stop_mcp_loop"):
+            shutdown_mcp_servers(names={"todoist"})
+        manager.clear_cached_providers.assert_not_called()
+        manager.evict.assert_called_once_with("todoist", hermes_home=None)
 
     def test_shutdown_drains_parked_server_after_bounded_wait_expires(self):
         """The public shutdown path drains a parked server if graceful shutdown stalls.

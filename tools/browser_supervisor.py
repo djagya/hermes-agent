@@ -46,6 +46,11 @@ def _redact_cdp_error_text(exc: object) -> str:
         return "<error redacted>"
 
 
+def _cdp_reconnect_is_handshake_race(attempt: int) -> bool:
+    """First reconnect after a live attach is the known Chrome handshake race."""
+    return attempt == 1
+
+
 class _LoopUnavailable(RuntimeError):
     """The supervisor loop refused new work (closed / shutting down)."""
 
@@ -360,8 +365,11 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 attempt += 1
                 if self._fail_start(e):
                     return
-                logger.warning("CDP supervisor %s: connect failed (attempt %s): %s",
-                               self.task_id, attempt, _redact_cdp_error_text(e))
+                # First reconnect after a live attach is the known Chrome
+                # handshake race (InvalidMessage). Warn from attempt 2.
+                log = logger.debug if _cdp_reconnect_is_handshake_race(attempt) else logger.warning
+                log("CDP supervisor %s: connect failed (attempt %s): %s",
+                    self.task_id, attempt, _redact_cdp_error_text(e))
                 await asyncio.sleep(min(backoff, 10.0))
                 backoff = min(backoff * 2, 10.0)
                 continue
@@ -375,6 +383,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 await self._attach_initial_page()
                 self._set_active(True)
                 last_success_at = time.time()
+                attempt = 0
                 backoff = 0.5  # reset after a successful attach
                 self._ready_event.set()
                 await reader_task

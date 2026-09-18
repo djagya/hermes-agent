@@ -448,6 +448,60 @@ def test_direct_skill_pending_apply_without_live_record_is_rejected(hermes_home)
     assert "restage" in result["error"].lower()
 
 
+def test_staged_create_reviewed_payload_is_what_persists(hermes_home):
+    """Canonical approval contract for an authorless create: the bytes the
+    reviewer approved (post author-normalization, pre-gate) are EXACTLY the
+    bytes persisted at apply time, and the same bytes replay on a raw
+    skill_manage call (normalization is idempotent)."""
+    from tools import skill_manager_tool as smt
+    from tools import write_approval as wa
+
+    _set_approval("skills", True)
+    caller = "---\nname: demo\ndescription: Use when testing staging.\n---\n# Demo\nbody\n"
+    staged = json.loads(smt.skill_manage(action="create", name="demo", content=caller))
+    assert staged.get("staged") is True, staged
+
+    record = wa.get_pending(wa.SKILLS, staged["pending_id"])
+    assert record is not None, "staged create must be durably pending until apply"
+    reviewed = record["payload"]["content"]
+    assert reviewed == (
+        "---\nname: demo\ndescription: Use when testing staging.\nauthor: Sera\n---\n# Demo\nbody\n"
+    ), "approval must stage the final normalized frontmatter"
+
+    ok, message = _apply_staged_skill_record(wa, smt, staged["pending_id"])
+    assert ok is True, message
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is None, \
+        "approved create must consume its pending record"
+    skill_md = os.path.join(hermes_home, "skills", "demo", "SKILL.md")
+    with open(skill_md, encoding="utf-8") as handle:
+        assert handle.read() == reviewed, "persisted bytes must equal the reviewed payload"
+
+    # Raw reapply with the gate still ON: an identical dispatcher call STAGES a
+    # new pending record (staged != applied) and must not mutate the skill by
+    # itself. The staged record is then applied through the real approval
+    # helper: pending consumed, and the persisted bytes remain exactly the
+    # reviewed payload (author normalization is idempotent on already-authored
+    # content), so replay cannot diverge from what was approved.
+    with open(skill_md, encoding="utf-8") as handle:
+        before = handle.read()
+    replay = json.loads(smt.skill_manage(
+        action="write_file", name="demo", file_path="SKILL.md", file_content=before))
+    assert replay.get("staged") is True, replay
+    replay_id = replay["pending_id"]
+    assert replay_id != staged["pending_id"]
+    assert wa.get_pending(wa.SKILLS, replay_id) is not None, \
+        "gated reapply must stage, not write"
+    with open(skill_md, encoding="utf-8") as handle:
+        assert handle.read() == before, "staging alone must not mutate the skill"
+    ok, message = _apply_staged_skill_record(wa, smt, replay_id)
+    assert ok is True, message
+    assert wa.get_pending(wa.SKILLS, replay_id) is None, \
+        "approved replay must consume its pending record"
+    with open(skill_md, encoding="utf-8") as handle:
+        assert handle.read() == reviewed, \
+            "applied replay bytes must stay identical to the reviewed payload"
+
+
 def test_deleted_pending_record_cannot_mutate_skill(hermes_home):
     from tools import skill_manager_tool as smt
     from tools import write_approval as wa

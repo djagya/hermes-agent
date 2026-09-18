@@ -17,6 +17,7 @@ import pytest
 VALID_SKILL_CONTENT = """---
 name: my-skill
 description: test skill
+author: Sera
 ---
 
 # My Skill

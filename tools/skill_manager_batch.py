@@ -11,6 +11,14 @@ from pathlib import Path
 
 logger = logging.getLogger("tools.skill_manager_tool")
 
+# Declared shape of the atomic batch contract implemented here, read by
+# tools/skill_manager_batch reviewers (pending-skill-review reconciler): snapshot
+# -> ordered apply -> rollback on returned failure OR raised exception, with
+# snapshot evidence retained when rollback itself fails. This declares the
+# ordinary in-process guarantees only; abrupt process/power loss is a separate
+# recovery boundary and is NOT covered by this version.
+BATCH_ATOMIC_CONTRACT_VERSION = 2
+
 _BATCH_OP_ACTIONS = {"create", "patch", "write_file", "remove_file"}
 _BATCH_MAX_OPS = 20
 
@@ -150,6 +158,11 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
         shutil.rmtree(snap_root, ignore_errors=True)
         return tool_error(snap_err, success=False)
     # Single-op path with the gate bypassed (the batch already cleared/staged it).
+    # Atomicity contract: any op that returns a failure OR raises rolls back every
+    # already-applied op before returning. Rollback itself may fail; then the
+    # snapshot directory is deliberately kept as recovery evidence and the batch
+    # reports the failed skills. This is ordinary in-process exception atomicity —
+    # a crash or power loss mid-op is NOT covered by it.
     results = []
     rollback_failed = False
     token = _smt._skill_gate_bypass.set(True)
@@ -176,6 +189,15 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
                 return json.dumps(fail, ensure_ascii=False)
             results.append({"name": names[i], "action": op["action"],
                             "file_path": op.get("file_path"), "success": True})
+    except BaseException:  # Roll back even cancellation and malformed op results.
+        rollback_failed = True  # Keep evidence if rollback itself unexpectedly raises.
+        try:
+            note, rollback_failed = _rollback(snapshots, _smt._find_skill)
+            if rollback_failed:
+                logger.error("skill_manage batch exception: %s", note)
+        except BaseException:
+            logger.exception("skill_manage batch rollback raised; preserving snapshots")
+        raise
     finally:
         _smt._skill_gate_bypass.reset(token)
         if rollback_failed:

@@ -1,4 +1,4 @@
-"""Managed scope — IT-pushed, user-immutable config & env layer.
+"""Managed scope — IT-pushed seed for omitted config leaves; managed .env stays locked.
 
 DISTINCT from ``hermes_cli.config.is_managed()`` / ``HERMES_MANAGED`` (a coarse package-manager
 write-lock that blocks all mutation); this layer injects specific immutable values. The two are
@@ -76,8 +76,7 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
         if hit is not None and hit[:2] == key:
             return copy.deepcopy(hit[2])
     try:
-        with open(path, encoding="utf-8") as f:
-            parsed = parse(f)
+        parsed = parse(path)
     except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
         logger.warning(
             "managed scope: failed to parse %s: %s — IGNORING this managed file. "
@@ -99,20 +98,47 @@ def _load_managed_file(name: str, cache: Dict[str, tuple], parse) -> dict:
 
 def load_managed_config() -> dict:
     """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
-    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda f: yaml.safe_load(f) or {})
+    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda p: yaml.safe_load(p.read_text(encoding="utf-8")) or {})
 
 
 def load_managed_env() -> Dict[str, str]:
     """Parsed managed .env (KEY=VALUE), or {} when absent (fail-open)."""
-    return _load_managed_file(".env", _ENV_CACHE, _parse_env)
+    return _load_managed_file(".env", _ENV_CACHE, _parse_managed_env)
+
+
+def _parse_managed_env(path: Path) -> Dict[str, str]:
+    from agent.secret_scope import load_env_file
+
+    path.read_text(encoding="utf-8-sig")  # load_env_file swallows decode errors; an admin file must fail LOUD
+    return load_env_file(path)
+
+
+def _user_presence(user: dict) -> dict:
+    """Canonicalize raw user yaml so omit sees the same leaves load_config promotes.
+
+    Root ``max_turns`` becomes ``agent.max_turns``. A bare ``model: id`` string
+    marks ``model.default`` present so a seed ``model.provider`` cannot clobber
+    a shorthand default.
+    """
+    presence = dict(user)
+    if "max_turns" in presence:
+        agent = presence.get("agent")
+        agent = dict(agent) if isinstance(agent, dict) else {}
+        if agent.get("max_turns") is None:
+            agent["max_turns"] = presence["max_turns"]
+        presence["agent"] = agent
+        presence.pop("max_turns", None)
+    model = presence.get("model")
+    if isinstance(model, str):
+        presence["model"] = {"default": model}
+    return presence
 
 
 def _omit_present_leaves(managed: dict, user: dict) -> dict:
     """Managed leaves the user document did not set.
 
     A key present on the user side wins, including a user ``${VAR}`` that
-    expands later. YAML ``null`` against a managed dict is treated as
-    absent (same as ``_deep_merge`` ignoring a None override of a dict).
+    expands later. YAML ``null`` is treated as absent (same as ``unset``).
     """
     out: dict = {}
     for key, value in managed.items():
@@ -120,7 +146,7 @@ def _omit_present_leaves(managed: dict, user: dict) -> dict:
             out[key] = value
             continue
         user_val = user[key]
-        if user_val is None and isinstance(value, dict):
+        if user_val is None:
             out[key] = value
             continue
         if isinstance(value, dict) and isinstance(user_val, dict) and value:
@@ -130,7 +156,7 @@ def _omit_present_leaves(managed: dict, user: dict) -> dict:
     return out
 
 
-def apply_managed_overlay(config: dict, *, user_raw: dict | None = None) -> dict:
+def apply_managed_overlay(config: dict, *, user_raw: Optional[dict] = None) -> dict:
     """Seed administrator values for leaves the user did not set.
 
     ``${VAR}`` refs in the managed config expand against the PROCESS env;
@@ -157,6 +183,8 @@ def apply_managed_overlay(config: dict, *, user_raw: dict | None = None) -> dict
         presence = user_raw if user_raw is not None else config
         if not isinstance(presence, dict):
             presence = {}
+        else:
+            presence = _user_presence(presence)
         seeds = _omit_present_leaves(managed_expanded, presence)
         if not seeds:
             return config
@@ -164,15 +192,6 @@ def apply_managed_overlay(config: dict, *, user_raw: dict | None = None) -> dict
     except Exception:  # noqa: BLE001 — overlay must never break a caller
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config
-
-
-def _parse_env(f) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for line in map(str.strip, f):
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            out[key.strip()] = value.strip().strip("\"'")
-    return out
 
 
 def _flatten_keys(d: dict, prefix: str = "") -> set:

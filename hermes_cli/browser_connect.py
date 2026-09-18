@@ -39,14 +39,18 @@ MANAGED_CONNECT_REFUSAL = (
 
 
 def managed_connect_refusal() -> str | None:
-    """Return the connect-disabled message when browser-control is configured."""
+    """Return the connect-disabled message when browser-control is configured.
+
+    Probe failures fail closed: a broken import must not look unmanaged.
+    """
     try:
         from tools.browser_control_route import is_managed
 
         if is_managed():
             return MANAGED_CONNECT_REFUSAL
     except Exception:
-        return None
+        logger.exception("managed-connect probe failed; refusing connect")
+        return MANAGED_CONNECT_REFUSAL
     return None
 
 

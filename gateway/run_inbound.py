@@ -18,6 +18,7 @@ import re
 import time
 from contextlib import suppress
 from gateway.config import Platform
+from gateway.pending_audio import PendingAudioClip, pending_audio_clips
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_common import _UNSET
@@ -155,11 +156,16 @@ class GatewayInboundMixin:
         # Ignored-channel guard runs FIRST — before startup-restore queueing, plugin hooks, auth,
         # and session setup — so an ignored channel can never reach pairing/auth/session state.
         _chat_id = getattr(source, "chat_id", None)
+        if not is_internal and getattr(source, "platform", None) == Platform.SLACK:
+            # The routed adapter's extra carries a secondary profile's own list; ``_config`` is the default's.
+            _slack_adapter = None
+            with suppress(Exception):
+                _slack_adapter = self._adapter_for_source(source)
         if (
             # See #51899.
             not is_internal
             and getattr(source, "platform", None) == Platform.SLACK
-            and _is_slack_ignored_channel(_config, _chat_id)
+            and _is_slack_ignored_channel(_config, _chat_id, _slack_adapter)
         ):
             logger.info("Dropping Slack message from configured ignored channel %s", _chat_id)
             return None
@@ -484,8 +490,10 @@ class GatewayInboundMixin:
             logger.debug("reaped-session staleness check failed", exc_info=True)
 
     def _hm_evict_running_agent(self, _quick_key: str, reason: str) -> None:
-        self._invalidate_session_run_generation(_quick_key, reason=reason)
-        self._release_running_agent_state(_quick_key)
+        from gateway.run import _INTERRUPT_REASON_EVICTED
+        _generation_at_interrupt = self._interrupt_running_turn(
+            _quick_key, interrupt_reason=_INTERRUPT_REASON_EVICTED, invalidation_reason=reason)
+        self._drop_turn_slot(_quick_key, run_generation=_generation_at_interrupt)
 
     def _hm_merge_pending_for_source(
         self, source: SessionSource, _quick_key: str, event: "MessageEvent", *, merge_text: bool = False
@@ -896,13 +904,13 @@ class GatewayInboundMixin:
         try:
             event.text = moa_payload
             _moa_state = self._session_state(_quick_key)
-            event._moa_restore_override = _moa_state.conversation.model_override
+            # Same one-shot snapshot `/model --once` uses, so eviction/stop/finalizer settle both alike.
+            self._claim_one_turn_restore(_quick_key)
             _moa_state.conversation.model_override = {
                 "provider": "moa", "model": moa_cfg["default_preset"], "base_url": "moa://local",
                 "api_key": "moa-virtual-provider", "api_mode": "chat_completions",
             }
             self._evict_cached_agent(_quick_key)
-            event._moa_disable_after_turn = True
         except Exception:
             return True, "Failed to prepare MoA turn."
         return False, None
@@ -1279,48 +1287,39 @@ class GatewayInboundMixin:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # MoA one-shot restore must run on EVERY exit path (success, exception, interrupt):
-            # the restore data lives on the per-turn event and would leak permanently otherwise.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
+            # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
+            # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
+            self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
             # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
             # recovery pass.
             await self._clear_durable_active_turn(event)
-            # Unconditional, idempotent release without a run_generation guard: evicts the zombie
-            # left when session_reset bumps the generation mid-flight (gen-N's guarded release in
-            # _run_agent returns False; a sentinel-only check would lock forever).
-            self._release_running_agent_state(_quick_key)
+            # Release only this turn's generation. Eviction may immediately admit a replacement
+            # through the cold path; an unconditional release here would then clear the replacement
+            # sentinel/agent and lease. Reset/stop release their stale slot before installing a
+            # successor, preserving reset-zombie cleanup without granting gen-N successor authority.
+            self._release_running_agent_state(_quick_key, run_generation=_run_generation)
             # Turn lease is keyed by (routing key, run generation) so this unwind can only free
             # the lease its own turn acquired, never a newer turn's.
-            # Unconditional release covers every exit path. _release_running_agent_state is idempotent
-            # (pop-on-absent is harmless) and, called without a run_generation guard, always clears the slot
-            # regardless of which generation it holds. This evicts the zombie left when session_reset bumps
-            # the generation (N -> N+1) mid-flight: gen-N's guarded release inside _run_agent returns False,
-            # and the old sentinel-only check here missed the leftover real agent — locking the session out
-            # forever (#28686).
             self._release_turn_lease(_quick_key, _run_generation)
 
-    def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
-        """Revert a ``/moa <prompt>`` one-shot model override after its turn (called from the
-        message-handling ``finally``). ``_moa_restore_override`` holds the prior per-session
-        override (``None`` = clear the MoA override outright)."""
-        if not getattr(event, "_moa_disable_after_turn", False):
-            return
-        with suppress(Exception):
-            self._session_state(quick_key).conversation.model_override = getattr(event, "_moa_restore_override", None)
-            self._evict_cached_agent(quick_key)
+    def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
+        """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
 
-    def _restore_pending_one_turn_model_override(self, session_key: str) -> None:
-        """Restore a per-session model override after ``/model --once`` runs."""
+        With ``run_generation`` (the turn finalizer) the restore happens only while that generation
+        is still current; a stop/reset/eviction has already settled the snapshot itself (see
+        ``_invalidate_session_run_generation``), so the displaced finalizer finds nothing to do.
+        Without it (the settlement paths) the restore is unconditional."""
         if not session_key:
             return
         try:
             _otr_state = self._peek_session_state(session_key)
-            snapshot = _otr_state.conversation.one_turn_restore if _otr_state else None
-            if _otr_state is not None:
-                _otr_state.conversation.one_turn_restore = None
-            if snapshot:
-                self._restore_session_model_override(session_key, snapshot)
+            if _otr_state is None or not _otr_state.conversation.one_turn_restore:
+                return
+            if run_generation is not None and not self._is_session_run_current(session_key, run_generation):
+                return
+            snapshot = _otr_state.conversation.one_turn_restore
+            _otr_state.conversation.one_turn_restore = None
+            self._restore_session_model_override(session_key, snapshot)
         except Exception:
             logger.debug("Failed to restore one-turn model override", exc_info=True)
 
@@ -1619,6 +1618,34 @@ class GatewayInboundMixin:
         model supports native vision; the caller consumes that buffer at ``run_conversation``."""
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         message_text = (event._gateway_pending_stt_text if _pending_stt_prepared else event.text) or ""
+        if not _pending_stt_prepared and self._pending_event_audio_paths(event):
+            # The clip may already be transcribing in the background (drain-path receipt fix: the
+            # finished turn's answer was delivered while this ran). The canonical per-clip entry
+            # point joins that same in-flight work in-band, reuses a warm cache, or starts a cold
+            # transcription — one STT call per clip either way (gateway/pending_audio.py); it must
+            # not depend on background state existing. Echo ownership stays with whichever path
+            # claims it (the cold inbound path has never echoed). A raise from a failed shared
+            # task keeps the caption and falls through to the cold-path classification below,
+            # whose inline enrichment retries honestly (notes + provider fallback).
+            try:
+                _prepared_text, _prepared_transcripts = await self._transcribe_pending_audio_event_once(event)
+            except Exception as prep_exc:
+                logger.warning("Pending voice STT join failed: %s", prep_exc)
+            else:
+                message_text = _prepared_text if _prepared_text is not None else (event.text or "")
+                # Echo ownership belongs to the background claim on receipt-fixed routes, but this
+                # entry point is also the COLD ordinary-inbound path — there no background wrapper
+                # exists, so the caller-side echo-once contract (the base-mode behavior
+                # ``_enrich_inbound_voice`` preserves, and the upstream entry suite asserts with
+                # echo=True) would silently die. The clip ledger makes it exactly-once.
+                await self._echo_pending_stt_transcripts_once(
+                    event, self._adapter_for_source(source), source, _prepared_transcripts,
+                    metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                    log_context="Voice-prepare",
+                )
+            # The cache attr may have just been published above; recompute so media classification
+            # below treats the STT-eligible paths as prepared instead of transcribing them again.
+            _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         # Prefer the caller's resolved session key so this write key matches the consume key at the
         # run_conversation site; derive it here only for tests and legacy standalone callers.
         session_key = session_key or self._session_key_for_source(source)
@@ -1789,7 +1816,7 @@ class GatewayInboundMixin:
 
         source = dataclasses.replace(entry.origin)
         try:
-            authorized = self._is_user_authorized(source, allow_adapter_delegation=False)
+            authorized = self._is_user_authorized_for_source(source, allow_adapter_delegation=False)
         except Exception:
             logger.warning(
                 "Plugin message injection authorization check failed: plugin=%s session=%s",
@@ -2010,33 +2037,57 @@ class GatewayInboundMixin:
     async def _transcribe_pending_audio_event_once(
         self, event, user_text: Optional[str] = None
     ) -> tuple[str | None, List[str]]:
-        """Transcribe a pending audio event once and cache the result on the event: the interrupt
-        monitor and the pending-drain path both need it — one STT call and one echo per message."""
-        if hasattr(event, "_gateway_pending_stt_text"):
-            return event._gateway_pending_stt_text, list(getattr(event, "_gateway_pending_stt_transcripts", []) or [])
-        audio_paths = self._pending_event_audio_paths(event)
-        if not audio_paths:
+        """Cache pending audio per clip; merges may extend the event while STT is running.
+        The interrupt monitor and pending drain share results without freezing the caption."""
+        if not self._pending_event_audio_paths(event):
             return user_text if user_text is not None else (getattr(event, "text", None) or None), []
-        text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
-        event._gateway_pending_stt_text = enriched_text
-        event._gateway_pending_stt_transcripts = list(successful_transcripts)
-        return enriched_text, successful_transcripts
+        if not hasattr(event, "_gateway_pending_stt_lock"):
+            event._gateway_pending_stt_lock = asyncio.Lock()
+        async with event._gateway_pending_stt_lock:
+            clips = pending_audio_clips(event)
+            results = {}
+            while True:
+                audio_paths = list(dict.fromkeys(self._pending_event_audio_paths(event)))
+                missing = next((path for path in audio_paths if path not in results), None)
+                if missing is None:
+                    break
+                clip = clips.setdefault(missing, PendingAudioClip())
+                results[missing] = await clip.transcribe(
+                    lambda: self._enrich_message_with_transcription("", [missing])
+                )
+                # A merge can append media/text during STT. Re-read the event before publishing;
+                # keep completed clips so a caption merge cannot retranscribe or change an echo.
+            prefix = "\n\n".join(results[path][0] for path in audio_paths)
+            successful_transcripts = [
+                transcript for path in audio_paths for transcript in results[path][1]
+            ]
+            current_text = getattr(event, "text", "") or ""
+            event._gateway_pending_stt_text = (
+                self._prepend_media_prefix(prefix, current_text) if prefix else current_text
+            )
+            event._gateway_pending_stt_transcripts = list(successful_transcripts)
+            # Explicit overrides (including clarify's "") belong to this caller, never the cache.
+            text = current_text if user_text is None else user_text
+            return (
+                self._prepend_media_prefix(prefix, text) if prefix else text,
+                successful_transcripts,
+            )
 
     async def _echo_pending_stt_transcripts_once(
         self, event, adapter, source, transcripts: List[str], *, metadata=None,
         log_context: str = "Transcript",
     ) -> None:
-        """Echo pending-event STT transcripts to the chat at most once. Tracked as a COUNT (not a
-        set — identical transcripts are distinct deliveries): ``merge_pending_message_event`` can
-        append a second voice note and invalidate the cache; the re-run returns earlier transcripts
-        as a prefix, so only the unsent tail is echoed."""
+        """Claim echoes by clip identity, including transcripts already echoed by an absorbed event."""
         if not transcripts or not self._should_echo_stt_transcripts() or adapter is None:
             return
-        already_echoed = int(getattr(event, "_gateway_pending_stt_echoed", 0) or 0)
-        event._gateway_pending_stt_echoed = max(already_echoed, len(transcripts))
+        clips = pending_audio_clips(event)
+        unsent = [
+            transcript
+            for path in dict.fromkeys(self._pending_event_audio_paths(event))
+            for transcript in clips[path].claim_echo()
+        ]
         await self._echo_stt_transcripts(
-            adapter, source, transcripts[already_echoed:], metadata=metadata, log_context=log_context,
+            adapter, source, unsent, metadata=metadata, log_context=log_context,
         )
 
     async def _transcribe_and_echo_pending_voice(
@@ -2048,13 +2099,53 @@ class GatewayInboundMixin:
         if not self._pending_event_audio_paths(event):
             return text, []
         try:
-            enriched_text, transcripts = await self._transcribe_pending_audio_event_once(event, text)
             if metadata is _UNSET:
                 metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-            await self._echo_pending_stt_transcripts_once(
-                event, adapter, source, transcripts, metadata=metadata, log_context=log_context
-            )
-            return enriched_text or text, transcripts
+            while True:
+                if not self._pending_event_audio_paths(event):
+                    return getattr(event, "text", "") or "", []
+                enriched_text, transcripts = await self._transcribe_pending_audio_event_once(event)
+                await self._echo_pending_stt_transcripts_once(
+                    event, adapter, source, transcripts, metadata=metadata, log_context=log_context
+                )
+                # Sending an echo also yields to incoming merges. Refresh before interrupt/drain.
+                if getattr(event, "_gateway_pending_stt_text", None) == enriched_text:
+                    return enriched_text or text, transcripts
         except Exception as trans_exc:
             logger.warning("%s transcription failed: %s", log_context, trans_exc)
             return text, []
+
+    def _start_pending_voice_stt(
+        self, event, adapter, source, *, log_context: str, metadata=_UNSET,
+    ) -> "asyncio.Task | None":
+        """Start this event's clip transcription as a tracked background task; never await it.
+
+        Receipt/ordering fix: delivery proceeds while a long clip transcribes. Echo ownership is
+        claimed inside the task (one echo per clip, gateway/pending_audio.py); the transcription
+        result stays cached on the event so the follow-up turn's ``_prepare_inbound_message_text``
+        joins the in-flight work instead of duplicating it. The task is registered on
+        ``adapter._background_tasks`` (the canonical container; cancelled by shutdown) so it
+        cannot outlive the gateway. Returns the task (test/observability handle)."""
+        if not self._pending_event_audio_paths(event):
+            return None
+
+        async def _run() -> None:
+            try:
+                await self._transcribe_and_echo_pending_voice(
+                    event, adapter, source, event.text or "", log_context=log_context,
+                    metadata=metadata,
+                )
+            except asyncio.CancelledError:
+                # A cancelled waiter must not cancel the shared clip task (asyncio.shield owns
+                # that); this wrapper unwinding is all that happens here.
+                raise
+            except Exception as stt_exc:
+                logger.warning("%s background transcription failed: %s", log_context, stt_exc)
+
+        task = asyncio.create_task(_run())
+        try:
+            adapter._background_tasks.add(task)
+            task.add_done_callback(adapter._background_tasks.discard)
+        except AttributeError:
+            pass
+        return task

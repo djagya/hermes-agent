@@ -19,6 +19,7 @@ SKILL_CONTENT = """\
 ---
 name: test-skill
 description: A test skill for unit testing.
+author: Sera
 ---
 
 # Test Skill
@@ -319,6 +320,32 @@ word word word
         assert result["success"] is False
         assert reference.read_text(encoding="utf-8") == "original\n"
         assert stat.S_IMODE(reference.stat().st_mode) == 0o660
+
+    def test_patch_rollback_restores_raw_authorless_bytes_exactly(self, monkeypatch):
+        """Rollback restores the ACTUAL pre-operation disk bytes: a skill with
+        an explicit non-Sera author is never normalized or rewritten by a
+        blocked patch, and an authorless skill (created out-of-band, not via
+        skill_manage) is restored exactly as it was — raw, still authorless.
+        """
+        imported = SKILL_CONTENT.replace(
+            "description: A test skill for unit testing.",
+            "description: A test skill for unit testing.\nauthor: Hermes Agent",
+        )
+        _create_skill("rollback-skill", imported)
+        skill_md = self.skills_dir / "rollback-skill" / "SKILL.md"
+        # Out-of-band mutation: the on-disk preimage is RAW and authorless.
+        raw_authorless = SKILL_CONTENT.replace("author: Sera\n", "")
+        skill_md.write_text(raw_authorless, encoding="utf-8")
+        monkeypatch.setattr(
+            "tools.skill_manager_tool._security_scan_skill",
+            lambda _skill_dir: "blocked",
+        )
+
+        result = _patch_skill("rollback-skill", "Step 1: Do the thing.", "blocked patch")
+
+        assert result["success"] is False
+        assert skill_md.read_text(encoding="utf-8") == raw_authorless
+        assert "author:" not in skill_md.read_text(encoding="utf-8")
 
     def test_new_supporting_file_rollback_removes_file_when_scan_blocks(self, monkeypatch):
         """Blocked supporting-file creates remove the newly written file."""

@@ -2,12 +2,9 @@
 
 cli.py's load_cli_config() builds config separately from
 hermes_cli.config._load_config_impl, so the managed-scope seed has to be
-applied in BOTH places or the interactive CLI/TUI surface (skin, display prefs)
-silently ignores administrator seeds while `hermes config`/`doctor` honor
-them. This locks the cli.py path.
+applied in BOTH places or the interactive CLI/TUI surface silently ignores
+omitted administrator seeds while `hermes config`/`doctor` honor them.
 """
-import importlib
-
 import pytest
 
 
@@ -20,10 +17,12 @@ def homes(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
     import hermes_cli.config as cfg
-    from hermes_cli import managed_scope
+    from hermes_cli import config_effective, managed_scope
 
     cfg._LOAD_CONFIG_CACHE.clear()
     cfg._RAW_CONFIG_CACHE.clear()
+    config_effective._EFFECTIVE_CACHE.clear()
+    config_effective._LAST_GOOD_USER_RAW.clear()
     managed_scope.invalidate_managed_cache()
     return home, managed
 
@@ -43,8 +42,7 @@ def _load_cli_config(home):
     return cli.load_cli_config()
 
 
-def test_cli_config_user_skin_wins_over_managed_seed(homes):
-    """A user display.skin must reach CLI_CONFIG even when a seed exists."""
+def test_cli_config_user_skin_beats_managed_seed(homes):
     home, managed = homes
     (home / "config.yaml").write_text("display:\n  skin: user_skin\n", encoding="utf-8")
     (managed / "config.yaml").write_text("display:\n  skin: charizard\n", encoding="utf-8")
@@ -55,9 +53,11 @@ def test_cli_config_user_skin_wins_over_managed_seed(homes):
     assert (cfg.get("display") or {}).get("skin") == "user_skin"
 
 
-def test_cli_config_managed_skin_fills_when_user_omits(homes):
+def test_cli_config_seeds_omitted_skin_and_preserves_user_siblings(homes):
     home, managed = homes
-    (home / "config.yaml").write_text("display:\n  show_reasoning: true\n", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "display:\n  show_reasoning: true\n", encoding="utf-8"
+    )
     (managed / "config.yaml").write_text("display:\n  skin: charizard\n", encoding="utf-8")
     from hermes_cli import managed_scope
 
@@ -66,21 +66,3 @@ def test_cli_config_managed_skin_fills_when_user_omits(homes):
     display = cfg.get("display") or {}
     assert display.get("skin") == "charizard"
     assert display.get("show_reasoning") is True
-
-
-def test_cli_config_managed_leaf_preserves_user_siblings(homes):
-    """Managed display.skin must not wipe a user's other display.* prefs."""
-    home, managed = homes
-    (home / "config.yaml").write_text(
-        "display:\n  skin: user_skin\n  show_reasoning: true\n", encoding="utf-8"
-    )
-    (managed / "config.yaml").write_text("display:\n  skin: charizard\n", encoding="utf-8")
-    from hermes_cli import managed_scope
-
-    managed_scope.invalidate_managed_cache()
-    cfg = _load_cli_config(home)
-    display = cfg.get("display") or {}
-    assert display.get("skin") == "user_skin"
-    assert display.get("show_reasoning") is True
-
-

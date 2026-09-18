@@ -112,7 +112,19 @@ jobs:
           /tmp/gitleaks detect --redact --log-opts="$range"
 
       - name: sera-toolbox unit tests
-        run: python3 -m unittest discover -s tests/sera_toolbox -v
+        # These tools' tests live with the rest of the docker tests
+        # (tests/test_tests_tree_layout.py gate); they import stdlib only, so
+        # named dotted modules avoid sweeping the heavy suite in tests/docker.
+        run: |
+          python3 -m unittest tests.docker.test_archive_members \
+            tests.docker.test_disk_gate \
+            tests.docker.test_gnu_tar_unwrapped \
+            tests.docker.test_healthcheck \
+            tests.docker.test_image_doctor \
+            tests.docker.test_office_macro \
+            tests.docker.test_stage2_migrate_fail \
+            tests.docker.test_wrap_nproc \
+            tests.docker.test_wrap_profiles -v
 
   # Build the image and run the docker integration suite against it.
   # This job runs branch code, so it stays secret-free; publishing happens

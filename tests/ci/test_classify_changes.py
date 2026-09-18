@@ -3,6 +3,13 @@
 Check some common patterns of file modifications and the CI lanes they should run.
 We should always fail open. We may run a lane we didn't need, never skip one a
 change could have broken.
+
+The three JSON-contract cases intentionally carry ``os_tests=True``: these
+generated artifacts are asserted about by ``tests/tui_gateway/``, which lives
+under the ``tests/hermes_cli/`` OS-lane prefix, so dropping the desktop lane
+would skip the very suite that fails when a generated contract goes stale on
+a Windows/macOS-only change. The frontend cases also expect concrete
+workspaces (the shared contract is consumed by both apps).
 """
 
 from __future__ import annotations
@@ -135,6 +142,22 @@ CASES = {
         ["apps/desktop/src/store/profile.ts"],
         _lanes(frontend=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
     ),
+    # Cross-language contract JSON under apps/: the pytest that pins it against
+    # the Python side must run even when nothing else in the PR is Python.
+    # apps/ is an OS-lane source prefix and both apps consume the shared
+    # contract, so these carry os_tests=True and the concrete workspace pair.
+    "generated gateway contract → python + frontend": (
+        ["apps/shared/src/gateway-contract.generated.ts"],
+        _lanes(python=True, frontend=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
+    ),
+    "gateway OpenRPC document → python + frontend": (
+        ["apps/shared/src/gateway-contract.openrpc.json"],
+        _lanes(python=True, frontend=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
+    ),
+    "desktop slash-registry JSON → python + frontend": (
+        ["apps/desktop/src/lib/desktop-slash-registry.json"],
+        _lanes(python=True, frontend=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
+    ),
     # The published CIMD document is asserted about by the Python suite, so a
     # lone edit there must not skip the lane that would catch a bad edit.
     "cimd document → python + site": (
@@ -205,8 +228,8 @@ CASES = {
         _lanes(python=True, frontend=True, desktop_updater=True, workspaces=["apps/desktop"], os_tests=True),
     ),
     "desktop-update test → desktop_updater": (
-        ["tests/test_desktop_update_windows_progress.py"],
-        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, os_tests=True, py_full=False, py_roots=[["tests/test_desktop_update_windows_progress.py"]]),
+        ["tests/scripts/desktop_update/test_desktop_update_windows_progress.py"],
+        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, os_tests=True, py_full=False, py_roots=[["tests/scripts/desktop_update/test_desktop_update_windows_progress.py"]]),
     ),
     "updater-process.ts → desktop_updater": (
         ["apps/desktop/electron/updater-process.ts"],
@@ -450,14 +473,14 @@ def test_pull_request_changed_files_parses_gh_output(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(
             args[0],
             0,
-            stdout="scripts/install.sh\ntests/test_install_sh_node_deps_workspaces.py\n",
+            stdout="scripts/install.sh\ntests/scripts/install/test_install_sh_node_deps_workspaces.py\n",
             stderr="",
         )
 
     monkeypatch.setattr(_mod.subprocess, "run", fake_run)
     assert pull_request_changed_files() == [
         "scripts/install.sh",
-        "tests/test_install_sh_node_deps_workspaces.py",
+        "tests/scripts/install/test_install_sh_node_deps_workspaces.py",
     ]
 
 
@@ -478,7 +501,7 @@ def test_main_recovers_pr_files_instead_of_fail_open_ci_review(monkeypatch, caps
     monkeypatch.setattr(
         _mod,
         "pull_request_changed_files",
-        lambda: ["scripts/install.sh", "tests/test_install_sh_node_deps_workspaces.py"],
+        lambda: ["scripts/install.sh", "tests/scripts/install/test_install_sh_node_deps_workspaces.py"],
     )
     monkeypatch.setattr(sys, "stdin", io.StringIO("\n"))
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)

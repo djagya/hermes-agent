@@ -1,4 +1,4 @@
-"""apply_managed_overlay() — the shared helper used by every standalone loader."""
+"""apply_managed_overlay() — seed missing leaves; a present user leaf wins."""
 import textwrap
 
 import pytest
@@ -63,3 +63,25 @@ def test_overlay_user_raw_keeps_schema_defaults_from_shadowing_seed(managed):
     )
     assert out["display"]["skin"] == "charizard"
     assert out["display"]["show_reasoning"] is True
+
+
+def test_overlay_scalar_null_takes_seed(managed):
+    from hermes_cli import managed_scope
+
+    _write(managed, "security:\n  tirith_enabled: true\n")
+    out = managed_scope.apply_managed_overlay(
+        {"security": {"tirith_enabled": None}},
+        user_raw={"security": {"tirith_enabled": None}},
+    )
+    assert out["security"]["tirith_enabled"] is True
+
+
+def test_overlay_bare_model_string_keeps_user_default(managed):
+    from hermes_cli import managed_scope
+
+    _write(managed, "model:\n  default: managed/model\n  provider: nous\n")
+    out = managed_scope.apply_managed_overlay(
+        {"model": {"default": "user/model", "provider": "nous"}},
+        user_raw={"model": "user/model"},
+    )
+    assert out["model"]["default"] == "user/model"
