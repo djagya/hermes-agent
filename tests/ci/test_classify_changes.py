@@ -3,6 +3,13 @@
 Check some common patterns of file modifications and the CI lanes they should run.
 We should always fail open. We may run a lane we didn't need, never skip one a
 change could have broken.
+
+The three JSON-contract cases intentionally carry ``os_tests=True``: these
+generated artifacts are asserted about by ``tests/tui_gateway/``, which lives
+under the ``tests/hermes_cli/`` OS-lane prefix, so dropping the desktop lane
+would skip the very suite that fails when a generated contract goes stale on
+a Windows/macOS-only change. The frontend cases also expect concrete
+workspaces (the shared contract is consumed by both apps).
 """
 
 from __future__ import annotations
@@ -137,17 +144,19 @@ CASES = {
     ),
     # Cross-language contract JSON under apps/: the pytest that pins it against
     # the Python side must run even when nothing else in the PR is Python.
+    # apps/ is an OS-lane source prefix and both apps consume the shared
+    # contract, so these carry os_tests=True and the concrete workspace pair.
     "generated gateway contract → python + frontend": (
         ["apps/shared/src/gateway-contract.generated.ts"],
-        _lanes(python=True, frontend=True),
+        _lanes(python=True, frontend=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
     ),
     "gateway OpenRPC document → python + frontend": (
         ["apps/shared/src/gateway-contract.openrpc.json"],
-        _lanes(python=True, frontend=True),
+        _lanes(python=True, frontend=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
     ),
     "desktop slash-registry JSON → python + frontend": (
         ["apps/desktop/src/lib/desktop-slash-registry.json"],
-        _lanes(python=True, frontend=True),
+        _lanes(python=True, frontend=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
     ),
     # The published CIMD document is asserted about by the Python suite, so a
     # lone edit there must not skip the lane that would catch a bad edit.

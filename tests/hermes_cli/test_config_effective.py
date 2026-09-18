@@ -75,9 +75,19 @@ def test_effective_is_user_plus_managed_plus_env_with_no_defaults(homes):
             "api_key": "user-secret",
             "base_url": "https://managed.example",
         },
-        "display": {"skin": "managed-skin"},
+        # The managed seed is omit-style: a leaf the user set (skin) keeps the
+        # user's value, and no DEFAULT_CONFIG key leaks in (asserted below).
+        "display": {"skin": "user-skin"},
     }
     assert "agent" in DEFAULT_CONFIG  # would be present if defaults had been merged
+    # Declared ownership on the enforcement layer is independent of the seed:
+    # a user-set managed leaf stays pinned (plugins/doctor refuse writes to it)
+    # even though the effective loader keeps the user's bytes.
+    from hermes_cli import managed_scope
+
+    assert managed_scope.is_key_managed("display.skin")
+    assert managed_scope.is_key_managed("model.base_url")
+    assert not managed_scope.is_key_managed("model.default")
 
 
 def test_broken_yaml_serves_last_good_and_fail_closed_raises(homes):

@@ -2,8 +2,8 @@
 
 The fork fences live FTS ``'rebuild'`` (``_rebuild_fts_indexes`` is a no-op and
 ``_migrate_trigram_cron_exclusion`` returns False to hold ``schema_version``
-below 30 — see ``tests/sera_toolbox/test_fts_fork_fence_source.py`` and
-``tests/state/test_fts_fork_fence.py``). Upstream tests written when the
+below 30 — see ``tests/hermes_state/test_fts_fork_fence_source.py`` and
+``tests/hermes_state/test_fts_fork_fence.py``). Upstream tests written when the
 trigram migration could complete therefore fail here for exactly one reason:
 their final ``schema_version == SCHEMA_VERSION`` assertion, or a follow-on
 assertion that depends on the migration having run.
@@ -44,7 +44,7 @@ def _read_version(path) -> int:
 
 
 def test_legacy_sessions_table_recovers_column_while_version_holds(tmp_path):
-    """Upstream mirror: tests/state/test_session_git_metadata_generation.py::
+    """Upstream mirror: tests/hermes_state/test_session_git_metadata_generation.py::
     test_legacy_sessions_table_reconciles_generation_column.
 
     The reconciler must re-add ``git_metadata_generation`` on reopen; the

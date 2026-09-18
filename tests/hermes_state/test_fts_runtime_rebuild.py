@@ -29,9 +29,9 @@ from hermes_state_common import FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY, LEGACY_
 from hermes_state_dbfile import _concrete_state_db_holder_pids, _is_inactive_orphan_desktop_holder
 
 # Fork FTS fence: live rebuild machinery is disabled on this fork; the fenced contract
-# is owned by tests/state/test_fts_fork_fence.py.
+# is owned by tests/hermes_state/test_fts_fork_fence.py.
 pytestmark = pytest.mark.skip(
-    reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)"
+    reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)"
 )
 
 
@@ -91,7 +91,7 @@ def _base_fts_triggers(db_path):
     return {row[0] for row in rows}
 
 
-@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)")
 class TestRuntimeFtsRebuild:
     def test_reap_candidates_exclude_uninspectable_holder_suspicions(
         self, tmp_path
@@ -971,7 +971,7 @@ def _corrupt_canonical_btree(db_path):
             f.write(b"\xff\xff\xff\xff")
 
 
-@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)")
 class TestPhysicalCorruptionAcceptance:
     """Real-fixture acceptance tests for the fail-closed classifier (#97940).
 

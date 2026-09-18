@@ -11,6 +11,10 @@ loose files at ``tests/`` root that belonged to a package.
 Filenames also stopped carrying issue numbers: ``test_89315_x.py`` reads as
 noise in a directory listing and the number belongs in the docstring, where
 ``git log -S`` and a reader can both find it with context.
+
+The fork's ``tests/sera_toolbox`` and ``tests/state`` were folded into
+``tests/docker`` and ``tests/hermes_state`` (their subjects) during the
+v0.21.4 integration; the release workflow pins the moved modules by name.
 """
 
 from __future__ import annotations

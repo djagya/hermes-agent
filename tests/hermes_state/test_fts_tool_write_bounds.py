@@ -118,7 +118,7 @@ def test_trigger_migration_preserves_historical_tool_tokens_without_rebuild(tmp_
         migrated.close()
 
 
-@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)")
 def test_full_rebuild_moves_boundary_before_future_tool_writes(db):
     before_id = db.append_message(
         "session",

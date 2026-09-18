@@ -19,6 +19,7 @@ SKILL_CONTENT = """\
 ---
 name: test-skill
 description: A test skill for unit testing.
+author: Sera
 ---
 
 # Test Skill

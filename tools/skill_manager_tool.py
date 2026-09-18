@@ -1107,31 +1107,11 @@ def skill_manage(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
     if (preflight := _background_review_preflight(action, name)) is not None:
         return json.dumps(preflight, ensure_ascii=False)
-    # Normalize author before the approval gate so the staged payload shows the
-    # exact frontmatter that will be written on approval.
-    if action == "create" and content:
-        content, author_error = apply_local_author_policy("create", name, content)
-        if author_error:
-            return tool_error(author_error, success=False)
-    elif action == "edit" and content:
-        existing = None
-        found = _find_skill(name)
-        if found:
-            with suppress(OSError):
-                existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
-        content, author_error = apply_local_author_policy(action, name, content, existing=existing)
-        if author_error:
-            return tool_error(author_error, success=False)
-    elif action == "write_file" and file_content is not None and _is_skill_md_target(file_path):
-        existing = None
-        found = _find_skill(name)
-        if found:
-            with suppress(OSError):
-                existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
-        file_content, author_error = apply_local_author_policy(
-            "edit" if existing else "create", name, file_content, existing=existing)
-        if author_error:
-            return tool_error(author_error, success=False)
+    # Author normalization is the HANDLERS' job, after their size validation: the size
+    # budget applies to caller bytes (a boundary-sized create must not fail because the
+    # injected author line pushed it over), and the approval gate must stage exactly the
+    # bytes the caller sent so an approved replay re-enters through the same validated
+    # path instead of trusting pre-transformed content.
     # Approval gate: skills are too large to review inline, so they always stage regardless
     # of origin; bypassed when replaying an approved staged write.
     args = dict(content=content, category=category, file_path=file_path, file_content=file_content,

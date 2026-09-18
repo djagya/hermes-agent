@@ -1,11 +1,11 @@
 """Fresh state.db FTS bootstrap must honor cross-process rebuild admission."""
 
 # Fork FTS fence: this file's subject (live FTS rebuild/admission machinery) is disabled
-# on this fork; the fenced contract is owned by tests/state/test_fts_fork_fence.py.
+# on this fork; the fenced contract is owned by tests/hermes_state/test_fts_fork_fence.py.
 import pytest
 
 pytestmark = pytest.mark.skip(
-    reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)"
+    reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)"
 )
 
 

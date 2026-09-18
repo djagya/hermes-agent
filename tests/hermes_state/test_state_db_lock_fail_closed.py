@@ -75,7 +75,7 @@ def test_fts_admission_still_admits_a_pathless_db(tmp_path):
         assert admitted is True
 
 
-@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)")
 def test_rebuild_fts_defers_when_lock_file_is_unopenable(tmp_path):
     """Behavior: the rebuild entry point reports no progress and rebuilds nothing."""
     db = SessionDB(db_path=tmp_path / "state.db")

@@ -210,7 +210,7 @@ def test_imported_prompts_are_deduplicated(tmp_path):
         target.close()
 
 
-@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/state/test_fts_fork_fence.py)")
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)")
 def test_v24_inline_prompts_migrate_once_to_content_addressed_storage(tmp_path):
     db_path = tmp_path / "legacy-prompts.db"
     legacy_prompt = "Legacy system prompt\n" + ("same policy\n" * 20)
