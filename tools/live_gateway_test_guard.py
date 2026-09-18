@@ -1,7 +1,7 @@
 """Live-gateway test guard: refuse Hermes-repo test execution inside the running gateway.
 
 On 2026-09-17 a release card ran the Hermes suite with the terminal tool inside
-Danil's live s6 gateway container; ``tests/docker`` lifecycle tests SIGTERM'd the
+the operator's live s6 gateway container; ``tests/docker`` lifecycle tests SIGTERM'd the
 real ``gateway-default`` service three times during user work. Prompt-level
 policy could not hold: specialized profiles are isolated islands, profile
 configs drift, and memory/skill prose is advisory text a model may ignore.
@@ -1032,7 +1032,7 @@ def hermes_live_test_block(
     Gated on the live supervised gateway (``_is_supervised_gateway_process``):
     a CLI or unsupervised run may execute Hermes tests locally — CI parity
     instructions tell developers to do exactly that — while the gateway
-    process, which serves Danil's production s6 tree, must never spawn the
+    process, which serves the operator's live-production s6 tree, must never spawn the
     suite. Applies on local AND container-with-host-mount backends: the
     incident path was a local run inside the gateway container.
 
