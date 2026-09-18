@@ -470,19 +470,36 @@ def test_staged_create_reviewed_payload_is_what_persists(hermes_home):
 
     ok, message = _apply_staged_skill_record(wa, smt, staged["pending_id"])
     assert ok is True, message
+    assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is None, \
+        "approved create must consume its pending record"
     skill_md = os.path.join(hermes_home, "skills", "demo", "SKILL.md")
     with open(skill_md, encoding="utf-8") as handle:
         assert handle.read() == reviewed, "persisted bytes must equal the reviewed payload"
 
-    # Raw reapply through the same dispatcher stays byte-stable (idempotent
-    # author policy), so replay cannot diverge from what was approved.
+    # Raw reapply with the gate still ON: an identical dispatcher call STAGES a
+    # new pending record (staged != applied) and must not mutate the skill by
+    # itself. The staged record is then applied through the real approval
+    # helper: pending consumed, and the persisted bytes remain exactly the
+    # reviewed payload (author normalization is idempotent on already-authored
+    # content), so replay cannot diverge from what was approved.
     with open(skill_md, encoding="utf-8") as handle:
         before = handle.read()
     replay = json.loads(smt.skill_manage(
         action="write_file", name="demo", file_path="SKILL.md", file_content=before))
-    assert replay["success"] is True, replay
+    assert replay.get("staged") is True, replay
+    replay_id = replay["pending_id"]
+    assert replay_id != staged["pending_id"]
+    assert wa.get_pending(wa.SKILLS, replay_id) is not None, \
+        "gated reapply must stage, not write"
     with open(skill_md, encoding="utf-8") as handle:
-        assert handle.read() == before
+        assert handle.read() == before, "staging alone must not mutate the skill"
+    ok, message = _apply_staged_skill_record(wa, smt, replay_id)
+    assert ok is True, message
+    assert wa.get_pending(wa.SKILLS, replay_id) is None, \
+        "approved replay must consume its pending record"
+    with open(skill_md, encoding="utf-8") as handle:
+        assert handle.read() == reviewed, \
+            "applied replay bytes must stay identical to the reviewed payload"
 
 
 def test_deleted_pending_record_cannot_mutate_skill(hermes_home):

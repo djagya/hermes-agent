@@ -6,12 +6,14 @@ Hand-placed and hub-installed skills have no hard limit.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
 from tools.skill_manager_tool import (
     MAX_SKILL_CONTENT_CHARS,
     _validate_content_size,
+    apply_local_author_policy,
     skill_manage,
 )
 
@@ -93,11 +95,29 @@ class TestPatchSkillSizeLimit:
     """patch action checks resulting size, not just the new_string."""
 
     def test_patch_that_would_exceed_limit(self, isolate_skills):
-        # Create a skill near the limit
-        near_limit = _make_skill_content(MAX_SKILL_CONTENT_CHARS - 50)
-        json.loads(skill_manage(action="create", name="near-limit", content=near_limit))
+        # Create an explicitly authored near-limit skill: the fixture is sized
+        # by TOTAL document length (frontmatter + heading + body) and already
+        # carries 'author: Sera', so normalization is a no-op and create must
+        # actually succeed before the patch is attempted.
+        frontmatter = (
+            "---\nname: near-limit\ndescription: Near-limit fixture\nauthor: Sera\n---\n"
+        )
+        head = "# Test Skill\n\n"
+        body_budget = MAX_SKILL_CONTENT_CHARS - len(frontmatter) - len(head)
+        assert body_budget > 200
+        content = frontmatter + head + ("x" * body_budget)
+        normalized, author_error = apply_local_author_policy("create", "near-limit", content)
+        assert author_error is None, author_error
+        assert normalized == content, "explicit author must make normalization a no-op"
+        assert len(normalized) == MAX_SKILL_CONTENT_CHARS
+        result = json.loads(skill_manage(action="create", name="near-limit", content=content))
+        assert result["success"] is True, result
+        skill_md = Path(isolate_skills) / "near-limit" / "SKILL.md"
+        assert skill_md.exists(), "near-limit skill must exist before patching"
 
-        # Patch that adds enough to go over
+        # A patch that adds enough to push the FINAL document over the limit
+        # is rejected with the documented size error; the stored bytes are
+        # untouched by the failed patch.
         result = json.loads(skill_manage(
             action="patch",
             name="near-limit",
@@ -106,6 +126,7 @@ class TestPatchSkillSizeLimit:
         ))
         assert result["success"] is False
         assert "100,000" in result["error"]
+        assert skill_md.read_text(encoding="utf-8") == content
 
 
     def test_patch_supporting_file_size_limit(self, isolate_skills):

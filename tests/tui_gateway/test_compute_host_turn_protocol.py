@@ -83,9 +83,25 @@ def test_turn_start_streams_deltas_then_turn_end_with_history_identity(turn_env)
     out = io.StringIO()
     host = ComputeHost(stdout=out, heartbeat_secs=0)
     sid = "s1"
-    server._sessions[sid] = _session(_agent(["a ", "b ", "c "]))
+    session = _session(_agent(["a ", "b ", "c "]))
+    server._sessions[sid] = session
     try:
         host.handle_frame({"type": "turn.start", "sid": sid, "request_id": "turn", "prompt": "hello"})
+        _wait(out, lambda f: f["type"] == "rpc"
+              and f["message"]["params"]["type"] == "message.complete")
+        # turn.end is emitted only after the host JOINS the run thread, and the
+        # post-message.complete epilogue (goal/loop hooks, marker retire, settled
+        # session-info, followup drain) does real first-touch work on a cold
+        # runner — imports plus state.db writes (DELETE-journal fallback on the
+        # CI runner's SQLite) — that can outlast a fixed frame deadline on a
+        # loaded shared machine. Synchronize on the deterministic event the
+        # host itself waits for: the run thread's exit (event-based join on the
+        # thread's completion lock, the same handle the host joins).
+        thread = session.get("_run_thread")
+        if thread is not None:
+            thread.join(timeout=30.0)
+            if thread.is_alive():
+                raise AssertionError(f"turn run thread never finished; saw={_frames(out)}")
         end = _wait(out, lambda f: f["type"] == "turn.end")
     finally:
         server._sessions.pop(sid, None)
