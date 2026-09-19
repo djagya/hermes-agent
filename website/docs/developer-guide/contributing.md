@@ -137,6 +137,18 @@ ln -sf "$(pwd)/venv/bin/hermes" ~/.local/bin/hermes
 scripts/run_tests.sh
 ```
 
+The canonical runners refuse to start (exit code 78) when the host looks
+like a live s6-supervised gateway container — running the suite there lets
+Docker/lifecycle tests signal the host's supervised services. If you hit
+`refusing to run tests: live s6 gateway container`, run tests through
+GitHub Actions CI or a genuinely isolated container instead; never disable
+the guard on a shared host. A disposable s6 test container can opt in by
+setting `HERMES_TEST_ISOLATED=1` together with `CI=1` or
+`HERMES_TEST_IMAGE` (the marker the repository's Docker CI jobs already
+set). This is an accidental-safety guard, not a security boundary: it only
+reads PID 1's comm and `/run/service` directory names, so a same-UID
+process could spoof them.
+
 ## Code Style
 
 - **PEP 8** with practical exceptions (no strict line length enforcement)
