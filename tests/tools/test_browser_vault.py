@@ -784,3 +784,219 @@ class TestTwoFactor:
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
         assert out["error_type"] == "no_code_field" and "device" in out["error"]
+
+
+class TestExplicitCodeMode:
+    """code + expected_origin: Hermes supplies the code it obtained through its own
+    authorized mail workflow; no TOTP lookup, no interactive prompt (Telegram-shaped
+    sessions have neither)."""
+
+    OTP_PAGE = "https://c818518.easybill.de/login"
+    PAGE_ORIGIN = "https://c818518.easybill.de"
+
+    def _patches(self, controls, origin=PAGE_ORIGIN, seen=None):
+        from tools import browser_vault_tool
+
+        def fake_eval(task_id, expr):
+            if "querySelectorAll" in expr:
+                return {"success": True, "result": json.dumps(controls)}
+            return {"success": True, "result": f"{origin}/verify"}
+
+        def fake_secret(task_id, expr):
+            if seen is not None:
+                seen["expr"] = expr
+            return {"success": True, "result": json.dumps({"filled": 1})}
+
+        return (
+            patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None),
+            patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval),
+            patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret),
+        )
+
+    def test_valid_supplied_code_fills_without_totp_or_prompt(self):
+        from tools import browser_vault_tool
+
+        controls = [{"index": 0, "type": "text", "name": "otp", "label": "Code",
+                     "autocomplete": "one-time-code"}]
+        seen = {}
+        with patch("agent.vault_backends.unlock.can_prompt_here", return_value=False), \
+             patch("agent.vault_backends.unlock.get_code_prompt_callback", return_value=None), \
+             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(controls) if "querySelectorAll" in e else self.OTP_PAGE}), \
+             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=lambda t, e: seen.update(expr=e) or {"success": True, "result": json.dumps({"filled": 1})}):
+            raw = browser_vault_tool.browser_vault_enter_code(
+                task_id="t", code="042172", expected_origin=self.PAGE_ORIGIN
+            )
+        out = json.loads(raw)
+        assert out["success"] and out["source"] == "supplied" and out["filled_fields"] == 1
+        assert "042172" not in raw  # the code never echoes back
+        assert '042172' in seen["expr"]  # but it did reach the page fill
+
+    def test_leading_zeros_alphanumerics_and_hyphens_preserved(self):
+        from tools import browser_vault_tool
+
+        controls = [{"index": 0, "type": "text", "name": "otp", "label": "Code",
+                     "autocomplete": "one-time-code"}]
+        for supplied, want in (("0a7Z9", '"value": "0a7Z9"'), ("123-456", '"value": "123-456"'),
+                                ("  042172  ", '"value": "042172"')):
+            seen = {}
+            with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+                 patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(controls) if "querySelectorAll" in e else self.OTP_PAGE}), \
+                 patch.object(browser_vault_tool, "_eval_js_secret", side_effect=lambda t, e: seen.update(expr=e) or {"success": True, "result": json.dumps({"filled": 1})}):
+                browser_vault_tool.browser_vault_enter_code(
+                    task_id="t", code=supplied, expected_origin=self.PAGE_ORIGIN
+                )
+            assert want in seen["expr"], supplied
+
+    def test_malformed_codes_fail_closed_without_leaking(self):
+        from tools import browser_vault_tool
+
+        # An empty/whitespace code is "not supplied" → the legacy path (no
+        # error_type guarantee); every malformed NON-EMPTY shape must be a
+        # typed refusal that never echoes the input.
+        for bad in ("12 34", "12345678901234567", "abc\x00def", "ab\ncd", "   "):
+            out = json.loads(
+                browser_vault_tool.browser_vault_enter_code(
+                    task_id="t", code=bad, expected_origin=self.PAGE_ORIGIN
+                )
+            )
+            assert out["success"] is False, bad
+            assert out.get("error_type") == "invalid_code", (bad, out)
+            stripped = bad.strip()
+            if stripped and len(stripped) > 3:  # short inputs are substrings of the message itself
+                assert stripped not in out.get("error", ""), bad
+
+    def test_expected_origin_is_mandatory_and_exact(self):
+        from tools import browser_vault_tool
+
+        controls = [{"index": 0, "type": "text", "name": "otp", "label": "Code",
+                     "autocomplete": "one-time-code"}]
+        common = [
+            patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None),
+            patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(controls) if "querySelectorAll" in e else self.OTP_PAGE}),
+        ]
+        with patch.object(browser_vault_tool, "_eval_js_secret") as secret_eval:
+            with common[0], common[1]:
+                out = json.loads(browser_vault_tool.browser_vault_enter_code(
+                    task_id="t", code="123456", expected_origin=""))
+                assert out["error_type"] == "origin_required"
+                assert secret_eval.call_count == 0
+            with common[0], common[1]:
+                out = json.loads(browser_vault_tool.browser_vault_enter_code(
+                    task_id="t", code="123456", expected_origin="https://evil.example"))
+                assert out["error_type"] == "origin_mismatch"
+                assert secret_eval.call_count == 0
+
+    def test_handle_origin_must_agree(self, store):
+        from tools import browser_vault_tool
+
+        meta = store.add_item("login", "gh", {"identifier_type": "username",
+                                              "identifier": "tek", "password": "pw"},
+                              origin="https://github.com")
+        controls = [{"index": 0, "type": "text", "name": "otp", "label": "Code",
+                     "autocomplete": "one-time-code"}]
+        with patch("agent.vault_backends.backend_for_handle", return_value=None), \
+             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(controls) if "querySelectorAll" in e else self.OTP_PAGE}), \
+             patch.object(browser_vault_tool, "_eval_js_secret") as secret_eval:
+            out = json.loads(browser_vault_tool.browser_vault_enter_code(
+                handle=meta.id, task_id="t", code="123456", expected_origin=self.PAGE_ORIGIN))
+        # backend_for_handle patched to None → no meta lookup; the origin gate alone governs.
+        # Now the real backend disagrees with the page origin:
+        from agent.vault_backends import enabled_backends
+        real = [b for b in enabled_backends() if b.name == "local"]
+        assert real, "local backend expected"
+        with patch("agent.vault_backends.backend_for_handle", return_value=real[0]), \
+             patch.object(real[0], "get_meta", return_value=store.get_meta(meta.id)), \
+             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(controls) if "querySelectorAll" in e else self.OTP_PAGE}), \
+             patch.object(browser_vault_tool, "_eval_js_secret") as secret_eval2:
+            out = json.loads(browser_vault_tool.browser_vault_enter_code(
+                handle=meta.id, task_id="t", code="123456", expected_origin=self.PAGE_ORIGIN))
+        assert out["error_type"] == "origin_mismatch"
+        assert secret_eval2.call_count == 0
+
+    def test_navigation_during_fill_refuses(self):
+        from tools import browser_vault_tool
+
+        controls = [{"index": 0, "type": "text", "name": "otp", "label": "Code",
+                     "autocomplete": "one-time-code"}]
+        with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(controls) if "querySelectorAll" in e else self.OTP_PAGE}), \
+             patch.object(browser_vault_tool, "_eval_js_secret", return_value={"success": True, "result": json.dumps({"refused": "origin_changed", "found": "https://other.example"})}):
+            out = json.loads(browser_vault_tool.browser_vault_enter_code(
+                task_id="t", code="123456", expected_origin=self.PAGE_ORIGIN))
+        assert out["error_type"] == "origin_changed" and out["success"] is False
+
+    def test_supplied_code_split_across_digit_boxes(self):
+        from tools import browser_vault_tool
+
+        boxes = [{"index": i, "type": "tel", "name": f"d{i}", "label": "",
+                  "autocomplete": "one-time-code", "formIndex": 0, "maxLength": 1}
+                 for i in range(6)]
+        seen = {}
+        with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(boxes) if "querySelectorAll" in e else self.OTP_PAGE}), \
+             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=lambda t, e: seen.update(expr=e) or {"success": True, "result": json.dumps({"filled": 6})}):
+            out = json.loads(browser_vault_tool.browser_vault_enter_code(
+                task_id="t", code="042172", expected_origin=self.PAGE_ORIGIN))
+        assert out["filled_fields"] == 6
+        assert re.findall(r'"value": "(\d)"', seen["expr"]) == list("042172")
+
+    def test_without_code_totp_and_prompt_paths_unchanged(self, store, monkeypatch):
+        """No code supplied → the pre-existing behavior (TOTP, else prompt) is intact."""
+        from agent.vault_backends import unlock as unlock_mod
+        from tools import browser_vault_tool
+
+        meta = store.add_item("login", "gh", {"identifier_type": "username",
+                                              "identifier": "tek", "password": "pw",
+                                              "otp_secret": "JBSWY3DPEHPK3PXP"},
+                              origin="https://github.com")
+        asked = []
+        monkeypatch.setattr(unlock_mod, "set_code_prompt_callback",
+                            lambda cb: asked.append(cb))
+        controls = [{"index": 0, "type": "text", "name": "otp", "label": "Code",
+                     "autocomplete": "one-time-code"}]
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_eval_js", side_effect=lambda t, e: {"success": True, "result": json.dumps(controls) if "querySelectorAll" in e else "https://github.com/2fa"}), \
+             patch.object(browser_vault_tool, "_eval_js_secret", return_value={"success": True, "result": json.dumps({"filled": 1})}):
+            out = json.loads(browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t"))
+        assert out["success"] and out["source"] == "local"
+
+    def test_supplied_code_registered_for_redaction_and_scrubbed_from_persistence(self):
+        """The pre-dispatch hook registers the code; redact_sensitive_text then scrubs
+        it from request dumps, logs and any tool_calls row projection."""
+        from agent.redact import clear_vault_redaction_values, redact_sensitive_text
+        from agent.tool_executor import _register_supplied_otp_for_redaction
+
+        try:
+            _register_supplied_otp_for_redaction(
+                "browser_vault_enter_code",
+                {"code": "042172", "expected_origin": "https://x.example"},
+            )
+            payload = json.dumps({
+                "tool_calls": [{"function": {"name": "browser_vault_enter_code",
+                                             "arguments": "{\"code\": \"042172\"}"}}]
+            })
+            scrubbed = redact_sensitive_text(payload, force=True)
+            assert "042172" not in scrubbed
+            # other tools' args are untouched by the registration itself
+            _register_supplied_otp_for_redaction("browser_type", {"text": "042172"})
+            # (same value already registered; the point is the hook ignores other tools)
+        finally:
+            clear_vault_redaction_values()
+
+    def test_durable_tool_calls_row_scrubs_registered_code(self):
+        from agent.redact import clear_vault_redaction_values, register_vault_redaction_value
+        from agent.session_persistence import _durable_tool_calls
+
+        try:
+            register_vault_redaction_value("042172")
+            row = [{"function": {"name": "browser_vault_enter_code",
+                                 "arguments": "{\"code\": \"042172\", \"expected_origin\": \"https://x\"}"}}]
+            out = _durable_tool_calls(row)
+            assert "042172" not in out[0]["function"]["arguments"]
+            assert "expected_origin" in out[0]["function"]["arguments"]  # structure kept
+        finally:
+            clear_vault_redaction_values()

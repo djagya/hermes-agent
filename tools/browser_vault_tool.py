@@ -319,22 +319,93 @@ _TAB_PROBES["otp"] = ("!!document.querySelector('input[autocomplete=one-time-cod
                       "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]')")
 
 
-def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) -> str:
+def _validate_supplied_otp(code: str) -> tuple[Optional[str], Optional[str]]:
+    """Validate an explicit one-time code. Returns ``(normalized, error)``.
+
+    Bounded, nonempty, no control characters, no whitespace; leading zeros and
+    alphanumeric bodies are preserved (some sites use alphanumeric codes).
+    Interior hyphens are preserved too — a site that issues ``123-456`` wants
+    exactly those bytes, and silently stripping a separator would corrupt the
+    fill. Only surrounding whitespace is trimmed. The error message never
+    embeds the input.
+    """
+    if not isinstance(code, str) or not code.strip():
+        return None, "The supplied code is empty. Provide the code exactly as shown."
+    trimmed = code.strip()
+    if len(trimmed) > 16:
+        return None, "The supplied code is longer than any one-time code (max 16 characters)."
+    if any(ch.isspace() for ch in trimmed):
+        return None, "The supplied code contains internal whitespace. Provide the code exactly as issued."
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in trimmed):
+        return None, "The supplied code contains control characters."
+    return trimmed, None
+
+
+def browser_vault_enter_code(
+    handle: str = "",
+    task_id: Optional[str] = None,
+    code: str = "",
+    expected_origin: str = "",
+) -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. If the saved login (``handle``) has an
     authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
     their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
-    socket and never enters the conversation."""
+    socket and never enters the conversation.
+
+    With ``code`` supplied, that explicit code is used directly — no TOTP lookup, no interactive prompt —
+    so an unattended session (e.g. Telegram) can hand over a code obtained through Hermes' own authorized
+    mail workflow. ``expected_origin`` is mandatory in that mode and must equal the current page origin;
+    a login ``handle``'s bound origin must also agree. The supplied code is registered with the redaction
+    boundary the same way a generated one is."""
     from agent.redact import register_vault_redaction_value
     from agent.vault_backends import backend_for_handle
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
+
+    # Validate the explicit code BEFORE any page interaction: a malformed code
+    # must fail fast, and the validation errors never embed the input.
+    explicit_code: Optional[str] = None
+    if code:
+        explicit_code, code_error = _validate_supplied_otp(code)
+        if code_error:
+            return json.dumps({"success": False, "error_type": "invalid_code", "error": code_error})
+
     _focus_bound_origin(effective_task_id, "", "otp")
     origin = _current_page_origin(effective_task_id)
     if not origin:
         return json.dumps({"success": False, "error": "No page with a code field is open."})
     site = origin.split("://", 1)[-1]
+
+    # Explicit mode origin gate: require an exact expected_origin match before
+    # anything is classified or filled.
+    if explicit_code is not None:
+        if not expected_origin:
+            return json.dumps({"success": False, "error_type": "origin_required",
+                               "error": ("Explicit-code mode requires expected_origin to equal the page's origin "
+                                         f"({origin}). It is checked again immediately before the fill.")})
+        try:
+            from agent.vault_store import normalize_origin
+            wanted_origin = normalize_origin(expected_origin)
+        except Exception:
+            return json.dumps({"success": False, "error_type": "invalid_origin",
+                               "error": "expected_origin could not be parsed; use scheme://host[:port]."})
+        if wanted_origin != origin:
+            return json.dumps({"success": False, "error_type": "origin_mismatch",
+                               "error": (f"Refused: current page origin ({origin}) does not match "
+                                         f"expected_origin ({wanted_origin}). Nothing was written.")})
+        backend = backend_for_handle(handle) if handle else None
+        if backend is not None:
+            try:
+                meta = backend.get_meta(handle)
+            except Exception:
+                meta = None
+            bound = str(getattr(meta, "origin", "") or "") if meta is not None else ""
+            if bound and bound != origin:
+                return json.dumps({"success": False, "error_type": "origin_mismatch",
+                                   "error": (f"Refused: the login handle's bound origin ({bound}) does not match "
+                                             f"the current page origin ({origin}). Nothing was written.")})
 
     nonce = secrets.token_hex(8)
     inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
@@ -347,31 +418,39 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                            "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or "
                                      "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
 
-    code: Optional[str] = None
+    code_value: Optional[str] = None
     source = "user"
-    backend = backend_for_handle(handle) if handle else None
-    if backend is not None:
-        try:
-            code = backend.resolve_otp(handle)
-        except Exception:
-            code = None
-        if code:
-            source = backend.name
-    if not code:
-        prompt = get_code_prompt_callback()
-        if prompt is None or not can_prompt_here():
-            return json.dumps({"success": False, "error_type": "prompt_unavailable",
-                               "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
-                                         "Save an authenticator key for this login so codes can be generated automatically.")})
-        code = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
-        if not code:
-            return json.dumps({"success": False, "error_type": "code_declined",
-                               "error": "The user did not enter a code. Do not ask again this turn."})
+    if explicit_code is not None:
+        # Explicit code takes precedence; a malformed explicit code already
+        # failed above, so no silent fallback to another source happens.
+        code_value = explicit_code
+        source = "supplied"
+    else:
+        backend = backend_for_handle(handle) if handle else None
+        if backend is not None:
+            try:
+                code_value = backend.resolve_otp(handle)
+            except Exception:
+                code_value = None
+            if code_value:
+                source = backend.name
+        if not code_value:
+            prompt = get_code_prompt_callback()
+            if prompt is None or not can_prompt_here():
+                return json.dumps({"success": False, "error_type": "prompt_unavailable",
+                                   "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
+                                             "Save an authenticator key for this login so codes can be generated automatically, or "
+                                             "obtain the code through Hermes' own mail workflow and pass it as the code argument with "
+                                             "expected_origin set to the page's origin.")})
+            code_value = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
+            if not code_value:
+                return json.dumps({"success": False, "error_type": "code_declined",
+                                   "error": "The user did not enter a code. Do not ask again this turn."})
 
-    register_vault_redaction_value(code)
-    fills = build_otp_fills(otp_controls, code)
+    register_vault_redaction_value(code_value)
+    fills = build_otp_fills(otp_controls, code_value)
     result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
-    del code
+    del code_value
     if not result.get("success"):
         return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
     parsed = _parse_json_result(result.get("result"))
@@ -647,18 +726,36 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
         "for the code in their UI (they read it from their phone, email or authenticator app). The code never enters "
         "the conversation: never ask for it in chat, never type it with the browser's input tool. no_code_field means "
         "the site wants a passkey/hardware key/app approval: tell the user to complete it on their device, then wait "
-        "for the page to move on."
+        "for the page to move on. When Hermes itself obtained a code through its own authorized mail workflow "
+        "(e.g. the site emailed a code and you read it with the mail tools), pass it as the code argument together "
+        "with expected_origin set to the page's origin — that dedicated mode fills it directly, no prompt needed "
+        "(works in unattended sessions). Never use the browser's input tool for a code, and never relay a code "
+        "through any other path."
     ),
     "parameters": {
         "type": "object",
-        "properties": {"handle": {"type": "string", "description": "The login handle you just filled (lets Hermes generate the code when an authenticator key is saved)."}},
+        "properties": {
+            "handle": {"type": "string", "description": "The login handle you just filled (lets Hermes generate the code when an authenticator key is saved)."},
+            "code": {"type": "string", "maxLength": 16,
+                     "description": "A one-time code Hermes obtained through its own authorized workflow (e.g. read from the user's mail). "
+                                    "Exactly as issued including any hyphens and leading zeros; surrounding whitespace is trimmed. Requires "
+                                    "expected_origin. Never ask the user for a code in chat to fill this — this mode is for codes you already "
+                                    "hold through a legitimate channel."},
+            "expected_origin": {"type": "string",
+                                "description": "Mandatory with code: the page's origin (scheme://host[:port]). The fill is refused unless it matches exactly."},
+        },
         "required": [],
     },
 }
 
 
 def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"))
+    return browser_vault_enter_code(
+        handle=str(args.get("handle") or ""),
+        task_id=kwargs.get("task_id"),
+        code=str(args.get("code") or ""),
+        expected_origin=str(args.get("expected_origin") or ""),
+    )
 
 
 def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
