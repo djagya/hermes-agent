@@ -37,6 +37,41 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# ── Live s6 gateway preflight ───────────────────────────────────────────────
+# Refuse before anything else (venv probing, env stripping, test discovery,
+# child processes, Docker interaction) when this host looks like a live
+# s6-supervised gateway container — running the suite there lets Docker
+# lifecycle tests signal the host's supervised services. One detection
+# implementation, shared with run_tests_parallel.py, lives in the guard
+# module; see it for the decision table and the isolated-execution opt-in.
+#
+# The guard is stdlib-only, so any system python can run it. We deliberately
+# resolve it BEFORE the pytest-capable venv probe below, so no pytest import
+# happens on a refused host. If no interpreter exists outside the repo venvs
+# the guard cannot evaluate; say so and continue (the venv probe below then
+# needs a pytest venv anyway).
+S6_GUARD="$SCRIPT_DIR/s6_preflight.py"
+S6_PYTHON=""
+for s6_candidate in python3 python; do
+  if command -v "$s6_candidate" >/dev/null 2>&1; then
+    S6_PYTHON="$s6_candidate"
+    break
+  fi
+done
+if [ -z "$S6_PYTHON" ] && [ -n "${HERMES_PYTHON:-}" ] \
+    && command -v "${HERMES_PYTHON}" >/dev/null 2>&1; then
+  S6_PYTHON="$HERMES_PYTHON"
+fi
+if [ -n "$S6_PYTHON" ]; then
+  s6_preflight_rc=0
+  "$S6_PYTHON" "$S6_GUARD" || s6_preflight_rc=$?
+  if [ "$s6_preflight_rc" -ne 0 ]; then
+    exit "$s6_preflight_rc"
+  fi
+else
+  echo "▶ s6 preflight: no system python found; guard not evaluated" >&2
+fi
+
 # ── Locate python ───────────────────────────────────────────────────────────
 # Probe local venvs first; fall back to the Nix devShell's editable venv
 # (HERMES_PYTHON is exported by the devShell hook and ships [dev] extras:
@@ -136,14 +171,21 @@ done
 #     subprocess rebuild the 5GB image from a cold builder cache instead
 #     (~4 min per worker per run, and the rebuilt image lacked the
 #     HERMES_GIT_SHA build-arg the workflow bakes in).
+#   * HERMES_TEST_ISOLATED + CI form the s6_preflight.py isolated-execution
+#     opt-in. The guard evaluates TWICE on this path — here in the outer
+#     shell, and again inside run_tests_parallel.py under the stripped
+#     `env -i` below. Forwarding only one half (or neither) makes the two
+#     evaluations disagree on a disposable s6 test container: the shell
+#     guard allows, then the inner guard re-refuses mid-handoff and the
+#     run dies with exit 78 despite a complete opt-in.
 #
 # These are test-infrastructure knobs, not credentials — same class as the
 # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER opt-ins already forwarded.
 # Keep this an explicit allowlist (no HERMES_TEST_* glob) so the "no
 # credential can leak" property stays auditable at a glance.
 TEST_ENV=()
-for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
-  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE; do
+for _test_var in HERMES_TEST_IMAGE HERMES_TEST_ISOLATED CI HERMES_TEST_WORKERS \
+  HERMES_TEST_PATHS HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi

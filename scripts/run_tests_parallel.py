@@ -56,6 +56,35 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 
+def _load_s6_guard():
+    """Load the shared guard module from this script's own directory.
+
+    The sibling ``s6_preflight.py`` holds the one detection implementation
+    (also executed directly by run_tests.sh). Loading by path keeps this
+    directly-invoked script independent of sys.path; the module must be
+    registered in ``sys.modules`` before ``exec_module`` because the
+    dataclass in the guard resolves its own module during class creation.
+    """
+    import importlib.util
+
+    guard_path = Path(__file__).resolve().parent / "s6_preflight.py"
+    spec = importlib.util.spec_from_file_location("s6_preflight", guard_path)
+    assert spec is not None and spec.loader is not None  # noqa: S101 — our own sibling
+    guard = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = guard
+    spec.loader.exec_module(guard)
+    return guard
+
+
+def _run_s6_preflight() -> None:
+    """Refuse (SystemExit 78) on a live s6 gateway host, before any work.
+
+    Runs before discovery, test-file enumeration or subprocess creation so a
+    live gateway container can never reach pytest import or a child process.
+    """
+    _load_s6_guard().preflight_or_die()
+
+
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
 
@@ -772,6 +801,7 @@ def _make_stdio_glyph_safe() -> None:
 
 
 def main() -> int:
+    _run_s6_preflight()
     _make_stdio_glyph_safe()
     parser = argparse.ArgumentParser(
         description=__doc__,
