@@ -76,22 +76,23 @@ def test_recovery_refusal_and_audit_failure_leave_database_unchanged(conn, monke
     tid = _escalated(conn)
     snapshot = recovery_snapshot(conn, tid)
     stale = case in {"spec", "config", "dependency", "blocker"}
-    with kb.write_txn(conn):
+    # A separate native connection can commit between operator review and recovery.
+    with kbc.connect_closing() as writer, kb.write_txn(writer):
         updates = {
             "spec": "body = 'changed'", "config": "priority = priority + 1",
             "claim": "claim_lock = 'owner'", "worker": "worker_pid = 123",
             "run-pointer": "current_run_id = 999", "human-hold": "block_kind = 'needs_input'",
         }
         if case in updates:
-            conn.execute(f"UPDATE tasks SET {updates[case]} WHERE id = ?", (tid,))
+            writer.execute(f"UPDATE tasks SET {updates[case]} WHERE id = ?", (tid,))
         if case == "dependency":
-            conn.execute("INSERT INTO task_links VALUES (?, ?)", ("missing-parent", tid))
+            writer.execute("INSERT INTO task_links VALUES (?, ?)", ("missing-parent", tid))
         if case in {"blocker", "human-event"}:
-            kb._append_event(conn, tid, "blocked", {"kind": "needs_input" if case == "human-event" else "capability"})
+            kb._append_event(writer, tid, "blocked", {"kind": "needs_input" if case == "human-event" else "capability"})
         if case == "missing-blocker":
-            conn.execute("DELETE FROM task_events WHERE task_id = ?", (tid,))
+            writer.execute("DELETE FROM task_events WHERE task_id = ?", (tid,))
         if case == "live-run":
-            conn.execute("UPDATE task_runs SET ended_at = NULL WHERE task_id = ?", (tid,))
+            writer.execute("UPDATE task_runs SET ended_at = NULL WHERE task_id = ?", (tid,))
     if not stale:
         snapshot = recovery_snapshot(conn, tid)
     args = _arguments(snapshot)
