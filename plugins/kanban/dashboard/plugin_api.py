@@ -495,6 +495,7 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    blocker_key: Optional[str] = None
     # Handoff fields forwarded to complete_task on -> 'done' (parity with ``hermes kanban complete``).
     summary: Optional[str] = None
     metadata: Optional[dict] = None
@@ -510,6 +511,7 @@ class UpdateTaskBody(BaseModel):
 
 class BulkTaskBody(BaseModel):
     ids: list[str]
+    blocker_key: Optional[str] = None
     status: Optional[str] = None
     assignee: Optional[str] = None  # "" or None = unassign
     priority: Optional[int] = None
@@ -550,7 +552,8 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
 # detection) with ``force=True``: a dashboard action is a human override of a live worker claim.
 _STATUS_HANDLERS: dict[str, Any] = {
     "done": lambda conn, tid, p: kanban_db.complete_task(conn, tid, result=p.result, summary=p.summary, metadata=p.metadata),
-    "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
+    "blocked": lambda conn, tid, p: kanban_db.block_task(
+        conn, tid, reason=getattr(p, "block_reason", None), blocker_key=getattr(p, "blocker_key", None)),
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),

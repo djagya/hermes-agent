@@ -622,6 +622,22 @@ def test_bulk_status_ready(client):
     assert {a["id"], b["id"], c2["id"]}.issubset(ids)
 
 
+@pytest.mark.parametrize("bulk", [False, True])
+def test_blocker_key_reaches_native_storage(client, bulk):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "Obstacle"}).json()["task"]
+    tid = task["id"]
+    payload = {"status": "blocked", "blocker_key": "source-packet-unreadable"}
+    if bulk:
+        response = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [tid], **payload})
+    else:
+        response = client.patch(f"/api/plugins/kanban/tasks/{tid}", json=payload)
+    assert response.status_code == 200
+    state = client.get(f"/api/plugins/kanban/tasks/{tid}").json()
+    assert state["task"]["blocker_key"] == payload["blocker_key"]
+    blocked = [event for event in state["events"] if event["kind"] == "blocked"]
+    assert blocked[-1]["payload"]["blocker_key"] == payload["blocker_key"]
+
+
 def test_bulk_review_assignment_preserves_implementer_provenance(client):
     tasks = [
         client.post(

@@ -812,6 +812,7 @@ _LATER_TASK_COLUMNS = (
     ("session_id", "session_id TEXT"),
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
+    ("blocker_key", "blocker_key TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
 )
 

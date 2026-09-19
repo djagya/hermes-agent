@@ -330,7 +330,7 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract last_failure_error block_kind blocker_key block_recurrences".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override".split())
@@ -641,9 +641,10 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
+        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+                           blocker_key=args.get("blocker_key"))
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
-        return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)
+        return _ok_landed(kb, conn, tid, "blocked", block_kind=kind, blocker_key=args.get("blocker_key"))
 
 
 @_kanban_handler("kanban_request_review")

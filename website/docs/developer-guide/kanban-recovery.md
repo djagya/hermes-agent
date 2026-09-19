@@ -67,3 +67,20 @@ Do not compose snapshot + `specify_triage_task`, use loose SQL, or manufacture
 historical provenance. The snapshot is conservative and may be large on tasks
 with long histories; operators should retain it only in appropriate private
 evidence storage. No live image or helper is modified by this change.
+
+## Stable blocker identity
+
+`kanban_db.block_task(..., blocker_key=...)`, `hermes kanban block --blocker-key`,
+the `kanban_block` tool, and dashboard PATCH/bulk block payloads accept the same
+optional nonblank key, at most 128 characters. Use a non-secret stable obstacle
+identifier such as `source-packet-unreadable`, not a reason sentence or broad
+category. Keys compare exactly (no trimming or case conversion). They are stored
+on the task and blocking event, exposed in task readback, and retained on unblock.
+Successful completion clears the key with the recurrence counter.
+
+For keyed calls recurrence requires both kind and key equality; a new key starts
+at one. An omitted key preserves historical kind-only counting, even after a
+keyed call, and stores null (no fabricated key for legacy callers). Dependency
+waits still bypass the breaker, and review changes do not touch cause accounting.
+Do not rotate a key to evade repeated-failure escalation. Before image deployment,
+live callers still use the old schema/accounting; no live upgrade is implied.

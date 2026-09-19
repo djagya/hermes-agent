@@ -185,6 +185,12 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "two sentences. Don't paste the whole conversation; the "
                 "human has the board and can ask follow-ups via comments."
         )),
+        "blocker_key": {
+            "type": "string", "minLength": 1, "maxLength": 128,
+            "description": "Stable, non-secret obstacle identity, not changing wording or broad category. "
+                           "Reuse for the same cause; a different key starts a new cause count. "
+                           "Omit for legacy kind-only accounting.",
+        },
         "kind": {
             "type": "string",
             "enum": ["dependency", "needs_input", "capability", "transient"],
