@@ -35,6 +35,8 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.tool_result_classification import NO_EFFECT_TOOL_NAMES
+
 logger = logging.getLogger(__name__)
 
 # --- Sentinel registry -----------------------------------------------------------------
@@ -222,13 +224,12 @@ def find_corrupted_payload(
 
 
 # Read-only tools: sentinel text in their arguments is DATA being queried, never state
-# being written (spec section C: do not globally ban a word). Mirrors
-# agent.tool_result_classification.NO_EFFECT_TOOL_NAMES plus the read/search pair.
-READ_ONLY_TOOL_NAMES = frozenset({
-    "read_file", "search_files", "session_search", "skill_view", "skills_list",
-    "web_extract", "web_search", "vision_analyze", "browser_snapshot",
-    "browser_get_images", "browser_console", "read_terminal", "tool_search",
-    "tool_describe", "kanban_show", "kanban_attachments", "kanban_list",
+# being written (spec section C: do not globally ban a word). Derived from the canonical
+# effect classification (agent.tool_result_classification — the same set the turn loop
+# uses for result-effect decisions) plus the read-only kanban/toolset surface, so future
+# changes to the canonical set cannot drift this guard stale.
+READ_ONLY_TOOL_NAMES = NO_EFFECT_TOOL_NAMES | frozenset({
+    "tool_search", "tool_describe", "kanban_show", "kanban_attachments", "kanban_list",
 })
 
 
@@ -245,13 +246,21 @@ def refusal_message(tool_name: str, finding: Dict[str, Any]) -> str:
     )
 
 
-def guard_effectful_payload(tool_name: str, function_args: Any) -> Optional[str]:
-    """One-call seam for dispatchers: ``tool_error``-shaped refusal JSON, or ``None``
-    when the call is clean. Read-only tools always pass (marker-in-query stays usable).
-    """
+def _classify_effectful_payload(tool_name: str, function_args: Any) -> Optional[Dict[str, Any]]:
+    """Shared refusal classification: read-only tools pass (marker-in-query stays
+    usable, spec section C), everything else goes through ``find_corrupted_payload``.
+    Both dispatch-time guards and the persist-before-execute boundary classify here so
+    the two seams can never disagree about a payload."""
     if tool_name in READ_ONLY_TOOL_NAMES:
         return None
-    finding = find_corrupted_payload(tool_name, function_args)
+    return find_corrupted_payload(tool_name, function_args)
+
+
+def guard_effectful_payload(tool_name: str, function_args: Any) -> Optional[str]:
+    """One-call seam for dispatchers: ``tool_error``-shaped refusal JSON, or ``None``
+    when the call is clean.
+    """
+    finding = _classify_effectful_payload(tool_name, function_args)
     if finding is None:
         return None
     logger.warning(
@@ -262,3 +271,47 @@ def guard_effectful_payload(tool_name: str, function_args: Any) -> Optional[str]
         [d.get("sentinels") for d in finding.get("diagnostics", []) if isinstance(d, dict)],
     )
     return refusal_message(tool_name, finding)
+
+
+def pending_call_corruption(tool_name: str, raw_arguments: Any) -> Optional[Dict[str, Any]]:
+    """Classification seam for the persist-before-execute invariant
+    (``agent.tool_payload_integrity``): classify a PENDING tool call exactly as the
+    dispatcher would, then apply the same refusal logic.
+
+    The dispatcher entry point (``model_tools.handle_function_call``) decodes the raw
+    provider ``arguments`` string via ``json.loads`` (empty/broken → ``{}``), then
+    canonicalizes legacy aliases, then coerces schema-typed args — and only then runs
+    ``guard_effectful_payload``. Mirroring that decode here is what guarantees the
+    boundary check can never disagree with the guard that actually enforces refusals:
+    read-only tools pass (a marker in a query field stays usable, spec section C),
+    free-form command/code fields refuse only the full long-head+sentinel corruption
+    fingerprint, and typed preview markers refuse anywhere.
+
+    Returns a typed, secret-safe diagnostic dict (the ``find_corrupted_payload``
+    finding) or ``None`` when the pending call is clean.
+    """
+    from tools.arg_coercion import coerce_tool_args
+    from model_tools import _LEGACY_TOOL_ALIASES
+
+    # Exact dispatcher decode order (model_tools.handle_function_call): coerce with the
+    # pre-alias name (a legacy alias has no registry schema, so coercion is a no-op
+    # there — mirrored, not "improved"), then canonicalize, then classify.
+    if isinstance(raw_arguments, str):
+        try:
+            decoded = json.loads(raw_arguments) if raw_arguments.strip() else {}
+        except ValueError:
+            decoded = {}
+        # Broken-JSON decode means the dispatcher would also hand the guard ``{}``;
+        # the registry's own invalid-JSON error covers that case independently.
+        if not isinstance(decoded, dict):
+            decoded = {}
+    else:
+        decoded = raw_arguments
+    try:
+        decoded = coerce_tool_args(tool_name, decoded)
+    except Exception:
+        # The boundary must never introduce a new crash path into the turn loop; an
+        # uncoerced payload classifies conservatively (originals kept).
+        pass
+    name = _LEGACY_TOOL_ALIASES.get(tool_name, tool_name)
+    return _classify_effectful_payload(name, decoded)

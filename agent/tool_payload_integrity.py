@@ -6,77 +6,43 @@ before execution. Compression and every other send-path rewrite operate on detac
 copies only; a divergence at this boundary means the durable transcript no longer
 matches what actually ran, so the turn stops before side effects.
 
+Ordering: the caller (``agent.turn_tool_round``) flushes the assistant row to the
+session DB BEFORE running this invariant, so a pending call that already carries preview
+corruption is durable here — kept as verbatim transcript, which is safe because replayed
+history is a typed opaque reference (spec section B) and can no longer teach the model a
+half-executable payload shape. This module refuses the EXECUTION of such a call; it does
+not rewrite the transcript row.
+
 The row-vs-handler comparison is keyed by tool-call id (the assistant row keeps every
 emitted call, including mixed-batch invalid ones that are never dispatched — positional
 indexing would misalign the two lists and stop turns spuriously). The handler leg
 re-reads ``tc.function.arguments`` off the same provider response object the call was
 parsed from, so any earlier in-place mutation of the pending response object surfaces
 here as a row/handler divergence.
+
+Corruption classification of pending calls is delegated to
+``tools.integrity_guard.pending_call_corruption`` — the same effect/field classification
+the dispatcher enforces (read-only tools stay usable for the literal ``...[truncated]``
+marker; command/code fields refuse only the long-head+sentinel fingerprint; typed
+preview markers refuse anywhere). One shared classification keeps this boundary and the
+dispatcher from ever disagreeing about a payload (spec section C).
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 from typing import Any, Dict, List, Optional
 
+from tools.integrity_guard import pending_call_corruption
+
 logger = logging.getLogger(__name__)
-
-# Free-form fields where only the full corruption fingerprint refuses (probe
-# compatibility with the sentinel literal inside commands/code). Mirrors
-# tools.integrity_guard._FINGERPRINT_ONLY_FIELDS; kept literal here so the invariant
-# does not import the dispatcher module.
-_FINGERPRINT_ONLY_FIELDS = {
-    "terminal": ("command",),
-    "execute_code": ("code",),
-}
-_CORRUPTION_MIN_HEAD = 80
-
-TRUNCATION_SENTINEL = "...[truncated]"
 
 
 def _args_digest(raw_arguments: Any) -> Optional[str]:
     if not isinstance(raw_arguments, str):
         return None
     return hashlib.sha256(raw_arguments.encode("utf-8", errors="replace")).hexdigest()
-
-
-def _looks_like_replayed_preview(function_name: str, value: str) -> bool:
-    """True when a fresh call embeds the compaction preview corruption fingerprint —
-    a long preview head immediately followed by the literal sentinel (the production
-    incident shape in tasks t_e7a190fc / t_d6569a19)."""
-    if function_name not in _FINGERPRINT_ONLY_FIELDS:
-        return TRUNCATION_SENTINEL in value
-    for leaf in _string_leaves(value):
-        idx = leaf.find(TRUNCATION_SENTINEL)
-        if idx >= _CORRUPTION_MIN_HEAD:
-            return True
-    return False
-
-
-def _string_leaves(value: str) -> List[str]:
-    """String leaves of a JSON-encoded arguments document (best effort)."""
-    try:
-        parsed = json.loads(value)
-    except (ValueError, TypeError):
-        return [value]
-    out: List[str] = []
-
-    def _walk(obj: Any, depth: int = 0) -> None:
-        if depth > 24:
-            return
-        if isinstance(obj, str):
-            out.append(obj)
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                _walk(v, depth + 1)
-        elif isinstance(obj, (list, tuple)):
-            for v in obj:
-                _walk(v, depth + 1)
-
-    _walk(parsed)
-    return out
 
 
 def verify_persist_before_execute(
@@ -96,12 +62,15 @@ def verify_persist_before_execute(
     - ``assistant_row_vs_handler``: for every DISPATCHED call, the row's arguments for
       the same tool-call id must be byte-identical (SHA-256) to what the handler is
       about to receive. This is the persisted-vs-executed leg of the spec invariant.
-    - ``pending_call_preview_corruption``: a pending call already carrying the compaction
-      preview fingerprint would be persisted verbatim and replayed forever; refuse it
-      before the store ever sees the corrupted form.
+    - ``pending_call_preview_corruption``: a pending call classified corrupt by the
+      dispatcher's own refusal logic (``tools.integrity_guard``) would run tools from a
+      compaction preview if dispatch proceeded; stop the turn here instead. The
+      corrupted call is already persisted as transcript at this point (the flush
+      precedes this check) — that is safe, not a gap: history is now a typed opaque
+      reference, so the row can never be replayed as a half-executable payload.
 
     Returns ``None`` when the envelope is intact. Otherwise a typed diagnostic —
-    tool-call ids and digests only, never payload content — for a
+    tool-call ids, digests, field paths; never payload content — for a
     ``session_persistence_failed``-style turn stop.
     """
     mismatches: List[Dict[str, Any]] = []
@@ -126,13 +95,18 @@ def verify_persist_before_execute(
                 "row_sha256": _args_digest(row_args),
                 "handler_sha256": digest,
             })
-        if digest is not None and _looks_like_replayed_preview(name, raw):
-            mismatches.append({
-                "boundary": "pending_call_preview_corruption",
-                "call_id": call_id,
-                "tool": name,
-                "sentinel": TRUNCATION_SENTINEL,
-            })
+        if digest is not None:
+            finding = pending_call_corruption(name, raw)
+            if finding is not None:
+                mismatches.append({
+                    "boundary": "pending_call_preview_corruption",
+                    "call_id": call_id,
+                    "tool": name,
+                    "reason": finding.get("reason"),
+                    "field": finding.get("field"),
+                    "length": finding.get("length"),
+                    "sha256": finding.get("sha256"),
+                })
     if not mismatches:
         return None
     return {"error": "tool_payload_integrity", "mismatches": mismatches}

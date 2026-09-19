@@ -76,6 +76,19 @@ class TestHistoricalCompactionIsOpaque:
         broken = '{"content": "cut'
         assert _truncate_tool_call_args_json(broken) == broken
 
+    def test_write_file_history_becomes_reference_without_copyable_prefix(self):
+        # Live-reproducer acceptance (2026-09-19): a compacted write_file document must
+        # carry NO executable prefix of the original content — nothing copyable remains,
+        # only the typed reference.
+        content = "intended PR body " * 400
+        original = json.dumps({"path": "/tmp/pr.md", "content": content})
+        sent = _truncate_tool_call_args_json(original, tool_name="write_file")
+        ref = json.loads(sent)
+        assert ref["kind"] == COMPACTED_ARGS_KIND and ref["non_executable"] is True
+        assert ref["tool"] == "write_file" and ref["original_length"] == len(original)
+        assert "PR body" not in sent and TRUNCATION_PREVIEW_SENTINEL not in sent
+        assert original == json.dumps({"path": "/tmp/pr.md", "content": content})
+
     def test_prune_pass_leaves_persisted_history_byte_exact(self):
         with patch("agent.context_compressor.get_model_context_length",
                    return_value=100000):
@@ -180,6 +193,19 @@ class TestEffectfulRefusal:
         assert guard_effectful_payload(
             "kanban_create", {"title": "t", "assignee": "w", "body": "x" * 50_000}) is None
 
+    def test_live_reproducer_write_file_refused_before_side_effect(self, tmp_path):
+        # Live reproducer (2026-09-19, PR #31 prep): a long write_file call carried the
+        # compressor preview in its content and a real 211-byte file landed. Acceptance:
+        # a fresh effectful write carrying preview corruption fails TYPED, before any
+        # side effect — the target file must never exist.
+        target = tmp_path / "should-never-exist.md"
+        corrupted = {"path": str(target), "content":
+                     "head " * 60 + TRUNCATION_PREVIEW_SENTINEL}
+        from model_tools import handle_function_call
+        result = handle_function_call("write_file", dict(corrupted))
+        assert "compacted_payload_refused" in result
+        assert not target.exists()
+
     def test_nested_bridge_and_batch_entries_classified(self):
         corrupted = {"title": "t", "assignee": "w",
                      "body": "head " * 60 + TRUNCATION_PREVIEW_SENTINEL}
@@ -203,6 +229,18 @@ class TestEffectfulRefusal:
         assert len(finding["sha256"]) == 64
         blob = json.dumps(finding)
         assert "«redacted:sk-…»" not in blob
+
+    def test_read_only_classification_derived_from_canonical_set(self):
+        # Contract between the guard and the canonical effect classification (spec §C,
+        # round-1 review finding 2): the guard's read-only set CONTAINS the canonical
+        # no-effect set and adds only the kanban/toolset read surface — it never runs a
+        # parallel copy that can drift stale.
+        from agent.tool_result_classification import NO_EFFECT_TOOL_NAMES
+        from tools.integrity_guard import READ_ONLY_TOOL_NAMES
+        assert NO_EFFECT_TOOL_NAMES <= READ_ONLY_TOOL_NAMES
+        extras = READ_ONLY_TOOL_NAMES - NO_EFFECT_TOOL_NAMES
+        assert extras == {"tool_search", "tool_describe", "kanban_show",
+                          "kanban_attachments", "kanban_list"}
 
 
 # ── Invariant 3: persist-before-execute byte-exactness (per tool-call id) ───────────
@@ -256,6 +294,93 @@ class TestPersistBeforeExecuteInvariant:
         assert failure is not None
         assert any(m["boundary"] == "pending_call_preview_corruption"
                    for m in failure["mismatches"])
+
+    # The corruption leg shares the dispatcher's effect/field classification
+    # (tools.integrity_guard) — spec section C: read-only tools stay usable for the
+    # literal marker; no global word ban (round-1 review finding 1).
+
+    def test_read_only_marker_query_passes_the_boundary(self):
+        failure = verify_persist_before_execute(
+            self._row(),
+            parsed_calls=[{"id": "c9", "name": "search_files",
+                           "arguments": json.dumps({"pattern": TRUNCATION_PREVIEW_SENTINEL})}])
+        assert failure is None
+
+    def test_web_search_marker_query_passes_the_boundary(self):
+        failure = verify_persist_before_execute(
+            self._row(),
+            parsed_calls=[{"id": "c9", "name": "web_search",
+                           "arguments": json.dumps({"query": TRUNCATION_PREVIEW_SENTINEL})}])
+        assert failure is None
+
+    def test_short_literal_in_command_passes_the_boundary(self):
+        failure = verify_persist_before_execute(
+            self._row(),
+            parsed_calls=[{"id": "c1", "name": "terminal",
+                           "arguments": json.dumps(
+                               {"command": f"grep -r '{TRUNCATION_PREVIEW_SENTINEL}' logs/"})}])
+        assert failure is None
+
+    @pytest.mark.parametrize("name,args", [
+        ("kanban_create", {"title": "t", "assignee": "w",
+                           "body": "head " * 60 + TRUNCATION_PREVIEW_SENTINEL}),
+        ("kanban_comment", {"task_id": "t",
+                            "body": "head " * 60 + TRUNCATION_PREVIEW_SENTINEL}),
+        ("write_file", {"path": "/tmp/x",
+                        "content": "head " * 60 + TRUNCATION_PREVIEW_SENTINEL}),
+        # Legacy alias must classify too: the dispatcher canonicalizes before guarding.
+        ("cronjob", {"action": "create", "schedule": "in 10m",
+                     "prompt": "head " * 60 + TRUNCATION_PREVIEW_SENTINEL}),
+    ])
+    def test_state_bearing_pending_calls_refused_at_boundary(self, name, args):
+        failure = verify_persist_before_execute(
+            self._row(),
+            parsed_calls=[{"id": "c1", "name": name, "arguments": json.dumps(args)}])
+        assert failure is not None
+        m = failure["mismatches"][0]
+        assert m["boundary"] == "pending_call_preview_corruption"
+        assert m["reason"] == "truncation_sentinel"
+        assert "head " not in json.dumps(m)  # diagnostic stays secret-safe
+
+    def test_fingerprint_only_pending_code_refused(self):
+        bad = "x = '" + "head " * 60 + TRUNCATION_PREVIEW_SENTINEL + "'"
+        failure = verify_persist_before_execute(
+            self._row(),
+            parsed_calls=[{"id": "c1", "name": "execute_code",
+                           "arguments": json.dumps({"code": bad})}])
+        assert failure is not None
+
+    def test_typed_reference_pending_call_refused(self):
+        ref = {"kind": COMPACTED_ARGS_KIND, "tool": "kanban_create",
+               "sha256": "0" * 64, "non_executable": True}
+        failure = verify_persist_before_execute(
+            self._row(),
+            parsed_calls=[{"id": "c1", "name": "kanban_create",
+                           "arguments": json.dumps(ref)}])
+        assert failure is not None
+        assert failure["mismatches"][0]["reason"] == "compacted_tool_arguments_reference"
+
+    @pytest.mark.parametrize("name,args", [
+        ("kanban_create", {"title": "t", "assignee": "w",
+                           "body": "head " * 60 + TRUNCATION_PREVIEW_SENTINEL}),
+        ("cronjob", {"action": "create",
+                     "prompt": "head " * 60 + TRUNCATION_PREVIEW_SENTINEL}),
+        ("terminal", {"command": "cat > out.md <<'EOF'\n" + "head " * 60
+                      + TRUNCATION_PREVIEW_SENTINEL + "\nEOF"}),
+        ("search_files", {"pattern": TRUNCATION_PREVIEW_SENTINEL}),
+    ])
+    def test_boundary_never_disagrees_with_dispatcher(self, name, args):
+        # Same payload at both seams: refused at dispatch  <=>  flagged at the boundary.
+        from model_tools import handle_function_call
+        refusal = handle_function_call(name, json.loads(json.dumps(args)))
+        failure = verify_persist_before_execute(
+            self._row(),
+            parsed_calls=[{"id": "c1", "name": name, "arguments": json.dumps(args)}])
+        refused_at_dispatch = "compacted_payload_refused" in refusal
+        flagged_at_boundary = failure is not None and any(
+            m["boundary"] == "pending_call_preview_corruption"
+            for m in failure["mismatches"])
+        assert refused_at_dispatch == flagged_at_boundary
 
 
 # ── Durable-source handoff contract (spec section E) ─────────────────────────────────
