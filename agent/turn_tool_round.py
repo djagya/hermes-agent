@@ -104,6 +104,11 @@ def run_tool_round(
         tc for tc in assistant_message.tool_calls if tc.function.name not in agent.valid_tool_names
     ] if _tvv.mixed_invalid_batch else []
 
+    # A supplied one-time code must be registered for redaction before the flush below
+    # writes this tool-call row; dispatch-time registration would come too late.
+    from agent.tool_executor import register_supplied_otps
+    register_supplied_otps(assistant_message.tool_calls)
+
     assistant_msg, duplicate_previous_interim = stage_tool_call_message(
         agent, assistant_message=assistant_message, finish_reason=finish_reason, messages=messages
     )

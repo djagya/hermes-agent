@@ -683,6 +683,57 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
         return None, ref.args
 
 
+_SUPPLIED_OTP_TOOL = "browser_vault_enter_code"
+_OTP_TOOL_ARG_NAMES = ("code", "otp", "one_time_code", "one_time_password")
+
+
+def _register_supplied_otp_for_redaction(function_name: str, function_args: dict) -> None:
+    """Register an explicitly supplied one-time code with the redaction boundary.
+
+    ``browser_vault_enter_code(code=...)`` carries a live OTP in its tool arguments; the handler
+    registers the value only once it starts, but by then the arguments were already captured by the
+    assistant's tool_calls row, request dumps and plugin-hook copies. Registering earlier means every
+    surface that scrubs registered vault values (session DB tool_calls projection, request dumps, log
+    formatter) replaces the exact bytes. Runs at the dispatch chokepoint (before pre_tool_call hooks) and,
+    earlier, from :func:`register_supplied_otps` before the turn's tool-call row is persisted.
+    The model itself still saw the code when it emitted the call (it read it from the mail tool); this
+    closes the persistence surfaces, not the model context, as the tool description says.
+    """
+    if function_name != _SUPPLIED_OTP_TOOL or not isinstance(function_args, dict):
+        return
+    from agent.redact import register_vault_redaction_value
+
+    for name in _OTP_TOOL_ARG_NAMES:
+        value = function_args.get(name)
+        if isinstance(value, str) and value:
+            register_vault_redaction_value(value)
+
+
+def register_supplied_otps(tool_calls) -> None:
+    """Register the supplied one-time codes of a new assistant turn BEFORE its tool-call row is persisted.
+
+    ``run_tool_round`` writes that row before any tool runs (persist-before-execute), so registering only
+    at dispatch would let that first flush store the live code. Structural only, no scope or schema probe:
+    a call that never dispatches is persisted all the same. ``tool_call`` bridge entries are unwrapped the
+    way the dispatcher unwraps them."""
+    from tools.tool_search_catalog import TOOL_CALL_NAME
+    from tools.tool_search_validation import normalize_tool_call_entries
+
+    for tool_call in tool_calls or ():
+        function = getattr(tool_call, "function", None)
+        name = _canonical_tool_name(str(getattr(function, "name", "") or ""))
+        raw_arguments = getattr(function, "arguments", None)
+        bridged = name == TOOL_CALL_NAME and isinstance(raw_arguments, str) and _SUPPLIED_OTP_TOOL in raw_arguments
+        if name != _SUPPLIED_OTP_TOOL and not bridged:
+            continue
+        args, parse_error = _parse_tool_arguments(raw_arguments)
+        if parse_error is not None:
+            continue
+        entries = normalize_tool_call_entries(args)[0] if bridged else [{"name": name, "arguments": args}]
+        for entry in entries:
+            _register_supplied_otp_for_redaction(entry["name"], entry["arguments"])
+
+
 def _dispatch_authorized_once(
     agent,
     state: _ManagedToolResult,
@@ -705,6 +756,8 @@ def _dispatch_authorized_once(
             begin_execution(callback)
         elif callback is not None:
             callback()
+
+    _register_supplied_otp_for_redaction(function_name=ref.name, function_args=ref.args)
 
     block_message, block_error_type = scope_block, "tool_scope_block"
     if block_message is None:
