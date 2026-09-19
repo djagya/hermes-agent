@@ -146,6 +146,19 @@ def _reject_delegated_child_mutation(tool_name: str) -> None:
             "configured Kanban orchestrator must perform board mutations.")
 
 
+def _refuse_preview_corrupted_payload(tool_name: str, function_args: Any) -> None:
+    """Defense-in-depth gate for state-bearing fields: refuse context-compaction
+    preview corruption before it is persisted as durable state. The generic dispatcher
+    guard (tools/integrity_guard.py) runs first; this catches direct handler calls and
+    future dispatch seams. Field selection follows the guard's schema-grounded
+    per-tool table; typed refusal, zero side effects."""
+    from tools.integrity_guard import find_corrupted_payload, refusal_message
+    finding = find_corrupted_payload(
+        tool_name, function_args if isinstance(function_args, dict) else {})
+    if finding is not None:
+        raise _Reject(refusal_message(tool_name, finding))
+
+
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
     """``task_id`` arg or the dispatcher's env var. A delegate child or an
     in-process cron job must never inherit the worker's task id implicitly."""
@@ -730,6 +743,9 @@ def _handle_comment(args: dict, **kw) -> str:
     _check(tid, "task_id is required (use the current task id if that's what "
                 "you mean — pulls from env but kept explicit here)")
     body = _redact(_require_text(args, "body"))
+    # Defense in depth (generic guard lives in tools/integrity_guard.py): a comment
+    # body is durable handoff evidence; refuse preview-corrupted bodies here too.
+    _refuse_preview_corrupted_payload("kanban_comment", args)
     # Author comes from the worker's runtime identity, never caller args: comments are
     # injected into future workers' system prompts, so an args["author"] override could
     # forge a directive from ``hermes-system``. Cross-task commenting stays unrestricted —
@@ -852,6 +868,9 @@ def _handle_create(args: dict, **kw) -> str:
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
                      "task (the dispatcher will only spawn tasks with an assignee)")
+    # Defense in depth (generic guard lives in tools/integrity_guard.py): the body is
+    # the durable execution contract, so refuse preview-corrupted bodies here too.
+    _refuse_preview_corrupted_payload("kanban_create", args)
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
     # mutate review evidence or race its checkout). Project identity is the one safe thing

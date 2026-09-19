@@ -874,8 +874,17 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
-    trace = list(tool_request_middleware_trace or [])
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
+    # Preview-corruption guard: a fresh state-bearing payload carrying a compaction
+    # sentinel (e.g. `...[truncated]` copied from replayed history) is refused BEFORE
+    # any handler, hook, or side effect. Runs after alias canonicalization so field
+    # classification matches the canonical tool's schema. Read-only tools stay usable
+    # for the literal text. See tools/integrity_guard.py.
+    from tools.integrity_guard import guard_effectful_payload
+    _integrity_refusal = guard_effectful_payload(function_name, function_args)
+    if _integrity_refusal is not None:
+        return tool_error(_integrity_refusal, error_type="compacted_payload_refused")
+    trace = list(tool_request_middleware_trace or [])
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
     start = time.monotonic()
 

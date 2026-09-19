@@ -2293,21 +2293,28 @@ class TestThresholdTokensCap:
 
 
 class TestTruncateToolCallArgsJson:
-    """Regression tests for #11762.
+    """Regression tests for #11762 and the truncation-integrity fix.
 
-    The previous implementation produced invalid JSON by slicing
-    ``function.arguments`` mid-string, which caused non-retryable 400s from
-    strict providers (observed on MiniMax) and stuck long sessions in a
-    re-send loop. The helper here must always emit parseable JSON whose
-    shape matches the original — shrunken, not corrupted.
+    The original #11762 bug produced invalid JSON by slicing
+    ``function.arguments`` mid-string, causing non-retryable 400s from
+    strict providers (observed on MiniMax). The helper must always emit
+    parseable JSON. The SECOND bug (production: tasks t_e7a190fc /
+    t_d6569a19) was the shrunken shape itself: a 200-char head plus a
+    literal ``...[truncated]`` inside otherwise executable JSON was
+    copied by a model into a FRESH ``kanban_create`` call and faithfully
+    persisted. Large historical argument documents therefore become a
+    typed opaque reference (``hermes_compacted_tool_arguments``) carrying
+    tool name, original length, SHA-256 and a non-executable marker —
+    never a partial replay of the payload.
     """
 
     def _helper(self):
         from agent.context_compressor import _truncate_tool_call_args_json
         return _truncate_tool_call_args_json
 
-    def test_shrunken_args_remain_valid_json(self):
+    def test_large_args_become_typed_opaque_reference(self):
         import json as _json
+        import hashlib as _hashlib
         shrink = self._helper()
         original = _json.dumps({
             "path": "~/.hermes/skills/shopping/browser-setup-notes.md",
@@ -2316,14 +2323,38 @@ class TestTruncateToolCallArgsJson:
         assert len(original) > 500
         shrunk = shrink(original)
         parsed = _json.loads(shrunk)  # must not raise
-        assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        assert parsed["kind"] == "hermes_compacted_tool_arguments"
+        assert parsed["non_executable"] is True
+        assert parsed["original_length"] == len(original)
+        assert parsed["sha256"] == _hashlib.sha256(original.encode()).hexdigest()
+        assert "durable session history" in parsed["instruction"]
+        # The corruption vector is gone: no partial payload, no sentinel.
+        assert "...[truncated]" not in shrunk
+        assert "Shopping" not in shrunk
         assert len(shrunk) < len(original)
 
+    def test_idempotent_on_references(self):
+        import json as _json
+        shrink = self._helper()
+        original = _json.dumps({"content": "z" * 2000})
+        reference = shrink(original)
+        assert shrink(reference) == reference
+        parsed = _json.loads(reference)
+        # original_length stays the ORIGINAL document's length, not the reference's.
+        assert parsed["original_length"] == len(original)
 
+    def test_small_and_unparseable_args_untouched(self):
+        import json as _json
+        shrink = self._helper()
+        small = _json.dumps({"path": "a.txt", "content": "short"})
+        assert shrink(small) == small
+        unparseable = '{"content": "cut'
+        assert shrink(unparseable) == unparseable
 
-
-    def test_non_string_leaves_preserved(self):
+    def test_document_becomes_one_reference_with_digest(self):
+        """Numbers/bools/null/lists inside a compacted document are not preserved
+        field-by-field anymore — the whole document becomes one reference whose
+        sha256 covers the original bytes (length-gated: small docs untouched)."""
         import json as _json
         shrink = self._helper()
         payload = _json.dumps({
@@ -2333,18 +2364,17 @@ class TestTruncateToolCallArgsJson:
             "items": [1, 2, 3],
             "note": "z" * 500,
         })
-        parsed = _json.loads(shrink(payload))
-        assert parsed["retries"] == 3
-        assert parsed["enabled"] is True
-        assert parsed["timeout"] is None
-        assert parsed["items"] == [1, 2, 3]
-        assert parsed["note"].endswith("...[truncated]")
+        ref = _json.loads(shrink(payload))
+        assert ref["kind"] == "hermes_compacted_tool_arguments"
+        assert ref["original_length"] == len(payload)
+        # The small-document floor still applies to genuinely tiny args.
+        small = _json.dumps({"retries": 3})
+        assert shrink(small) == small
 
-
-
-    def test_pass3_emits_valid_json_for_downstream_provider(self):
-        """End-to-end: Pass 3 must never produce the exact failure payload
-        that caused the 400 loop (unterminated string, missing brace)."""
+    def test_pass3_emits_typed_reference_downstream(self):
+        """End-to-end: Pass 3 replaces an oversized historical document with
+        the typed reference — valid JSON for providers, unmistakably
+        non-executable for the model; persisted history untouched."""
         import json as _json
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(
@@ -2375,8 +2405,11 @@ class TestTruncateToolCallArgsJson:
         shrunk = result[1]["tool_calls"][0]["function"]["arguments"]
         # Must parse — otherwise downstream provider returns 400
         parsed = _json.loads(shrunk)
-        assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        assert parsed["kind"] == "hermes_compacted_tool_arguments"
+        assert parsed["tool"] == "write_file"
+        assert "...[truncated]" not in shrunk
+        # Send-path only: the input history list keeps the original bytes.
+        assert messages[1]["tool_calls"][0]["function"]["arguments"] == args_payload
 
 
 class TestLazyContextResolution:

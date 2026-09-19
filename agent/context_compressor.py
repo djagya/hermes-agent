@@ -1263,25 +1263,66 @@ def evict_stale_outbound_tool_images(
     return _retire_stale_tool_result_images(api_messages, keep_newest=keep_newest)
 
 
-def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
-    """Shrink long string leaves in a tool-call arguments JSON blob, keeping it valid (providers 400 on malformed args)."""
+_COMPACTED_ARGS_KIND = "hermes_compacted_tool_arguments"
+
+# Size gate shared by both compaction call sites: only oversized argument documents
+# are replaced (matches the historical >500 gate at the call sites).
+_COMPACT_ARGS_MIN_CHARS = 500
+
+
+def _is_large_arguments(args: str) -> bool:
+    return isinstance(args, str) and len(args) > _COMPACT_ARGS_MIN_CHARS
+
+
+def _reference_tool_name(value: str) -> str:
+    """Original tool name from a compacted-arguments JSON reference, else ``""``."""
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return ""
+    return parsed.get("tool", "") if isinstance(parsed, dict) else ""
+
+
+def _truncate_tool_call_args_json(args: str, head_chars: int = 200, tool_name: str = "") -> str:
+    """Replace a large historical tool-call arguments document with a typed opaque reference.
+
+    The previous shape (200-char heads + a literal ``...[truncated]`` inside otherwise
+    executable JSON) let a model copy the preview into a FRESH effectful call, which was
+    then faithfully executed and persisted (tasks t_e7a190fc / t_d6569a19). The whole
+    document is therefore replaced by a non-executable reference carrying the original
+    tool name, byte length, SHA-256, and an explicit instruction: canonical arguments
+    live only in durable session history — never reconstruct them from this preview.
+    Unparseable args and small documents are returned unchanged (the repair path owns
+    malformed JSON; only oversized documents are compacted — callers gate on length).
+
+    ``head_chars`` is retained for call-site compatibility and is no longer a content
+    preview: replaying a partial payload as if it were whole is the bug class. Send-path
+    only; the persisted session row keeps the original bytes, and dispatch refuses fresh
+    state-bearing payloads referencing this shape (tools/integrity_guard.py).
+    """
     try:
         parsed = json.loads(args)
     except (ValueError, TypeError):
         return args
-
-    def _shrink(obj: Any) -> Any:
-        if isinstance(obj, str):
-            return obj[:head_chars] + "...[truncated]" if len(obj) > head_chars else obj
-        if isinstance(obj, dict):
-            return {k: _shrink(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_shrink(v) for v in obj]
-        return obj
-
-    shrunken = _shrink(parsed)
-    # ensure_ascii=False keeps CJK/emoji from bloating into \uXXXX
-    return json.dumps(shrunken, ensure_ascii=False)
+    if isinstance(parsed, dict) and parsed.get("kind") == _COMPACTED_ARGS_KIND:
+        return args  # already a reference
+    if not _is_large_arguments(args):
+        return args
+    reference = {
+        "kind": _COMPACTED_ARGS_KIND,
+        "tool": tool_name or _reference_tool_name(args),
+        "original_length": len(args),
+        "sha256": hashlib.sha256(args.encode("utf-8", errors="replace")).hexdigest(),
+        "non_executable": True,
+        "instruction": (
+            "Opaque compaction reference: the original tool arguments were elided to "
+            "save context and are available only in durable session history. Do not "
+            "reconstruct, guess, or re-emit them from this preview; recover canonical "
+            "content from the durable source and verify its SHA-256 before any "
+            "state-changing re-use."
+        ),
+    }
+    return json.dumps(reference, ensure_ascii=False)
 
 
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
@@ -2663,8 +2704,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             return False
         new_tcs = []
         for tc in msg["tool_calls"]:
-            args = tc.get("function", {}).get("arguments", "") if isinstance(tc, dict) else ""
-            new_args = _truncate_tool_call_args_json(args) if len(args) > 500 else args
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            args = fn.get("arguments", "")
+            new_args = _truncate_tool_call_args_json(args, tool_name=fn.get("name", "")) if _is_large_arguments(args) else args
             new_tcs.append(tc if new_args == args else {**tc, "function": {**tc["function"], "arguments": new_args}})
         modified = any(new is not old for new, old in zip(new_tcs, msg["tool_calls"]))
         if modified:

@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.tool_payload_integrity import verify_persist_before_execute
 from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
 
@@ -127,6 +128,28 @@ def run_tool_round(
             agent.session_id or "none",
             exc,
         )
+
+    # Persist-before-execute integrity invariant: the arguments about to be handed to
+    # the dispatcher must be byte-exact with the assistant row just persisted. A
+    # mismatch means the durable transcript no longer matches what would run; stop the
+    # turn before side effects (truncation-integrity spec, section A). Comparison is
+    # keyed by tool-call id, not position: the row keeps every emitted call (mixed
+    # batches keep invalid ones too) while only valid calls dispatch.
+    _pending_calls = [
+        {"id": coalesce_tool_call_id(tc), "name": tc.function.name, "arguments": tc.function.arguments}
+        for tc in assistant_message.tool_calls
+    ]
+    _integrity_failure = verify_persist_before_execute(assistant_msg, parsed_calls=_pending_calls)
+    if _integrity_failure is not None:
+        logger.warning(
+            "Tool-call payload integrity mismatch before execution (session=%s): %s",
+            agent.session_id or "none",
+            _integrity_failure,
+        )
+        _turn_exit_reason = "tool_payload_integrity"
+        final_response = ""
+        failed = True
+        return _verdict("break")
 
     if _tool_turn_persisted is False:
         # Canonical append failed: never project the row or run tools from process-only
