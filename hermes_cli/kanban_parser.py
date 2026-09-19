@@ -292,6 +292,8 @@ _SPECS = [
     ], help="Edit recovery fields on an already-completed task"),
     _cmd("block", [
         _TASK_ID,
+        _arg("--blocker-key", help="Stable obstacle identity (1-128 characters, no secrets). "
+             "Same kind+key counts as recurrence; omit for legacy kind-only accounting."),
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
