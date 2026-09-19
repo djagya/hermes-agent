@@ -167,6 +167,77 @@ def test_deny_projection_preserves_data_and_path_rules(deny_config):
         assert _split_env_string(unresolved) is None
 
 
+def test_anchored_executable_policy_distinguishes_execution_from_data(
+        deny_config, clean_env):
+    """A keyword-policy migration must fix prose without losing executable denial.
+
+    Only classify synthetic strings: none of these commands is executed.
+    The legacy assertion is the reproduction, not a change to glob semantics.
+    """
+    literal_commands = (
+        'git commit -m "document op policy handling"',
+        "git commit -m 'document op policy\nop item list is example text'",
+        "grep -F 'use op item list' README.md",
+        "printf '%s' 'example $(op item list); op item list'",
+        "command -v op",
+        "env -u op printf safe",
+        "exec -a op printf safe",
+    )
+    deny_config(["op *", "* op *"])
+    for guard in (mod.check_dangerous_command, mod.check_all_command_guards):
+        result = guard(literal_commands[0], "local")
+        assert result.get("user_deny") is True, result
+        assert result["approved"] is False
+
+    deny_config(["op", "op *"])
+    for command in literal_commands:
+        assert approval_floors._match_user_deny_rule(command) is None, command
+        for guard in (mod.check_dangerous_command, mod.check_all_command_guards):
+            result = guard(command, "local")
+            assert result["approved"] is True, (command, result)
+
+    for command in (
+        "op", "op item list", "/usr/local/bin/op", "./op item list",
+        "op\titem list", '"/usr/local/bin/o"p item list',
+        r"o\p item list", "o''p item list", "$(printf op) item list",
+        "FOO=synthetic /usr/local/bin/op item list",
+        "env -i FOO=synthetic /usr/local/bin/op item list",
+        "command -p op item list", "exec -a label op item list",
+        "nohup op item list", "timeout 5 op item list",
+        "nice -n 5 op item list", "setsid op item list",
+        "true && op item list", "true; op", "printf safe | op item list",
+        "(op item list)", "if true; then op item list; fi",
+        'printf "%s" "$(op item list)"', 'printf "%s" "`op item list`"',
+        "sh -c 'op item list'", "bash -lc 'env op item list'",
+        "env -S 'op item list'", "env -S op item list",
+    ):
+        for guard in (mod.check_dangerous_command, mod.check_all_command_guards):
+            result = guard(command, "local")
+            assert result.get("user_deny") is True, (command, result)
+            assert result["approved"] is False
+
+
+@pytest.mark.parametrize("command", (
+    "eval 'op item list'",
+    "env -S '${SYNTHETIC_EXEC} op item list'",
+))
+@pytest.mark.parametrize("guard", (mod.check_dangerous_command, mod.check_all_command_guards))
+def test_anchored_policy_must_not_autoapprove_unresolved_execution(
+        command, guard, deny_config, clean_env):
+    """Migration acceptance gate: losing a text match is not evidence of safety.
+
+    These inputs intentionally exercise the unattended profile configuration.
+    No subprocess or credential executable is invoked by this test.
+    """
+    deny_config(["op *", "* op *"], mode="smart", single_query_mode="approve")
+    legacy = guard(command, "local")
+    assert legacy.get("user_deny") is True, (command, legacy)
+    assert legacy["approved"] is False
+    deny_config(["op", "op *"], mode="smart", single_query_mode="approve")
+    result = guard(command, "local")
+    assert result["approved"] is False, (command, result)
+
+
 class TestDenyBeatsYolo:
     def test_deny_blocks_under_yolo_env(self, deny_config, clean_env, monkeypatch):
         deny_config(["git push --force*"])
