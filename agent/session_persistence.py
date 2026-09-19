@@ -102,6 +102,34 @@ def _summary_display_kind(msg: Dict) -> Any:
     return msg.get("display_kind")
 
 
+def _durable_tool_calls(tool_calls: Any) -> Any:
+    """Persisted projection of an assistant's tool_calls: vault-registered
+    values (a supplied one-time code among them) are scrubbed before the row
+    is built. ``redact_sensitive_text`` runs the exact-value vault scrub first
+    (force-independent), so an OTP passed to browser_vault_enter_code lands in
+    the transcript as the redaction sentinel, not as live credential bytes.
+    Tool-call structure is preserved for replay: only the offending substring
+    inside each serialized ``arguments`` string is replaced."""
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return tool_calls
+    try:
+        from agent.redact import redact_sensitive_text
+    except Exception:
+        return tool_calls
+    out = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            out.append(tc)
+            continue
+        args = tc.get("function", {}).get("arguments") if isinstance(tc.get("function"), dict) else None
+        if isinstance(args, str) and args:
+            redacted = redact_sensitive_text(args, force=True)
+            if redacted != args:
+                tc = {**tc, "function": {**tc["function"], "arguments": redacted}}
+        out.append(tc)
+    return out
+
+
 def _durable_content(content: Any) -> Any:
     """Text-only DB projection: multimodal envelopes → summary; part lists keep text, images → ``[screenshot]``."""
     if _is_multimodal_tool_result(content):
@@ -171,7 +199,7 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
     row = {
         "role": role, "content": _durable_content(content), "tool_name": msg.get("tool_name"),
-        "tool_calls": msg["tool_calls"] if isinstance(msg.get("tool_calls"), list) else None,
+        "tool_calls": _durable_tool_calls(msg["tool_calls"]) if isinstance(msg.get("tool_calls"), list) else None,
         "tool_call_id": msg.get("tool_call_id"), "finish_reason": msg.get("finish_reason"),
         **{k: msg.get(k) for k in _ROW_REASONING_KEYS},
         "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),

@@ -636,6 +636,37 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
         return None, ref.args
 
 
+_OTP_TOOL_ARG_NAMES = ("code", "otp", "one_time_code", "one_time_password")
+
+
+def _register_supplied_otp_for_redaction(function_name: str, function_args: dict) -> None:
+    """Pre-handler redaction hook for explicitly supplied one-time codes.
+
+    ``browser_vault_enter_code(code=...)`` carries a live OTP in its tool
+    arguments; the handler registers the value with the redaction boundary
+    only once it starts, but the arguments are already captured by then in
+    the assistant's tool_calls row, request dumps and plugin-hook copies.
+    Registering here — at the single dispatch chokepoint, before any
+    hook/persistence sees the args — means every downstream surface that
+    runs ``redact_sensitive_text`` (session DB rows, request dumps, log
+    formatter) scrubs the exact bytes. The model itself still saw the code
+    when it emitted the call (it read it from the mail tool); this closes
+    the persistence surfaces, not the model context, and is documented as
+    such in the tool description.
+    """
+    if function_name != "browser_vault_enter_code" or not isinstance(function_args, dict):
+        return
+    try:
+        from agent.redact import register_vault_redaction_value
+
+        for name in _OTP_TOOL_ARG_NAMES:
+            value = function_args.get(name)
+            if isinstance(value, str) and value:
+                register_vault_redaction_value(value)
+    except Exception:  # never break dispatch on a redaction hiccup
+        logger.debug("supplied-otp redaction registration failed", exc_info=True)
+
+
 def _dispatch_authorized_once(
     agent,
     state: _ManagedToolResult,
@@ -658,6 +689,8 @@ def _dispatch_authorized_once(
             begin_execution(callback)
         elif callback is not None:
             callback()
+
+    _register_supplied_otp_for_redaction(function_name=ref.name, function_args=ref.args)
 
     block_message, block_error_type = scope_block, "tool_scope_block"
     if block_message is None:
