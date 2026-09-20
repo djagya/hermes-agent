@@ -60,12 +60,25 @@ def test_key_does_not_weaken_other_lifecycle_contracts(conn, case):
     assert kb.block_task(conn, tid, kind="capability", blocker_key="packet-unreadable")
     assert kb.unblock_task(conn, tid)
     if case == "dependency":
+        # Discover the prerequisite during a run; linking it while ready would
+        # already demote the task to todo, where block_task must refuse it.
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
         parent = kb.create_task(conn, title="Prerequisite", triage=True)
         kb.link_tasks(conn, parent_id=parent, child_id=tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
         assert kb.block_task(conn, tid, kind="dependency", blocker_key="prerequisite")
         kb.recompute_ready(conn)
-        assert kb.get_task(conn, tid).status == "todo"
-        assert kb.get_task(conn, tid).block_recurrences == 1
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "todo"
+        assert task.block_recurrences == 1
+        assert task.blocker_key == "prerequisite"
+        event = kb.list_events(conn, tid)[-1]
+        assert event.kind == "dependency_wait"
+        assert event.payload is not None and event.payload["blocker_key"] == "prerequisite"
+        before = list(conn.iterdump())
+        assert not kb.block_task(conn, tid, kind="dependency", blocker_key="prerequisite")
+        assert list(conn.iterdump()) == before
     elif case == "review":
         assert kb.request_review(conn, tid, summary="Candidate", reviewer="reviewer")
         assert kb.claim_review_task(conn, tid, claimer="reviewer") is not None
