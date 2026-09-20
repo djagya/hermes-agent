@@ -285,6 +285,11 @@ _SPECS = [
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                   '"tests_run": 12}\'). Stored on the closing run.'),
     ], help="Mark one or more tasks done"),
+    _cmd("operator-recover", [
+        _arg("operation", choices=["snapshot", "complete-gate", "resolve-blocker"]),
+        _TASK_ID,
+        _arg("--request", help="Operator-authored JSON attestations/evidence; required for mutations"),
+    ], help="Trusted-operator triage recovery (explicit --board required; unavailable to workers)"),
     _cmd("edit", [
         _TASK_ID,
         _arg("--result", required=True, help="Backfilled task result text for a done task"),
