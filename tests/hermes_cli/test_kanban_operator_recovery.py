@@ -43,13 +43,25 @@ def _held(conn, *, review=False):
     kb.recompute_ready(conn)
     if review:
         assert kb.request_review(conn, tid, summary="Ready", reviewer="reviewer")
+    claim = kb.claim_review_task if review else kb.claim_task
     for attempt in range(kb.BLOCK_RECURRENCE_LIMIT):
         if attempt:
             assert kb.unblock_task(conn, tid)
-        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        # Unblocking must restore the same lane, not turn a reviewer into a builder.
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == ("review" if review else "ready")
+        claimed = claim(conn, tid, claimer="worker")
+        assert claimed is not None
+        assert claimed.status == "running"
+        assert claimed.assignee == ("reviewer" if review else "builder")
         assert kb.block_task(conn, tid, kind="needs_input", blocker_key="fixture-decision",
                              reason="Explicit technical decision required")
     assert kb.get_task(conn, tid).status == "triage"
+    claims = [json.loads(event["payload"]) for event in recovery_snapshot(conn, tid)["events"]
+              if event["kind"] == "claimed"]
+    assert len(claims) == kb.BLOCK_RECURRENCE_LIMIT
+    assert all((event.get("source_status") == "review") is review for event in claims)
     return tid
 
 
