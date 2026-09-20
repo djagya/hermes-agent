@@ -341,6 +341,19 @@ parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
 
+## Explicit operator recovery from triage
+
+Ordinary completion and promotion do not close triage gates. A trusted operator
+can use `hermes kanban --board BOARD operator-recover` to snapshot a task, close an
+attested nonspawning evidence gate directly to done, or explicitly resolve the
+exact typed blocker on executable work. These are audited, snapshot-guarded
+operations, not agent tools or generic force flags. They never infer approval from
+technical wording and do not bypass parents or PR completion contracts.
+
+See [operator recovery requests and deployment boundaries](../../developer-guide/kanban-recovery.md#explicit-operator-recovery-cli)
+for the required JSON fields, refusal rules, and the separate installed-image
+bootstrap gate. Do not make an operator gate runnable to work around an old image.
+
 ## Enabling tools for a chat profile
 
 The Desktop Kanban plugin displays the board; it does not grant the chat agent

@@ -152,6 +152,10 @@ def kanban_command(args: argparse.Namespace) -> int:
     if _is_delegated_child_cli_mutation(args):
         return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
 
+    if action == "operator-recover":
+        from hermes_cli.kanban_operator import operator_recovery_command
+        return operator_recovery_command(args)
+
     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
     # the `--board` routing override (else `--board beta boards show` reports beta).
     if action == "boards":
