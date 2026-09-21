@@ -43,7 +43,7 @@ RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     make -j"$(nproc)" && \
     make install
 
-FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
+FROM ghcr.io/astral-sh/uv:0.12.17-python3.13-trixie@sha256:b49f54e077b975791900368b1c51f8ce2e139f0eba89d4a2dc0cad6d614d8736 AS uv_source
 # Node 26 source stage. Debian trixie's bundled nodejs is pinned to 20.x
 # which reached EOL in April 2026 — we copy node + npm from the upstream
 # node:26 image instead (Hermes pins its toolchain to Node 26 everywhere).
@@ -51,7 +51,7 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # against glibc 2.36, which runs cleanly on our Debian 13 (trixie, glibc
 # 2.41) runtime.  Bumping to a new Node major is a one-line ARG change; see
 # #4977.
-FROM node:26-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS node_source
+FROM node:26-bookworm-slim@sha256:582460f614631b59b824ac6020533b9bf339c7fdf3a6d7db31abb6b4065f0212 AS node_source
 
 # Live himalaya is v2.0.0 rev b1f6dece with +gmail +msgraph +native-tls
 # +vendored (not the stock pimalaya install.sh tarball).
@@ -149,11 +149,11 @@ db.close()"
 # the whole 15-45 min build. curl -fsSL --retry 3 self-heals those blips,
 # and every tarball is still checksum-verified below before extraction.
 ARG TARGETARCH
-ARG S6_OVERLAY_VERSION=3.2.3.0
-ARG S6_OVERLAY_NOARCH_SHA256=b720f9d9340efc8bb07528b9743813c836e4b02f8693d90241f047998b4c53cf
-ARG S6_OVERLAY_X86_64_SHA256=a93f02882c6ed46b21e7adb5c0add86154f01236c93cd82c7d682722e8840563
-ARG S6_OVERLAY_AARCH64_SHA256=0952056ff913482163cc30e35b2e944b507ba1025d78f5becbb89367bf344581
-ARG S6_OVERLAY_SYMLINKS_SHA256=a60dc5235de3ecbcf874b9c1f18d73263ab99b289b9329aa950e8729c4789f0e
+ARG S6_OVERLAY_VERSION=3.2.3.2
+ARG S6_OVERLAY_NOARCH_SHA256=5379750ed30a84bbd2e2dd74847ba6b5bd29cd0b2e3ea2ec58049b57eb2eda12
+ARG S6_OVERLAY_X86_64_SHA256=e6befcc96a437a3831386ecfc51808c5d3e939dc5fe3c02ae9284599e8aa2408
+ARG S6_OVERLAY_AARCH64_SHA256=b17f17a82e7a515c682a91edaf2ffdabb73f891981b6c1fd712115693a2f8b4c
+ARG S6_OVERLAY_SYMLINKS_SHA256=a215675c375aca9efecde3065df22b19fb8dcdc1362566931c6b5e778099a0fb
 RUN set -eu; \
     case "${TARGETARCH:-amd64}" in \
         amd64) s6_arch="x86_64"; s6_arch_sha="${S6_OVERLAY_X86_64_SHA256}" ;; \
