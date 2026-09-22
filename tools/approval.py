@@ -1170,6 +1170,23 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
 
     # (-q clears the presence flags, but its unattended context resolves first anyway.)
     approval_callback, is_cli, is_gateway, is_ask = _presence()
+
+    # Safe-operation automatic path (HER-193): a provably side-effect-free
+    # subset (pure computation; read-only sandbox tools + literal report-file
+    # writes) skips the guardian LLM and the human prompt. Floors above
+    # (hardline/deny, gateway lifecycle) already ran; anything NOT provably in
+    # the subset falls through to the unchanged PR #23 gate below.
+    from tools.approval_safe_path import classify_cell, safe_path_enabled
+
+    if safe_path_enabled():
+        _safe_class = classify_cell(code, get_current_session_key())
+        if _safe_class is not None:
+            logger.debug("safe-path: auto-approved %s execute_code cell", _safe_class)
+            result = _approved()
+            result.update(decision_source="safe_path", gate_id=pattern_key,
+                          safe_path=_safe_class)
+            return result
+
     # No user is present to approve arbitrary code in -q / cron / unattended
     # sessions: the first active context resolves instantly from its mode.
     for ctx in _unattended_contexts():
@@ -1181,8 +1198,6 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
                 decision_source="unattended", gate_id=pattern_key,
             )
         return _approved()
-
-    # Only gateway/ask contexts get the one-shot whole-script approval. In an interactive CLI the script's terminal()
     # calls are guarded per-call (context propagates into the RPC thread, #33057), so a whole-script prompt would fire
     # on every execute_code call. Ask-mode still takes this path even with INTERACTIVE set (how gateway/smart tests
     # and messaging ask-mode drive whole-script approval); when that leaks into a CLI with no notify callback, the

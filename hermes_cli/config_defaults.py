@@ -1549,6 +1549,11 @@ DEFAULT_CONFIG = {
         # After this many consecutive guardian DENYs in a session, the deny message escalates to a
         # hard-stop (report to user / ask for /approve). Approval resets; 0 off.
         "denial_breaker_threshold": 3,
+        # Automatic safe path for execute_code (HER-193): cells provably free of
+        # dynamic code/imports/IO beyond read-only sandbox tools and report*.txt
+        # writes run WITHOUT the guardian LLM and human prompt. false = the
+        # guardian gate evaluates every flagged cell again.
+        "safe_path": True,
         # Case-insensitive fnmatch globs against terminal commands; a match blocks even under --yolo
         # / mode=off. Quote in YAML when starting with * or containing {}/!/: e.g. "git push
         # --force*".
