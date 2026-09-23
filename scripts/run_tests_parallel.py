@@ -37,6 +37,11 @@ Environment:
                          default: 'tests')
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
+
+Receipt:
+    --receipt PATH (env HERMES_TEST_RECEIPT) additionally writes a versioned
+    JSON verification record of this run (see scripts/run_tests_receipt.py).
+    Console output and exit semantics are unchanged.
 """
 
 from __future__ import annotations
@@ -372,6 +377,12 @@ def _run_one_file(
 _FLAKY_RESULTS: List[Tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
+# Raw pytest exit code of every attempt per file, BEFORE the per-file rc=5
+# tolerance below rewrites it. The receipt needs the real phase: an import
+# error (2), a usage error (4) and an assertion failure (1) all surface as
+# a failed file, but only the last one is behavioural RED.
+_RAW_EXITS: Dict[Path, List[int]] = {}
+
 
 def _run_one_file_once(
     file: Path,
@@ -460,6 +471,8 @@ def _run_one_file_once(
         # runner over one suite.
         shutil.rmtree(temproot, ignore_errors=True)
 
+    with _flaky_lock:
+        _RAW_EXITS.setdefault(file, []).append(rc)
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
         # platform-gated or fully-marker-filtered file (e.g. a win32-only
@@ -491,7 +504,7 @@ def _parse_pytest_summary(output: str) -> dict[str, int]:
         if not line:
             continue
         # Match "N passed", "N failed", "N skipped", "N errors", "N xfailed", "N xpassed"
-        for m in re.finditer(r"(\d+)\s+(passed|failed|skipped|errors|xfailed|xpassed)", line):
+        for m in re.finditer(r"(\d+)\s+(passed|failed|skipped|errors|xfailed|xpassed|deselected)", line):
             result[m.group(2)] = int(m.group(1))
         # Also match "N error" (singular — pytest uses this sometimes).
         for m in re.finditer(r"(\d+)\s+error\b", line):
@@ -857,6 +870,17 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--receipt",
+        metavar="PATH",
+        default=os.environ.get("HERMES_TEST_RECEIPT") or None,
+        help=(
+            "Also write a versioned JSON verification receipt (candidate, "
+            "scope, environment/import provenance, per-file exit phases, "
+            "omissions) to PATH. Additive: console output and exit code are "
+            "unchanged. Env: HERMES_TEST_RECEIPT."
+        ),
+    )
+    parser.add_argument(
         "paths_positional",
         nargs="*",
         metavar="PATH",
@@ -885,6 +909,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+        "--receipt",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -926,6 +951,21 @@ def main() -> int:
         i += 1
 
     args = parser.parse_args(our_args)
+
+    receipt_mod = None
+    run_identity: Dict[str, str] = {}
+    if args.receipt:
+        import importlib.util
+
+        # Load by path: the runner is executed as a script, and sys.path[0]
+        # is not guaranteed to be scripts/ (PYTHONSAFEPATH, -P, runpy).
+        spec = importlib.util.spec_from_file_location(
+            "run_tests_receipt", Path(__file__).resolve().parent / "run_tests_receipt.py"
+        )
+        receipt_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(receipt_mod)
+        # Before any pytest child is spawned: the children inherit os.environ.
+        run_identity = receipt_mod.take_run_identity(os.environ)
 
     # ── Node-id selectors → file + ``-k`` filter ────────────────────────────
     # This runner is FILE-granular: it spawns one ``pytest <file>`` per test
@@ -1005,9 +1045,59 @@ def main() -> int:
 
         files = _discover_files(roots)
 
+    # Receipt records (filled as files finish; see _emit_receipt below).
+    file_records: List[Dict[str, object]] = []
+    receipt_totals: Dict[str, int] = {}
+
+    def _emit_receipt(exit_code: int) -> int:
+        """Write the optional receipt for this run and pass ``exit_code`` through."""
+        if receipt_mod is None:
+            return exit_code
+        omitted: List[Dict[str, str]] = []
+        if not args.files:
+            for part in sorted(_SKIP_PARTS):
+                omitted.append({
+                    "gate": f"tests/**/{part}/",
+                    "reason": "excluded from discovery; runs in its own CI job "
+                              "(see _SKIP_PARTS in scripts/run_tests_parallel.py)",
+                })
+        for marker, n in sorted(_off_host_marker_files(files).items()):
+            omitted.append({
+                "gate": marker,
+                "reason": f"{n} file(s) gated to another host; skipped on "
+                          f"{sys.platform}, run on {_OS_MARKERS[marker][1]}",
+            })
+        scope = {
+            "mode": "files" if args.files else "discover",
+            "roots": [_format_file(r, repo_root) for r in roots],
+            "slice": slice_raw or None,
+            "include_integration": bool(args.include_integration),
+            "pytest_passthrough": pytest_passthrough,
+            "node_id_selectors": [raw for raw, _ in node_id_selectors],
+            "file_retries": args.file_retries,
+            "file_timeout_seconds": args.file_timeout,
+            "jobs": args.jobs,
+        }
+        receipt = receipt_mod.build_receipt(
+            repo_root=repo_root,
+            python=sys.executable,
+            pytest_env=dict(os.environ),
+            identity=run_identity,
+            argv=[sys.argv[0], *sys.argv[1:]],
+            scope=scope,
+            exit_code=exit_code,
+            files=sorted(file_records, key=lambda r: str(r["path"])),
+            totals=receipt_totals,
+            flaky=sorted(_format_file(f, repo_root) for f, _ in _FLAKY_RESULTS),
+            omitted=omitted,
+        )
+        receipt_mod.write_receipt(Path(args.receipt), receipt)
+        print(f"  Receipt written to {args.receipt} (verdict={receipt['verdict']})")
+        return exit_code
+
     if not files:
         print("No test files to run", file=sys.stderr)
-        return 1
+        return _emit_receipt(1)
 
     # --generate-slices: compute LPT distribution and emit JSON, then exit.
     if args.generate_slices is not None:
@@ -1086,6 +1176,11 @@ def main() -> int:
                 tests_done += n_tests
                 fail_count += 1
                 failures.append((file, f"runner crashed: {exc!r}", {}))
+                file_records.append({
+                    "path": _format_file(file, repo_root),
+                    "exit_codes": [], "rc": None, "runner_error": repr(exc),
+                    "counts": {}, "flaky": False,
+                })
                 _print_progress(
                     tests_done, approx_total_tests, file, 1,
                     time.monotonic() - started_at,
@@ -1106,6 +1201,17 @@ def main() -> int:
                 for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed")
             )
             file_times.append((fpath, subproc_wall))
+            raw_exits = list(_RAW_EXITS.get(fpath, []))
+            for key, n in summary.items():
+                receipt_totals[key] = receipt_totals.get(key, 0) + n
+            file_records.append({
+                "path": _format_file(fpath, repo_root),
+                "exit_codes": raw_exits,
+                "rc": rc,
+                "counts": dict(summary),
+                "flaky": rc == 0 and len(raw_exits) > 1,
+                "seconds": round(subproc_wall, 3),
+            })
             if rc == 0:
                 pass_count += 1
             else:
@@ -1250,12 +1356,12 @@ def main() -> int:
             print(f"=== {len(no_tests_ran)} file{'s' if len(no_tests_ran) != 1 else ''} where no tests ran (collection/import error, timeout before collection, etc.) ===")
             for file, s in no_tests_ran:
                 print(f"  {_format_file(file, repo_root)}")
-        return 1
+        return _emit_receipt(1)
 
     if no_tests_ran_at_all:
-        return 1
+        return _emit_receipt(1)
 
-    return 0
+    return _emit_receipt(0)
 
 
 if __name__ == "__main__":

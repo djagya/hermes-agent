@@ -147,6 +147,7 @@ jobs:
         run: uv cache prune --ci
 
       - name: Run tests (slice ${{ matrix.slice }})
+        id: run_tests
         # Per-file isolation via scripts/run_tests.sh: each test file runs
         # in its own freshly-spawned `python -m pytest <file>` subprocess.
         # Each slice job discovers the plan's roots itself and runs only its
@@ -163,10 +164,43 @@ jobs:
           # standard 4-core host keep each slice moving without the pathological
           # contention caused by hard-coding the upstream fleet's 96 workers.
           HERMES_TEST_WORKERS: 8
+          # Verification receipt (scripts/run_tests_receipt.py): what this
+          # slice tested and how it ended, as machine-readable JSON. On a
+          # pull_request the checkout is GitHub's test-merge commit, so the
+          # receipt records both it (candidate.commit) and the PR head the
+          # run was meant to verify (candidate.declared_candidate).
+          HERMES_TEST_RECEIPT: test-receipt.json
+          HERMES_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+      - name: Check test receipt binds to this run
+        # A missing receipt, an exit code that disagrees with the run step, or
+        # a receipt naming another candidate fails the job: a broken
+        # forwarding in run_tests.sh must not leave CI silently green.
+        if: ${{ !cancelled() && (steps.run_tests.outcome == 'success' || steps.run_tests.outcome == 'failure') }}
+        run: |
+          python3 scripts/run_tests_receipt.py check test-receipt.json \
+            --step-outcome "$RUN_OUTCOME" --expected-candidate "$EXPECTED_CANDIDATE"
+        env:
+          RUN_OUTCOME: ${{ steps.run_tests.outcome }}
+          EXPECTED_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Upload test receipt
+        # Also on failure: a red slice's receipt is the one reviewers need.
+        # Artifact names cannot contain "/", so key on the matrix index.
+        # always(): even cancelled slices must publish (or loudly fail on a
+        # missing receipt) — evidence collection is not success-conditional.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-receipt-${{ strategy.job-index }}
+          path: test-receipt.json
+          retention-days: 14
+          overwrite: true
+          if-no-files-found: error
 
   e2e:
     runs-on: ubuntu-latest
