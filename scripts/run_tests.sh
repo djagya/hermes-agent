@@ -141,9 +141,22 @@ done
 # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER opt-ins already forwarded.
 # Keep this an explicit allowlist (no HERMES_TEST_* glob) so the "no
 # credential can leak" property stays auditable at a glance.
+#
+# HERMES_TEST_RECEIPT names the optional verification receipt
+# (scripts/run_tests_receipt.py). Only when it is set are the run-identity
+# strings forwarded too (which candidate the caller meant to test, which CI
+# run produced the receipt); the runner removes them from its environment
+# before any test subprocess starts. GITHUB_TOKEN is deliberately absent.
+RECEIPT_IDENTITY_VARS=""
+if [ -n "${HERMES_TEST_RECEIPT:-}" ]; then
+  RECEIPT_IDENTITY_VARS="HERMES_CANDIDATE_SHA GITHUB_REPOSITORY GITHUB_RUN_ID \
+    GITHUB_RUN_ATTEMPT GITHUB_WORKFLOW GITHUB_JOB GITHUB_REF GITHUB_SHA \
+    GITHUB_EVENT_NAME GITHUB_SERVER_URL"
+fi
 TEST_ENV=()
 for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
-  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE; do
+  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
+  HERMES_TEST_RECEIPT $RECEIPT_IDENTITY_VARS; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi

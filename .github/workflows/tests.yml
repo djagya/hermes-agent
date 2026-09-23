@@ -163,10 +163,30 @@ jobs:
           # standard 4-core host keep each slice moving without the pathological
           # contention caused by hard-coding the upstream fleet's 96 workers.
           HERMES_TEST_WORKERS: 8
+          # Verification receipt (scripts/run_tests_receipt.py): what this
+          # slice tested and how it ended, as machine-readable JSON. On a
+          # pull_request the checkout is GitHub's test-merge commit, so the
+          # receipt records both it (candidate.commit) and the PR head the
+          # run was meant to verify (candidate.declared_candidate).
+          HERMES_TEST_RECEIPT: test-receipt.json
+          HERMES_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+      - name: Upload test receipt
+        # Also on failure: a red slice's receipt is the one reviewers need.
+        # Artifact names cannot contain "/", so key on the matrix index.
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-receipt-${{ strategy.job-index }}
+          path: test-receipt.json
+          retention-days: 14
+          overwrite: true
+          if-no-files-found: warn
 
   e2e:
     runs-on: ubuntu-latest
