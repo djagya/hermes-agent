@@ -661,6 +661,12 @@ def _dispatch_authorized_once(
 
     block_message, block_error_type = scope_block, "tool_scope_block"
     if block_message is None:
+        # Checked per call, not per batch: a trailing call after a successful terminal
+        # lifecycle call in the same batch must see the ended run.
+        from agent.kanban_retirement import admission_block
+
+        block_message, block_error_type = admission_block(agent, ref.name), "kanban_run_retired"
+    if block_message is None:
         block_error_type = "plugin_block"
         resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)

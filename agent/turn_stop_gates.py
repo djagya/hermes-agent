@@ -78,12 +78,22 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
 
 def _kanban_stop_nudge(agent, messages) -> Optional[str]:
     """Workers must end with kanban_complete / kanban_block; a narrated stop is recorded
-    as protocol_violation, so nudge once or twice first."""
+    as protocol_violation, so nudge once or twice first.
+
+    A pinned run's committed state wins over tool names in history: an ended run (any
+    successful handoff, including review/changes) is never nudged, and a still-live run
+    is nudged even if a terminal tool was called — that call failed, so repair guidance
+    must stay. Unknown ownership falls back to the history heuristic."""
     try:
+        from agent.kanban_retirement import current_run_state
         from agent.kanban_stop import build_kanban_stop_nudge
 
+        state = current_run_state(agent)
+        if state is not None and state.state == "retired":
+            return None
         return build_kanban_stop_nudge(
-            messages=messages, attempts=getattr(agent, "_kanban_stop_nudges", 0)
+            messages=None if state is not None and state.state == "live" else messages,
+            attempts=getattr(agent, "_kanban_stop_nudges", 0),
         )
     except Exception:
         logger.debug("kanban stop-loop check failed", exc_info=True)

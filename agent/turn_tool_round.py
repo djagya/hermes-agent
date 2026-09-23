@@ -24,6 +24,15 @@ logger = logging.getLogger("agent.conversation_loop")
 _HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session_search"})
 
 
+def _retired_kanban_run(agent):
+    """The ended run state for a dispatcher-owned worker, else ``None`` (no pinned run,
+    live, or unknown — unknown keeps the turn alive so the worker can repair or block)."""
+    from agent.kanban_retirement import current_run_state
+
+    state = current_run_state(agent)
+    return state if state is not None and state.state == "retired" else None
+
+
 @dataclass
 class ToolRoundVerdict:
     """``action``: ``"continue"`` (tools ran, next API call), ``"break"`` (turn ends:
@@ -196,6 +205,17 @@ def run_tool_round(
                 with suppress(Exception):
                     agent.stream_delta_callback(final_response)
                     agent.stream_delta_callback(None)
+        return _verdict("break")
+
+    _retired = _retired_kanban_run(agent)
+    if _retired is not None:
+        # The pinned run ended (successful handoff or successor): no further model or tool
+        # dispatch. The tool results are already paired; close with one assistant message.
+        from agent.kanban_retirement import retirement_exit_message
+
+        _turn_exit_reason = "kanban_run_retired"
+        final_response = retirement_exit_message(_retired)
+        append_message(messages, {"role": "assistant", "content": final_response})
         return _verdict("break")
 
     # Reset per-turn retry counters so one truncation can't poison the turn.
