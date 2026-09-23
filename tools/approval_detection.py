@@ -864,6 +864,24 @@ def _bash_exec_payload(args: list[str]) -> tuple[bool, str | None]:
     return False, None
 
 
+def _eval_payload(args: list[str]) -> str | None:
+    """Return the shell code string eval owns, or None when unresolvable.
+
+    eval concatenates ALL its arguments with spaces and parses the result as
+    shell code; only `--` and `-` terminate option processing. A payload we
+    cannot resolve to literal code must still surface (as the raw argument
+    text) — the caller treats it as a command-position variant — so this
+    returns the argument text rather than None except for a bare `eval`.
+    """
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        if args[index] == "--":
+            index += 1
+            break
+        index += 1
+    return " ".join(args[index:]) or None
+
+
 def _read_tool_exec_flag(tool: str, args: list[str]) -> tuple[str, str] | None:
     """Return (option, program) for a read-only tool's program-running flag."""
     flags = _READ_TOOL_EXEC_FLAGS[tool]
@@ -922,6 +940,20 @@ def _execution_flag_findings(command: str):
                     found, payload = _bash_exec_payload(args)
                     if found:
                         yield ("shell command via -c/-lc flag", payload)
+                if executable_name == "eval" and args:
+                    # eval's first non-option argument is shell code: descend
+                    # into it like a `sh -c` payload so anchored deny rules keep
+                    # matching the commands it would actually run.
+                    payload = _eval_payload(args)
+                    if payload:
+                        yield ("shell command via eval", payload)
+                if executable_name == "env":
+                    unresolved = _unresolved_env_split_payload(tokens)
+                    if unresolved:
+                        # env -S with a payload we cannot project to argv
+                        # (e.g. ${NAME} expansion) is unresolved execution:
+                        # unknown must not become auto-approved.
+                        yield ("command via unresolved env -S string", unresolved)
                 if executable_name in _READ_TOOL_EXEC_FLAGS:
                     finding = _read_tool_exec_flag(executable_name, args)
                     if finding:
@@ -1266,6 +1298,34 @@ def _split_env_string(payload: str) -> list[str] | None:
     return args
 
 
+def _env_split_option(tokens: list[str]) -> tuple[str, int] | None:
+    """Return the raw env -S/--split-string payload text and its token index."""
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--" or not token.startswith("-"):
+            return None
+        option, equals, value = token.partition("=")
+        if option == "--split-string" or token.startswith("-S"):
+            attached = equals if option == "--split-string" else len(token) > 2
+            if not attached:
+                index += 1
+            payload = (value if option == "--split-string" else token[2:]) if attached else (
+                tokens[index] if index < len(tokens) else "")
+            return payload, index
+        index += 2 if not equals and option in _COMMAND_WRAPPER_OPTIONS_WITH_ARG["env"] else 1
+    return None
+
+
+def _unresolved_env_split_payload(tokens: list[str]) -> str | None:
+    """Return the -S payload text when it cannot be projected to literal argv."""
+    found = _env_split_option(tokens)
+    if found is None:
+        return None
+    payload, _ = found
+    return payload if _split_env_string(payload) is None else None
+
+
 def _env_split_payload(tokens: list[str]) -> str | None:
     index = 1
     while index < len(tokens):
@@ -1280,9 +1340,14 @@ def _env_split_payload(tokens: list[str]) -> str | None:
             payload = (value if option == "--split-string" else token[2:]) if attached else (
                 tokens[index] if index < len(tokens) else "")
             args = _split_env_string(payload)
+            if args is None:
+                # Unresolvable split-string (e.g. ${NAME} expansion): descend
+                # into the RAW payload text so anchored deny rules still see
+                # the commands env would run; unknown stays non-approved.
+                return payload
             # Protect literal separators when reusing command-position detection;
             # only a real shell -c carrier may turn these argv bytes into code.
-            return shlex.join(args + tokens[index + 1:]) if args is not None else None
+            return shlex.join(args + tokens[index + 1:])
         index += 2 if not equals and option in _COMMAND_WRAPPER_OPTIONS_WITH_ARG["env"] else 1
     return None
 
@@ -1320,6 +1385,14 @@ def _deny_command_variants(command: str):
                 # Apply the existing text matching semantics only AFTER locating
                 # executable positions; never parse its rewritten quotes again.
                 yield _normalize_command_for_detection(candidate)
+            if "$" in executable:
+                # Unresolved substitution in executable position: project the
+                # argument tail itself so anchored deny rules still match the
+                # commands it may run; unknown execution must not auto-approve.
+                stripped = tail.strip()
+                if stripped:
+                    yield stripped
+                    yield _normalize_command_for_detection(stripped)
             if os.path.basename(executable) == "env":
                 tokens = _shell_segment_tokens(segment, 0)
                 if tokens:
