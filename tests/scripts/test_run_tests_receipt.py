@@ -12,6 +12,11 @@ over a synthetic probe file and asserts on the JSON it wrote:
   ``pass``); an assertion failure yields ``fail`` / ``tests_failed``; an
   import error yields ``fail`` / ``interrupted`` — not behavioural RED;
 - a flake that self-heals on retry is recorded as flaky with both exit codes.
+
+The launcher tests go through the production entrypoint CI uses
+(scripts/run_tests.sh, with its ``env -i`` allowlist) and the same
+``run_tests_receipt.py check`` gate the workflow runs after it, so a broken
+forwarding turns the check red instead of leaving CI silently green.
 """
 
 from __future__ import annotations
@@ -25,6 +30,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER = REPO_ROOT / "scripts" / "run_tests_parallel.py"
+LAUNCHER = REPO_ROOT / "scripts" / "run_tests.sh"
+RECEIPT_TOOL = REPO_ROOT / "scripts" / "run_tests_receipt.py"
 
 
 def _run(
@@ -79,8 +86,13 @@ def test_passing_run_receipt_carries_candidate_scope_and_import_provenance(tmp_p
 
 def test_run_identity_is_recorded_but_hidden_from_the_tests(tmp_path: Path) -> None:
     """Receipt-only identity must not change what the verified tests see."""
+    # The env receipt path is overridden by --receipt, but must still be
+    # removed: a nested runner started by a test would otherwise write its
+    # own receipt while the outer run is in progress.
+    env_receipt = tmp_path / "env-receipt.json"
     env = {
         **os.environ,
+        "HERMES_TEST_RECEIPT": str(env_receipt),
         "HERMES_CANDIDATE_SHA": "0" * 40,
         "GITHUB_SERVER_URL": "https://ci.example.invalid",
         "GITHUB_REPOSITORY": "example/repo",
@@ -89,12 +101,14 @@ def test_run_identity_is_recorded_but_hidden_from_the_tests(tmp_path: Path) -> N
     body = (
         "import os\n\n"
         "def test_identity_not_leaked():\n"
-        "    for k in ('HERMES_CANDIDATE_SHA', 'GITHUB_RUN_ID', 'GITHUB_REPOSITORY'):\n"
+        "    for k in ('HERMES_TEST_RECEIPT', 'HERMES_CANDIDATE_SHA',\n"
+        "              'GITHUB_RUN_ID', 'GITHUB_REPOSITORY'):\n"
         "        assert k not in os.environ, k\n"
     )
     proc, receipt = _run(tmp_path, body, env=env)
     assert proc.returncode == 0, proc.stdout
     assert receipt["verdict"] == "pass"
+    assert not env_receipt.exists()
     assert receipt["candidate"]["declared_candidate"] == "0" * 40
     assert receipt["ci"]["run_url"] == "https://ci.example.invalid/example/repo/actions/runs/12345"
 
@@ -176,3 +190,107 @@ def test_import_provenance_flags_a_foreign_checkout(tmp_path: Path) -> None:
     missing = mod.import_provenance(sys.executable, checkout, env, module="absent_mod_xyz")
     assert missing["matches_checkout"] is None
     assert "reason" in missing
+
+
+_CANDIDATE = "c0ffee" + "0" * 34
+
+_IDENTITY_PROBE = (
+    "import os\n\n"
+    "def test_launcher_hides_run_identity():\n"
+    "    for k in ('HERMES_TEST_RECEIPT', 'HERMES_CANDIDATE_SHA',\n"
+    "              'GITHUB_RUN_ID', 'GITHUB_REPOSITORY'):\n"
+    "        assert k not in os.environ, k\n"
+)
+
+
+def _launch(tmp_path: Path, extra_env: dict) -> tuple[subprocess.CompletedProcess, Path]:
+    """Run the real scripts/run_tests.sh over a synthetic probe, CI-style."""
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    (probe_dir / "test_launcher_probe.py").write_text(_IDENTITY_PROBE, encoding="utf-8")
+    receipt_path = tmp_path / "out" / "test-receipt.json"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", str(tmp_path)),
+        "GITHUB_SERVER_URL": "https://ci.example.invalid",
+        "GITHUB_REPOSITORY": "example/repo",
+        "GITHUB_RUN_ID": "4242",
+        **extra_env,
+    }
+    proc = subprocess.run(
+        ["bash", str(LAUNCHER), "--paths", str(probe_dir), "-j", "1",
+         "--file-timeout", "120", "--file-retries", "0"],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=600,
+    )
+    return proc, receipt_path
+
+
+def _check(receipt_path: Path, proc: subprocess.CompletedProcess) -> subprocess.CompletedProcess:
+    """The workflow's post-run gate, invoked exactly as tests.yml does."""
+    return subprocess.run(
+        [sys.executable, str(RECEIPT_TOOL), "check", str(receipt_path),
+         "--step-outcome", "success" if proc.returncode == 0 else "failure",
+         "--expected-candidate", _CANDIDATE],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+
+def test_launcher_forwards_receipt_binding_and_hides_identity(tmp_path: Path) -> None:
+    receipt_path = tmp_path / "out" / "test-receipt.json"
+    proc, receipt_path = _launch(tmp_path, {
+        "HERMES_TEST_RECEIPT": str(receipt_path),
+        "HERMES_CANDIDATE_SHA": _CANDIDATE,
+    })
+    # The probe itself asserts the identity vars never reach the test process.
+    assert proc.returncode == 0, proc.stdout
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["verdict"] == "pass"
+    assert receipt["totals"]["collected"] == 1
+    assert receipt["candidate"]["declared_candidate"] == _CANDIDATE
+    assert receipt["ci"]["run_url"] == "https://ci.example.invalid/example/repo/actions/runs/4242"
+    check = _check(receipt_path, proc)
+    assert check.returncode == 0, check.stdout
+
+
+def test_launcher_without_receipt_binding_fails_the_check(tmp_path: Path) -> None:
+    """Negative control: the receipt variable never reaches the runner."""
+    proc, receipt_path = _launch(tmp_path, {"HERMES_CANDIDATE_SHA": _CANDIDATE})
+    assert proc.returncode == 0, proc.stdout
+    assert not receipt_path.exists()
+    check = _check(receipt_path, proc)
+    assert check.returncode != 0
+    assert "not readable" in check.stdout
+
+
+def test_launcher_without_candidate_binding_fails_the_check(tmp_path: Path) -> None:
+    """Negative control: a receipt that does not name the candidate is rejected."""
+    receipt_path = tmp_path / "out" / "test-receipt.json"
+    proc, receipt_path = _launch(tmp_path, {"HERMES_TEST_RECEIPT": str(receipt_path)})
+    assert proc.returncode == 0, proc.stdout
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["candidate"]["declared_candidate"] is None
+    check = _check(receipt_path, proc)
+    assert check.returncode != 0
+    assert "declared_candidate" in check.stdout
+
+
+def test_check_rejects_a_receipt_that_disagrees_with_the_step(tmp_path: Path) -> None:
+    mod = _load_receipt_module()
+    path = tmp_path / "r.json"
+    mod.write_receipt(path, {
+        "schema": mod.SCHEMA, "exit_code": 0,
+        "candidate": {"declared_candidate": _CANDIDATE},
+    })
+    assert mod.check_receipt(path, step_outcome="success", expected_candidate=_CANDIDATE) == []
+    assert mod.check_receipt(path, step_outcome="failure", expected_candidate=_CANDIDATE)
+    assert mod.check_receipt(path, step_outcome="success", expected_candidate="f" * 40)

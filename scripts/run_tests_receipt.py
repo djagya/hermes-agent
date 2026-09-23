@@ -66,8 +66,9 @@ _CI_VARS = (
 # Variables that exist only to describe the run in the receipt. The runner
 # removes them from its own environment before any pytest child starts, so
 # forwarding them through run_tests.sh's `env -i` allowlist does not change
-# what the tests under verification see.
-RECEIPT_ONLY_ENV = ("HERMES_CANDIDATE_SHA",) + _CI_VARS
+# what the tests under verification see. HERMES_TEST_RECEIPT is included:
+# a nested runner started by a test must not write its own receipt.
+RECEIPT_ONLY_ENV = ("HERMES_TEST_RECEIPT", "HERMES_CANDIDATE_SHA") + _CI_VARS
 
 _MAX_DIRTY_PATHS = 50
 
@@ -279,3 +280,69 @@ def write_receipt(path: Path, receipt: Dict[str, Any]) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def check_receipt(
+    path: Path, *, step_outcome: str, expected_candidate: str
+) -> List[str]:
+    """Problems that make ``path`` unusable as evidence for the CI step.
+
+    The binding CI relies on: the run step that produced ``step_outcome``
+    wrote a receipt at ``path``, its exit code agrees with that outcome, and
+    it names the candidate the workflow meant to test. A broken forwarding
+    in run_tests.sh shows up here as a missing file or a missing
+    ``declared_candidate``, not as a silently green job.
+    """
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return [f"receipt not readable at {path}: {type(exc).__name__}"]
+    except ValueError:
+        return [f"receipt at {path} is not valid JSON"]
+    if not isinstance(receipt, dict):
+        return [f"receipt at {path} is not a JSON object"]
+    problems: List[str] = []
+    if receipt.get("schema") != SCHEMA:
+        problems.append(f"schema is {receipt.get('schema')!r}, expected {SCHEMA!r}")
+    exit_code = receipt.get("exit_code")
+    if step_outcome == "success" and exit_code != 0:
+        problems.append(f"run step succeeded but receipt exit_code is {exit_code!r}")
+    elif step_outcome == "failure" and exit_code in (0, None):
+        problems.append(f"run step failed but receipt exit_code is {exit_code!r}")
+    elif step_outcome not in ("success", "failure"):
+        problems.append(f"unsupported step outcome {step_outcome!r}")
+    declared = (receipt.get("candidate") or {}).get("declared_candidate")
+    if declared != expected_candidate:
+        problems.append(
+            f"declared_candidate is {declared!r}, expected {expected_candidate!r}"
+        )
+    return problems
+
+
+def _main(argv: List[str]) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Fail unless a test receipt binds to the CI step that wrote it."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    check = sub.add_parser("check")
+    check.add_argument("path", type=Path)
+    check.add_argument("--step-outcome", required=True)
+    check.add_argument("--expected-candidate", required=True)
+    args = parser.parse_args(argv)
+    problems = check_receipt(
+        args.path,
+        step_outcome=args.step_outcome,
+        expected_candidate=args.expected_candidate,
+    )
+    for problem in problems:
+        print(f"receipt check: {problem}", file=sys.stderr)
+    if problems:
+        return 1
+    print(f"receipt check: {args.path} binds to this step ({args.step_outcome})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

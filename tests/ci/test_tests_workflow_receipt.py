@@ -3,7 +3,9 @@
 The receipt the runner writes is only external evidence if CI keeps it. The
 contract: the step that runs the suite names a receipt path, and an upload
 step that runs even when the suite fails publishes exactly that path under a
-per-slice artifact name (so slices don't overwrite each other).
+per-slice artifact name (so slices don't overwrite each other). A missing
+receipt, or one that disagrees with the run step or the candidate, fails
+the job.
 """
 
 from __future__ import annotations
@@ -39,3 +41,22 @@ def test_every_slice_uploads_the_receipt_the_runner_writes() -> None:
     assert steps.index(upload) > steps.index(run_step)
     assert "always()" in str(upload.get("if", "")), "red slices must still publish"
     assert "${{" in upload["with"]["name"], "artifact name must be per-slice"
+    # Missing receipt fails the job instead of warning.
+    assert upload["with"].get("if-no-files-found") == "error"
+    assert not upload.get("continue-on-error")
+
+
+def test_receipt_is_checked_against_the_run_step_and_candidate() -> None:
+    steps = _test_job_steps()
+    [run_step] = [s for s in steps if "scripts/run_tests.sh" in s.get("run", "")]
+    run_id = run_step["id"]
+    receipt_path = run_step["env"]["HERMES_TEST_RECEIPT"]
+    [check] = [s for s in steps if "scripts/run_tests_receipt.py check" in s.get("run", "")]
+    assert steps.index(check) > steps.index(run_step)
+    assert receipt_path in check["run"]
+    assert not check.get("continue-on-error")
+    # Runs after a red run step too, and binds to that step's outcome and the
+    # same candidate expression the run step declared.
+    assert f"steps.{run_id}.outcome" in str(check.get("if", ""))
+    assert check["env"]["RUN_OUTCOME"] == f"${{{{ steps.{run_id}.outcome }}}}"
+    assert check["env"]["EXPECTED_CANDIDATE"] == run_step["env"]["HERMES_CANDIDATE_SHA"]
