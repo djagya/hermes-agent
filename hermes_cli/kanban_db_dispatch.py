@@ -1536,6 +1536,12 @@ def _dispatch_lane_task(
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
+    from hermes_cli.kanban_db_workspace_owners import hold_for_predecessor_writers
+
+    held = hold_for_predecessor_writers(conn, task_id, dry_run=dry_run)
+    if held is not None:
+        result.respawn_guarded.append((task_id, held))
+        return False
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
