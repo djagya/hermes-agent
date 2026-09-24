@@ -211,7 +211,7 @@ class _Checker:
         call, handle = item.context_expr, item.optional_vars
         if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
                 and call.func.id == "open" and isinstance(handle, ast.Name)):
-            raise _Reject("with is only for open(<artifact>, 'x') as <name>")
+            raise _Reject("with is only for exclusive-create of a literal artifact name, bound to a variable")
         if len(call.args) != 2:
             raise _Reject("open needs a literal name and literal mode")
         name_node, mode_node = call.args
