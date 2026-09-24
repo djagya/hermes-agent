@@ -263,9 +263,9 @@ def kernel(monkeypatch):
     monkeypatch.setenv("TERMINAL_ENV", "local")
     from tools.code_kernel import execute_in_session_kernel, shutdown_all_kernels
 
-    def run(code, admitted, cwd=None):
+    def run(code, admitted, cwd=None, task_id="safe-path-kernel"):
         return json.loads(execute_in_session_kernel(
-            code, task_id="safe-path-kernel", mode="strict", child_python=sys.executable,
+            code, task_id=task_id, mode="strict", child_python=sys.executable,
             child_cwd=cwd or tempfile.gettempdir(), sandbox_tools=frozenset({"read_file"}),
             timeout=30, max_tool_calls=5, reset=False, is_interrupted=lambda: False,
             safe_path_admitted=admitted))
@@ -291,20 +291,24 @@ def test_kernel_refuses_safe_admission_after_a_non_grammar_cell(kernel):
 
 @pytest.mark.linux_only
 def test_admitted_cell_memory_is_bounded_and_the_bound_is_released(kernel):
+    # Gated probe cells must run on their own task-id: a non-grammar cell
+    # permanently taints that session's lineage, so mixing gated probes into
+    # the admitted session would make every later admitted cell refuse with
+    # lineage_tainted instead of exercising the memory bound.
     probe = "import resource\nprint(resource.getrlimit(resource.RLIMIT_AS))"
-    before = kernel(probe, False)["output"].strip()
+    before = kernel(probe, False, task_id="mem-gated")["output"].strip()
     # ~700 MB: fits an unbounded kernel, exceeds SAFE_CELL_MEMORY_BYTES (512 MiB).
     bomb_cell = "n = 10000000\nprint(len('x' * n * 70))"
     assert SP.classify_cell(bomb_cell) == "pure"
     assert 10_000_000 * 70 > SP.SAFE_CELL_MEMORY_BYTES
-    bomb = kernel(bomb_cell, True)
+    bomb = kernel(bomb_cell, True, task_id="mem-adm")
     assert bomb["status"] == "error"
     assert "MemoryError" in bomb["error"]
     # The same allocation through the normal gate is not bounded (the cap is per admitted cell).
-    assert kernel("print(len('x' * 10000000 * 70))", False)["output"].strip() == "700000000"
+    assert kernel("print(len('x' * 10000000 * 70))", False, task_id="mem-gated2")["output"].strip() == "700000000"
     # The kernel survives, ordinary admitted work still runs, and the limit is restored.
-    assert kernel("print(len([0] * 1000000))", True)["output"].strip() == "1000000"
-    assert kernel(probe, False)["output"].strip() == before
+    assert kernel("print(len([0] * 1000000))", True, task_id="mem-adm")["output"].strip() == "1000000"
+    assert kernel(probe, False, task_id="mem-gated")["output"].strip() == before
 
 
 @pytest.mark.linux_only
