@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.tool_payload_integrity import verify_persist_before_execute
 from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
 
@@ -21,6 +22,15 @@ logger = logging.getLogger("agent.conversation_loop")
 
 # Post-response housekeeping tools: a round made only of these mutes tool progress.
 _HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session_search"})
+
+
+def _retired_kanban_run(agent):
+    """The ended run state for a dispatcher-owned worker, else ``None`` (no pinned run,
+    live, or unknown — unknown keeps the turn alive so the worker can repair or block)."""
+    from agent.kanban_retirement import current_run_state
+
+    state = current_run_state(agent)
+    return state if state is not None and state.state == "retired" else None
 
 
 @dataclass
@@ -128,6 +138,28 @@ def run_tool_round(
             exc,
         )
 
+    # Persist-before-execute integrity invariant: the arguments about to be handed to
+    # the dispatcher must be byte-exact with the assistant row just persisted. A
+    # mismatch means the durable transcript no longer matches what would run; stop the
+    # turn before side effects (truncation-integrity spec, section A). Comparison is
+    # keyed by tool-call id, not position: the row keeps every emitted call (mixed
+    # batches keep invalid ones too) while only valid calls dispatch.
+    _pending_calls = [
+        {"id": coalesce_tool_call_id(tc), "name": tc.function.name, "arguments": tc.function.arguments}
+        for tc in assistant_message.tool_calls
+    ]
+    _integrity_failure = verify_persist_before_execute(assistant_msg, parsed_calls=_pending_calls)
+    if _integrity_failure is not None:
+        logger.warning(
+            "Tool-call payload integrity mismatch before execution (session=%s): %s",
+            agent.session_id or "none",
+            _integrity_failure,
+        )
+        _turn_exit_reason = "tool_payload_integrity"
+        final_response = ""
+        failed = True
+        return _verdict("break")
+
     if _tool_turn_persisted is False:
         # Canonical append failed: never project the row or run tools from process-only
         # state; break rather than retry. No recorded cause means genuinely unknown.
@@ -173,6 +205,17 @@ def run_tool_round(
                 with suppress(Exception):
                     agent.stream_delta_callback(final_response)
                     agent.stream_delta_callback(None)
+        return _verdict("break")
+
+    _retired = _retired_kanban_run(agent)
+    if _retired is not None:
+        # The pinned run ended (successful handoff or successor): no further model or tool
+        # dispatch. The tool results are already paired; close with one assistant message.
+        from agent.kanban_retirement import retirement_exit_message
+
+        _turn_exit_reason = "kanban_run_retired"
+        final_response = retirement_exit_message(_retired)
+        append_message(messages, {"role": "assistant", "content": final_response})
         return _verdict("break")
 
     # Reset per-turn retry counters so one truncation can't poison the turn.

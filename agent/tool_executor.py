@@ -661,6 +661,12 @@ def _dispatch_authorized_once(
 
     block_message, block_error_type = scope_block, "tool_scope_block"
     if block_message is None:
+        # Checked per call, not per batch: a trailing call after a successful terminal
+        # lifecycle call in the same batch must see the ended run.
+        from agent.kanban_retirement import admission_block
+
+        block_message, block_error_type = admission_block(agent, ref.name), "kanban_run_retired"
+    if block_message is None:
         block_error_type = "plugin_block"
         resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
@@ -1401,6 +1407,32 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
     return True
 
 
+def _split_at_terminal_lifecycle_calls(parsed_calls: list[_ParsedCall]) -> list[list[_ParsedCall]]:
+    """Split a concurrent batch into ordered runs at terminal Kanban lifecycle calls.
+
+    A lifecycle call (complete / request_review / request_changes / block) can end the
+    worker's pinned run; any sibling still in flight would have passed its retirement
+    admission check before the handoff committed. Each terminal call therefore closes the
+    current run and starts its own single-call run, so nothing dispatches in parallel with
+    it. Order is preserved exactly, so per-call result slots still match emission order.
+    """
+    from agent.kanban_retirement import TERMINAL_LIFECYCLE_TOOLS
+
+    runs: list[list[_ParsedCall]] = []
+    current: list[_ParsedCall] = []
+    for pc in parsed_calls:
+        if pc.name in TERMINAL_LIFECYCLE_TOOLS:
+            if current:
+                runs.append(current)
+                current = []
+            runs.append([pc])
+            continue
+        current.append(pc)
+    if current:
+        runs.append(current)
+    return runs
+
+
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls concurrently; results are appended in original call order.
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
@@ -1421,27 +1453,51 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         return
 
     parsed_calls = [_parse_tool_call(agent, tc) for tc in tool_calls]
-
-    tool_names_str = ", ".join(pc.name for pc in parsed_calls)
-    if _tool_progress_enabled(agent):
-        print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
+    all_names_str = ", ".join(pc.name for pc in parsed_calls)
 
     # Resolved before the batch is built so the start-order gate can clamp under the deadline.
     timeout_s = _resolve_concurrent_tool_timeout()
-    batch = _ConcurrentBatch(agent, messages, effective_task_id, parsed_calls, timeout_s)
-    agent._current_tool = tool_names_str
-    agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
+
+    # A terminal Kanban lifecycle call must not race a batch sibling: on this path all
+    # workers run in parallel, so a sibling's retirement admission check could pass before
+    # the handoff commits. Split into ordered runs at each terminal lifecycle call and run
+    # the runs one after another (call order, and thus result order, is preserved).
+    lifecycle_runs = _split_at_terminal_lifecycle_calls(parsed_calls)
+    if len(lifecycle_runs) > 1 and _tool_progress_enabled(agent):
+        print(f"  ⚡ Concurrent: {num_tools} tool calls — {all_names_str} "
+              f"(sequenced around {len(lifecycle_runs) - 1} terminal lifecycle barrier(s))")
+    elif _tool_progress_enabled(agent):
+        print(f"  ⚡ Concurrent: {num_tools} tool calls — {all_names_str}")
+
+    agent._current_tool = all_names_str
+    agent._touch_activity(f"executing {num_tools} tools concurrently: {all_names_str}")
 
     spinner = _start_quiet_tool_spinner(agent, "", {}, label=f"⚡ running {num_tools} tools concurrently")
+    completed = 0
     try:
-        batch.run()
+        for run_index, run_calls in enumerate(lifecycle_runs):
+            if getattr(agent, "_incremental_persistence_failed", False):
+                break
+            if agent._interrupt_requested:
+                remaining = [pc.tool_call for pc in (
+                    call for run in lifecycle_runs[run_index:] for call in run
+                )]
+                _append_skipped_tool_results(
+                    agent, messages, remaining, effective_task_id,
+                    content="[Tool execution cancelled — {name} was skipped due to user interrupt]",
+                    hook_error_type="user_interrupt",
+                    flush_stage="cancelled tool result",
+                    stop_on_flush_failure=False,
+                )
+                break
+            batch = _ConcurrentBatch(agent, messages, effective_task_id, run_calls, timeout_s)
+            batch.run()
+            if not _append_batch_results(agent, messages, effective_task_id, batch, _tool_budget):
+                return
+            completed += len(run_calls)
     finally:
         if spinner:
-            finished = [r for r in batch.results if r is not None]
-            spinner.stop(f"⚡ {len(finished)}/{num_tools} tools completed in {sum(r.duration for r in finished):.1f}s total")
-
-    if not _append_batch_results(agent, messages, effective_task_id, batch, _tool_budget):
-        return
+            spinner.stop(f"⚡ {completed}/{num_tools} tools completed")
     if finalize:
         _finalize_tool_batch(agent, messages, effective_task_id, len(parsed_calls), _tool_budget)
 
