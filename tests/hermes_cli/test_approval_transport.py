@@ -342,7 +342,7 @@ def test_execute_code_gateway_uses_selected_transport(monkeypatch):
     )
     monkeypatch.setattr(approval, "_gateway_notify_cbs", {})
 
-    result = approval.check_execute_code_guard("print('ok')", "local")
+    result = approval.check_execute_code_guard("import os; print('ok')", "local")
 
     assert result["approved"] is True
     assert len(seen) == 1

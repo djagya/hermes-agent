@@ -321,6 +321,9 @@ class SessionKernel:
         self.raw, self.stderr = _BoundedBuffer(), _BoundedBuffer()
         self.execution_count, self.last_used = 0, time.monotonic()
         self.cell_authority: Optional[CellAuthority] = None
+        # HER-193 clean lineage: False once any cell outside the safe grammar has run here.
+        # Checked under ``lock`` so a safe-path admission can never land in a poisoned namespace.
+        self.lineage_clean = True
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -743,16 +746,20 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
 def execute_in_session_kernel(
     code: str, *, task_id: str, mode: str, child_python: str, child_cwd: str,
     sandbox_tools: frozenset, timeout: int, max_tool_calls: int, reset: bool, is_interrupted,
+    safe_path_admitted: bool = False,
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
-    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
+    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns.
+    ``safe_path_admitted``: the approval guard skipped its gate because the cell is in the
+    HER-193 safe grammar; the kernel then refuses to run it unless its own lineage is clean."""
     key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
     exec_start = time.monotonic()
     kernel, state_reset = _acquire_kernel(key, reset)
     try:
         result = _run_cell(kernel, key, code, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
                            sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
-                           is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset)
+                           is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset,
+                           safe_path_admitted=safe_path_admitted)
         _record_cell_for_provenance(key[0], code)
         return result
     finally:
@@ -784,12 +791,24 @@ def _record_cell_for_provenance(owner: str, code: str) -> None:
 
 def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, child_python: str,
               child_cwd: str, sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
-              is_interrupted, exec_start: float, state_reset: bool) -> str:
+              is_interrupted, exec_start: float, state_reset: bool,
+              safe_path_admitted: bool = False) -> str:
     reused = kernel.proc is not None
     # Captured on the calling thread BEFORE the cell runs (the snapshot a per-call RPC thread
     # would get) and installed on the kernel so RPC dispatches under THIS cell's identity.
     authority = CellAuthority(task_id)
     with kernel.lock:
+        from tools.approval_safe_path import classify_cell
+        if classify_cell(code) is None:
+            kernel.lineage_clean = False
+        elif safe_path_admitted and not kernel.lineage_clean:
+            authority.retire()
+            from tools.code_execution_tool import _error_result
+            return _error_result(
+                "execute_code safe-path admission refused: this kernel already ran a cell outside "
+                "the safe grammar. Retry the call; it will go through the normal approval gate.",
+                tool_calls_made=0, duration=round(time.monotonic() - exec_start, 2),
+                decision_source="safe_path", outcome="lineage_tainted")
         try:
             if kernel.proc is None:
                 _spawn(kernel, task_id=task_id, child_python=child_python, child_cwd=child_cwd,

@@ -287,6 +287,9 @@ def clear_session(session_key: str) -> None:
         forget_session(session_key)
     except Exception:
         pass
+    # Safe-path lineage describes the kernels just torn down; a new kernel starts clean.
+    from tools.approval_safe_path import forget_session as forget_safe_path_lineage
+    forget_safe_path_lineage(session_key)
 
 
 def is_session_yolo_enabled(session_key: str) -> bool:
@@ -1244,6 +1247,11 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     pattern_key = "execute_code"
     description = _EXECUTE_CODE_DESCRIPTION
 
+    # Clean-lineage bookkeeping runs before every early return: a cell admitted by yolo,
+    # headless or container paths still taints the session's safe path (HER-193).
+    from tools import approval_safe_path
+    safe_kind = approval_safe_path.observe_cell(get_current_session_key(), code)
+
     # Isolated backends already sandbox the child. vercel_sandbox has no host-bind concept so it stays always-skipped.
     if env_type == "vercel_sandbox":
         return _approved()
@@ -1283,6 +1291,19 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     # consulted, so every execute_code call re-prompts (#39275).
     if is_approved(session_key, pattern_key):
         return _approved()
+
+    # Safe-operation path (HER-193): a cell inside the closed grammar, in a session whose
+    # kernel lineage never saw any other cell, needs neither the guardian nor a human.
+    # Placed after the isolation, yolo/off, unattended-deny and presence gates so it can only
+    # replace a prompt, never widen what an unattended context may run. Local backend only:
+    # the session kernel re-checks its own lineage under its cell lock
+    # (``tools.code_kernel._run_cell``) and refuses the admission if it is tainted.
+    if (safe_kind is not None and env_type == "local"
+            and approval_safe_path.session_is_clean(session_key)
+            and approval_safe_path.safe_path_enabled()):
+        logger.info("execute_code safe path: %s cell auto-approved", safe_kind)
+        return {"approved": True, "message": None, "decision_source": "safe_path",
+                "gate_id": pattern_key, "safe_path": safe_kind}
 
     # Persistent-kernel provenance: the guardian and the human see what helper names
     # used by this cell were defined in earlier cells (AST-parsed, bounded, redacted).
