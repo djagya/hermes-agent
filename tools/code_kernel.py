@@ -50,17 +50,49 @@ def _clip(text):
     return (text, False) if len(text) <= _CAPTURE_LIMIT else (text[:_CAPTURE_LIMIT], True)
 
 
+def _cap_address_space(budget):
+    """Lower the soft RLIMIT_AS to current usage + budget bytes; return the previous limits,
+    or None when the cap cannot be applied (non-Linux, no resource module, /proc missing)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import resource
+        with open("/proc/self/statm") as fh:
+            used = int(fh.read().split()[0]) * os.sysconf("SC_PAGE_SIZE")
+        previous = resource.getrlimit(resource.RLIMIT_AS)
+        soft = used + int(budget)
+        for existing in previous:  # never raise a tighter limit the kernel already has
+            if existing != resource.RLIM_INFINITY:
+                soft = min(soft, existing)
+        resource.setrlimit(resource.RLIMIT_AS, (soft, previous[1]))
+        return previous
+    except (ImportError, OSError, ValueError):
+        return None
+
+
 def run_cell(request, execution_count):
-    """Exec one cell; returns (response payload, FULL stdout text)."""
+    """Exec one cell; returns (response payload, FULL stdout text).
+
+    ``memory_budget`` (bytes) bounds the cell's new address space for its duration; a cell
+    that asks for a bound it cannot get does not run (fail closed)."""
     out, err = io.StringIO(), io.StringIO()
     status, trace = "ok", ""
+    budget = request.get("memory_budget")
+    previous = _cap_address_space(budget) if budget else None
     try:
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            exec(compile(request["code"], "<cell>", "exec"), GLOBALS)
+        if budget and previous is None:
+            status, trace = "error", "ResourceBoundUnavailable: the cell's memory bound could not be applied"
+        else:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                exec(compile(request["code"], "<cell>", "exec"), GLOBALS)
     except SystemExit as exc:
         status, trace = "exit", "SystemExit: " + repr(exc.code)
     except BaseException:
         status, trace = "error", traceback.format_exc()
+    finally:
+        if previous is not None:
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, previous)
     stdout_text, stdout_clipped = _clip(out.getvalue())
     stderr_text, stderr_clipped = _clip(err.getvalue())
     return {
@@ -321,6 +353,9 @@ class SessionKernel:
         self.raw, self.stderr = _BoundedBuffer(), _BoundedBuffer()
         self.execution_count, self.last_used = 0, time.monotonic()
         self.cell_authority: Optional[CellAuthority] = None
+        # HER-193 clean lineage: False once any cell outside the safe grammar has run here.
+        # Checked under ``lock`` so a safe-path admission can never land in a poisoned namespace.
+        self.lineage_clean = True
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -743,16 +778,20 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
 def execute_in_session_kernel(
     code: str, *, task_id: str, mode: str, child_python: str, child_cwd: str,
     sandbox_tools: frozenset, timeout: int, max_tool_calls: int, reset: bool, is_interrupted,
+    safe_path_admitted: bool = False,
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
-    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
+    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns.
+    ``safe_path_admitted``: the approval guard skipped its gate because the cell is in the
+    HER-193 safe grammar; the kernel then refuses to run it unless its own lineage is clean."""
     key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
     exec_start = time.monotonic()
     kernel, state_reset = _acquire_kernel(key, reset)
     try:
         result = _run_cell(kernel, key, code, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
                            sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
-                           is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset)
+                           is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset,
+                           safe_path_admitted=safe_path_admitted)
         _record_cell_for_provenance(key[0], code)
         return result
     finally:
@@ -784,12 +823,24 @@ def _record_cell_for_provenance(owner: str, code: str) -> None:
 
 def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, child_python: str,
               child_cwd: str, sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
-              is_interrupted, exec_start: float, state_reset: bool) -> str:
+              is_interrupted, exec_start: float, state_reset: bool,
+              safe_path_admitted: bool = False) -> str:
     reused = kernel.proc is not None
     # Captured on the calling thread BEFORE the cell runs (the snapshot a per-call RPC thread
     # would get) and installed on the kernel so RPC dispatches under THIS cell's identity.
     authority = CellAuthority(task_id)
     with kernel.lock:
+        from tools.approval_safe_path import classify_cell
+        if classify_cell(code) is None:
+            kernel.lineage_clean = False
+        elif safe_path_admitted and not kernel.lineage_clean:
+            authority.retire()
+            from tools.code_execution_tool import _error_result
+            return _error_result(
+                "execute_code safe-path admission refused: this kernel already ran a cell outside "
+                "the safe grammar. Retry the call; it will go through the normal approval gate.",
+                tool_calls_made=0, duration=round(time.monotonic() - exec_start, 2),
+                decision_source="safe_path", outcome="lineage_tainted")
         try:
             if kernel.proc is None:
                 _spawn(kernel, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
@@ -799,7 +850,13 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
             kernel.tool_call_counter[0] = 0
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell
             kernel.cell_authority = authority
-            kernel.proc.stdin.write((json.dumps({"id": uuid.uuid4().hex, "code": code}) + "\n").encode("utf-8"))
+            request: Dict[str, Any] = {"id": uuid.uuid4().hex, "code": code}
+            if safe_path_admitted:
+                # Nobody saw this cell's code: bound its memory (CPU is the cell timeout,
+                # output the capture cap). The runner refuses to run it if it cannot.
+                from tools.approval_safe_path import SAFE_CELL_MEMORY_BYTES
+                request["memory_budget"] = SAFE_CELL_MEMORY_BYTES
+            kernel.proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
             kernel.proc.stdin.flush()
             status, payload = _await_cell(kernel, timeout, is_interrupted)
             result = _cell_result(

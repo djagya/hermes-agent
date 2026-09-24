@@ -1564,6 +1564,11 @@ DEFAULT_CONFIG = {
         "cron_mode": "deny",
         "single_query_mode": "deny",
         "unattended_mode": "deny",
+        # execute_code safe path: cells in a closed, statically checked grammar (sandbox reads,
+        # literal-argument web lookups, exclusive-create report files in the working directory)
+        # skip the guardian and the prompt while the session kernel has run nothing else.
+        # false restores the whole-script gate for every cell.
+        "safe_path": True,
         # Extra rules appended to the smart-approval guardian's SYSTEM prompt, e.g. "Always ESCALATE
         # commands touching /etc".
         "smart_policy": "",

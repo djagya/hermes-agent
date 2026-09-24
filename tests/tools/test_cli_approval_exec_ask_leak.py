@@ -106,7 +106,7 @@ class TestExecuteCodeGuardCliApprovalSurvivesExecAskLeak:
             return "once"
 
         set_approval_callback(_cb)
-        result = check_execute_code_guard("print('hi')", "local")
+        result = check_execute_code_guard("import os; print(\'hi\')", "local")
 
         assert calls, "CLI approval callback was never invoked"
         assert result.get("status") != "pending_approval"
@@ -118,7 +118,7 @@ class TestExecuteCodeGuardCliApprovalSurvivesExecAskLeak:
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         set_approval_callback(lambda command, description, **kwargs: "deny")
 
-        result = check_execute_code_guard("print('hi')", "local")
+        result = check_execute_code_guard("import os; print(\'hi\')", "local")
 
         assert result.get("approved") is False
         assert result.get("outcome") == "denied"
@@ -128,7 +128,7 @@ class TestExecuteCodeGuardCliApprovalSurvivesExecAskLeak:
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         set_approval_callback(lambda command, description, **kwargs: "timeout")
 
-        result = check_execute_code_guard("print('hi')", "local")
+        result = check_execute_code_guard("import os; print(\'hi\')", "local")
 
         assert result.get("approved") is False
         assert result.get("outcome") == "timeout"
@@ -137,13 +137,13 @@ class TestExecuteCodeGuardCliApprovalSurvivesExecAskLeak:
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         set_approval_callback(lambda command, description, **kwargs: "session")
 
-        first = check_execute_code_guard("print('hi')", "local")
+        first = check_execute_code_guard("import os; print(\'hi\')", "local")
         assert first.get("approved") is True
 
         # A second call in the same session must short-circuit on the
         # session-approval cache without prompting again.
         set_approval_callback(None)
-        second = check_execute_code_guard("print('again')", "local")
+        second = check_execute_code_guard("import os; print(\'again\')", "local")
         assert second.get("approved") is True
         assert second.get("status") != "pending_approval"
 
@@ -153,7 +153,7 @@ class TestExecuteCodeGuardCliApprovalSurvivesExecAskLeak:
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
         set_approval_callback(None)
 
-        result = check_execute_code_guard("print('hi')", "local")
+        result = check_execute_code_guard("import os; print(\'hi\')", "local")
 
         assert result.get("approved") is False
         assert result.get("status") == "pending_approval"
@@ -178,7 +178,7 @@ class TestExecuteCodeGuardCliApprovalSurvivesExecAskLeak:
             return "once"
 
         set_approval_callback(_cb)
-        result = check_execute_code_guard("print('marker')", "local")
+        result = check_execute_code_guard("import os; print(\'marker\')", "local")
 
         assert calls, "CLI approval callback was never invoked"
         assert result.get("approved") is True
@@ -201,7 +201,7 @@ class TestExecuteCodeGuardCliDenialBreakerParity:
         set_approval_callback(lambda command, description, **kwargs: "deny")
 
         for _ in range(3):
-            result = check_execute_code_guard("print('hi')", "local")
+            result = check_execute_code_guard("import os; print(\'hi\')", "local")
             assert result.get("outcome") == "denied"
 
         assert not approval_module._denial_tally, (
@@ -221,7 +221,7 @@ class TestExecuteCodeGuardCliDenialBreakerParity:
         assert expected, "breaker should be tripped for this fixture"
 
         set_approval_callback(lambda command, description, **kwargs: "timeout")
-        result = check_execute_code_guard("print('hi')", "local")
+        result = check_execute_code_guard("import os; print(\'hi\')", "local")
 
         assert result.get("outcome") == "timeout"
         assert expected in (result.get("message") or "")

@@ -742,6 +742,7 @@ def execute_code(
         timeout=_cfg.get("timeout", DEFAULT_TIMEOUT),
         max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
         reset=bool(reset), is_interrupted=_is_interrupted,
+        safe_path_admitted=_guard.get("decision_source") == "safe_path",
     )
 
 

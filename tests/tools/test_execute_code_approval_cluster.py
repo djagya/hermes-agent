@@ -335,7 +335,7 @@ def test_execute_code_smart_deny_owner_override_is_one_operation(gw_session, mon
                         lambda _command, _description, _provenance="": "deny")
 
     shown = _register_capturing_resolver(gw_session, "session")
-    result = A.check_execute_code_guard("print('first')", "local")
+    result = A.check_execute_code_guard("import os; print(\'first\')", "local")
 
     assert result["approved"] is True
     assert result["user_approved"] is True
@@ -344,7 +344,7 @@ def test_execute_code_smart_deny_owner_override_is_one_operation(gw_session, mon
     assert A.is_approved(gw_session, "execute_code") is False
 
     _register_resolver(gw_session, "deny")
-    changed = A.check_execute_code_guard("print('second')", "local")
+    changed = A.check_execute_code_guard("import os; print(\'second\')", "local")
     assert changed["approved"] is False
     assert changed["outcome"] == "denied"
 
@@ -414,7 +414,7 @@ def test_execute_code_smart_deny_pending_payload_is_one_operation(gw_session, mo
     monkeypatch.setattr(approval_smart, "_smart_approve",
                         lambda _command, _description, _provenance="": "deny")
 
-    result = A.check_execute_code_guard("print('pending')", "local")
+    result = A.check_execute_code_guard("import os; print(\'pending\')", "local")
 
     assert result["status"] == "pending_approval"
     assert result["smart_denied"] is True
