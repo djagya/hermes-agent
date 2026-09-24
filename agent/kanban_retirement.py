@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 
 RETIRED_STATUSES = frozenset({"done", "review", "changes_requested", "blocked", "superseded"})
 
+# Lifecycle tools whose successful outcome ends the pinned run. They are a concurrency
+# barrier inside the tool executor: a batch sibling must not have its admission check
+# pass in parallel before the handoff commits.
+TERMINAL_LIFECYCLE_TOOLS = frozenset({
+    "kanban_complete", "kanban_request_review", "kanban_request_changes", "kanban_block",
+})
+
 # Tools that stay admissible while ownership is UNKNOWN (DB unreadable): pure reads and the
 # lifecycle tools, whose handlers enforce the run guard themselves. After retirement
 # nothing is admitted.
@@ -128,6 +135,6 @@ def retirement_exit_message(state: RunState) -> str:
 
 
 __all__ = [
-    "RETIRED_STATUSES", "RunState", "admission_block", "current_run_state",
-    "read_run_state", "retirement_exit_message", "worker_run_identity",
+    "RETIRED_STATUSES", "TERMINAL_LIFECYCLE_TOOLS", "RunState", "admission_block",
+    "current_run_state", "read_run_state", "retirement_exit_message", "worker_run_identity",
 ]

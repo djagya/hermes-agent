@@ -18,6 +18,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli.kanban_db_workspace_owners import (
     WORKSPACE_HELD,
     WORKSPACE_OWNERSHIP_UNKNOWN,
@@ -57,7 +58,7 @@ def _task_with_ended_predecessor(conn, workspace: Path) -> str:
     run = kb.claim_task(conn, task_id)
     assert kb.block_task(conn, task_id, reason="handoff", expected_run_id=run.current_run_id)
     assert kb.unblock_task(conn, task_id)
-    kb.set_workspace_path(conn, task_id, workspace)
+    kbw.set_workspace_path(conn, task_id, workspace)
     return task_id
 
 
@@ -133,5 +134,5 @@ def test_first_run_is_never_held(kanban_home, tmp_path, all_assignees_spawnable)
 
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="t", assignee="builder")
-        kb.set_workspace_path(conn, task_id, tmp_path)
+        kbw.set_workspace_path(conn, task_id, tmp_path)
         assert hold_for_predecessor_writers(conn, task_id) is None

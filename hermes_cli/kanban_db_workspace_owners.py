@@ -93,7 +93,16 @@ def _self_and_ancestors() -> set[int]:
 
 def _owner_reason(proc: Any, task_id: str, root: str) -> tuple[Optional[str], bool]:
     """``(why, undecided)`` for one process. The environment is the primary marker, so
-    an unreadable environment with no cwd/file evidence stays ``undecided`` (fail closed)."""
+    an unreadable environment with no other evidence stays ``undecided`` (fail closed).
+
+    One carve-out: ``cmdline`` stays readable for same-uid processes even where
+    ``ptrace_scope`` (Yama) hides ``environ``/``cwd``/``open_files`` of non-relatives —
+    on shared hosts (CI runners, multi-user boxes) pure fail-closed would hold the
+    workspace forever on unrelated sibling noise. So when every ownership probe failed
+    BUT the argv is readable and carries neither this task's worker marker
+    (``work kanban task <id>`` — the dispatcher always injects it) nor a reference to
+    the workspace path, the process is provably not this task's worker and the hold
+    is released. A marker or path reference in argv is holder evidence."""
     import psutil
 
     env_unreadable = False
@@ -122,6 +131,21 @@ def _owner_reason(proc: Any, task_id: str, root: str) -> tuple[Optional[str], bo
                 return f"open file {opened.path}", False
     except (psutil.AccessDenied, psutil.ZombieProcess):
         probe_failed = True
+    try:
+        cmdline = proc.cmdline()
+    except (psutil.AccessDenied, psutil.ZombieProcess, AttributeError):
+        cmdline = None
+    if cmdline:
+        worker_marker = f"work kanban task {task_id}"
+        if worker_marker in cmdline:
+            return f"worker argv for task {task_id}", False
+        if root and root in " ".join(cmdline):
+            return "argv references workspace", False
+        if env_unreadable:
+            # Readable argv with no marker: not this task's worker. Releasing here is
+            # the deliberate trade-off documented in the docstring — the alternative
+            # (undecided) parks the successor forever on ptrace-protected hosts.
+            return None, False
     return None, env_unreadable and probe_failed
 
 
