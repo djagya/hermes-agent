@@ -49,6 +49,7 @@ The full set of keys:
 | `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger a dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves everything in cron context. |
 | `single_query_mode` | `deny` | How one-shot [`hermes chat -q`](./cli.md) sessions behave when they trigger a dangerous-command prompt. A `-q` session runs a single turn and exits with no user waiting to answer prompts; `deny` blocks the command (the agent must find another path), `approve` auto-approves everything in single-query context. Mirrors `cron_mode`. |
 | `unattended_mode` | `deny` | How sessions on unattended programmatic platforms (webhook, msgraph_webhook, api_server) behave when they trigger a dangerous-command prompt. These surfaces have no human who can answer `/approve`, so instead of blocking for the full approval timeout, `deny` blocks the command instantly (the agent must find another path) and `approve` auto-approves everything in unattended context. Mirrors `cron_mode`. |
+| `safe_path` | `true` | Lets `execute_code` cells inside a small, statically checked grammar run without the guardian LLM or a prompt — see [execute_code safe path](#execute_code-safe-path). `false` sends every cell through the normal gate. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
 | `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. The TUI also honors this setting for its `/clear`, `/new`, and `/reset` modal; `HERMES_TUI_NO_CONFIRM=1` force-skips that modal regardless of the configured value. |
 
@@ -168,6 +169,26 @@ Like the rest of the approval config, changes take effect immediately (the confi
 :::note Threat model
 Deny rules are a shell-command policy, not a complete shell interpreter or an OS capability sandbox. Normalization does not resolve arbitrary variables (including GNU `env -S` `${NAME}` expansion), aliases, functions, renamed binaries, scripts, interpreter programs, or every shell/launcher grammar (for example, case-pattern syntax, clustered launcher options, or options embedded inside an `env -S` string). Do not use a basename deny rule as a guarantee that a capability cannot be reached by other means. For containment, use OS permissions and an isolated backend with appropriately restricted mounts, credentials, and network access. This matching behavior does not change the configured approval mode or the empty-deny-list default.
 :::
+
+### execute_code safe path {#execute_code-safe-path}
+
+In a gateway or ask session, `execute_code` normally goes through a single approval for the whole script: first the guardian LLM in `smart` mode, then a human if the guardian escalates. Cells that only read, transform and write a report skip both. The check is a static parse of the cell (no LLM involved) and passes only when all of these hold:
+
+- **The cell is inside the grammar.** It may use literals, names, arithmetic without `**`, comparisons, comprehensions, `if`/`for` over bounded data, and a fixed set of pure builtins and `str`/`list`/`dict`/`set` methods. It may import only `read_file`, `search_files`, `web_search`, `web_extract`, `json_parse` and `shell_quote` from `hermes_tools`, and must call them directly. The grammar has no `import` of anything else, no `def`/`class`/`lambda`, no `while`, no attribute assignment, no dunder names, no `eval`/`exec`/`getattr`/`type`/`vars`/`__import__`, no `format`/`format_map`, and no rebinding of builtin or tool names. Size bounds apply: 20,000 characters, 4,000 AST nodes, integer literals up to 10,000,000, and at most 16 writes.
+- **Web calls use literal arguments and never share a cell with reads.** A cell that reads local data cannot also call a web tool, so read data has no path out.
+- **Artifacts are created exclusively.** A write must be `with open('<name>', 'x') as fh: fh.write(...)`. The name must be a literal plain file name in the working directory with a `.txt`, `.md`, `.csv`, `.tsv` or `.json` extension, and must not be an instruction-file stem (`AGENTS`, `CLAUDE`, `SOUL`, `README`, `MEMORY`, ...). Mode `x` refuses existing files and symlinks, so nothing can be overwritten.
+- **The session's lineage is clean.** A persistent kernel keeps state between cells, so one earlier cell could redefine a name that a later "safe" cell relies on. Any cell outside the grammar therefore taints the session, including cells that yolo, `mode: off`, headless or container paths let through. From then on every later cell goes through the normal gate. The kernel checks its lineage again under its own lock and refuses a safe-path admission once it has run any other cell. A retry then goes through the gate.
+- **It is the local backend on Linux.** Remote and container backends keep their existing behavior.
+- **No floor matches.** Hardline patterns and your `approvals.deny` rules are matched against the cell text first. On a match the cell gets the normal handling: those floors, the supervised-gateway lifecycle block, and `cron_mode` / `single_query_mode` / `unattended_mode: deny` all still take precedence.
+
+Each admitted cell runs under a memory bound: the kernel lowers its soft `RLIMIT_AS` to current usage plus 512 MiB for that cell only, then restores the previous limit. A cell that exceeds the bound fails with `MemoryError` and the kernel survives. If the bound cannot be applied, the cell is refused (`ResourceBoundUnavailable`) rather than run without it. CPU time is still bounded by the `execute_code` timeout, and output by the usual capture cap.
+
+Approved results carry `decision_source: safe_path`, and the gateway log records `execute_code safe path: <kind> cell auto-approved`. To turn the path off:
+
+```yaml
+approvals:
+  safe_path: false
+```
 
 ### Approval Timeout
 

@@ -50,17 +50,49 @@ def _clip(text):
     return (text, False) if len(text) <= _CAPTURE_LIMIT else (text[:_CAPTURE_LIMIT], True)
 
 
+def _cap_address_space(budget):
+    """Lower the soft RLIMIT_AS to current usage + budget bytes; return the previous limits,
+    or None when the cap cannot be applied (non-Linux, no resource module, /proc missing)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import resource
+        with open("/proc/self/statm") as fh:
+            used = int(fh.read().split()[0]) * os.sysconf("SC_PAGE_SIZE")
+        previous = resource.getrlimit(resource.RLIMIT_AS)
+        soft = used + int(budget)
+        for existing in previous:  # never raise a tighter limit the kernel already has
+            if existing != resource.RLIM_INFINITY:
+                soft = min(soft, existing)
+        resource.setrlimit(resource.RLIMIT_AS, (soft, previous[1]))
+        return previous
+    except (ImportError, OSError, ValueError):
+        return None
+
+
 def run_cell(request, execution_count):
-    """Exec one cell; returns (response payload, FULL stdout text)."""
+    """Exec one cell; returns (response payload, FULL stdout text).
+
+    ``memory_budget`` (bytes) bounds the cell's new address space for its duration; a cell
+    that asks for a bound it cannot get does not run (fail closed)."""
     out, err = io.StringIO(), io.StringIO()
     status, trace = "ok", ""
+    budget = request.get("memory_budget")
+    previous = _cap_address_space(budget) if budget else None
     try:
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            exec(compile(request["code"], "<cell>", "exec"), GLOBALS)
+        if budget and previous is None:
+            status, trace = "error", "ResourceBoundUnavailable: the cell's memory bound could not be applied"
+        else:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                exec(compile(request["code"], "<cell>", "exec"), GLOBALS)
     except SystemExit as exc:
         status, trace = "exit", "SystemExit: " + repr(exc.code)
     except BaseException:
         status, trace = "error", traceback.format_exc()
+    finally:
+        if previous is not None:
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, previous)
     stdout_text, stdout_clipped = _clip(out.getvalue())
     stderr_text, stderr_clipped = _clip(err.getvalue())
     return {
@@ -818,7 +850,13 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
             kernel.tool_call_counter[0] = 0
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell
             kernel.cell_authority = authority
-            kernel.proc.stdin.write((json.dumps({"id": uuid.uuid4().hex, "code": code}) + "\n").encode("utf-8"))
+            request: Dict[str, Any] = {"id": uuid.uuid4().hex, "code": code}
+            if safe_path_admitted:
+                # Nobody saw this cell's code: bound its memory (CPU is the cell timeout,
+                # output the capture cap). The runner refuses to run it if it cannot.
+                from tools.approval_safe_path import SAFE_CELL_MEMORY_BYTES
+                request["memory_budget"] = SAFE_CELL_MEMORY_BYTES
+            kernel.proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
             kernel.proc.stdin.flush()
             status, payload = _await_cell(kernel, timeout, is_interrupted)
             result = _cell_result(

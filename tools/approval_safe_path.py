@@ -41,6 +41,10 @@ MAX_CODE_CHARS = 20_000
 MAX_NODES = 4_000
 MAX_INT_LITERAL = 10_000_000
 MAX_WRITES = 16
+# Address-space budget for one auto-approved cell above the kernel's current usage
+# (RLIMIT_AS, applied by the session-kernel runner for that cell only). CPU is bounded by
+# the execute_code timeout and output by the kernel capture cap.
+SAFE_CELL_MEMORY_BYTES = 512 * 1024 * 1024
 
 # Builtins a safe cell may load. Value-only: nothing that reaches namespaces, attributes,
 # code objects, I/O (``open`` is handled by the dedicated write grammar) or dunder hooks.

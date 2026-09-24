@@ -16,6 +16,7 @@ import hashlib
 import importlib
 import logging
 import os
+import sys
 import threading
 from typing import Optional
 
@@ -1297,10 +1298,15 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     # Placed after the isolation, yolo/off, unattended-deny and presence gates so it can only
     # replace a prompt, never widen what an unattended context may run. Local backend only:
     # the session kernel re-checks its own lineage under its cell lock
-    # (``tools.code_kernel._run_cell``) and refuses the admission if it is tainted.
-    if (safe_kind is not None and env_type == "local"
+    # (``tools.code_kernel._run_cell``) and refuses the admission if it is tainted. Linux only:
+    # the kernel bounds an admitted cell's memory with RLIMIT_AS and refuses to run it unbounded.
+    if (safe_kind is not None and env_type == "local" and sys.platform.startswith("linux")
             and approval_safe_path.session_is_clean(session_key)
-            and approval_safe_path.safe_path_enabled()):
+            and approval_safe_path.safe_path_enabled()
+            # A cell whose text trips the hardline floor or an approvals.deny rule never takes
+            # the shortcut: it keeps the normal gate (floor matching is not reinterpreted here).
+            and not detect_hardline_command(code)[0]
+            and _match_user_deny_rule(code) is None):
         logger.info("execute_code safe path: %s cell auto-approved", safe_kind)
         return {"approved": True, "message": None, "decision_source": "safe_path",
                 "gate_id": pattern_key, "safe_path": safe_kind}
