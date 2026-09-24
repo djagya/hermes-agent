@@ -879,9 +879,9 @@ def _handle_create(args: dict, **kw) -> str:
     # See #67567. ``project=""`` is an explicit "no project" (no ``or`` collapse, #106342).
     project_id = args["project"] if "project" in args else args.get("project_id")
     project_source_task_id = None
-    triage, skills, goal_mode = (
-        _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
-        _parse_bool_arg(args, "goal_mode"))
+    skills = _coerce_str_list(args.get("skills"), "skills", "skill names") or []
+    triage, goal_mode = _parse_bool_arg(args, "triage"), _parse_bool_arg(args, "goal_mode")
+    required_skills = _coerce_str_list(args.get("required_skills"), "required_skills", "skill names") or []
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
@@ -908,6 +908,7 @@ def _handle_create(args: dict, **kw) -> str:
             creator_task_id=self_tid,
             idempotency_key=args.get("idempotency_key"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+            required_skills=required_skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),

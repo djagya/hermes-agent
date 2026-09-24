@@ -631,7 +631,7 @@ def test_review_bound_handoff_preserves_declared_artifacts(kanban_home):
         run_id = kb.get_task(conn, t).current_run_id
         assert run_id is not None
         assert kb.request_review(
-            conn, t, summary="ready for review",
+            conn, t, reviewer="reviewer", summary="ready for review",
             metadata={"artifacts": [str(artifact)]}, expected_run_id=run_id)
         handoff = [e for e in kb.list_events(conn, t) if e.kind == "review_requested"][-1]
         assert kb.complete_task(conn, t, summary="approved")
@@ -665,11 +665,11 @@ def test_request_review_rollback_discards_staged_copies(kanban_home):
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(kb, "_end_or_synthesize_run", _boom)
             with pytest.raises(RuntimeError):
-                kb.request_review(conn, t, **kwargs)
+                kb.request_review(conn, t, reviewer="reviewer", **kwargs)
         attachment_dir = kb.task_attachments_dir(t)
         assert kb.get_task(conn, t).status == "running"
         assert not attachment_dir.exists() or not any(attachment_dir.iterdir())
-        assert kb.request_review(conn, t, **kwargs)
+        assert kb.request_review(conn, t, reviewer="reviewer", **kwargs)
         assert [a.filename for a in kb.list_attachments(conn, t)] == ["evidence.json"]
         assert sorted(p.name for p in attachment_dir.iterdir()) == ["evidence.json"]
 

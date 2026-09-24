@@ -2408,6 +2408,13 @@ def _parse_skills_argument(skills: str | list[str] | tuple[str, ...] | None) -> 
     return list(dict.fromkeys(p for p in parts if p))
 
 
+class RequiredSkillError(ValueError):
+    """A ``--required-skills`` entry did not resolve (missing, disabled, or the
+    preload did not finish) — the session must not start. Kanban workers exit
+    ``KANBAN_MISSING_SKILL_EXIT_CODE`` (EX_CONFIG) so the dispatcher parks the
+    task as a correctable configuration outcome instead of retrying."""
+
+
 def save_config_value(key_path: str, value: any) -> bool:
     """Persist dot-separated ``key_path`` = value into HERMES_HOME/config.yaml; True on success.
 
@@ -2942,6 +2949,8 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         self._preload_skills_result: Optional[tuple] = None
         self._preload_skills_error: Optional[BaseException] = None
         self._preload_skills_requested: list = []
+        # --required-skills names recorded for finalize-time enforcement.
+        self._required_skills_requested: list = []
         self._preload_skills_finalized = False
         self._active_session_lease = None
 
@@ -3073,6 +3082,9 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         """Join the background --skills preload and fold it into the prompt (idempotent).
 
         Raises ``ValueError`` only when EVERY requested skill was unknown.
+        With ``--required-skills`` every required name must have resolved
+        (:class:`RequiredSkillError` otherwise — including a preload that did
+        not finish within the join timeout, which is never success).
         """
         if getattr(self, "_preload_skills_finalized", False):
             return
@@ -3082,13 +3094,42 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             return
         thread.join(timeout=120)
         self._preload_skills_finalized = True
+        if thread.is_alive():
+            # Timeout is never success for a mandatory contract.
+            required = getattr(self, "_required_skills_requested", None) or []
+            if required:
+                raise RequiredSkillError(
+                    f"required skill(s) did not finish loading within the startup "
+                    f"timeout: {', '.join(required)}"
+                )
+            return
         err = getattr(self, "_preload_skills_error", None)
         if err is not None:
+            required = getattr(self, "_required_skills_requested", None) or []
+            if required:
+                # Loader exception under a mandatory contract: distinct, typed failure.
+                raise RequiredSkillError(
+                    f"required skill(s) failed to load: {err}"
+                ) from err
             raise err
         result = getattr(self, "_preload_skills_result", None)
         if not result:
+            required = getattr(self, "_required_skills_requested", None) or []
+            if required:
+                raise RequiredSkillError(
+                    f"required skill(s) could not be loaded: {', '.join(required)}"
+                )
             return
         skills_prompt, loaded_skills, missing_skills = result
+        required = list(getattr(self, "_required_skills_requested", None) or [])
+        if required:
+            # Mandatory contract: one missing item among valid items blocks.
+            required_missing = [s for s in required if s not in (loaded_skills or [])]
+            if required_missing:
+                raise RequiredSkillError(
+                    f"required skill(s) missing or disabled in this profile: "
+                    f"{', '.join(required_missing)}"
+                )
         if missing_skills:
             missing_display = ", ".join(missing_skills)
             # A typo'd name must not crash a kanban worker; only a fully-missing set fails loudly.
@@ -4294,7 +4335,7 @@ def _install_single_query_signal_handlers(cli):
                 _signal.signal(getattr(_signal, _name), _signal_handler_q)
 
 
-def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
+def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills, required_skills=None):
     """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
     toolsets_list = None
     if isinstance(toolsets, str) and toolsets:
@@ -4316,6 +4357,10 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
             toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
 
     parsed_skills = _parse_skills_argument(skills)
+    parsed_required = _parse_skills_argument(required_skills)
+    # Required skills join the advisory preload (deduped) so one scanner and
+    # one prompt build serve both contracts.
+    parsed_skills = list(dict.fromkeys([*parsed_skills, *parsed_required]))
 
     try:
         cli = HermesCLI(
@@ -4356,6 +4401,9 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
         cli._preload_skills_requested = parsed_skills
         cli._preload_skills_thread = threading.Thread(target=_load_preloaded_skills, name="skills-preload", daemon=True)
         cli._preload_skills_thread.start()
+    # Mandatory contract: recorded even when the preload list is empty so
+    # finalize_preloaded_skills can enforce it (getattr default [] elsewhere).
+    cli._required_skills_requested = parsed_required
     return cli
 
 
@@ -4475,11 +4523,22 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
                 turn_route = cli._resolve_turn_agent_config(effective_query)
                 if turn_route["signature"] != cli._active_agent_route_signature:
                     cli.agent = None
-                if cli._init_agent(
-                    model_override=turn_route["model"],
-                    runtime_override=turn_route["runtime"],
-                    request_overrides=turn_route.get("request_overrides"),
-                ):
+                try:
+                    agent_ready = cli._init_agent(
+                        model_override=turn_route["model"],
+                        runtime_override=turn_route["runtime"],
+                        request_overrides=turn_route.get("request_overrides"),
+                    )
+                except RequiredSkillError as _skill_err:
+                    # Mandatory context unavailable: typed, correctable exit.
+                    # EX_CONFIG so the dispatcher blocks instead of retrying.
+                    print(f"Error: {_skill_err}", file=sys.stderr)
+                    try:
+                        from hermes_cli.kanban_db import KANBAN_MISSING_SKILL_EXIT_CODE as _MS_CODE
+                        sys.exit(_MS_CODE)
+                    except Exception:
+                        sys.exit(78)
+                if agent_ready:
                     _configure_quiet_agent(cli.agent)
                     _run_quiet_single_query(cli, effective_query)
 
@@ -4500,8 +4559,9 @@ def main(
     q: str = None,
     oneshot: bool = False,
     image: str = None,
-    toolsets: str = None,
-    skills: str | list[str] | tuple[str, ...] = None,
+    toolsets: str | list[str] | tuple[str, ...] | None = None,
+    skills: str | list[str] | tuple[str, ...] | None = None,
+    required_skills: str | list[str] | tuple[str, ...] | None = None,
     model: str = None,
     provider: str = None,
     reasoning: str = None,
@@ -4579,7 +4639,8 @@ def main(
     _join_worktree = _start_worktree_setup(list_tools, list_toolsets, worktree, w)
     query = query or q
     cli = _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
-                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills)
+                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills,
+                               required_skills=required_skills)
 
     # Join the background worktree creation before anything consumes TERMINAL_CWD.
     # A requested worktree whose setup failed aborts: never silently run without isolation.

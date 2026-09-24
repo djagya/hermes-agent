@@ -331,7 +331,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
         assert implementation is not None
         assert kb.request_review(
             conn,
-            child_id,
+            child_id, reviewer="reviewer",
             summary="ready",
             expected_run_id=implementation.current_run_id,
         )
@@ -436,7 +436,7 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
         assert implementation is not None
         assert kb.request_review(
             conn,
-            task_id,
+            task_id, reviewer="reviewer",
             summary="ready",
             expected_run_id=implementation.current_run_id,
         )

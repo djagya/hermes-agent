@@ -75,7 +75,7 @@ def _run_batch(agent, worker, *, handoff_succeeds: bool, concurrent: bool = Fals
             if not handoff_succeeds:
                 return json.dumps({"error": "artifact preservation failed"})
             with kbc.connect_closing() as conn:
-                assert kb.request_review(conn, worker.task_id, summary="done",
+                assert kb.request_review(conn, worker.task_id, reviewer="reviewer", summary="done",
                                          expected_run_id=worker.run_id)
             return json.dumps({"ok": True})
         return json.dumps({"ok": name})
@@ -160,5 +160,5 @@ def test_stop_nudge_follows_committed_run_state_not_tool_names(worker):
     assert _kanban_stop_nudge(SimpleNamespace(), failed_history) is not None
 
     with kbc.connect_closing() as conn:
-        assert kb.request_review(conn, worker.task_id, summary="done", expected_run_id=worker.run_id)
+        assert kb.request_review(conn, worker.task_id, reviewer="reviewer", summary="done", expected_run_id=worker.run_id)
     assert _kanban_stop_nudge(SimpleNamespace(), []) is None

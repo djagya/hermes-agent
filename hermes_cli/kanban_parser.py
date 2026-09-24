@@ -174,6 +174,11 @@ _SPECS = [
              help="Skill to force-load into the worker (repeatable). The kanban "
                   "lifecycle is already injected automatically. Example: --skill "
                   "translation --skill github-code-review"),
+        _arg("--require-skill", action="append", default=[], dest="required_skills",
+             help="MANDATORY skill (repeatable). If missing or disabled on the "
+                  "assignee's profile the worker fails fast at startup (typed "
+                  "exit) and the task is blocked (kind=capability) instead of "
+                  "being retried."),
         _arg("--max-retries", type=int, metavar="N",
              help="Per-task override for the consecutive-failure "
                   f"circuit breaker. Trip on the Nth failure — e.g. --max-retries 1 blocks on the "

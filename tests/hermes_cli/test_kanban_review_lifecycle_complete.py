@@ -124,7 +124,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert implementation_2 is not None
     assert kb.request_review(
         conn,
-        task_id,
+        task_id, reviewer="reviewer",
         summary="Fallback regression added.",
         expected_run_id=implementation_2.current_run_id,
     )
@@ -183,7 +183,7 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
     assert implementation is not None
     assert not kb.request_review(
         conn,
-        task_id,
+        task_id, reviewer="reviewer",
         summary="Corrected implementation.",
         expected_run_id=implementation.current_run_id,
     )
@@ -257,7 +257,7 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent_id,))
     assert not kb.request_review(
         conn,
-        task_id,
+        task_id, reviewer="reviewer",
         summary="must wait",
         expected_run_id=implementation.current_run_id,
     )
@@ -267,7 +267,7 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
     assert kb.complete_task(conn, parent_id)
     assert kb.request_review(
         conn,
-        task_id,
+        task_id, reviewer="reviewer",
         summary="parent stable",
         expected_run_id=implementation.current_run_id,
     )
@@ -550,7 +550,7 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
 
 def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -> None:
     task_id = kb.create_task(conn, title="Manual approval", assignee="reviewer")
-    assert kb.request_review(conn, task_id, summary="implementation handoff")
+    assert kb.request_review(conn, task_id, reviewer="reviewer", summary="implementation handoff")
     assert kb.complete_task(conn, task_id)
     completed_event = _event(kb.list_events(conn, task_id), "completed")
     assert completed_event.run_id is not None
@@ -687,7 +687,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     retry = kb.claim_task(conn, task_id, claimer="builder:2")
     assert retry is not None
     assert kb.request_review(
-        conn, task_id, summary="v2",
+        conn, task_id, reviewer="reviewer", summary="v2",
         expected_run_id=retry.current_run_id,
     )
     assert _failures(conn, task_id) == 1  # full re-review cycle: still 1

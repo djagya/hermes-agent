@@ -465,6 +465,17 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "assignee's profile."
             ),
         },
+        "required_skills": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "MANDATORY skill names. If any is missing or disabled on the "
+                "assignee's profile, the worker fails fast at startup with a "
+                "typed exit and the task is blocked (kind=capability) "
+                "instead of being retried. Use for skills the task "
+                "cannot proceed without."
+            ),
+        },
         "goal_mode": _prop("boolean", (
                 "Run the dispatched worker in a goal loop. When true, "
                 "after each turn an auxiliary judge checks the worker's "

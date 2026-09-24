@@ -293,6 +293,11 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # breaker must never trip on a throttle). 75 == BSD EX_TEMPFAIL.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Worker exit "mandatory skill unavailable/disabled": a CORRECTABLE CONFIG
+# outcome, not a task defect. 78 == BSD EX_CONFIG. The dispatcher blocks the
+# task (kind=capability) without consuming the failure breaker.
+KANBAN_MISSING_SKILL_EXIT_CODE = 78
+
 
 def _resolve_crash_grace_seconds() -> int:
     """``HERMES_KANBAN_CRASH_GRACE_SECONDS`` (0 = immediate, for tests) else default."""
@@ -701,6 +706,9 @@ class Task:
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
     skills: Optional[list] = None            # None = defaults only; [] = explicitly none
+    # Mandatory skills: worker startup FAILS when any is missing/disabled
+    # (typed exit -> blocked; no partial-success, no cross-profile fallback).
+    required_skills: Optional[list] = None   # None = none declared
     model_override: Optional[str] = None
     provider_override: Optional[str] = None  # provider ``model_override`` belongs to
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
@@ -721,6 +729,8 @@ class Task:
         g = lambda col, default=None: _row_get(row, col, default)  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        parsed_req = _json_or(g("required_skills"))
+        required_value = [str(s) for s in parsed_req if s] if isinstance(parsed_req, list) else None
         return cls(
             **{col: row[col] for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -730,6 +740,7 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            required_skills=required_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -893,6 +904,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
+    -- Mandatory skills (JSON): the worker FAILS FAST (typed exit, task
+    -- blocked) when any of these is missing or disabled in its profile.
+    -- Unlike `skills` there is no partial-success: all must resolve.
+    required_skills      TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
@@ -1225,6 +1240,7 @@ def create_task(
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
+    required_skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
@@ -1290,6 +1306,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    required_skills_list = _normalize_task_skills(required_skills)
 
     fixed_notify_target = _fixed_notify_target()
 
@@ -1319,6 +1336,11 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Authoring-time early feedback (advisory): required skills that don't
+    # resolve under the assignee profile's skills tree. The durable gate is the
+    # worker's startup check; this only warns the author at create time.
+    _warn_missing_required_skills(assignee, required_skills_list)
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -1342,10 +1364,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, required_skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1353,6 +1375,7 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
+                        json.dumps(required_skills_list) if required_skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                     ),
@@ -1374,6 +1397,7 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
+                        "required_skills": list(required_skills_list) if required_skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
@@ -1412,6 +1436,76 @@ def create_task(
 
 def _board_meta_for(board: Optional[str]) -> dict:
     return read_board_metadata(board if board else get_current_board())
+
+
+def validate_required_skills_for_assignee(
+    assignee: Optional[str], required_skills: Optional[Iterable[str]],
+) -> list[str]:
+    """Authoring-time early feedback: required skill names that do NOT resolve
+    to a ``SKILL.md`` under the assignee profile's skills tree (bundled
+    skills dir as fallback when no profile is given). Advisory — it warns the
+    author at ``create`` time; the durable enforcement gate is the worker's
+    own startup check (``cli.finalize_preloaded_skills`` raising
+    ``RequiredSkillError`` → typed exit), so a stale cache of profile trees
+    cannot fabricate a PASS. Plugin (``plugin:skill``) and path-like names are
+    skipped here (resolution is plugin-registry-dependent)."""
+    names = [n for n in (required_skills or []) if n]
+    if not names:
+        return []
+    from hermes_constants import get_skills_dir
+    from hermes_cli.profiles import get_profile_dir
+
+    roots: list[Path] = []
+    if assignee:
+        try:
+            roots.append(get_profile_dir(assignee) / "skills")
+        except Exception:
+            pass
+    try:
+        roots.append(get_skills_dir())
+    except Exception:
+        pass
+    if not roots:
+        return []
+    missing: list[str] = []
+    for name in names:
+        if ":" in name or "/" in name:
+            continue  # plugin-qualified or path-like: startup gate owns these
+        needle = name.lower()
+        found = any(
+            _dir_is_root(skill_md.parent, root) for root in roots
+            for skill_md in root.rglob("SKILL.md")
+            if skill_md.parent.name.lower() == needle
+        )
+        if not found:
+            missing.append(name)
+    return missing
+
+
+def _dir_is_root(p: Path, root: Path) -> bool:
+    try:
+        p.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _warn_missing_required_skills(
+    assignee: Optional[str], required_skills: Optional[Iterable[str]],
+) -> None:
+    """Log a warning when a declared required skill does not resolve under the
+    assignee profile's skills tree (authoring-time early feedback; the worker
+    startup gate remains the durable enforcement)."""
+    try:
+        missing = validate_required_skills_for_assignee(assignee, required_skills)
+    except Exception:
+        return
+    if missing:
+        logging.getLogger("hermes.kanban").warning(
+            "required_skills %s do not resolve under assignee %r's skills tree; "
+            "the worker will fail fast at startup until they are installed",
+            missing, assignee,
+        )
 
 
 def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -> Optional[str]:
@@ -3116,6 +3210,28 @@ def request_review(
                         "latest changes_requested event is missing or "
                         "malformed); pass reviewer= explicitly",
                     )
+                if reviewer is None and not force and implementer:
+                    # First review with no reviewer resolved: under automatic
+                    # review dispatch the row would be spawned for its current
+                    # assignee — the implementer reviewing their own work.
+                    # Require an explicit reviewer. Human-only boards
+                    # (kanban.review_dispatch=false) and explicit operator
+                    # overrides (force=True) keep the previous behavior.
+                    try:
+                        from hermes_cli.kanban_db_dispatch import review_dispatch_enabled
+                        auto_dispatch = review_dispatch_enabled()
+                    except Exception:
+                        auto_dispatch = True
+                    if auto_dispatch:
+                        return _ret(
+                            False, "automatic review dispatch is enabled but no "
+                            "reviewer resolved; an unresolved reviewer would "
+                            "default to the implementer (accidental "
+                            "self-review). Pass reviewer= explicitly, or use "
+                            "force=True (operator override), or set "
+                            "kanban.review_dispatch: false for human-only "
+                            "review",
+                        )
             reviewer = _canonical_assignee(reviewer)
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"

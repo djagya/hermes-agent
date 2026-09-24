@@ -126,6 +126,14 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    missing_skill: list[str] = field(default_factory=list)
+    """Task ids whose workers exited ``KANBAN_MISSING_SKILL_EXIT_CODE``
+    (mandatory ``required_skills`` entry unavailable in the worker profile)
+    and were blocked as ``capability`` without breaker accounting."""
+    skipped_review_missing_reviewer: list[str] = field(default_factory=list)
+    """Review-lane task ids skipped because no ``review_requested`` provenance
+    names a reviewer (legacy rows); auto-spawning them would produce
+    accidental implementer self-review."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -166,6 +174,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
     still ``running`` = protocol violation), ``rate_limited``
     (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
+    ``missing_skill`` (``KANBAN_MISSING_SKILL_EXIT_CODE``: mandatory skill
+    unavailable — blocked as ``capability`` without breaker churn),
     ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
     not in the reap registry; ``code`` None)."""
     entry = _recent_worker_exits.get(int(pid))
@@ -179,6 +189,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == _kb.KANBAN_MISSING_SKILL_EXIT_CODE:
+                return ("missing_skill", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -742,12 +754,18 @@ class _DeadWorker:
     event_payload: dict
     protocol_violation: bool = False
     rate_limited: bool = False
+    missing_skill: bool = False
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        if self.rate_limited:
+            return "rate_limited"
+        # Mandatory-skill failure is its own typed outcome, never a crash.
+        if self.missing_skill:
+            return "missing_skill"
+        return "crashed"
 
 
 def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
@@ -775,6 +793,18 @@ def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
         )
+    if kind == "missing_skill":
+        # Mandatory skill unavailable in the worker's profile: a correctable
+        # CONFIG outcome. Not a crash, no breaker accounting — the sweep books
+        # it as a ``capability`` block below.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} exited missing a required skill (EX_CONFIG) — "
+            f"task blocked pending skill availability",
+            "missing_skill",
+            {"pid": pid, "claimer": claimer, "exit_code": code},
+            missing_skill=True,
+        )
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
@@ -794,6 +824,9 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    # Tasks whose worker exited ``KANBAN_MISSING_SKILL_EXIT_CODE``: blocked as
+    # ``capability``, no breaker accounting.
+    missing_skill: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, protocol_violation, error_text)``: accounted
     # after the txn via ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, bool, str]] = field(default_factory=list)
@@ -828,6 +861,60 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             dead = _classify_dead_worker(pid, row["claim_lock"])
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            if dead.missing_skill:
+                # Correctable config outcome: block as ``capability`` (no
+                # breaker accounting, no retry). ``block_task`` requires a
+                # non-running row, so release the claim first.
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (retry_status, row["id"], pid, row["claim_lock"]),
+                )
+                if cur.rowcount != 1:
+                    continue  # row moved under us; another writer owns it
+                run_id = _kb._end_run(
+                    conn, row["id"],
+                    outcome=dead.run_outcome, status=dead.run_outcome,
+                    error=dead.error_text,
+                    metadata=dict(dead.event_payload),
+                )
+                _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                    (dead.error_text[:500], row["id"]),
+                )
+                # Inline ``capability`` block (same shape ``block_task`` would
+                # write): ``block_task`` opens its own non-nested write_txn,
+                # which cannot run inside this sweep txn. No breaker counter
+                # moves — the outcome is correctable config, not a failure.
+                block_payload = {
+                    "reason": dead.error_text[:500],
+                    "kind": "capability",
+                    "source_status": retry_status,
+                }
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', "
+                    "block_kind = 'capability', "
+                    "block_recurrences = block_recurrences + 1, "
+                    "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ?",
+                    (row["id"],),
+                )
+                _kb._append_event(conn, row["id"], "blocked", block_payload, run_id=run_id)
+                sweep.exited_hook_payloads.append({
+                    "task_id": row["id"],
+                    "assignee": row["assignee"],
+                    "run_id": run_id,
+                    "worker_pid": pid,
+                    "exit_kind": dead.kind,
+                    "exit_code": dead.code,
+                    "outcome": dead.run_outcome,
+                    "retry_status": "blocked",
+                })
+                sweep.missing_skill.append(row["id"])
+                continue
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -952,6 +1039,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_missing_skill = sweep.missing_skill  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1649,6 +1737,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.missing_skill.extend(getattr(detect_crashed_workers, "_last_missing_skill", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
@@ -1721,6 +1810,26 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+
+
+def _review_lane_blocked_for_missing_reviewer(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when a ``review`` row has no ``review_requested`` provenance naming
+    a reviewer distinct from the routing baseline. Rows that reached ``review``
+    before reviewer provenance was recorded (legacy cards, manual status
+    writes) would otherwise be auto-spawned for their current assignee — the
+    implementer reviewing their own work. A recorded reviewer (any name) or a
+    human-routed board (``review_dispatch: false`` skips this lane entirely)
+    unblocks the row."""
+    event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if event is None:
+        return True
+    reviewer = (_kb._json_dict(_kb._row_get(event, "payload")) or {}).get("reviewer")
+    return not (isinstance(reviewer, str) and reviewer.strip())
 
 
 def _any_spawnable_review(review_rows: list[sqlite3.Row]) -> bool:
@@ -1846,6 +1955,12 @@ def _dispatch_once_locked(
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
+            continue
+        if _review_lane_blocked_for_missing_reviewer(conn, row["id"]):
+            # Legacy review row with no review_requested provenance naming a
+            # reviewer: spawning here would have the implementer review their
+            # own work. Park it for explicit routing instead of auto-spawning.
+            result.skipped_review_missing_reviewer.append(row["id"])
             continue
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
@@ -2118,6 +2233,12 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     for sk in task.skills or ():
         if sk:
             cmd.extend(["--skills", sk])
+    # Mandatory skills: one pair per declared name. The worker merges these
+    # into the advisory preload (dedup) and FAILS FAST (typed exit -> blocked)
+    # when any does not resolve in ITS profile.
+    for sk in getattr(task, "required_skills", None) or ():
+        if sk:
+            cmd.extend(["--required-skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too so the worker resolves the model against the
