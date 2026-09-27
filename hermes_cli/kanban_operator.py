@@ -26,7 +26,7 @@ def operator_recovery_command(args):
         if args.operation != "snapshot":
             if not args.request:
                 raise ValueError("--request must name an operator-authored JSON request file")
-            request = json.loads(Path(args.request).read_text(encoding="utf-8"))
+            request = json.loads(Path(args.request).read_text(encoding="utf-8-sig"))
             if not isinstance(request, dict):
                 raise ValueError("request must be a JSON object")
         elif args.request:

@@ -229,7 +229,7 @@ def consume_pending_apply_capability(subsystem: str, payload: Dict[str, Any]) ->
 
 def _load_pending_file(path: Path) -> Optional[Dict[str, Any]]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return None
     return value if isinstance(value, dict) else None
@@ -780,7 +780,7 @@ def resolve_applying(
             ).encode("utf-8")
             if archive_path.exists():
                 try:
-                    archived = json.loads(archive_path.read_text(encoding="utf-8"))
+                    archived = json.loads(archive_path.read_text(encoding="utf-8-sig"))
                 except Exception as exc:
                     raise PendingWriteError(
                         "existing quarantine tombstone is unreadable"
@@ -1117,7 +1117,7 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
                 p = base / "SKILL.md"
             try:
                 if p.exists():
-                    current = p.read_text(encoding="utf-8")
+                    current = p.read_text(encoding="utf-8-sig")
             except Exception:
                 current = ""
 

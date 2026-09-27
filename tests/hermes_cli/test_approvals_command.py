@@ -1,8 +1,6 @@
 """Cross-surface contract for the persistent /approvals mode command."""
 
 
-import yaml
-
 from cli import HermesCLI
 from hermes_cli.commands import (
     GATEWAY_KNOWN_COMMANDS,
