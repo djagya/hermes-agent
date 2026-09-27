@@ -1,7 +1,7 @@
 # Upstream merge conflict ledger (local candidate)
 
-Base HEAD: `8a237660c2fb70895ac0ea1c64ef66d8bbd2968f`  
-Upstream MERGE_HEAD: `6f7a7991bb069db07ae74a479823ce8310f8c7e0`  
+Base HEAD: `8a237660c2fb70895ac0ea1c64ef66d8bbd2968f`
+Upstream MERGE_HEAD: `6f7a7991bb069db07ae74a479823ce8310f8c7e0`
 Upstream `55a93d8f70` is an ancestor of MERGE_HEAD and remains in the merged history. The cancelled duplicate task lane supplied no changes.
 
 ## Subsystem decisions and uncertainty
