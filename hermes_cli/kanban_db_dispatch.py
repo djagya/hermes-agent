@@ -1135,7 +1135,8 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (worker-authored PR URL in a recent comment; re-spawning risks a duplicate PR). The review
+    (worker-authored PR URL in a recent comment, unless an explicit unblock
+    followed it and has not yet been consumed by a claim). The review
     lane skips the last two: they are the *inputs* to a review handoff. Stale /
     dead claim locks are NOT a guard reason — the reclaim passes own those.
     """
@@ -1205,14 +1206,46 @@ def check_respawn_guard(
 
     # 4. A worker's PR URL signals duplicate work; ROOT's publication/evidence
     #    comment does not. Include past run profiles when the assignee changed.
+    #    Only an explicit unblock after the newest qualifying PR comment allows
+    #    another claim; a later claim consumes that signal even if the run fails.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ? "
+    pr_comments = conn.execute(
+        "SELECT id, body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ? "
         "AND author IN (SELECT assignee FROM tasks WHERE id = ? "
-        "UNION SELECT profile FROM task_runs WHERE task_id = ?)",
+        "UNION SELECT profile FROM task_runs WHERE task_id = ?) ORDER BY id DESC",
         (task_id, pr_cutoff, task_id, task_id),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+    ).fetchall()
+    latest_pr = next(
+        (c for c in pr_comments if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])),
+        None,
+    )
+    if latest_pr is not None:
+        unblock = conn.execute(
+            "SELECT id, created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'unblocked' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if unblock is None:
+            return "active_pr"
+        commented = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'commented' "
+            "AND json_extract(payload, '$.comment_id') = ? ORDER BY id DESC LIMIT 1",
+            (task_id, latest_pr["id"]),
+        ).fetchone()
+        # Legacy commented events have no comment_id. A same-second unblock
+        # cannot prove it followed the PR comment, so keep the guard.
+        after_pr = (
+            unblock["id"] > commented["id"] if commented is not None
+            else unblock["created_at"] > latest_pr["created_at"]
+        )
+        if not after_pr:
+            return "active_pr"
+        claimed = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' "
+            "AND id > ? LIMIT 1",
+            (task_id, unblock["id"]),
+        ).fetchone()
+        if claimed:
             return "active_pr"
 
     return None
