@@ -134,6 +134,65 @@ def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
         _real_finalize(created["cli"])
 
 
+def test_required_skill_missing_among_valid_blocks_while_advisory_partial_succeeds(monkeypatch):
+    """Same preload result (one loaded, one missing): advisory --skills keeps
+    partial success; --required-skills naming the missing one refuses."""
+    import cli as cli_mod
+
+    created = []
+
+    def fake_cli(**kwargs):
+        created.append(_DummyCLI(**kwargs))
+        return created[-1]
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
+    monkeypatch.setattr(
+        cli_mod,
+        "build_preloaded_skills_prompt",
+        lambda skills, task_id=None: ("skill prompt", ["present"], ["absent"]),
+    )
+
+    with pytest.raises(SystemExit):
+        cli_mod.main(skills="present,absent", list_tools=True)
+    _real_finalize(created[-1])
+    assert created[-1].preloaded_skills == ["present"]
+
+    with pytest.raises(SystemExit):
+        cli_mod.main(skills="present", required_skills="absent", list_tools=True)
+    with pytest.raises(cli_mod.RequiredSkillError, match="absent"):
+        _real_finalize(created[-1])
+
+
+def test_single_query_required_skill_failure_exits_typed_code(monkeypatch):
+    """Every single-query branch (kanban workers run ``chat -q`` with or
+    without ``-Q``) turns a missing required skill into the EX_CONFIG exit
+    the dispatcher books as a capability block — before agent work."""
+    import cli as cli_mod
+    from hermes_cli.kanban_db import KANBAN_MISSING_SKILL_EXIT_CODE
+
+    created = []
+
+    def fake_cli(**kwargs):
+        created.append(_DummyCLI(**kwargs))
+        return created[-1]
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
+    monkeypatch.setattr(
+        cli_mod,
+        "build_preloaded_skills_prompt",
+        lambda skills, task_id=None: ("", [], ["absent"]),
+    )
+    with pytest.raises(SystemExit):
+        cli_mod.main(required_skills="absent", list_tools=True)
+    cli_obj = created[-1]
+    cli_obj.finalize_preloaded_skills = lambda: _real_finalize(cli_obj)
+    cli_obj._claim_active_session = MagicMock(side_effect=AssertionError("agent work started"))
+
+    with pytest.raises(SystemExit) as exc:
+        cli_mod._run_single_query_mode(cli_obj, "work kanban task t_x", None, False, False)
+    assert exc.value.code == KANBAN_MISSING_SKILL_EXIT_CODE
+
+
 def test_show_banner_does_not_print_skills():
     """show_banner() no longer prints the activated skills line — it moved to run()."""
     cli_obj = _make_real_cli(compact=False)

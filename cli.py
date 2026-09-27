@@ -4488,6 +4488,23 @@ def _configure_quiet_agent(agent) -> None:
     agent.tool_progress_mode = "off"
 
 
+def _enforce_required_skills_or_exit(cli) -> None:
+    """Fail a ``--required-skills`` one-shot before any agent work.
+
+    Kanban workers run ``chat -q`` with or without ``-Q``; both branches must
+    turn an unresolved mandatory skill into the typed EX_CONFIG exit the
+    dispatcher books as a ``capability`` block, never a crash-and-retry.
+    """
+    if not getattr(cli, "_required_skills_requested", None):
+        return
+    try:
+        cli.finalize_preloaded_skills()
+    except RequiredSkillError as exc:
+        from hermes_cli.kanban_db import KANBAN_MISSING_SKILL_EXIT_CODE
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(KANBAN_MISSING_SKILL_EXIT_CODE)
+
+
 def _run_single_query_mode(cli, query, image, quiet, oneshot):
     """``-q``/``--image`` entry: seed an interactive session on a TTY, else run the one-shot turn and exit."""
     if _should_seed_interactive(query, image, quiet, oneshot):
@@ -4508,6 +4525,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
     # isn't engaged) and takes the deterministic approvals.single_query_mode path instead of waiting the
     # full timeout. See #86878.
     os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
+    _enforce_required_skills_or_exit(cli)
     if not cli._claim_active_session("cli", stderr=bool(quiet)):
         sys.exit(1)
     try:
@@ -4523,22 +4541,11 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
                 turn_route = cli._resolve_turn_agent_config(effective_query)
                 if turn_route["signature"] != cli._active_agent_route_signature:
                     cli.agent = None
-                try:
-                    agent_ready = cli._init_agent(
-                        model_override=turn_route["model"],
-                        runtime_override=turn_route["runtime"],
-                        request_overrides=turn_route.get("request_overrides"),
-                    )
-                except RequiredSkillError as _skill_err:
-                    # Mandatory context unavailable: typed, correctable exit.
-                    # EX_CONFIG so the dispatcher blocks instead of retrying.
-                    print(f"Error: {_skill_err}", file=sys.stderr)
-                    try:
-                        from hermes_cli.kanban_db import KANBAN_MISSING_SKILL_EXIT_CODE as _MS_CODE
-                        sys.exit(_MS_CODE)
-                    except Exception:
-                        sys.exit(78)
-                if agent_ready:
+                if cli._init_agent(
+                    model_override=turn_route["model"],
+                    runtime_override=turn_route["runtime"],
+                    request_overrides=turn_route.get("request_overrides"),
+                ):
                     _configure_quiet_agent(cli.agent)
                     _run_quiet_single_query(cli, effective_query)
 
