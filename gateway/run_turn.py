@@ -1975,7 +1975,7 @@ class GatewayTurnMixin:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
 
-        adapter = self._adapter_for_source(source)
+        adapter = self._delivery_adapter_for(source)
         _interim_media_payloads = agent_result.get("interim_media_responses") or []
         if (
             adapter

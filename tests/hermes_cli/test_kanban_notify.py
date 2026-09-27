@@ -1,6 +1,6 @@
 import asyncio
 import pytest
-import yaml
+from ruamel.yaml import YAML
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,9 +53,8 @@ _FIXED_NOTIFY_CONFIG = {
 
 
 def _enable_fixed_notify_target(home: Path) -> None:
-    (home / "config.yaml").write_text(
-        yaml.safe_dump(_FIXED_NOTIFY_CONFIG), encoding="utf-8",
-    )
+    with (home / "config.yaml").open("w", encoding="utf-8") as stream:
+        YAML().dump(_FIXED_NOTIFY_CONFIG, stream)
 
 
 def _assert_fixed_notify_sub(sub: dict, *, delivery_mode: str) -> None:

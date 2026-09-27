@@ -1726,7 +1726,7 @@ class GatewayInboundMixin:
                 # ``_enrich_inbound_voice`` preserves, and the upstream entry suite asserts with
                 # echo=True) would silently die. The clip ledger makes it exactly-once.
                 await self._echo_pending_stt_transcripts_once(
-                    event, self._adapter_for_source(source), source, _prepared_transcripts,
+                    event, self._delivery_adapter_for(source), source, _prepared_transcripts,
                     metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
                     log_context="Voice-prepare",
                 )
