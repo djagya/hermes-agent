@@ -478,6 +478,111 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_root_pr_comment_does_not_guard_ready_worker(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ROOT's published-PR evidence must not strand a worker correction run."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    pr_url = "https://github.com/example/repo/pull/123"
+    with kbc.connect() as conn:
+        root_id = kb.create_task(conn, title="continue on ROOT PR", assignee="worker")
+        kb.add_comment(conn, root_id, author="default", body=f"Published {pr_url}")
+        worker_id = kb.create_task(conn, title="worker opened PR", assignee="worker")
+        kb.add_comment(conn, worker_id, author="worker", body=f"Opened {pr_url}")
+
+        assert kbd.check_respawn_guard(conn, root_id) is None
+        assert kbd.check_respawn_guard(conn, worker_id) == "active_pr"
+        result = kbd.dispatch_once(conn, dry_run=True)
+        assert root_id in [row[0] for row in result.spawned]
+        assert (worker_id, "active_pr") in result.respawn_guarded
+
+
+def test_prior_worker_pr_comment_still_guards_after_reassignment(
+    kanban_home: Path,
+) -> None:
+    """Changing the assignee does not erase the original worker's PR signal."""
+    pr_url = "https://github.com/example/repo/pull/123"
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="continue", assignee="first-worker")
+        assert kb.claim_task(conn, tid) is not None
+        kb.add_comment(conn, tid, author="default", body=f"ROOT published {pr_url}")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee = ? WHERE id = ?",
+                ("second-worker", tid),
+            )
+        assert kbd.check_respawn_guard(conn, tid) is None
+        kb.add_comment(conn, tid, author="first-worker", body=f"Opened {pr_url}")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_unblock_is_one_shot_after_latest_worker_comment(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda _name: True)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="PR follow-up", assignee="worker")
+        pr = "https://github.com/example/repo/pull/123"
+        kb.add_comment(conn, tid, author="worker", body=pr)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        assert kb.block_task(conn, tid, reason="operator hold", kind="needs_input")
+        assert kb.unblock_task(conn, tid)
+        # Force a timestamp tie: event ids, not second-resolution clocks,
+        # determine whether the explicit signal followed the comment.
+        conn.execute(
+            "UPDATE task_events SET created_at = "
+            "(SELECT created_at FROM task_comments WHERE task_id = ? LIMIT 1) "
+            "WHERE task_id = ? AND kind = 'unblocked'", (tid, tid),
+        )
+        assert kbd.check_respawn_guard(conn, tid) is None
+        dispatched = kbd.dispatch_once(conn, dry_run=True)
+        assert tid in [item[0] for item in dispatched.spawned]
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.reclaim_task(conn, tid, reason="crash retry", signal_fn=lambda *_: None)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        # Automatic status churn is not a second operator authorization.
+        for kind in ("promoted", "reclaimed", "status"):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, created_at) "
+                "VALUES (?, ?, strftime('%s','now'))", (tid, kind),
+            )
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        assert kb.block_task(conn, tid, reason="another hold", kind="transient")
+        assert kb.unblock_task(conn, tid)
+        assert kbd.check_respawn_guard(conn, tid) is None
+        kb.add_comment(conn, tid, author="worker", body=pr)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_legacy_comment_unblock_tie_is_conservative(
+    kanban_home: Path,
+) -> None:
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="legacy PR follow-up", assignee="worker")
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="https://github.com/example/repo/pull/123",
+        )
+        # Prior releases had commented events without a comment_id link.
+        conn.execute(
+            "UPDATE task_events SET payload = '{}' "
+            "WHERE task_id = ? AND kind = 'commented'", (tid,),
+        )
+        assert kb.block_task(conn, tid, reason="operator hold", kind="needs_input")
+        assert kb.unblock_task(conn, tid)
+        conn.execute(
+            "UPDATE task_events SET created_at = "
+            "(SELECT created_at FROM task_comments WHERE task_id = ? LIMIT 1) "
+            "WHERE task_id = ? AND kind = 'unblocked'", (tid, tid),
+        )
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
