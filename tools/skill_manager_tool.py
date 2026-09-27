@@ -573,7 +573,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     found = _find_skill(name)
     if found:
         with suppress(OSError):
-            existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
+            existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8-sig")
     content, author_error = apply_local_author_policy("edit", name, content, existing=existing)
     if author_error:
         return _err(author_error)
@@ -713,7 +713,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         skill_md = skill_dir / "SKILL.md"
         if skill_md.exists():
             with suppress(OSError):
-                existing = skill_md.read_text(encoding="utf-8")
+                existing = skill_md.read_text(encoding="utf-8-sig")
         file_content, author_error = apply_local_author_policy(
             "edit" if existing else "create", name, file_content, existing=existing)
         if author_error:
@@ -1164,7 +1164,7 @@ def skill_manage(
         found = _find_skill(name)
         if found:
             with suppress(OSError):
-                existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
+                existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8-sig")
         content, author_error = apply_local_author_policy(action, name, content, existing=existing)
         if author_error:
             return tool_error(author_error, success=False)
@@ -1173,7 +1173,7 @@ def skill_manage(
         found = _find_skill(name)
         if found:
             with suppress(OSError):
-                existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8")
+                existing = (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8-sig")
         file_content, author_error = apply_local_author_policy(
             "edit" if existing else "create", name, file_content, existing=existing)
         if author_error:

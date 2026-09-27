@@ -76,7 +76,7 @@ def find_unguarded_larger_runners(root: Path) -> list[str]:
 
     failures: list[str] = []
     for path in sorted(workflow_dir.glob("*.yml")) + sorted(workflow_dir.glob("*.yaml")):
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
         rel = path.relative_to(root).as_posix()
         for job_id, job_text in _job_blocks(text):
             labels = sorted(set(LARGE_RUNNER.findall(job_text)))

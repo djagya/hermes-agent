@@ -1112,7 +1112,8 @@ class SessionSchemaMixin:
             # Detach + LIKE. Do not recover (that path drop-recreates FTS).
             self._fts_enabled = self._trigram_available = self._fts_cjk_available = False
             return
-        self._migrate_bounded_tool_fts_triggers(cursor, legacy=legacy_fts)
+        # Do not revive the retired high-water trigger migration: the fork
+        # fences live FTS rebuilds, and this path only repairs existing DDL.
         base_sql, trigram_sql = _FTS_DDL[legacy_fts]
         # Hoist ensure on every non-stale path. Skipping admitted rebuild
         # without this leaves an empty FTS family while postcheck stays green.

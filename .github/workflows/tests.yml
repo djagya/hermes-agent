@@ -138,7 +138,8 @@ jobs:
         # Each slice job discovers the plan's roots itself and runs only its
         # own duration-balanced slice — no pre-computed file lists.
         run: |
-          source .venv/bin/activate
+          # setup-pm exports HERMES_PYTHON from its isolated test environment;
+          # it does not create a checkout-local .venv.
           scripts/run_tests.sh --slice "${{ matrix.slice }}"
         env:
           # Discovery roots resolved by the plan job (full scope: "tests").
