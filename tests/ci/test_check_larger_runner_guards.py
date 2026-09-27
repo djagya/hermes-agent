@@ -78,6 +78,37 @@ def test_nous_guard_allows_larger_runner(tmp_path: Path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_fork_fallback_preserves_upstream_runner(tmp_path: Path):
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "tests.yml").write_text(
+        "jobs:\n"
+        "  tests:\n"
+        "    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}\n",
+        encoding="utf-8",
+    )
+    assert _run(tmp_path).returncode == 0
+
+
+def test_one_guarded_occurrence_does_not_mask_unguarded_matrix_row(tmp_path: Path):
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "tests.yml").write_text(
+        "jobs:\n"
+        "  tests:\n"
+        "    runs-on: ${{ matrix.runner }}\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        include:\n"
+        "          - runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}\n"
+        "          - runner: ubuntu-latest-32-core\n",
+        encoding="utf-8",
+    )
+    result = _run(tmp_path)
+    assert result.returncode == 1
+    assert "ubuntu-latest-32-core" in result.stdout
+
+
 def test_standard_runners_pass(tmp_path: Path):
     workflows = tmp_path / ".github" / "workflows"
     workflows.mkdir(parents=True)
