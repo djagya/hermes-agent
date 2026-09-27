@@ -228,6 +228,20 @@ exa = ["exa-py==2.10.2"]
 firecrawl = ["firecrawl-py==4.17.0"]
 parallel-web = ["parallel-web==0.4.2"]
 ddgs = ["ddgs==9.16.0"]
+# Production image toolbox: Docker selects this extra explicitly, not [all].
+# Reuse existing opt-in pins for search, image generation and STT; pillow_heif
+# is already in core. Ruff is otherwise only in the excluded dev group.
+sera-toolbox = [
+  "hermes-agent[ddgs]",
+  "hermes-agent[fal]",
+  "hermes-agent[stt-whisper]",
+  "PyMuPDF==1.25.5",
+  "weasyprint==69.0",
+  "python-docx==1.2.0",
+  "openpyxl==3.1.5",
+  "yt-dlp==2026.08.19",
+  "ruff==0.15.10",
+]
 # Image generation backends
 fal = ["fal-client==0.13.1"]
 # Edge TTS — default TTS provider but still optional (users can pick
