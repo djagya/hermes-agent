@@ -471,6 +471,10 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "assignee's profile."
             ),
         },
+        "required_skills": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Mandatory skill names; unavailable skills block the task as capability.",
+        },
         "goal_mode": _prop("boolean", (
                 "Run the dispatched worker in a goal loop. When true, "
                 "after each turn an auxiliary judge checks the worker's "
