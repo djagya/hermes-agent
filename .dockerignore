@@ -120,6 +120,7 @@ plans/
 .mailmap
 
 # Debug/export artifacts — must never reach image layers (COPY . .)
+/artifacts/
 /log.txt
 /sqlite_leak_fix.png
 /*.png.bak
