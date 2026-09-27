@@ -1,0 +1,16 @@
+# Upstream integration impact — local candidate
+
+Frozen parents: fork `8a237660c2fb70895ac0ea1c64ef66d8bbd2968f`; upstream `6f7a7991bb069db07ae74a479823ce8310f8c7e0`. The upstream compaction fix `55a93d8f70` is reachable from the latter; the cancelled duplicate lane produced nothing.
+
+| Surface | Material deployment impact | Remaining proof |
+|---|---|---|
+| Kanban | Fork typed operator holds, attested transitions and fixed notify targets retained. Upstream ownership gate makes guidance dispatcher-only even if interactive Kanban tools are available. Fixed-target notification still does not automatically return to originating conversation. | CI: Kanban tool exposure, task recovery, notification routing. Product decision for any future dual route is out of scope. |
+| Telegram/gateway | Group admission and busy-turn supersession/transcript contracts reconciled with upstream platform methods. | CI focused gateway/Telegram and background notification tests. No live gateway action. |
+| Browser slots | Fork CDP/session ownership and supervisor behavior retained alongside upstream slot lifecycle changes. | CI focused browser slot/supervisor tests. |
+| Cron/delegation | Monitor runtime data uses distinct injection boundary; monitor hash commits after setup gate. Referenced-script lifecycle scanner combines fork typed refusal and upstream budgeted traversal. | CI cron monitor/lifecycle and delegation cancellation tests; no local runners. |
+| Approvals/security | One-shot staged-write identity and digest checks retained; approved memory edits check target bytes and full matched entry. Skill mutation locks serialize across queued replay and direct writes. | CI stale-write, concurrency, memory/skill, OnePassword and profile-isolation regressions. |
+| s6/container | Upstream SQLite fix, PM sealed toolchain, s6 boot and Bot Screen image variant; fork toolbox commands/wrappers kept where compatible. Fork test target retains fixtures, pinned himalaya and GHCR provenance while upstream publishers select runtime. Old raw installer overlay removed. | **Known missing sealed Python toolbox packages:** `pymupdf`, `weasyprint`, `python-docx`, `openpyxl`, `yt-dlp` absent from merged lock; fork smoke expects imports. ROOT must decide on lock-backed Docker toolbox extra or intentional contract retirement before CI/build acceptance. No local Docker/s6. |
+| Config/state migrations | Upstream config/profile and state/FTS migrations layered over fork durable schema decisions; declared Python compatibility now `<3.15`. | Exact-head CI migration and profile A→B→A targets. |
+| Release/build | Fork GHCR path and selective CI checks combined with upstream reusable release gate and strict release skips; version remains fork `0.21.4`, upstream lock graph and npm workspace lock selected. | Exact-head CI lock consistency, frontend/install and publish dry-run only; ROOT owns publication, no push or release performed here. |
+
+Evidence is currently implementation plus local static analysis only; no test PASS is claimed without an external exact-head CI receipt. See `upstream-sync-conflict-ledger.md` for all 66 path-level decisions and limitations.

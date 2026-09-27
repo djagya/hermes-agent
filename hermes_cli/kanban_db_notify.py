@@ -183,7 +183,9 @@ def add_notify_sub(
     omitting it would key the wake into a different session. ``None`` keeps an
     existing row's value. ``delivery_mode``: ``None`` leaves an existing row
     untouched, an explicit valid value is last-write-wins, unknown falls back
-    to ``"notify"``. New subs start caught up (``last_event_id`` =
+    to ``"notify"``. ``delivery_metadata`` merges supplied routing anchors
+    into an existing row so re-subscribing never discards them. New subs start
+    caught up (``last_event_id`` =
     ``MAX(task_events.id)``) so the notifier never replays history at boot.
 
     When ``kanban.fixed_notify_target`` is enabled, caller-supplied routing is

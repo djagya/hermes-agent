@@ -47,7 +47,7 @@ DEFAULT = {
     "deps": True,
     "uv_lock": True,
     "npm_lock": True,
-    "installer": True,
+    "bootstrap": True,
     "desktop_updater": True,
     "rust": True,
     "mcp_catalog": False,
@@ -96,7 +96,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "deps": deps,
         "uv_lock": uv_lock,
         "npm_lock": npm_lock,
-        "installer": installer,
+        "bootstrap": bootstrap,
         "desktop_updater": desktop_updater,
         "rust": rust,
         "mcp_catalog": mcp_catalog,
@@ -111,6 +111,8 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
 
 
 CASES = {
+    "shared JS builder → frontend": (["scripts/build/web.mjs"], _lanes(python=True, frontend=True)),
+    "root JS tests → frontend": (["tests-js/product-builders.test.mjs"], _lanes(python=True, frontend=True)),
     "docs-only → nothing heavy": (["README.md", "docs/guide.md"], _lanes()),
     "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
     # pyproject.toml declares the pytest markers the OS lanes select on, so it
@@ -275,12 +277,18 @@ CASES = {
         ["tests/conftest.py"],
         _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, os_tests=True),
     ),
+    "conftest fixture module → python + desktop_updater": (
+        ["tests/_fixtures/platform_gating.py"],
+        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True),
+    ),
     "tests + prod source → both lanes": (
         ["tests/agent/test_foo.py", "agent/x.py"],
         _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/agent/test_foo.py"], ["tests/agent/test_x*.py", "tests/test_x*.py", "tests/agent/"]]),
     ),
     # Runner infrastructure is NOT tests-only — a bad runner edit can mask
-    # real failures, so it keeps the conservative full lane set.
+    # real failures, so it keeps the conservative full lane set. The .py
+    # runner additionally trips the supply-chain scan lane (executable
+    # .py/.pth payloads are what it scans for).
     "test runner script → python_prod stays on": (
         ["scripts/run_tests_parallel.py"],
         _lanes(python=True, scan=True, os_tests=True),
@@ -361,6 +369,20 @@ CASES = {
         [".github/workflows/typecheck.yml"],
         DEFAULT,
     ),
+    # The bootstrap installer lane: shell installer, dev-checkout wrapper,
+    # and the Tauri app's non-Rust sources.
+    "install.sh → bootstrap lane": (
+        ["scripts/install.sh"],
+        _lanes(python=True, bootstrap=True, python_prod=True),
+    ),
+    "setup-hermes.sh → bootstrap lane": (
+        ["setup-hermes.sh"],
+        _lanes(python=True, bootstrap=True, python_prod=True),
+    ),
+    "tauri installer source → bootstrap + rust": (
+        ["apps/bootstrap-installer/src-tauri/src/lib.rs"],
+        _lanes(frontend=True, bootstrap=True, rust=True),
+    ),
     "composite action → ci_review (also fail-open all)": (
         [".github/actions/retry/action.yml"],
         DEFAULT,
@@ -387,7 +409,7 @@ _REPO = Path(__file__).resolve().parents[2]
 
 
 def _yaml(rel: str) -> dict:
-    yaml = pytest.importorskip("yaml")
+    yaml = pytest.importorskip("hermes_yaml")
     return yaml.safe_load((_REPO / rel).read_text(encoding="utf-8"))
 
 

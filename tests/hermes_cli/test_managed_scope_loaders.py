@@ -70,7 +70,11 @@ def test_gateway_env_bridge_honors_user_then_seed(homes):
     home, managed = homes
     _seed(home, managed, user="timezone: America/New_York\n", mgd="timezone: Asia/Tokyo\n")
     from hermes_cli import managed_scope
-    import yaml
+
+    managed_scope.invalidate_managed_cache()
+    # The bridge loads config.yaml, expands env, then applies this overlay before
+    # writing HERMES_TIMEZONE = cfg["timezone"]. Prove the overlay flips the value.
+    import hermes_yaml as yaml
 
     managed_scope.invalidate_managed_cache()
     raw = yaml.safe_load((home / "config.yaml").read_text())

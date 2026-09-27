@@ -61,23 +61,38 @@ def load_on_disk_store() -> "MemoryStore":
     store.load_from_disk()
     return store
 
-
 def _build_memory_write_guard(store: "MemoryStore", target: str) -> Dict[str, Any]:
-    """Snapshot the exact target bytes under the store's mutation lock."""
+    """Snapshot exact target bytes under the store's mutation lock."""
     path = store._path_for(target)
     with store._file_lock(path):
         try:
-            if path.exists():
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            else:
-                digest = "ABSENT"
-        except (OSError, IOError) as exc:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "ABSENT"
+        except OSError as exc:
             raise RuntimeError(f"Cannot stage memory write from unreadable target: {path}") from exc
     return {"target": target, "expected_sha256": digest}
 
 
-def _gate_or_stage(summary: str, detail: str, payload: Dict[str, Any],
-                   store: "MemoryStore") -> Optional[str]:
+def _pin_matched_entries(store: "MemoryStore", payload: Dict[str, Any]) -> Optional[str]:
+    """Record on each staged replace/remove the FULL entry its old_text selects now. Approval
+    then applies to exactly the entry the approver reviewed and refuses if it changed:
+    re-running the old_text search at approve time could hit a newer entry that still
+    contains it. Returns the JSON error when the search fails now, as the direct write would."""
+    target = payload.get("target", "memory")
+    if payload.get("action") == "batch":
+        result = store.resolve_batch_entries(target, payload["operations"])
+        if result.get("success"):
+            payload["operations"] = [op if entry is None else {**op, "matched_entry": entry}
+                                     for op, entry in zip(payload["operations"], result["matched_entries"])]
+    elif payload.get("action") in _BG_DELETE_ACTIONS:
+        result = store.resolve_entry(target, payload.get("old_text") or "", payload["action"])
+        if result.get("success"):
+            payload["matched_entry"] = result["matched_entry"]
+    else:
+        return None
+    return None if result.get("success") else json.dumps(result, ensure_ascii=False)
+
+
+def _gate_or_stage(store: "MemoryStore", summary: str, detail: str, payload: Dict[str, Any]) -> Optional[str]:
     """JSON tool-result string when the write must NOT proceed (blocked or staged
     for approval), None to proceed. Fails open if the gate module can't load."""
     try:
@@ -89,6 +104,8 @@ def _gate_or_stage(summary: str, detail: str, payload: Dict[str, Any],
         return None
     if decision.blocked:
         return tool_error(decision.message, success=False)
+    if (unmatched := _pin_matched_entries(store, payload)) is not None:
+        return unmatched
     payload = dict(payload)
     payload["_write_guard"] = _build_memory_write_guard(store, payload.get("target", "memory"))
     record = wa.stage_write(wa.MEMORY, payload, summary=f"{summary}: {detail[:120]}", origin=wa.current_origin())
@@ -98,11 +115,12 @@ def _gate_or_stage(summary: str, detail: str, payload: Dict[str, Any],
 
 # action -> (store call, gate (summary, detail) text) for the live tool path and staged replay.
 _STORE_ACTIONS = {
-    "add": (lambda store, target, content, old_text: store.add(target, content),
+    "add": (lambda store, target, content, old_text, entry=None, **kw: store.add(target, content, **kw),
             lambda label, content, old_text: (f"add to {label}", content or "")),
-    "replace": (lambda store, target, content, old_text: store.replace(target, old_text, content),
-                lambda label, content, old_text: (f"replace in {label}", f"old: {old_text}\nnew: {content}")),
-    "remove": (lambda store, target, content, old_text: store.remove(target, old_text),
+    "replace": (lambda store, target, content, old_text, entry=None, **kw: store.replace(target, old_text, content, entry, **kw),
+                lambda label, content, old_text: (f"replace in {label}",
+                                                  f"entry matching: {old_text}\nwhole entry becomes: {content}")),
+    "remove": (lambda store, target, content, old_text, entry=None, **kw: store.remove(target, old_text, entry, **kw),
                lambda label, content, old_text: (f"remove from {label}", old_text or ""))}
 
 
@@ -111,24 +129,23 @@ def _batch_op_line(op: Dict[str, Any]) -> str:
     act, content, old = op.get("action", "?"), op.get("content") or op.get("new_text") or "", op.get("old_text", "")
     if act == "remove":
         return f"- remove: {old}"
-    return f"- replace: {old} -> {content}" if act == "replace" else f"- {act}: {content}"
+    # Whole-entry contract (#117952): the approver must not read this as a span patch.
+    return (f"- replace entry matching '{old}' -> whole entry becomes: {content}" if act == "replace"
+            else f"- {act}: {content}")
 
 
-def _apply_write_gate(action: str, target: str, content: Optional[str], old_text: Optional[str],
-                      operations: Optional[List[Dict[str, Any]]] = None,
-                      store: Optional["MemoryStore"] = None) -> Optional[str]:
+def _apply_write_gate(store: "MemoryStore", action: str, target: str, content: Optional[str],
+                      old_text: Optional[str], operations: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
     """Gate one mutating op, or (``operations`` set) a whole batch as a single unit."""
     if store is None:
         return tool_error("Memory store unavailable for write approval.", success=False)
     label = "user profile" if target == "user" else "memory"
     if operations is not None:
-        return _gate_or_stage(f"apply {len(operations)} op(s) to {label}",
+        return _gate_or_stage(store, f"apply {len(operations)} op(s) to {label}",
                               "\n".join(_batch_op_line(op) for op in operations),
-                              {"action": "batch", "target": target, "operations": operations},
-                              store)
-    return _gate_or_stage(*_STORE_ACTIONS[action][1](label, content, old_text),
-                          {"action": action, "target": target, "content": content, "old_text": old_text},
-                          store)
+                              {"action": "batch", "target": target, "operations": operations})
+    return _gate_or_stage(store, *_STORE_ACTIONS[action][1](label, content, old_text),
+                          {"action": action, "target": target, "content": content, "old_text": old_text})
 
 
 def _validate_single_op(store, action, target, content, old_text) -> Optional[str]:
@@ -138,11 +155,14 @@ def _validate_single_op(store, action, target, content, old_text) -> Optional[st
     if action == "add" and not content:
         return tool_error("Content is required for 'add' action.", success=False)
     if action in ("replace", "remove") and not old_text:
+        replace_hint = (" For 'replace', content is the COMPLETE new entry -- the whole "
+                        "matched entry is overwritten, not just the old_text span."
+                        if action == "replace" else "")
         return json.dumps({
             "success": False,
             "error": (f"'{action}' needs old_text -- a short unique substring of the entry "
                       f"to {action}. None was provided. Reissue the {action} with old_text "
-                      f"set to part of one of the current_entries below."),
+                      f"set to part of one of the current_entries below.{replace_hint}"),
             "current_entries": store._entries_for(target), "usage": store._usage(target)}, ensure_ascii=False)
     if action == "replace" and not content:
         return tool_error("content is required for 'replace' action.", success=False)
@@ -152,8 +172,14 @@ def _validate_single_op(store, action, target, content, old_text) -> Optional[st
 _BG_DELETE_ACTIONS = ("replace", "remove")
 
 
-def _background_delete_gate(action, operations, target="memory", content=None, old_text=None,
-                            store=None) -> Optional[str]:
+def destructive_ops(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The replace/remove ops of a staged memory payload, single-op or batch shape."""
+    ops = (payload.get("operations") or []) if payload.get("action") == "batch" else [payload]
+    return [op for op in ops if (op or {}).get("action") in _BG_DELETE_ACTIONS]
+
+
+def _background_delete_gate(store, action, operations, target="memory", content=None,
+                            old_text=None) -> Optional[str]:
     """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
     stays available (it is all any review prompt asks for), while ``replace``/``remove`` —
     single or inside a batch — are never applied unattended. The op is staged in the pending
@@ -164,16 +190,16 @@ def _background_delete_gate(action, operations, target="memory", content=None, o
 
     if not is_unattended_review():
         return None
-    hit = action in _BG_DELETE_ACTIONS or any(
-        isinstance(op, dict) and op.get("action") in _BG_DELETE_ACTIONS for op in (operations or []))
-    if not hit:
-        return None
     payload = ({"action": "batch", "target": target, "operations": operations}
                if operations is not None else
                {"action": action, "target": target, "content": content, "old_text": old_text})
+    if not destructive_ops(payload):
+        return None
     detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
               else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
     try:
+        if (unmatched := _pin_matched_entries(store, payload)) is not None:
+            return unmatched
         from tools import write_approval as wa
         if store is not None:
             payload["_write_guard"] = _build_memory_write_guard(store, target)
@@ -200,7 +226,8 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
                 store: Optional[MemoryStore] = None) -> str:
     """Tool entry point; returns a JSON string. Single op (action + content/old_text)
     or batch (``operations``, atomic against the final budget). ``new_text``
-    aliases ``content`` — callers mirror ``old_text`` with it (patch-tool shape)."""
+    aliases ``content`` -- for 'replace' both mean the COMPLETE new entry (the
+    whole matched entry is overwritten; old_text only locates it)."""
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
     if content is None and new_text is not None:
@@ -213,19 +240,19 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        denied = _background_delete_gate(action, operations, target, store=store)
+        denied = _background_delete_gate(store, action, operations, target)
         if denied is not None:
             return denied
         # Approval gate: stages (background/gateway) or prompts inline (CLI); off by default.
-        gate_result = _apply_write_gate("batch", target, None, None, operations, store=store)
+        gate_result = _apply_write_gate(store, "batch", target, None, None, operations)
         if gate_result is not None:
             return gate_result
         return json.dumps(store.apply_batch(target, operations), ensure_ascii=False)
     if action not in _STORE_ACTIONS:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
     invalid = (_validate_single_op(store, action, target, content, old_text)
-               or _background_delete_gate(action, None, target, content, old_text, store=store)
-               or _apply_write_gate(action, target, content, old_text, store=store))
+               or _background_delete_gate(store, action, None, target, content, old_text)
+               or _apply_write_gate(store, action, target, content, old_text))
     if invalid is not None:
         return invalid
     return json.dumps(_STORE_ACTIONS[action][0](store, target, content, old_text), ensure_ascii=False)
@@ -273,63 +300,30 @@ def _memory_target_error(store: "MemoryStore", target: str) -> Optional[Dict[str
 
 
 def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
-    """Replay a staged write against the store, bypassing the gate (/memory approve)."""
+    """Replay a staged write against the store, bypassing the gate (/memory approve). A
+    replace/remove applies to exactly its pinned ``matched_entry`` or is refused; a record
+    staged before pinning has no verifiable target, so it is refused rather than replayed by
+    old_text (which could hit a newer entry the approver never saw)."""
     action, target = payload.get("action"), payload.get("target", "memory")
     target_error = _memory_target_error(store, target)
     if target_error is not None:
         return target_error
+    if any(not op.get("matched_entry") for op in destructive_ops(payload)):
+        return {"success": False, "error": "This destructive pending write predates entry pinning and cannot be "
+                                           "verified; nothing was applied. Reject it and recreate the change."}
     guard = payload.get("_write_guard")
-    if not isinstance(guard, dict):
-        return {
-            "success": False,
-            "error": "Pending memory write has no base-state guard; inspect and restage it.",
-            "target": target,
-        }
-    if guard.get("target") != target:
-        return {
-            "success": False,
-            "error": "Pending memory write guard targets a different store; inspect and restage it.",
-            "target": target,
-        }
-    expected_sha256 = guard.get("expected_sha256")
-    if not (
-        expected_sha256 == "ABSENT"
-        or (
-            isinstance(expected_sha256, str)
-            and len(expected_sha256) == 64
-            and all(char in "0123456789abcdef" for char in expected_sha256)
-        )
-    ):
-        return {
-            "success": False,
-            "error": "Pending memory write has a malformed base-state guard; inspect and restage it.",
-            "target": target,
-        }
-    guard_error = store._pending_guard_error(target, expected_sha256)
-    if guard_error is not None:
-        return guard_error
-    content = payload.get("content") or ""
-    old_text = payload.get("old_text") or ""
-    if action not in {"add", "replace", "remove", "batch"}:
-        return {"success": False, "error": f"Unknown staged action '{action}'.", "target": target}
-    from tools import write_approval as wa
-    if not wa.consume_pending_apply_capability(wa.MEMORY, payload):
-        return {
-            "success": False,
-            "error": "Pending memory write must be applied through its live approval record.",
-            "target": target,
-        }
+    if not isinstance(guard, dict) or guard.get("target") != target:
+        return {"success": False, "error": "Pending memory write has no valid base-state guard; inspect and restage it."}
+    digest = guard.get("expected_sha256")
+    if not (digest == "ABSENT" or isinstance(digest, str) and len(digest) == 64
+            and all(char in "0123456789abcdef" for char in digest)):
+        return {"success": False, "error": "Pending memory write has a malformed base-state guard; inspect and restage it."}
     if action == "batch":
-        return store.apply_batch(
-            target, payload.get("operations") or [], expected_sha256=expected_sha256
-        )
-    if action == "add":
-        return store.add(target, content, expected_sha256=expected_sha256)
-    if action == "replace":
-        return store.replace(target, old_text, content, expected_sha256=expected_sha256)
-    if action == "remove":
-        return store.remove(target, old_text, expected_sha256=expected_sha256)
-    raise AssertionError("validated staged memory action was not dispatched")
+        return store.apply_batch(target, payload.get("operations") or [], expected_sha256=digest)
+    if action not in _STORE_ACTIONS:
+        return {"success": False, "error": f"Unknown staged action '{action}'."}
+    return _STORE_ACTIONS[action][0](store, target, payload.get("content") or "", payload.get("old_text") or "",
+                                     payload.get("matched_entry"), expected_sha256=digest)
 
 
 MEMORY_SCHEMA = {
@@ -373,15 +367,15 @@ MEMORY_SCHEMA = {
             },
             "content": {
                 "type": "string",
-                "description": "The entry content. Required for 'add' and 'replace' (single-op shape). Alias: 'new_text' is also accepted (mirrors old_text)."
+                "description": "The entry content. Required for 'add' and 'replace'. For 'replace' it is the COMPLETE new entry text: the whole matched entry is overwritten, so include everything you want to keep. Alias: 'new_text' is also accepted (same full-entry meaning)."
             },
             "old_text": {
                 "type": "string",
-                "description": "REQUIRED for 'replace' and 'remove' (single-op shape): a short unique substring identifying the existing entry to modify. Omit only for 'add'."
+                "description": "REQUIRED for 'replace' and 'remove' (single-op shape): a short unique substring IDENTIFYING the existing entry to modify -- it locates the entry, it is not spliced out. Omit only for 'add'."
             },
             "new_text": {
                 "type": "string",
-                "description": "Alias for 'content' (single-op shape). Provided so the replace/remove old_text/new_text pairing works; if both are set, 'content' wins."
+                "description": "Alias for 'content' (single-op shape): the COMPLETE new entry for 'replace', not a patch of old_text. If both are set, 'content' wins."
             },
             "operations": {
                 "type": "array",
@@ -394,7 +388,7 @@ MEMORY_SCHEMA = {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["add", "replace", "remove"]},
-                        "content": {"type": "string", "description": "Entry content for add/replace. Alias: 'new_text'."},
+                        "content": {"type": "string", "description": "Entry content for add/replace. For replace, the COMPLETE new entry (whole entry is overwritten). Alias: 'new_text'."},
                         "new_text": {"type": "string", "description": "Alias for 'content' in a batch op."},
                         "old_text": {"type": "string", "description": "Substring identifying the entry for replace/remove."},
                     },

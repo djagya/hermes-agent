@@ -1008,7 +1008,9 @@ def _prompt_inline_memory_approval(summary: str, detail: str) -> Optional[bool]:
     # silently refuse the write. Direct invocation lets a crashed prompt fall
     # back to staging (the gate only ever delays a write, never drops it).
     try:
-        choice = callback(command, description, allow_permanent=False)
+        from tools.approval_prompt import callback_accepts
+        extra = {"title": "Save to memory?"} if callback_accepts(callback, "title") else {}
+        choice = callback(detail.strip() or header, f"Save to memory: {header}", allow_permanent=False, **extra)
     except Exception as e:
         logger.error("Inline memory approval prompt failed: %s", e)
         return None
