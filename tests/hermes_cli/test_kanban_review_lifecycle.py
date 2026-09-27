@@ -478,6 +478,46 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_root_pr_comment_does_not_guard_ready_worker(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ROOT's published-PR evidence must not strand a worker correction run."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    pr_url = "https://github.com/example/repo/pull/123"
+    with kbc.connect() as conn:
+        root_id = kb.create_task(conn, title="continue on ROOT PR", assignee="worker")
+        kb.add_comment(conn, root_id, author="default", body=f"Published {pr_url}")
+        worker_id = kb.create_task(conn, title="worker opened PR", assignee="worker")
+        kb.add_comment(conn, worker_id, author="worker", body=f"Opened {pr_url}")
+
+        assert kbd.check_respawn_guard(conn, root_id) is None
+        assert kbd.check_respawn_guard(conn, worker_id) == "active_pr"
+        result = kbd.dispatch_once(conn, dry_run=True)
+        assert root_id in [row[0] for row in result.spawned]
+        assert (worker_id, "active_pr") in result.respawn_guarded
+
+
+def test_prior_worker_pr_comment_still_guards_after_reassignment(
+    kanban_home: Path,
+) -> None:
+    """Changing the assignee does not erase the original worker's PR signal."""
+    pr_url = "https://github.com/example/repo/pull/123"
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="continue", assignee="first-worker")
+        assert kb.claim_task(conn, tid) is not None
+        kb.add_comment(conn, tid, author="default", body=f"ROOT published {pr_url}")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee = ? WHERE id = ?",
+                ("second-worker", tid),
+            )
+        assert kbd.check_respawn_guard(conn, tid) is None
+        kb.add_comment(conn, tid, author="first-worker", body=f"Opened {pr_url}")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
