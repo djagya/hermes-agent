@@ -143,9 +143,9 @@ def test_inconclusive_refusal_message_does_not_claim_lifecycle(tmp_path):
     with pytest.raises(lifecycle_guard.GatewayLifecycleBlocked) as excinfo:
         lifecycle_guard.check_gateway_lifecycle(f"bash {huge}")
     message = str(excinfo.value)
-    assert "could not be scanned" in message
-    assert "no lifecycle command was found" in message
-    assert "gateway lifecycle command" not in message
+    assert "could not scan" in message
+    assert "Nothing in the job is known to contain a gateway lifecycle command" in message
+    assert "cron job contains a gateway lifecycle command" not in message
 
 
 def test_observed_lifecycle_refusal_message_keeps_meaning():

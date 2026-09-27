@@ -1392,29 +1392,17 @@ class TestGatewaySessionDbRecovery:
             RuntimeError("gifts received")
         )
 
-    def test_rebuild_fts_once_retries_after_cooldown(self, monkeypatch):
-        """A deferred/failed rebuild must not disable recovery for the process lifetime
-        (#114266): blocked inside the cooldown, retried once it elapses. A call with no usable
-        DB attempts nothing and so must not start the cooldown."""
+    def test_rebuild_fts_once_never_rebuilds_live_index(self):
+        """FTS corruption must not trigger a live rebuild, even on a later retry."""
         from types import SimpleNamespace
-        clock = {"now": 1000.0}
-        monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
         rebuild_calls = []
         store = object.__new__(SessionStore)
-        store._fts_rebuild_last_attempt_at = None
         store._db = None
         assert store._rebuild_fts_once() is False
-        assert store._fts_rebuild_last_attempt_at is None  # no attempt, no cooldown
-
-        store._db = SimpleNamespace(rebuild_fts=lambda: rebuild_calls.append(clock["now"]) or 0)
-        assert store._rebuild_fts_once() is False  # deferred (0 indexes rebuilt)
-        clock["now"] += store._FTS_REBUILD_COOLDOWN_SECONDS - 1
+        store._db = SimpleNamespace(rebuild_fts=lambda: rebuild_calls.append(True) or 1)
         assert store._rebuild_fts_once() is False
-        assert len(rebuild_calls) == 1  # still cooling down: no second attempt
-        clock["now"] += 2
-        store._db = SimpleNamespace(rebuild_fts=lambda: rebuild_calls.append(clock["now"]) or 1)
-        assert store._rebuild_fts_once() is True
-        assert len(rebuild_calls) == 2
+        assert store._rebuild_fts_once() is False
+        assert rebuild_calls == []
 
     def test_transcript_append_failures_escalate_to_error(self, caplog):
         """Repeated append failures on one session escalate WARNING -> ERROR at the threshold so a

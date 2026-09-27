@@ -598,7 +598,9 @@ def _unreadable_reason(path: Path) -> str:
         return f"`{path}` could not be read"
     if not stat.S_ISREG(metadata.st_mode):
         return f"`{path}` is not a regular file"
-    return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget"
+    if metadata.st_size > _MAX_REFERENCED_SCRIPT_BYTES:
+        return f"`{path}` exceeds the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes)"
+    return f"`{path}` exhausted the remaining walk budget"
 
 
 def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) -> bool:
@@ -1152,7 +1154,7 @@ def _contains_unsafe_gateway_action(
     if not budget.charge_text(command):
         return _budget_exhausted(budget, "text", depth) if executed else False
     if _direct_lifecycle_scan(command):
-        return LifecycleScanVerdict(BLOCKED_SCAN, "direct text scan matched a lifecycle command")
+        return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return executed
 
