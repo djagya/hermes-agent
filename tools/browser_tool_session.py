@@ -788,49 +788,39 @@ def _run_browser_command(
     """Run one agent-browser CLI command against the task's session; returns its parsed JSON.
     ``timeout=None`` reads ``browser.command_timeout``; ``_engine_override`` forces an engine
     for this call only (Lightpanda fallback retries with Chrome without touching global state)."""
-    if timeout is None:
-        timeout = _bt._safe_command_timeout()
+    command_timeout: int = timeout if timeout is not None else _bt._safe_command_timeout()
     args = args or []
 
     preflight = _browser_command_preflight()
     if "browser_cmd" not in preflight:
         return preflight
     browser_cmd = preflight["browser_cmd"]
+    engine = "auto"
+    result: Dict[str, Any] = {}
 
-    try:
-        session_info = _get_session_info(task_id)
-    except Exception as e:
-        from tools.browser_control_route import ManagedBrowserError
+    for attempt in range(2):
+        try:
+            session_info = _get_session_info(task_id)
+        except Exception as e:
+            from tools.browser_control_route import ManagedBrowserError
 
-        if isinstance(e, ManagedBrowserError):
-            return {"success": False, "error": str(e)}
-        _bt.logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
-        return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
-    # Cleanup stops the supervisor before closing the backend; keep it stopped.
-    if command != "close" and session_info.get("cdp_url"):
-        _cdp._ensure_cdp_supervisor(task_id)
-
-    # Cloud/CDP: ``--cdp <ws_url>`` (NEVER with --session: agent-browser >=0.13
-    # would create a local browser and silently ignore --cdp). Local: ``--session <name>``.
-    # Engine injection keys off the resolved session backend, not global provider
-    # state: hybrid routing can create a local sidecar while a cloud provider stays configured.
-    engine = _engine_override or _cloud._get_browser_engine()
-    if session_info.get("cdp_url"):
-        backend_args = ["--cdp", session_info["cdp_url"]]
-    else:
-        backend_args = ["--session", session_info["session_name"]]
-        if _cloud._is_headed_mode():
-            backend_args.append("--headed")
-        if engine != "auto" and not _bt._is_camofox_mode():
-            backend_args += ["--engine", engine]
-
-    cmd_parts = _agent_browser_argv(browser_cmd) + backend_args + ["--json", command] + args
-
-    try:
-        result = _spawn_and_collect(task_id, session_info, cmd_parts, command, engine, timeout)
-    except Exception as e:
-        _bt.logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
-        result = {"success": False, "error": str(e)}
+            if isinstance(e, ManagedBrowserError):
+                return {"success": False, "error": str(e)}
+            _bt.logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
+            return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
+        engine, result = run_fenced_pair(session_info, lambda: _dispatch_browser_command(
+            task_id, session_info, browser_cmd, command, args, command_timeout, _engine_override))
+        if result.get("code") == "human_has_control":
+            return result
+        # A protocol-level failure poisons the cached local daemon; recycle it and retry once.
+        # Closing a dead daemon must not spawn a replacement merely to close it.
+        if attempt == 0 and command != "close" and _is_recoverable_local_backend_failure(session_info, result):
+            _bt.logger.warning("browser '%s' failed at the backend level (task=%s, rc=%s); recycling the session "
+                               "and retrying once", command, task_id, result.get("returncode"))
+            _recycle_local_session(task_id, session_info, _prepare_session_socket_dir(session_info["session_name"]),
+                                   f"agent-browser '{command}' exited {result.get('returncode')}")
+            continue
+        break
 
     # Lightpanda automatic Chrome fallback — runs for ALL exit paths (timeout,
     # empty, non-JSON, nonzero rc, parsed).
@@ -838,9 +828,9 @@ def _run_browser_command(
     if fallback_reason:
         _bt.logger.info("Lightpanda fallback: retrying '%s' with Chrome (task=%s): %s", command, task_id, fallback_reason)
         if command == "screenshot":  # separate Chrome session to the same URL
-            fallback_result = _lp._chrome_fallback_screenshot(task_id, args or [], timeout)
+            fallback_result = _lp._chrome_fallback_screenshot(task_id, args or [], command_timeout)
         else:
-            fallback_result = _lp._run_chrome_fallback_command(task_id, command, args, timeout)
+            fallback_result = _lp._run_chrome_fallback_command(task_id, command, args, command_timeout)
         return _lp._annotate_lightpanda_fallback(fallback_result, fallback_reason)
 
     return result
