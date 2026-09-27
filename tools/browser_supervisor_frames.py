@@ -36,6 +36,9 @@ class FrameInfo:
     is_oopif: bool
     cdp_session_id: Optional[str] = None
     name: str = ""
+    # CDP session the OOPIF's Target.attachedToTarget arrived on (its embedder's session). Lets
+    # ``frames_on_origin`` prove a frame hangs under the CURRENT page session, not another tab.
+    attached_via: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {"frame_id": self.frame_id, "url": self.url, "origin": self.origin, "is_oopif": self.is_oopif}
@@ -75,6 +78,7 @@ class FrameTrackingMixin:
                 origin=str(frame.get("securityOrigin") or frame.get("origin") or ""),
                 parent_frame_id=frame.get("parentId") or old.parent_frame_id, is_oopif=old.is_oopif,
                 cdp_session_id=old.cdp_session_id, name=str(frame.get("name") or old.name),
+                attached_via=old.attached_via,
             )
 
     def _on_frame_detached(self, params: Dict[str, Any], session_id: Optional[str]) -> None:
@@ -105,6 +109,7 @@ class FrameTrackingMixin:
                 self._frames[target_id] = FrameInfo(
                     frame_id=target_id, url=str(info.get("url") or ""), origin="", is_oopif=True, cdp_session_id=sid,
                     parent_frame_id=old.parent_frame_id if old else None, name=str(info.get("title") or (old.name if old else "")),
+                    attached_via=session_id,
                 )
         # Enable child domains off-loop: awaiting the replies here would deadlock
         # because only the reader can resolve those Futures.
@@ -128,6 +133,39 @@ class FrameTrackingMixin:
         with self._state_lock:
             self._frames.update({fid: replace(f, cdp_session_id=None) for fid, f in self._frames.items()
                                  if f.cdp_session_id == sid})
+
+    def _frame_under_page_locked(self, frame: FrameInfo, page_session_id: Optional[str]) -> bool:
+        """True when ``frame`` is an attached OOPIF whose chain of embedder sessions reaches
+        ``page_session_id`` (must hold state lock). Nested OOPIFs walk through their parent OOPIF's session."""
+        if not (page_session_id and frame.is_oopif and frame.cdp_session_id):
+            return False
+        by_session = {f.cdp_session_id: f for f in self._frames.values() if f.is_oopif and f.cdp_session_id}
+        sid, seen = frame.attached_via, set()
+        while sid and sid not in seen:
+            if sid == page_session_id:
+                return True
+            seen.add(sid)
+            parent = by_session.get(sid)
+            sid = parent.attached_via if parent else None
+        return False
+
+    def frames_on_origin(self, origin: str) -> List[Dict[str, Any]]:
+        """Out-of-process frames on exactly ``origin`` (``scheme://host[:port]``) under the current
+        page session, as ``[{"frame_id", "url"}]``. The cached origin only nominates candidates; callers
+        re-assert the live frame origin inside the frame before acting (see ``evaluate_in_frame``)."""
+        from agent.vault_store import normalize_origin
+
+        out: List[Dict[str, Any]] = []
+        with self._state_lock:
+            page_sid = self._page_session_id
+            for f in self._frames.values():
+                try:
+                    same = bool(f.origin) and normalize_origin(f.origin) == origin
+                except Exception:
+                    same = False
+                if same and self._frame_under_page_locked(f, page_sid):
+                    out.append({"frame_id": f.frame_id, "url": f.url})
+        return out
 
     def _build_frame_tree_locked(self) -> Dict[str, Any]:
         """Capped frame_tree payload (must hold state lock). Top frame = one with

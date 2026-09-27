@@ -281,7 +281,8 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
 })()"""
 
 
-def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
+def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str = "",
+                  ancestry: Optional[Dict[str, Any]] = None) -> str:
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
@@ -292,18 +293,32 @@ def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str 
     THIS inspection; a ``current-password`` fill additionally requires ``type=password``; ``<select>``
     controls (country, state, expiry month) match an option by value or visible text. No marker is
     left on filled controls so later model-driven DOM reads cannot address them deterministically.
+
+    ``ancestry`` (``{"top": origin, "allowed": [origins]}``) is for a fill INSIDE a cross-origin frame:
+    the same script also asserts, via Chromium's ``location.ancestorOrigins``, that the top-level page
+    is ``top`` and every ancestor is in ``allowed``, so a PSP frame re-embedded by another page (or a
+    top-level navigation racing the fill) writes nothing (``{"refused": "ancestor_changed"}``).
+    Browsers without ``ancestorOrigins`` refuse too.
     """
     payload = json.dumps(
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
     )
     return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
-            .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce)))
+            .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce))
+            .replace("__ANCESTRY__", json.dumps(ancestry)))
 
 
 _FILL_JS_TEMPLATE = """(() => {
   const expectedOrigin = __EXPECTED_ORIGIN__;
   if (window.location.origin !== expectedOrigin) {
     return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
+  }
+  const ancestry = __ANCESTRY__;
+  if (ancestry) {
+    const chain = window.location.ancestorOrigins ? Array.from(window.location.ancestorOrigins) : [];
+    if (chain.length === 0 || chain[chain.length - 1] !== ancestry.top || !chain.every((o) => ancestry.allowed.includes(o))) {
+      return JSON.stringify({ refused: "ancestor_changed" });
+    }
   }
   const fills = __FILLS__;
   const nonce = __NONCE__;
