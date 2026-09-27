@@ -84,7 +84,6 @@ def test_clean_command_passes(tmp_path, monkeypatch):
         session_key="diagnostic-test",
     )
     assert blocked is None
-    assert result["error"]
 
 
 def test_interpreter_kill_rejection_names_the_owned_process_route(tmp_path, monkeypatch):

@@ -6,6 +6,7 @@ import textwrap
 import pytest
 
 import hermes_yaml as yaml
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 
 
 @pytest.fixture
