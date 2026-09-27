@@ -49,9 +49,6 @@ on:
   pull_request:
   push:
     branches: [main]
-  workflow_dispatch:
-    # Manual full validation. No inputs: dispatch ALWAYS runs the complete
-    # matrix, so the evidence can never be a half-run by accident.
 
 permissions:
   contents: read

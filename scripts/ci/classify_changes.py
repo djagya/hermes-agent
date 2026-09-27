@@ -148,10 +148,15 @@ _SCAN_FILES = {"setup.cfg", "pyproject.toml"}
 _MCP_CATALOG_PATHS = ("optional-mcps/",)
 _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 
+# Windows installer + its PowerShell tests. The legacy dedicated lane was
+# retired upstream, but these paths still arm the fork's OS test matrix.
+_INSTALLER_PATHS = ("scripts/tests/",)
+_INSTALLER_FILES = {"scripts/install.ps1", "scripts/install.cmd"}
+
 # Bootstrap installer: the POSIX shell installer, the dev-checkout wrapper
-# that carries the same pin fragment, and the Tauri app's non-Rust sources
-# (the .rs/Cargo files are the ``rust`` lane's job). Changes here get the
-# bootstrap-installer.yml lane — a real sandboxed install + stamp check.
+# that carries the same pin fragment, and the Tauri app. Rust/Cargo changes
+# arm both ``bootstrap`` and ``rust``. The bootstrap lane performs the real
+# sandboxed install + stamp check.
 _BOOTSTRAP_PATHS = ("apps/bootstrap-installer/",)
 _BOOTSTRAP_FILES = {"scripts/install.sh", "setup-hermes.sh"}
 # Windows desktop-update hand-off (scripts/desktop-update/windows.ps1 + the
@@ -281,6 +286,10 @@ def _is_scan(p: str) -> bool:
 
 def _is_mcp_catalog(p: str) -> bool:
     return p.startswith(_MCP_CATALOG_PATHS) or p in _MCP_CATALOG_FILES
+
+
+def _is_installer(p: str) -> bool:
+    return p.startswith(_INSTALLER_PATHS) or p in _INSTALLER_FILES
 
 
 def _is_desktop_updater(p: str) -> bool:

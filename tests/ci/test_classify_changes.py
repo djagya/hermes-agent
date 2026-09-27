@@ -111,7 +111,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
 
 
 CASES = {
-    "shared JS builder → frontend": (["scripts/build/web.mjs"], _lanes(python=True, frontend=True)),
+    "shared JS builder → frontend": (["scripts/build/web.mjs"], _lanes(python=True, frontend=True, os_tests=True)),
     "root JS tests → frontend": (["tests-js/product-builders.test.mjs"], _lanes(python=True, frontend=True)),
     "docs-only → nothing heavy": (["README.md", "docs/guide.md"], _lanes()),
     "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
@@ -243,20 +243,20 @@ CASES = {
     # the ONLY lane a Rust change ran, and the crate's tests never executed.
     "rust source → rust": (
         ["apps/bootstrap-installer/src-tauri/src/powershell.rs"],
-        _lanes(frontend=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
+        _lanes(frontend=True, bootstrap=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     "cargo lockfile → rust": (
         ["apps/bootstrap-installer/src-tauri/Cargo.lock"],
-        _lanes(frontend=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
+        _lanes(frontend=True, bootstrap=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     # Non-.rs files in the crate still change what cargo builds.
     "tauri config → rust": (
         ["apps/bootstrap-installer/src-tauri/tauri.conf.json"],
-        _lanes(frontend=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
+        _lanes(frontend=True, bootstrap=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     "ts source alone → no rust lane": (
         ["apps/bootstrap-installer/src/main.tsx"],
-        _lanes(frontend=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
+        _lanes(frontend=True, bootstrap=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     # Unknown top-level file keeps Python on rather than risk a silent skip.
     "unknown toplevel → python": (["Makefile"], _lanes(python=True)),
@@ -279,7 +279,7 @@ CASES = {
     ),
     "conftest fixture module → python + desktop_updater": (
         ["tests/_fixtures/platform_gating.py"],
-        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True),
+        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, os_tests=True, py_full=False, py_roots=[["tests/_fixtures/platform_gating.py"]]),
     ),
     "tests + prod source → both lanes": (
         ["tests/agent/test_foo.py", "agent/x.py"],
@@ -327,7 +327,7 @@ CASES = {
     ),
     "bootstrap-installer eslint config → ci_review": (
         ["apps/bootstrap-installer/eslint.config.mjs"],
-        _lanes(frontend=True, ci_review=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
+        _lanes(frontend=True, bootstrap=True, ci_review=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     "prettier config → ci_review": (
         [".prettierrc"],
@@ -370,10 +370,10 @@ CASES = {
         DEFAULT,
     ),
     # The bootstrap installer lane: shell installer, dev-checkout wrapper,
-    # and the Tauri app's non-Rust sources.
+    # and the Tauri app; Rust sources additionally arm the rust lane.
     "install.sh → bootstrap lane": (
         ["scripts/install.sh"],
-        _lanes(python=True, bootstrap=True, python_prod=True),
+        _lanes(python=True, bootstrap=True, python_prod=True, os_tests=True),
     ),
     "setup-hermes.sh → bootstrap lane": (
         ["setup-hermes.sh"],
@@ -381,7 +381,7 @@ CASES = {
     ),
     "tauri installer source → bootstrap + rust": (
         ["apps/bootstrap-installer/src-tauri/src/lib.rs"],
-        _lanes(frontend=True, bootstrap=True, rust=True),
+        _lanes(frontend=True, bootstrap=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     "composite action → ci_review (also fail-open all)": (
         [".github/actions/retry/action.yml"],
