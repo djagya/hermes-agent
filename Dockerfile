@@ -453,6 +453,10 @@ RUN set -eu; \
     mkdir -p /etc/hermes; \
     python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; stamp = json.loads(pathlib.Path("/opt/hermes/install-stamp.json").read_text(encoding="utf-8")); commit = stamp.get("commit"); revision = commit if commit and set(commit) != {"0"} else None; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": os.environ.get("HERMES_IMAGE_NAME", "nousresearch/hermes-agent"), "version": project["version"], "revision": revision}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 
+# Restore the managed-policy seed from the fork builder stage. The source
+# copy above only places this file under /opt/hermes/docker, not /etc/hermes.
+COPY --chmod=0444 docker/sera-toolbox/managed-config.yaml /etc/hermes/config.yaml
+
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.
 # Per-profile gateway services are registered dynamically at runtime by
