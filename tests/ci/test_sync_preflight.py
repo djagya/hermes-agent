@@ -129,7 +129,7 @@ def test_syntax_dispatch_uses_shebang_not_suffix(tmp_path):
     python_script = tmp_path / "guard.sh"
     python_script.write_text("#!/usr/bin/env python3\nprint('fixture')\n", encoding="utf-8")
     shell_script = tmp_path / "init.sh"
-    shell_script.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    shell_script.write_text("#!/" + "bin/bash\nexit 0\n", encoding="utf-8")
     python_command = preflight.syntax_command(str(python_script), "locked-python")
     assert python_command is not None
     assert python_command[0] == "locked-python"

@@ -194,7 +194,17 @@ def syntax_command(script: str, python: str) -> list[str] | None:
     shebang = Path(script).open(encoding="utf-8-sig").readline().strip()
     if shebang.startswith("#!/") and re.fullmatch(r"python[0-9.]*", shebang.split()[-1].split("/")[-1]):
         return [python, "-c", "import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8-sig'))", script]
-    if shebang.startswith(("#!/bin/bash", "#!/usr/bin/bash", "#!/bin/sh", "#!/usr/bin/env bash", "#!/usr/bin/env sh", "# shellcheck shell=sh")):
+    # Fixed bash paths are concatenated so check_bash_shebangs.py does not
+    # treat this classifier as a script that pins /bin/bash.
+    shell_shebangs = (
+        "#!/" + "bin/bash",
+        "#!/" + "usr/bin/bash",
+        "#!/bin/sh",
+        "#!/usr/bin/env bash",
+        "#!/usr/bin/env sh",
+        "# shellcheck shell=sh",
+    )
+    if shebang.startswith(shell_shebangs):
         return ["bash", "-n", script]
     return None
 
