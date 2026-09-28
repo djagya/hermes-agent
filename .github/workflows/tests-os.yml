@@ -180,6 +180,9 @@ jobs:
     # host (tests/e2e/core/windows_update): fresh install, gateway across the update,
     # interpreter selection, non-ASCII profile paths and tool ACLs, partial-clone fetch and
     # venv holders. Its own workflow so wine2e-install/** pushes can run it alone.
+    # Upstream's 32-core Windows runner is the only host this journey fits. Fork
+    # windows-latest spends most of an hour here and then trips the install cap.
+    if: github.repository == 'NousResearch/hermes-agent'
     name: Windows install + update E2E
     uses: ./.github/workflows/windows-install-update-e2e.yml
 

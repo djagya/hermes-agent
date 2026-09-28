@@ -24,6 +24,9 @@ concurrency:
 
 jobs:
   install-update:
+    # Same gate as the tests-os caller. A fork push to wine2e-install/** must
+    # not start this journey on windows-latest.
+    if: github.repository == 'NousResearch/hermes-agent'
     name: Windows install.ps1 + hermes update E2E
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
     # Fork runners are windows-latest, not the upstream 32-core host. Passing
