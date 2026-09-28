@@ -45,6 +45,18 @@ def _only(matches: list[str], role: str) -> str:
     return matches[0]
 
 
+def cache_mode(job: dict) -> str:
+    """Release legs may write the shared cache; commit and channel legs only read.
+
+    The mode lives in ``env.CACHE_MODE``. A job-level ``cache-mode`` key is not
+    in the Actions schema, so actionlint rejects it.
+    """
+    mode = (job.get("env") or {}).get("CACHE_MODE")
+    if mode not in _MODE_BY_CACHE:
+        raise KeyError(f"CACHE_MODE must be write or read, got {mode!r}")
+    return mode
+
+
 def native_builds(jobs: dict) -> dict[tuple[str, str], str]:
     """``(target, "release" | "commit")`` -> id of that native build leg."""
     legs: dict[tuple[str, str], str] = {}
@@ -52,7 +64,7 @@ def native_builds(jobs: dict) -> dict[tuple[str, str], str]:
         if not any(step.get("uses") == BUILD_CACHE_ACTION for step in job.get("steps", [])):
             continue
         (target,) = [row["label"] for row in job["strategy"]["matrix"]["target"]]
-        key = (target, _MODE_BY_CACHE[job["cache-mode"]])
+        key = (target, _MODE_BY_CACHE[cache_mode(job)])
         assert key not in legs, f"{name} and {legs[key]} both build {key}"
         legs[key] = name
     assert {target for target, _ in legs} == set(NATIVE_TARGETS), legs

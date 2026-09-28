@@ -71,6 +71,7 @@ jobs:
     timeout-minutes: 30
     # Smoke setup-pm disables dependency cache writes.
     env: &smoke-env
+      CACHE_MODE: read
       RELEASE_COMMIT: ${{ inputs.sha }}
       RELEASE_TAG: ${{ inputs.tag }}
       ARCHIVE_TAG: ${{ inputs.archive-tag }}
