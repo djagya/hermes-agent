@@ -295,7 +295,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
+          # pull_request checkouts are the synthetic merge into the base.
+          # That merge's first parent is the base, so `git describe HEAD~1`
+          # (N-1) would follow the base branch instead of the candidate.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           fetch-tags: true
 
