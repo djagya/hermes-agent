@@ -47,7 +47,14 @@ def _apply_staged_skill_record(wa, smt, pending_id):
 def test_list_pending_skips_non_dict_record(hermes_home):
     """A parseable-but-non-object pending file must be skipped, not crash the sort."""
     from tools import write_approval as wa
-    # Default: gate off → writes flow freely.
+    valid = wa.stage_write(wa.MEMORY, {"action": "add", "target": "memory", "content": "keep"},
+                           summary="keep", origin="foreground")
+    directory = wa._pending_dir(wa.MEMORY)
+    (directory / "invalid.json").write_text("[]", encoding="utf-8")
+    assert [record["id"] for record in wa.list_pending(wa.MEMORY)] == [valid["id"]]
+
+def test_write_approval_defaults_off(hermes_home):
+    from tools import write_approval as wa
     assert wa.write_approval_enabled("memory") is False
     assert wa.write_approval_enabled("skills") is False
 
@@ -786,7 +793,7 @@ def test_direct_memory_pending_apply_without_live_record_is_rejected(hermes_home
         EnabledStore(),  # type: ignore[arg-type]
     )
     assert result["success"] is False
-    assert result["target"] == "memory"
+    assert "target" not in result  # replay guard refuses before any store-target operation
     assert "restage" in result["error"]
 
 
