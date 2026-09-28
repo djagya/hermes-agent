@@ -193,6 +193,8 @@ def _add_top_level_flags(parser: argparse.ArgumentParser) -> None:
         "runs that can't prompt."))
     inherited(parser, "--skills", "-s", action="append", default=None,
               help="Preload one or more skills for the session (repeat flag or comma-separate)")
+    add("--required-skills", action="append", default=None, metavar="SKILL",
+        help="Mandatory preloaded skill (repeatable); missing skills cause typed EX_CONFIG exit")
     inherited(parser, "--yolo", action="store_true", default=False,
               help="Bypass all dangerous command approval prompts (use at your own risk)")
     inherited(parser, "--pass-session-id", action="store_true", default=False,
@@ -254,6 +256,8 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
         "this run only (same levels as the /reasoning slash command)."))
     inherited(chat_parser, "-s", "--skills", action="append", default=SUPPRESS,
               help="Preload one or more skills for the session (repeat flag or comma-separate)")
+    inherited(chat_parser, "--required-skills", action="append", default=SUPPRESS, metavar="SKILL",
+              help="Mandatory preloaded skill (repeatable); missing skills cause typed EX_CONFIG exit")
     # No `choices=` on --provider: user-defined providers from config.yaml `providers:` are valid
     # too; runtime resolution (resolve_runtime_provider) validates, same as the top-level flag.
     inherited(chat_parser, "--provider", default=SUPPRESS,

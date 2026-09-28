@@ -1802,7 +1802,8 @@ def _read_query_file(args) -> None:
 
 # args attr -> (kwarg, default) passed through to _launch_tui / cli.main.
 _CHAT_PASSTHROUGH = (
-    ("provider", None), ("toolsets", None), ("skills", None), ("verbose", None),
+    ("provider", None), ("toolsets", None), ("skills", None), ("required_skills", None),
+    ("verbose", None),
     ("quiet", False), ("query", None), ("image", None), ("resume", None),
     ("worktree", False), ("checkpoints", False), ("pass_session_id", False),
     ("max_turns", None),

@@ -415,6 +415,19 @@ def _install_single_query_signal_handlers(cli):
                 _signal.signal(getattr(_signal, _name), _signal_handler_q)
 
 
+def _enforce_required_skills_or_exit(cli) -> None:
+    """Block a one-shot worker before it claims a session when a mandatory skill is missing."""
+    if not getattr(cli, "_required_skills_requested", None):
+        return
+    from cli import RequiredSkillError
+    try:
+        cli.finalize_preloaded_skills()
+    except RequiredSkillError as exc:
+        from hermes_cli.kanban_db import KANBAN_MISSING_SKILL_EXIT_CODE
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(KANBAN_MISSING_SKILL_EXIT_CODE)
+
+
 def _configure_quiet_agent(agent) -> None:
     """Neutralize every stdout-writing callback so -Q stdout carries only the final response."""
     agent.quiet_mode = True
@@ -456,6 +469,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
     # isn't engaged) and takes the deterministic approvals.single_query_mode path instead of waiting the
     # full timeout. See #86878.
     os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
+    _enforce_required_skills_or_exit(cli)
     from hermes_cli.quiet_single_query import exit_single_query
     if os.environ.get("HERMES_KANBAN_TASK"):
         from tools.kanban_tools import register_current_worker_from_env

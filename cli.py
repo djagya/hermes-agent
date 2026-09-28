@@ -1063,6 +1063,10 @@ def _parse_skills_argument(skills: str | list[str] | tuple[str, ...] | None) -> 
     return list(dict.fromkeys(p for p in parts if p))
 
 
+class RequiredSkillError(ValueError):
+    """Mandatory preloaded skill unavailable in this worker profile."""
+
+
 def save_config_value(key_path: str, value: any) -> bool:
     """Persist dot-separated ``key_path`` = value into HERMES_HOME/config.yaml; True on success.
 
@@ -1315,8 +1319,15 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             return
         thread.join(timeout=120)
         self._preload_skills_finalized = True
+        required = getattr(self, "_required_skills_requested", None) or []
+        if thread.is_alive():
+            if required:
+                raise RequiredSkillError(f"required skill(s) did not finish loading: {', '.join(required)}")
+            return
         err = getattr(self, "_preload_skills_error", None)
         if err is not None:
+            if required:
+                raise RequiredSkillError(f"required skill(s) failed to load: {', '.join(required)}") from err
             raise err
         auto_result = getattr(self, "_auto_load_skills_result", None)
         if auto_result and auto_result[2]:
@@ -1325,8 +1336,15 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         self.preloaded_skills = list(auto_result[1]) if auto_result else []
         result = getattr(self, "_preload_skills_result", None)
         if not result:
+            if required:
+                raise RequiredSkillError(f"required skill(s) could not be loaded: {', '.join(required)}")
             return
         skills_prompt, loaded_skills, missing_skills = result
+        required_missing = [s for s in required if s not in (loaded_skills or [])]
+        if required_missing:
+            raise RequiredSkillError(
+                f"required skill(s) missing or disabled in this profile: {', '.join(required_missing)}"
+            )
         if missing_skills:
             missing_display = ", ".join(missing_skills)
             # A typo'd name must not crash a kanban worker; only a fully-missing set fails loudly.
@@ -1797,7 +1815,7 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             relaunch(self._pending_relaunch, preserve_inherited=False)
 
 
-def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
+def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills, required_skills=None):
     """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
     toolsets_list = None
     if isinstance(toolsets, str) and toolsets:
@@ -1819,6 +1837,8 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
             toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
 
     parsed_skills = _parse_skills_argument(skills)
+    parsed_required = _parse_skills_argument(required_skills)
+    parsed_skills = list(dict.fromkeys([*parsed_skills, *parsed_required]))
 
     try:
         cli = HermesCLI(
@@ -1870,6 +1890,7 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
         cli._preload_skills_requested = [*auto_load_names, *(s for s in parsed_skills if s not in auto_load_names)]
         cli._preload_skills_thread = threading.Thread(target=_load_preloaded_skills, name="skills-preload", daemon=True)
         cli._preload_skills_thread.start()
+    cli._required_skills_requested = parsed_required
     return cli
 
 
@@ -1946,6 +1967,7 @@ def main(
     image: str = None,
     toolsets: str = None,
     skills: str | list[str] | tuple[str, ...] = None,
+    required_skills: str | list[str] | tuple[str, ...] | None = None,
     model: str = None,
     provider: str = None,
     reasoning: str = None,
@@ -2038,7 +2060,8 @@ def main(
             raise ValueError("--format stream-json requires -q/--query")
         quiet = True
     cli = _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
-                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills)
+                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills,
+                               required_skills=required_skills)
 
     # Join the background worktree creation before anything consumes TERMINAL_CWD.
     # A requested worktree whose setup failed aborts: never silently run without isolation.
