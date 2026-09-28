@@ -397,10 +397,16 @@ COPY --link --chmod=a+rX,go-w . .
 # The shared assembler binds the prepared environment and frontend products.
 RUN /opt/hermes/.venv/bin/python -m docker.build_agent
 
-RUN npm install -g --omit=dev \
+# PM's npm shim lives in the sealed tool store, so npm's implicit global
+# prefix is that store, not /usr/local. Install the toolbox packages into the
+# runtime-copied /usr/local tree used by smoke.sh and start-baked-mcp.sh.
+RUN npm install -g --prefix /usr/local --omit=dev \
         markdownlint-cli2@0.18.1 \
         @hauptsache.net/clickup-mcp@1.8.0 \
-        caldav-mcp@0.10.0
+        caldav-mcp@0.10.0 && \
+    test -x /usr/local/bin/markdownlint-cli2 && \
+    test -f /usr/local/lib/node_modules/@hauptsache.net/clickup-mcp/package.json && \
+    test -f /usr/local/lib/node_modules/caldav-mcp/package.json
 
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, dep assembly, npm install all run as root) and
@@ -629,7 +635,10 @@ RUN ldconfig && \
     python3 -c 'import sqlite3; assert sqlite3.sqlite_version_info >= (3, 51, 3)' && \
     test ! -x /usr/bin/gcc && test ! -x /usr/bin/g++ && test ! -x /usr/bin/docker && \
     test -r /etc/hermes/config.yaml && test -x /init && \
-    test -x /opt/hermes/.venv/bin/hermes
+    test -x /opt/hermes/.venv/bin/hermes && \
+    test -x /usr/local/bin/markdownlint-cli2 && \
+    test -f /usr/local/lib/node_modules/@hauptsache.net/clickup-mcp/package.json && \
+    test -f /usr/local/lib/node_modules/caldav-mcp/package.json
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/tools HERMES_RUNTIME_DIR=/opt/hermes/tools
 ENV HERMES_PYTHON=/usr/local/bin/python3
