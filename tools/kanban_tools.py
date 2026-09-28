@@ -801,7 +801,12 @@ def _handle_block(args: dict, **kw) -> str:
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
                            blocker_key=args.get("blocker_key"))
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
-        return _ok_landed(kb, conn, tid, "blocked", block_kind=kind, blocker_key=args.get("blocker_key"))
+        landed = kb.get_task(conn, tid)
+        extra = {"block_kind": landed.block_kind, "blocker_key": landed.blocker_key}
+        if kind == "dependency" and landed.block_kind == "needs_input":
+            extra.update(requested_kind=kind,
+                         note="no parent is open; dependency re-kinded to needs_input")
+        return _ok_landed(kb, conn, tid, "blocked", **extra)
 
 
 @_kanban_handler("kanban_request_review")
