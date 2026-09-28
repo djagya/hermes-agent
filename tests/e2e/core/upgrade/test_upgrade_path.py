@@ -139,7 +139,7 @@ added = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "--diff-f
                         *[f"{t}/*.py" for t in tops]], capture_output=True, text=True).stdout.split()
 added = [a[:-3].replace("/", ".") for a in added if "/tests/" not in a and not a.endswith("__init__.py")][:3]
 bad = []
-for name in tops + ["hermes_cli.main", "run_agent", "hermes_state"] + added:
+for name in tops + ["hermes_cli.main", "run_agent", "hermes_state"]:
     try:
         mod = importlib.import_module(name)
     except BaseException as exc:
@@ -148,6 +148,25 @@ for name in tops + ["hermes_cli.main", "run_agent", "hermes_state"] + added:
     where = Path(getattr(mod, "__file__", None) or str(list(getattr(mod, "__path__", [""]))[0])).resolve()
     if where.is_relative_to(root.resolve()):
         continue  # N-1's editable venv serves the source tree directly.
+    workspace = Path(sys.prefix).resolve().parent / "workspace"
+    if not where.is_relative_to(workspace) or not (root / where.relative_to(workspace)).is_file():
+        bad.append(f"{name}: resolved outside the checkout and PM workspace: {where}")
+    elif where.read_bytes() != (root / where.relative_to(workspace)).read_bytes():
+        bad.append(f"{name}: PM workspace differs from the updated checkout: {where}")
+# Newly added modules may belong to optional extras (e.g. ACP). Check their import
+# resolution and bytes without executing an optional dependency absent from this venv.
+for name in added:
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, AttributeError) as exc:
+        bad.append(f"{name}: {type(exc).__name__}: {exc}")
+        continue
+    if spec is None or spec.origin is None:
+        bad.append(f"{name}: no importable module source")
+        continue
+    where = Path(spec.origin).resolve()
+    if where.is_relative_to(root.resolve()):
+        continue
     workspace = Path(sys.prefix).resolve().parent / "workspace"
     if not where.is_relative_to(workspace) or not (root / where.relative_to(workspace)).is_file():
         bad.append(f"{name}: resolved outside the checkout and PM workspace: {where}")
