@@ -143,10 +143,20 @@ def _insert_notify_sub(
             insert_mode, metadata_json, int(time.time()), task_id,
         ),
     )
-    # chat_type / delivery_mode / delivery_metadata are last-write-wins;
-    # user_id_alt and notifier_profile only self-heal legacy rows lacking one.
+    # Retain routing anchors not included in a partial re-subscribe. The
+    # primary sender identity, like the alternate one, only fills legacy rows.
+    if metadata_json:
+        row = conn.execute(
+            "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+            key,
+        ).fetchone()
+        metadata_json = _encode_notify_delivery_metadata({
+            **_decode_notify_delivery_metadata(row[0]),
+            **_decode_notify_delivery_metadata(metadata_json),
+        })
     for column, value, fill_only in (
         ("chat_type", chat_type, False),
+        ("user_id", user_id, True),
         ("user_id_alt", user_id_alt, True),
         ("notifier_profile", notifier_profile, True),
         ("delivery_mode", valid_mode, False),

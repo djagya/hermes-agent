@@ -177,7 +177,7 @@ class TestSmartApprovePromptHardening(unittest.TestCase):
         mock_call_llm.return_value = response
         with self.assertLogs("tools.approval", level="WARNING") as logs:
             assert _smart_approve("rm -rf /", "recursive delete") == "escalate"
-        assert any("empty answer" in message and "length" in message
+        assert any("'outcome_category': 'empty_response'" in message and "'finish_reason': 'length'" in message
                    for message in logs.output), logs.output
 
     @patch("agent.auxiliary_client.call_llm")
@@ -189,7 +189,8 @@ class TestSmartApprovePromptHardening(unittest.TestCase):
         mock_call_llm.return_value = response
         with self.assertLogs("tools.approval", level="WARNING") as logs:
             assert _smart_approve("rm -rf /", "recursive delete") == "escalate"
-        assert any("finish_reason=None" in message for message in logs.output), logs.output
+        assert any("'outcome_category': 'empty_response'" in message and "'finish_reason': 'unknown'" in message
+                   for message in logs.output), logs.output
 
     @patch("agent.auxiliary_client.call_llm")
     def test_recognized_verdict_does_not_warn(self, mock_call_llm):
