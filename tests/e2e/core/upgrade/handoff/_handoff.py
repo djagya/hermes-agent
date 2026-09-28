@@ -173,6 +173,52 @@ def _user_uv(env: dict[str, str], hermes_home: Path) -> None:
     uv.chmod(0o755)
 
 
+def _materialize_n1_control_socket(checkout: Path) -> None:
+    """Put ``gateway/control_socket.py`` into the N-1 worktree.
+
+    The tag contains the blob, but a shared clone of a partial host object
+    store can leave that one file out of the worktree. The socket starter
+    imports it and swallows the failure at DEBUG, so the gateway comes up
+    with no socket and every identify probe times out.
+    """
+    target = checkout / "gateway" / "control_socket.py"
+    if target.is_file():
+        return
+    try:
+        blob = I.git("rev-parse", "HEAD:gateway/control_socket.py", cwd=checkout)
+    except AssertionError as exc:
+        raise AssertionError(
+            f"N-1 HEAD has no gateway/control_socket.py in its tree\n{exc}"
+        ) from None
+    # Fault the blob into the host object store. The column's clone reads it
+    # through alternates; checkout then writes the worktree file.
+    subprocess.run(
+        ["git", "cat-file", "-e", blob],
+        cwd=H.WORKTREE,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    checkout_error = ""
+    try:
+        I.git("checkout", "HEAD", "--", "gateway/control_socket.py", cwd=checkout)
+    except AssertionError as exc:
+        checkout_error = str(exc)
+    if not target.is_file():
+        shown = subprocess.run(
+            ["git", "show", "HEAD:gateway/control_socket.py"],
+            cwd=checkout,
+            capture_output=True,
+        )
+        assert shown.returncode == 0 and shown.stdout, (
+            f"could not materialize gateway/control_socket.py ({blob}) into {checkout}\n"
+            f"{checkout_error}\n{shown.stderr.decode(errors='replace')[-1500:]}"
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(shown.stdout)
+    assert target.is_file(), f"gateway/control_socket.py still missing at {target}"
+
+
 def stage_n1(root: Path) -> Install:
     """A git install at release N-1 with its own venv, as the N-1 installer left it."""
     root.mkdir(parents=True, exist_ok=True)
@@ -187,6 +233,7 @@ def stage_n1(root: Path) -> Install:
     I.git("clone", "-q", "--shared", "-b", "main", str(origin), str(checkout), cwd=root)
     I.git("remote", "set-url", "origin", I.OFFICIAL_HTTPS, cwd=checkout)
     assert I.git("rev-parse", "HEAD", cwd=checkout) == refs().base
+    _materialize_n1_control_socket(checkout)
     with (checkout / "pyproject.toml").open("rb") as fh:
         base_python = tomllib.load(fh)["project"]["requires-python"]
     no_cfg = root / "uv-config"
@@ -196,6 +243,9 @@ def stage_n1(root: Path) -> Install:
     cp = subprocess.run([I.real_uv(), "sync", "-q", "--locked", "--extra", "all", "--managed-python", "--python",
                          base_python], cwd=str(checkout), env=uv_env, capture_output=True, text=True, timeout=1800)
     assert cp.returncode == 0, f"N-1 venv install from its uv.lock failed:\n{cp.stderr[-4000:]}"
+    # The wheel was built from the worktree. Put the module back if sync
+    # dropped it, so the process and the identify probe both see the file.
+    _materialize_n1_control_socket(checkout)
     local_bin = sb.home / ".local" / "bin"
     local_bin.mkdir(parents=True, exist_ok=True)
     (local_bin / "hermes").symlink_to(checkout / "venv" / "bin" / "hermes")
