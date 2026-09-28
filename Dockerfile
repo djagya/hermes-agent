@@ -568,6 +568,12 @@ ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data && chmod 0644 /opt/hermes/tools/facts.json && \
     rm -f /opt/hermes/.venv/.lock /opt/hermes/pm-runtime/.lock
 
+# Keep the large sealed tool store and venv as separate copy layers. Moving
+# them out of the assembled stage before the final copy prevents a second
+# /opt/hermes COPY from folding them back into one oversized layer.
+RUN mkdir -p /runtime-cut && \
+    mv /opt/hermes/tools /opt/hermes/.venv /runtime-cut/
+
 # Compilers, headers and build-only transitive packages live in runtime_base,
 # not the published image. Purging them after this stage would leave their
 # bytes in earlier Docker layers. Assemble the sealed product above and copy
@@ -602,6 +608,8 @@ RUN useradd -u 10000 -m -d /opt/data hermes && \
     mkdir -p /tmp/.X11-unix /tmp/hermes-runtime && \
     chmod 1777 /tmp/.X11-unix && chmod 0700 /tmp/hermes-runtime
 COPY --from=assembled_build /opt/hermes /opt/hermes
+COPY --from=assembled_build /runtime-cut/tools /opt/hermes/tools
+COPY --from=assembled_build /runtime-cut/.venv /opt/hermes/.venv
 COPY --from=assembled_build /usr/local /usr/local
 COPY --from=assembled_build /usr/libexec/sera-toolbox /usr/libexec/sera-toolbox
 COPY --from=assembled_build /etc/hermes /etc/hermes
