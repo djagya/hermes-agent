@@ -420,7 +420,7 @@ jobs:
   # Pinned-input archiving runs as a validate step with the job's own gate
   # shape, so a skipped archive must not skip the selected build legs.
   #
-  # Cache permissions are literal job-token scopes, not checkout/save-step policy.
+  # Save steps gate cache writes; commit/channel builds only restore.
   # Share execution via anchors, and keep the original IDs as downstream gates.
   build-win32-x64-release:
     name: bundled win32-x64
@@ -431,7 +431,7 @@ jobs:
     needs: [validate]
     runs-on: ${{ matrix.target.runner }}
     environment: release-signing
-    cache-mode: write
+    # Cache writes are controlled by gated save steps below.
     timeout-minutes: 900
     strategy: &win32-strategy
       fail-fast: false
@@ -652,9 +652,9 @@ jobs:
         working-directory: apps/desktop
         run: node ../../node_modules/vitest/vitest.mjs run --project electron scripts/payload-sign-cache.test.mjs scripts/batch-sign-binaries.test.mjs
 
-      # Commit jobs share these steps but have read-only cache tokens.
+      # Commit/channel jobs share these steps but must not save caches.
       - name: Save verified payload signatures
-        if: inputs.build_commit == ''
+        if: inputs.build_commit == '' && inputs.channel == ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.cache/electron-builder-payload-signatures
@@ -729,7 +729,7 @@ jobs:
     needs: [validate]
     runs-on: ${{ matrix.target.runner }}
     environment: release-signing
-    cache-mode: write
+    # Cache writes are controlled by gated save steps below.
     timeout-minutes: 900
     strategy: &win32-strategy-arm64
       fail-fast: false
@@ -750,7 +750,7 @@ jobs:
     needs: [validate]
     runs-on: ${{ matrix.target.runner }}
     environment: release-signing
-    cache-mode: read
+    # Cache consumption is restore-only in this job.
     timeout-minutes: 900
     strategy: *win32-strategy
     env: *win32-env
@@ -766,7 +766,7 @@ jobs:
     needs: [validate]
     runs-on: ${{ matrix.target.runner }}
     environment: release-signing
-    cache-mode: read
+    # Cache consumption is restore-only in this job.
     timeout-minutes: 900
     strategy: *win32-strategy-arm64
     env: *win32-env
@@ -839,7 +839,7 @@ jobs:
     needs: [validate]
     runs-on: ${{ matrix.target.runner }}
     environment: release-signing
-    cache-mode: write
+    # Cache writes are controlled by gated save steps below.
     timeout-minutes: 360
     strategy: &darwin-strategy
       fail-fast: false
@@ -1124,7 +1124,7 @@ jobs:
     needs: [validate]
     runs-on: ${{ matrix.target.runner }}
     environment: release-signing
-    cache-mode: write
+    # Cache writes are controlled by gated save steps below.
     timeout-minutes: 360
     strategy: &darwin-strategy-x64
       fail-fast: false
@@ -1145,7 +1145,7 @@ jobs:
     needs: [validate]
     runs-on: ${{ matrix.target.runner }}
     environment: release-signing
-    cache-mode: read
+    # Cache consumption is restore-only in this job.
     timeout-minutes: 360
     strategy: *darwin-strategy
     env: *darwin-env
@@ -1161,7 +1161,7 @@ jobs:
     needs: [validate]
     runs-on: ${{ matrix.target.runner }}
     environment: release-signing
-    cache-mode: read
+    # Cache consumption is restore-only in this job.
     timeout-minutes: 360
     strategy: *darwin-strategy-x64
     env: *darwin-env
@@ -1436,7 +1436,7 @@ jobs:
       && (inputs.upload_release == true || inputs.release-phase == 'candidate' || inputs.build_commit != '' || inputs.channel != '')
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
     environment: release-signing
-    cache-mode: read
+    # Cache consumption is restore-only in this job.
     timeout-minutes: 45
     outputs:
       receipt-url: ${{ steps.receipt.outputs.receipt-url }}
@@ -1639,7 +1639,7 @@ jobs:
       && needs.smoke-win32-arm64.result == 'success' && needs.smoke-win32-x64.result == 'success'
     runs-on: ubuntu-24.04
     environment: release-signing
-    cache-mode: read
+    # Cache consumption is restore-only in this job.
     timeout-minutes: 45
     permissions:
       contents: write

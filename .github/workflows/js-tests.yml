@@ -23,6 +23,46 @@ jobs:
       checks: ${{ steps.set-matrix.outputs.checks }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ./.github/actions/setup-pm
+        with:
+          toolchain: node
+      - name: Discover workspace check scripts
+        id: set-matrix
+        env:
+          SELECTED_WORKSPACES: ${{ inputs.workspaces }}
+        run: |
+          node -e '
+            const { readFileSync, appendFileSync } = require("node:fs");
+            const { join } = require("node:path");
+            const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
+            const locations = Object.keys(lock.packages).filter(p => p && lock.packages[p].link && lock.packages[p].resolved);
+            let selected = [];
+            try { selected = JSON.parse(process.env.SELECTED_WORKSPACES || "[]"); } catch { /* fail open */ }
+            if (!Array.isArray(selected)) selected = [];
+            const workspaces = [...new Set(locations.map(p => lock.packages[p].resolved).filter(p => !p.startsWith("node_modules/")))];
+            if (!workspaces.length) throw Error("no npm workspaces found in lockfile");
+            const wanted = selected.length ? workspaces.filter(p => selected.includes(p)) : workspaces;
+            if (!wanted.length) throw Error("workspace selection matched no workspace");
+            const checks = wanted.flatMap(p => {
+              const scripts = JSON.parse(readFileSync(join(p, "package.json"), "utf8")).scripts || {};
+              const subs = Object.keys(scripts).filter(s => /^check:.+$/.test(s));
+              return (subs.length ? subs : scripts.check ? ["check"] : []).map(script => ({ package: p, script }));
+            });
+            if (!checks.length) throw Error("no check scripts in selected workspaces");
+            appendFileSync(process.env.GITHUB_OUTPUT, `checks=${JSON.stringify(checks)}\n`);
+          '
+
+  check:
+    name: ${{ matrix.package }} / ${{ matrix.script }}
+    needs: workspaces
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.workspaces.outputs.checks) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Set up the locked JS build toolchain
         id: node
         uses: ./.github/actions/setup-pm
