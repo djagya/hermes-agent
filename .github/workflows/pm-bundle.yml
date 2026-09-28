@@ -105,20 +105,6 @@ jobs:
           cache: ${{ runner.temp }}/payload-inputs
           producer: payload-test
 
-      # PyMuPDF 1.25.5's wdev.py only globs Visual Studio directories named
-      # 2* (2019/2022). windows-11-arm now ships VS 18 at that path, so the
-      # arm64 wheel build asserts. A junction lets the glob resolve Enterprise.
-      - name: Alias Visual Studio 18 as 2022 for the arm64 wheel build
-        if: matrix.target.label == 'win32-arm64'
-        shell: pwsh
-        run: |
-          $root = "C:\Program Files\Microsoft Visual Studio"
-          $vs18 = Join-Path $root "18"
-          $vs2022 = Join-Path $root "2022"
-          if ((Test-Path $vs18) -and -not (Test-Path $vs2022)) {
-            New-Item -ItemType Junction -Path $vs2022 -Target $vs18 | Out-Null
-          }
-
       - name: Prepare native payload dependencies
         id: prepare
         shell: bash

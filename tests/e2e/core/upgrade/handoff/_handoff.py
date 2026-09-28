@@ -138,7 +138,12 @@ class Install:
         for name in ("gateway.log", "errors.log", "update.log", "agent.log"):
             p = logs / name
             if p.exists():
-                parts.append(f"--- logs/{name} (tail) ---\n{p.read_text(errors='replace')[-3000:]}")
+                text = p.read_text(errors="replace")
+                socket_lines = [line for line in text.splitlines()
+                                if "socket" in line.lower() or "control socket" in line.lower()]
+                if socket_lines:
+                    parts.append("--- socket lines in logs/" + name + " ---\n" + "\n".join(socket_lines[-20:]))
+                parts.append(f"--- logs/{name} (tail) ---\n{text[-3000:]}")
         receipt = logs / "update_receipts" / "latest.json"
         if receipt.exists():
             parts.append(f"--- update receipt ---\n{receipt.read_text(errors='replace')[-4000:]}")
@@ -196,6 +201,12 @@ def stage_n1(root: Path) -> Install:
     (local_bin / "hermes").symlink_to(checkout / "venv" / "bin" / "hermes")
     _user_uv(env, hermes_home)
     env["PATH"] = os.pathsep.join([str(local_bin), env["PATH"]])
+    # The control-socket starter imports gateway.control_socket from this
+    # checkout. uv sync's venv does not put that module on sys.path for a bare
+    # interpreter, so the import is swallowed at DEBUG and no socket is bound.
+    # The checkout is the git install the column is running.
+    prior = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(checkout) if not prior else str(checkout) + os.pathsep + prior
     return Install("n1", root, origin, env)
 
 

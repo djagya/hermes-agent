@@ -152,7 +152,11 @@ jobs:
     # See scripts/check-windows-footguns.py for the full rule list.
     name: Windows footguns (blocking)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Blocking checkers use about four minutes. The two advisory diffs below
+    # are each capped at 170s by a command timeout (a step-level
+    # timeout-minutes cancels the whole job, and continue-on-error does not
+    # catch that). 15 minutes covers both advisories after the checkers.
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -202,16 +206,18 @@ jobs:
       - name: Profile-scope patterns on added lines (advisory)
         if: github.event_name == 'pull_request'
         continue-on-error: true
-        timeout-minutes: 3
         env:
           PR_HEAD: "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
         run: |
-          git fetch --no-tags --deepen=200 origin "${{ github.base_ref }}" "$PR_HEAD"
+          # Command timeout, not timeout-minutes: a step timeout cancels the job.
+          timeout 170s bash -euo pipefail <<EOS
+          git fetch --no-tags --deepen=200 origin "${{ github.base_ref }}" "\$PR_HEAD"
           for i in 1 2 3; do
             git merge-base "origin/${{ github.base_ref }}" origin/pr-head >/dev/null 2>&1 && break
-            git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" "$PR_HEAD"
+            git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" "\$PR_HEAD"
           done
           python scripts/check_profile_scope_patterns.py --base "origin/${{ github.base_ref }}" --head origin/pr-head
+          EOS
 
       # Advisory: dropped public names / methods / test defs vs the PR base, printed into the log.
       # A refactor that silently removes a public symbol breaks plugins that import it; the Sep 2026
@@ -224,19 +230,19 @@ jobs:
       - name: Public-surface diff vs base (advisory)
         if: github.event_name == 'pull_request'
         continue-on-error: true
-        # Bound the advisory step so a long deepen/fetch (e.g. a distant or missing
-        # merge-base) can't consume the blocking job's 5-minute budget and cancel it.
-        # continue-on-error already keeps a step *failure* off the job; a step-level
-        # timeout keeps a step *overrun* off the job-level timeout the same way.
-        # Sizing: a --deepen=200 fetch took ~56s and a --deepen=1000 ~67s on the runner, and
-        # main gains ~170 commits/day, so a day-old branch legitimately needs both (~2 min).
-        timeout-minutes: 3
+        # A step-level timeout-minutes cancels the whole job; continue-on-error
+        # does not catch that. `timeout 170s` exits 124 instead, which this
+        # advisory step is allowed to do. Sizing: a --deepen=200 fetch took ~56s
+        # and a --deepen=1000 ~67s, and this branch's merge-base with main is
+        # far enough that both fetches run.
         env:
           PR_HEAD: "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
         run: |
-          git fetch --no-tags --deepen=200 origin "${{ github.base_ref }}" "$PR_HEAD"
+          timeout 170s bash -euo pipefail <<EOS
+          git fetch --no-tags --deepen=200 origin "${{ github.base_ref }}" "\$PR_HEAD"
           for i in 1 2 3; do
             git merge-base "origin/${{ github.base_ref }}" origin/pr-head >/dev/null 2>&1 && break
-            git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" "$PR_HEAD"
+            git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" "\$PR_HEAD"
           done
           python scripts/ci/check_public_surface.py --base "origin/${{ github.base_ref }}" --head origin/pr-head
+          EOS
