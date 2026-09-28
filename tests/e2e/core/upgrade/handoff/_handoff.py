@@ -207,16 +207,30 @@ def stage_n1(root: Path) -> Install:
     # The checkout is the git install the column is running.
     prior = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(checkout) if not prior else str(checkout) + os.pathsep + prior
-    # uv's venv python can ignore PYTHONPATH. A sitecustomize insert puts the
-    # checkout ahead of site-packages so gateway.control_socket resolves for
-    # both `hermes gateway run` and the in-sandbox identify probe.
+    # The venv can ignore PYTHONPATH, and hermes_cli.main inserts site-packages
+    # at sys.path[0] after startup. A meta-path hook loaded from sitecustomize
+    # still resolves gateway.* from this checkout, which is where
+    # gateway/control_socket.py lives at the N-1 tag.
     for site_packages in (checkout / "venv" / "lib").glob("python*/site-packages"):
-        hook = site_packages / "sitecustomize.py"
-        hook.write_text(
-            "import sys\n"
-            f"p = {str(checkout)!r}\n"
-            "if p not in sys.path:\n"
-            "    sys.path.insert(0, p)\n",
+        (site_packages / "sitecustomize.py").write_text(
+            "import importlib.util, os, sys\n"
+            f"_ROOT = {str(checkout)!r}\n"
+            "class _CheckoutGateway:\n"
+            "    def find_spec(self, fullname, path, target=None):\n"
+            "        if fullname != 'gateway' and not fullname.startswith('gateway.'):\n"
+            "            return None\n"
+            "        base = os.path.join(_ROOT, *fullname.split('.'))\n"
+            "        py = base + '.py'\n"
+            "        init = os.path.join(base, '__init__.py')\n"
+            "        if os.path.isfile(py):\n"
+            "            return importlib.util.spec_from_file_location(fullname, py)\n"
+            "        if os.path.isfile(init):\n"
+            "            return importlib.util.spec_from_file_location(\n"
+            "                fullname, init, submodule_search_locations=[base])\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, _CheckoutGateway())\n"
+            "if _ROOT not in sys.path:\n"
+            "    sys.path.insert(0, _ROOT)\n",
             encoding="utf-8",
         )
         break
@@ -336,9 +350,12 @@ def identify_in_sandbox(inst: Install) -> dict | None:
     if not py.is_file():
         return None
     code = (
-        "import json,sys\n"
+        "import json,os,sys\n"
         "from pathlib import Path\n"
-        "sys.path.insert(0, sys.argv[2])\n"
+        "root=sys.argv[2]\n"
+        "sys.path.insert(0, root)\n"
+        "target=os.path.join(root, 'gateway', 'control_socket.py')\n"
+        "sys.stderr.write('root=%s control_socket=%s\\n' % (root, os.path.isfile(target)))\n"
         "from gateway.control_socket import identify_gateway\n"
         "home=Path(sys.argv[1])\n"
         "r=identify_gateway(home, timeout=5.0)\n"
