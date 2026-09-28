@@ -152,6 +152,32 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
     real_init = processes._WindowsJob.__init__
     real_assign = processes._WindowsJob.assign
 
+    def assert_primary_thread_suspended(proc):
+        # CREATE_SUSPENDED stops the initial thread, not the entire process.
+        # psutil.status() reports 'running' on Windows for that state.
+        api = ctypes.WinDLL('kernel32', use_last_error=True)
+        api.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        api.OpenThread.restype = wintypes.HANDLE
+        api.SuspendThread.argtypes = [wintypes.HANDLE]
+        api.SuspendThread.restype = wintypes.DWORD
+        api.ResumeThread.argtypes = [wintypes.HANDLE]
+        api.ResumeThread.restype = wintypes.DWORD
+        api.CloseHandle.argtypes = [wintypes.HANDLE]
+        api.CloseHandle.restype = wintypes.BOOL
+        threads = psutil.Process(proc.pid).threads()
+        assert len(threads) == 1, 'child started more threads before job assignment'
+        handle = api.OpenThread(0x0002, False, threads[0].id)  # THREAD_SUSPEND_RESUME
+        assert handle, ctypes.WinError(ctypes.get_last_error())
+        try:
+            previous = api.SuspendThread(handle)
+            assert previous != 0xFFFFFFFF, ctypes.WinError(ctypes.get_last_error())
+            try:
+                assert previous >= 1, 'child thread was runnable before job assignment'
+            finally:
+                assert api.ResumeThread(handle) == previous + 1
+        finally:
+            assert api.CloseHandle(handle)
+
     def track_job(job):
         jobs.append(job)
         real_init(job)
@@ -174,7 +200,7 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
 
     def assign(job, proc):
         children.append(proc)
-        assert psutil.Process(proc.pid).status() == psutil.STATUS_STOPPED
+        assert_primary_thread_suspended(proc)
         assert not marker.exists()
         # Query the actual kernel object, not implementation source/constants.
         limits = processes._ExtendedLimits()
