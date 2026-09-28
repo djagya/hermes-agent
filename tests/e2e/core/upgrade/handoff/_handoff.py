@@ -86,6 +86,7 @@ class Install:
     target: str = ""
     port: int = 0
     logs: list[Path] = field(default_factory=list)
+    identify_debug: str = ""
 
     @property
     def home(self) -> Path:
@@ -127,7 +128,12 @@ class Install:
             parts.append(H.describe(cp, 8000))
         for log in self.logs:
             if log.exists():
-                parts.append(f"--- {log.name} (tail) ---\n{log.read_text(errors='replace')[-3000:]}")
+                text = log.read_text(errors="replace")
+                socket_lines = [line for line in text.splitlines()
+                                if "socket" in line.lower() or "Control socket" in line]
+                if socket_lines:
+                    parts.append("--- socket lines in " + log.name + " ---\n" + "\n".join(socket_lines[-20:]))
+                parts.append(f"--- {log.name} (tail) ---\n{text[-3000:]}")
         logs = self.hermes_home / "logs"
         for name in ("gateway.log", "errors.log", "update.log", "agent.log"):
             p = logs / name
@@ -295,6 +301,35 @@ def identify(home: Path) -> dict | None:
     return identify_gateway(home, timeout=5.0)
 
 
+def identify_in_sandbox(inst: Install) -> dict | None:
+    """Ask for ``identify`` from inside the sandbox.
+
+    The host probe looks at ``HERMES_HOME/gateway.sock`` on the runner mount. A
+    socket the N-1 gateway bound only inside the sandbox namespace is invisible
+    there, so the column's own interpreter asks.
+    """
+    py = inst.checkout / "venv" / "bin" / "python"
+    if not py.is_file():
+        return None
+    code = (
+        "import json,sys\n"
+        "from pathlib import Path\n"
+        "from gateway.control_socket import identify_gateway\n"
+        "home=Path(sys.argv[1])\n"
+        "r=identify_gateway(home, timeout=5.0)\n"
+        "sys.stderr.write('sock=%s pointer=%s\\n' % ((home/'gateway.sock').exists(), (home/'gateway.sock.path').is_file()))\n"
+        "sys.stdout.write(json.dumps(r) if isinstance(r, dict) else '')\n"
+    )
+    cp = inst.host.run([str(py), "-c", code, str(inst.hermes_home)], timeout=30, quiet=True)
+    inst.identify_debug = ((cp.stderr or "") + (cp.stdout or ""))[-800:]
+    if cp.returncode != 0 or not (cp.stdout or "").strip():
+        return None
+    try:
+        return json.loads(cp.stdout)
+    except ValueError:
+        return None
+
+
 def _socket_probe(home: Path) -> str:
     """Why ``identify`` returned nothing: path, connect error, and the raw reply."""
     import socket as _socket
@@ -395,10 +430,13 @@ def start_gateway(inst: Install, *args: str) -> dict:
     inst.spawn("gateway", "gateway", "run", *args)
     try:
         wait_for(lambda: health(inst.port), timeout=240, what="the gateway API server /health")
-        ident = wait_for(lambda: identify(inst.hermes_home), timeout=60, what="control-socket identify")
+        ident = identify_in_sandbox(inst) or wait_for(
+            lambda: identify(inst.hermes_home), timeout=45, what="control-socket identify")
     except AssertionError as exc:
         raise AssertionError(
-            f"premise: the gateway never came up: {exc}\n{_socket_probe(inst.hermes_home)}\n{inst.diagnostics()}"
+            f"premise: the gateway never came up: {exc}\n"
+            f"--- in-sandbox identify ---\n{inst.identify_debug}\n"
+            f"{_socket_probe(inst.hermes_home)}\n{inst.diagnostics()}"
         ) from None
     assert ident["code_sha"] == inst.sha(), f"premise: the gateway must serve the installed commit: {ident}"
     return ident
