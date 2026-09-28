@@ -99,6 +99,17 @@ const BUILD_CACHE = './.github/actions/desktop-build-cache'
 const cacheUsers = workflow => Object.entries(workflow.jobs)
   .filter(([, job]) => (job.steps ?? []).some(step => step.uses === BUILD_CACHE))
 const targetOf = job => job.strategy.matrix.target.map(row => row.label)
+// Job-level cache-mode is not in the Actions schema. Native legs share one
+// env anchor, so the trust-branch if is the write/read signal. Jobs that own
+// an env map set CACHE_MODE directly.
+const cacheModeOf = job => {
+  const mode = job?.env?.CACHE_MODE
+  if (mode === 'read' || mode === 'write') return mode
+  const text = String(job?.if ?? '').replace(/\s+/g, ' ')
+  if (text.includes("inputs.build_commit != '' || inputs.channel != ''")) return 'read'
+  if (text.includes("inputs.build_commit == '' && inputs.channel == ''")) return 'write'
+  return undefined
+}
 const desktopLegs = cacheUsers(desktop)
 
 const SHA = 'a'.repeat(40)
@@ -118,7 +129,7 @@ const payloadEvents = {
 }
 
 it('finds a release and a commit leg for every native target, and the payload producer', () => {
-  const legs = desktopLegs.map(([, job]) => `${targetOf(job)}:${job['cache-mode']}`).sort()
+  const legs = desktopLegs.map(([, job]) => `${targetOf(job)}:${cacheModeOf(job)}`).sort()
   const targets = ['darwin-arm64', 'darwin-x64', 'win32-arm64', 'win32-x64']
   expect(legs).toEqual(targets.flatMap(target => [`${target}:read`, `${target}:write`]).sort())
   expect(cacheUsers(payload)).toHaveLength(1)
@@ -128,7 +139,7 @@ it.each([
   ...desktopLegs.map(([id, job]) => [id, job, 'desktop', 'scripts/bundles/desktop.py']),
   ...cacheUsers(payload).map(([id, job]) => [id, job, 'payload-test', 'scripts/bundles/native_build.py']),
 ])('%s restores, admits and saves candidates before consuming them', (id, job, producer, driver) => {
-  const cacheMode = job['cache-mode']
+  const cacheMode = cacheModeOf(job)
   if (cacheMode) {
     expect(job.needs).toEqual(['validate'])
     // Only the release branch writes the shared cache; commit and channel
@@ -197,7 +208,7 @@ it('each selection gate joins exactly one target\'s two trust branches after adm
   for (const gate of gates) {
     const [admission, ...branches] = gate.needs
     expect(admission).toBe('validate')
-    expect(branches.map(id => legs[id]?.['cache-mode']).sort()).toEqual(['read', 'write'])
+    expect(branches.map(id => cacheModeOf(legs[id])).sort()).toEqual(['read', 'write'])
     const [label] = new Set(branches.flatMap(id => targetOf(legs[id])))
     expect(new Set(branches.flatMap(id => targetOf(legs[id]))).size).toBe(1)
     // The gate runs always() to judge a skipped branch, so it must still
