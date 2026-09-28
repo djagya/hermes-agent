@@ -52,6 +52,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import tomllib
 from dataclasses import dataclass, field
@@ -456,7 +457,8 @@ def migrate_oracle(leg: Leg, name: str, before: bytes) -> bytes:
     if src_env.exists():
         shutil.copy2(src_env, home / ".env")
     code = "from hermes_cli.config import migrate_config; migrate_config(interactive=False, quiet=True)"
-    cp = H.run([str(H.WORKTREE / ".venv" / "bin" / "python"), "-c", code],
+    # The test runner is the locked PM interpreter; CI does not create checkout/.venv.
+    cp = H.run([sys.executable, "-c", code],
                env=env, cwd=H.WORKTREE, writable=[oroot], timeout=CLI_TIMEOUT)
     assert cp.returncode == 0 and TRACEBACK not in cp.stderr, H.describe(cp)
     return (home / "config.yaml").read_bytes()

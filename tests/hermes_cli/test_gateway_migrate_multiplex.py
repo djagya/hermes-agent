@@ -659,10 +659,10 @@ def test_unresolvable_system_unit_user_is_unknown_principal_not_directory_owner(
     assert fleet.ops == [] and _config_flag(fleet.root) is None
 
 
-def test_opt_out_reads_effective_config_managed_false_wins_and_string_false_is_false(fleet, tmp_path, monkeypatch):
+def test_opt_out_reads_effective_config_managed_seed_and_string_false(fleet, tmp_path, monkeypatch):
     """The opt-out authorizes an unattended destructive action, so it reads the same effective config
-    the CLI does: a managed ``false`` overrides the user's ``true``; a hand-written ``"false"`` string is
-    an opt-out, not a truthy value; the declared default keeps absent == opted in."""
+    the CLI does: a managed ``false`` seeds an omitted leaf, but an explicit user ``true`` wins;
+    a hand-written ``"false"`` string is an opt-out, not a truthy value."""
     from hermes_cli import config as cfg
     from hermes_cli.config_defaults import DEFAULT_CONFIG
     from hermes_cli.gateway_migrate_guards import auto_migration_opted_out
@@ -681,6 +681,10 @@ def test_opt_out_reads_effective_config_managed_false_wins_and_string_false_is_f
     (managed / "config.yaml").write_text("gateway:\n  auto_multiplex_migration: false\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
     managed_scope.invalidate_managed_cache()
+    with gm._home_env(fleet.root):
+        assert cfg.load_config()["gateway"]["auto_multiplex_migration"] is True
+    assert auto_migration_opted_out(fleet.root) is False
+    (fleet.root / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")
     with gm._home_env(fleet.root):
         assert cfg.load_config()["gateway"]["auto_multiplex_migration"] is False
     assert auto_migration_opted_out(fleet.root) is True
