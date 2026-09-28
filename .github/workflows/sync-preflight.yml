@@ -1,0 +1,198 @@
+name: Hermes Sync Preflight
+
+# Dispatch ON the candidate branch/ref. candidate_sha must equal github.sha;
+# this binds the workflow definition, checkout, run receipt and tested code.
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact 40-character candidate SHA (must equal dispatch ref head)
+        type: string
+        required: true
+      baseline_sha:
+        description: Exact pre-sync fork head (sync merge first parent)
+        type: string
+        required: true
+      upstream_sha:
+        description: Exact imported upstream head (sync merge second parent)
+        type: string
+        required: true
+      sync_merge_sha:
+        description: Exact two-parent sync merge on candidate first-parent history
+        type: string
+        required: true
+      selectors:
+        description: all or comma-separated identity-and-contracts,windows-paths,upgrade-config,sqlite-wal,affected-python,image-inventory
+        type: string
+        default: all
+      python_roots:
+        description: JSON test roots for affected-python (1..500 files, no Docker/E2E)
+        type: string
+        default: '["tests/ci"]'
+
+permissions:
+  contents: read
+
+# Never cancel ordinary CI or another diagnostic receipt.
+concurrency:
+  group: sync-preflight-${{ github.run_id }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CANDIDATE: ${{ inputs.candidate_sha }}
+  BASELINE: ${{ inputs.baseline_sha }}
+  UPSTREAM: ${{ inputs.upstream_sha }}
+  SYNC_MERGE: ${{ inputs.sync_merge_sha }}
+  SELECTORS: ${{ inputs.selectors }}
+  PYTHON_ROOTS: ${{ inputs.python_roots }}
+
+jobs:
+  identity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind dispatch, checkout and merge provenance
+        run: |
+          python3 scripts/ci/sync_preflight.py identity \
+            --candidate "$CANDIDATE" --dispatch-sha "$GITHUB_SHA" \
+            --baseline "$BASELINE" --upstream "$UPSTREAM" --merge "$SYNC_MERGE" \
+            --selectors "$SELECTORS" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: preflight-identity
+          path: preflight/
+          if-no-files-found: error
+          retention-days: 14
+
+  focused:
+    name: ${{ matrix.lane }}
+    needs: identity
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: identity-and-contracts
+            os: ubuntu-latest
+          - lane: windows-paths
+            os: windows-latest
+          - lane: upgrade-config
+            os: ubuntu-latest
+          - lane: sqlite-wal
+            os: ubuntu-latest
+          - lane: affected-python
+            os: ubuntu-latest
+          - lane: image-inventory
+            os: ubuntu-latest
+    env:
+      LANE: ${{ matrix.lane }}
+      HERMES_TEST_WORKERS: '2'
+      HERMES_TEST_FILE_RETRIES: '0'
+      OPENAI_API_KEY: ''
+      OPENROUTER_API_KEY: ''
+      NOUS_API_KEY: ''
+    steps:
+      - id: selected
+        env:
+          ENABLED: ${{ inputs.selectors == 'all' || contains(format(',{0},', inputs.selectors), format(',{0},', matrix.lane)) }}
+        run: printf 'enabled=%s\n' "$ENABLED" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        if: steps.selected.outputs.enabled == 'true'
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare tools without consuming the candidate dependency lock
+        if: steps.selected.outputs.enabled == 'true' && matrix.lane == 'identity-and-contracts'
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+      - name: Prepare pinned workflow syntax checker
+        if: steps.selected.outputs.enabled == 'true' && matrix.lane == 'identity-and-contracts'
+        # Its failure must not hide lock/collection/dependency diagnostics.
+        continue-on-error: true
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/actionlint.tgz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          printf '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  %s\n' "$RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/actionlint.tgz" actionlint
+      - name: Capture cheap contracts before dependency bootstrap can fail
+        if: steps.selected.outputs.enabled == 'true' && matrix.lane == 'identity-and-contracts'
+        run: |
+          "$HERMES_PYTHON" scripts/ci/sync_preflight.py lane --phase cheap \
+            --candidate "$CANDIDATE" --lane "$LANE" --python "$HERMES_PYTHON" \
+            --actionlint "$RUNNER_TEMP/actionlint" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Use the existing locked test environment (no alternate bootstrap)
+        if: steps.selected.outputs.enabled == 'true' && matrix.lane != 'image-inventory'
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          packages: ${{ matrix.os == 'windows-latest' && 'git,ripgrep' || 'ripgrep' }}
+          extras: '["all", "telegram", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: Collect the whole selected failure tranche
+        if: steps.selected.outputs.enabled == 'true'
+        run: |
+          if [ "$LANE" = image-inventory ]; then interpreter=python3; else interpreter="$HERMES_PYTHON"; fi
+          phase=all
+          if [ "$LANE" = identity-and-contracts ]; then phase=tests; fi
+          "$interpreter" scripts/ci/sync_preflight.py lane --phase "$phase" \
+            --candidate "$CANDIDATE" --lane "$LANE" --python "$interpreter" \
+            --roots "$PYTHON_ROOTS" --actionlint "$RUNNER_TEMP/actionlint" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always() && steps.selected.outputs.enabled == 'true'
+        with:
+          name: preflight-${{ matrix.lane }}
+          path: preflight/
+          if-no-files-found: error
+          retention-days: 14
+
+  failure-manifest:
+    if: always()
+    needs: [identity, focused]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          pattern: preflight-*
+          path: preflight
+          merge-multiple: true
+      - name: Fail closed on failures or missing receipts
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          mkdir -p preflight
+          python3 scripts/ci/sync_preflight.py aggregate \
+            --candidate "$CANDIDATE" --selectors "$SELECTORS" --job-results "$JOB_RESULTS" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Write human summary
+        if: always()
+        run: cat preflight/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: sync-preflight-manifest
+          path: |
+            preflight/failure-manifest.json
+            preflight/summary.md
+          if-no-files-found: error
+          retention-days: 14
