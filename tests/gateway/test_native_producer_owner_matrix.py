@@ -28,14 +28,18 @@ def owners(request, tmp_path, monkeypatch):
         home = root / "profiles" / name
         home.mkdir(parents=True)
         value = mode if name == "a" else not bool(mode)
-        cfg = {} if value is None else {"display": {"suppress_warning_notifications": value is True}}
+        # A managed seed fills an omitted leaf; an explicit false belongs to the
+        # user and must win. Exercise both in the same alternating-owner run.
+        cfg = {} if value is None or (mode == "managed" and name == "a") else {
+            "display": {"suppress_warning_notifications": value is True}}
         if name == "a" and mode in ("override", "null"):
             cfg = {"display": {"suppress_warning_notifications": True, "platforms": {
                 p: {"suppress_warning_notifications": False if mode == "override" else None}
                 for p in ("slack", "signal")}}}
         (home / "config.yaml").write_text(json.dumps(cfg))
     def suppressed(name):
-        return mode == "managed" or (mode in (True, "null") if name == "a" else not bool(mode))
+        return (name == "a" if mode == "managed" else
+                (mode in (True, "null") if name == "a" else not bool(mode)))
     return root, suppressed
 
 
