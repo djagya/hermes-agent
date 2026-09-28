@@ -440,8 +440,6 @@ jobs:
           - label: win32-x64
             runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
     env: &win32-env
-      # write = release leg may save the signature cache; commit/channel override to read.
-      CACHE_MODE: write
       CHANNEL_BUILD: ${{ needs.validate.outputs.channel-build }}
       HERMES_DESKTOP_VARIANT: bundled
       HERMES_PAYLOAD_TAG: ${{ inputs.tag }}
@@ -755,9 +753,7 @@ jobs:
     # Cache consumption is restore-only in this job.
     timeout-minutes: 900
     strategy: *win32-strategy
-    env:
-      <<: *win32-env
-      CACHE_MODE: read
+    env: *win32-env
     steps: *win32-steps
 
   build-win32-arm64-commit:
@@ -773,9 +769,7 @@ jobs:
     # Cache consumption is restore-only in this job.
     timeout-minutes: 900
     strategy: *win32-strategy-arm64
-    env:
-      <<: *win32-env
-      CACHE_MODE: read
+    env: *win32-env
     steps: *win32-steps
 
   build-win32-x64:
@@ -854,8 +848,6 @@ jobs:
           - label: darwin-arm64
             runner: macos-15
     env: &darwin-env
-      # write = release leg may save the signature cache; commit/channel override to read.
-      CACHE_MODE: write
       CHANNEL_BUILD: ${{ needs.validate.outputs.channel-build }}
       HERMES_DESKTOP_VARIANT: bundled
       HERMES_PAYLOAD_TAG: ${{ inputs.tag }}
@@ -1156,9 +1148,7 @@ jobs:
     # Cache consumption is restore-only in this job.
     timeout-minutes: 360
     strategy: *darwin-strategy
-    env:
-      <<: *darwin-env
-      CACHE_MODE: read
+    env: *darwin-env
     steps: *darwin-steps
 
   build-darwin-x64-commit:
@@ -1174,9 +1164,7 @@ jobs:
     # Cache consumption is restore-only in this job.
     timeout-minutes: 360
     strategy: *darwin-strategy-x64
-    env:
-      <<: *darwin-env
-      CACHE_MODE: read
+    env: *darwin-env
     steps: *darwin-steps
 
   build-darwin-arm64:

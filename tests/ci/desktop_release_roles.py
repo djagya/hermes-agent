@@ -48,13 +48,19 @@ def _only(matches: list[str], role: str) -> str:
 def cache_mode(job: dict) -> str:
     """Release legs may write the shared cache; commit and channel legs only read.
 
-    The mode lives in ``env.CACHE_MODE``. A job-level ``cache-mode`` key is not
-    in the Actions schema, so actionlint rejects it.
+    Jobs that own their env map set ``CACHE_MODE``. Native build legs share one
+    env anchor, and GitHub Actions rejects YAML merge keys, so those legs are
+    classified by the trust-branch ``if`` instead of a second env copy.
     """
     mode = (job.get("env") or {}).get("CACHE_MODE")
-    if mode not in _MODE_BY_CACHE:
-        raise KeyError(f"CACHE_MODE must be write or read, got {mode!r}")
-    return mode
+    if mode in _MODE_BY_CACHE:
+        return mode
+    text = " ".join(str(job.get("if") or "").split())
+    if "inputs.build_commit != '' || inputs.channel != ''" in text:
+        return "read"
+    if "inputs.build_commit == '' && inputs.channel == ''" in text:
+        return "write"
+    raise KeyError(f"CACHE_MODE missing and if does not name a trust branch: {text!r}")
 
 
 def native_builds(jobs: dict) -> dict[tuple[str, str], str]:

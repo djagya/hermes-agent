@@ -14,7 +14,7 @@ import pytest
 
 from tests.ci.desktop_release_roles import (
     CANARY_TAG as TAG, DOWNLOADABLE_DISPATCHES, NATIVE_TARGETS, SHA, admitted, canary_publisher,
-    gate, native_builds, needs_of, phase_result, selection_gates, smoke_callers, stage_step,
+    cache_mode, gate, native_builds, needs_of, phase_result, selection_gates, smoke_callers, stage_step,
     termux_builder, universal_assembler, updater_publishers,
 )
 from tests.ci.test_commit_build_staging import ROOT, shell_step
@@ -156,11 +156,11 @@ def test_signature_cache_saves_only_in_the_writable_build():
         save = next(step for step in cache_steps if step['uses'].startswith('actions/cache/save@'))
         assert save['with']['path'] == restore['with']['path']
         assert save['with']['key'] == '${{ steps.' + restore['id'] + '.outputs.cache-primary-key }}'
-        assert gate(save['if'], {'build_commit': commit}, {}, job_if=False) is (job['env']['CACHE_MODE'] == 'write')
+        assert gate(save['if'], {'build_commit': commit}, {}, job_if=False) is (cache_mode(job) == 'write')
         verify = next(step for step in steps if step.get('name') == 'Verify native signature cache contracts')
         assert steps.index(restore) < steps.index(verify) < steps.index(save)
     assembly = jobs[universal_assembler(jobs)]
-    assert assembly['env']['CACHE_MODE'] == 'read'
+    assert cache_mode(assembly) == 'read'
     setup = next(step for step in assembly['steps'] if step.get('uses') == './.github/actions/setup-pm')
     assert setup['with']['cache-python'] is False
     assert setup['with']['save-tools-cache'] is False and setup['with']['save-node-cache'] is False
@@ -192,7 +192,7 @@ def test_smoke_matrix_native_routes_and_driver_only_dependencies():
     # and needs no source; every job that checks out is a read-only smoke runner.
     assert runners and len(runners) < len(workflow['jobs'])
     for name, job in runners.items():
-        assert job['env']['CACHE_MODE'] == 'read' and 'environment' not in job
+        assert cache_mode(job) == 'read' and 'environment' not in job
         checkout = next(step for step in job['steps'] if 'actions/checkout@' in step.get('uses', ''))
         assert checkout['with']['persist-credentials'] is False
         # A channel build smokes the trusted controller's checkout, not the
