@@ -568,10 +568,13 @@ ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data && chmod 0644 /opt/hermes/tools/facts.json && \
     rm -f /opt/hermes/.venv/.lock /opt/hermes/pm-runtime/.lock
 
-# Keep the large sealed tool store and venv as separate copy layers. Moving
-# them out of the assembled stage before the final copy prevents a second
-# /opt/hermes COPY from folding them back into one oversized layer.
-RUN mkdir -p /runtime-cut && \
+# The pm archive includes ffplay (~173 MB), but Docker's PATH only exposes
+# ffmpeg and ffprobe. Do not copy the unexposed player into the sealed image;
+# keep the pinned capture/transcode binaries and their store metadata intact.
+# Prune in the assembler, before the final-stage COPY, not in the published
+# image (a later rm would leave the bytes in an earlier layer).
+RUN python3 -c 'from pm import installed_package; p = installed_package("ffmpeg").binary.with_name("ffplay"); p.unlink()' && \
+    mkdir -p /runtime-cut && \
     mv /opt/hermes/tools /opt/hermes/.venv /runtime-cut/
 
 # Compilers, headers and build-only transitive packages live in runtime_base,
