@@ -298,10 +298,9 @@ FROM runtime_base AS python_deps
 #
 # The Matrix gateway's deps ([matrix] extra) are baked in because
 # python-olm (transitive via mautrix[encryption]) builds from source on
-# Python/image combinations without usable wheels.  The Docker image is
-# Linux-only, so keeping the native libolm/build-toolchain packages here
-# avoids the cross-platform failures that kept [matrix] out of [all]
-# while still making Matrix work in the published container. Fixes #30399.
+# Python/image combinations without usable wheels. The build stage has
+# libolm-dev and compilers; the final image keeps libolm3 for the extension.
+# Fixes #30399.
 #
 # Google Chat's [google-chat] extra (google-cloud-pubsub + Chat API clients)
 # is baked so hosted/immutable images can enable the adapter without writing
@@ -346,7 +345,7 @@ COPY --from=icons /tmp/hermes-icons /tmp/hermes-icons
 RUN node scripts/build/tui.mjs --source /opt/hermes --out /opt/products/tui && \
     node scripts/build/web.mjs --source /opt/hermes --icons /tmp/hermes-icons --out /opt/products/web
 
-FROM python_deps AS runtime
+FROM python_deps AS assembled_build
 ARG HERMES_GIT_SHA=
 ARG HERMES_IMAGE_NAME=nousresearch/hermes-agent
 ARG HERMES_BUILD_REF=
@@ -568,6 +567,72 @@ ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 # them after all builds; never relax permissions on mutable PM/home state.
 RUN mkdir -p /opt/data && chmod 0644 /opt/hermes/tools/facts.json && \
     rm -f /opt/hermes/.venv/.lock /opt/hermes/pm-runtime/.lock
+
+# Compilers, headers and build-only transitive packages live in runtime_base,
+# not the published image. Purging them after this stage would leave their
+# bytes in earlier Docker layers. Assemble the sealed product above and copy
+# only its runtime trees onto the same pinned Debian base instead.
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS runtime
+ARG HERMES_GIT_SHA=
+LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
+      org.opencontainers.image.revision="${HERMES_GIT_SHA}"
+ARG HERMES_BOT_DESKTOP=0
+ARG DEBIAN_SNAPSHOT=20260914T000000Z
+COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
+RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
+    apt-get -o Acquire::Retries=3 update && \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+    ca-certificates curl iputils-ping python3 python-is-python3 python3-venv \
+    libffi8 libolm3 libatomic1 procps git openssh-client xz-utils \
+    libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
+    bubblewrap file jq zip unzip p7zip-full zstd libarchive-tools \
+    poppler-utils qpdf ghostscript tesseract-ocr tesseract-ocr-eng ocrmypdf \
+    imagemagick pandoc libreoffice-writer libreoffice-calc \
+    libimage-exiftool-perl libheif1 libheif-examples \
+    fonts-noto-core fonts-noto-color-emoji fonts-liberation \
+    iproute2 bind9-dnsutils lsof psmisc rclone shellcheck \
+    libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info && \
+    if [ "$HERMES_BOT_DESKTOP" = "1" ]; then \
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+        tigervnc-standalone-server xfce4-panel xfwm4 xfdesktop4 xfce4-settings xfce4-terminal \
+        dbus-x11 x11-xserver-utils x11-utils x11-xkb-utils xauth fonts-dejavu-core chromium; \
+    fi && \
+    rm -rf /var/lib/apt/lists/*
+RUN useradd -u 10000 -m -d /opt/data hermes && \
+    mkdir -p /tmp/.X11-unix /tmp/hermes-runtime && \
+    chmod 1777 /tmp/.X11-unix && chmod 0700 /tmp/hermes-runtime
+COPY --from=assembled_build /opt/hermes /opt/hermes
+COPY --from=assembled_build /usr/local /usr/local
+COPY --from=assembled_build /usr/libexec/sera-toolbox /usr/libexec/sera-toolbox
+COPY --from=assembled_build /etc/hermes /etc/hermes
+COPY --from=assembled_build /etc/sera-toolbox /etc/sera-toolbox
+COPY --from=assembled_build /etc/profile.d/hermes-path.sh /etc/profile.d/hermes-path.sh
+COPY --from=assembled_build /etc/cont-init.d /etc/cont-init.d
+COPY --from=assembled_build /etc/s6-overlay /etc/s6-overlay
+COPY --from=assembled_build /etc/ld.so.conf.d/000-sqlite-fixed.conf /etc/ld.so.conf.d/000-sqlite-fixed.conf
+COPY --from=assembled_build /init /init
+COPY --from=assembled_build /command /command
+COPY --from=assembled_build /package /package
+COPY --from=assembled_build /usr/bin/tini /usr/bin/tini
+RUN ldconfig && \
+    python3 -c 'import sqlite3; assert sqlite3.sqlite_version_info >= (3, 51, 3)' && \
+    test ! -x /usr/bin/gcc && test ! -x /usr/bin/g++ && test ! -x /usr/bin/docker && \
+    test -r /etc/hermes/config.yaml && test -x /init && \
+    test -x /opt/hermes/.venv/bin/hermes
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/tools HERMES_RUNTIME_DIR=/opt/hermes/tools
+ENV HERMES_PYTHON=/usr/local/bin/python3
+ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist HERMES_TUI_DIR=/opt/hermes/ui-tui
+ENV HERMES_HOME=/opt/data HERMES_WRITE_SAFE_ROOT=/opt/data
+ENV HERMES_CHILD_HOME=/opt/data/home
+ENV XDG_CACHE_HOME=/opt/data/cache UV_CACHE_DIR=/opt/data/cache/uv
+ENV HERMES_MODEL_ROOT=/opt/data/models HF_HOME=/opt/data/models/huggingface
+ENV TRANSFORMERS_CACHE=/opt/data/models/huggingface HUGGINGFACE_HUB_CACHE=/opt/data/models/huggingface
+ENV NPM_CONFIG_CACHE=/opt/data/cache/npm NPM_CONFIG_UPDATE_NOTIFIER=false
+ENV npm_config_install_links=false
+ENV XDG_RUNTIME_DIR=/tmp/hermes-runtime
+ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/command:/opt/data/.local/bin:${PATH}"
+WORKDIR /opt/hermes
 VOLUME [ "/opt/data" ]
 
 # The image ENTRYPOINT is a tiny dispatcher rather than `/init` directly.
