@@ -33,7 +33,7 @@ from agent.turn_context import extract_api_content_sidecar
 from hermes_cli.cli_agent_setup_mixin import _retire_agent
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL, discover_local_cdp_url, find_free_debug_port, is_browser_debug_ready,
-    launch_chrome_debug, local_port_in_use, manual_chrome_debug_command)
+    launch_chrome_debug, local_port_in_use, manual_chrome_debug_command, managed_connect_refusal)
 
 
 # Output helpers. Slash-command text is user-visible: every literal below is load-bearing.
@@ -502,6 +502,9 @@ def _launch_default_cdp_browser(port: int):
 def _browser_connect(cli, cdp_url: str) -> None:
     """/browser connect [url] — validate the CDP URL, find or launch a debug browser, then
     point the browser tools at it (BROWSER_CDP_URL) and tell the model."""
+    if refusal := managed_connect_refusal():
+        _say_block(refusal)
+        return
     normalized = _normalize_cdp_url(cdp_url)
     if normalized is None:
         return

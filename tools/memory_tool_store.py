@@ -256,7 +256,7 @@ class MemoryStore:
         return None
 
     def _mutate(self, target: str, mutate, *, skip_drift: bool = False,
-                expected_sha256: Optional[str] = None) -> Dict[str, Any]:
+                expected_sha256: Optional[str] = None, before_write=None) -> Dict[str, Any]:
         """Lock, re-read from disk, run ``mutate(entries, limit)`` -> ``(new_entries, message)``
         or an error dict, then persist and return the success response. The reload aborts
         on an existing-but-unreadable file (even append-only ``add`` rewrites the whole
@@ -281,16 +281,21 @@ class MemoryStore:
                 return _drift_error(path, bak)
             result = mutate(self._entries_for(target), self._char_limit(target))
             if isinstance(result, dict):
+                if result.get("success") and before_write is not None and not before_write():
+                    return _error("Pending memory approval capability is not live.")
                 return result
-            self._set_entries(target, result[0])
             from hermes_constants import mkdir_under_hermes_home
 
             mkdir_under_hermes_home(path.parent)
+            if before_write is not None and not before_write():
+                return _error("Pending memory approval capability is not live.")
+            self._set_entries(target, result[0])
             self._write_file(path, result[0])
             extra_fields = result[2] if len(result) > 2 else {}
             return self._success_response(target, result[1], **extra_fields)
 
-    def add(self, target: str, content: str, *, expected_sha256: Optional[str] = None) -> Dict[str, Any]:
+    def add(self, target: str, content: str, *, expected_sha256: Optional[str] = None,
+            before_write=None) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
         if not content:
@@ -310,10 +315,12 @@ class MemoryStore:
             return entries + [content], "Entry added."
         # Append-only: skip the drift guard (appending never clobbers foreign
         # content) but still refuse a failed read — add rewrites the WHOLE file.
-        return self._mutate(target, _add, skip_drift=True, expected_sha256=expected_sha256)
+        return self._mutate(target, _add, skip_drift=True, expected_sha256=expected_sha256,
+                            before_write=before_write)
 
     def replace(self, target: str, old_text: str, new_content: str,
-                matched_entry: Optional[str] = None, *, expected_sha256: Optional[str] = None) -> Dict[str, Any]:
+                matched_entry: Optional[str] = None, *, expected_sha256: Optional[str] = None,
+                before_write=None) -> Dict[str, Any]:
         """Find the entry containing old_text (whole-entry exact match first) and
         replace the WHOLE entry with new_content — old_text only locates the entry;
         the matched span is not spliced into it."""
@@ -324,14 +331,16 @@ class MemoryStore:
             return _error("new_content cannot be empty. Use 'remove' to delete entries.")
         if scan_error := _scan_memory_content(new_content):
             return _error(scan_error)
-        return self._edit(target, old_text.strip(), new_content, matched_entry, expected_sha256=expected_sha256)
+        return self._edit(target, old_text.strip(), new_content, matched_entry,
+                          expected_sha256=expected_sha256, before_write=before_write)
 
     def remove(self, target: str, old_text: str, matched_entry: Optional[str] = None,
-               *, expected_sha256: Optional[str] = None) -> Dict[str, Any]:
+               *, expected_sha256: Optional[str] = None, before_write=None) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
         if not old_text.strip():
             return _error("old_text cannot be empty.")
-        return self._edit(target, old_text.strip(), None, matched_entry, expected_sha256=expected_sha256)
+        return self._edit(target, old_text.strip(), None, matched_entry,
+                          expected_sha256=expected_sha256, before_write=before_write)
 
     def _locate(self, entries: List[str], old_text: str, verb: str, matched_entry: Optional[str] = None):
         """Index of the entry *old_text* selects, or the error dict the edit returns. A write
@@ -360,7 +369,8 @@ class MemoryStore:
         return self._mutate(target, _resolve, skip_drift=True)
 
     def _edit(self, target: str, old_text: str, new_content: Optional[str],
-              matched_entry: Optional[str] = None, *, expected_sha256: Optional[str] = None) -> Dict[str, Any]:
+              matched_entry: Optional[str] = None, *, expected_sha256: Optional[str] = None,
+              before_write=None) -> Dict[str, Any]:
         """Locked replace (``new_content`` set) or remove (None) of the entry matching *old_text*."""
         def _apply(entries, limit):
             idx = self._locate(entries, old_text, "replace" if new_content else "remove", matched_entry)
@@ -376,7 +386,8 @@ class MemoryStore:
                     f"or 'remove' other stale or less important entries to make room (see current_entries "
                     f"below), then retry — all in this turn."))
             return replaced, "Entry replaced.", {"replaced_entry": entries[idx]}
-        return self._mutate(target, _apply, expected_sha256=expected_sha256)
+        return self._mutate(target, _apply, expected_sha256=expected_sha256,
+                            before_write=before_write)
 
     @staticmethod
     def _apply_batch_op(working: List[str], act: str, content: str, old_text: str,
@@ -413,12 +424,13 @@ class MemoryStore:
         return None, previous_content
 
     def apply_batch(self, target: str, operations: List[Dict[str, Any]],
-                    *, expected_sha256: Optional[str] = None) -> Dict[str, Any]:
+                    *, expected_sha256: Optional[str] = None, before_write=None) -> Dict[str, Any]:
         """Apply add/replace/remove ops atomically against the FINAL budget, so one call
         can free space and add entries. All-or-nothing: any malformed / unmatched op or
         an over-limit result writes NOTHING and returns the first failure. Aborts do not
         echo ``current_entries`` — the store is unchanged and the model already has it."""
-        return self._batch(target, operations, commit=True, expected_sha256=expected_sha256)
+        return self._batch(target, operations, commit=True, expected_sha256=expected_sha256,
+                           before_write=before_write)
 
     def resolve_batch_entries(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Dry-run ``apply_batch`` under the lock without persisting: the same content scan,
@@ -428,7 +440,7 @@ class MemoryStore:
         return self._batch(target, operations, commit=False)
 
     def _batch(self, target: str, operations: List[Dict[str, Any]], *, commit: bool,
-               expected_sha256: Optional[str] = None) -> Dict[str, Any]:
+               expected_sha256: Optional[str] = None, before_write=None) -> Dict[str, Any]:
         if not operations:
             return _error("operations list is empty.")
         ops = [op or {} for op in operations]
@@ -478,7 +490,8 @@ class MemoryStore:
             if removed:
                 replaced_fields["removed_entries"] = removed
             return working, f"Applied {len(operations)} operation(s).", replaced_fields
-        return self._mutate(target, _apply, skip_drift=not commit, expected_sha256=expected_sha256)
+        return self._mutate(target, _apply, skip_drift=not commit, expected_sha256=expected_sha256,
+                            before_write=before_write)
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch

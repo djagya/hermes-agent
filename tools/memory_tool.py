@@ -318,12 +318,22 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     if not (digest == "ABSENT" or isinstance(digest, str) and len(digest) == 64
             and all(char in "0123456789abcdef" for char in digest)):
         return {"success": False, "error": "Pending memory write has a malformed base-state guard; inspect and restage it."}
+    from tools import write_approval as wa
+
+    # Consume only at the store's locked commit boundary. Stale target guards,
+    # missing pinned entries and validation failures must remain retryable;
+    # a failure after this point is quarantined rather than blindly replayed.
+    def before_write():
+        return wa.consume_pending_apply_capability(wa.MEMORY, payload)
+
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [], expected_sha256=digest)
+        return store.apply_batch(target, payload.get("operations") or [],
+                                 expected_sha256=digest, before_write=before_write)
     if action not in _STORE_ACTIONS:
         return {"success": False, "error": f"Unknown staged action '{action}'."}
     return _STORE_ACTIONS[action][0](store, target, payload.get("content") or "", payload.get("old_text") or "",
-                                     payload.get("matched_entry"), expected_sha256=digest)
+                                     payload.get("matched_entry"), expected_sha256=digest,
+                                     before_write=before_write)
 
 
 MEMORY_SCHEMA = {
