@@ -44,6 +44,8 @@ def _fmt_pending_list(subsystem: str) -> str:
         if r.get("legacy_schema"):
             tag += " [legacy — restage required]"
         lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
+        if subsystem == wa.MEMORY:
+            lines.extend(f"    {entry}" for entry in _matched_entries(r.get("payload") or {}))
     where = "/{s} approve <id>".format(s=subsystem)
     lines.append("")
     lines.append(f"Apply: {where}   Reject: /{subsystem} reject <id>")

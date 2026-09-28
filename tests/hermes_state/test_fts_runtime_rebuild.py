@@ -595,6 +595,22 @@ class TestRuntimeFtsRebuild:
         assert any("python language guide" in snippet for snippet in snippets)
         assert all("java" not in snippet for snippet in snippets)
 
+    def test_stale_search_respects_token_boundaries_before_pagination(self, db, tmp_path):
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "TKtx12 turn")
+        db.append_message("s1", "user", "TKtx128 turn")
+        db.append_message("s1", "user", "TKtx129 turn")
+        _corrupt_fts(db_path)
+        db.append_message("s1", "user", "canonical survives")
+        assert db._fts_stale is True
+        assert [r["snippet"] for r in db.search_messages("TKtx12", limit=1)] == ["TKtx12 turn"]
+        assert db.search_messages("TKtx12", limit=1, offset=1) == []
+        assert len(db.search_messages("TKtx12*")) == 3
+        assert [r["snippet"] for r in db.search_messages("TKtx12 NOT TKtx128")] == ["TKtx12 turn"]
+
     def test_existing_peer_observes_fail_open_marker(
         self, db, tmp_path, monkeypatch
     ):

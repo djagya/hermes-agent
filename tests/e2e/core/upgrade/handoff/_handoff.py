@@ -127,7 +127,13 @@ class Install:
             parts.append(H.describe(cp, 8000))
         for log in self.logs:
             if log.exists():
-                parts.append(f"--- {log.name} (tail) ---\n{log.read_text(errors='replace')[-3000:]}")
+                text = log.read_text(errors="replace")
+                if log.name == "gateway.log" and self.column == "n1":
+                    control_lines = [line for line in text.splitlines()
+                                     if "Control socket startup failed" in line or "control socket failed to start" in line.lower()]
+                    if control_lines:
+                        parts.append("--- release control-socket diagnostics ---\n" + "\n".join(control_lines[-5:]))
+                parts.append(f"--- {log.name} (tail) ---\n{text[-3000:]}")
         logs = self.hermes_home / "logs"
         for name in ("gateway.log", "errors.log", "update.log", "agent.log"):
             p = logs / name
@@ -364,7 +370,9 @@ def cell(column: str, root: Path, provider_url: str, *, extra: dict | None = Non
 
 def start_gateway(inst: Install, *args: str) -> dict:
     """``hermes gateway run`` as a user starts it by hand; returns its ``identify`` answer."""
-    inst.spawn("gateway", "gateway", "run", *args)
+    # The release gateway treats control-socket setup as non-fatal and logs its
+    # exception only at DEBUG; surface the actual cause when the N-1 premise fails.
+    inst.spawn("gateway", "gateway", "run", *(("-vv",) if inst.column == "n1" else ()), *args)
     try:
         wait_for(lambda: health(inst.port), timeout=240, what="the gateway API server /health")
         ident = wait_for(lambda: identify(inst.hermes_home), timeout=60, what="control-socket identify")

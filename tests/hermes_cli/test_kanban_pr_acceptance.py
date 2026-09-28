@@ -145,7 +145,7 @@ def _last_receipt(conn, tid):
     return json.loads(row[0]) if row else None
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_required_failures_refuse_with_typed_evidence(github):
     """Failed/pending/missing required checks refuse, each with bound head and per-check classification."""
     with connect() as conn:
@@ -167,7 +167,7 @@ def test_required_failures_refuse_with_typed_evidence(github):
         assert receipt["checks"] == [{"name": "required", "classification": "missing", "head_sha": "a" * 40}]
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_merged_pr_with_provable_exact_head_and_required_checks_is_acceptable(github):
     """Merged PRs stay completable when exact head + required checks prove out (t_06d13cf0 shape)."""
     github.update(pr_state="MERGED", pull_state="closed", merged=True, head="a" * 40, conclusion="success")
@@ -182,7 +182,7 @@ def test_merged_pr_with_provable_exact_head_and_required_checks_is_acceptable(gi
         assert receipt["checks"][0]["head_sha"] == "a" * 40
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_missing_gh_binary_is_a_typed_capability_result(github, tmp_path, monkeypatch):
     """No gh CLI => explicit capability classification, never the generic null-head infra ambiguity."""
     import hermes_cli.kanban_pr_acceptance as acc
@@ -196,7 +196,7 @@ def test_missing_gh_binary_is_a_typed_capability_result(github, tmp_path, monkey
     assert receipt["pr_url"] == "https://github.com/acme/repo/pull/7"
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_unauthenticated_gh_is_typed_auth_unavailable(github, tmp_path, monkeypatch):
     """gh's exit-4 login banner maps to auth_unavailable, not null-head infra."""
     import hermes_cli.kanban_pr_acceptance as acc
@@ -215,7 +215,7 @@ def test_unauthenticated_gh_is_typed_auth_unavailable(github, tmp_path, monkeypa
     assert "authenticated" in receipt["detail"]
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_graphql_bad_credentials_map_to_auth_unavailable(github):
     """GraphQL errors[] bodies carrying Bad credentials become typed auth failures."""
     import hermes_cli.kanban_pr_acceptance as acc
@@ -225,7 +225,7 @@ def test_graphql_bad_credentials_map_to_auth_unavailable(github):
     assert receipt["head_sha"] is None
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_failure_receipts_never_embed_gh_stderr_or_token_material(github, monkeypatch):
     """No gh stderr, token shape, or env echo survives into any receipt classification."""
     import hermes_cli.kanban_pr_acceptance as acc
@@ -272,7 +272,7 @@ def test_failure_receipts_never_embed_gh_stderr_or_token_material(github, monkey
     assert receipt["classification"] == "provider_error"
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_historical_infra_shape_is_now_typed(github, tmp_path, monkeypatch):
     """The exact t_06d13cf0/t_5346b4d6 receipt (infra + null head + empty checks) becomes typed."""
     import hermes_cli.kanban_pr_acceptance as acc
@@ -297,7 +297,7 @@ def test_historical_infra_shape_is_now_typed(github, tmp_path, monkeypatch):
     assert receipt["pr_url"] == "https://github.com/djagya/hermes-agent/pull/19"
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_unscoped_multiplex_secret_read_refuses_as_capability(github, monkeypatch):
     """Multiplex mode with no secret scope fails closed as capability; os.environ is never read."""
     import agent.secret_scope as scope

@@ -165,9 +165,10 @@ jobs:
             -m "platforms and not integration" \
             -v --tb=short
         env:
-          # These files spawn nested PowerShell trees. CPU-count parallelism
-          # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '2' || '8') || '' }}
+          # These files spawn nested PowerShell trees. The fork's windows-latest
+          # runner has two cores, not the upstream 32-core runner; eight files
+          # concurrently coincide with handoff self-test 60s timeouts.
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (github.repository == 'NousResearch/hermes-agent' && runner.arch != 'ARM64' && '8' || '2') || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ''
