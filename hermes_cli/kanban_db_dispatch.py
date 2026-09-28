@@ -126,6 +126,8 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    missing_skill: list[str] = field(default_factory=list)
+    """Workers with missing mandatory skills, blocked without breaker accounting."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -179,6 +181,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == _kb.KANBAN_MISSING_SKILL_EXIT_CODE:
+                return ("missing_skill", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -742,12 +746,15 @@ class _DeadWorker:
     event_payload: dict
     protocol_violation: bool = False
     rate_limited: bool = False
+    missing_skill: bool = False
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        if self.rate_limited:
+            return "rate_limited"
+        return "missing_skill" if self.missing_skill else "crashed"
 
 
 def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
@@ -775,6 +782,12 @@ def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
         )
+    if kind == "missing_skill":
+        return _DeadWorker(
+            kind, code, f"pid {pid} exited missing a required skill (EX_CONFIG) — task blocked",
+            "missing_skill", {"pid": pid, "claimer": claimer, "exit_code": code},
+            missing_skill=True,
+        )
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
@@ -794,6 +807,7 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    missing_skill: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, protocol_violation, error_text)``: accounted
     # after the txn via ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, bool, str]] = field(default_factory=list)
@@ -828,6 +842,34 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             dead = _classify_dead_worker(pid, row["claim_lock"])
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            if dead.missing_skill:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                    "block_recurrences = block_recurrences + 1, "
+                    "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                    "last_failure_error = ? "
+                    "WHERE id = ? AND status = 'running' "
+                    "AND worker_pid = ? AND claim_lock IS ?",
+                    (dead.error_text[:500], row["id"], pid, row["claim_lock"]),
+                )
+                if cur.rowcount != 1:
+                    continue
+                run_id = _kb._end_run(
+                    conn, row["id"], outcome="missing_skill", status="missing_skill",
+                    error=dead.error_text, metadata=dict(dead.event_payload),
+                )
+                _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
+                _kb._append_event(conn, row["id"], "blocked", {
+                    "reason": dead.error_text[:500], "kind": "capability",
+                    "source_status": retry_status,
+                }, run_id=run_id)
+                sweep.exited_hook_payloads.append({
+                    "task_id": row["id"], "assignee": row["assignee"],
+                    "run_id": run_id, "worker_pid": pid, "exit_kind": dead.kind,
+                    "exit_code": dead.code, "outcome": "missing_skill", "retry_status": "blocked",
+                })
+                sweep.missing_skill.append(row["id"])
+                continue
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -952,6 +994,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_missing_skill = sweep.missing_skill  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1679,6 +1722,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.missing_skill.extend(getattr(detect_crashed_workers, "_last_missing_skill", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
@@ -2148,6 +2192,9 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     for sk in task.skills or ():
         if sk:
             cmd.extend(["--skills", sk])
+    for sk in task.required_skills or ():
+        if sk:
+            cmd.extend(["--required-skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too so the worker resolves the model against the
