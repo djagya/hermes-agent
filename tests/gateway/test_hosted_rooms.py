@@ -730,6 +730,9 @@ def test_room_log_pages_are_bounded_by_serialized_event_bytes(tmp_path, monkeypa
             kind="message.user",
             actor=USER,
             payload={"text": "x" * 180, "index": index},
+            # Same timestamp: a live clock makes the next event's JSON longer than
+            # the first page's budget and the replay page limit raises.
+            now=1_000.0,
         )
 
     one_event = rooms.read_events(db, room_id="room-1", limit=1)

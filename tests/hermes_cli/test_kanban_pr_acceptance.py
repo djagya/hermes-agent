@@ -152,7 +152,7 @@ def test_required_failures_refuse_with_typed_evidence(github):
         for conclusion, expected in (("failure", "failure"), ("pending", "pending")):
             github.update(conclusion=conclusion, head="a" * 40)
             tid = kb.create_task(conn, title=conclusion, completion_contract="acme/repo")
-            assert not kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
             receipt = _last_receipt(conn, tid)
             assert receipt["ok"] is False and receipt["classification"] == expected
             assert receipt["head_sha"] == "a" * 40
@@ -160,7 +160,7 @@ def test_required_failures_refuse_with_typed_evidence(github):
             assert kb.get_task(conn, tid).status != "done"
         github.update(conclusion="success", head="a" * 40, missing=True)
         tid = kb.create_task(conn, title="missing", completion_contract="acme/repo")
-        assert not kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         receipt = _last_receipt(conn, tid)
         assert receipt["classification"] == "missing"
         assert receipt["head_sha"] == "a" * 40
@@ -173,7 +173,7 @@ def test_merged_pr_with_provable_exact_head_and_required_checks_is_acceptable(gi
     github.update(pr_state="MERGED", pull_state="closed", merged=True, head="a" * 40, conclusion="success")
     with connect() as conn:
         tid = kb.create_task(conn, title="merged", completion_contract="djagya/hermes-agent")
-        assert kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/djagya/hermes-agent/pull/18"})
+        assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/djagya/hermes-agent/pull/18"})
         assert kb.get_task(conn, tid).status == "done"
         receipt = _last_receipt(conn, tid)
         assert receipt["ok"] is True and receipt["classification"] == "success"

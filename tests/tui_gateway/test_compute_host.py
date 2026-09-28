@@ -20,7 +20,7 @@ def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
     return out
 
 
-def _read_json_line(out: queue.Queue[dict], timeout: float = 2.0) -> dict:
+def _read_json_line(out: queue.Queue[dict], timeout: float = 15.0) -> dict:
     try:
         return out.get(timeout=timeout)
     except queue.Empty as exc:

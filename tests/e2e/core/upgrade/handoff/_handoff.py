@@ -127,13 +127,7 @@ class Install:
             parts.append(H.describe(cp, 8000))
         for log in self.logs:
             if log.exists():
-                text = log.read_text(errors="replace")
-                if log.name == "gateway.log" and self.column == "n1":
-                    control_lines = [line for line in text.splitlines()
-                                     if "Control socket startup failed" in line or "control socket failed to start" in line.lower()]
-                    if control_lines:
-                        parts.append("--- release control-socket diagnostics ---\n" + "\n".join(control_lines[-5:]))
-                parts.append(f"--- {log.name} (tail) ---\n{text[-3000:]}")
+                parts.append(f"--- {log.name} (tail) ---\n{log.read_text(errors='replace')[-3000:]}")
         logs = self.hermes_home / "logs"
         for name in ("gateway.log", "errors.log", "update.log", "agent.log"):
             p = logs / name
@@ -301,6 +295,34 @@ def identify(home: Path) -> dict | None:
     return identify_gateway(home, timeout=5.0)
 
 
+def _socket_probe(home: Path) -> str:
+    """Why ``identify`` returned nothing: path, connect error, and the raw reply."""
+    import socket as _socket
+
+    from gateway.control_socket import resolve_client_socket_path
+
+    sock_path = Path(home) / "gateway.sock"
+    pointer = Path(home) / "gateway.sock.path"
+    lines = [
+        f"sock_exists={sock_path.exists()} pointer_exists={pointer.is_file()} "
+        f"resolved={resolve_client_socket_path(Path(home))}"
+    ]
+    if pointer.is_file():
+        lines.append("pointer=" + pointer.read_text(errors="replace")[:200])
+    target = resolve_client_socket_path(Path(home))
+    if target is None:
+        return "--- control-socket probe ---\n" + "\n".join(lines)
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
+            sock.settimeout(2.0)
+            sock.connect(str(target))
+            sock.sendall(b'{"verb":"identify","id":1,"protocol":1}\n')
+            lines.append("raw=" + repr(sock.recv(4096))[:500])
+    except OSError as exc:
+        lines.append(f"connect={type(exc).__name__}: {exc}")
+    return "--- control-socket probe ---\n" + "\n".join(lines)
+
+
 def gateway_pids(inst: Install) -> list[dict]:
     """Every gateway in the sandbox (the user's view: the process table). A gateway's own children
     (forked helpers carrying the same argv) belong to it and are not counted as a second gateway."""
@@ -370,14 +392,14 @@ def cell(column: str, root: Path, provider_url: str, *, extra: dict | None = Non
 
 def start_gateway(inst: Install, *args: str) -> dict:
     """``hermes gateway run`` as a user starts it by hand; returns its ``identify`` answer."""
-    # The release gateway treats control-socket setup as non-fatal and logs its
-    # exception only at DEBUG; surface the actual cause when the N-1 premise fails.
-    inst.spawn("gateway", "gateway", "run", *(("-vv",) if inst.column == "n1" else ()), *args)
+    inst.spawn("gateway", "gateway", "run", *args)
     try:
         wait_for(lambda: health(inst.port), timeout=240, what="the gateway API server /health")
         ident = wait_for(lambda: identify(inst.hermes_home), timeout=60, what="control-socket identify")
     except AssertionError as exc:
-        raise AssertionError(f"premise: the gateway never came up: {exc}\n{inst.diagnostics()}") from None
+        raise AssertionError(
+            f"premise: the gateway never came up: {exc}\n{_socket_probe(inst.hermes_home)}\n{inst.diagnostics()}"
+        ) from None
     assert ident["code_sha"] == inst.sha(), f"premise: the gateway must serve the installed commit: {ident}"
     return ident
 

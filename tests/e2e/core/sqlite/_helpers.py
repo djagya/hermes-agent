@@ -336,6 +336,19 @@ def token_counts(db: Path) -> dict[str, int]:
     return out
 
 
+def _canonical_token_hits(conn: sqlite3.Connection, tok: str) -> int:
+    """Rows whose first word is ``tok``.
+
+    An unanchored ``LIKE '%tok%'`` also matches later tokens that merely start
+    with it (``TKx30`` inside ``TKx300``), which is not a duplicate write.
+    """
+    escaped = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return conn.execute(
+        "SELECT count(*) FROM messages WHERE content = ? OR content LIKE ? ESCAPE '\\'",
+        (tok, escaped + " %"),
+    ).fetchone()[0]
+
+
 def fts_problems(db: Path, sample_tokens: list[str], *, expect_detached: bool = False) -> list[str]:
     """FTS must mirror canonical rows exactly: docsize == source rows for each external-content index,
     FTS5's own 'integrity-check' against the content, and a sample of acked tokens found exactly once.
@@ -357,7 +370,7 @@ def fts_problems(db: Path, sample_tokens: list[str], *, expect_detached: bool = 
             if triggers.fetchall():
                 problems.append("FTS triggers still attached to a stale index")
             for tok in sample_tokens:
-                hits = conn.execute("SELECT count(*) FROM messages WHERE content LIKE ?", (f"%{tok}%",)).fetchone()[0]
+                hits = _canonical_token_hits(conn, tok)
                 if hits != 1:
                     problems.append(f"canonical LIKE finds acked {tok} {hits}x (expected 1)")
             return problems

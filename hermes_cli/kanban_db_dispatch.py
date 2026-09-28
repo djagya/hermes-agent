@@ -1620,8 +1620,13 @@ def check_respawn_guard(
         "UNION SELECT profile FROM task_runs WHERE task_id = ?) ORDER BY id DESC",
         (task_id, pr_cutoff, task_id, task_id),
     ).fetchall()
+    def _pr_comment_body(comment: sqlite3.Row) -> str:
+        # A BLOB-typed body is bytes; the regex is a str pattern (#116473).
+        body = _kb._lossy_text(comment["body"])
+        return body if isinstance(body, str) else ""
+
     latest_pr = next(
-        (c for c in pr_comments if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])),
+        (c for c in pr_comments if _RESPAWN_GUARD_PR_URL_RE.search(_pr_comment_body(c))),
         None,
     )
     if latest_pr is not None:
