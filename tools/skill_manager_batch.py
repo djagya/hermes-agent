@@ -300,6 +300,11 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
                 # compact success row otherwise hides them and the model never sees a finding.
                 entry.update({k: parsed[k] for k in _ADVISORY_KEYS if parsed.get(k) is not None})
                 results.append(entry)
+        except BaseException:
+            # A raised op has the same atomicity obligation as a failed result.
+            # Keep the original exception, and retain snapshots if restoration fails.
+            _, rollback_failed = _rollback(snapshots, _smt._find_skill, results)
+            raise
         finally:
             _smt._skill_gate_bypass.reset(token)
             if rollback_failed:

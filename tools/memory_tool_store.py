@@ -252,7 +252,7 @@ class MemoryStore:
         except OSError:
             return _read_failed_error(path)
         if actual != expected_sha256:
-            return {"success": False, "error": "Pending memory write is stale: target changed after staging; inspect current memory and restage.", "target": target}
+            return {"success": False, "error": "Pending memory write is stale: target changed since it was staged; inspect current memory and restage.", "target": target}
         return None
 
     def _mutate(self, target: str, mutate, *, skip_drift: bool = False,

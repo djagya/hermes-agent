@@ -2800,6 +2800,12 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        trow = conn.execute(
+            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if trow is not None and expected_run_id is None and not force and _claim_is_live(trow):
+            raise LiveClaimError(task_id)
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         from hermes_cli.kanban_db_completion import record_completion

@@ -215,15 +215,27 @@ class TestMemoryStoreReplace:
         write-approval replay) must agree on the final entry for the same op (#117952).
         Each surface gets its OWN store dir — the surfaces share nothing but the op."""
         from tools.memory_tool import apply_memory_pending
+        from tools.memory_tool import _build_memory_write_guard
+        from tools import write_approval as wa
         entry = "alpha fact. beta fact. gamma fact."
         op = {"action": "replace", "old_text": "beta fact.", "content": "beta fact, updated."}
         results = {}
 
+        def replay(store):
+            payload = {"action": "batch", "target": "memory",
+                       "operations": [{**op, "matched_entry": entry}],
+                       "_write_guard": _build_memory_write_guard(store, "memory")}
+            pending = wa.stage_write(wa.MEMORY, payload, summary="replace", origin="foreground")
+            def apply(record):
+                outcome = apply_memory_pending(record["payload"], store)
+                return outcome["success"], outcome.get("error", "")
+            ok, message = wa.apply_pending_record(wa.MEMORY, pending["id"], apply)
+            return {"success": ok, "error": message}
+
         for surface, run in (
                 ("single", lambda s: s.replace("memory", op["old_text"], op["content"])),
                 ("batch", lambda s: s.apply_batch("memory", [op])),
-                ("replay", lambda s: apply_memory_pending({"action": "batch", "target": "memory",
-                                                           "operations": [{**op, "matched_entry": entry}]}, s))):
+                ("replay", replay)):
             store_dir = tmp_path / surface
             store_dir.mkdir()
             monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda d=store_dir: d)

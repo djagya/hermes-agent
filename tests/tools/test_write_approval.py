@@ -192,14 +192,14 @@ def test_handle_approve_surfaces_overwritten_entry(hermes_home):
     approver the FULL entry it overwrote — the store's replaced_entries field used to be
     dropped by _apply_one, so the incident path stayed silent."""
     from hermes_cli.write_approval_commands import handle_pending_subcommand
-    from tools.memory_tool import MemoryStore
+    from tools.memory_tool import MemoryStore, _build_memory_write_guard
     from tools import write_approval as wa
     store = MemoryStore(); store.load_from_disk()
     entry = "RULE A: gate merges. RULE B: ci per HEAD. RULE C: never squash."
     store.add("memory", entry)
     wa.stage_write("memory", {"action": "batch", "target": "memory", "operations": [
         {"action": "replace", "old_text": "RULE B: ci per HEAD.", "content": "RULE B: CI is per-head.",
-         "matched_entry": entry}]},
+         "matched_entry": entry}], "_write_guard": _build_memory_write_guard(store, "memory")},
         summary="batch", origin="background_review")
     out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
     assert "Approved 1" in out and entry in out
@@ -269,9 +269,10 @@ def test_approve_refuses_unpinned_legacy_remove(hermes_home):
     from tools.memory_tool import load_on_disk_store
     from tools import write_approval as wa
     _store, pid = _review_stages_remove("single")
-    path = wa._pending_path(wa.MEMORY, pid)
+    path = wa._pending_dir(wa.MEMORY) / f"{pid}.json"
     record = json.loads(path.read_text(encoding="utf-8"))
     record["payload"].pop("matched_entry", None)
+    record["payload_sha256"] = wa._payload_sha256(record["payload"])
     path.write_text(json.dumps(record), encoding="utf-8")
     assert "unpinned legacy target" in handle_pending_subcommand(wa.MEMORY, ["pending"])
 
