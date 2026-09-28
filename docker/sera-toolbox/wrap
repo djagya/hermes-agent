@@ -98,8 +98,11 @@ case "$tool" in
     extra+=(-protocol_whitelist file,pipe,crypto,data)
     ;;
   weasyprint|sera-weasyprint|sera-pymupdf)
-    # Helpers live in libexec but import from the image venv.
-    venv_binds+=(--ro-bind /opt/hermes/.venv /opt/hermes/.venv)
+    # uv's venv python3 resolves into the pinned standalone Python store.
+    # Mount that interpreter AND its stdlib, not the rest of /opt/hermes/tools.
+    # /usr (already RO below) supplies the /usr/local/bin/python3 symlink.
+    venv_binds+=(--ro-bind /opt/hermes/.venv /opt/hermes/.venv
+                 --ro-bind /opt/hermes/tools/python /opt/hermes/tools/python)
     ;;
 esac
 cleanup() {

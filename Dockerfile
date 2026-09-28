@@ -633,6 +633,10 @@ COPY --from=assembled_build /package /package
 COPY --from=assembled_build /usr/bin/tini /usr/bin/tini
 RUN ldconfig && \
     python3 -c 'import sqlite3; assert sqlite3.sqlite_version_info >= (3, 51, 3)' && \
+    case "$(readlink -f /opt/hermes/.venv/bin/python3)" in \
+        /opt/hermes/tools/python/*) ;; \
+        *) echo 'toolbox helper interpreter escapes pinned Python store' >&2; exit 1 ;; \
+    esac && \
     test ! -x /usr/bin/gcc && test ! -x /usr/bin/g++ && test ! -x /usr/bin/docker && \
     test -r /etc/hermes/config.yaml && test -x /init && \
     test -x /opt/hermes/.venv/bin/hermes && \
