@@ -104,5 +104,8 @@ def test_skill_manage_schema_stable_but_creation_follows_active_profile(two_prof
         assert not (other / "brain-b" / name / "SKILL.md").exists()
         result = _under(home, create)
         assert result["success"], result
-        assert (home / create_dir / name / "SKILL.md").read_text(encoding="utf-8") == content
+        # User-local creation inserts the required author without changing
+        # where the profile-scoped document is written.
+        expected = content.replace("---\n\n# Scoped skill", "author: Sera\n---\n\n# Scoped skill")
+        assert (home / create_dir / name / "SKILL.md").read_text(encoding="utf-8") == expected
         assert not (home / "skills" / name).exists()

@@ -302,16 +302,12 @@ word word word
         assert stat.S_IMODE(reference.stat().st_mode) == 0o660
 
     def test_patch_rollback_restores_raw_authorless_bytes_exactly(self, monkeypatch):
-        """Rollback restores the ACTUAL pre-operation disk bytes: a skill with
-        an explicit non-Sera author is never normalized or rewritten by a
-        blocked patch, and an authorless skill (created out-of-band, not via
-        skill_manage) is restored exactly as it was — raw, still authorless.
+        """Blocked patches restore the raw out-of-band authorless preimage,
+        without persisting the author inserted for the attempted patch.
         """
-        imported = SKILL_CONTENT.replace(
-            "description: A test skill for unit testing.",
-            "description: A test skill for unit testing.\nauthor: Hermes Agent",
-        )
-        _create_skill("rollback-skill", imported)
+        # Create through the local-author policy, then simulate an out-of-band
+        # authorless preimage. Explicit non-Sera authors cannot be created here.
+        assert _create_skill("rollback-skill", SKILL_CONTENT)["success"] is True
         skill_md = self.skills_dir / "rollback-skill" / "SKILL.md"
         # Out-of-band mutation: the on-disk preimage is RAW and authorless.
         raw_authorless = SKILL_CONTENT.replace("author: Sera\n", "")
