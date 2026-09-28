@@ -35,7 +35,7 @@ TARGETS = {
 
 
 def git(*args: str) -> str:
-    return subprocess.check_output(["git", *args], text=True).strip()
+    return subprocess.check_output(["git", *args], text=True, encoding="utf-8").strip()
 
 
 def exact_sha(value: str) -> str:
@@ -110,7 +110,7 @@ class Report:
                      "run_attempt": args.run_attempt, "job": args.lane,
                      "checks": [], "causal_classes": CLASSES}
         if args.phase == "tests":
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            self.data = json.loads(self.path.read_text(encoding="utf-8-sig"))
             if (self.data["candidate"], self.data["run_id"], self.data["run_attempt"]) != (
                     args.candidate, args.run_id, args.run_attempt):
                 raise ValueError("cannot resume a foreign receipt")
@@ -217,7 +217,7 @@ def aggregate(args):
         try:
             if path.stat().st_size > 1024 * 1024:
                 raise ValueError("oversized report")
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
             if (data["candidate"], data["run_id"], data["run_attempt"], data["job"]) != (
                     args.candidate, args.run_id, args.run_attempt, name):
                 raise ValueError("report identity mismatch")
@@ -302,7 +302,7 @@ def main():
     except (ValueError, OSError, subprocess.CalledProcessError) as exc:
         # Preserve earlier independent results if discovery itself failed.
         path = Path(args.output, args.lane + ".json")
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         data["checks"].append({"name": "lane-incomplete", "status": "failed",
                                "causal_class": "unresolved", "detail": str(exc)[:500]})
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
