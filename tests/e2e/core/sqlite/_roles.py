@@ -245,6 +245,10 @@ def role_opener(a: dict, out: Out) -> int:
         from hermes_state import SessionDB
         db = SessionDB(db_path=db_path)
         try:
+            for token in a.get("search_tokens", ()):
+                hits = db.search_messages(token, limit=3)
+                if len(hits) != 1 or token not in hits[0]["snippet"]:
+                    raise AssertionError(f"degraded search did not find {token} exactly once: {hits}")
             return db.message_count()
         finally:
             db.close()

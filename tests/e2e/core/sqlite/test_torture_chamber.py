@@ -19,8 +19,9 @@ SAME invariants:
 * every acknowledged append is stored exactly once (per-writer intent/ack journals), an in-flight append at
   most once, and no row exists that no writer intended;
 * canonical row counts only grow (no compaction runs here), and repair never lowers them;
-* FTS mirrors the canonical rows (docsize == source rows, FTS5 ``integrity-check``) and session search
-  finds acked messages exactly once;
+* healthy FTS mirrors canonical rows (docsize == source rows, FTS5 ``integrity-check``); after
+  injected corruption the fork's no-live-rebuild fence leaves FTS explicitly stale with triggers
+  detached, while a fresh production opener finds acked messages via canonical LIKE search;
 * no role hit an error (DELETE arm: readers block on writes by design, so a SQLITE_BUSY refusal of a read,
   open or FTS pass is waited out and counted, never an integrity failure); the long-lived reader's and the
   open/close churner's fd counts stay bounded.
@@ -373,7 +374,16 @@ def test_torture_episode(chamber, episode):
     episode_acks = acked_tokens(chamber, runs)
     if not episode_acks:
         problems.append("episode acknowledged no appends")
-    problems += fts_problems(chamber.db, sample(rng, episode_acks, 12))
+    search_tokens = sample(rng, episode_acks, 12)
+    detached = episode in ("fts_corruption_fail_open", "kill9_everything")
+    problems += fts_problems(chamber.db, search_tokens, expect_detached=detached)
+    if detached:
+        # The fork cannot rebuild FTS live. A fresh real opener must search canonical
+        # rows via LIKE while the stale index stays explicitly detached.
+        name = f"{episode}-search-after-stale"
+        chamber.spawn("opener", name, search_tokens=search_tokens)
+        chamber.wait_event(name, "stats")
+        chamber.reap(name)
     problems += _reader_fd_problems(chamber)
     problems += _churn_fd_problems(chamber, episode)
     busy = busy_summary(chamber, episode)

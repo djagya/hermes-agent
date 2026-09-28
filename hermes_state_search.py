@@ -1310,12 +1310,13 @@ class SessionSearchMixin:
         path, which retries in-process from the gateway housekeeping tick (``retry_deferred_fts_recovery``)
         and at next startup.
         """
-        self._raise_if_db_corrupt()
-        self._raise_if_db_replaced()
-        logger.warning(
-            "Live Session DB FTS rebuild is disabled on this fork; "
-            "search stays on existing indexes or LIKE."
-        )
+        with self._lock:
+            self._raise_if_db_corrupt()
+            self._raise_if_db_replaced()
+            logger.warning(
+                "Live Session DB FTS rebuild is disabled on this fork; "
+                "search stays on existing indexes or LIKE."
+            )
         return 0
 
     def _merge_fts_incrementally(self, *, max_pages: int, max_commands: Optional[int] = None) -> int:

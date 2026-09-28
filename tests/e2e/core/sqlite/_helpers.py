@@ -336,15 +336,31 @@ def token_counts(db: Path) -> dict[str, int]:
     return out
 
 
-def fts_problems(db: Path, sample_tokens: list[str]) -> list[str]:
+def fts_problems(db: Path, sample_tokens: list[str], *, expect_detached: bool = False) -> list[str]:
     """FTS must mirror canonical rows exactly: docsize == source rows for each external-content index,
-    FTS5's own 'integrity-check' against the content, and a sample of acked tokens found exactly once."""
+    FTS5's own 'integrity-check' against the content, and a sample of acked tokens found exactly once.
+    In the fork's fenced degraded mode, require a persisted stale marker, detached triggers and
+    canonical rows instead; the real SessionDB search route is checked by a fresh opener."""
     problems: list[str] = []
     conn = _connect(db, ro=False)
     try:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master").fetchall()}
         meta = dict(conn.execute("SELECT key, value FROM state_meta").fetchall()) if "state_meta" in tables else {}
         pending = {k: v for k, v in meta.items() if k.startswith("fts_rebuild") or k in ("fts_stale",)}
+        if expect_detached:
+            # The fork deliberately fences live FTS rebuilds: corruption leaves an explicit
+            # breadcrumb and detached triggers, never an index falsely declared current.
+            if meta.get("fts_stale") != "1":
+                problems.append(f"FTS degradation not recorded: {pending}")
+            triggers = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'messages_fts%'")
+            if triggers.fetchall():
+                problems.append("FTS triggers still attached to a stale index")
+            for tok in sample_tokens:
+                hits = conn.execute("SELECT count(*) FROM messages WHERE content LIKE ?", (f"%{tok}%",)).fetchone()[0]
+                if hits != 1:
+                    problems.append(f"canonical LIKE finds acked {tok} {hits}x (expected 1)")
+            return problems
         if pending:
             problems.append(f"FTS recovery still pending in state_meta: {pending}")
         canon = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
