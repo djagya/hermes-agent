@@ -1856,6 +1856,9 @@ def cmd_chat(args):
 
     passthrough = {k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH}
     if use_tui:
+        # The one-shot skill gate lives in cli.main. The TUI launcher does not
+        # take required_skills, and passing None still crashes startup.
+        passthrough.pop("required_skills", None)
         _launch_tui(
             passthrough.pop("resume"),
             tui_dev=getattr(args, "tui_dev", False),

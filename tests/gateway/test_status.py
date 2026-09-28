@@ -1307,6 +1307,18 @@ class TestReadProcessCmdlinePsFallback:
 
     def test_ps_fallback_when_proc_unavailable(self, monkeypatch):
         monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
+        # psutil sits between /proc and ps. A live PID on the runner (containerd
+        # has been 873) answers before the mocked ps command unless it errors.
+        import sys
+        import types
+        fake_psutil = types.ModuleType("psutil")
+
+        class _Denied:
+            def __init__(self, pid):
+                raise OSError(f"psutil unavailable for {pid}")
+
+        fake_psutil.Process = _Denied
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
         monkeypatch.setattr(
             status.subprocess, "run",
             lambda args, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/libexec/bluetoothuserd\n"),

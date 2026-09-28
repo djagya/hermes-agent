@@ -207,6 +207,19 @@ def stage_n1(root: Path) -> Install:
     # The checkout is the git install the column is running.
     prior = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(checkout) if not prior else str(checkout) + os.pathsep + prior
+    # uv's venv python can ignore PYTHONPATH. A sitecustomize insert puts the
+    # checkout ahead of site-packages so gateway.control_socket resolves for
+    # both `hermes gateway run` and the in-sandbox identify probe.
+    for site_packages in (checkout / "venv" / "lib").glob("python*/site-packages"):
+        hook = site_packages / "sitecustomize.py"
+        hook.write_text(
+            "import sys\n"
+            f"p = {str(checkout)!r}\n"
+            "if p not in sys.path:\n"
+            "    sys.path.insert(0, p)\n",
+            encoding="utf-8",
+        )
+        break
     return Install("n1", root, origin, env)
 
 
@@ -325,13 +338,17 @@ def identify_in_sandbox(inst: Install) -> dict | None:
     code = (
         "import json,sys\n"
         "from pathlib import Path\n"
+        "sys.path.insert(0, sys.argv[2])\n"
         "from gateway.control_socket import identify_gateway\n"
         "home=Path(sys.argv[1])\n"
         "r=identify_gateway(home, timeout=5.0)\n"
         "sys.stderr.write('sock=%s pointer=%s\\n' % ((home/'gateway.sock').exists(), (home/'gateway.sock.path').is_file()))\n"
         "sys.stdout.write(json.dumps(r) if isinstance(r, dict) else '')\n"
     )
-    cp = inst.host.run([str(py), "-c", code, str(inst.hermes_home)], timeout=30, quiet=True)
+    cp = inst.host.run(
+        [str(py), "-c", code, str(inst.hermes_home), str(inst.checkout)],
+        timeout=30, quiet=True,
+    )
     inst.identify_debug = ((cp.stderr or "") + (cp.stdout or ""))[-800:]
     if cp.returncode != 0 or not (cp.stdout or "").strip():
         return None
