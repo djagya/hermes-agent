@@ -1019,6 +1019,9 @@ class SessionSchemaMixin:
         if (
             fts5_available
             and not self._db_needs_fts_storage_upgrade(cursor)
+            # The fork forbids a live rebuild of an older raw-content index.
+            # Do not stamp it as aligned merely because the main schema opened.
+            and not self._fts_index_is_misaligned_source(cursor)
             and cursor.execute(
                 "SELECT 1 FROM state_meta WHERE key = 'fts_rebuild_high_water' LIMIT 1"
             ).fetchone() is None

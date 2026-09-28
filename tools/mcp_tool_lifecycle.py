@@ -225,6 +225,11 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
         for name in to_evict:
             manager.evict(name, hermes_home=scope)
     _loop._stop_mcp_loop(only_if_idle=scope is not None or names is not None)
+    # Stderr is shared by all stdio servers in a profile. Release it only
+    # after a full profile (or process-wide) shutdown, never a names prune.
+    if names is None:
+        from tools.mcp_tool_config import _close_mcp_stderr_logs
+        _close_mcp_stderr_logs(scope=scope)
 
 
 def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tuple[Dict[int, str], Dict[int, int]]:
