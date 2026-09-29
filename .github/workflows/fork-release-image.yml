@@ -139,6 +139,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Record SOURCE_DATE_EPOCH
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
@@ -165,11 +166,25 @@ jobs:
             exit 1
           fi
 
+      # The version is derived, never hand-kept: the nearest upstream release tag in
+      # this tree sets the base, commits past it the distance (scripts/fork-release-version.sh).
+      # Upstream tags are fetched so a sync never reports an older release.
+      - name: Derive release version
+        id: version
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags https://github.com/NousResearch/hermes-agent.git '+refs/tags/v2*:refs/tags/v2*'
+          scripts/fork-release-version.sh --check >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
       - name: Write install stamp
+        env:
+          BASE_VERSION: ${{ steps.version.outputs.base }}
+          DISTANCE: ${{ steps.version.outputs.distance }}
         run: |
           python3 scripts/write_install_stamp.py --output install-stamp.json \
             --distribution docker --update-mechanism external --source ci \
-            --commit "$GITHUB_SHA"
+            --commit "$GITHUB_SHA" --base-version "$BASE_VERSION" --distance "$DISTANCE"
 
       - name: Build image (amd64)
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -184,8 +199,11 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:test
           labels: |
             HERMES_GIT_SHA=${{ github.sha }}
+            HERMES_BASE_VERSION=${{ steps.version.outputs.base }}
+            HERMES_UPSTREAM_TAG=${{ steps.version.outputs.tag }}
             org.opencontainers.image.source=https://github.com/djagya/hermes-agent
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.display }}
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
@@ -252,6 +270,7 @@ jobs:
         env:
           IMAGE: ${{ env.IMAGE_NAME }}:test
           EXPECT_SHA: ${{ github.sha }}
+          EXPECT_BASE: ${{ steps.version.outputs.base }}
           EXPECT_IMAGE: ${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
@@ -263,6 +282,12 @@ jobs:
           fi
           if [ "$oci_rev" != "$EXPECT_SHA" ]; then
             echo "ERROR: OCI revision=$oci_rev != $EXPECT_SHA" >&2
+            exit 1
+          fi
+          stamp_base="$(docker run --rm --entrypoint cat "$IMAGE" /opt/hermes/install-stamp.json \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin).get("baseVersion") or "")')"
+          if [ "$stamp_base" != "$EXPECT_BASE" ]; then
+            echo "ERROR: install-stamp baseVersion=${stamp_base:-<none>} != $EXPECT_BASE" >&2
             exit 1
           fi
           docker run --rm --entrypoint cat "$IMAGE" /etc/hermes/image-provenance.json > /tmp/prov.json
@@ -464,6 +489,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Record SOURCE_DATE_EPOCH
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
@@ -496,11 +522,25 @@ jobs:
           tag="${tag//\//-}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
+      # The version is derived, never hand-kept: the nearest upstream release tag in
+      # this tree sets the base, commits past it the distance (scripts/fork-release-version.sh).
+      # Upstream tags are fetched so a sync never reports an older release.
+      - name: Derive release version
+        id: version
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags https://github.com/NousResearch/hermes-agent.git '+refs/tags/v2*:refs/tags/v2*'
+          scripts/fork-release-version.sh >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
       - name: Write install stamp
+        env:
+          BASE_VERSION: ${{ steps.version.outputs.base }}
+          DISTANCE: ${{ steps.version.outputs.distance }}
         run: |
           python3 scripts/write_install_stamp.py --output install-stamp.json \
             --distribution docker --update-mechanism external --source ci \
-            --commit "$GITHUB_SHA"
+            --commit "$GITHUB_SHA" --base-version "$BASE_VERSION" --distance "$DISTANCE"
 
       - name: Push image
         id: push
@@ -516,8 +556,11 @@ jobs:
             ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
           labels: |
             HERMES_GIT_SHA=${{ github.sha }}
+            HERMES_BASE_VERSION=${{ steps.version.outputs.base }}
+            HERMES_UPSTREAM_TAG=${{ steps.version.outputs.tag }}
             org.opencontainers.image.source=https://github.com/djagya/hermes-agent
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.display }}
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
