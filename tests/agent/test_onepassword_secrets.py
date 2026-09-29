@@ -592,3 +592,19 @@ def test_cache_only_never_blocks_an_explicit_uncached_read(monkeypatch, tmp_path
     secrets, _ = op.fetch_onepassword_secrets(
         references={"A": "op://V/One/f"}, binary=fake_op, use_cache=False, home_path=tmp_path)
     assert secrets == {"A": "live"}
+
+
+def test_cache_only_keeps_sync_apply_live(monkeypatch, tmp_path):
+    """`hermes secrets onepassword sync --apply` resolves with cache_ttl_seconds=0 (fresh)."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setenv(op.CACHE_ONLY_ENV, "1")
+    calls, fake_run = _recorder(lambda cmd: _ok("live"))
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    monkeypatch.setattr(op, "find_op", lambda *a, **k: fake_op)
+    monkeypatch.delenv("CU_KEY", raising=False)
+    result = op.apply_onepassword_secrets(
+        enabled=True, env={"CU_KEY": "op://V/One/f"}, cache_ttl_seconds=0, home_path=tmp_path)
+    assert calls, "op must run for an explicit fresh apply"
+    assert result.applied == ["CU_KEY"]
+    monkeypatch.delenv("CU_KEY", raising=False)
