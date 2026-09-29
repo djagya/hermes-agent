@@ -91,6 +91,17 @@ def _should_skip_external_secret_sources() -> bool:
         a in ("-h", "--help") or not a.startswith("-") for a in args)
 
 
+# Long-lived services an agent shell might start (`hermes gateway run`, `hermes dashboard`).
+# The terminal tool sets HERMES_OP_CACHE_ONLY for its children so shell `hermes` runs never
+# spend the 1Password read budget; a service launched from that shell must still read live.
+_LONG_LIVED_SUBCOMMANDS = frozenset({"gateway", "dashboard"})
+
+
+def runs_long_lived_service() -> bool:
+    """True when this process is a long-lived service (argv[1] is authoritative, see above)."""
+    return sys.argv[1:2] != [] and sys.argv[1] in _LONG_LIVED_SUBCOMMANDS
+
+
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 

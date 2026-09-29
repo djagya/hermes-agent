@@ -403,7 +403,8 @@ def test_rate_limit_stops_pull_and_backs_off_across_processes(monkeypatch, tmp_p
     assert any("10 reference(s) not fetched" in w for w in warnings)
 
     marker = json.loads((tmp_path / "cache" / "op_rate_limit.json").read_text())
-    assert 23 * 3600 < marker["until"] - time.time() <= 24 * 3600  # honours op's retry hint
+    (until,) = marker["identities"].values()
+    assert 23 * 3600 < until - time.time() <= 24 * 3600  # honours op's retry hint
 
     op._CACHE.clear()  # a new process: only the disk marker survives
     _, warnings = op.fetch_onepassword_secrets(
@@ -411,8 +412,8 @@ def test_rate_limit_stops_pull_and_backs_off_across_processes(monkeypatch, tmp_p
     assert len(calls) == 1  # backoff active → op not called at all
     assert any("not calling op until" in w for w in warnings)
 
-    op.clear_caches(tmp_path)  # token rotation drops the marker
-    assert not (tmp_path / "cache" / "op_rate_limit.json").exists()
+    op.clear_caches(tmp_path)  # token rotation drops this identity's backoff
+    assert op._active_backoff(op._auth_fingerprint(op._DEFAULT_TOKEN_ENV), tmp_path) is None
 
 
 def test_rate_limit_serves_last_complete_pull(monkeypatch, tmp_path):
@@ -429,7 +430,7 @@ def test_rate_limit_serves_last_complete_pull(monkeypatch, tmp_path):
     secrets, warnings = op.fetch_onepassword_secrets(references=refs, binary=fake_op,
                                                      cache_ttl_seconds=60, home_path=tmp_path)
     assert secrets == good
-    assert any("last complete pull" in w for w in warnings)
+    assert any("last good read" in w for w in warnings)
 
 
 def test_auth_failure_never_serves_last_good(monkeypatch, tmp_path):
@@ -608,3 +609,121 @@ def test_cache_only_keeps_sync_apply_live(monkeypatch, tmp_path):
     assert calls, "op must run for an explicit fresh apply"
     assert result.applied == ["CU_KEY"]
     monkeypatch.delenv("CU_KEY", raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: per-reference last-good, per-identity backoff, parsing
+# ---------------------------------------------------------------------------
+
+
+def _pull_values(monkeypatch, values):
+    """op returns values[ref] for op read; item get fails so every ref is read singly."""
+    def handler(cmd, **k):
+        target = cmd[cmd.index("--") + 1]
+        if cmd[1:3] == ["item", "get"]:
+            return _err(1, '[ERROR] "x" isn\'t an item')
+        return _ok(values[target])
+    monkeypatch.setattr(op.subprocess, "run", handler)
+
+
+def test_last_good_is_per_reference_so_a_changed_mapping_keeps_other_secrets(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    _pull_values(monkeypatch, {"op://V/One/f": "a", "op://V/Two/f": "b"})
+    op.fetch_onepassword_secrets(references={"A": "op://V/One/f", "B": "op://V/Two/f"},
+                                 binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
+    op._CACHE.clear()
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _err(1, _RATE_LIMITED))
+    secrets, _ = op.fetch_onepassword_secrets(
+        references={"A": "op://V/One/f", "B": "op://V/Two/f", "C": "op://V/Three/f"},
+        binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
+    assert secrets == {"A": "a", "B": "b"}  # a new mapping entry no longer empties the rest
+
+
+def test_rotated_value_replaces_last_good_and_removed_reference_is_pruned(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/One/f", "OLD": "op://V/Old/f"}
+    _pull_values(monkeypatch, {"op://V/One/f": "a1", "op://V/Old/f": "old"})
+    op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
+    _pull_values(monkeypatch, {"op://V/One/f": "a2"})
+    op._CACHE.clear()
+    (tmp_path / "cache" / "op_cache.json").unlink()
+    op.fetch_onepassword_secrets(references={"A": "op://V/One/f"}, binary=fake_op,
+                                 cache_ttl_seconds=60, home_path=tmp_path)  # complete pull: prunes OLD
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _err(1, _RATE_LIMITED))
+    op._CACHE.clear()
+    (tmp_path / "cache" / "op_cache.json").unlink()
+    secrets, _ = op.fetch_onepassword_secrets(references=refs, binary=fake_op,
+                                              cache_ttl_seconds=60, home_path=tmp_path)
+    assert secrets == {"A": "a2"}  # rotated value served; OLD was pruned, never resurrected
+
+
+def test_auth_failure_is_never_masked_by_last_good(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/One/f"}
+    _pull_values(monkeypatch, {"op://V/One/f": "a"})
+    op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
+    op._CACHE.clear()
+    (tmp_path / "cache" / "op_cache.json").unlink()
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _err(1, "[ERROR] 401: Unauthorized"))
+    secrets, _ = op.fetch_onepassword_secrets(references=refs, binary=fake_op,
+                                              cache_ttl_seconds=60, home_path=tmp_path)
+    assert secrets == {}
+
+
+def test_backoff_is_per_identity_and_clear_drops_only_the_caller(tmp_path):
+    op._record_backoff("id-a", "Try again in 2 hours", tmp_path)
+    op._record_backoff("id-b", "Try again in 1 hour", tmp_path)
+    assert op._active_backoff("id-a", tmp_path) and op._active_backoff("id-b", tmp_path)
+    op._clear_backoff(tmp_path, "id-b")
+    assert op._active_backoff("id-a", tmp_path) and op._active_backoff("id-b", tmp_path) is None
+    legacy = tmp_path / "cache" / "op_rate_limit.json"
+    legacy.write_text(json.dumps({"auth": "id-c", "until": time.time() + 60}))
+    assert op._active_backoff("id-c", tmp_path)  # pre-map marker still honoured
+
+
+@pytest.mark.parametrize("message, seconds", [
+    ("Please retry later. Try again in 3 hours", 3 * 3600),
+    ("rate limited, retry after 3600s", 3600),
+    ("Retry-After: 120", 120),
+])
+def test_backoff_takes_the_first_hint_with_a_number(message, seconds):
+    assert op._backoff_seconds(message) == seconds
+
+
+def test_apostrophes_and_quoted_status_still_classify():
+    text = "couldn't read: Too Many Requests, can't retry"
+    err = op._OpError("x", op._without_names(text, "t"), text)
+    assert op._op_error_kind(err) is op.ErrorKind.RATE_LIMITED
+    quoted = 'error: "Too Many Requests"'
+    assert op._op_error_kind(op._OpError("x", op._without_names(quoted, "t"), quoted)) is op.ErrorKind.RATE_LIMITED
+
+
+def test_fresh_cache_hit_seeds_last_good_for_cache_only_children(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/One/f"}
+    _pull_values(monkeypatch, {"op://V/One/f": "a"})
+    op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
+    (tmp_path / "cache" / "op_last_good.json").unlink()  # e.g. cache written by an older image
+    op._CACHE.clear()
+    op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
+    monkeypatch.setenv(op.CACHE_ONLY_ENV, "1")
+    op._CACHE.clear()
+    (tmp_path / "cache" / "op_cache.json").unlink()
+    secrets, _ = op.fetch_onepassword_secrets(references=refs, binary=fake_op,
+                                              cache_ttl_seconds=60, home_path=tmp_path)
+    assert secrets == {"A": "a"}
+
+
+@pytest.mark.parametrize("argv, cache_only", [
+    (["hermes", "chat", "-q", "x"], True),
+    (["hermes", "gateway", "run"], False),  # a service started from an agent shell reads live
+    (["hermes", "dashboard"], False),
+])
+def test_cache_only_never_applies_to_long_lived_services(monkeypatch, argv, cache_only):
+    monkeypatch.setenv(op.CACHE_ONLY_ENV, "1")
+    monkeypatch.setattr(sys, "argv", argv)
+    assert op._cache_only() is cache_only

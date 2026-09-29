@@ -73,18 +73,23 @@ def _disk_key_str(cache_key: _CacheKey) -> str:
 _STORE: SecretCache[_CacheKey] = SecretCache(_DISK_CACHE_BASENAME, key_serializer=_disk_key_str)
 _CACHE = _STORE.memory  # tests flush L1 directly
 
-# Rate-limit backoff marker: {"auth": <auth fingerprint>, "until": <epoch>}. Holds no
+# Rate-limit backoff markers: {"identities": {<auth fingerprint>: <until epoch>}}. Holds no
 # secret values, so it is written even when cache_ttl_seconds is 0. The limit is per
-# 1Password account, not per profile, so the marker lives once under the default root
-# (``<root>/cache``, shared by ``<root>/profiles/*``), keyed by the auth fingerprint.
+# 1Password account, not per profile, so the file lives once under the default root
+# (``<root>/cache``, shared by ``<root>/profiles/*``); one entry per identity so a second
+# service account's 429 never overwrites (or clears) the first one's backoff.
 _BACKOFF_BASENAME = "op_rate_limit.json"
+# Last value read per (identity, op:// reference), under the home's cache dir at 0600. Filled
+# per NAME, so a changed mapping keeps every other secret; pruned on complete pulls so a
+# removed reference does not linger; never consulted after an auth failure.
+_LAST_GOOD_BASENAME = "op_last_good.json"
 # Used when op's message carries no retry hint. 1Password's hourly window is 60 min.
 _DEFAULT_BACKOFF_SECONDS = 15 * 60
 _MAX_BACKOFF_SECONDS = 24 * 60 * 60
 _RETRY_HINT_RE = re.compile(
-    r"(?:try again|retry)\s+(?:in\s+)?(?:about\s+|approximately\s+)?"
-    r"(?:(\d+)\s*hours?)?(?:\s*(?:and|,)?\s*(\d+)\s*minutes?)?"
-    r"(?:\s*(?:and|,)?\s*(\d+)\s*seconds?)?", re.IGNORECASE)
+    r"(?:try again|retry)(?:\s*-\s*after)?\s*(?:in|after|:)?\s*(?:about\s+|approximately\s+)?"
+    r"(?:(\d+)\s*(?:hours?|h)\b)?(?:\s*(?:and|,)?\s*(\d+)\s*(?:minutes?|m)\b)?"
+    r"(?:\s*(?:and|,)?\s*(\d+)\s*(?:seconds?|s)?\b)?", re.IGNORECASE)
 # ``op item get`` prints this instead of a concealed value when it is not revealed.
 _CONCEALED_PLACEHOLDER_RE = re.compile(r"^\[use 'op item get .*--reveal' to reveal\]$", re.IGNORECASE)
 
@@ -119,23 +124,33 @@ def _classify_op_error(message: str) -> ErrorKind:
 class _OpError(RuntimeError):
     """``op`` failure. ``detail`` is op's own text (stderr / timeout / spawn error) with the
     names it echoes blanked (see ``_without_names``), so a vault/item/field name can never
-    change how the failure is classified."""
+    change how the failure is classified. ``raw`` keeps op's text minus the reference only,
+    for the unambiguous rate-limit phrases (a status op itself quotes must still count)."""
 
-    def __init__(self, message: str, detail: str) -> None:
+    def __init__(self, message: str, detail: str, raw: str = "") -> None:
         super().__init__(message)
         self.detail = detail
+        self.raw = raw
 
 
 def _without_names(text: str, target: str) -> str:
     """``text`` with every quoted span and the raw ``target`` blanked. op quotes the names it
     echoes (``"Port 8429" isn't an item``, ``could not read secret 'op://…'``); its own prose is
     never quoted, so a name like "token", "requests" or "429" cannot add or erase a classifying word."""
-    text = re.sub(r"\"[^\"\n]*\"|'[^'\n]*'", " ", text)
+    # A single quote after a letter is an apostrophe (couldn't, can't), not a name delimiter.
+    text = re.sub(r"\"[^\"\n]*\"|(?<![A-Za-z])'[^'\n]*'", " ", text)
     return text.replace(target, " ") if target else text
 
 
+_UNAMBIGUOUS_RATE_LIMIT = ("too many requests", "rate-limited", "rate limited")
+
+
 def _op_error_kind(exc: Exception) -> ErrorKind:
-    return _classify_op_error(exc.detail if isinstance(exc, _OpError) else str(exc))
+    kind = _classify_op_error(exc.detail if isinstance(exc, _OpError) else str(exc))
+    if kind is not ErrorKind.RATE_LIMITED and isinstance(exc, _OpError):
+        if any(p in exc.raw.lower() for p in _UNAMBIGUOUS_RATE_LIMIT):
+            return ErrorKind.RATE_LIMITED
+    return kind
 
 
 def _validate_references(references: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], List[str]]:
@@ -207,13 +222,15 @@ def _run_op(op: Path, args: List[str], target: str, *, account: str, token_value
         proc = run_cli(cmd, env=_op_child_env(token_value), timeout=_OP_RUN_TIMEOUT, label="op",
                        timeout_message=f"op {what} timed out after {_OP_RUN_TIMEOUT}s", stdin=None)
     except RuntimeError as exc:
-        raise _OpError(f"{exc} for {target!r}", _without_names(str(exc), target)) from exc
+        raise _OpError(f"{exc} for {target!r}", _without_names(str(exc), target),
+                       str(exc).replace(target, " ")) from exc
 
     if proc.returncode != 0:
         # Room for op's full 429 text including its "try again in …" hint.
         err = _scrub(proc.stderr or "")[:300]
         if err:
-            raise _OpError(f"op {what} failed for {target!r}: {err}", _without_names(err, target))
+            raise _OpError(f"op {what} failed for {target!r}: {err}", _without_names(err, target),
+                           err.replace(target, " "))
         raise _OpError(f"op {what} exited {proc.returncode} for {target!r}", f"exited {proc.returncode}")
     return proc.stdout or ""
 
@@ -287,11 +304,11 @@ def _is_rate_limited(exc: Exception) -> bool:
 
 def _backoff_seconds(message: str) -> float:
     """Seconds op asked us to wait (``… try again in 23 hours and 59 minutes``), else the default."""
-    match = _RETRY_HINT_RE.search(message)
-    if match and (match.group(1) or match.group(2) or match.group(3)):
-        seconds = int(match.group(1) or 0) * 3600 + int(match.group(2) or 0) * 60 + int(match.group(3) or 0)
-        if seconds > 0:
-            return float(min(seconds, _MAX_BACKOFF_SECONDS))
+    for match in _RETRY_HINT_RE.finditer(message):  # first hint that carries a number
+        if match.group(1) or match.group(2) or match.group(3):
+            seconds = int(match.group(1) or 0) * 3600 + int(match.group(2) or 0) * 60 + int(match.group(3) or 0)
+            if seconds > 0:
+                return float(min(seconds, _MAX_BACKOFF_SECONDS))
     return float(_DEFAULT_BACKOFF_SECONDS)
 
 
@@ -301,40 +318,91 @@ def _backoff_path(home_path: Optional[Path]) -> Path:
     return get_default_hermes_root(home=resolve_cache_home(home_path)) / "cache" / _BACKOFF_BASENAME
 
 
-def _active_backoff(auth_fp: str, home_path: Optional[Path]) -> Optional[float]:
-    """Epoch until which ``op`` must not be called for this identity, or None."""
+def _read_backoffs(home_path: Optional[Path]) -> Dict[str, float]:
     try:
         with open(_backoff_path(home_path), "r", encoding="utf-8-sig") as f:
             payload = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("auth") != auth_fp:
-        return None
-    until = payload.get("until")
-    if not isinstance(until, (int, float)) or until <= time.time():
-        return None
-    return float(until)
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    if "auth" in payload:  # single-identity marker written before the per-identity map
+        payload = {"identities": {payload.get("auth"): payload.get("until")}}
+    ids = payload.get("identities")
+    now = time.time()
+    return {str(k): float(v) for k, v in (ids or {}).items()
+            if isinstance(v, (int, float)) and v > now} if isinstance(ids, dict) else {}
+
+
+def _active_backoff(auth_fp: str, home_path: Optional[Path]) -> Optional[float]:
+    """Epoch until which ``op`` must not be called for this identity, or None."""
+    return _read_backoffs(home_path).get(auth_fp)
 
 
 def _record_backoff(auth_fp: str, message: str, home_path: Optional[Path]) -> float:
     until = time.time() + _backoff_seconds(message)
+    ids = _read_backoffs(home_path)
+    ids[auth_fp] = until
     try:
-        atomic_write_json(_backoff_path(home_path), {"auth": auth_fp, "until": until})
+        atomic_write_json(_backoff_path(home_path), {"identities": ids})
     except OSError:
         pass  # best-effort — without the marker the next process just pays one more request
     return until
 
 
-def _clear_backoff(home_path: Optional[Path]) -> None:
+def _clear_backoff(home_path: Optional[Path], auth_fp: Optional[str] = None) -> None:
+    """Drop one identity's backoff (or, without ``auth_fp``, the whole file)."""
+    path = _backoff_path(home_path)
     try:
-        _backoff_path(home_path).unlink()
+        if auth_fp is None:
+            path.unlink()
+            return
+        ids = _read_backoffs(home_path)
+        if ids.pop(auth_fp, None) is not None:
+            atomic_write_json(path, {"identities": ids})
     except (FileNotFoundError, OSError):
         pass
 
 
+def _last_good_path(home_path: Optional[Path]) -> Path:
+    return resolve_cache_home(home_path) / "cache" / _LAST_GOOD_BASENAME
+
+
+def _read_last_good(home_path: Optional[Path], identity: str) -> Dict[str, str]:
+    try:
+        with open(_last_good_path(home_path), "r", encoding="utf-8-sig") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    refs = payload.get(identity) if isinstance(payload, dict) else None
+    if not isinstance(refs, dict):
+        return {}
+    return {k: v for k, v in refs.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _write_last_good(home_path: Optional[Path], identity: str, refs: Dict[str, str]) -> None:
+    path = _last_good_path(home_path)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            payload = {}
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    payload[identity] = refs
+    try:
+        atomic_write_json(path, payload)
+    except OSError:
+        pass  # best-effort — a missing last-good copy only matters during a later outage
+
+
 def _cache_only() -> bool:
     value = os.environ.get(CACHE_ONLY_ENV) or get_source_environment().get(CACHE_ONLY_ENV, "")
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    if str(value).strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    from hermes_cli._early_recovery import runs_long_lived_service
+
+    return not runs_long_lived_service()  # a gateway started from an agent shell reads live
 
 
 def _fmt_epoch(epoch: float) -> str:
@@ -366,30 +434,39 @@ def fetch_onepassword_secrets(
     cache_key: _CacheKey = (auth_fp, account or "",
                             str(home_path) if home_path is not None else "", _refs_fingerprint(valid))
 
+    # TTL 0 = no secret values on disk: no last-good copies either. An explicit fresh read
+    # (`sync --apply` / rotation pass cache_ttl_seconds=0, the dry run use_cache=False) stays live.
+    keep_last_good = use_cache and cache_ttl_seconds > 0
+    identity = f"{auth_fp}|{account or ''}"
+
     if use_cache:
         cached = _STORE.lookup(cache_key, cache_ttl_seconds, home_path)
         if cached is not None:
+            if keep_last_good:
+                # Seed per-reference last-good from a still-fresh complete pull (write only on change).
+                last = _read_last_good(home_path, identity)
+                fresh = {valid[n]: v for n, v in cached.secrets.items() if n in valid}
+                if any(last.get(ref) != v for ref, v in fresh.items()):
+                    last.update(fresh)
+                    _write_last_good(home_path, identity, last)
             return dict(cached.secrets), warnings
 
-    # An explicit fresh read stays live: `sync --apply` / rotation pass cache_ttl_seconds=0, the dry
-    # run passes use_cache=False.
-    if use_cache and cache_ttl_seconds > 0 and _cache_only():
-        last = _STORE.disk.read(cache_key, float("inf"), home_path)
-        if last is None:
-            warnings.append(f"{CACHE_ONLY_ENV} is set and no 1Password pull is cached; op not called")
-            return {}, warnings
-        return dict(last.secrets), warnings
-
     def _fill_from_last_good(secrets: Dict[str, str], names: List[str], reason: str) -> None:
-        if not (use_cache and cache_ttl_seconds > 0) or not names:
+        if not keep_last_good or not names:
             return
-        last = _STORE.memory.get(cache_key) or _STORE.disk.read(cache_key, float("inf"), home_path)
-        filled = [n for n in names if last is not None and n in last.secrets]
+        last = _read_last_good(home_path, identity)
+        filled = [n for n in names if valid[n] in last]
         for name in filled:
-            secrets[name] = last.secrets[name]
+            secrets[name] = last[valid[name]]
         if filled:
-            age = int(max(0.0, time.time() - last.fetched_at))
-            warnings.append(f"{reason}; served {len(filled)} value(s) from the last complete pull ({age}s old)")
+            warnings.append(f"{reason}; served {len(filled)} value(s) from the last good read of each reference")
+        if len(filled) < len(names):
+            warnings.append(f"{reason}; {len(names) - len(filled)} reference(s) have no last good value")
+
+    if keep_last_good and _cache_only():
+        secrets_only: Dict[str, str] = {}
+        _fill_from_last_good(secrets_only, sorted(valid), f"{CACHE_ONLY_ENV} is set; op not called")
+        return secrets_only, warnings
 
     secrets: Dict[str, str] = {}
     if use_cache:
@@ -451,6 +528,12 @@ def fetch_onepassword_secrets(
                     transient_failed.append(name)
 
     complete = rate_limit_msg is None and not read_errors
+    if keep_last_good and secrets:
+        # Record every value op actually returned (before any fill). A complete pull also
+        # prunes references that left the mapping, so a removed secret does not linger.
+        last = {} if complete else _read_last_good(home_path, identity)
+        last.update({valid[n]: v for n, v in secrets.items()})
+        _write_last_good(home_path, identity, last)
     if rate_limit_msg is not None:
         missing = sorted(n for n in valid if n not in secrets)
         until = _record_backoff(auth_fp, rate_limit_detail, home_path)
@@ -590,10 +673,14 @@ class OnePasswordSource(SecretSource):
 
 def clear_caches(home_path: Optional[Path] = None) -> None:
     """Drop in-process AND disk caches (after a token rotation, so the next
-    startup resolves fresh instead of serving values cached under the old token).
-    Also drops the rate-limit backoff marker."""
+    startup resolves fresh instead of serving values cached under the old token),
+    the last-good copies, and this identity's rate-limit backoff (other identities keep theirs)."""
     _STORE.clear(home_path)
-    _clear_backoff(home_path)
+    _clear_backoff(home_path, _auth_fingerprint(_DEFAULT_TOKEN_ENV))
+    try:
+        _last_good_path(home_path).unlink()
+    except (FileNotFoundError, OSError):
+        pass
 
 
 _reset_cache_for_tests = clear_caches
