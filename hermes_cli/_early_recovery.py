@@ -82,8 +82,13 @@ def _should_skip_external_secret_sources() -> bool:
     """
     if _UPDATE_RETRY_RECOVERED or sys.argv[1:2] == ["update"]:
         return True
-    return sys.argv[1:2] in (["--version"], ["-V"], ["version"]) or any(
-        arg in ("-h", "--help") for arg in sys.argv[1:])
+    args = sys.argv[1:]
+    if args[:1] in (["--version"], ["-V"], ["version"]):
+        return True
+    # Only a pure help request: subcommand words plus -h/--help. `chat -q -h` passes -h as a
+    # value and still needs credentials.
+    return any(a in ("-h", "--help") for a in args) and all(
+        a in ("-h", "--help") or not a.startswith("-") for a in args)
 
 
 def _project_root() -> Path:

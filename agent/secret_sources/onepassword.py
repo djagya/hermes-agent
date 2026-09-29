@@ -74,14 +74,23 @@ _STORE: SecretCache[_CacheKey] = SecretCache(_DISK_CACHE_BASENAME, key_serialize
 _CACHE = _STORE.memory  # tests flush L1 directly
 
 # Rate-limit backoff marker: {"auth": <auth fingerprint>, "until": <epoch>}. Holds no
-# secret values, so it is written even when cache_ttl_seconds is 0.
+# secret values, so it is written even when cache_ttl_seconds is 0. The limit is per
+# 1Password account, not per profile, so the marker lives once under the default root
+# (``<root>/cache``, shared by ``<root>/profiles/*``), keyed by the auth fingerprint.
 _BACKOFF_BASENAME = "op_rate_limit.json"
 # Used when op's message carries no retry hint. 1Password's hourly window is 60 min.
 _DEFAULT_BACKOFF_SECONDS = 15 * 60
 _MAX_BACKOFF_SECONDS = 24 * 60 * 60
 _RETRY_HINT_RE = re.compile(
     r"(?:try again|retry)\s+(?:in\s+)?(?:about\s+|approximately\s+)?"
-    r"(?:(\d+)\s*hours?)?(?:\s*(?:and|,)?\s*(\d+)\s*minutes?)?", re.IGNORECASE)
+    r"(?:(\d+)\s*hours?)?(?:\s*(?:and|,)?\s*(\d+)\s*minutes?)?"
+    r"(?:\s*(?:and|,)?\s*(\d+)\s*seconds?)?", re.IGNORECASE)
+# ``op item get`` prints this instead of a concealed value when it is not revealed.
+_CONCEALED_PLACEHOLDER_RE = re.compile(r"^\[use 'op item get .*--reveal' to reveal\]$", re.IGNORECASE)
+
+# Set on agent terminal children (tools/environments/local.py::_make_run_env): serve the last
+# complete disk pull at any age and never call op. An empty result when nothing is cached.
+CACHE_ONLY_ENV = "HERMES_OP_CACHE_ONLY"
 
 _MISSING_BINARY_HINT = (
     "Install the 1Password CLI (https://developer.1password.com/docs/cli/get-started/) "
@@ -91,7 +100,8 @@ _MISSING_BINARY_HINT = (
 # First matching rule wins. RATE_LIMITED leads: op's 429 text must never fall
 # through to a kind whose policy is "retry".
 _OP_ERROR_RULES = (
-    (ErrorKind.RATE_LIMITED, ("too many requests", "rate-limit", "rate limit", "429")),
+    (ErrorKind.RATE_LIMITED, ("too many requests", "rate-limit", "rate limit", "status 429", "http 429",
+                              "(429)", "429 too many")),
     (ErrorKind.TIMEOUT, ("timed out",)),
     (ErrorKind.BINARY_MISSING, ("not found on path", "not an executable", "failed to invoke")),
     (ErrorKind.AUTH_FAILED, ("unauthorized", "not signed in", "session expired",
@@ -103,6 +113,28 @@ _OP_ERROR_RULES = (
 
 def _classify_op_error(message: str) -> ErrorKind:
     return classify_cli_error(message, _OP_ERROR_RULES)
+
+
+class _OpError(RuntimeError):
+    """``op`` failure. ``detail`` is op's own text (stderr / timeout / spawn error) with the
+    reference and its vault/item/field names blanked (op echoes the item name in its errors),
+    so a name containing "429" or "rate limit" can never change how the failure is classified."""
+
+    def __init__(self, message: str, detail: str) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
+def _without_names(text: str, target: str) -> str:
+    """``text`` with ``target`` and each of its ``op://`` path segments blanked, longest first."""
+    names = {target, *(target[len("op://"):].split("?")[0].split("/") if target.startswith("op://") else ())}
+    for name in sorted((n for n in names if n), key=len, reverse=True):
+        text = re.sub(re.escape(name), " ", text, flags=re.IGNORECASE)
+    return text
+
+
+def _op_error_kind(exc: Exception) -> ErrorKind:
+    return _classify_op_error(exc.detail if isinstance(exc, _OpError) else str(exc))
 
 
 def _validate_references(references: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], List[str]]:
@@ -170,15 +202,18 @@ def _run_op(op: Path, args: List[str], target: str, *, account: str, token_value
         cmd += ["--account", account]
     cmd += ["--", target]
 
-    proc = run_cli(cmd, env=_op_child_env(token_value), timeout=_OP_RUN_TIMEOUT, label="op",
-                   timeout_message=f"op {what} timed out after {_OP_RUN_TIMEOUT}s for {target!r}", stdin=None)
+    try:
+        proc = run_cli(cmd, env=_op_child_env(token_value), timeout=_OP_RUN_TIMEOUT, label="op",
+                       timeout_message=f"op {what} timed out after {_OP_RUN_TIMEOUT}s", stdin=None)
+    except RuntimeError as exc:
+        raise _OpError(f"{exc} for {target!r}", _without_names(str(exc), target)) from exc
 
     if proc.returncode != 0:
         # Room for op's full 429 text including its "try again in …" hint.
         err = _scrub(proc.stderr or "")[:300]
         if err:
-            raise RuntimeError(f"op {what} failed for {target!r}: {err}")
-        raise RuntimeError(f"op {what} exited {proc.returncode} for {target!r}")
+            raise _OpError(f"op {what} failed for {target!r}: {err}", _without_names(err, target))
+        raise _OpError(f"op {what} exited {proc.returncode} for {target!r}", f"exited {proc.returncode}")
     return proc.stdout or ""
 
 
@@ -189,7 +224,7 @@ def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: st
     value = _run_op(op, ["read"], reference, account=account, token_value=token_value,
                     what="read").rstrip("\r\n")
     if not value.strip():
-        raise RuntimeError(f"op read returned an empty value for {reference!r}")
+        raise _OpError(f"op read returned an empty value for {reference!r}", "empty value")
     return value
 
 
@@ -221,7 +256,9 @@ def _field_from_item(item: dict, field_path: Tuple[str, ...]) -> Optional[str]:
     if len(matches) != 1:
         return None
     value = matches[0].get("value")
-    return value if isinstance(value, str) and value.strip() else None
+    if not isinstance(value, str) or not value.strip() or _CONCEALED_PLACEHOLDER_RE.match(value.strip()):
+        return None  # a concealed placeholder is not the secret — let `op read` answer
+    return value
 
 
 def _item_groups(refs: Dict[str, str]) -> Tuple[Dict[Tuple[str, str], Dict[str, Tuple[str, ...]]], Dict[str, str]]:
@@ -244,21 +281,23 @@ def _item_groups(refs: Dict[str, str]) -> Tuple[Dict[Tuple[str, str], Dict[str, 
 
 
 def _is_rate_limited(exc: Exception) -> bool:
-    return _classify_op_error(str(exc)) is ErrorKind.RATE_LIMITED
+    return _op_error_kind(exc) is ErrorKind.RATE_LIMITED
 
 
 def _backoff_seconds(message: str) -> float:
     """Seconds op asked us to wait (``… try again in 23 hours and 59 minutes``), else the default."""
     match = _RETRY_HINT_RE.search(message)
-    if match and (match.group(1) or match.group(2)):
-        seconds = int(match.group(1) or 0) * 3600 + int(match.group(2) or 0) * 60
+    if match and (match.group(1) or match.group(2) or match.group(3)):
+        seconds = int(match.group(1) or 0) * 3600 + int(match.group(2) or 0) * 60 + int(match.group(3) or 0)
         if seconds > 0:
             return float(min(seconds, _MAX_BACKOFF_SECONDS))
     return float(_DEFAULT_BACKOFF_SECONDS)
 
 
 def _backoff_path(home_path: Optional[Path]) -> Path:
-    return resolve_cache_home(home_path) / "cache" / _BACKOFF_BASENAME
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root(home=resolve_cache_home(home_path)) / "cache" / _BACKOFF_BASENAME
 
 
 def _active_backoff(auth_fp: str, home_path: Optional[Path]) -> Optional[float]:
@@ -290,6 +329,11 @@ def _clear_backoff(home_path: Optional[Path]) -> None:
         _backoff_path(home_path).unlink()
     except (FileNotFoundError, OSError):
         pass
+
+
+def _cache_only() -> bool:
+    value = os.environ.get(CACHE_ONLY_ENV) or get_source_environment().get(CACHE_ONLY_ENV, "")
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _fmt_epoch(epoch: float) -> str:
@@ -326,6 +370,13 @@ def fetch_onepassword_secrets(
         if cached is not None:
             return dict(cached.secrets), warnings
 
+    if _cache_only():
+        last = _STORE.disk.read(cache_key, float("inf"), home_path) if use_cache and cache_ttl_seconds > 0 else None
+        if last is None:
+            warnings.append(f"{CACHE_ONLY_ENV} is set and no 1Password pull is cached; op not called")
+            return {}, warnings
+        return dict(last.secrets), warnings
+
     def _fill_from_last_good(secrets: Dict[str, str], names: List[str], reason: str) -> None:
         if not (use_cache and cache_ttl_seconds > 0) or not names:
             return
@@ -354,19 +405,20 @@ def fetch_onepassword_secrets(
     read_errors = 0
     transient_failed: List[str] = []
     rate_limit_msg: Optional[str] = None
+    rate_limit_detail = ""
 
     grouped, pending_reads = _item_groups(valid)
     for (vault, item_name), fields in sorted(grouped.items()):
         item: Optional[dict] = None
         try:
-            parsed = json.loads(_run_op(op, ["item", "get", "--vault", vault, "--format", "json"], item_name,
+            parsed = json.loads(_run_op(op, ["item", "get", "--vault", vault, "--format", "json", "--reveal"], item_name,
                                         account=account, token_value=token_value, what="item get"))
             item = parsed if isinstance(parsed, dict) else None
         except RuntimeError as exc:
             if _is_rate_limited(exc):
-                rate_limit_msg = str(exc)
+                rate_limit_msg, rate_limit_detail = str(exc), getattr(exc, "detail", str(exc))
                 break
-            if _classify_op_error(str(exc)) in (ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED):
+            if _op_error_kind(exc) in (ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED):
                 # Every field read would fail the same way; don't spend a request on each.
                 warnings.append(str(exc))
                 read_errors += len(fields)
@@ -388,17 +440,17 @@ def fetch_onepassword_secrets(
                 secrets[name] = _run_op_read(op, pending_reads[name], account=account, token_value=token_value)
             except RuntimeError as exc:
                 if _is_rate_limited(exc):
-                    rate_limit_msg = str(exc)
+                    rate_limit_msg, rate_limit_detail = str(exc), getattr(exc, "detail", str(exc))
                     break
                 warnings.append(str(exc))
                 read_errors += 1
-                if _classify_op_error(str(exc)) in (ErrorKind.NETWORK, ErrorKind.TIMEOUT):
+                if _op_error_kind(exc) in (ErrorKind.NETWORK, ErrorKind.TIMEOUT):
                     transient_failed.append(name)
 
     complete = rate_limit_msg is None and not read_errors
     if rate_limit_msg is not None:
         missing = sorted(n for n in valid if n not in secrets)
-        until = _record_backoff(auth_fp, rate_limit_msg, home_path)
+        until = _record_backoff(auth_fp, rate_limit_detail, home_path)
         warnings.append(f"{rate_limit_msg} — stopped at the first throttled call; {len(missing)} "
                         f"reference(s) not fetched; op skipped until {_fmt_epoch(until)}")
         _fill_from_last_good(secrets, missing, "1Password rate-limited")

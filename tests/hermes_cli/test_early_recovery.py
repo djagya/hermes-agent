@@ -19,6 +19,13 @@ from pm import recovery
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def _restore_update_retry_flag(monkeypatch):
+    """``recover_if_needed(argv=["update"])`` sets a process global that makes every later
+    dotenv load skip external secret sources; without this, later test modules see none."""
+    monkeypatch.setattr(er, "_UPDATE_RETRY_RECOVERED", er._UPDATE_RETRY_RECOVERED)
+
+
 @pytest.mark.parametrize("prefix", [[], ["-p", "default"], ["--profile=default"]])
 def test_bootstrap_and_pm_cli_work_without_site_packages(tmp_path, prefix):
     env = {**os.environ, "HERMES_HOME": str(tmp_path / "home"), "PYTHONPATH": str(REPO_ROOT)}
@@ -163,6 +170,9 @@ def _project(tmp_path: Path, *, pyproject: bool = True) -> Path:
     (["hermes", "--version"], True),
     (["hermes", "chat", "-q", "hello"], False),
     (["hermes", "gateway", "run"], False),
+    (["hermes", "cron", "create", "--help"], True),
+    (["hermes", "chat", "-q", "-h"], False),  # -h is the query value; the run needs credentials
+    (["hermes", "chat", "--model", "x", "--help"], False),
 ])
 def test_help_and_version_skip_external_secret_sources(monkeypatch, argv, skip):
     """Usage/version output reads no credentials, so it must not spend 1Password requests."""

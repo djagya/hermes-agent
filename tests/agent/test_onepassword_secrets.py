@@ -474,6 +474,9 @@ def test_rate_limited_item_get_skips_field_reads(monkeypatch, tmp_path):
     ("rate-limited, retry in about 59 minutes", 59 * 60),
     ("Too many requests. Your client has been rate-limited.", op._DEFAULT_BACKOFF_SECONDS),
     ("Too many requests. Try again in 40 hours", op._MAX_BACKOFF_SECONDS),
+    ("Too many requests. Try again in 90 seconds", 90),
+    ("Too many requests. Try again in 1 minute and 30 seconds", 90),
+    ("Too many requests. Your client has been rate-limited. Try again in  seconds", op._DEFAULT_BACKOFF_SECONDS),
 ])
 def test_backoff_follows_op_retry_hint(message, seconds):
     assert op._backoff_seconds(message) == seconds
@@ -482,3 +485,90 @@ def test_backoff_follows_op_retry_hint(message, seconds):
 
 
 
+
+
+def test_item_get_reveals_and_rejects_concealed_placeholder(monkeypatch, tmp_path):
+    """A concealed placeholder in item JSON is never applied as the secret; op read answers."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    item = _item_json([
+        {"id": "a", "label": "A", "value": "[use 'op item get abc123 --reveal' to reveal]"},
+        {"id": "b", "label": "B", "value": "real-b"},
+    ])
+
+    def handler(cmd):
+        if cmd[1:3] == ["item", "get"]:
+            assert "--reveal" in cmd
+            return _ok(item)
+        assert cmd[cmd.index("--") + 1] == "op://V/I/A"
+        return _ok("real-a")
+
+    calls, fake_run = _recorder(handler)
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    secrets, _ = op.fetch_onepassword_secrets(
+        references={"A": "op://V/I/A", "B": "op://V/I/B"}, binary=fake_op, use_cache=False)
+    assert secrets == {"A": "real-a", "B": "real-b"}
+    assert len(calls) == 2
+
+
+def test_reference_text_never_classifies_the_failure(monkeypatch, tmp_path):
+    """A name containing "429" / "rate limit" must not turn a plain failure into a backoff."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setattr(op.subprocess, "run",
+                        lambda cmd, **k: _err(1, '[ERROR] "F" isn\'t a field in the "Port 8429" item'))
+    refs = {"A": "op://V/Port 8429/rate limit key", "B": "op://V/Other 429/f"}
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, cache_ttl_seconds=300, home_path=tmp_path)
+    assert secrets == {}
+    assert len(warnings) == 2  # both refs tried and reported, no rate-limit stop
+    assert not (tmp_path / "cache" / "op_rate_limit.json").exists()
+
+
+def test_backoff_marker_is_shared_by_every_profile(monkeypatch, tmp_path):
+    """The limit is per account: a 429 in one profile stops op in its siblings and the root."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    (tmp_path / "config.yaml").write_text("")
+    builder = tmp_path / "profiles" / "builder"
+    research = tmp_path / "profiles" / "research"
+    builder.mkdir(parents=True)
+    research.mkdir(parents=True)
+    calls, fake_run = _recorder(lambda cmd: _err(1, _RATE_LIMITED))
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    refs = {"A": "op://V/One/f"}
+
+    op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=300, home_path=builder)
+    assert len(calls) == 1
+    assert (tmp_path / "cache" / "op_rate_limit.json").exists()
+    for home in (research, tmp_path):
+        op._CACHE.clear()
+        _, warnings = op.fetch_onepassword_secrets(
+            references=refs, binary=fake_op, cache_ttl_seconds=300, home_path=home)
+        assert any("not calling op until" in w for w in warnings)
+    assert len(calls) == 1
+
+
+def test_cache_only_serves_any_age_disk_pull_and_never_calls_op(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/One/f"}
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _ok("v"))
+    op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
+    _age_disk_cache(tmp_path, seconds=10 * 24 * 3600)
+
+    def boom(*a, **k):
+        raise AssertionError("op must not run in cache-only mode")
+
+    monkeypatch.setattr(op.subprocess, "run", boom)
+    monkeypatch.setenv(op.CACHE_ONLY_ENV, "1")
+    secrets, _ = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
+    assert secrets == {"A": "v"}
+
+    empty = tmp_path / "fresh"
+    empty.mkdir()
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=empty)
+    assert secrets == {}
+    assert any(op.CACHE_ONLY_ENV in w for w in warnings)
