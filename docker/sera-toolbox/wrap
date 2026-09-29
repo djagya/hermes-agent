@@ -99,10 +99,17 @@ case "$tool" in
     ;;
   weasyprint|sera-weasyprint|sera-pymupdf)
     # uv's venv python3 resolves into the pinned standalone Python store.
-    # Mount that interpreter AND its stdlib, not the rest of /opt/hermes/tools.
+    # The store entry is python-<version>-<target>, not a fixed tools/python
+    # directory. Mount that entry and its stdlib, not the rest of tools.
     # /usr (already RO below) supplies the /usr/local/bin/python3 symlink.
+    py="$(readlink -f /opt/hermes/.venv/bin/python3)"
+    py_store="$(dirname "$(dirname "$py")")"
+    case "$py_store" in
+      /opt/hermes/tools/python|/opt/hermes/tools/python-*) ;;
+      *) echo "sera-toolbox: venv python is outside the pinned store: $py" >&2; exit 1 ;;
+    esac
     venv_binds+=(--ro-bind /opt/hermes/.venv /opt/hermes/.venv
-                 --ro-bind /opt/hermes/tools/python /opt/hermes/tools/python)
+                 --ro-bind "$py_store" "$py_store")
     ;;
 esac
 cleanup() {
