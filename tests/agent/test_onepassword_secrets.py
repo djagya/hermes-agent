@@ -308,5 +308,287 @@ def test_apply_never_overrides_token_var(monkeypatch, tmp_path):
     assert calls["n"] == 0
 
 
+# ---------------------------------------------------------------------------
+# Rate limiting: one item fetch per item, stop on 429, back off, serve last good
+# ---------------------------------------------------------------------------
+
+_RATE_LIMITED = ("[ERROR] 2026/09/29 10:13:18 could not read secret: Too many requests. "
+                 "Your client has been rate-limited. Try again in 23 hours and 59 minutes")
 
 
+def _item_json(fields):
+    return json.dumps({"id": "abc", "title": "Runtime", "fields": fields})
+
+
+def _age_disk_cache(home, seconds=3600):
+    """Push the on-disk pull past its TTL and drop L1, as a later process would see it."""
+    path = home / "cache" / "op_cache.json"
+    payload = json.loads(path.read_text())
+    payload["fetched_at"] -= seconds
+    path.write_text(json.dumps(payload))
+    op._CACHE.clear()
+
+
+def _recorder(handler):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return handler(cmd)
+
+    return calls, fake_run
+
+
+def test_refs_into_one_item_cost_one_item_get(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    item = _item_json([
+        {"id": "a1", "label": "API_KEY", "value": "key-a"},
+        {"id": "b2", "label": "TOKEN", "value": "tok-b", "section": {"id": "s", "label": "Bot"}},
+        {"id": "c3", "label": "TOKEN", "value": "tok-c", "section": {"id": "t", "label": "Other"}},
+    ])
+
+    def handler(cmd):
+        if cmd[1:3] == ["item", "get"]:
+            assert cmd[cmd.index("--") + 1] == "Runtime" and cmd[cmd.index("--vault") + 1] == "Vault"
+            return _ok(item)
+        return _ok({"op://Other/Solo/f": "solo"}[cmd[cmd.index("--") + 1]])
+
+    calls, fake_run = _recorder(handler)
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={"A": "op://Vault/Runtime/API_KEY", "B": "op://Vault/Runtime/Bot/TOKEN",
+                    "C": "op://Vault/Runtime/c3", "S": "op://Other/Solo/f"},
+        binary=fake_op, use_cache=False)
+
+    assert secrets == {"A": "key-a", "B": "tok-b", "C": "tok-c", "S": "solo"}
+    assert warnings == []
+    assert len(calls) == 2  # one item get for three refs + one op read for the lone ref
+
+
+def test_ambiguous_field_falls_back_to_op_read(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    item = _item_json([{"id": "x", "label": "TOKEN", "value": "one"},
+                       {"id": "y", "label": "TOKEN", "value": "two"},
+                       {"id": "z", "label": "OK", "value": "fine"}])
+
+    def handler(cmd):
+        if cmd[1:3] == ["item", "get"]:
+            return _ok(item)
+        assert cmd[cmd.index("--") + 1] == "op://V/I/TOKEN"
+        return _ok("what-op-read-says")
+
+    calls, fake_run = _recorder(handler)
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+
+    secrets, _ = op.fetch_onepassword_secrets(
+        references={"T": "op://V/I/TOKEN", "O": "op://V/I/OK"}, binary=fake_op, use_cache=False)
+    assert secrets == {"T": "what-op-read-says", "O": "fine"}
+    assert len(calls) == 2
+
+
+def test_rate_limit_stops_pull_and_backs_off_across_processes(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    calls, fake_run = _recorder(lambda cmd: _err(1, _RATE_LIMITED))
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    refs = {f"K{i}": f"op://V/Item{i}/f" for i in range(10)}
+
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, cache_ttl_seconds=300, home_path=tmp_path)
+    assert secrets == {}
+    assert len(calls) == 1  # stopped at the first throttled call, not ten
+    assert any("10 reference(s) not fetched" in w for w in warnings)
+
+    marker = json.loads((tmp_path / "cache" / "op_rate_limit.json").read_text())
+    assert 23 * 3600 < marker["until"] - time.time() <= 24 * 3600  # honours op's retry hint
+
+    op._CACHE.clear()  # a new process: only the disk marker survives
+    _, warnings = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, cache_ttl_seconds=300, home_path=tmp_path)
+    assert len(calls) == 1  # backoff active → op not called at all
+    assert any("not calling op until" in w for w in warnings)
+
+    op.clear_caches(tmp_path)  # token rotation drops the marker
+    assert not (tmp_path / "cache" / "op_rate_limit.json").exists()
+
+
+def test_rate_limit_serves_last_complete_pull(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/One/f", "B": "op://V/Two/f"}
+    monkeypatch.setattr(op.subprocess, "run", lambda cmd, **k: _ok("v-" + cmd[cmd.index("--") + 1][7:10]))
+    good, _ = op.fetch_onepassword_secrets(references=refs, binary=fake_op,
+                                           cache_ttl_seconds=60, home_path=tmp_path)
+    assert good == {"A": "v-One", "B": "v-Two"}
+
+    _age_disk_cache(tmp_path)  # fresh TTL expired; the disk entry is now only a last-good copy
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _err(1, _RATE_LIMITED))
+    secrets, warnings = op.fetch_onepassword_secrets(references=refs, binary=fake_op,
+                                                     cache_ttl_seconds=60, home_path=tmp_path)
+    assert secrets == good
+    assert any("last complete pull" in w for w in warnings)
+
+
+def test_auth_failure_never_serves_last_good(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/One/f"}
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _ok("old"))
+    op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
+
+    _age_disk_cache(tmp_path)
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _err(1, "[ERROR] unauthorized"))
+    secrets, _ = op.fetch_onepassword_secrets(references=refs, binary=fake_op,
+                                              cache_ttl_seconds=60, home_path=tmp_path)
+    assert secrets == {}
+    assert not (tmp_path / "cache" / "op_rate_limit.json").exists()
+
+
+def test_unauthorized_item_get_skips_field_reads(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    calls, fake_run = _recorder(lambda cmd: _err(1, "[ERROR] unauthorized: invalid token"))
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={f"K{i}": f"op://V/Runtime/F{i}" for i in range(5)}, binary=fake_op, use_cache=False)
+    assert secrets == {} and len(warnings) == 1
+    assert len(calls) == 1
+
+
+def test_rate_limited_item_get_skips_field_reads(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    calls, fake_run = _recorder(lambda cmd: _err(1, _RATE_LIMITED))
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op.fetch_onepassword_secrets(
+        references={f"K{i}": f"op://V/Runtime/F{i}" for i in range(22)},
+        binary=fake_op, cache_ttl_seconds=300, home_path=tmp_path)
+    assert len(calls) == 1 and calls[0][1:3] == ["item", "get"]
+
+
+@pytest.mark.parametrize("message, seconds", [
+    ("Too many requests. Try again in 23 hours and 59 minutes", 23 * 3600 + 59 * 60),
+    ("rate-limited, retry in about 59 minutes", 59 * 60),
+    ("Too many requests. Your client has been rate-limited.", op._DEFAULT_BACKOFF_SECONDS),
+    ("Too many requests. Try again in 40 hours", op._MAX_BACKOFF_SECONDS),
+    ("Too many requests. Try again in 90 seconds", 90),
+    ("Too many requests. Try again in 1 minute and 30 seconds", 90),
+    ("Too many requests. Your client has been rate-limited. Try again in  seconds", op._DEFAULT_BACKOFF_SECONDS),
+])
+def test_backoff_follows_op_retry_hint(message, seconds):
+    assert op._backoff_seconds(message) == seconds
+    assert op._classify_op_error(message) is op.ErrorKind.RATE_LIMITED
+
+
+
+
+
+
+def test_item_get_reveals_and_rejects_concealed_placeholder(monkeypatch, tmp_path):
+    """A concealed placeholder in item JSON is never applied as the secret; op read answers."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    item = _item_json([
+        {"id": "a", "label": "A", "value": "[use 'op item get abc123 --reveal' to reveal]"},
+        {"id": "b", "label": "B", "value": "real-b"},
+    ])
+
+    def handler(cmd):
+        if cmd[1:3] == ["item", "get"]:
+            assert "--reveal" in cmd
+            return _ok(item)
+        assert cmd[cmd.index("--") + 1] == "op://V/I/A"
+        return _ok("real-a")
+
+    calls, fake_run = _recorder(handler)
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    secrets, _ = op.fetch_onepassword_secrets(
+        references={"A": "op://V/I/A", "B": "op://V/I/B"}, binary=fake_op, use_cache=False)
+    assert secrets == {"A": "real-a", "B": "real-b"}
+    assert len(calls) == 2
+
+
+def test_reference_text_never_classifies_the_failure(monkeypatch, tmp_path):
+    """A name containing "429" / "rate limit" must not turn a plain failure into a backoff."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setattr(op.subprocess, "run",
+                        lambda cmd, **k: _err(1, '[ERROR] "F" isn\'t a field in the "Port 8429" item'))
+    refs = {"A": "op://V/Port 8429/rate limit key", "B": "op://V/Other 429/f"}
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, cache_ttl_seconds=300, home_path=tmp_path)
+    assert secrets == {}
+    assert len(warnings) == 2  # both refs tried and reported, no rate-limit stop
+    assert not (tmp_path / "cache" / "op_rate_limit.json").exists()
+
+
+def test_backoff_marker_is_shared_by_every_profile(monkeypatch, tmp_path):
+    """The limit is per account: a 429 in one profile stops op in its siblings and the root."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    (tmp_path / "config.yaml").write_text("")
+    builder = tmp_path / "profiles" / "builder"
+    research = tmp_path / "profiles" / "research"
+    builder.mkdir(parents=True)
+    research.mkdir(parents=True)
+    calls, fake_run = _recorder(lambda cmd: _err(1, _RATE_LIMITED))
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    refs = {"A": "op://V/One/f"}
+
+    op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=300, home_path=builder)
+    assert len(calls) == 1
+    assert (tmp_path / "cache" / "op_rate_limit.json").exists()
+    for home in (research, tmp_path):
+        op._CACHE.clear()
+        _, warnings = op.fetch_onepassword_secrets(
+            references=refs, binary=fake_op, cache_ttl_seconds=300, home_path=home)
+        assert any("not calling op until" in w for w in warnings)
+    assert len(calls) == 1
+
+
+def test_cache_only_serves_any_age_disk_pull_and_never_calls_op(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/One/f"}
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _ok("v"))
+    op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
+    _age_disk_cache(tmp_path, seconds=10 * 24 * 3600)
+
+    def boom(*a, **k):
+        raise AssertionError("op must not run in cache-only mode")
+
+    monkeypatch.setattr(op.subprocess, "run", boom)
+    monkeypatch.setenv(op.CACHE_ONLY_ENV, "1")
+    secrets, _ = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
+    assert secrets == {"A": "v"}
+
+    empty = tmp_path / "fresh"
+    empty.mkdir()
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=empty)
+    assert secrets == {}
+    assert any(op.CACHE_ONLY_ENV in w for w in warnings)
+
+
+def test_echoed_names_never_add_or_erase_classifying_words():
+    rl = "[ERROR] could not read secret 'op://V/Item/requests': Too many requests. Try again in 5 minutes"
+    assert op._classify_op_error(op._without_names(rl, "op://V/Item/requests")) is op.ErrorKind.RATE_LIMITED
+    miss = '[ERROR] "rate limit key" isn\'t a field in the "Port 8429" item'
+    assert op._classify_op_error(op._without_names(miss, "op://V/Port 8429/rate limit key")) \
+        is not op.ErrorKind.RATE_LIMITED
+    auth = "[ERROR] invalid token: unauthorized"
+    assert op._classify_op_error(op._without_names(auth, "op://V/I/token")) is op.ErrorKind.AUTH_FAILED
+
+
+def test_cache_only_never_blocks_an_explicit_uncached_read(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setenv(op.CACHE_ONLY_ENV, "1")
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _ok("live"))
+    secrets, _ = op.fetch_onepassword_secrets(
+        references={"A": "op://V/One/f"}, binary=fake_op, use_cache=False, home_path=tmp_path)
+    assert secrets == {"A": "live"}

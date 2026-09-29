@@ -76,8 +76,19 @@ def _should_skip_external_secret_sources() -> bool:
     120s critical-module import probe and be reported as an import-health timeout.
     Profile flags are stripped before ``hermes_cli.main`` loads dotenv, so ``argv[1]`` is
     the authoritative subcommand.
+
+    Also true for help and version output, which read no credentials: resolving every
+    ``op://`` reference just to print usage spends a rate-limited service account's budget.
     """
-    return _UPDATE_RETRY_RECOVERED or sys.argv[1:2] == ["update"]
+    if _UPDATE_RETRY_RECOVERED or sys.argv[1:2] == ["update"]:
+        return True
+    args = sys.argv[1:]
+    if args[:1] in (["--version"], ["-V"], ["version"]):
+        return True
+    # Only a pure help request: subcommand words plus -h/--help. `chat -q -h` passes -h as a
+    # value and still needs credentials.
+    return any(a in ("-h", "--help") for a in args) and all(
+        a in ("-h", "--help") or not a.startswith("-") for a in args)
 
 
 def _project_root() -> Path:

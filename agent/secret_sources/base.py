@@ -74,6 +74,7 @@ class ErrorKind(str, Enum):
     NETWORK = "network"                  # transport-level failure
     EMPTY_VALUE = "empty_value"          # backend returned nothing for a ref
     TIMEOUT = "timeout"                  # fetch exceeded its wall-clock budget
+    RATE_LIMITED = "rate_limited"        # backend throttled us; retrying extends the limit
     INTERNAL = "internal"                # anything else (bug, unexpected shape)
 
 
@@ -130,6 +131,7 @@ _GENERIC_REMEDIATION = {
     ErrorKind.AUTH_EXPIRED: "Credentials expired — run `hermes secrets {name} setup` to re-authenticate.",
     ErrorKind.NETWORK: "Network problem reaching the secrets backend — check connectivity and retry.",
     ErrorKind.TIMEOUT: "Backend was slow — raise secrets.{name}.timeout_seconds if this recurs.",
+    ErrorKind.RATE_LIMITED: "Backend rate limit hit — avoid restarts and CLI probes until it resets.",
 }
 
 
