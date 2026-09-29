@@ -408,7 +408,7 @@ RUN /opt/hermes/.venv/bin/python -m docker.build_agent
 # prefix is that store, not /usr/local. Install the toolbox packages into the
 # runtime-copied /usr/local tree used by smoke.sh and start-baked-mcp.sh.
 RUN npm install -g --prefix /usr/local --omit=dev \
-        markdownlint-cli2@0.18.1 \
+        markdownlint-cli2@0.23.3 \
         @hauptsache.net/clickup-mcp@1.8.0 \
         caldav-mcp@0.10.0 && \
     test -x /usr/local/bin/markdownlint-cli2 && \
