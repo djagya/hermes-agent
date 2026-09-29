@@ -413,15 +413,15 @@ jobs:
           version: "0.9.28"
           enable-cache: false
 
-      - name: Set up Python 3.11 (for docker tests)
+      - name: Set up Python 3.14 (for docker tests)
         uses: ./.github/actions/retry
         with:
-          command: uv python install 3.11
+          command: uv python install 3.14
 
       - name: Install Python dependencies (for docker tests)
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra dev
+          command: uv sync --locked --python 3.14 --group dev
 
       - name: Run docker integration tests
         env:
