@@ -155,3 +155,42 @@ def test_real_workflow_uses_only_supported_steps():
                 or uses == "./.github/actions/retry"
                 or uses.startswith(supported)
             ), (job, step.get("name"))
+
+
+def test_real_workflow_build_inputs_are_all_translated():
+    """An unknown build-push/setup-uv input would build or set up differently than CI."""
+    yaml = pytest.importorskip("yaml")
+
+    wf = yaml.safe_load((ROOT / ".github/workflows/fork-release-image.yml").read_text())
+    known_with = {
+        "docker/build-push-action@": rjl.BUILD_PUSH_KEYS | rjl.BUILD_PUSH_IGNORED,
+        "astral-sh/setup-uv@": rjl.SETUP_UV_KEYS,
+    }
+    for job in ("lint", "build-test"):
+        for step in wf["jobs"][job]["steps"]:
+            for prefix, keys in known_with.items():
+                if (step.get("uses") or "").startswith(prefix):
+                    assert set(step.get("with") or {}) <= keys, (job, step.get("name"))
+
+
+def test_unterminated_output_block_fails(repo):
+    workflow = {
+        "jobs": {
+            "j": {
+                "steps": [
+                    {
+                        "id": "v",
+                        "run": 'printf "base<<EOF\\n0.21.5\\n" >> "$GITHUB_OUTPUT"',
+                    },
+                ]
+            }
+        }
+    }
+    ctx = rjl.Context(workflow, "r", repo)
+    assert rjl.run_job(workflow, "j", ctx, repo, repo / ".tools")[0][1] == "failure"
+
+
+def test_unknown_build_push_input_fails_loudly(repo):
+    ctx = ctx_for(repo)
+    with pytest.raises(rjl.StepError, match="unsupported with: secrets"):
+        rjl.build_push({"context": ".", "secrets": "x"}, ctx, repo)

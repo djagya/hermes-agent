@@ -28,6 +28,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -154,6 +155,10 @@ def _read_kv_file(path: Path) -> dict[str, str]:
             while i < len(lines) and lines[i] != delim:
                 buf.append(lines[i])
                 i += 1
+            if i >= len(lines):  # GitHub fails the step on an unterminated delimiter
+                raise StepError(
+                    f"unterminated {delim!r} block for {key!r} in {path.name}"
+                )
             out[key] = "\n".join(buf)
         elif "=" in line:
             key, value = line.split("=", 1)
@@ -185,14 +190,17 @@ def run_shell(
             "GITHUB_EVENT_NAME": ctx.github["event_name"],
             "CI": "true",
             "RUNNER_TEMP": tmp,
+            # Same path on host and in the container: temp dirs a step bind-mounts into a
+            # test container resolve, and nothing lands in the gate host's /tmp.
+            "TMPDIR": tmp,
         }
         shell = ["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script_file)]
+        shim = tmpd / "shim"  # in both modes: a job must never get real sudo here
+        shim.mkdir(exist_ok=True)
+        (shim / "sudo").write_text(SUDO_SHIM, encoding="utf-8")
+        (shim / "sudo").chmod(0o755)
         if ctx.container:
             # Runner-image parity: the step sees the image's tools, not the host's.
-            shim = ctx.tmp_root / "shim"
-            shim.mkdir(exist_ok=True)
-            (shim / "sudo").write_text(SUDO_SHIM, encoding="utf-8")
-            (shim / "sudo").chmod(0o755)
             step_env["PATH"] = ":".join([
                 str(shim),
                 *ctx.path_prepend,
@@ -204,7 +212,11 @@ def run_shell(
                 cmd += ["-e", f"{key}={value}"]
             proc = subprocess.run([*cmd, ctx.container, *shell])
         else:
-            step_env["PATH"] = ":".join([*ctx.path_prepend, os.environ["PATH"]])
+            step_env["PATH"] = ":".join([
+                str(shim),
+                *ctx.path_prepend,
+                os.environ["PATH"],
+            ])
             proc = subprocess.run(shell, cwd=cwd, env={**os.environ, **step_env})
         ctx.env.update(_read_kv_file(genv))
         if step_id:
@@ -213,7 +225,34 @@ def run_shell(
             raise StepError(f"exit {proc.returncode}")
 
 
+# `with:` keys a translation understands. Cache keys are deliberately ignored (no GHA cache
+# locally, and they never change image contents); any other key fails the step, because
+# silently dropping it could build a different image than CI does.
+BUILD_PUSH_KEYS = frozenset({
+    "context",
+    "file",
+    "target",
+    "platforms",
+    "load",
+    "push",
+    "tags",
+    "labels",
+    "build-args",
+})
+BUILD_PUSH_IGNORED = frozenset({"cache-from", "cache-to"})
+SETUP_UV_KEYS = frozenset({"version", "enable-cache"})
+
+
+def _check_with(
+    uses: str, with_: dict, known: frozenset, ignored: frozenset = frozenset()
+) -> None:
+    unknown = sorted(set(with_) - known - ignored)
+    if unknown:
+        raise StepError(f"{uses.split('@')[0]}: unsupported with: {', '.join(unknown)}")
+
+
 def build_push(with_: dict, ctx: Context, cwd: Path) -> None:
+    _check_with("docker/build-push-action", with_, BUILD_PUSH_KEYS, BUILD_PUSH_IGNORED)
     w = {k: ctx.render(v) for k, v in with_.items()}
     if w.get("push", "false").lower() == "true":
         raise StepError("refusing to push from a local gate")
@@ -246,6 +285,7 @@ def build_push(with_: dict, ctx: Context, cwd: Path) -> None:
 
 
 def setup_uv(with_: dict, ctx: Context, tools: Path) -> None:
+    _check_with("astral-sh/setup-uv", with_, SETUP_UV_KEYS)
     version = ctx.render(with_.get("version", "")).strip()
     if not version:
         raise StepError("setup-uv without a pinned version")
@@ -258,6 +298,12 @@ def setup_uv(with_: dict, ctx: Context, tools: Path) -> None:
         dest.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(suffix=".tgz", dir=tools) as tgz:
             urllib.request.urlretrieve(url, tgz.name)  # noqa: S310 — fixed https URL
+            # The binary runs with docker-socket access: verify it like setup-uv does.
+            with urllib.request.urlopen(url + ".sha256") as resp:  # noqa: S310
+                want = resp.read().decode().split()[0]
+            got = hashlib.sha256(Path(tgz.name).read_bytes()).hexdigest()
+            if got != want:
+                raise StepError(f"uv {version} checksum mismatch: {got} != {want}")
             with tarfile.open(tgz.name) as tar:
                 for member in tar.getmembers():
                     if member.isfile() and Path(member.name).name in ("uv", "uvx"):
@@ -297,7 +343,15 @@ def run_job(
                 setup_uv(with_, ctx, tools)
             elif uses == "./.github/actions/retry":
                 wd = workspace / ctx.render(with_.get("working-directory", "."))
-                run_shell(ctx.render(with_["command"]), env, wd, ctx, sid)
+                attempts = int(ctx.render(with_.get("attempts", 1)) or 1)
+                for attempt in range(1, attempts + 1):
+                    try:
+                        run_shell(ctx.render(with_["command"]), env, wd, ctx, sid)
+                        break
+                    except StepError:
+                        if attempt == attempts:
+                            raise
+                        time.sleep(float(ctx.render(with_.get("delay", 5)) or 5))
             else:
                 raise StepError(f"unsupported action {uses}")
             outcome = "success"
@@ -362,6 +416,16 @@ def start_container(image: str, workspace: Path, tools: Path) -> str:
         "run",
         "-d",
         "--rm",
+        "--label",
+        "fork-gate=1",
+        # The gate host may be production: cap the job container. Image builds run in the
+        # host's buildkitd and test containers in dockerd, outside these limits.
+        "--cpuset-cpus",
+        _half_the_cpus(),
+        "--memory",
+        "8g",
+        "--pids-limit",
+        "4096",
         *extra,
         "-e",
         "HOME=/tmp/gate-home",
@@ -382,13 +446,26 @@ def start_container(image: str, workspace: Path, tools: Path) -> str:
         "infinity",
     ]
     cid = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
+    try:
+        _setup_container(cid)
+    except BaseException:
+        subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
+        raise
+    return cid
+
+
+def _half_the_cpus() -> str:
+    n = max(1, (os.cpu_count() or 2) // 2)
+    return f"0-{n - 1}"
+
+
+def _setup_container(cid: str) -> None:
     setup = (
         "set -e; mkdir -p /tmp/gate-home && chmod 1777 /tmp/gate-home; "
         "apt-get update -qq >/dev/null && DEBIAN_FRONTEND=noninteractive "
         f"apt-get install -y -qq --no-install-recommends {' '.join(RUNNER_EXTRA_PACKAGES)} >/dev/null"
     )
     subprocess.run(["docker", "exec", cid, "bash", "-c", setup], check=True)
-    return cid
 
 
 def step_user() -> str:
@@ -426,15 +503,15 @@ def main(argv: list[str] | None = None) -> int:
     for job in jobs:
         ctx = Context(workflow, args.ref_name, workspace, args.before)
         ctx.tmp_root = tools
-        if args.container:
-            ctx.container = start_container(args.container, workspace, tools)
-            ctx.container_path = subprocess.run(
-                ["docker", "exec", ctx.container, "printenv", "PATH"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
         try:
+            if args.container:
+                ctx.container = start_container(args.container, workspace, tools)
+                ctx.container_path = subprocess.run(
+                    ["docker", "exec", ctx.container, "printenv", "PATH"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
             summary += [
                 (job, *r) for r in run_job(workflow, job, ctx, workspace, tools)
             ]
