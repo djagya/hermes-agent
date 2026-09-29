@@ -26,7 +26,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 from hermes_constants import get_hermes_home
@@ -167,6 +167,9 @@ class VaultItemMeta:
     identifier_type: Optional[str] = None
     identifier: Optional[str] = None
     has_otp: bool = False  # a TOTP seed is stored: 2FA codes can be minted without asking the user
+    # payment only: exact https origins of the PSP frames (hosted card fields) the user authorized for
+    # this card, on top of the merchant ``origin``. Empty = card fields are filled on the merchant page only.
+    frame_origins: Tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
@@ -181,6 +184,8 @@ class VaultItemMeta:
             out["identifier_type"] = self.identifier_type
         if self.has_otp:
             out["has_otp"] = True
+        if self.frame_origins:
+            out["frame_origins"] = list(self.frame_origins)
         return out
 
 

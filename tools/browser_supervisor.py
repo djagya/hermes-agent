@@ -262,6 +262,34 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             value = result_obj.get("description") or result_obj.get("unserializableValue")
         return {"ok": True, "result": value, "result_type": result_type}
 
+    def evaluate_in_frame(self, frame_id: str, expression: str, *, timeout: float = 10.0) -> Dict[str, Any]:
+        """Evaluate ``expression`` in the main world of out-of-process frame ``frame_id``, over that
+        frame's own CDP session on the live socket. Refuses a frame that is detached or no longer hangs
+        under the current page session (tab switch / navigation). Same result shape as
+        ``evaluate_runtime``; values are returned by value and never retried by description."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return _fail("supervisor loop is not running")
+        with self._state_lock:
+            frame = self._frames.get(frame_id)
+            under_page = frame is not None and self._frame_under_page_locked(frame, self._page_session_id)
+            active, session_id = self._active, (frame.cdp_session_id if frame else None)
+        if not active:
+            return _fail("supervisor is not active")
+        if not under_page or not session_id:
+            return _fail("frame is not attached under the current page")
+        params = {"expression": expression, "returnByValue": True, "awaitPromise": True}
+        try:
+            response = _schedule(self._cdp("Runtime.evaluate", params, session_id=session_id, timeout=timeout),
+                                 loop, timeout=timeout + 1)
+        except Exception as exc:
+            return _err(exc)
+        payload = response.get("result", {}) if isinstance(response, dict) else {}
+        if payload.get("exceptionDetails"):
+            return _fail(str(payload["exceptionDetails"].get("text") or "JavaScript exception"))
+        result_obj = payload.get("result", {})
+        return {"ok": True, "result": result_obj.get("value"), "result_type": result_obj.get("type", "undefined")}
+
     def focus_page(self, origin: str, *, accept: Optional[str] = None, timeout: float = 10.0) -> Dict[str, Any]:
         """Re-attach the supervisor's page session to an open page target on ``origin``
         (``scheme://host[:port]``). The initial attach picks the FIRST page target, but tools

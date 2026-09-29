@@ -183,7 +183,8 @@ def _current_page_origin(task_id: str) -> Optional[str]:
 # Per kind: a JS probe that is truthy on a tab holding the form this kind fills.
 _TAB_PROBES = {
     "login": "!!document.querySelector('input[type=password]')",
-    "payment": "!!document.querySelector('input[autocomplete^=cc-], [name*=card i], [placeholder*=card i], [name*=cvc i], [name*=cvv i]')",
+    # iframe: hosted card fields (Datatrans, Adyen, Stripe...) leave the checkout page itself without card inputs
+    "payment": "!!document.querySelector('input[autocomplete^=cc-], [name*=card i], [placeholder*=card i], [name*=cvc i], [name*=cvv i], iframe')",
     "address": "!!document.querySelector('input[autocomplete^=address-], [autocomplete=postal-code], [name*=address i], [name*=zip i], [name*=postal i]')",
 }
 
@@ -229,7 +230,9 @@ def browser_vault_list() -> str:
         for meta in metas:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
                      "origin": meta.origin, "available": meta.kind == "login" or bool(meta.origin)}
-            if meta.has_otp or backend.needs_unlock:
+            if meta.frame_origins:
+                entry["frame_origins"] = list(meta.frame_origins)  # PSP frames the user bound this card to
+            if meta.kind == "login" and (meta.has_otp or backend.needs_unlock):
                 entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
             if meta.identifier:
                 entry["identifier"] = meta.identifier
@@ -511,7 +514,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     if meta.kind != "login" and not meta.origin:
         return json.dumps({"success": False, "error_type": "no_origin",
                            "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})
-    if meta.kind == "payment" and not _confirm_payment_fill(meta.label, str(meta.origin)):
+    if meta.kind == "payment" and not _confirm_payment_fill(meta.label, str(meta.origin), tuple(meta.frame_origins)):
         return json.dumps({"success": False, "error_type": "payment_declined",
                            "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
 
@@ -535,45 +538,62 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             }
         )
 
-    # ── Inspect + classify page controls ────────────────────────────────────
+    # ── Inspect + classify controls: the page, plus (payment only) the PSP frames bound to this card ──
+    frame_origins = tuple(meta.frame_origins) if meta.kind == "payment" else ()
+    classify = classify_login_control if meta.kind == "login" else classify_checkout_control
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
     inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
     if not inspect.get("success"):
         return json.dumps(
             {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
         )
-    raw_controls = _parse_json_result(inspect.get("result"))
-    if isinstance(raw_controls, str):
-        raw_controls = _parse_json_result(raw_controls)
-    if not isinstance(raw_controls, list):
+    classified = _classify_raw(inspect.get("result"), classify)
+    if classified is None:
         return json.dumps({"success": False, "error": "Page input inspection returned no usable controls."})
-
-    classify = classify_login_control if meta.kind == "login" else classify_checkout_control
-    classified: list[ClassifiedLoginControl] = []
-    for raw in raw_controls:
-        if not isinstance(raw, dict):
-            continue
-        result = classify(LoginControl.from_dict(raw))
-        if result is not None:
-            classified.append(result)
-    if not classified:
+    docs = [{"frame_id": None, "origin": str(meta.origin), "nonce": nonce, "classified": classified}]
+    if frame_origins:
+        frame_docs = _inspect_bound_frames(effective_task_id, frame_origins, classify)
+        if isinstance(frame_docs, str):
+            return frame_docs
+        docs.extend(frame_docs)
+    if not any(d["classified"] for d in docs):
         return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
 
     # ── Resolve secret and fill (secret never enters any logged string) ─────
     try:
         if meta.kind == "login":
             secret = {"password": backend.resolve_password(handle)}
-            fills = select_password_fill(classified, secret["password"])
+            docs[0]["fills"] = select_password_fill(classified, secret["password"])
         else:
             secret = backend.resolve_secret(handle)
-            fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
+            for d in docs:
+                d["fills"] = select_checkout_fills(d["classified"], secret,
+                                                   PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
-    if not fills:
+    except RuntimeError as exc:
+        return json.dumps({"success": False, "error_type": "resolve_failed",
+                           "error": scrub_secret_from_text(str(exc), {})[:200]})
+    docs = [d for d in docs if d.get("fills")]
+    if frame_origins:
+        # A card bound to PSP frames is filled completely or not at all: the number and CVC must each have
+        # exactly one target, else the checkout would be half-written into whatever matched.
+        targeted = {f["token"] for d in docs for f in d["fills"]}
+        unmatched = [t for t in ("cc-number", "cc-csc") if t not in targeted]
+        if unmatched:
+            return json.dumps({"success": False, "error_type": "unmatched_fields",
+                               "error": ("Refused: no field for " + ", ".join(unmatched) + " was found on the page or in "
+                                         "a payment frame on " + ", ".join(frame_origins) + ". Nothing was written.")})
+    if not docs:
         return json.dumps(
             {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
         )
+    ambiguous = _ambiguous_tokens(docs)
+    if ambiguous:
+        return json.dumps({"success": False, "error_type": "ambiguous_fields",
+                           "error": ("Refused: the same card field (" + ", ".join(ambiguous) + ") appears in more than "
+                                     "one document (page and/or payment frames), so the target is ambiguous. Nothing was written.")})
 
     # Register the secret bytes with the model-egress redaction boundary
     # BEFORE they touch the page: any later browser_* result (including
@@ -582,39 +602,47 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
         register_vault_redaction_value(value)
 
-    try:
-        fill_result = _eval_js_secret(
-            effective_task_id, build_fill_js(fills, expected_origin=str(meta.origin), nonce=nonce)
-        )
-    except Exception as exc:
-        # Strip any secret material from exception text before surfacing.
-        return json.dumps(
-            {"success": False, "error": scrub_secret_from_text(str(exc), secret)}
-        )
-    if not fill_result.get("success"):
-        err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
-        out = {"success": False, "error": err}
-        if fill_result.get("error_type"):
-            out["error_type"] = fill_result["error_type"]
-        return json.dumps(out)
-
-    parsed = _parse_json_result(fill_result.get("result"))
-    if isinstance(parsed, str):
-        parsed = _parse_json_result(parsed)
-    if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
-        return json.dumps(
-            {
+    ancestry = {"top": str(meta.origin), "allowed": [str(meta.origin), *frame_origins]}
+    filled, filled_origins, fields = 0, [], []
+    for d in docs:
+        if d["frame_id"] is None:
+            expr = build_fill_js(d["fills"], expected_origin=str(meta.origin), nonce=d["nonce"])
+            run = lambda e=expr: _eval_js_secret(effective_task_id, e)  # noqa: E731
+        else:
+            expr = build_fill_js(d["fills"], expected_origin=d["origin"], nonce=d["nonce"], ancestry=ancestry)
+            run = lambda e=expr, fid=d["frame_id"]: _eval_in_frame(effective_task_id, fid, e)  # noqa: E731
+        try:
+            fill_result = run()
+        except Exception as exc:
+            # Strip any secret material from exception text before surfacing.
+            return json.dumps(_partial({"success": False, "error": scrub_secret_from_text(str(exc), secret)}, filled))
+        finally:
+            del expr
+        if not fill_result.get("success"):
+            err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
+            out = {"success": False, "error": err}
+            if fill_result.get("error_type"):
+                out["error_type"] = fill_result["error_type"]
+            return json.dumps(_partial(out, filled))
+        parsed = _parse_json_result(fill_result.get("result"))
+        if isinstance(parsed, str):
+            parsed = _parse_json_result(parsed)
+        if isinstance(parsed, dict) and parsed.get("refused") in ("origin_changed", "ancestor_changed"):
+            where = "the page" if d["frame_id"] is None else f"the payment frame ({d['origin']})"
+            return json.dumps(_partial({
                 "success": False,
-                "error_type": "origin_changed",
+                "error_type": parsed["refused"],
                 "error": (
-                    "Refused: the page navigated away from the bound origin "
-                    f"({meta.origin}) before the fill could run "
-                    f"(now on {parsed.get('found') or 'unknown'}). "
-                    "Nothing was written."
+                    f"Refused: {where} navigated away from the bound origin "
+                    f"({d['origin'] if d['frame_id'] else meta.origin}) or is no longer embedded by it before the fill "
+                    f"could run (now on {parsed.get('found') or 'unknown'}). Nothing was written there."
                 ),
-            }
-        )
-    filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
+            }, filled))
+        count = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+        filled += count
+        if count:
+            filled_origins.append(d["origin"])
+            fields.extend(f["token"] for f in d["fills"])
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": meta.origin}
@@ -622,20 +650,108 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault_enter_code with this handle"
                        + (" (a code will be generated automatically)." if meta.has_otp else "."))
     if meta.kind != "login":
-        out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
+        out["fields"] = sorted(fields)  # which controls were targeted, never the values
+    if any(d["frame_id"] for d in docs):
+        out["frame_origins"] = sorted({o for o in filled_origins if o != meta.origin})
     return json.dumps(out)
 
 
-def _confirm_payment_fill(label: str, origin: str) -> bool:
+def _classify_raw(raw: Any, classify) -> Optional[list]:
+    """Classified controls from an inspection result, or None when the result is not a control list."""
+    from agent.vault_login_classifier import LoginControl
+
+    controls = _parse_json_result(raw)
+    if isinstance(controls, str):
+        controls = _parse_json_result(controls)
+    if not isinstance(controls, list):
+        return None
+    out = []
+    for c in controls:
+        if isinstance(c, dict) and (res := classify(LoginControl.from_dict(c))) is not None:
+            out.append(res)
+    return out
+
+
+def _eval_in_frame(task_id: str, frame_id: str, expression: str) -> Dict[str, Any]:
+    """Evaluate in an out-of-process frame over the supervisor CDP WebSocket. Never falls back to the
+    agent-browser CLI: that path cannot target a frame and would put a card into argv."""
+    supervisor = _ensure_supervisor(task_id)
+    if supervisor is None:
+        return {"success": False, "error_type": "supervisor_required",
+                "error": "Filling a payment frame requires the supervised browser session (direct CDP WebSocket)."}
+    sup = supervisor.evaluate_in_frame(frame_id, expression)
+    if sup.get("ok"):
+        return {"success": True, "result": sup.get("result")}
+    return {"success": False, "error_type": "frame_unavailable", "error": str(sup.get("error") or "frame eval failed")}
+
+
+def _inspect_bound_frames(task_id: str, frame_origins, classify):
+    """Inspect every out-of-process frame on a bound PSP origin under the CURRENT page.
+
+    Returns ``[{"frame_id", "origin", "nonce", "classified"}]`` or a JSON refusal string. Frames on any
+    other origin are never inspected; each candidate's live ``window.location.origin`` is re-asserted
+    inside the inspection script itself, so a frame that navigated since the supervisor cached it is refused."""
+    from agent.vault_login_classifier import build_inspection_js
+
+    supervisor = _ensure_supervisor(task_id)
+    if supervisor is None:
+        return json.dumps({"success": False, "error_type": "supervisor_required",
+                           "error": "Filling hosted payment fields requires the supervised browser session."})
+    docs = []
+    for origin in frame_origins:
+        for frame in supervisor.frames_on_origin(origin):
+            nonce = secrets.token_hex(8)
+            expr = ("(() => { if (window.location.origin !== " + json.dumps(origin) + ") "
+                    "return JSON.stringify({refused: 'origin_changed', found: window.location.origin}); "
+                    "return " + build_inspection_js(nonce) + "; })()")
+            res = _eval_in_frame(task_id, frame["frame_id"], expr)
+            if not res.get("success"):
+                return json.dumps({"success": False, "error_type": res.get("error_type", "frame_unavailable"),
+                                   "error": f"Could not inspect the payment frame on {origin}: {res.get('error')}"})
+            parsed = _parse_json_result(res.get("result"))
+            if isinstance(parsed, dict) and parsed.get("refused"):
+                return json.dumps({"success": False, "error_type": "origin_changed",
+                                   "error": (f"Refused: a payment frame expected on {origin} is now on "
+                                             f"{parsed.get('found') or 'another origin'}. Nothing was written.")})
+            classified = _classify_raw(parsed, classify)
+            if classified:
+                docs.append({"frame_id": frame["frame_id"], "origin": origin, "nonce": nonce, "classified": classified})
+    return docs
+
+
+_EXPIRY_TOKENS = ("cc-exp", "cc-exp-month", "cc-exp-year")
+
+
+def _ambiguous_tokens(docs) -> list:
+    """Field groups targeted in more than one document. Expiry is ONE group (a combined box in one
+    document and month/year selects in another would both be written)."""
+    seen: Dict[str, int] = {}
+    for d in docs:
+        for group in {("cc-exp" if f["token"] in _EXPIRY_TOKENS else f["token"]) for f in d["fills"]}:
+            seen[group] = seen.get(group, 0) + 1
+    return sorted(g for g, n in seen.items() if n > 1)
+
+
+def _partial(out: Dict[str, Any], filled: int) -> Dict[str, Any]:
+    """A multi-document fill stopped after some fields were written: tell the agent not to submit."""
+    if filled:
+        out["filled_fields"] = filled
+        out["error"] += " Some fields were already filled; do NOT submit — ask the user to review the form."
+    return out
+
+
+def _confirm_payment_fill(label: str, origin: str, frame_origins: tuple = ()) -> bool:
     """Human confirmation before a card is written into a page: a prompt injection that reaches a checkout
     must not be able to spend. Routes through the approval surface of the active session (gateway button
     round-trip or CLI panel); headless sessions cannot confirm and the fill is refused."""
     from tools.approval_prompt import request_elicitation_consent
 
+    frames = (" and its payment provider frame(s) " + ", ".join(frame_origins)) if frame_origins else ""
     return request_elicitation_consent(
-        f"Fill payment card '{label}' on {origin}",
-        "The agent wants to enter your saved card details into this checkout page. The card number and "
-        "CVC never enter the conversation. Approve only if you intend to pay here.",
+        f"Fill payment card '{label}' on {origin}{frames}",
+        "The agent wants to enter your saved card details into this checkout page"
+        + (" and the payment fields hosted by the provider(s) you bound to this card" if frame_origins else "")
+        + ". The card number and CVC never enter the conversation. Approve only if you intend to pay here.",
         surface="vault-payment") == "accept"
 
 
