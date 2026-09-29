@@ -1,25 +1,38 @@
 """1Password (`op` CLI) secret source.
 
 Users map env-var names to ``op://vault/item/field`` references in
-``secrets.onepassword.env``; each is resolved with one ``op read -- <ref>``
-call using whatever auth the user's ``op`` already has (``OP_SERVICE_ACCOUNT_TOKEN``
-headless, ``OP_SESSION_*`` interactive) — Hermes never authenticates on the
-user's behalf, and failures never block startup. Complete pulls are cached
-in-process and under ``<hermes_home>/cache/op_cache.json`` (values only; auth
-material is fingerprinted, never stored).
+``secrets.onepassword.env``. Two or more references into the same item are
+resolved with ONE ``op item get`` (1Password rate-limits service accounts per
+request, and a 20-field item would otherwise cost 20 ``op read`` calls); a lone
+reference, or one the item JSON can't answer unambiguously, uses
+``op read -- <ref>``. Auth is whatever the user's ``op`` already has
+(``OP_SERVICE_ACCOUNT_TOKEN`` headless, ``OP_SESSION_*`` interactive) — Hermes
+never authenticates on the user's behalf, and failures never block startup.
+Complete pulls are cached in-process and under
+``<hermes_home>/cache/op_cache.json`` (values only; auth material is
+fingerprinted, never stored).
+
+On a rate-limit response the pull stops at once, a backoff marker
+(``op_rate_limit.json``, no secret values) makes every later process skip
+``op`` until it expires, and the last complete pull is served for the missing
+names — so a throttled account is not kept throttled by restarts and CLI runs.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import shutil
 import subprocess  # noqa: F401 — tests monkeypatch ``op.subprocess.run``
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from agent.secret_sources._cache import CachedFetch, SecretCache, fingerprint as _fingerprint
+from agent.secret_sources._cache import (
+    CachedFetch, SecretCache, atomic_write_json, fingerprint as _fingerprint, resolve_cache_home,
+)
 from agent.secret_sources.base import (
     ErrorKind, FetchResult, SecretSource, classify_cli_error, coerce_float,
     get_source_environment, is_valid_env_name, run_cli,
@@ -60,13 +73,36 @@ def _disk_key_str(cache_key: _CacheKey) -> str:
 _STORE: SecretCache[_CacheKey] = SecretCache(_DISK_CACHE_BASENAME, key_serializer=_disk_key_str)
 _CACHE = _STORE.memory  # tests flush L1 directly
 
+# Rate-limit backoff marker: {"auth": <auth fingerprint>, "until": <epoch>}. Holds no
+# secret values, so it is written even when cache_ttl_seconds is 0. The limit is per
+# 1Password account, not per profile, so the marker lives once under the default root
+# (``<root>/cache``, shared by ``<root>/profiles/*``), keyed by the auth fingerprint.
+_BACKOFF_BASENAME = "op_rate_limit.json"
+# Used when op's message carries no retry hint. 1Password's hourly window is 60 min.
+_DEFAULT_BACKOFF_SECONDS = 15 * 60
+_MAX_BACKOFF_SECONDS = 24 * 60 * 60
+_RETRY_HINT_RE = re.compile(
+    r"(?:try again|retry)\s+(?:in\s+)?(?:about\s+|approximately\s+)?"
+    r"(?:(\d+)\s*hours?)?(?:\s*(?:and|,)?\s*(\d+)\s*minutes?)?"
+    r"(?:\s*(?:and|,)?\s*(\d+)\s*seconds?)?", re.IGNORECASE)
+# ``op item get`` prints this instead of a concealed value when it is not revealed.
+_CONCEALED_PLACEHOLDER_RE = re.compile(r"^\[use 'op item get .*--reveal' to reveal\]$", re.IGNORECASE)
+
+# Set on agent terminal children (tools/environments/local.py::_make_run_env): serve the last
+# complete disk pull at any age and never call op. An empty result when nothing is cached.
+# Explicit uncached reads (`hermes secrets onepassword sync --apply`, rotation) stay live.
+CACHE_ONLY_ENV = "HERMES_OP_CACHE_ONLY"
+
 _MISSING_BINARY_HINT = (
     "Install the 1Password CLI (https://developer.1password.com/docs/cli/get-started/) "
     "or set secrets.onepassword.binary_path."
 )
 
-# First matching rule wins.
+# First matching rule wins. RATE_LIMITED leads: op's 429 text must never fall
+# through to a kind whose policy is "retry".
 _OP_ERROR_RULES = (
+    (ErrorKind.RATE_LIMITED, ("too many requests", "rate-limit", "rate limit", "status 429", "http 429",
+                              "(429)", "429 too many")),
     (ErrorKind.TIMEOUT, ("timed out",)),
     (ErrorKind.BINARY_MISSING, ("not found on path", "not an executable", "failed to invoke")),
     (ErrorKind.AUTH_FAILED, ("unauthorized", "not signed in", "session expired",
@@ -78,6 +114,28 @@ _OP_ERROR_RULES = (
 
 def _classify_op_error(message: str) -> ErrorKind:
     return classify_cli_error(message, _OP_ERROR_RULES)
+
+
+class _OpError(RuntimeError):
+    """``op`` failure. ``detail`` is op's own text (stderr / timeout / spawn error) with the
+    names it echoes blanked (see ``_without_names``), so a vault/item/field name can never
+    change how the failure is classified."""
+
+    def __init__(self, message: str, detail: str) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
+def _without_names(text: str, target: str) -> str:
+    """``text`` with every quoted span and the raw ``target`` blanked. op quotes the names it
+    echoes (``"Port 8429" isn't an item``, ``could not read secret 'op://…'``); its own prose is
+    never quoted, so a name like "token", "requests" or "429" cannot add or erase a classifying word."""
+    text = re.sub(r"\"[^\"\n]*\"|'[^'\n]*'", " ", text)
+    return text.replace(target, " ") if target else text
+
+
+def _op_error_kind(exc: Exception) -> ErrorKind:
+    return _classify_op_error(exc.detail if isinstance(exc, _OpError) else str(exc))
 
 
 def _validate_references(references: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], List[str]]:
@@ -137,28 +195,150 @@ def _op_child_env(token_value: str) -> Dict[str, str]:
     return env
 
 
+def _run_op(op: Path, args: List[str], target: str, *, account: str, token_value: str, what: str) -> str:
+    """Run ``op <args…> [--account A] -- <target>``; stdout on success, ``RuntimeError`` otherwise.
+    ``--`` so a reference or item name can never parse as an op flag."""
+    cmd: List[str] = [str(op), *args]
+    if account:
+        cmd += ["--account", account]
+    cmd += ["--", target]
+
+    try:
+        proc = run_cli(cmd, env=_op_child_env(token_value), timeout=_OP_RUN_TIMEOUT, label="op",
+                       timeout_message=f"op {what} timed out after {_OP_RUN_TIMEOUT}s", stdin=None)
+    except RuntimeError as exc:
+        raise _OpError(f"{exc} for {target!r}", _without_names(str(exc), target)) from exc
+
+    if proc.returncode != 0:
+        # Room for op's full 429 text including its "try again in …" hint.
+        err = _scrub(proc.stderr or "")[:300]
+        if err:
+            raise _OpError(f"op {what} failed for {target!r}: {err}", _without_names(err, target))
+        raise _OpError(f"op {what} exited {proc.returncode} for {target!r}", f"exited {proc.returncode}")
+    return proc.stdout or ""
+
+
 def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: str = "") -> str:
     """Resolve one ``op://`` reference; raises ``RuntimeError`` on any failure, including
     an exit-0 empty value (applying it would clobber a good credential with ``""``)."""
-    cmd: List[str] = [str(op), "read"]
-    if account:
-        cmd += ["--account", account]
-    cmd += ["--", reference]  # `--` so a reference can never parse as an op flag
-
-    proc = run_cli(cmd, env=_op_child_env(token_value), timeout=_OP_RUN_TIMEOUT, label="op",
-                   timeout_message=f"op read timed out after {_OP_RUN_TIMEOUT}s for {reference!r}", stdin=None)
-
-    if proc.returncode != 0:
-        err = _scrub(proc.stderr or "")[:200]
-        if err:
-            raise RuntimeError(f"op read failed for {reference!r}: {err}")
-        raise RuntimeError(f"op read exited {proc.returncode} for {reference!r}")
-
     # Strip only op's trailing newline so intentional edge spaces survive.
-    value = (proc.stdout or "").rstrip("\r\n")
+    value = _run_op(op, ["read"], reference, account=account, token_value=token_value,
+                    what="read").rstrip("\r\n")
     if not value.strip():
-        raise RuntimeError(f"op read returned an empty value for {reference!r}")
+        raise _OpError(f"op read returned an empty value for {reference!r}", "empty value")
     return value
+
+
+def _split_reference(reference: str) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
+    """``op://vault/item/[section/]field`` → ``(vault, item, field_path)``; None for shapes the
+    item-JSON resolver does not handle (query attributes like ``?attribute=otp``, odd depth)."""
+    if "?" in reference:
+        return None
+    parts = reference[len("op://"):].split("/")
+    if len(parts) not in (3, 4) or not all(parts):
+        return None
+    return parts[0], parts[1], tuple(parts[2:])
+
+
+def _field_from_item(item: dict, field_path: Tuple[str, ...]) -> Optional[str]:
+    """The value ``op read`` would return for ``field_path``, or None when the item JSON can't say
+    unambiguously (no match, several matches, no value) — the caller then falls back to ``op read``."""
+    want = field_path[-1]
+    section = field_path[0] if len(field_path) == 2 else None
+    matches = []
+    for fld in item.get("fields") or []:
+        if not isinstance(fld, dict) or want not in (fld.get("label"), fld.get("id")):
+            continue
+        if section is not None:
+            sec = fld.get("section") if isinstance(fld.get("section"), dict) else {}
+            if section not in (sec.get("label"), sec.get("id")):
+                continue
+        matches.append(fld)
+    if len(matches) != 1:
+        return None
+    value = matches[0].get("value")
+    if not isinstance(value, str) or not value.strip() or _CONCEALED_PLACEHOLDER_RE.match(value.strip()):
+        return None  # a concealed placeholder is not the secret — let `op read` answer
+    return value
+
+
+def _item_groups(refs: Dict[str, str]) -> Tuple[Dict[Tuple[str, str], Dict[str, Tuple[str, ...]]], Dict[str, str]]:
+    """Split ``refs`` into ``{(vault, item): {name: field_path}}`` for items referenced 2+ times
+    (one ``op item get`` each) and the remainder resolved one ``op read`` apiece."""
+    by_item: Dict[Tuple[str, str], Dict[str, Tuple[str, ...]]] = {}
+    singles: Dict[str, str] = {}
+    for name, ref in refs.items():
+        split = _split_reference(ref)
+        if split is None:
+            singles[name] = ref
+        else:
+            by_item.setdefault((split[0], split[1]), {})[name] = split[2]
+    grouped = {key: names for key, names in by_item.items() if len(names) > 1}
+    for key, names in by_item.items():
+        if len(names) == 1:
+            (name,) = names
+            singles[name] = refs[name]
+    return grouped, singles
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    return _op_error_kind(exc) is ErrorKind.RATE_LIMITED
+
+
+def _backoff_seconds(message: str) -> float:
+    """Seconds op asked us to wait (``… try again in 23 hours and 59 minutes``), else the default."""
+    match = _RETRY_HINT_RE.search(message)
+    if match and (match.group(1) or match.group(2) or match.group(3)):
+        seconds = int(match.group(1) or 0) * 3600 + int(match.group(2) or 0) * 60 + int(match.group(3) or 0)
+        if seconds > 0:
+            return float(min(seconds, _MAX_BACKOFF_SECONDS))
+    return float(_DEFAULT_BACKOFF_SECONDS)
+
+
+def _backoff_path(home_path: Optional[Path]) -> Path:
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root(home=resolve_cache_home(home_path)) / "cache" / _BACKOFF_BASENAME
+
+
+def _active_backoff(auth_fp: str, home_path: Optional[Path]) -> Optional[float]:
+    """Epoch until which ``op`` must not be called for this identity, or None."""
+    try:
+        with open(_backoff_path(home_path), "r", encoding="utf-8-sig") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("auth") != auth_fp:
+        return None
+    until = payload.get("until")
+    if not isinstance(until, (int, float)) or until <= time.time():
+        return None
+    return float(until)
+
+
+def _record_backoff(auth_fp: str, message: str, home_path: Optional[Path]) -> float:
+    until = time.time() + _backoff_seconds(message)
+    try:
+        atomic_write_json(_backoff_path(home_path), {"auth": auth_fp, "until": until})
+    except OSError:
+        pass  # best-effort — without the marker the next process just pays one more request
+    return until
+
+
+def _clear_backoff(home_path: Optional[Path]) -> None:
+    try:
+        _backoff_path(home_path).unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _cache_only() -> bool:
+    value = os.environ.get(CACHE_ONLY_ENV) or get_source_environment().get(CACHE_ONLY_ENV, "")
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fmt_epoch(epoch: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(epoch))
 
 
 def fetch_onepassword_secrets(
@@ -171,13 +351,19 @@ def fetch_onepassword_secrets(
     Raises ``RuntimeError`` only when no ``op`` binary is available; per-ref
     failures become warnings. Only a complete, error-free pull is cached, so a
     transient auth failure isn't frozen in for the whole TTL window.
+
+    With ``use_cache``: an active rate-limit backoff skips ``op`` entirely, and
+    names lost to a rate limit, network error or timeout are filled from the
+    last complete pull (any age; never after an auth failure, where old values
+    would mask a real problem).
     """
     valid, warnings = _validate_references(references)
     if not valid:
         return {}, warnings
 
     token_value = get_source_environment().get(token_env, "").strip()
-    cache_key: _CacheKey = (_auth_fingerprint(token_env), account or "",
+    auth_fp = _auth_fingerprint(token_env)
+    cache_key: _CacheKey = (auth_fp, account or "",
                             str(home_path) if home_path is not None else "", _refs_fingerprint(valid))
 
     if use_cache:
@@ -185,22 +371,96 @@ def fetch_onepassword_secrets(
         if cached is not None:
             return dict(cached.secrets), warnings
 
+    # An explicit fresh read stays live: `sync --apply` / rotation pass cache_ttl_seconds=0, the dry
+    # run passes use_cache=False.
+    if use_cache and cache_ttl_seconds > 0 and _cache_only():
+        last = _STORE.disk.read(cache_key, float("inf"), home_path)
+        if last is None:
+            warnings.append(f"{CACHE_ONLY_ENV} is set and no 1Password pull is cached; op not called")
+            return {}, warnings
+        return dict(last.secrets), warnings
+
+    def _fill_from_last_good(secrets: Dict[str, str], names: List[str], reason: str) -> None:
+        if not (use_cache and cache_ttl_seconds > 0) or not names:
+            return
+        last = _STORE.memory.get(cache_key) or _STORE.disk.read(cache_key, float("inf"), home_path)
+        filled = [n for n in names if last is not None and n in last.secrets]
+        for name in filled:
+            secrets[name] = last.secrets[name]
+        if filled:
+            age = int(max(0.0, time.time() - last.fetched_at))
+            warnings.append(f"{reason}; served {len(filled)} value(s) from the last complete pull ({age}s old)")
+
+    secrets: Dict[str, str] = {}
+    if use_cache:
+        until = _active_backoff(auth_fp, home_path)
+        if until is not None:
+            warnings.append(f"1Password rate-limited; not calling op until {_fmt_epoch(until)}")
+            _fill_from_last_good(secrets, sorted(valid), "1Password backoff active")
+            return secrets, warnings
+
     op = binary or find_op(binary_path)
     if op is None:
         raise RuntimeError("op CLI not found.  Install the 1Password CLI "
                            "(https://developer.1password.com/docs/cli/get-started/) or set "
                            "secrets.onepassword.binary_path to its absolute location.")
 
-    secrets: Dict[str, str] = {}
     read_errors = 0
-    for name in sorted(valid):
-        try:
-            secrets[name] = _run_op_read(op, valid[name], account=account, token_value=token_value)
-        except RuntimeError as exc:
-            warnings.append(str(exc))
-            read_errors += 1
+    transient_failed: List[str] = []
+    rate_limit_msg: Optional[str] = None
+    rate_limit_detail = ""
 
-    if use_cache and not read_errors and secrets:
+    grouped, pending_reads = _item_groups(valid)
+    for (vault, item_name), fields in sorted(grouped.items()):
+        item: Optional[dict] = None
+        try:
+            parsed = json.loads(_run_op(op, ["item", "get", "--vault", vault, "--format", "json", "--reveal"], item_name,
+                                        account=account, token_value=token_value, what="item get"))
+            item = parsed if isinstance(parsed, dict) else None
+        except RuntimeError as exc:
+            if _is_rate_limited(exc):
+                rate_limit_msg, rate_limit_detail = str(exc), getattr(exc, "detail", str(exc))
+                break
+            if _op_error_kind(exc) in (ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED):
+                # Every field read would fail the same way; don't spend a request on each.
+                warnings.append(str(exc))
+                read_errors += len(fields)
+                continue
+            # Otherwise (item renamed, field-level quirk) the per-field `op read` below
+            # reports the real per-ref error.
+        except ValueError:  # malformed JSON — fall back to op read
+            pass
+        for name, field_path in fields.items():
+            value = _field_from_item(item, field_path) if item is not None else None
+            if value is None:
+                pending_reads[name] = valid[name]
+            else:
+                secrets[name] = value
+
+    if rate_limit_msg is None:
+        for name in sorted(pending_reads):
+            try:
+                secrets[name] = _run_op_read(op, pending_reads[name], account=account, token_value=token_value)
+            except RuntimeError as exc:
+                if _is_rate_limited(exc):
+                    rate_limit_msg, rate_limit_detail = str(exc), getattr(exc, "detail", str(exc))
+                    break
+                warnings.append(str(exc))
+                read_errors += 1
+                if _op_error_kind(exc) in (ErrorKind.NETWORK, ErrorKind.TIMEOUT):
+                    transient_failed.append(name)
+
+    complete = rate_limit_msg is None and not read_errors
+    if rate_limit_msg is not None:
+        missing = sorted(n for n in valid if n not in secrets)
+        until = _record_backoff(auth_fp, rate_limit_detail, home_path)
+        warnings.append(f"{rate_limit_msg} — stopped at the first throttled call; {len(missing)} "
+                        f"reference(s) not fetched; op skipped until {_fmt_epoch(until)}")
+        _fill_from_last_good(secrets, missing, "1Password rate-limited")
+    elif transient_failed:
+        _fill_from_last_good(secrets, transient_failed, "1Password unreachable")
+
+    if use_cache and complete and secrets:
         _STORE.store(cache_key, CachedFetch(secrets=dict(secrets), fetched_at=time.time()),
                      cache_ttl_seconds, home_path)
 
@@ -330,8 +590,10 @@ class OnePasswordSource(SecretSource):
 
 def clear_caches(home_path: Optional[Path] = None) -> None:
     """Drop in-process AND disk caches (after a token rotation, so the next
-    startup resolves fresh instead of serving values cached under the old token)."""
+    startup resolves fresh instead of serving values cached under the old token).
+    Also drops the rate-limit backoff marker."""
     _STORE.clear(home_path)
+    _clear_backoff(home_path)
 
 
 _reset_cache_for_tests = clear_caches

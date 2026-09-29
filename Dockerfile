@@ -5,7 +5,7 @@
 # Pinned by the multi-arch index digest: uv and node already come from pm's
 # sha-verified lock, and a tag alone would let the base drift under them.
 FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS sqlite_build
-ARG DEBIAN_SNAPSHOT=20260918T000000Z
+ARG DEBIAN_SNAPSHOT=20260928T000000Z
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
@@ -226,6 +226,11 @@ WORKDIR /opt/hermes
 # /opt/hermes, outside the /opt/data volume so it survives the overlay.
 # PM alone resolves the pinned uv for dependency preparation; build consumers
 # receive Python environments, never an installer executable.
+# The runtime still exposes that same pinned uv/uvx on PATH: stdio MCP
+# servers and skills launch `uv run` / `uvx` (sera_canvas runs
+# /usr/local/bin/uv). uv is internal PM tooling (installed_package refuses
+# it), so link the toolchain's resolved binary; the version keeps one
+# authority.
 #
 # Full Chromium supports both headed and headless sessions. It is staged
 # here rather than by `npx playwright install`,
@@ -248,6 +253,8 @@ COPY scripts/bundles/payload.py scripts/bundles/payload.py
 RUN set -eu; \
     python3 -c 'from pm import ensure; [ensure(name, explicit=True) for name in ("python", "uv", "chromium", "npm", "ffmpeg", "ripgrep")]'; \
     python3 -c 'from pathlib import Path; from pm import installed_package; [Path("/usr/local/bin", command).symlink_to(installed_package(package).binary) for command, package in (("python3", "python"), ("node", "node"), ("npm", "npm"), ("ffmpeg", "ffmpeg"), ("rg", "ripgrep"))]; Path("/usr/local/bin/ffprobe").symlink_to(installed_package("ffmpeg").binary.with_name("ffprobe"))'; \
+    python3 -c 'from pathlib import Path; from pm._uv import _toolchain; uv = _toolchain(realize=False)[0]; [Path("/usr/local/bin", name).symlink_to(uv.with_name(name)) for name in ("uv", "uvx")]'; \
+    uv --version >/dev/null; uvx --version >/dev/null; \
     ffmpeg -version >/dev/null; ffprobe -version >/dev/null; rg --version >/dev/null; \
     python3 -c 'import shutil; from pathlib import Path; from pm import env_for; Path("/usr/local/bin/npx").symlink_to(shutil.which("npx", path=env_for("npm", base_env={})["PATH"]))'; \
     node --version; npm --version; \
@@ -592,10 +599,13 @@ ARG HERMES_GIT_SHA=
 LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
       org.opencontainers.image.revision="${HERMES_GIT_SHA}"
 ARG HERMES_BOT_DESKTOP=0
-ARG DEBIAN_SNAPSHOT=20260918T000000Z
+ARG DEBIAN_SNAPSHOT=20260928T000000Z
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
 RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --only-upgrade --no-install-recommends \
+      bsdutils gzip libblkid1 liblastlog2-2 libmount1 libpcre2-8-0 libsmartcols1 \
+      libsqlite3-0 libuuid1 login mount util-linux && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 python3-venv \
     libffi8 libolm3 libatomic1 procps git openssh-client xz-utils \
@@ -634,20 +644,21 @@ COPY --from=assembled_build /usr/bin/tini /usr/bin/tini
 RUN ldconfig && \
     python3 -c 'import sqlite3; assert sqlite3.sqlite_version_info >= (3, 51, 3)' && \
     case "$(readlink -f /opt/hermes/.venv/bin/python3)" in \
-        /opt/hermes/tools/python/*) ;; \
-        *) echo 'toolbox helper interpreter escapes pinned Python store' >&2; exit 1 ;; \
+        /opt/hermes/tools/python/*|/opt/hermes/tools/python-*/bin/python3*) ;; \
+        *) echo "toolbox helper interpreter escapes pinned Python store: $(readlink -f /opt/hermes/.venv/bin/python3)" >&2; exit 1 ;; \
     esac && \
     test ! -x /usr/bin/gcc && test ! -x /usr/bin/g++ && test ! -x /usr/bin/docker && \
     test -r /etc/hermes/config.yaml && test -x /init && \
     test -x /opt/hermes/.venv/bin/hermes && \
     test -x /usr/local/bin/markdownlint-cli2 && \
+    test -x /usr/local/bin/uv && test -x /usr/local/bin/uvx && \
     test -f /usr/local/lib/node_modules/@hauptsache.net/clickup-mcp/package.json && \
     test -f /usr/local/lib/node_modules/caldav-mcp/package.json
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/tools HERMES_RUNTIME_DIR=/opt/hermes/tools
 ENV HERMES_PYTHON=/usr/local/bin/python3
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist HERMES_TUI_DIR=/opt/hermes/ui-tui
-ENV HERMES_HOME=/opt/data HERMES_WRITE_SAFE_ROOT=/opt/data
+ENV HERMES_HOME=/opt/data HERMES_WRITE_SAFE_ROOT=/opt/data:/opt/vault:/tmp HERMES_DISABLE_LAZY_INSTALLS=1
 ENV HERMES_CHILD_HOME=/opt/data/home
 ENV XDG_CACHE_HOME=/opt/data/cache UV_CACHE_DIR=/opt/data/cache/uv
 ENV HERMES_MODEL_ROOT=/opt/data/models HF_HOME=/opt/data/models/huggingface

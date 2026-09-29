@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 # Kept at module level on purpose: importing this module must fail when the dotenv install is
@@ -41,6 +42,14 @@ _SECRET_SOURCE_RESTORE_BY_HOME: dict[str, dict[str, str]] = {}
 # re-parse + ASCII sweep re-run each time (Bitwarden's own cache only saves the network call).
 _APPLIED_HOMES: set[str] = set()
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
+# Per home: the last snapshot no read failure trimmed, and a monotonic retry-after deadline set by a
+# degraded re-pull. A per-reference read failure (1Password "Too many requests", a network blip) is a
+# warning, not a source error, so the report still says ok. Publishing that pull replaced a working
+# snapshot with an empty one until the next re-pull — and a multiplex gateway re-pulls the default home
+# on every cron fire, so the uncached failures kept the account throttled. Per-home resets keep both.
+_SECRET_SOURCE_LAST_GOOD_BY_HOME: dict[str, dict[str, str]] = {}
+_SECRET_SOURCE_RETRY_AFTER: dict[str, float] = {}
+_DEGRADED_PULL_BACKOFF_SECONDS = 300.0
 
 # What THIS process has published from dotenv files, per variable: (value before our first publish, or
 # None if absent; last value we published; load pass that published it). Reloads run per gateway turn and
@@ -126,6 +135,13 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
     if home_key in _APPLIED_HOMES:
         return get_secret_source_values(home)
 
+    last_good = _SECRET_SOURCE_LAST_GOOD_BY_HOME.get(home_key, {})
+    if last_good and time.monotonic() < _SECRET_SOURCE_RETRY_AFTER.get(home_key, 0.0):
+        # A degraded pull is backing off: serve the last complete snapshot instead of re-reading.
+        _SECRET_SOURCE_VALUES_BY_HOME[home_key] = dict(last_good)
+        _APPLIED_HOMES.add(home_key)
+        return dict(last_good)
+
     # A retry must not keep serving a partial result after the source is removed, disabled, or can no
     # longer be evaluated. Publish only the snapshot established by this attempt.
     _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
@@ -172,6 +188,17 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
             continue
         _SECRET_SOURCES[name] = applied.source
         values[name] = value
+
+    # Read failures only trim the snapshot: keep last-good values for names this pull missed, and back
+    # off before the next pull. A name removed from config drops out on the next clean pull.
+    missing = {name: value for name, value in last_good.items() if name not in values}
+    if missing and any(not src.result.ok or src.result.warnings for src in report.sources):
+        values.update(missing)
+        _SECRET_SOURCE_RETRY_AFTER[home_key] = time.monotonic() + _DEGRADED_PULL_BACKOFF_SECONDS
+        _APPLIED_HOMES.add(home_key)
+    elif values:
+        _SECRET_SOURCE_LAST_GOOD_BY_HOME[home_key] = dict(values)
+        _SECRET_SOURCE_RETRY_AFTER.pop(home_key, None)
     _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
     return dict(values)
 
@@ -182,12 +209,15 @@ def reset_secret_source_cache(hermes_home: str | os.PathLike | None = None) -> N
     ``hermes_home`` limits the reset to ONE home: a multiplex gateway keeps every profile's snapshot in
     this process, and a per-fire cron re-pull or a plugin-discovery refresh for one home must not wipe
     a sibling's hydrated snapshot — the sibling's next scope build would run empty until it re-hydrated
-    (#102041)."""
+    (#102041). A per-home reset keeps that home's last-good snapshot and degraded-pull backoff, so a
+    throttled re-pull cannot empty the scope."""
     if hermes_home is None:
         _APPLIED_HOMES.clear()
         _SECRET_SOURCES.clear()
         _SECRET_SOURCE_VALUES_BY_HOME.clear()
         _SECRET_SOURCE_RESTORE_BY_HOME.clear()
+        _SECRET_SOURCE_LAST_GOOD_BY_HOME.clear()
+        _SECRET_SOURCE_RETRY_AFTER.clear()
         return
     home_key = str(Path(hermes_home).resolve())
     _APPLIED_HOMES.discard(home_key)
@@ -584,6 +614,7 @@ def _apply_external_secret_sources(home_path: Path) -> None:
             values[name] = os.environ[name]
     if values:
         _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+        _SECRET_SOURCE_LAST_GOOD_BY_HOME[home_key] = dict(values)
     _SECRET_SOURCE_RESTORE_BY_HOME[home_key] = {
         n: values[n] for n, a in report.provenance.items() if a.authoritative and n in values}
 

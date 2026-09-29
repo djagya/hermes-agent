@@ -679,8 +679,13 @@ def _make_run_env(env: dict) -> dict:
     the LAUNCH profile's; under a routed home override its ``.env`` residue is dropped first
     (``strip_launch_profile_env``, a no-op for the launch profile) so the backend's own ``env``
     and the served profile's declared passthrough names are what the child sees."""
-    return _scrubbed_env([(dict(strip_launch_profile_env(os.environ.copy()) | env), True)], frozenset(),
-                         lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)))
+    run_env = _scrubbed_env([(dict(strip_launch_profile_env(os.environ.copy()) | env), True)], frozenset(),
+                            lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)))
+    # A `hermes` the agent runs from its shell resolves 1Password from the disk cache only: every
+    # such run would otherwise re-read each mapped reference and spend the account's shared daily
+    # read budget (agent.secret_sources.onepassword.CACHE_ONLY_ENV).
+    run_env.setdefault("HERMES_OP_CACHE_ONLY", "1")
+    return run_env
 
 
 # --- Hermes venv / repo-root detection (module-level, computed once) ---

@@ -46,7 +46,7 @@ env:
   # Must match every Dockerfile `ARG DEBIAN_SNAPSHOT=` default. Build-args
   # override the Dockerfile; leaving May here after a Sept bump rebuilt
   # stale apt and failed smoke/Trivy.
-  DEBIAN_SNAPSHOT: 20260918T000000Z
+  DEBIAN_SNAPSHOT: 20260928T000000Z
 
 jobs:
   lint:
@@ -139,6 +139,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Record SOURCE_DATE_EPOCH
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
@@ -165,6 +166,26 @@ jobs:
             exit 1
           fi
 
+      # The version is derived, never hand-kept: the nearest upstream release tag in
+      # this tree sets the base, commits past it the distance (scripts/fork-release-version.sh).
+      # Upstream tags are fetched so a sync never reports an older release.
+      - name: Derive release version
+        id: version
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags https://github.com/NousResearch/hermes-agent.git '+refs/tags/v2*:refs/tags/v2*'
+          scripts/fork-release-version.sh --check >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+      - name: Write install stamp
+        env:
+          BASE_VERSION: ${{ steps.version.outputs.base }}
+          DISTANCE: ${{ steps.version.outputs.distance }}
+        run: |
+          python3 scripts/write_install_stamp.py --output install-stamp.json \
+            --distribution docker --update-mechanism external --source ci \
+            --commit "$GITHUB_SHA" --base-version "$BASE_VERSION" --distance "$DISTANCE"
+
       - name: Build image (amd64)
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
@@ -178,8 +199,11 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:test
           labels: |
             HERMES_GIT_SHA=${{ github.sha }}
+            HERMES_BASE_VERSION=${{ steps.version.outputs.base }}
+            HERMES_UPSTREAM_TAG=${{ steps.version.outputs.tag }}
             org.opencontainers.image.source=https://github.com/djagya/hermes-agent
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.display }}
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
@@ -246,6 +270,7 @@ jobs:
         env:
           IMAGE: ${{ env.IMAGE_NAME }}:test
           EXPECT_SHA: ${{ github.sha }}
+          EXPECT_BASE: ${{ steps.version.outputs.base }}
           EXPECT_IMAGE: ${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
@@ -257,6 +282,12 @@ jobs:
           fi
           if [ "$oci_rev" != "$EXPECT_SHA" ]; then
             echo "ERROR: OCI revision=$oci_rev != $EXPECT_SHA" >&2
+            exit 1
+          fi
+          stamp_base="$(docker run --rm --entrypoint cat "$IMAGE" /opt/hermes/install-stamp.json \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin).get("baseVersion") or "")')"
+          if [ "$stamp_base" != "$EXPECT_BASE" ]; then
+            echo "ERROR: install-stamp baseVersion=${stamp_base:-<none>} != $EXPECT_BASE" >&2
             exit 1
           fi
           docker run --rm --entrypoint cat "$IMAGE" /etc/hermes/image-provenance.json > /tmp/prov.json
@@ -393,6 +424,9 @@ jobs:
           # skip vendor CLIs: no rebuild path here. gh 2.100.0 / gitleaks
           # 8.30.1 are latest; leftover findings are vendored Go
           # (x/mod, stdlib), same class as 1Password `op`.
+          # python-build-standalone's pip vendors msgpack 1.1.2 and
+          # setuptools 70.3.0. The sealed venv pins the fixed releases
+          # and is still scanned. No rebuild of that interpreter this cut.
           /tmp/trivy image --scanners vuln --severity CRITICAL,HIGH \
             --ignore-unfixed --exit-code 1 --no-progress \
             --ignorefile .trivyignore \
@@ -401,6 +435,7 @@ jobs:
             --skip-files usr/local/bin/gitleaks \
             --skip-files usr/local/bin/uv \
             --skip-files usr/local/bin/uvx \
+            --skip-dirs '**/site-packages/pip/_vendor' \
             "$IMAGE"
 
       - name: Install uv (for docker tests)
@@ -409,20 +444,23 @@ jobs:
           version: "0.9.28"
           enable-cache: false
 
-      - name: Set up Python 3.11 (for docker tests)
+      - name: Set up Python 3.14 (for docker tests)
         uses: ./.github/actions/retry
         with:
-          command: uv python install 3.11
+          command: uv python install 3.14
 
       - name: Install Python dependencies (for docker tests)
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra dev
+          command: uv sync --locked --python 3.14 --group dev
 
       - name: Run docker integration tests
         env:
           # Use the image already loaded by the build step; skip rebuild.
           HERMES_TEST_IMAGE: ${{ env.IMAGE_NAME }}:test
+          # The checkout stamp is the image build input. It is not a
+          # packaged runtime, so don't let activate treat it as one.
+          HERMES_PYTHON: ${{ github.workspace }}/.venv/bin/python
           # No accidental real-API calls from inside the harness.
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
@@ -451,6 +489,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Record SOURCE_DATE_EPOCH
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
@@ -483,6 +522,26 @@ jobs:
           tag="${tag//\//-}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
+      # The version is derived, never hand-kept: the nearest upstream release tag in
+      # this tree sets the base, commits past it the distance (scripts/fork-release-version.sh).
+      # Upstream tags are fetched so a sync never reports an older release.
+      - name: Derive release version
+        id: version
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags https://github.com/NousResearch/hermes-agent.git '+refs/tags/v2*:refs/tags/v2*'
+          scripts/fork-release-version.sh >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+      - name: Write install stamp
+        env:
+          BASE_VERSION: ${{ steps.version.outputs.base }}
+          DISTANCE: ${{ steps.version.outputs.distance }}
+        run: |
+          python3 scripts/write_install_stamp.py --output install-stamp.json \
+            --distribution docker --update-mechanism external --source ci \
+            --commit "$GITHUB_SHA" --base-version "$BASE_VERSION" --distance "$DISTANCE"
+
       - name: Push image
         id: push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -497,8 +556,11 @@ jobs:
             ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
           labels: |
             HERMES_GIT_SHA=${{ github.sha }}
+            HERMES_BASE_VERSION=${{ steps.version.outputs.base }}
+            HERMES_UPSTREAM_TAG=${{ steps.version.outputs.tag }}
             org.opencontainers.image.source=https://github.com/djagya/hermes-agent
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.display }}
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
             HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
