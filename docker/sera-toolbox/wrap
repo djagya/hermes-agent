@@ -73,7 +73,24 @@ mkdir -p "$out_dir"
 extra=()
 lo_binds=()
 venv_binds=()
+store_binds=()
 lo_profile=""
+# Managed tools keep their binary in the pm store (python-<ver>, ffmpeg-<ver>)
+# and record that path as the wrapper origin. /usr is mounted; the store is not.
+case "$real" in
+  /opt/hermes/tools/*/*)
+    store_entry="$(dirname "$real")"
+    while [ "$(dirname "$store_entry")" != /opt/hermes/tools ]; do
+      store_entry="$(dirname "$store_entry")"
+      case "$store_entry" in
+        /|/opt|/opt/hermes) store_entry=""; break ;;
+      esac
+    done
+    if [ -n "$store_entry" ]; then
+      store_binds+=(--ro-bind "$store_entry" "$store_entry")
+    fi
+    ;;
+esac
 case "$tool" in
   gs|ghostscript)
     extra+=(-dSAFER -dNOPAUSE)
@@ -362,6 +379,7 @@ env -i \
     --ro-bind-try /var/lib/tesseract-ocr /var/lib/tesseract-ocr \
     --ro-bind-try /var/lib/libreoffice /var/lib/libreoffice \
     "${venv_binds[@]}" \
+    "${store_binds[@]}" \
     "${lo_binds[@]}" \
     "${fs_binds[@]}" \
     --chdir "$cwd" \
