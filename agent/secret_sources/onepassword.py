@@ -371,8 +371,10 @@ def fetch_onepassword_secrets(
         if cached is not None:
             return dict(cached.secrets), warnings
 
-    if use_cache and _cache_only():  # an explicit uncached read (sync --apply, rotation) stays live
-        last = _STORE.disk.read(cache_key, float("inf"), home_path) if cache_ttl_seconds > 0 else None
+    # An explicit fresh read stays live: `sync --apply` / rotation pass cache_ttl_seconds=0, the dry
+    # run passes use_cache=False.
+    if use_cache and cache_ttl_seconds > 0 and _cache_only():
+        last = _STORE.disk.read(cache_key, float("inf"), home_path)
         if last is None:
             warnings.append(f"{CACHE_ONLY_ENV} is set and no 1Password pull is cached; op not called")
             return {}, warnings
