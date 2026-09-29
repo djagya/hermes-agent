@@ -123,8 +123,9 @@ jobs:
           # djagya/hermes-agent ships one linux/amd64 Docker image. macOS/Windows
           # tests, desktop E2E, Rust, the bootstrap installer and the docs site
           # cannot affect it, and on the fork they were most of every upgrade's
-          # CI time. `workflow_dispatch` with release=true still forces every lane.
-          FORK_LEAN: ${{ github.repository == 'djagya/hermes-agent' && inputs.release != true }}
+          # CI time. Lean applies to push/PR only: a manual `workflow_dispatch` stays the
+          # full-validation receipt the header above describes (release=true forces every lane).
+          FORK_LEAN: ${{ github.repository == 'djagya/hermes-agent' && github.event_name != 'workflow_dispatch' && inputs.release != true }}
         run: |
           python3 - <<'PY'
           import json, os
