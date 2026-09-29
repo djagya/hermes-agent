@@ -226,6 +226,10 @@ WORKDIR /opt/hermes
 # /opt/hermes, outside the /opt/data volume so it survives the overlay.
 # PM alone resolves the pinned uv for dependency preparation; build consumers
 # receive Python environments, never an installer executable.
+# The runtime still exposes that same pinned uv/uvx on PATH: stdio MCP
+# servers and skills launch `uv run` / `uvx` (sera_canvas runs
+# /usr/local/bin/uv). They link into the PM store, so the version keeps one
+# authority.
 #
 # Full Chromium supports both headed and headless sessions. It is staged
 # here rather than by `npx playwright install`,
@@ -247,7 +251,8 @@ COPY hermes_cli/__init__.py hermes_cli/runtime_state.py hermes_cli/
 COPY scripts/bundles/payload.py scripts/bundles/payload.py
 RUN set -eu; \
     python3 -c 'from pm import ensure; [ensure(name, explicit=True) for name in ("python", "uv", "chromium", "npm", "ffmpeg", "ripgrep")]'; \
-    python3 -c 'from pathlib import Path; from pm import installed_package; [Path("/usr/local/bin", command).symlink_to(installed_package(package).binary) for command, package in (("python3", "python"), ("node", "node"), ("npm", "npm"), ("ffmpeg", "ffmpeg"), ("rg", "ripgrep"))]; Path("/usr/local/bin/ffprobe").symlink_to(installed_package("ffmpeg").binary.with_name("ffprobe"))'; \
+    python3 -c 'from pathlib import Path; from pm import installed_package; [Path("/usr/local/bin", command).symlink_to(installed_package(package).binary) for command, package in (("python3", "python"), ("node", "node"), ("npm", "npm"), ("ffmpeg", "ffmpeg"), ("rg", "ripgrep"), ("uv", "uv"))]; Path("/usr/local/bin/ffprobe").symlink_to(installed_package("ffmpeg").binary.with_name("ffprobe")); Path("/usr/local/bin/uvx").symlink_to(installed_package("uv").binary.with_name("uvx"))'; \
+    uv --version >/dev/null; uvx --version >/dev/null; \
     ffmpeg -version >/dev/null; ffprobe -version >/dev/null; rg --version >/dev/null; \
     python3 -c 'import shutil; from pathlib import Path; from pm import env_for; Path("/usr/local/bin/npx").symlink_to(shutil.which("npx", path=env_for("npm", base_env={})["PATH"]))'; \
     node --version; npm --version; \
@@ -644,6 +649,7 @@ RUN ldconfig && \
     test -r /etc/hermes/config.yaml && test -x /init && \
     test -x /opt/hermes/.venv/bin/hermes && \
     test -x /usr/local/bin/markdownlint-cli2 && \
+    test -x /usr/local/bin/uv && test -x /usr/local/bin/uvx && \
     test -f /usr/local/lib/node_modules/@hauptsache.net/clickup-mcp/package.json && \
     test -f /usr/local/lib/node_modules/caldav-mcp/package.json
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1

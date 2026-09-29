@@ -8,7 +8,7 @@ need=(
   convert pandoc soffice
   ffmpeg ffprobe exiftool
   shellcheck ruff markdownlint-cli2
-  python3
+  python3 uv uvx
   gh gitleaks tirith rclone op himalaya
   ss dig lsof fuser
   s6-svstat
