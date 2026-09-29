@@ -154,3 +154,18 @@ def _project(tmp_path: Path, *, pyproject: bool = True) -> Path:
 
 
 
+
+
+@pytest.mark.parametrize("argv, skip", [
+    (["hermes", "update"], True),
+    (["hermes", "--help"], True),
+    (["hermes", "chat", "-h"], True),
+    (["hermes", "--version"], True),
+    (["hermes", "chat", "-q", "hello"], False),
+    (["hermes", "gateway", "run"], False),
+])
+def test_help_and_version_skip_external_secret_sources(monkeypatch, argv, skip):
+    """Usage/version output reads no credentials, so it must not spend 1Password requests."""
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(er, "_UPDATE_RETRY_RECOVERED", False)
+    assert er._should_skip_external_secret_sources() is skip
