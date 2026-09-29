@@ -211,6 +211,9 @@ jobs:
             DEBIAN_SNAPSHOT=${{ env.DEBIAN_SNAPSHOT }}
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
           cache-from: type=gha,scope=fork-amd64
+          # Write the cache too: a failed attempt otherwise leaves the next push
+          # rebuilding every layer (publish only writes after a green build-test).
+          cache-to: type=gha,mode=max,scope=fork-amd64
 
       # The budget gate measures uncompressed layers; preserve a filesystem
       # breakdown even when that gate rejects the candidate image.
