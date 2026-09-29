@@ -42,3 +42,31 @@ updates:
         update-types:
           - "minor"
           - "patch"
+
+  # Fork release line (djagya/hermes-agent). The entry above only scans the
+  # default branch, so the release image workflow's pins
+  # (fork-release-image.yml, pin-refresh.yml, reproducible-build.yml) never
+  # moved. Dependabot reads this file from the default branch only; it lands
+  # there with the release -> main merge PR. Move `target-branch` to the new
+  # line whenever a release/vX.Y-dlz branch is cut. A bump PR also rewrites
+  # upstream workflows that use the same action; keep only the fork-owned
+  # files if those hunks would fight the next upstream sync.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "release/v0.21.5-dlz"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(actions)"
+      include: "scope"
+    groups:
+      # Majors open alone: read their breaking changes before merging.
+      release-actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
