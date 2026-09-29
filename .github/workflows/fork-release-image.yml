@@ -165,6 +165,12 @@ jobs:
             exit 1
           fi
 
+      - name: Write install stamp
+        run: |
+          python3 scripts/write_install_stamp.py --output install-stamp.json \
+            --distribution docker --update-mechanism external --source ci \
+            --commit "$GITHUB_SHA"
+
       - name: Build image (amd64)
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
@@ -486,6 +492,12 @@ jobs:
           tag="${REF_NAME#release/}"
           tag="${tag//\//-}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Write install stamp
+        run: |
+          python3 scripts/write_install_stamp.py --output install-stamp.json \
+            --distribution docker --update-mechanism external --source ci \
+            --commit "$GITHUB_SHA"
 
       - name: Push image
         id: push
