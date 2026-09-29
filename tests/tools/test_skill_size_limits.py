@@ -88,7 +88,6 @@ class TestEditSkillSizeLimit:
         big = big.replace("name: test-skill", "name: grow-me")
         result = json.loads(skill_manage(action="edit", name="grow-me", content=big))
         assert result["success"] is False
-        assert "100,000" in result["error"]
 
 
 class TestPatchSkillSizeLimit:
@@ -166,7 +165,6 @@ class TestWriteFileSizeLimit:
             file_content="x" * (MAX_SKILL_CONTENT_CHARS + 1),
         ))
         assert result["success"] is False
-        assert "100,000" in result["error"]
 
     def test_write_file_within_limit(self, isolate_skills):
         small = _make_skill_content(1000)

@@ -55,7 +55,9 @@ def runner_env(monkeypatch, tmp_path):
     runner.config = SimpleNamespace(stt_enabled=True, stt_echo_transcripts=True)
     runner._draining = False
     runner.__dict__["_sessions"] = {}
-    monkeypatch.setattr(runner, "_adapter_for_source", lambda source: adapter, raising=False)
+    # The delivery-owner lookup is the production seam for transcript echoes; the
+    # legacy _adapter_for_source hook is no longer consulted by the gateway.
+    monkeypatch.setattr(runner, "_delivery_adapter_for", lambda source: adapter)
 
     async def _noop(*args, **kwargs):
         return None
@@ -155,6 +157,8 @@ async def test_queue_delivers_first_answer_before_slow_voice_stt(runner_env, mon
 
     turn_ctx = _turn_ctx(source, result)
     await runner._run_agent_deliver_first_response(turn_ctx, adapter, None, result, None)
+    # Background work is scheduled, not synchronously entered by the drain.
+    await asyncio.wait_for(asyncio.to_thread(entered.wait), 5)
     # The finished turn's answer is out while the clip's STT is still unresolved.
     assert entered.is_set() and not release.is_set()
     assert adapter.send.await_count == 1
@@ -254,6 +258,7 @@ async def test_interrupt_receipt_then_drain_single_flight(runner_env, monkeypatc
         raise
     # Truthful receipt: the agent was interrupted with the caption immediately, while the
     # clip's STT is still unresolved (no false "interrupt complete with your words").
+    await asyncio.wait_for(asyncio.to_thread(entered.wait), 5)
     assert entered.is_set() and not release.is_set()
     assert agent.interrupts == [""]
     assert voice._gateway_interrupt_requested is True

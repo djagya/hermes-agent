@@ -97,8 +97,9 @@ def test_batch_op_failure_result_rolls_back_earlier_ops(hermes_home):
         operations=[
             {"action": "patch", "name": "alpha",
              "old_string": "one", "new_string": "two"},
-            # Missing required file_content -> failure RESULT after op 1 applied.
-            {"action": "write_file", "name": "beta", "file_path": "notes.md"},
+            # Valid shape, but the old text is absent: failure RESULT after op 1.
+            {"action": "patch", "name": "beta", "old_string": "not present",
+             "new_string": "two"},
         ],
     ))
     assert result["success"] is False
@@ -164,11 +165,11 @@ def test_batch_rollback_failure_keeps_snapshot_evidence(hermes_home, monkeypatch
             raise OSError("injected disk failure")
         return original_patch(name, old_string, new_string, file_path, replace_all)
 
-    def flaky_restore(pre_dir, snap, post_dir):
+    def flaky_restore(pre_dir, snap, post_dir, dir_pre_existed=False, written=()):
         restore_calls["n"] += 1
         if restore_calls["n"] == 1:  # first rollback attempt fails
             raise OSError("injected restore failure")
-        return original_restore(pre_dir, snap, post_dir)
+        return original_restore(pre_dir, snap, post_dir, dir_pre_existed, written)
 
     monkeypatch.setattr(smt, "_patch_skill", boom)
     monkeypatch.setattr(smb, "_restore_snapshot", flaky_restore)

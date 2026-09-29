@@ -62,9 +62,11 @@ def test_key_does_not_weaken_other_lifecycle_contracts(conn, case):
     if case == "dependency":
         # Discover the prerequisite during a run; linking it while ready would
         # already demote the task to todo, where block_task must refuse it.
-        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        claimed = kb.claim_task(conn, tid, claimer="worker")
+        assert claimed is not None and claimed.current_run_id is not None
         parent = kb.create_task(conn, title="Prerequisite", triage=True)
-        kb.link_tasks(conn, parent_id=parent, child_id=tid)
+        assert not kb.link_tasks(conn, parent_id=parent, child_id=tid,
+                                 expected_child_run_id=claimed.current_run_id)
         task = kb.get_task(conn, tid)
         assert task is not None and task.status == "running"
         assert kb.block_task(conn, tid, kind="dependency", blocker_key="prerequisite")

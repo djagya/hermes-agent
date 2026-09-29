@@ -130,7 +130,8 @@ jobs:
         if: steps.selected.outputs.enabled == 'true' && matrix.lane == 'identity-and-contracts'
         run: |
           "$HERMES_PYTHON" scripts/ci/sync_preflight.py lane --phase cheap \
-            --candidate "$CANDIDATE" --lane "$LANE" --python "$HERMES_PYTHON" \
+            --candidate "$CANDIDATE" --baseline "$BASELINE" --upstream "$UPSTREAM" --merge "$SYNC_MERGE" \
+            --lane "$LANE" --python "$HERMES_PYTHON" \
             --actionlint "$RUNNER_TEMP/actionlint" \
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
       - name: Use the existing locked test environment (no alternate bootstrap)
@@ -149,7 +150,8 @@ jobs:
           phase=all
           if [ "$LANE" = identity-and-contracts ]; then phase=tests; fi
           "$interpreter" scripts/ci/sync_preflight.py lane --phase "$phase" \
-            --candidate "$CANDIDATE" --lane "$LANE" --python "$interpreter" \
+            --candidate "$CANDIDATE" --baseline "$BASELINE" --upstream "$UPSTREAM" --merge "$SYNC_MERGE" \
+            --lane "$LANE" --python "$interpreter" \
             --roots "$PYTHON_ROOTS" --actionlint "$RUNNER_TEMP/actionlint" \
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

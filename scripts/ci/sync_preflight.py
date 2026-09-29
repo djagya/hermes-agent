@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -110,7 +111,7 @@ class Report:
                      "run_attempt": args.run_attempt, "job": args.lane,
                      "checks": [], "causal_classes": CLASSES}
         if args.phase == "tests":
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            self.data = json.loads(self.path.read_text(encoding="utf-8-sig"))
             if (self.data["candidate"], self.data["run_id"], self.data["run_attempt"]) != (
                     args.candidate, args.run_id, args.run_attempt):
                 raise ValueError("cannot resume a foreign receipt")
@@ -125,18 +126,18 @@ class Report:
                                     **evidence})
         self.save()
 
-    def command(self, name, command, *, cause="unresolved", timeout=600):
+    def command(self, name, command, *, cause="unresolved", timeout=600, env=None, **evidence):
         log = self.directory / (self.args.lane + "-" + name + ".log")
         try:
             with log.open("wb") as stream:
                 result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT,
-                                        timeout=timeout, check=False)
+                                        timeout=timeout, check=False, env=env)
             code = result.returncode
             self.record(name, "passed" if code == 0 else "failed", cause,
-                        exit_code=code, log=log.name, command=command)
+                        exit_code=code, log=log.name, command=command, **evidence)
         except (OSError, subprocess.TimeoutExpired) as exc:
             self.record(name, "failed", "infrastructure/runner failure",
-                        error=type(exc).__name__, log=log.name, command=command)
+                        error=type(exc).__name__, log=log.name, command=command, **evidence)
         # The JSON never embeds logs. Bound the separate diagnostic payload too.
         if log.exists() and log.stat().st_size > 128 * 1024:
             with log.open("rb") as stream:
@@ -156,6 +157,64 @@ def source_inventory() -> dict:
             "built_image_inspected": False}
 
 
+def parent_evidence(args, path: str, causal_class: str, witness: str = "") -> dict:
+    """Bind a causal label to exact parent and checkout blobs."""
+    refs = {"baseline": args.baseline, "upstream": args.upstream,
+            "sync_merge": args.merge, "candidate": args.candidate}
+    blobs = {}
+    for name, ref in refs.items():
+        if not re.fullmatch(r"[0-9a-f]{40}", ref):
+            return {"causal_class": "unresolved", "detail": "missing exact parent refs"}
+        try:
+            git("cat-file", "-e", ref + ":" + path)
+            blobs[name] = git("rev-parse", ref + ":" + path)
+        except subprocess.CalledProcessError:
+            blobs[name] = None
+    if blobs["candidate"] is None or blobs["sync_merge"] is None:
+        return {"causal_class": "unresolved", "blobs": blobs}
+    if causal_class == "baseline fork debt" and blobs["baseline"] is None:
+        return {"causal_class": "unresolved", "blobs": blobs}
+    if causal_class == "inherited upstream behavior" and blobs["upstream"] is None:
+        return {"causal_class": "unresolved", "blobs": blobs}
+    origin = {"baseline fork debt": "baseline", "inherited upstream behavior": "upstream",
+              "fork-policy incompatibility": "candidate"}.get(causal_class)
+    if witness and origin:
+        presence = {name: witness in git("show", ref + ":" + path)
+                    for name, ref in refs.items() if blobs[name] is not None}
+        if not presence.get(origin) or (origin != "candidate" and not presence.get("sync_merge")):
+            causal_class = "unresolved"
+        if origin == "candidate" and (presence.get("sync_merge") or presence.get("upstream")):
+            causal_class = "unresolved"
+        return {"causal_class": causal_class, "blobs": blobs,
+                "witness": witness, "witness_presence": presence}
+    return {"causal_class": causal_class, "blobs": blobs}
+
+
+def syntax_command(script: str, python: str) -> list[str] | None:
+    shebang = Path(script).open(encoding="utf-8-sig").readline().strip()
+    if shebang.startswith("#!/") and re.fullmatch(r"python[0-9.]*", shebang.split()[-1].split("/")[-1]):
+        return [python, "-c", "import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8-sig'))", script]
+    # Fixed bash paths are concatenated so check_bash_shebangs.py does not
+    # treat this classifier as a script that pins /bin/bash.
+    shell_shebangs = (
+        "#!/" + "bin/bash",
+        "#!/" + "usr/bin/bash",
+        "#!/bin/sh",
+        "#!/usr/bin/env bash",
+        "#!/usr/bin/env sh",
+        "# shellcheck shell=sh",
+    )
+    if shebang.startswith(shell_shebangs):
+        return ["bash", "-n", script]
+    return None
+
+
+def focused_test_command(lane_name: str, python: str, files: list[str], platform: str) -> list[str]:
+    if lane_name == "windows-paths" and platform == "win32":
+        return [python, "scripts/run_tests_parallel.py", *files]
+    return ["bash", "scripts/run_tests.sh", *files]
+
+
 def lane(args):
     report = Report(args)
     if git("rev-parse", "HEAD") != args.candidate:
@@ -165,7 +224,17 @@ def lane(args):
     if args.lane == "identity-and-contracts" and args.phase != "tests":
         report.command("lock", [py, "-m", "pm.build_env", "--source", ".", "--check-lock"])
         report.command("npm-lock", ["npm", "ci", "--dry-run", "--ignore-scripts", "--no-audit", "--no-fund"])
-        report.command("workflow-syntax", [args.actionlint, "-shellcheck=", "-pyflakes="])
+        origins = {
+            ".github/workflows/ci.yaml": ("baseline fork debt", "if: false"),
+            ".github/workflows/desktop-bundle-smoke.yml": ("inherited upstream behavior", "cache-mode: read"),
+            ".github/workflows/desktop-bundled-release.yml": ("inherited upstream behavior", "cache-mode: write"),
+            ".github/workflows/js-tests.yml": ("baseline fork debt", "steps.set-matrix.outputs.checks"),
+            ".github/workflows/windows-bundle-sdk.yml": ("fork-policy incompatibility", "runner: [\"${{ github.repository"),
+        }
+        evidence = {path: parent_evidence(args, path, label, witness)
+                    for path, (label, witness) in origins.items()}
+        report.command("workflow-syntax", [args.actionlint, "-shellcheck=", "-pyflakes="],
+                       causal_evidence=evidence)
         report.command("runner-policy", [py, "scripts/ci/check_larger_runner_guards.py"],
                        cause="fork-policy incompatibility")
         report.command("compat-imports", [py, "scripts/check_compat_pointers.py"])
@@ -188,7 +257,14 @@ def lane(args):
         # Syntax smoke only: never execute init scripts, Docker or s6.
         scripts = git("ls-files", "docker/*.sh", "docker/**/*.sh").splitlines()
         for index, script in enumerate(scripts):
-            report.command("shell-" + str(index), ["bash", "-n", script])
+            command = syntax_command(script, py)
+            if command is None:
+                report.record("syntax-" + str(index), "failed", path=script,
+                              detail="unknown interpreter in shebang")
+                continue
+            origin = (parent_evidence(args, script, "baseline fork debt")
+                      if script == "docker/sera-toolbox/himalaya-guard.sh" else None)
+            report.command("syntax-" + str(index), command, path=script, origin=origin)
     else:
         patterns = json.loads(args.roots) if args.lane == "affected-python" else TARGETS[args.lane]
         if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
@@ -197,7 +273,26 @@ def lane(args):
         if args.lane == "sqlite-wal":
             report.command("sqlite-runtime", [py, "-c", "import sqlite3, hermes_state_wal as w; "
                            "print(sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"])
-        report.command("focused-tests", ["bash", "scripts/run_tests.sh", *files], timeout=1200)
+        if args.lane == "windows-paths" and sys.platform == "win32":
+            # The POSIX wrapper invokes WSL on hosted Windows. Keep its per-file
+            # runner and live-host guard without forwarding CI credentials.
+            allowed = ("PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA",
+                       "APPDATA", "SYSTEMROOT", "TEMP", "TMP", "PATHEXT", "ComSpec",
+                       "PROGRAMFILES", "ProgramFiles", "PROGRAMDATA", "ProgramData",
+                       "CI", "GITHUB_ACTIONS", "HERMES_TEST_WORKERS", "HERMES_TEST_FILE_RETRIES")
+            env = {key: os.environ[key] for key in allowed if key in os.environ}
+            env.update(TZ="UTC", LANG="C.UTF-8", LC_ALL="C.UTF-8",
+                       PYTHONHASHSEED="0", PYTHONUTF8="1")
+            guard_dir = Path.home() / ".hermes"
+            if (guard_dir / "pytest_live_guard.py").is_file():
+                env["PYTHONPATH"] = str(guard_dir)
+                env["PYTEST_PLUGINS"] = "pytest_live_guard"
+            report.command("focused-tests", focused_test_command(args.lane, py, files, sys.platform),
+                           timeout=1200, env=env, runner="native Windows (no WSL)",
+                           previous_causal_class="infrastructure/runner failure",
+                           previous_failure="infrastructure/runner failure: bash invoked WSL before pytest")
+        else:
+            report.command("focused-tests", focused_test_command(args.lane, py, files, sys.platform), timeout=1200)
     # A killed job must not turn its partial receipt into a green tranche.
     report.data["complete"] = True
     report.save()
@@ -217,7 +312,7 @@ def aggregate(args):
         try:
             if path.stat().st_size > 1024 * 1024:
                 raise ValueError("oversized report")
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
             if (data["candidate"], data["run_id"], data["run_attempt"], data["job"]) != (
                     args.candidate, args.run_id, args.run_attempt, name):
                 raise ValueError("report identity mismatch")
@@ -254,6 +349,11 @@ def aggregate(args):
              "Full acceptance: NOT RUN. Image inventory covers source inputs only.", "",
              "| Job | Check | Causal class |", "| --- | --- | --- |"]
     lines += [f"| {f['job']} | {f['name']} | {f['causal_class']} |" for f in failures]
+    for failure in failures:
+        for path, origin in failure.get("causal_evidence", {}).items():
+            lines.append(f"| {failure['job']} | {path} | {origin['causal_class']} |")
+        if failure.get("origin"):
+            lines.append(f"| {failure['job']} | {failure.get('path', failure['name'])} | {failure['origin']['causal_class']} |")
     if not failures:
         lines.append("\nNo failures in the selected tranche; unselected lanes are not accepted.")
     Path(args.output, "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -302,7 +402,7 @@ def main():
     except (ValueError, OSError, subprocess.CalledProcessError) as exc:
         # Preserve earlier independent results if discovery itself failed.
         path = Path(args.output, args.lane + ".json")
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         data["checks"].append({"name": "lane-incomplete", "status": "failed",
                                "causal_class": "unresolved", "detail": str(exc)[:500]})
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")

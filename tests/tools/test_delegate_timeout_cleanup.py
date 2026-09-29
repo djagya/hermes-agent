@@ -72,6 +72,26 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
     monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
     monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
 
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    submit = DaemonThreadPoolExecutor.submit
+
+    def submit_started(executor, *args, **kwargs):
+        future = submit(executor, *args, **kwargs)
+        assert child.started.wait(timeout=10)
+        return future
+
+    # Timeout accounting starts only after this test's child is running.
+    monkeypatch.setattr(DaemonThreadPoolExecutor, "submit", submit_started)
+    result = delegate_tool._run_single_child(
+        task_index=0,
+        goal="exercise timeout teardown",
+        child=child,
+        parent_agent=parent,
+    )
+
+    assert result["status"] == "timeout"
+    assert child.unwinding.wait(timeout=10)
     try:
         result = delegate_tool._run_single_child(
             task_index=0,

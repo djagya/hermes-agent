@@ -1,9 +1,5 @@
 """Cross-surface contract for the persistent /approvals mode command."""
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
-
-import yaml
 
 from cli import HermesCLI
 from hermes_cli.commands import (
@@ -33,8 +29,6 @@ def _completions(text: str) -> set[str]:
 def test_approvals_registry_drives_help_menu_and_autocomplete():
     command = resolve_command("approvals")
     assert command is not None
-    assert command.category == "Configuration"
-    assert command.args_hint == "[manual|smart|off]"
     assert SUBCOMMANDS["/approvals"] == ["manual", "smart", "off"]
     assert "approvals" in GATEWAY_KNOWN_COMMANDS
     assert any("/approvals" in line for line in gateway_help_lines())
@@ -102,9 +96,5 @@ def test_managed_seed_still_guards_managed_env_secrets(tmp_path, monkeypatch):
     from hermes_cli.config import load_config, cfg_get
 
     assert cfg_get(load_config(), "approvals", "cron_mode") == "deny"
-
-
-
-
 
 

@@ -46,7 +46,7 @@ env:
   # Must match every Dockerfile `ARG DEBIAN_SNAPSHOT=` default. Build-args
   # override the Dockerfile; leaving May here after a Sept bump rebuilt
   # stale apt and failed smoke/Trivy.
-  DEBIAN_SNAPSHOT: 20260914T000000Z
+  DEBIAN_SNAPSHOT: 20260918T000000Z
 
 jobs:
   lint:
@@ -187,6 +187,28 @@ jobs:
             DEBIAN_SNAPSHOT=${{ env.DEBIAN_SNAPSHOT }}
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
           cache-from: type=gha,scope=fork-amd64
+
+      # The budget gate measures uncompressed layers; preserve a filesystem
+      # breakdown even when that gate rejects the candidate image.
+      - name: Inventory loaded image (no services)
+        id: inventory
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:test
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --user 0 --entrypoint sh "$IMAGE" \
+            -c 'exec /opt/hermes/.venv/bin/python -I /opt/hermes/docker/sera-toolbox/image-inventory.py' \
+            > image-inventory.json
+          python3 -m json.tool image-inventory.json > /dev/null
+
+      - name: Upload image inventory
+        if: always() && steps.inventory.outcome != 'skipped'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: image-inventory-${{ github.sha }}
+          path: image-inventory.json
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Record image size budget
         env:

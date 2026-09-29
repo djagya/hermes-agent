@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Reject unguarded GitHub-hosted larger runners.
-
-Larger runners (``*-NN-core``) are billed even on public repositories.
-This fork keeps those labels only on jobs that cannot execute here
-because the job ``if:`` requires ``github.repository == 'NousResearch/hermes-agent'``.
-"""
+"""Reject larger runners reachable on the fork without a hosted fallback."""
 
 from __future__ import annotations
 
@@ -16,6 +11,18 @@ LARGE_RUNNER = re.compile(
     r"(?:ubuntu|windows|macos)-latest-\d+(?:-arm)?-core"
 )
 NOUS_GUARD = "NousResearch/hermes-agent"
+FORK_FALLBACK = re.compile(
+    r"github\.repository\s*==\s*['\"]NousResearch/hermes-agent['\"]\s*"
+    r"&&\s*['\"](?P<label>(?:ubuntu|windows|macos)-latest-\d+(?:-arm)?-core)['\"]"
+    r"\s*\|\|\s*['\"](?P<fallback>(?:ubuntu|windows|macos)-(?:latest|24\.04(?:-arm)?|11-arm))['\"]"
+)
+HOSTED_FALLBACK = {
+    "ubuntu": "ubuntu-latest",
+    "ubuntu-arm": "ubuntu-24.04-arm",
+    "windows": "windows-latest",
+    "windows-arm": "windows-11-arm",
+    "macos": "macos-latest",
+}
 JOB_KEY = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 IF_LINE = re.compile(r"^    if:\s*(?:>-|>)?\s*(.*)$")
 
@@ -76,17 +83,27 @@ def find_unguarded_larger_runners(root: Path) -> list[str]:
 
     failures: list[str] = []
     for path in sorted(workflow_dir.glob("*.yml")) + sorted(workflow_dir.glob("*.yaml")):
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
         rel = path.relative_to(root).as_posix()
         for job_id, job_text in _job_blocks(text):
-            labels = sorted(set(LARGE_RUNNER.findall(job_text)))
+            # Each literal needs its own fallback: a guarded matrix row must
+            # not mask an unguarded occurrence of the same label elsewhere.
+            source = "\n".join(line for line in job_text.splitlines() if not line.lstrip().startswith("#"))
+            protected = []
+            for match in FORK_FALLBACK.finditer(source):
+                label = match.group("label")
+                family = label.split("-", 1)[0] + ("-arm" if "-arm-core" in label else "")
+                if match.group("fallback") == HOSTED_FALLBACK[family]:
+                    protected.append(match.span("label"))
+            labels = sorted({match.group() for match in LARGE_RUNNER.finditer(source)
+                             if match.span() not in protected})
             if not labels:
                 continue
             if NOUS_GUARD in _job_if(job_text):
                 continue
             failures.append(
                 f"{rel}: job {job_id!r} uses {', '.join(labels)} "
-                f"without if: github.repository == '{NOUS_GUARD}'"
+                f"without upstream-only if or repository-conditional hosted fallback"
             )
     return failures
 
@@ -112,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         print("No unguarded larger runners.")
         return 0
 
-    print("::error::larger runners must be repository-guarded to NousResearch/hermes-agent")
+    print("::error::larger runners require upstream-only guard or hosted fork fallback")
     for item in failures:
         print(f"  {item}")
     return 1

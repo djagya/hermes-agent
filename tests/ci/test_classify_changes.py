@@ -47,7 +47,7 @@ DEFAULT = {
     "deps": True,
     "uv_lock": True,
     "npm_lock": True,
-    "installer": True,
+    "bootstrap": True,
     "desktop_updater": True,
     "rust": True,
     "mcp_catalog": False,
@@ -61,7 +61,7 @@ DEFAULT = {
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None, py_full=None, py_roots=None, workspaces=None, os_tests=False, mode="selective") -> dict[str, object]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, installer=False, bootstrap=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=None, docker=None, py_full=None, py_roots=None, workspaces=None, os_tests=False, mode="selective") -> dict[str, object]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
     #
@@ -96,7 +96,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "deps": deps,
         "uv_lock": uv_lock,
         "npm_lock": npm_lock,
-        "installer": installer,
+        "bootstrap": bootstrap,
         "desktop_updater": desktop_updater,
         "rust": rust,
         "mcp_catalog": mcp_catalog,
@@ -111,6 +111,8 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
 
 
 CASES = {
+    "shared JS builder → frontend": (["scripts/build/web.mjs"], _lanes(python=True, frontend=True, os_tests=True)),
+    "root JS tests → frontend": (["tests-js/product-builders.test.mjs"], _lanes(python=True, frontend=True)),
     "docs-only → nothing heavy": (["README.md", "docs/guide.md"], _lanes()),
     "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
     # pyproject.toml declares the pytest markers the OS lanes select on, so it
@@ -241,20 +243,20 @@ CASES = {
     # the ONLY lane a Rust change ran, and the crate's tests never executed.
     "rust source → rust": (
         ["apps/bootstrap-installer/src-tauri/src/powershell.rs"],
-        _lanes(frontend=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
+        _lanes(frontend=True, bootstrap=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     "cargo lockfile → rust": (
         ["apps/bootstrap-installer/src-tauri/Cargo.lock"],
-        _lanes(frontend=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
+        _lanes(frontend=True, bootstrap=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     # Non-.rs files in the crate still change what cargo builds.
     "tauri config → rust": (
         ["apps/bootstrap-installer/src-tauri/tauri.conf.json"],
-        _lanes(frontend=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
+        _lanes(frontend=True, bootstrap=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     "ts source alone → no rust lane": (
         ["apps/bootstrap-installer/src/main.tsx"],
-        _lanes(frontend=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
+        _lanes(frontend=True, bootstrap=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     # Unknown top-level file keeps Python on rather than risk a silent skip.
     "unknown toplevel → python": (["Makefile"], _lanes(python=True)),
@@ -275,12 +277,18 @@ CASES = {
         ["tests/conftest.py"],
         _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, os_tests=True),
     ),
+    "conftest fixture module → python + desktop_updater": (
+        ["tests/_fixtures/platform_gating.py"],
+        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, os_tests=True, py_full=False, py_roots=[["tests/_fixtures/platform_gating.py"]]),
+    ),
     "tests + prod source → both lanes": (
         ["tests/agent/test_foo.py", "agent/x.py"],
         _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/agent/test_foo.py"], ["tests/agent/test_x*.py", "tests/test_x*.py", "tests/agent/"]]),
     ),
     # Runner infrastructure is NOT tests-only — a bad runner edit can mask
-    # real failures, so it keeps the conservative full lane set.
+    # real failures, so it keeps the conservative full lane set. The .py
+    # runner additionally trips the supply-chain scan lane (executable
+    # .py/.pth payloads are what it scans for).
     "test runner script → python_prod stays on": (
         ["scripts/run_tests_parallel.py"],
         _lanes(python=True, scan=True, os_tests=True),
@@ -319,7 +327,7 @@ CASES = {
     ),
     "bootstrap-installer eslint config → ci_review": (
         ["apps/bootstrap-installer/eslint.config.mjs"],
-        _lanes(frontend=True, ci_review=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
+        _lanes(frontend=True, bootstrap=True, ci_review=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
     ),
     "prettier config → ci_review": (
         [".prettierrc"],
@@ -361,6 +369,20 @@ CASES = {
         [".github/workflows/typecheck.yml"],
         DEFAULT,
     ),
+    # The bootstrap installer lane: shell installer, dev-checkout wrapper,
+    # and the Tauri app; Rust sources additionally arm the rust lane.
+    "install.sh → bootstrap lane": (
+        ["scripts/install.sh"],
+        _lanes(python=True, bootstrap=True, python_prod=True, os_tests=True),
+    ),
+    "setup-hermes.sh → bootstrap lane": (
+        ["setup-hermes.sh"],
+        _lanes(python=True, bootstrap=True, python_prod=True),
+    ),
+    "tauri installer source → bootstrap + rust": (
+        ["apps/bootstrap-installer/src-tauri/src/lib.rs"],
+        _lanes(frontend=True, bootstrap=True, rust=True, workspaces=["apps/bootstrap-installer"], os_tests=True),
+    ),
     "composite action → ci_review (also fail-open all)": (
         [".github/actions/retry/action.yml"],
         DEFAULT,
@@ -387,7 +409,7 @@ _REPO = Path(__file__).resolve().parents[2]
 
 
 def _yaml(rel: str) -> dict:
-    yaml = pytest.importorskip("yaml")
+    yaml = pytest.importorskip("hermes_yaml")
     return yaml.safe_load((_REPO / rel).read_text(encoding="utf-8"))
 
 

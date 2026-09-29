@@ -4,7 +4,9 @@ bootstrap modules) goes through."""
 import textwrap
 
 import pytest
-import yaml
+
+import hermes_yaml as yaml
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 
 
 @pytest.fixture
@@ -59,7 +61,6 @@ def test_effective_is_user_plus_managed_plus_env_with_no_defaults(homes):
     root ``provider`` migrated under ``model``, and no DEFAULT_CONFIG key introduced (a missing
     key stays missing). Per-message gateway reads (and the system prompt built from them) are
     pinned by this shape, not by re-running the implementation's primitives."""
-    from hermes_cli.config import DEFAULT_CONFIG
     from hermes_cli.config_effective import load_user_config_effective
 
     home, managed = homes

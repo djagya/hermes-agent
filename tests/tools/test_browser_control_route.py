@@ -443,9 +443,14 @@ def test_camofox_snapshot_skipped_in_managed(monkeypatch):
         lambda *a, **k: called.append(True) or json.dumps({"success": True, "via": "camofox"}),
     )
     import tools.browser_tool_lifecycle as lifecycle
+    import tools.browser_tool_session as session
 
     monkeypatch.setattr(lifecycle, "_start_browser_cleanup_thread", lambda: None)
     monkeypatch.setattr(lifecycle, "_update_session_activity", lambda task_id: None)
+    # The managed-session denial must be observed independently of whether CI
+    # installed the local agent-browser binary. No browser process is launched:
+    # session acquisition raises before dispatch can use this inert path.
+    monkeypatch.setattr(session, "_browser_command_preflight", lambda: {"browser_cmd": "/unused/agent-browser"})
     monkeypatch.setattr(browser_tool, "_active_sessions", {})
     monkeypatch.setattr(browser_tool, "_session_last_activity", {})
     monkeypatch.setattr(browser_tool, "_last_session_key", lambda task_id: task_id or "default")

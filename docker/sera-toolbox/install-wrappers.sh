@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Expose PATH wrappers. Real bits stay where the distro put them when
-# they are scripts that locate siblings via $0 (soffice). Binaries that
-# live in /usr/local/bin are copied to libexec first so replacing the
-# PATH entry does not delete the tool.
+# they are scripts that locate siblings via $0 (soffice). Real binaries
+# in /usr/local/bin are copied before replacing that PATH entry; symlinks
+# into the managed tool store retain their origin instead.
 set -euo pipefail
 
 libexec=/usr/libexec/sera-toolbox
@@ -39,8 +39,9 @@ for t in "${tools[@]}"; do
     missing=$((missing + 1))
     continue
   fi
-  # Replacing /usr/local/bin/T would delete the real binary; copy first.
-  if [ "$src" = "/usr/local/bin/${t}" ]; then
+  # A managed-tool symlink survives replacement of the PATH entry. Copying
+  # it duplicates the large ffmpeg/ffprobe binaries in the image layer.
+  if [ "$src" = "/usr/local/bin/${t}" ] && [ "$resolved" = "$src" ]; then
     cp -L -p "$resolved" "${libexec}/${t}"
     rm -f "${libexec}/${t}.origin"
   else

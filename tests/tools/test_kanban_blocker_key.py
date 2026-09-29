@@ -14,7 +14,11 @@ def test_registered_block_tool_preserves_cause_key(tmp_path, monkeypatch):
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="Tool cause identity", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        run_id = task.current_run_id
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     from tools import kanban_tools  # noqa: F401 — register the real handler
     from tools.registry import registry
 

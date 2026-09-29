@@ -81,7 +81,7 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
         command += ["--paginate", "--slurp"]
     try:
         result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                                text=True, timeout=30, check=True, env=_gh_auth_env())
+                                text=True, encoding="utf-8", timeout=30, check=True, env=_gh_auth_env())
     except FileNotFoundError:
         raise _GhError("capability", "gh CLI is not installed or not on PATH; install GitHub CLI to use PR completion contracts.") from None
     except subprocess.TimeoutExpired:

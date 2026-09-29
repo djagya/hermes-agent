@@ -2,7 +2,7 @@
 import textwrap
 
 import pytest
-import yaml
+from ruamel.yaml import YAML
 
 
 @pytest.fixture
@@ -187,5 +187,5 @@ def test_migrate_and_save_keep_explicit_user_leaf(homes):
     raw = read_raw_config()
     assert ((raw.get("skills") or {}).get("write_approval")) is True
     assert cfg_get(load_config(), "skills", "write_approval") is True
-    on_disk = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    on_disk = YAML(typ="safe").load((home / "config.yaml").read_text(encoding="utf-8"))
     assert (on_disk.get("skills") or {}).get("write_approval") is True
