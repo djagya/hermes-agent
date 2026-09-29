@@ -90,6 +90,7 @@ _CONCEALED_PLACEHOLDER_RE = re.compile(r"^\[use 'op item get .*--reveal' to reve
 
 # Set on agent terminal children (tools/environments/local.py::_make_run_env): serve the last
 # complete disk pull at any age and never call op. An empty result when nothing is cached.
+# Explicit uncached reads (`hermes secrets onepassword sync --apply`, rotation) stay live.
 CACHE_ONLY_ENV = "HERMES_OP_CACHE_ONLY"
 
 _MISSING_BINARY_HINT = (
@@ -117,8 +118,8 @@ def _classify_op_error(message: str) -> ErrorKind:
 
 class _OpError(RuntimeError):
     """``op`` failure. ``detail`` is op's own text (stderr / timeout / spawn error) with the
-    reference and its vault/item/field names blanked (op echoes the item name in its errors),
-    so a name containing "429" or "rate limit" can never change how the failure is classified."""
+    names it echoes blanked (see ``_without_names``), so a vault/item/field name can never
+    change how the failure is classified."""
 
     def __init__(self, message: str, detail: str) -> None:
         super().__init__(message)
@@ -126,11 +127,11 @@ class _OpError(RuntimeError):
 
 
 def _without_names(text: str, target: str) -> str:
-    """``text`` with ``target`` and each of its ``op://`` path segments blanked, longest first."""
-    names = {target, *(target[len("op://"):].split("?")[0].split("/") if target.startswith("op://") else ())}
-    for name in sorted((n for n in names if n), key=len, reverse=True):
-        text = re.sub(re.escape(name), " ", text, flags=re.IGNORECASE)
-    return text
+    """``text`` with every quoted span and the raw ``target`` blanked. op quotes the names it
+    echoes (``"Port 8429" isn't an item``, ``could not read secret 'op://…'``); its own prose is
+    never quoted, so a name like "token", "requests" or "429" cannot add or erase a classifying word."""
+    text = re.sub(r"\"[^\"\n]*\"|'[^'\n]*'", " ", text)
+    return text.replace(target, " ") if target else text
 
 
 def _op_error_kind(exc: Exception) -> ErrorKind:
@@ -370,8 +371,8 @@ def fetch_onepassword_secrets(
         if cached is not None:
             return dict(cached.secrets), warnings
 
-    if _cache_only():
-        last = _STORE.disk.read(cache_key, float("inf"), home_path) if use_cache and cache_ttl_seconds > 0 else None
+    if use_cache and _cache_only():  # an explicit uncached read (sync --apply, rotation) stays live
+        last = _STORE.disk.read(cache_key, float("inf"), home_path) if cache_ttl_seconds > 0 else None
         if last is None:
             warnings.append(f"{CACHE_ONLY_ENV} is set and no 1Password pull is cached; op not called")
             return {}, warnings

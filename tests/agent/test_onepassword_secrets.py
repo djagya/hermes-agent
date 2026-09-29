@@ -572,3 +572,23 @@ def test_cache_only_serves_any_age_disk_pull_and_never_calls_op(monkeypatch, tmp
         references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=empty)
     assert secrets == {}
     assert any(op.CACHE_ONLY_ENV in w for w in warnings)
+
+
+def test_echoed_names_never_add_or_erase_classifying_words():
+    rl = "[ERROR] could not read secret 'op://V/Item/requests': Too many requests. Try again in 5 minutes"
+    assert op._classify_op_error(op._without_names(rl, "op://V/Item/requests")) is op.ErrorKind.RATE_LIMITED
+    miss = '[ERROR] "rate limit key" isn\'t a field in the "Port 8429" item'
+    assert op._classify_op_error(op._without_names(miss, "op://V/Port 8429/rate limit key")) \
+        is not op.ErrorKind.RATE_LIMITED
+    auth = "[ERROR] invalid token: unauthorized"
+    assert op._classify_op_error(op._without_names(auth, "op://V/I/token")) is op.ErrorKind.AUTH_FAILED
+
+
+def test_cache_only_never_blocks_an_explicit_uncached_read(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setenv(op.CACHE_ONLY_ENV, "1")
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _ok("live"))
+    secrets, _ = op.fetch_onepassword_secrets(
+        references={"A": "op://V/One/f"}, binary=fake_op, use_cache=False, home_path=tmp_path)
+    assert secrets == {"A": "live"}
