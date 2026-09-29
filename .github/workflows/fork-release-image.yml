@@ -433,6 +433,9 @@ jobs:
         env:
           # Use the image already loaded by the build step; skip rebuild.
           HERMES_TEST_IMAGE: ${{ env.IMAGE_NAME }}:test
+          # The checkout stamp is the image build input. It is not a
+          # packaged runtime, so don't let activate treat it as one.
+          HERMES_PYTHON: ${{ github.workspace }}/.venv/bin/python
           # No accidental real-API calls from inside the harness.
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
