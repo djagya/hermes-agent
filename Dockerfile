@@ -596,6 +596,7 @@ ARG DEBIAN_SNAPSHOT=20260928T000000Z
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
 RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 python3-venv \
     libffi8 libolm3 libatomic1 procps git openssh-client xz-utils \
