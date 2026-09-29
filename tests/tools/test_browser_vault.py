@@ -249,6 +249,19 @@ class TestClassifier:
         assert "origin_changed" in js
         assert js.index("origin_changed") < js.index("querySelectorAll")
 
+    def test_build_fill_js_keeps_placeholder_text_inside_values_literal(self):
+        # A secret that happens to contain a template placeholder must reach the page verbatim,
+        # not have the nonce / origin JSON spliced into its string literal.
+        secret = 'p__NONCE__w__EXPECTED_ORIGIN__x__FILLS__'
+        js = build_fill_js(
+            [{"index": 0, "token": "current-password", "value": secret}],
+            expected_origin="https://example.com",
+            nonce="n0nce",
+        )
+        assert json.dumps(secret) in js
+        assert js.count('"n0nce"') == 1
+        assert js.count('"https://example.com"') == 1
+
 
 # ---------------------------------------------------------------------------
 # Browser tool: origin binding + gating
