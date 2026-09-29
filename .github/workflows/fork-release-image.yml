@@ -46,7 +46,7 @@ env:
   # Must match every Dockerfile `ARG DEBIAN_SNAPSHOT=` default. Build-args
   # override the Dockerfile; leaving May here after a Sept bump rebuilt
   # stale apt and failed smoke/Trivy.
-  DEBIAN_SNAPSHOT: 20260918T000000Z
+  DEBIAN_SNAPSHOT: 20260928T000000Z
 
 jobs:
   lint:
@@ -393,6 +393,9 @@ jobs:
           # skip vendor CLIs: no rebuild path here. gh 2.100.0 / gitleaks
           # 8.30.1 are latest; leftover findings are vendored Go
           # (x/mod, stdlib), same class as 1Password `op`.
+          # python-build-standalone's pip vendors msgpack 1.1.2 and
+          # setuptools 70.3.0. The sealed venv pins the fixed releases
+          # and is still scanned. No rebuild of that interpreter this cut.
           /tmp/trivy image --scanners vuln --severity CRITICAL,HIGH \
             --ignore-unfixed --exit-code 1 --no-progress \
             --ignorefile .trivyignore \
@@ -401,6 +404,7 @@ jobs:
             --skip-files usr/local/bin/gitleaks \
             --skip-files usr/local/bin/uv \
             --skip-files usr/local/bin/uvx \
+            --skip-dirs '**/site-packages/pip/_vendor' \
             "$IMAGE"
 
       - name: Install uv (for docker tests)
