@@ -129,13 +129,16 @@ db_open_check() {
     open_sqlite "$home/kanban.db" || return 1
     open_sqlite "$home/observatory.db" || return 1
     open_sqlite "$home/state/hermes-org-observability/observatory.db" || return 1
+    # Cache/scratch trees are disposable and may hold deliberately corrupt
+    # fixture DBs (pytest-of-* from agent test runs): skip them, or one stray
+    # fixture fails every boot (01-hermes-setup exits before the uid remap).
     for root in "$home/cron" "$home/kanban" "$home/profiles"; do
         [ -d "$root" ] || continue
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             open_sqlite "$f" || return 1
         done <<EOF
-$(find "$root" -name '*.db' -type f 2>/dev/null)
+$(find "$root" \( -type d \( -name cache -o -name .cache -o -name scratch -o -name 'pytest-of-*' \) -prune \) -o \( -name '*.db' -type f -print \) 2>/dev/null)
 EOF
     done
     return 0
@@ -198,6 +201,18 @@ self_test() {
         return 1
     }
     rm -f "$tmp/state.db"
+    mkdir -p "$tmp/profiles/p/cache/scratch/pytest-of-hermes/t"
+    printf 'SQLite format 3\000garbage' > "$tmp/profiles/p/cache/scratch/pytest-of-hermes/t/bad.db"
+    db_open_check "$tmp" || {
+        echo "self-test: expected cache/scratch fixture DBs to be skipped" >&2
+        return 1
+    }
+    printf 'SQLite format 3\000garbage' > "$tmp/profiles/p/live.db"
+    if db_open_check "$tmp" 2>/dev/null; then
+        echo "self-test: expected open fail on corrupt profile DB outside caches" >&2
+        return 1
+    fi
+    rm -rf "$tmp/profiles/p"
     dd if=/dev/zero of="$tmp/state.db" bs=1024 count=4 >/dev/null 2>&1
     mkdir -p "$tmp/profiles/stay"
     dd if=/dev/zero of="$tmp/profiles/stay/state.db" bs=1024 count=4 >/dev/null 2>&1
