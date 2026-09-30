@@ -227,6 +227,7 @@ def run_shell(
             step_env["PATH"] = ":".join([
                 str(shim),
                 *ctx.path_prepend,
+                # no-tmp: ok — path inside the disposable Linux runner container, not on the gate host
                 "/tmp/gate-home/.local/bin",
                 ctx.container_path,
             ])
@@ -462,6 +463,7 @@ def start_container(image: str, workspace: Path, tools: Path) -> str:
         "4096",
         *extra,
         "-e",
+        # no-tmp: ok — path inside the disposable Linux runner container, not on the gate host
         "HOME=/tmp/gate-home",
         # GitHub's ubuntu-latest allows `pip install --user` and has ~/.local/bin on PATH.
         "-e",
@@ -502,6 +504,7 @@ def _half_the_cpus() -> str:
 
 def _setup_container(cid: str) -> None:
     setup = (
+        # no-tmp: ok — path inside the disposable Linux runner container, not on the gate host
         "set -e; mkdir -p /tmp/gate-home && chmod 1777 /tmp/gate-home; "
         "apt-get update -qq >/dev/null && DEBIAN_FRONTEND=noninteractive "
         f"apt-get install -y -qq --no-install-recommends {' '.join(RUNNER_EXTRA_PACKAGES)} >/dev/null"
