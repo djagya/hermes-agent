@@ -167,7 +167,7 @@ class Context:
 
 def _read_kv_file(path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    lines = path.read_text(encoding="utf-8-sig").splitlines() if path.exists() else []
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -436,7 +436,11 @@ def start_container(image: str, workspace: Path, tools: Path) -> str:
     shared = [common]
     alternates = common / "objects" / "info" / "alternates"
     if alternates.exists():
-        shared += [Path(x) for x in alternates.read_text().splitlines() if x.strip()]
+        shared += [
+            Path(x)
+            for x in alternates.read_text(encoding="utf-8-sig").splitlines()
+            if x.strip()
+        ]
     extra: list[str] = []
     for path in shared:
         if not str(path).startswith(f"{workspace}/"):
@@ -475,7 +479,14 @@ def start_container(image: str, workspace: Path, tools: Path) -> str:
         image,
         "infinity",
     ]
-    cid = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
+    cid = subprocess.run(
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    ).stdout.strip()
     try:
         _setup_container(cid)
     except BaseException:
@@ -499,7 +510,7 @@ def _setup_container(cid: str) -> None:
 
 
 def step_user() -> str:
-    return f"{os.getuid()}:{Path('/var/run/docker.sock').stat().st_gid}"
+    return f"{os.getuid()}:{Path('/var/run/docker.sock').stat().st_gid}"  # windows-footgun: ok — Linux gate host only (runs jobs in a Linux runner container)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -525,7 +536,9 @@ def main(argv: list[str] | None = None) -> int:
     import yaml  # PyYAML: present on the gate host (python3-yaml), not a fork dependency
 
     workspace = Path.cwd()
-    workflow = yaml.safe_load((workspace / args.workflow).read_text(encoding="utf-8"))
+    workflow = yaml.safe_load(
+        (workspace / args.workflow).read_text(encoding="utf-8-sig")
+    )
     jobs = args.jobs or [j for j in ("lint", "build-test") if j in workflow["jobs"]]
     tools = Path(args.tools_dir).resolve()
     tools.mkdir(parents=True, exist_ok=True)
