@@ -155,6 +155,7 @@ def test_real_workflow_uses_only_supported_steps():
                 or uses == "./.github/actions/retry"
                 or uses.startswith(supported)
             ), (job, step.get("name"))
+        assert rjl.unsupported_steps(wf["jobs"][job]["steps"], ROOT) == [], job
 
 
 def test_real_workflow_build_inputs_are_all_translated():
@@ -248,3 +249,249 @@ def test_store_dependent_step_is_advisory_only_on_containerd_hosts(repo):
     ctx.containerd_store = True
     assert rjl.run_job(other, "j", ctx, repo, repo / ".tools")[0][1] == "failure"
     assert ctx.failed
+
+
+def test_expressions_follow_github_semantics(repo):
+    ctx = ctx_for(repo)
+    ctx.inputs = {"toolchain": "python", "cache": "true", "extras": "", "flag": True}
+    ctx.steps["a"] = {"outputs": {"p": ""}}
+    ctx.steps["b"] = {"outputs": {"p": "/b/python"}}
+    # || / && return operands; the losing side of a short-circuit is never evaluated
+    assert ctx.render("${{ steps.a.outputs.p || steps.b.outputs.p }}") == "/b/python"
+    assert (
+        ctx.condition("inputs.toolchain != 'python' && hashFiles(inputs.x) == ''")
+        is False
+    )
+    assert ctx.condition("inputs.extras != '' || inputs.cache == 'TRUE'") is True
+    assert ctx.condition("!(inputs.extras == '')") is False
+    assert ctx.condition("inputs.flag == true && inputs.cache == 'true'") is True
+    assert ctx.render("${{ inputs.flag }}") == "true"
+    with pytest.raises(rjl.StepError, match="hashFiles"):
+        ctx.condition("hashFiles('x') == ''")
+
+
+def test_workflow_call_inputs_default_and_job_if(repo):
+    wf = {
+        True: {
+            "workflow_call": {
+                "inputs": {
+                    "event_name": {"type": "string", "required": True},
+                    "strict": {"type": "boolean", "default": True},
+                }
+            }
+        },
+        "jobs": {
+            "pr-only": {
+                "if": "inputs.event_name == 'pull_request'",
+                "steps": [{"run": "false"}],
+            },
+            "blocking": {
+                "if": "inputs.strict",
+                "steps": [
+                    {
+                        "name": "advisory",
+                        "if": "github.event_name == 'pull_request'",
+                        "run": "false",
+                    },
+                    {"name": "check", "run": "true"},
+                ],
+            },
+        },
+    }
+    ctx = rjl.Context(wf, "release/x", repo, inputs={"event_name": "push"})
+    assert rjl.run_job(wf, "pr-only", ctx, repo, repo / ".tools") == [
+        ("(job if)", "skipped", 0.0)
+    ]
+    ctx = rjl.Context(wf, "release/x", repo, inputs={"event_name": "push"})
+    results = rjl.run_job(wf, "blocking", ctx, repo, repo / ".tools")
+    assert [(n, o) for n, o, _ in results] == [
+        ("advisory", "skipped"),
+        ("check", "success"),
+    ]
+    # A required input the caller did not pass fails loudly, never renders ''.
+    ctx = rjl.Context(wf, "release/x", repo)
+    assert rjl.run_job(wf, "pr-only", ctx, repo, repo / ".tools")[0][1] == "failure"
+    with pytest.raises(rjl.StepError, match="--input event_name="):
+        ctx.render("${{ inputs.event_name }}")
+    with pytest.raises(rjl.StepError, match="no input nope"):
+        rjl.Context(wf, "release/x", repo, inputs={"nope": "1"})
+
+
+def _write_action(repo, rel, text):
+    path = repo / rel / "action.yml"
+    path.parent.mkdir(parents=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_composite_action_runs_its_steps_with_inputs_path_and_outputs(repo):
+    pytest.importorskip("yaml")
+    _write_action(
+        repo,
+        ".github/actions/tool",
+        """
+inputs:
+  word:
+    default: fallback
+  enabled:
+    default: 'false'
+  optional:
+    default: ''
+outputs:
+  bin:
+    value: ${{ steps.missing.outputs.bin || steps.install.outputs.bin }}
+runs:
+  using: composite
+  steps:
+    - name: install
+      id: install
+      shell: bash
+      env:
+        _WORD: ${{ inputs.word }}
+        _HERE: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        test "$_HERE" = "$GITHUB_ACTION_PATH" && test -f "$_HERE/action.yml"
+        mkdir -p "$RUNNER_TEMP/bin"
+        { echo '#!/bin/sh'; echo "echo $_WORD"; } > "$RUNNER_TEMP/bin/tool"
+        chmod +x "$RUNNER_TEMP/bin/tool"
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+        echo "TOOL_HOME=$RUNNER_TEMP" >> "$GITHUB_ENV"
+        echo "bin=$RUNNER_TEMP/bin/tool" >> "$GITHUB_OUTPUT"
+    - id: cache
+      if: inputs.enabled == 'true'
+      uses: actions/cache@0000000000000000000000000000000000000000
+      with:
+        key: ${{ hashFiles('never-rendered') }}
+    - name: cold path after a miss
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: test "$(tool)" = "${{ inputs.word }}"
+    - name: short-circuited
+      if: inputs.optional != '' && hashFiles(inputs.optional) == ''
+      shell: bash
+      run: exit 1
+""",
+    )
+    workflow = {
+        "jobs": {
+            "j": {
+                "steps": [
+                    {
+                        "id": "tool",
+                        "uses": "./.github/actions/tool",
+                        "with": {"word": "hello", "enabled": True},
+                    },
+                    {
+                        "name": "consumer",
+                        "run": 'test "$(tool)" = hello && test -d "$TOOL_HOME"'
+                        ' && test "${{ steps.tool.outputs.bin }}" = "$TOOL_HOME/bin/tool"',
+                    },
+                ]
+            }
+        }
+    }
+    ctx = rjl.Context(workflow, "r", repo)
+    results = rjl.run_job(workflow, "j", ctx, repo, repo / ".tools")
+    assert [(n, o) for n, o, _ in results] == [
+        ("./.github/actions/tool > install", "success"),
+        (
+            "./.github/actions/tool > actions/cache@0000000000000000000000000000000000000000",
+            "success",
+        ),
+        ("./.github/actions/tool > cold path after a miss", "success"),
+        ("./.github/actions/tool > short-circuited", "skipped"),
+        ("./.github/actions/tool", "success"),
+        ("consumer", "success"),
+    ], results
+    assert not ctx.failed
+    # RUNNER_TEMP lives for the job (steps share it) and is removed after it.
+    assert not Path(ctx.runner_temp).exists()
+
+
+def test_composite_failure_and_continue_on_error(repo):
+    pytest.importorskip("yaml")
+    _write_action(
+        repo,
+        ".github/actions/broken",
+        """
+runs:
+  using: composite
+  steps:
+    - {name: boom, shell: bash, run: exit 3}
+    - {name: after, shell: bash, run: 'true'}
+""",
+    )
+    step = {"name": "advisory", "uses": "./.github/actions/broken"}
+    workflow = {
+        "jobs": {"j": {"steps": [{**step, "continue-on-error": True}, {"run": "true"}]}}
+    }
+    ctx = rjl.Context(workflow, "r", repo)
+    results = rjl.run_job(workflow, "j", ctx, repo, repo / ".tools")
+    assert [o for _, o, _ in results] == ["advisory", "skipped", "advisory", "success"]
+    assert not ctx.failed
+
+    workflow = {"jobs": {"j": {"steps": [step, {"name": "next", "run": "true"}]}}}
+    ctx = rjl.Context(workflow, "r", repo)
+    results = rjl.run_job(workflow, "j", ctx, repo, repo / ".tools")
+    assert [o for _, o, _ in results] == ["failure", "skipped", "failure", "skipped"]
+    assert ctx.failed
+
+    _write_action(repo, ".github/actions/js", "runs:\n  using: node24\n  main: x.js\n")
+    assert rjl.unsupported_steps([{"uses": "./.github/actions/js"}], repo) == [
+        "unsupported action ./.github/actions/js (runs.using: node24)"
+    ]
+
+
+def test_lint_workflow_blocking_jobs_are_supported():
+    """The jobs PRs into fork main require must run locally, setup-pm included."""
+    yaml = pytest.importorskip("yaml")
+
+    wf = yaml.safe_load((ROOT / ".github/workflows/lint.yml").read_text(encoding="utf-8"))
+    for job in ("windows-footguns", "ruff-blocking"):
+        steps = wf["jobs"][job]["steps"]
+        assert rjl.unsupported_steps(steps, ROOT) == [], job
+        assert "./.github/actions/setup-pm" in [s.get("uses") for s in steps], job
+
+
+def test_setup_pm_under_lint_inputs_runs_the_pinned_toolchain_steps(repo, monkeypatch):
+    """setup-pm as lint.yml calls it: prepare + install run, caches miss, prune skips,
+    dependency steps stay off, and a push renders the job's PR-only steps skipped."""
+    yaml = pytest.importorskip("yaml")
+
+    wf = yaml.safe_load((ROOT / ".github/workflows/lint.yml").read_text(encoding="utf-8"))
+    ran = []
+
+    def fake_shell(script, env, cwd, ctx, sid):
+        ran.append((sid, script, env))
+        if sid:
+            ctx.steps.setdefault(sid, {})["outputs"] = {
+                "bootstrap-python": "/usr/bin/python3",
+                "python-path": "/pm/python",
+            }
+
+    monkeypatch.setattr(rjl, "run_shell", fake_shell)
+    ctx = rjl.Context(wf, "release/test", repo, inputs={"event_name": "push"})
+    results = rjl.run_job(wf, "windows-footguns", ctx, ROOT, repo / ".tools")
+    outcomes = {n: o for n, o, _ in results}
+    pm = "./.github/actions/setup-pm > "
+    assert outcomes[pm + "Read PM pins with the runner bootstrap Python"] == "success"
+    assert outcomes[pm + "Install and verify tools through PM"] == "success"
+    assert outcomes[pm + "Cache verified PM tools"] == "success"  # the miss
+    assert outcomes[pm + "Register uv cache pruning"] == "success"  # skipped locally
+    for off in (
+        "Restore verified PM tools without saving",
+        "Preserve and retrieve the pinned toolchain",
+        "Cache uv dependency downloads and builds",
+        "Require an npm dependency lock for caching",
+        "Install the requested Python dependencies through PM",
+    ):
+        assert outcomes[pm + off] == "skipped", off
+    assert outcomes["Profile-scope patterns on added lines (advisory)"] == "skipped"
+    assert outcomes["Public-surface diff vs base (advisory)"] == "skipped"
+    assert outcomes["Run footgun checker"] == "success"
+    assert not ctx.failed
+    prepare, install = ran[0], ran[1]
+    assert prepare[0] == "prepare" and prepare[2]["_PM_TOOLCHAIN"] == "python"
+    assert prepare[2]["_PM_ACTION"] == str(ROOT / ".github/actions/setup-pm")
+    assert install[0] == "install" and install[2]["_PM_BOOTSTRAP"] == "/usr/bin/python3"
+    assert [s for _, s, _ in ran[2:]][0] == "python scripts/check-windows-footguns.py --all"
