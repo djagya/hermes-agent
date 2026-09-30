@@ -202,12 +202,12 @@ self_test() {
     }
     rm -f "$tmp/state.db"
     mkdir -p "$tmp/profiles/p/cache/scratch/pytest-of-hermes/t"
-    printf 'SQLite format 3\000garbage' > "$tmp/profiles/p/cache/scratch/pytest-of-hermes/t/bad.db"
+    printf 'not-a-db\n' > "$tmp/profiles/p/cache/scratch/pytest-of-hermes/t/bad.db"
     db_open_check "$tmp" || {
         echo "self-test: expected cache/scratch fixture DBs to be skipped" >&2
         return 1
     }
-    printf 'SQLite format 3\000garbage' > "$tmp/profiles/p/live.db"
+    printf 'not-a-db\n' > "$tmp/profiles/p/live.db"
     if db_open_check "$tmp" 2>/dev/null; then
         echo "self-test: expected open fail on corrupt profile DB outside caches" >&2
         return 1
