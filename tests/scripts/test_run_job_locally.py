@@ -227,3 +227,24 @@ def test_publish_promotes_the_image_build_test_tested():
     step_id = output.split("steps.", 1)[1].split(".", 1)[0]
     assert step_id in {s.get("id") for s in build["steps"]}
     assert "needs.build-test.outputs.config-digest" in yaml.safe_dump(publish)
+
+
+def test_store_dependent_step_is_advisory_only_on_containerd_hosts(repo):
+    step = {"name": "Record image size budget", "run": "exit 1"}
+    workflow = {"jobs": {"j": {"steps": [step]}}}
+
+    ctx = rjl.Context(workflow, "r", repo)
+    ctx.containerd_store = True
+    assert rjl.run_job(workflow, "j", ctx, repo, repo / ".tools")[0][1] == "advisory"
+    assert not ctx.failed
+
+    ctx = rjl.Context(workflow, "r", repo)
+    ctx.containerd_store = False
+    assert rjl.run_job(workflow, "j", ctx, repo, repo / ".tools")[0][1] == "failure"
+    assert ctx.failed
+
+    other = {"jobs": {"j": {"steps": [{"name": "Unit tests", "run": "exit 1"}]}}}
+    ctx = rjl.Context(other, "r", repo)
+    ctx.containerd_store = True
+    assert rjl.run_job(other, "j", ctx, repo, repo / ".tools")[0][1] == "failure"
+    assert ctx.failed

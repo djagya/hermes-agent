@@ -50,6 +50,27 @@ SKIPPED_ACTIONS = (
 )
 
 
+# Steps whose verdict depends on how the host's Docker stores images. GitHub
+# runners use overlay2, where `docker image inspect .Size` is the uncompressed
+# image; the containerd image store (Docker 29 default) reports compressed
+# content (+ unpacked snapshots), so the same image measured 1.95 GB, 4.95 GB
+# (CI) and 7.18 GB. On such a host a failure here is advisory; CI decides.
+STORE_DEPENDENT_STEPS = ("Record image size budget",)
+
+
+def host_uses_containerd_store() -> bool:
+    try:
+        out = subprocess.run(
+            ["docker", "info", "--format", "{{json .DriverStatus}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "io.containerd.snapshotter" in out
+
+
 class StepError(RuntimeError):
     pass
 
@@ -77,6 +98,7 @@ class Context:
             k: str(v) for k, v in (workflow.get("env") or {}).items()
         }
         self.steps: dict[str, dict] = {}
+        self.containerd_store = False
         self.failed = False
         self.before = before
         self.path_prepend: list[str] = []
@@ -359,7 +381,14 @@ def run_job(
         except StepError as exc:
             outcome = "failure"
             print(f"!!! {name}: {exc}", flush=True)
-            if not step.get("continue-on-error"):
+            if name in STORE_DEPENDENT_STEPS and ctx.containerd_store:
+                outcome = "advisory"
+                print(
+                    f"!!! {name}: advisory on this host (containerd image store"
+                    " measures differently from CI's overlay2); CI decides",
+                    flush=True,
+                )
+            elif not step.get("continue-on-error"):
                 ctx.failed = True
         if sid:
             ctx.steps.setdefault(sid, {"outputs": {}})["outcome"] = outcome
@@ -504,6 +533,7 @@ def main(argv: list[str] | None = None) -> int:
     for job in jobs:
         ctx = Context(workflow, args.ref_name, workspace, args.before)
         ctx.tmp_root = tools
+        ctx.containerd_store = host_uses_containerd_store()
         try:
             if args.container:
                 ctx.container = start_container(args.container, workspace, tools)
