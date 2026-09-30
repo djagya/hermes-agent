@@ -12,6 +12,12 @@
 # Prints GITHUB_OUTPUT lines: tag=, base=, distance=, display=.
 # Exits 1 when no release tag is reachable, or with --check when the committed
 # pyproject version differs from the derived base (the fix is printed).
+#
+# --check also refuses a release branch named for another version: the line
+# stayed release/v0.21.4-upstream-dlz after it shipped 0.21.5. A branch
+# release/vX.Y[.Z]-* must name the base (or its X.Y); cut a new branch when
+# upstream's release moves. The branch is GITHUB_REF_NAME on a push, or
+# RELEASE_BRANCH (the local gate passes its --target as GITHUB_REF_NAME).
 set -euo pipefail
 
 check=0
@@ -38,6 +44,15 @@ if [ "$check" = 1 ]; then
     echo "ERROR: pyproject.toml version $committed != $base (shipped by upstream $tag, the newest release in this tree)." >&2
     echo "       Set project.version and the hermes-agent entry in uv.lock to $base, then push." >&2
     exit 1
+  fi
+  branch="${RELEASE_BRANCH:-${GITHUB_REF_NAME:-}}"
+  if [[ "$branch" =~ ^release/v([0-9]+\.[0-9]+(\.[0-9]+)?)(-.*)?$ ]]; then
+    named="${BASH_REMATCH[1]}"
+    if [ "$named" != "$base" ] && [ "$named" != "${base%.*}" ]; then
+      echo "ERROR: branch $branch names $named but this tree ships $base (upstream $tag)." >&2
+      echo "       Push to release/v$base-dlz instead." >&2
+      exit 1
+    fi
   fi
 fi
 

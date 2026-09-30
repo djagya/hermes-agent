@@ -102,7 +102,8 @@ jobs:
       py_scope: ${{ steps.classify.outputs.py_scope }}
       py_roots: ${{ steps.classify.outputs.py_roots }}
       frontend_workspaces: ${{ steps.classify.outputs.frontend_workspaces }}
-      os_tests: ${{ steps.classify.outputs.os_tests }}
+      os_tests: ${{ steps.gate-lanes.outputs.os_tests }}
+      desktop_e2e: ${{ steps.gate-lanes.outputs.desktop_e2e }}
       mode: ${{ steps.classify.outputs.mode }}
       event_name: ${{ github.event_name }}
     steps:
@@ -119,10 +120,20 @@ jobs:
         env:
           RELEASE: ${{ inputs.release }}
           CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
+          # djagya/hermes-agent ships one linux/amd64 Docker image. macOS/Windows
+          # tests, desktop E2E, Rust, the bootstrap installer and the docs site
+          # cannot affect it, and on the fork they were most of every upgrade's
+          # CI time. Lean applies to push/PR only: a manual `workflow_dispatch` stays the
+          # full-validation receipt the header above describes (release=true forces every lane).
+          FORK_LEAN: ${{ github.repository == 'djagya/hermes-agent' && github.event_name != 'workflow_dispatch' && inputs.release != true }}
         run: |
           python3 - <<'PY'
           import json, os
           values = json.loads(os.environ['CLASSIFIED'])
+          values['desktop_e2e'] = 'true'
+          if os.environ['FORK_LEAN'] == 'true':
+              for lane in ('os_tests', 'rust', 'bootstrap', 'site', 'desktop_updater', 'desktop_e2e'):
+                  values[lane] = 'false'
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               for lane, value in values.items():
                   if os.environ['RELEASE'] == 'true' and value in ('true', 'false'):
@@ -218,7 +229,7 @@ jobs:
     needs: detect
     # The deterministic core suite (apps/desktop/e2e/core): transcript
     # integrity, boot/respawn/orphans, clarify+approval. Required; retries 0.
-    if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
+    if: ${{ needs.detect.outputs.desktop_e2e == 'true' && (needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true') }}
     uses: ./.github/workflows/e2e-desktop-core.yml
 
   e2e-desktop-update:
@@ -228,7 +239,7 @@ jobs:
     # first run, "Update now" hand-off/relaunch, concurrent-update refusal.
     # Advisory until it has proven stable on CI: its shards run with continue-on-error, so a
     # red shard shows on the PR but does not fail all-checks-pass.
-    if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
+    if: ${{ needs.detect.outputs.desktop_e2e == 'true' && (needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true') }}
     uses: ./.github/workflows/e2e-desktop-update.yml
 
   docs-site:
