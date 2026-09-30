@@ -33,7 +33,9 @@ A ``continue-on-error`` step may fail without failing the job, as in CI. Job
 ``if:`` is honoured, and a job whose ``needs`` did not succeed is skipped. A
 reusable workflow's ``on.workflow_call.inputs`` take their declared defaults;
 ``--input NAME=VALUE`` supplies what the caller would pass (lint.yml needs
-``--input event_name=push``). RUNNER_TEMP is per job, as on GitHub.
+``--input event_name=push``). RUNNER_TEMP is per job, and the untracked
+files a job leaves in the checkout are removed after it, as if each job had
+its own fresh checkout, as on GitHub.
 
 Usage::
 
@@ -910,6 +912,57 @@ def _setup_container(cid: str) -> None:
     subprocess.run(["docker", "exec", cid, "bash", "-c", setup], check=True)
 
 
+def checkout_extras(workspace: Path) -> set[str]:
+    """Untracked and ignored paths in the checkout (whole new directories collapsed)."""
+    out = subprocess.run(
+        [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--ignored",
+            "--untracked-files=normal",
+        ],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    ).stdout
+    return {
+        entry[3:].decode("utf-8", "surrogateescape")
+        for entry in out.split(b"\0")
+        if entry[:3] in (b"?? ", b"!! ")
+    }
+
+
+def remove_job_outputs(
+    workspace: Path, before: set[str], container: str | None
+) -> None:
+    """Every GitHub job starts from a fresh checkout; here jobs (and the gate's
+    successive runner calls) share one. Remove the untracked/ignored paths a job
+    created so the next job cannot read them: build-test's install-stamp.json
+    (distribution "docker") made the next job's PM treat the checkout as a
+    packaged Docker install. Pre-existing paths are kept; tracked files are
+    never touched."""
+    created = sorted(checkout_extras(workspace) - before)
+    if not created:
+        return
+    print(f"\n=== {len(created)} path(s) the job left in the checkout, removed:")
+    print("\n".join(f"    {p}" for p in created), flush=True)
+    paths = [workspace / p for p in created]
+    if container:
+        # As root in the job's container: docker tests can leave root-owned files.
+        subprocess.run(
+            ["docker", "exec", container, "rm", "-rf", "--", *map(str, paths)],
+            capture_output=True,
+        )
+        return
+    for path in paths:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+
+
 def step_user() -> str:
     return f"{os.getuid()}:{Path('/var/run/docker.sock').stat().st_gid}"  # windows-footgun: ok — Linux gate host only (runs jobs in a Linux runner container)
 
@@ -977,6 +1030,7 @@ def main(argv: list[str] | None = None) -> int:
         ctx = Context(workflow, args.ref_name, workspace, args.before, given)
         ctx.tmp_root = tools
         ctx.containerd_store = host_uses_containerd_store()
+        before_job = checkout_extras(workspace)
         try:
             if args.container:
                 ctx.container = start_container(args.container, workspace, tools)
@@ -990,6 +1044,7 @@ def main(argv: list[str] | None = None) -> int:
                 (job, *r) for r in run_job(workflow, job, ctx, workspace, tools)
             ]
         finally:
+            remove_job_outputs(workspace, before_job, ctx.container)
             if ctx.container:
                 subprocess.run(
                     ["docker", "rm", "-f", ctx.container], capture_output=True

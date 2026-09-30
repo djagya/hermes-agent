@@ -495,3 +495,31 @@ def test_setup_pm_under_lint_inputs_runs_the_pinned_toolchain_steps(repo, monkey
     assert prepare[2]["_PM_ACTION"] == str(ROOT / ".github/actions/setup-pm")
     assert install[0] == "install" and install[2]["_PM_BOOTSTRAP"] == "/usr/bin/python3"
     assert [s for _, s, _ in ran[2:]][0] == "python scripts/check-windows-footguns.py --all"
+
+
+def test_a_jobs_untracked_outputs_do_not_reach_the_next_job(repo, monkeypatch):
+    """GitHub gives every job a fresh checkout. build-test's install-stamp.json once
+    leaked into the lint lane, where PM took the checkout for a Docker install."""
+    pytest.importorskip("yaml")
+    (repo / ".gitignore").write_text("install-stamp.json\n", encoding="utf-8")
+    (repo / "mine.txt").write_text("pre-existing, not the job's\n", encoding="utf-8")
+    (repo / ".github/workflows").mkdir(parents=True)
+    (repo / ".github/workflows/w.yml").write_text(
+        """
+jobs:
+  build:
+    steps:
+      - run: echo '{"distribution":"docker"}' > install-stamp.json && mkdir -p out/deep && touch out/deep/f
+  lint:
+    steps:
+      - run: test ! -e install-stamp.json && test ! -e out && test -f mine.txt
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+    argv = ["--workflow", ".github/workflows/w.yml", "--tools-dir", ".gate-tools"]
+    assert rjl.main([*argv, "--job", "build", "--job", "lint"]) == 0
+    # ...and across runner invocations (the box gate calls it once per workflow).
+    assert rjl.main([*argv, "--job", "build"]) == 0
+    assert not (repo / "install-stamp.json").exists()
+    assert (repo / "mine.txt").exists() and (repo / ".gate-tools").is_dir()
