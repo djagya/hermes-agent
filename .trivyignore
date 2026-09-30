@@ -24,3 +24,7 @@ CVE-2026-69192
 # the next build re-checks once npm ships the fix.
 CVE-2026-102276 exp:2026-10-14
 CVE-2026-102278 exp:2026-10-14
+# undici 6.27.0 bundled inside npm itself (same two npm trees); fixed in
+# 6.28.1, not yet in an npm release. The photon sidecar's own undici is
+# locked to a fixed release. Expires with the entries above.
+CVE-2026-19534 exp:2026-10-14
