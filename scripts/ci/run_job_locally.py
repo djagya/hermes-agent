@@ -14,7 +14,8 @@ Supported ``uses:``:
                               file, target, platforms, tags, labels and
                               build-args; ``load`` honoured, never pushes,
                               no cache import/export
-  actions/upload-artifact     skipped
+  actions/upload-artifact     skipped (publish's tested-image hand-off is CI-only;
+                              the export step before it still runs)
   astral-sh/setup-uv          the pinned uv release, cached under --tools-dir
   ./.github/actions/retry     runs ``inputs.command`` (in working-directory)
 Anything else fails loudly: an unsupported step is not a passed step.
@@ -383,7 +384,7 @@ exit 1
 
 # Tools GitHub's ubuntu-latest ships that the act runner image lacks. Add one here
 # when a step fails locally only because of a missing binary.
-RUNNER_EXTRA_PACKAGES = ("sqlite3",)
+RUNNER_EXTRA_PACKAGES = ("sqlite3", "zstd")
 
 
 def start_container(image: str, workspace: Path, tools: Path) -> str:

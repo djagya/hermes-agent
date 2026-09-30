@@ -9,6 +9,17 @@
 # provenance attestation so the box can verify image identity post-pull
 # (`gh attestation verify`).
 #
+# Tested image == published image. build-test builds `target: runtime` (the
+# release image, no fixtures layer), runs every check against it, then
+# `docker save`s that exact image as a run artifact and exports its config
+# digest. publish never rebuilds: it loads the artifact, refuses a config
+# digest that differs from the tested one, pushes it, re-reads the config
+# digest from GHCR, and attests the pushed manifest digest.
+#
+# Action pins: Dependabot reads .github/dependabot.yml from the default branch
+# only. The github-actions entry there with `target-branch: release/...` covers
+# this workflow; move that value to the new line when a release branch is cut.
+#
 # Do not enable or retarget upstream docker.yml on this fork.
 name: Fork Release Image (GHCR)
 
@@ -55,7 +66,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -134,9 +145,13 @@ jobs:
     if: github.repository == 'djagya/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    outputs:
+      # Config digest of the image every step below tested; publish refuses
+      # anything else.
+      config-digest: ${{ steps.export.outputs.config-digest }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -149,11 +164,11 @@ jobs:
       - name: Set up Docker Buildx
         id: buildx
         continue-on-error: true
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Set up Docker Buildx (retry)
         if: steps.buildx.outcome == 'failure'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Assert Debian snapshot matches Dockerfile
         run: |
@@ -186,14 +201,15 @@ jobs:
             --distribution docker --update-mechanism external --source ci \
             --commit "$GITHUB_SHA" --base-version "$BASE_VERSION" --distance "$DISTANCE"
 
-      - name: Build image (amd64)
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+      # The release image itself (`:test` is only its local name here; the
+      # box gate removes that tag). golden-smoke gets its fixtures from a
+      # read-only bind mount, so no fixtures layer is needed.
+      - name: Build release image (amd64)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile
-          # Smoke + golden need the test-stage fixtures. Publish still
-          # targets runtime (no fixtures layer).
-          target: test
+          target: runtime
           load: true
           platforms: linux/amd64
           tags: ${{ env.IMAGE_NAME }}:test
@@ -215,6 +231,17 @@ jobs:
           # rebuilding every layer (publish only writes after a green build-test).
           cache-to: type=gha,mode=max,scope=fork-amd64
 
+      # Pins the candidate: the export step refuses to ship if the tag moved
+      # while the checks ran.
+      - name: Record candidate image ID
+        id: candidate
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:test
+        run: |
+          set -euo pipefail
+          echo "id=$(docker image inspect --format '{{.Id}}' "$IMAGE")" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
       # The budget gate measures uncompressed layers; preserve a filesystem
       # breakdown even when that gate rejects the candidate image.
       - name: Inventory loaded image (no services)
@@ -230,7 +257,7 @@ jobs:
 
       - name: Upload image inventory
         if: always() && steps.inventory.outcome != 'skipped'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: image-inventory-${{ github.sha }}
           path: image-inventory.json
@@ -261,7 +288,7 @@ jobs:
           python3 docker/sera-toolbox/verify-cyclonedx.py hermes-agent.cdx.json
 
       - name: Upload SPDX and CycloneDX SBOMs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hermes-agent-sbom
           path: |
@@ -366,7 +393,11 @@ jobs:
           # RLIMIT_NPROC is ignored. Production runs parsers as
           # hermes (10000).
           run_bwrap -u 10000:10000 --entrypoint /opt/hermes/docker/sera-toolbox/adversarial/fork-bomb.sh "$IMAGE"
-          run_bwrap -u 10000:10000 --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh "$IMAGE"
+          # The release image has no fixtures layer: mount them read-only.
+          run_bwrap -u 10000:10000 \
+            -v "$GITHUB_WORKSPACE/docker/sera-toolbox/fixtures:/opt/golden-fixtures:ro" \
+            -e SERA_GOLDEN_FIXTURES=/opt/golden-fixtures \
+            --entrypoint /opt/hermes/docker/sera-toolbox/golden-smoke.sh "$IMAGE"
 
       - name: Fork FTS fence creates display indexes
         env:
@@ -473,6 +504,40 @@ jobs:
           # container-spawning workers at nproc and give slow files headroom.
           HERMES_TEST_WORKERS=$(nproc) scripts/run_tests.sh tests/docker/ --file-timeout 900
 
+      # Hand the tested image to publish byte-for-byte. The config digest
+      # covers every layer's diff_id plus labels/env/entrypoint, so it is the
+      # identity publish checks against GHCR. Locally (run_job_locally.py)
+      # this runs too and the per-step RUNNER_TEMP is discarded after it.
+      - name: Export tested image
+        id: export
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:test
+          CANDIDATE_ID: ${{ steps.candidate.outputs.id }}
+        run: |
+          set -euo pipefail
+          now="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
+          if [ "$now" != "$CANDIDATE_ID" ]; then
+            echo "ERROR: $IMAGE is $now, not the built candidate $CANDIDATE_ID" >&2
+            exit 1
+          fi
+          docker save "$IMAGE" | zstd -q -T0 -3 -o "$RUNNER_TEMP/hermes-image.tar.zst"
+          config="$(zstd -dc "$RUNNER_TEMP/hermes-image.tar.zst" | tar -xOf - manifest.json \
+            | python3 -c 'import json, re, sys; m = json.load(sys.stdin); assert len(m) == 1, m; h = re.sub(r"\.json$", "", m[0]["Config"].rsplit("/", 1)[-1]); assert re.fullmatch(r"[0-9a-f]{64}", h), h; print("sha256:" + h)')"
+          echo "config-digest=$config" >> "$GITHUB_OUTPUT"
+          ls -l "$RUNNER_TEMP/hermes-image.tar.zst"
+          cat "$GITHUB_OUTPUT"
+
+      - name: Upload tested image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-image-${{ github.sha }}
+          path: ${{ runner.temp }}/hermes-image.tar.zst
+          if-no-files-found: error
+          # Already zstd; a job re-run replaces the previous attempt's image.
+          compression-level: 0
+          overwrite: true
+          retention-days: 3
+
   # Sole GHCR credential boundary. The `ghcr-release` environment requires a
   # manual approval, so nothing publishes without an operator click even if
   # the branch itself is compromised.
@@ -488,26 +553,35 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - name: Checkout trusted source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # No checkout and no build: this job only promotes the image build-test
+      # tested, so nothing reaches GHCR that the checks did not see.
+      - name: Download tested image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          persist-credentials: false
-          fetch-depth: 0
+          name: hermes-image-${{ github.sha }}
+          path: ${{ runner.temp }}/image
 
-      - name: Record SOURCE_DATE_EPOCH
-        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
-
-      - name: Set up Docker Buildx
-        id: buildx
-        continue-on-error: true
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Set up Docker Buildx (retry)
-        if: steps.buildx.outcome == 'failure'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Load tested image
+        env:
+          EXPECT_CONFIG: ${{ needs.build-test.outputs.config-digest }}
+        run: |
+          set -euo pipefail
+          case "$EXPECT_CONFIG" in
+            sha256:*) ;;
+            *) echo "ERROR: build-test exported no config digest" >&2; exit 1 ;;
+          esac
+          archive="$RUNNER_TEMP/image/hermes-image.tar.zst"
+          config="$(zstd -dc "$archive" | tar -xOf - manifest.json \
+            | python3 -c 'import json, re, sys; m = json.load(sys.stdin); assert len(m) == 1, m; h = re.sub(r"\.json$", "", m[0]["Config"].rsplit("/", 1)[-1]); assert re.fullmatch(r"[0-9a-f]{64}", h), h; print("sha256:" + h)')"
+          if [ "$config" != "$EXPECT_CONFIG" ]; then
+            echo "ERROR: artifact config $config != tested $EXPECT_CONFIG" >&2
+            exit 1
+          fi
+          zstd -dc "$archive" | docker load
+          rm -f "$archive"
 
       - name: Log in to GHCR
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -525,65 +599,53 @@ jobs:
           tag="${tag//\//-}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
-      # The version is derived, never hand-kept: the nearest upstream release tag in
-      # this tree sets the base, commits past it the distance (scripts/fork-release-version.sh).
-      # Upstream tags are fetched so a sync never reports an older release.
-      - name: Derive release version
-        id: version
+      # Retag + push the loaded image, then read back what GHCR serves: both
+      # tags must resolve to one digest whose config is the tested config.
+      - name: Push tested image
+        id: push
+        env:
+          SOURCE: ${{ env.IMAGE_NAME }}:test
+          SHA: ${{ github.sha }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          EXPECT_CONFIG: ${{ needs.build-test.outputs.config-digest }}
         run: |
           set -euo pipefail
-          git fetch --quiet --no-tags https://github.com/NousResearch/hermes-agent.git '+refs/tags/v2*:refs/tags/v2*'
-          scripts/fork-release-version.sh >> "$GITHUB_OUTPUT"
-          cat "$GITHUB_OUTPUT"
-
-      - name: Write install stamp
-        env:
-          BASE_VERSION: ${{ steps.version.outputs.base }}
-          DISTANCE: ${{ steps.version.outputs.distance }}
-        run: |
-          python3 scripts/write_install_stamp.py --output install-stamp.json \
-            --distribution docker --update-mechanism external --source ci \
-            --commit "$GITHUB_SHA" --base-version "$BASE_VERSION" --distance "$DISTANCE"
-
-      - name: Push image
-        id: push
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
-        with:
-          context: .
-          file: Dockerfile
-          target: runtime
-          push: true
-          platforms: linux/amd64
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
-          labels: |
-            HERMES_GIT_SHA=${{ github.sha }}
-            HERMES_BASE_VERSION=${{ steps.version.outputs.base }}
-            HERMES_UPSTREAM_TAG=${{ steps.version.outputs.tag }}
-            org.opencontainers.image.source=https://github.com/djagya/hermes-agent
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.version.outputs.display }}
-          build-args: |
-            HERMES_GIT_SHA=${{ github.sha }}
-            HERMES_IMAGE_NAME=${{ env.IMAGE_NAME }}
-            HERMES_BUILD_REF=${{ github.ref_name }}
-            DEBIAN_SNAPSHOT=${{ env.DEBIAN_SNAPSHOT }}
-            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
-          # BuildKit SLSA provenance + SBOM attached to the image manifest.
-          provenance: mode=max
-          sbom: true
-          cache-from: type=gha,scope=fork-amd64
-          cache-to: type=gha,mode=max,scope=fork-amd64
+          digest=""
+          for ref in "${IMAGE_NAME}:${SHA}" "${IMAGE_NAME}:${TAG}"; do
+            docker tag "$SOURCE" "$ref"
+            docker push "$ref"
+            got="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["digest"])')"
+            if [ -n "$digest" ] && [ "$got" != "$digest" ]; then
+              echo "ERROR: $ref -> $got, but ${IMAGE_NAME}:${SHA} -> $digest" >&2
+              exit 1
+            fi
+            digest="$got"
+          done
+          manifest="$(docker buildx imagetools inspect --raw "${IMAGE_NAME}@${digest}")"
+          child="$(printf '%s' "$manifest" | python3 -c 'import json, sys; m = json.load(sys.stdin); print(next((d["digest"] for d in m.get("manifests", []) if d.get("platform", {}).get("os") == "linux" and d.get("platform", {}).get("architecture") == "amd64"), ""))')"
+          if [ -n "$child" ]; then
+            manifest="$(docker buildx imagetools inspect --raw "${IMAGE_NAME}@${child}")"
+          fi
+          config="$(printf '%s' "$manifest" | python3 -c 'import json, sys; print(json.load(sys.stdin)["config"]["digest"])')"
+          if [ "$config" != "$EXPECT_CONFIG" ]; then
+            echo "ERROR: GHCR ${IMAGE_NAME}@${digest} config $config != tested $EXPECT_CONFIG" >&2
+            exit 1
+          fi
+          echo "published ${IMAGE_NAME}@${digest} (config ${config}, as tested)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       # GitHub-native attestation: lets the box verify post-pull with
       # `gh attestation verify oci://<image>@<digest> --repo djagya/hermes-agent`.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+          # Storage records exist only for organization-owned repositories.
+          create-storage-record: false
+
 
       - name: Assert published image SHA labels and provenance
         env:

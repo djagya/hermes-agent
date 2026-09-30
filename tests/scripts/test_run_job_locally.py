@@ -194,3 +194,36 @@ def test_unknown_build_push_input_fails_loudly(repo):
     ctx = ctx_for(repo)
     with pytest.raises(rjl.StepError, match="unsupported with: secrets"):
         rjl.build_push({"context": ".", "secrets": "x"}, ctx, repo)
+
+
+def test_publish_promotes_the_image_build_test_tested():
+    """publish must push build-test's image, not a rebuild the gate never saw."""
+    yaml = pytest.importorskip("yaml")
+
+    wf = yaml.safe_load((ROOT / ".github/workflows/fork-release-image.yml").read_text())
+    build, publish = wf["jobs"]["build-test"], wf["jobs"]["publish"]
+    builds = [
+        s
+        for s in build["steps"]
+        if (s.get("uses") or "").startswith("docker/build-push-action@")
+    ]
+    assert [s["with"]["target"] for s in builds] == ["runtime"]
+    assert not any(
+        (s.get("uses") or "").startswith("docker/build-push-action@")
+        for s in publish["steps"]
+    )
+    uploads = {
+        s["with"]["name"]
+        for s in build["steps"]
+        if (s.get("uses") or "").startswith("actions/upload-artifact@")
+    }
+    downloads = [
+        s["with"]["name"]
+        for s in publish["steps"]
+        if (s.get("uses") or "").startswith("actions/download-artifact@")
+    ]
+    assert downloads and set(downloads) <= uploads
+    output = build["outputs"]["config-digest"]
+    step_id = output.split("steps.", 1)[1].split(".", 1)[0]
+    assert step_id in {s.get("id") for s in build["steps"]}
+    assert "needs.build-test.outputs.config-digest" in yaml.safe_dump(publish)

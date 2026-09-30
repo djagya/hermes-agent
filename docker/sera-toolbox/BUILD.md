@@ -3,7 +3,9 @@
 Matches CI in `.github/workflows/fork-release-image.yml`. Published
 target is `runtime`. `--target test` is runtime plus
 `docker/sera-toolbox/fixtures/` (golden text fixtures). CI
-`build-test` loads `test`; `publish` pushes `runtime`.
+`build-test` loads and tests `runtime` (golden-smoke bind-mounts the
+fixtures, `SERA_GOLDEN_FIXTURES`); `publish` pushes that saved image,
+never a rebuild.
 
 ```bash
 # Local load (amd64). Pass the same args CI uses.
