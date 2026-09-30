@@ -18,3 +18,13 @@ CVE-2026-13149
 CVE-2026-14257
 CVE-2026-69152
 CVE-2026-69192
+# brace-expansion 5.0.7 bundled inside npm itself (tools/npm-12.0.2 and
+# node-26.7.0's lib/node_modules/npm); fixed in 5.0.10, not yet in an npm
+# release. The repo lockfiles already override brace-expansion. Expires so
+# the next build re-checks once npm ships the fix.
+CVE-2026-102276 exp:2026-10-14
+CVE-2026-102278 exp:2026-10-14
+# undici 6.27.0 bundled inside npm itself (same two npm trees); fixed in
+# 6.28.1, not yet in an npm release. The photon sidecar's own undici is
+# locked to a fixed release. Expires with the entries above.
+CVE-2026-19534 exp:2026-10-14
