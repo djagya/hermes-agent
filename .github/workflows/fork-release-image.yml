@@ -57,7 +57,7 @@ env:
   # Must match every Dockerfile `ARG DEBIAN_SNAPSHOT=` default. Build-args
   # override the Dockerfile; leaving May here after a Sept bump rebuilt
   # stale apt and failed smoke/Trivy.
-  DEBIAN_SNAPSHOT: 20260928T000000Z
+  DEBIAN_SNAPSHOT: 20260930T070000Z
 
 jobs:
   lint:
@@ -507,7 +507,7 @@ jobs:
       # Hand the tested image to publish byte-for-byte. The config digest
       # covers every layer's diff_id plus labels/env/entrypoint, so it is the
       # identity publish checks against GHCR. Locally (run_job_locally.py)
-      # this runs too and the per-step RUNNER_TEMP is discarded after it.
+      # this runs too and the job's RUNNER_TEMP is discarded when the job ends.
       - name: Export tested image
         id: export
         env:

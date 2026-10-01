@@ -18,6 +18,7 @@ import os
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 MANAGED_CONTROL_ENV = "HERMES_BROWSER_CONTROL_URL"
@@ -30,6 +31,11 @@ CONFIG_UNREADABLE_URL = "managed://config-unreadable"
 # Operator rollback: managed mode stays ON; every entry point fails closed.
 DISABLED_CONTROL_URL = "disabled://"
 OPERATOR_DISABLED_ERROR = "unavailable: browsing disabled by operator"
+
+# Acquire can wait on a Chrome boot behind the control lock; 5 s used to
+# time out a request the server then completed, orphaning the lease.
+CONTROL_TIMEOUT_S = 60.0
+STATUS_TIMEOUT_S = 10.0
 
 _held_lock = threading.Lock()
 _held_leases: Dict[str, Dict[str, str]] = {}
@@ -80,8 +86,19 @@ def clear_held_leases() -> None:
         _held_leases.clear()
 
 
-def _hold_key(task_id: Optional[str], session_name: str) -> str:
-    return (session_name or task_id or "default").strip() or "default"
+def _hold_key(
+    task_id: Optional[str], session_name: str, identity: str = "", mode: str = "research"
+) -> str:
+    """One held lease per (task, identity, mode).
+
+    Keying by session name alone handed a lease minted for one identity to
+    a later call asking for another (a ``sensitive`` call ran in a
+    temporary research slot) and reused one cron run's lease name in the
+    next run. The browser a lease points at is chosen by control, not by
+    the session name, so the name is only a fallback when there is no task.
+    """
+    owner = (str(task_id or "").strip() or (session_name or "").strip() or "default")
+    return f"{owner}|{identity}|{mode}"
 
 
 def _coerce_mode(mode: Optional[str]) -> str:
@@ -168,7 +185,7 @@ def _post(control: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         headers=headers,
     )
     try:
-        with urlopen(req, timeout=5) as resp:
+        with urlopen(req, timeout=CONTROL_TIMEOUT_S) as resp:
             raw = resp.read()
     except HTTPError as exc:
         try:
@@ -180,8 +197,54 @@ def _post(control: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "unavailable", "detail": "control returned a non-object"}
     except URLError as exc:
         return {"error": "unavailable", "detail": f"control unreachable: {exc.reason}"}
-    data = json.loads(raw.decode("utf-8") or "{}")
+    except OSError as exc:
+        # A read timeout is a bare TimeoutError, not URLError.
+        return {"error": "unavailable", "detail": f"control unreachable: {exc}"}
+    try:
+        data = json.loads(raw.decode("utf-8") or "{}")
+    except ValueError:
+        return {"error": "unavailable", "detail": "control returned non-JSON"}
     return data if isinstance(data, dict) else {"error": "unavailable"}
+
+
+def _lease_alive(control: str, lease_id: str) -> Optional[bool]:
+    """True/False from ``GET /v1/status?lease=``; None when control did not answer.
+
+    A cached lease dies without this process noticing: idle recycle, an
+    in-code ``/v1/release``, a human take (and Return to Sera, which mints
+    a new lease), a controller restart. Reusing it made every later call
+    fail at the gate (surfacing as the harness's "permission-blocked").
+    """
+    if not lease_id:
+        return False
+    headers = {}
+    key = control_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = Request(
+        control.rstrip("/") + "/v1/status?" + urlencode({"lease": lease_id}),
+        method="GET",
+        headers=headers,
+    )
+    try:
+        with urlopen(req, timeout=STATUS_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        try:
+            data = json.loads(exc.read().decode("utf-8") or "{}")
+        except (ValueError, OSError):
+            return None
+        return False if isinstance(data, dict) and data.get("error") == "stale" else None
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("error"):
+        return False if isinstance(data, dict) and data.get("error") == "stale" else None
+    return data.get("owner") == "agent" and data.get("state") == "agent"
+
+
+def _forget_held(key: str) -> None:
+    with _held_lock:
+        _held_leases.pop(key, None)
 
 
 def _acquire(
@@ -244,16 +307,22 @@ def resolve_managed_cdp(
     if refused:
         return refused
 
-    key = _hold_key(task_id, session_name)
-    if not reconnect:
-        with _held_lock:
-            cached = _held_leases.get(key)
-        if cached:
-            env.update(cached)
-            return None
-
     payload_mode = _coerce_mode(mode)
     payload_identity = str(identity or "")
+    key = _hold_key(task_id, session_name, payload_identity, payload_mode)
+    with _held_lock:
+        cached = None if reconnect else _held_leases.get(key)
+    if cached:
+        alive = _lease_alive(control, cached.get(MANAGED_LEASE_ENV, ""))
+        if alive is None:
+            return "unavailable: control unreachable while checking the held lease"
+        if alive:
+            env.update(cached)
+            return None
+        # Dead lease: forget it and acquire again (control hands a task its
+        # own resumed lease back, or a fresh slot).
+        _forget_held(key)
+
     payload_targets = _coerce_targets(qa_targets)
     task = str(task_id or session_name or "browser-exec")
 
@@ -350,6 +419,28 @@ def release_lease(env: Dict[str, str]) -> Optional[str]:
     if result.get("error"):
         return _format_error(result)
     return None
+
+
+def release_task_leases(owners: Any) -> int:
+    """Release every lease held for these task ids; returns how many.
+
+    The gateway is long-lived, so atexit never fires and a lease held by a
+    finished session, a /new or /reset, or a completed cron run used to
+    stay with control until its idle sweep, starving the slot pool. Call
+    from the agent's close path, off the event loop (blocking HTTP).
+    """
+    wanted = {str(owner).strip() for owner in (owners or ()) if str(owner or "").strip()}
+    if not wanted:
+        return 0
+    with _held_lock:
+        keys = [key for key in _held_leases if key.split("|", 1)[0] in wanted]
+        snapshots = [_held_leases.pop(key) for key in keys]
+    for snapshot in snapshots:
+        try:
+            release_lease(snapshot)
+        except Exception:
+            pass
+    return len(snapshots)
 
 
 def release_all_held_leases() -> None:

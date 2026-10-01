@@ -16,6 +16,7 @@ from tools.browser_control_route import (
     is_managed,
     managed_cdp_or_error,
     release_lease,
+    release_task_leases,
     resolve_managed_cdp,
 )
 from tools.browser_use_cli import _resolve_backend_cdp, browser_exec
@@ -37,12 +38,29 @@ class _State:
         self.releases = []
         self.auth = []
         self.acquire_replies = []
+        self.status_calls = []
+        # lease_id -> /v1/status reply; default: the lease is a live agent lease.
+        self.status_replies = {}
 
 
 def _start(state):
     class _Control(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             return
+
+        def do_GET(self):
+            from urllib.parse import parse_qs, urlparse
+
+            lease = (parse_qs(urlparse(self.path).query).get("lease") or [""])[0]
+            state.status_calls.append(lease)
+            body = state.status_replies.get(lease, {"owner": "agent", "state": "agent"})
+            status = 409 if body.get("error") == "stale" else 200
+            raw = json.dumps(body).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length") or 0)
@@ -459,3 +477,181 @@ def test_camofox_snapshot_skipped_in_managed(monkeypatch):
     assert out.get("success") is False
     err = out.get("error", "")
     assert "scope_denied" in err or err.startswith("unavailable") or "unavailable" in err
+
+
+def _resolve(port, monkeypatch, **kwargs):
+    env = {}
+    err = resolve_managed_cdp(env, raw_cdp_override="", **kwargs)
+    return err, env
+
+
+def test_cached_lease_is_reused_while_alive(monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        assert _resolve(port, monkeypatch, task_id="t1")[0] is None
+        err, env = _resolve(port, monkeypatch, task_id="t1")
+        assert err is None and env[MANAGED_LEASE_ENV] == "lease-1"
+        assert len(state.acquires) == 1 and state.status_calls == ["lease-1"]
+    finally:
+        httpd.shutdown()
+
+
+def test_dead_cached_lease_reacquires(monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        assert _resolve(port, monkeypatch, task_id="t1")[0] is None
+        state.status_replies["lease-1"] = {"error": "stale", "detail": "unknown lease"}
+        state.acquire_replies.append(dict(DEFAULT_LEASE, lease_id="lease-2", command_token="tok-2"))
+        err, env = _resolve(port, monkeypatch, task_id="t1")
+        assert err is None
+        assert env[MANAGED_LEASE_ENV] == "lease-2" and env[MANAGED_TOKEN_ENV] == "tok-2"
+        assert len(state.acquires) == 2
+    finally:
+        httpd.shutdown()
+
+
+def test_cached_lease_never_crosses_identity_or_mode(monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        assert _resolve(port, monkeypatch, task_id="t1", session_name="s")[0] is None
+        state.acquire_replies.append(
+            dict(DEFAULT_LEASE, lease_id="lease-s", slot_id="sensitive", command_token="tok-s")
+        )
+        err, env = _resolve(port, monkeypatch, task_id="t1", session_name="s", identity="sensitive")
+        assert err is None and env[MANAGED_LEASE_ENV] == "lease-s"
+        assert [a["identity"] for a in state.acquires] == ["", "sensitive"]
+    finally:
+        httpd.shutdown()
+
+
+def test_session_name_is_not_shared_across_tasks(monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        assert _resolve(port, monkeypatch, task_id="cron-run-1", session_name="x")[0] is None
+        assert _resolve(port, monkeypatch, task_id="cron-run-2", session_name="x")[0] is None
+        assert [a["task"] for a in state.acquires] == ["cron-run-1", "cron-run-2"]
+    finally:
+        httpd.shutdown()
+
+
+def test_unreachable_control_while_checking_cache_fails_closed(monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    _managed_env(monkeypatch, port)
+    assert _resolve(port, monkeypatch, task_id="t1")[0] is None
+    httpd.shutdown()
+    httpd.server_close()
+    err, env = _resolve(port, monkeypatch, task_id="t1")
+    assert err.startswith("unavailable:") and "BU_CDP_URL" not in env
+
+
+def test_post_read_timeout_is_unavailable_not_a_crash(monkeypatch):
+    import tools.browser_control_route as route
+
+    def boom(*_a, **_k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(route, "urlopen", boom)
+    out = route._post("http://127.0.0.1:9", "/v1/acquire", {})
+    assert out["error"] == "unavailable" and "timed out" in out["detail"]
+
+
+def test_release_task_leases_releases_only_that_tasks_holds(monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        assert _resolve(port, monkeypatch, task_id="cron:job:run-1")[0] is None
+        state.acquire_replies.append(
+            dict(DEFAULT_LEASE, lease_id="lease-2", slot_id="research-2", command_token="tok-2")
+        )
+        assert _resolve(port, monkeypatch, task_id="other-session")[0] is None
+        assert release_task_leases({"cron:job:run-1", "", None}) == 1
+        assert [r["lease_id"] for r in state.releases] == ["lease-1"]
+        assert release_task_leases(set()) == 0
+        # The other session's hold is untouched and still reused.
+        err, env = _resolve(port, monkeypatch, task_id="other-session")
+        assert err is None and env[MANAGED_LEASE_ENV] == "lease-2"
+    finally:
+        httpd.shutdown()
+
+
+def test_agent_close_releases_browser_exec_leases(monkeypatch):
+    import tools.browser_control_route as route
+    from agent.client_lifecycle import ClientLifecycleMixin
+
+    seen = []
+    monkeypatch.setattr(route, "release_task_leases", lambda owners: seen.append(set(owners)))
+
+    class _Agent:
+        _process_owner_task_ids = ("cron:job:run-1", "sess-rotated")
+
+    ClientLifecycleMixin._close_task_resources(_Agent(), "sess-1")
+    assert seen == [{"sess-1", "cron:job:run-1", "sess-rotated"}]
+
+
+def _fake_cli(tmp_path, body):
+    import stat
+
+    script = tmp_path / "browser-use"
+    script.write_text("#!/bin/sh\n" + body)
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script
+
+
+def test_managed_exec_raises_harness_cdp_timeout(tmp_path, monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    _managed_env(monkeypatch, port)
+    stdin_path = tmp_path / "stdin.txt"
+    script = _fake_cli(tmp_path, f"cat > '{stdin_path}'\necho ok\n")
+    import tools.browser_use_cli as bu_cli
+
+    monkeypatch.setattr(bu_cli, "_find_cli", lambda: [str(script)])
+    json.loads(bu_cli.browser_exec("print(1)", task_id="t1"))
+    httpd.shutdown()
+    posted = stdin_path.read_text()
+    assert "_hermes_ipc_timeout" in posted and posted.rstrip().endswith("print(1)")
+
+
+def test_gate_403_is_explained_and_retried_on_a_fresh_lease(tmp_path, monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        calls = tmp_path / "calls"
+        script = _fake_cli(
+            tmp_path,
+            f"echo x >> '{calls}'\n"
+            'case "$BU_CDP_URL" in *tok-1*) echo "browser-harness: permission-blocked: Chrome '
+            'is reachable, but the per-session Allow remote debugging popup" >&2; exit 1;; esac\n'
+            "echo ok\n",
+        )
+        import tools.browser_use_cli as bu_cli
+
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [str(script)])
+        # First call holds lease-1; then control recycles it.
+        state.status_replies["lease-1"] = {"error": "stale"}
+        state.acquire_replies.extend(
+            [dict(DEFAULT_LEASE), dict(DEFAULT_LEASE, lease_id="lease-2", command_token="tok-2")]
+        )
+        result = json.loads(bu_cli.browser_exec("print(1)", task_id="t1"))
+        assert result["success"] is True
+        assert len(calls.read_text().split()) == 2
+        # A refusal that persists is explained, not blamed on a popup.
+        state.status_replies.clear()
+        clear_held_leases()
+        state.acquire_replies.append(dict(DEFAULT_LEASE))
+        result = json.loads(bu_cli.browser_exec("print(1)", task_id="t2"))
+        assert result["success"] is False
+        assert result["stderr"].startswith("managed browser gate refused the lease (HTTP 403)")
+    finally:
+        httpd.shutdown()
