@@ -37,12 +37,29 @@ class _State:
         self.releases = []
         self.auth = []
         self.acquire_replies = []
+        self.status_calls = []
+        # lease_id -> /v1/status reply; default: the lease is a live agent lease.
+        self.status_replies = {}
 
 
 def _start(state):
     class _Control(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             return
+
+        def do_GET(self):
+            from urllib.parse import parse_qs, urlparse
+
+            lease = (parse_qs(urlparse(self.path).query).get("lease") or [""])[0]
+            state.status_calls.append(lease)
+            body = state.status_replies.get(lease, {"owner": "agent", "state": "agent"})
+            status = 409 if body.get("error") == "stale" else 200
+            raw = json.dumps(body).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length") or 0)
@@ -459,3 +476,88 @@ def test_camofox_snapshot_skipped_in_managed(monkeypatch):
     assert out.get("success") is False
     err = out.get("error", "")
     assert "scope_denied" in err or err.startswith("unavailable") or "unavailable" in err
+
+
+def _resolve(port, monkeypatch, **kwargs):
+    env = {}
+    err = resolve_managed_cdp(env, raw_cdp_override="", **kwargs)
+    return err, env
+
+
+def test_cached_lease_is_reused_while_alive(monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        assert _resolve(port, monkeypatch, task_id="t1")[0] is None
+        err, env = _resolve(port, monkeypatch, task_id="t1")
+        assert err is None and env[MANAGED_LEASE_ENV] == "lease-1"
+        assert len(state.acquires) == 1 and state.status_calls == ["lease-1"]
+    finally:
+        httpd.shutdown()
+
+
+def test_dead_cached_lease_reacquires(monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        assert _resolve(port, monkeypatch, task_id="t1")[0] is None
+        state.status_replies["lease-1"] = {"error": "stale", "detail": "unknown lease"}
+        state.acquire_replies.append(dict(DEFAULT_LEASE, lease_id="lease-2", command_token="tok-2"))
+        err, env = _resolve(port, monkeypatch, task_id="t1")
+        assert err is None
+        assert env[MANAGED_LEASE_ENV] == "lease-2" and env[MANAGED_TOKEN_ENV] == "tok-2"
+        assert len(state.acquires) == 2
+    finally:
+        httpd.shutdown()
+
+
+def test_cached_lease_never_crosses_identity_or_mode(monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        assert _resolve(port, monkeypatch, task_id="t1", session_name="s")[0] is None
+        state.acquire_replies.append(
+            dict(DEFAULT_LEASE, lease_id="lease-s", slot_id="sensitive", command_token="tok-s")
+        )
+        err, env = _resolve(port, monkeypatch, task_id="t1", session_name="s", identity="sensitive")
+        assert err is None and env[MANAGED_LEASE_ENV] == "lease-s"
+        assert [a["identity"] for a in state.acquires] == ["", "sensitive"]
+    finally:
+        httpd.shutdown()
+
+
+def test_session_name_is_not_shared_across_tasks(monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        assert _resolve(port, monkeypatch, task_id="cron-run-1", session_name="x")[0] is None
+        assert _resolve(port, monkeypatch, task_id="cron-run-2", session_name="x")[0] is None
+        assert [a["task"] for a in state.acquires] == ["cron-run-1", "cron-run-2"]
+    finally:
+        httpd.shutdown()
+
+
+def test_unreachable_control_while_checking_cache_fails_closed(monkeypatch):
+    state = _State()
+    httpd, port = _start(state)
+    _managed_env(monkeypatch, port)
+    assert _resolve(port, monkeypatch, task_id="t1")[0] is None
+    httpd.shutdown()
+    httpd.server_close()
+    err, env = _resolve(port, monkeypatch, task_id="t1")
+    assert err.startswith("unavailable:") and "BU_CDP_URL" not in env
+
+
+def test_post_read_timeout_is_unavailable_not_a_crash(monkeypatch):
+    import tools.browser_control_route as route
+
+    def boom(*_a, **_k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(route, "urlopen", boom)
+    out = route._post("http://127.0.0.1:9", "/v1/acquire", {})
+    assert out["error"] == "unavailable" and "timed out" in out["detail"]
