@@ -91,7 +91,7 @@ def _denied_terminal(command="dangerous thing"):
     return A.check_all_command_guards(command, "local")
 
 
-def _denied_execute_code(code="print('x')"):
+def _denied_execute_code(code="import os; print('x')"):
     return A.check_execute_code_guard(code, "local")
 
 
