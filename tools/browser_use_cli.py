@@ -38,6 +38,37 @@ _BOT_DESKTOP_BROWSER_SENTINEL = "_HERMES_BU_BOT_DESKTOP_BROWSER"
 # harness daemon attaches to the first existing page at startup, so two fresh named daemons can land on the
 # SAME tab. Steering each onto a tab it created prevents clobbering. Runs once per daemon (marker keyed by
 # BU_NAME + daemon pid).
+# Prepended in monolith managed mode. browser_harness gives every CDP round trip 5 s (no env knob);
+# heavy WebGL / SPA pages time Runtime.evaluate out. Only rewrites the stock defaults, so a harness
+# that changes them is left alone. HERMES_BH_IPC_TIMEOUT_S overrides the 30 s.
+_MANAGED_TIMEOUT_PREAMBLE = """\
+# hermes: managed slot CDP timeout
+def _hermes_ipc_timeout():
+    import os as _os
+    try:
+        import browser_harness.helpers as _bh
+        _t = float(_os.environ.get("HERMES_BH_IPC_TIMEOUT_S", "30"))
+        if _bh._send.__defaults__ == (5.0,):
+            _bh._send.__defaults__ = (_t,)
+        if _bh.cdp.__defaults__ == (None, 5.0):
+            _bh.cdp.__defaults__ = (None, _t)
+    except Exception:
+        pass
+_hermes_ipc_timeout()
+del _hermes_ipc_timeout
+"""
+
+# The harness reports any 403 from the CDP endpoint as Chrome's "Allow remote debugging" popup. Behind
+# monolith browser-control a 403 is the gate refusing a lease token; say that instead.
+_GATE_REFUSED_HINT = (
+    "managed browser gate refused the lease (HTTP 403): it expired, was released or recycled, or a "
+    "human holds the browser. Retry the call; there is no Chrome popup to accept."
+)
+_IPC_LINE_HINT = (
+    "browser_exec sent the harness a single request over its 64 KiB IPC line limit (a very large js() "
+    "expression or CDP params). Write large data to $BH_AGENT_WORKSPACE and send it in smaller pieces."
+)
+
 _OWN_TAB_PREAMBLE = """\
 # hermes: pin this named session to its own tab (once per daemon process)
 def _hermes_ensure_own_tab():
@@ -650,6 +681,13 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
     if session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
+    try:
+        from tools.browser_control_route import is_managed as _code_is_managed
+    except Exception:
+        _code_is_managed = lambda: False  # noqa: E731
+    managed = _code_is_managed()
+    if managed:
+        code = _MANAGED_TIMEOUT_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
     if workspace:
@@ -689,6 +727,25 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         dispatched = run_fenced({"features": {"local": True}}, dispatch)
     else:
         dispatched = dispatch()
+    if (
+        managed
+        and "proc" in dispatched
+        and "permission-blocked" in (dispatched["proc"].stderr or "")
+    ):
+        # The harness fails at daemon connect, before running any of the code, so one retry is
+        # safe. Re-resolving checks the held lease with control and re-acquires if it died.
+        before = env.get("BU_CDP_URL", "")
+        rerouted = dict(env)
+        rerouted.pop("BU_CDP_URL", None)
+        rerouted.pop("BU_CDP_WS", None)
+        if not _route_backend(
+            rerouted, session, task_id, False, mode=mode, identity=identity, qa_targets=qa_targets,
+        ) and rerouted.get("BU_CDP_URL") and rerouted.get("BU_CDP_URL") != before:
+            rerouted.pop(_PRIVATE_BROWSER_SENTINEL, None)
+            rerouted.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
+            env.clear()
+            env.update(rerouted)
+            dispatched = dispatch()
     if "proc" not in dispatched:
         if "error_result" in dispatched:
             return dispatched["error_result"]
@@ -707,6 +764,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     if session:
         result["session"] = session
     stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
+    if managed and "permission-blocked" in stderr:
+        stderr = _GATE_REFUSED_HINT + "\n" + stderr
+    if "chunk is longer than limit" in stderr or "chunk is longer than limit" in (proc.stdout or ""):
+        stderr = _IPC_LINE_HINT + ("\n" + stderr if stderr else "")
     if len(stderr) > _STDERR_CAP_CHARS:
         stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
     if stderr:
