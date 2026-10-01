@@ -421,6 +421,28 @@ def release_lease(env: Dict[str, str]) -> Optional[str]:
     return None
 
 
+def release_task_leases(owners: Any) -> int:
+    """Release every lease held for these task ids; returns how many.
+
+    The gateway is long-lived, so atexit never fires and a lease held by a
+    finished session, a /new or /reset, or a completed cron run used to
+    stay with control until its idle sweep, starving the slot pool. Call
+    from the agent's close path, off the event loop (blocking HTTP).
+    """
+    wanted = {str(owner).strip() for owner in (owners or ()) if str(owner or "").strip()}
+    if not wanted:
+        return 0
+    with _held_lock:
+        keys = [key for key in _held_leases if key.split("|", 1)[0] in wanted]
+        snapshots = [_held_leases.pop(key) for key in keys]
+    for snapshot in snapshots:
+        try:
+            release_lease(snapshot)
+        except Exception:
+            pass
+    return len(snapshots)
+
+
 def release_all_held_leases() -> None:
     with _held_lock:
         held = list(_held_leases.values())

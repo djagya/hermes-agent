@@ -134,8 +134,16 @@ class ClientLifecycleMixin:
                 if owner and owner != task_id:
                     clear_file_ops_cache(owner)
 
+        def release_browser_leases() -> None:
+            # browser_exec holds managed browser-control leases outside the
+            # built-in browser sessions cleanup_browser knows about; the
+            # owner set covers cron's ``cron:<job>:<run>`` task ids and any
+            # session id compression rotated in.
+            from tools.browser_control_route import release_task_leases
+            release_task_leases({task_id, *getattr(self, "_process_owner_task_ids", ())})
+
         for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id),
-                     release_computer_use, forget_file_state):
+                     release_browser_leases, release_computer_use, forget_file_state):
             _quietly(step)
 
     def _client_log_context(self) -> str:
