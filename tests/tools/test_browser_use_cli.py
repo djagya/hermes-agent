@@ -921,7 +921,8 @@ class TestBrowserExec:
         result = json.loads(bu_cli.browser_exec('print("hi")'))
         assert result["success"] is True
         assert result["exit_code"] == 0
-        assert 'got:print("hi")' in result["output"]
+        assert result["output"].startswith("got:" + bu_cli._WORKSPACE_PREAMBLE)
+        assert result["output"].rstrip().endswith('print("hi")')
         assert "session" not in result
 
     def test_session_sets_bu_name(self, tmp_path, monkeypatch):
@@ -945,6 +946,79 @@ class TestBrowserExec:
         assert result["success"] is False
         assert result["exit_code"] == 3
         assert "boom" in result["stderr"]
+
+    def test_workspace_preamble_binds_workspace(self, tmp_path, monkeypatch):
+        """The description names `workspace`; it must resolve as a bare name in the executed code."""
+        import ast
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        monkeypatch.setenv("BH_AGENT_WORKSPACE", str(ws))
+        cli = _fake_cli(tmp_path, f'exec "{sys.executable}" -\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(bu_cli.browser_exec("print('ws=' + workspace)"))
+        assert result["success"] is True, result
+        assert result["output"].strip() == f"ws={ws}"
+        assert result["workspace"] == str(ws)
+        # a single line, so tracebacks into the model's code shift by exactly one
+        assert bu_cli._WORKSPACE_PREAMBLE.count("\n") == 1
+        ast.parse(bu_cli._WORKSPACE_PREAMBLE + "print(workspace)")
+
+    def test_no_workspace_no_preamble(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(bu_cli, "_workspace_dir", lambda task_id: None)
+        cli = _fake_cli(tmp_path, "cat\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(bu_cli.browser_exec("print(1)"))
+        assert result["output"] == "print(1)"
+        assert "workspace" not in result
+
+    def test_name_error_guide_rewritten(self, tmp_path, monkeypatch):
+        """browser-use 0.13.10 _unknown_helper_message: traceback, then its generic CLI 3.0 guide."""
+        cli_stderr = (
+            "Traceback (most recent call last):\n"
+            '  File "<string>", line 3, in <module>\n'
+            "NameError: name 'workspace' is not defined\n"
+            "'workspace' is not defined in the browser-use CLI.\n\n"
+            "Example:\n  browser-use <<'PY'\n  new_tab(\"https://example.com\")\n  print(page_info())\n  PY\n\n"
+            "Core helpers: new_tab(url), goto_url(url), page_info(), capture_screenshot(),\n"
+            "  list_tabs(), switch_tab(target), close_tab(target)\n\n"
+            "Read the full interface now:   browser-use skill show\n"
+            "Install the CLI 3.0 skill (upgrades the CLI and replaces any pre-existing browser-use skill):\n"
+            "                               browser-use skill install\n"
+            "Health check:                  browser-use --doctor\n"
+        )
+        (tmp_path / "err.txt").write_text(cli_stderr, encoding="utf-8")
+        cli = _fake_cli(tmp_path, f'cat > /dev/null\ncat "{tmp_path / "err.txt"}" >&2\nexit 2\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(bu_cli.browser_exec("print(workspace)"))
+        stderr = result["stderr"]
+        assert result["success"] is False
+        assert "NameError: name 'workspace' is not defined" in stderr  # the traceback stays
+        for gone in ("--doctor", "Core helpers:", "Read the full interface now:", "Health check:", "Example:"):
+            assert gone not in stderr
+        assert stderr.endswith(bu_cli._NAME_ERROR_HINT.format(name="workspace"))
+        assert "not a browser or daemon fault" in stderr
+        assert "HERMES_BROWSER_LEASE_ID" in stderr
+
+    def test_name_error_unknown_shape_keeps_text(self):
+        """Without the stock guide markers nothing is cut; the hint is still appended."""
+        text = "'foo' is not defined in the browser-use CLI.\nsomething unexpected"
+        out = bu_cli._rewrite_name_error(text)
+        assert out.startswith(text)
+        assert out.endswith(bu_cli._NAME_ERROR_HINT.format(name="foo"))
+
+    def test_truncated_stderr_keeps_final_exception_line(self, tmp_path, monkeypatch):
+        lines = [f'  File "<string>", line {i}, in frame_{i}' for i in range(400)]
+        big = "Traceback (most recent call last):\n" + "\n".join(lines) + "\nValueError: the real cause"
+        assert len(big) > bu_cli._STDERR_CAP_CHARS
+        (tmp_path / "err.txt").write_text(big, encoding="utf-8")
+        cli = _fake_cli(tmp_path, f'cat > /dev/null\ncat "{tmp_path / "err.txt"}" >&2\nexit 1\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        stderr = json.loads(bu_cli.browser_exec("print(1)"))["stderr"]
+        assert len(stderr) <= bu_cli._STDERR_CAP_CHARS
+        assert stderr.startswith("Traceback (most recent call last):")
+        assert "(stderr truncated)" in stderr
+        assert stderr.endswith("ValueError: the real cause")
 
 
 

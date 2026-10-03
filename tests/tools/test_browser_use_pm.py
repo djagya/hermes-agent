@@ -63,7 +63,7 @@ def main():
     child = json.loads(result["output"])
     # Windows console-script launchers report sys.argv[0] without the .exe suffix.
     assert Path(child["argv"][0]).with_suffix("") == binary.with_suffix("")
-    assert child["stdin"] == "print('payload')"
+    assert child["stdin"] == bu._WORKSPACE_PREAMBLE + "print('payload')"
     for key in ("PYTHONPATH", "PYTHONHOME", "OPENAI_API_KEY", "_HERMES_BU_PRIVATE_BROWSER"):
         assert key not in child["env"]
     assert child["env"]["BU_NAME"] == "research"
