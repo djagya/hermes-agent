@@ -6,8 +6,20 @@ import sys
 from pathlib import Path
 
 
-def _refuse_url(url: str, timeout=10, ssl_context=None):  # noqa: ARG001
-    raise RuntimeError(f"refusing URL fetch: {url}")
+def _refusing_fetcher():
+    """A URLFetcher that refuses every fetch.
+
+    WeasyPrint 70 reads ``_fail_on_errors`` off the fetcher when a fetch
+    raises, so a bare function crashes the render on the first refused
+    resource; a URLFetcher subclass keeps refusal a logged warning.
+    """
+    from weasyprint.urls import URLFetcher
+
+    class RefuseURLFetcher(URLFetcher):
+        def fetch(self, url, headers=None):  # noqa: ARG002
+            raise RuntimeError(f"refusing URL fetch: {url}")
+
+    return RefuseURLFetcher()
 
 
 def main(argv: list[str]) -> int:
@@ -24,7 +36,7 @@ def main(argv: list[str]) -> int:
     # Disk HTML has no HTTP charset hint; WeasyPrint then defaults to
     # Latin-1 and stores UTF-8 bytes as WinAnsi (Cyrillic becomes
     # mojibake). Local Sera documents are UTF-8.
-    HTML(filename=str(src), encoding="utf-8", url_fetcher=_refuse_url).write_pdf(
+    HTML(filename=str(src), encoding="utf-8", url_fetcher=_refusing_fetcher()).write_pdf(
         str(dest)
     )
     return 0
