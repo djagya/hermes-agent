@@ -212,6 +212,9 @@ class Context:
                 take(")")
                 if text in STATUS_FUNCTIONS and not args:
                     return lambda: self._status(text)
+                if text in STRING_FUNCTIONS and len(args) == 2:
+                    fn, (left, right) = STRING_FUNCTIONS[text], args
+                    return lambda: fn(left(), right())
 
                 def unsupported():
                     raise StepError(f"unsupported function: {text}()")
@@ -344,6 +347,20 @@ def _to_str(value: object) -> str:
     if isinstance(value, float):
         return str(int(value)) if value.is_integer() else str(value)
     return str(value)
+
+def _contains(search: object, item: object) -> bool:
+    """GitHub ``contains``: array membership, else case-insensitive substring."""
+    if isinstance(search, (list, tuple)):
+        return any(_equal(element, item) for element in search)
+    return _to_str(item).casefold() in _to_str(search).casefold()
+
+
+# GitHub's string functions compare case-insensitively.
+STRING_FUNCTIONS = {
+    "startsWith": lambda s, v: _to_str(s).casefold().startswith(_to_str(v).casefold()),
+    "endsWith": lambda s, v: _to_str(s).casefold().endswith(_to_str(v).casefold()),
+    "contains": _contains,
+}
 
 
 def workflow_inputs(workflow: dict, given: dict[str, str]) -> dict[str, object]:
