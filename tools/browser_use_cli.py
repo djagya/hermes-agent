@@ -69,6 +69,27 @@ _IPC_LINE_HINT = (
     "expression or CDP params). Write large data to $BH_AGENT_WORKSPACE and send it in smaller pieces."
 )
 
+# Prepended (one line, so tracebacks shift by one) whenever a workspace is set: the description calls the
+# workspace dir `workspace`, and models use it as a bare name.
+_WORKSPACE_PREAMBLE = 'workspace = __import__("os").environ.get("BH_AGENT_WORKSPACE", "")\n'
+
+# On a NameError in the piped code the pinned CLI (browser_use/cli.py _unknown_helper_message) prints
+# "'<name>' is not defined in the browser-use CLI." then an Example block and its generic CLI 3.0 guide
+# ("Core helpers: …", "browser-use skill install", "Health check: browser-use --doctor"). Running
+# `skill install` would upgrade the pinned CLI, so swap the guide for a hint about the actual fault.
+_NAME_ERROR_RE = re.compile(r"'([A-Za-z_][A-Za-z0-9_]*)' is not defined in the browser-use CLI\.")
+_CLI_GUIDE_MARKERS = ("Core helpers:", "Read the full interface now:", "Health check:")
+_NAME_ERROR_HINT = (
+    "browser_exec: NameError — {name!r} is not defined in YOUR code; this is a bug in the submitted "
+    "Python, not a browser or daemon fault. Python variables do NOT persist between calls (fresh "
+    "interpreter each call): redefine them, or persist data in workspace files. The workspace dir is the "
+    "pre-bound `workspace` variable (= os.environ['BH_AGENT_WORKSPACE']); on managed slots the browser "
+    "lease id is os.environ['HERMES_BROWSER_LEASE_ID']. Do not run the browser-use doctor check or "
+    "`skill install` (the CLI is pinned; install would upgrade it) — fix the code and retry."
+)
+_STDERR_TRUNCATED = "\n… (stderr truncated) …\n"
+_STDERR_HEAD_CHARS = 1000
+
 _OWN_TAB_PREAMBLE = """\
 # hermes: pin this named session to its own tab (once per daemon process)
 def _hermes_ensure_own_tab():
@@ -107,7 +128,7 @@ del _hermes_ensure_own_tab
 _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
-_STDERR_CAP_CHARS = 4000
+_STDERR_CAP_CHARS = 4000  # total, including the truncation marker
 
 _TASK_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")  # filesystem-safe task ids
 # Screenshot paths printed by capture_screenshot(): POSIX or Windows drive-letter absolute.
@@ -302,6 +323,24 @@ def install_cli(timeout_s: int = 600) -> Tuple[bool, str]:
     except Exception as exc:
         return False, f"Could not install browser-use CLI: {exc}"
     return True, f"browser-use CLI installed ({binary})"
+
+
+def _rewrite_name_error(stderr: str) -> str:
+    """Replace the CLI's generic NameError guide with a hint about the model's code."""
+    m = _NAME_ERROR_RE.search(stderr)
+    if not m:
+        return stderr
+    if any(marker in stderr[m.end():] for marker in _CLI_GUIDE_MARKERS):
+        stderr = stderr[:m.start()]  # the stock CLI message + Example + CLI 3.0 guide: drop it
+    return stderr.rstrip() + "\n" + _NAME_ERROR_HINT.format(name=m.group(1))
+
+
+def _cap_stderr(stderr: str) -> str:
+    """Cap stderr at _STDERR_CAP_CHARS keeping head AND tail: a traceback's final exception line is last."""
+    if len(stderr) <= _STDERR_CAP_CHARS:
+        return stderr
+    tail = _STDERR_CAP_CHARS - _STDERR_HEAD_CHARS - len(_STDERR_TRUNCATED)
+    return stderr[:_STDERR_HEAD_CHARS] + _STDERR_TRUNCATED + stderr[-tail:]
 
 
 def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
@@ -692,6 +731,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     workspace = _workspace_dir(task_id)
     if workspace:
         env["BH_AGENT_WORKSPACE"] = workspace
+        code = _WORKSPACE_PREAMBLE + code
 
     # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no local
     # Chrome/CDP endpoint is reachable (their API key authenticates it)
@@ -768,8 +808,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         stderr = _GATE_REFUSED_HINT + "\n" + stderr
     if "chunk is longer than limit" in stderr or "chunk is longer than limit" in (proc.stdout or ""):
         stderr = _IPC_LINE_HINT + ("\n" + stderr if stderr else "")
-    if len(stderr) > _STDERR_CAP_CHARS:
-        stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
+    if "is not defined in the browser-use CLI" in stderr:
+        stderr = _rewrite_name_error(stderr)
+    stderr = _cap_stderr(stderr)
     if stderr:
         result["stderr"] = stderr
     screenshot = _find_screenshot(proc.stdout, started)
@@ -787,7 +828,8 @@ _HEADER_BASE = (
     "comment describing the step for the user in plain language, max 60 chars "
     "(e.g. `# Searching Amazon for paper towels`) — the UI shows it as the step label.\n\n"
     "STATE: the browser session and workspace persist across calls; Python variables do NOT (fresh "
-    "interpreter each call). The workspace dir is $BH_AGENT_WORKSPACE (also `workspace` in every result); "
+    "interpreter each call). The workspace dir is the pre-bound `workspace` variable (= $BH_AGENT_WORKSPACE, "
+    "also `workspace` in every result); "
     "functions defined in agent_helpers.py there are auto-imported into every call. For multi-item tasks "
     "('all N products / every entry'), append each batch to a JSON/CSV file in the workspace, then read it "
     "back and aggregate in code — dedupe/count/sort with Python, not in your head — and verify the "
