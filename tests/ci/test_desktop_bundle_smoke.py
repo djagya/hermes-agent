@@ -165,11 +165,16 @@ def test_signature_cache_saves_only_in_the_writable_build():
     assert setup['with']['cache-python'] is False
     assert setup['with']['save-tools-cache'] is False and setup['with']['save-node-cache'] is False
     action = hermes_yaml.safe_load((ROOT / '.github/actions/setup-pm/action.yml').read_text())
-    tools = next(step for step in action['runs']['steps'] if step.get('id') == 'tools-cache')
+    tools = next(step for step in action['runs']['steps'] if step.get('id') == 'tools-cache-save')
     # The assembly's save-tools-cache: false must turn the tool cache save off.
+    # dlz: the save is also limited to pushes to main / release/** refs.
     enabled = {'cache': 'true', 'save-tools-cache': 'true'}
-    assert gate(tools['if'], enabled, {}, job_if=False)
-    assert not gate(tools['if'], {**enabled, 'save-tools-cache': 'false'}, {}, job_if=False)
+    trusted = {'event_name': 'push', 'ref': 'refs/heads/main'}
+    assert gate(tools['if'], enabled, {}, job_if=False, github=trusted)
+    assert gate(tools['if'], enabled, {}, job_if=False, github={**trusted, 'ref': 'refs/heads/release/v1-dlz'})
+    assert not gate(tools['if'], {**enabled, 'save-tools-cache': 'false'}, {}, job_if=False, github=trusted)
+    assert not gate(tools['if'], enabled, {}, job_if=False, github={'event_name': 'pull_request', 'ref': 'refs/pull/1/merge'})
+    assert not gate(tools['if'], enabled, {}, job_if=False, github={'event_name': 'push', 'ref': 'refs/heads/feature'})
     assert all(not step.get('uses', '').startswith('actions/cache@') for step in assembly['steps'])
 
 

@@ -59,7 +59,7 @@ def test_render_and_conditions(repo):
     assert ctx.condition(None) is False
     assert ctx.condition("always() && steps.buildx.outcome != 'skipped'") is True
     with pytest.raises(rjl.StepError):
-        ctx.condition("contains(github.ref, 'x')")
+        ctx.condition("fromJSON(github.ref)")
     with pytest.raises(rjl.StepError):
         ctx.render("${{ format('{0}', 1) }}")
 
@@ -268,6 +268,24 @@ def test_expressions_follow_github_semantics(repo):
     assert ctx.render("${{ inputs.flag }}") == "true"
     with pytest.raises(rjl.StepError, match="hashFiles"):
         ctx.condition("hashFiles('x') == ''")
+
+
+def test_cache_save_is_a_local_no_op():
+    # setup-pm saves its tools cache only on push to main/release/**, which the
+    # gate simulates; a save must not fail the replay (nothing is saved locally).
+    assert "actions/cache/save@x".startswith(rjl.CACHE_ACTIONS)
+
+
+def test_string_functions_follow_github_semantics(repo):
+    ctx = ctx_for(repo)
+    ctx.inputs = {"ref": "refs/heads/release/v0.21.5-dlz", "labels": ["ci-reviewed"]}
+    # GitHub compares case-insensitively; setup-pm gates its cache save on startsWith
+    assert ctx.condition("startsWith(inputs.ref, 'refs/heads/RELEASE/')") is True
+    assert ctx.condition("startsWith(inputs.ref, 'refs/heads/main')") is False
+    assert ctx.condition("endsWith(inputs.ref, '-DLZ')") is True
+    assert ctx.condition("contains(inputs.ref, 'release')") is True
+    assert ctx.condition("contains(inputs.labels, 'CI-Reviewed')") is True
+    assert ctx.condition("contains(inputs.labels, 'other')") is False
 
 
 def test_workflow_call_inputs_default_and_job_if(repo):

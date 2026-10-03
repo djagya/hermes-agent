@@ -72,7 +72,7 @@ outputs:
     value: ${{ steps.prepare.outputs.target }}
   tools-cache-hit:
     description: Exact PM store cache hit.
-    value: ${{ steps.tools-cache.outputs.cache-hit || steps.tools-cache-restore.outputs.cache-hit }}
+    value: ${{ steps.tools-cache-restore.outputs.cache-hit }}
   python-cache-hit:
     description: Exact uv dependency cache hit.
     value: ${{ steps.python-cache.outputs.cache-hit || steps.python-cache-restore.outputs.cache-hit }}
@@ -113,21 +113,19 @@ runs:
     # The key covers the PM code and this action, not only the lock: a
     # provisioning change must re-run the cold path on every lane rather
     # than restore a store the previous code wrote.
-    - name: Cache verified PM tools
-      id: tools-cache
-      if: inputs.cache == 'true' && inputs.save-tools-cache == 'true'
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ${{ steps.prepare.outputs.store }}
-        key: setup-pm-tools-v1-${{ steps.prepare.outputs.target }}-${{ inputs.toolchain }}${{ steps.prepare.outputs.extra-packages }}-${{ hashFiles('pm/**', '.github/actions/setup-pm/**', 'scripts/ci/setup_toolchain.py') }}-${{ inputs.cache-suffix }}
-
-    - name: Restore verified PM tools without saving
+    # dlz: restore everywhere; save only from a push to main or release/**
+    # (step tools-cache-save). Per-PR saves (~0.17 GB each) filled the 10 GB
+    # repo cache and evicted the fork image's buildkit gha layers. The key
+    # also excludes __pycache__: the prepare step imports pm/ and writes
+    # pm/__pycache__/*.pyc (stamped with the checkout mtime) before hashFiles
+    # runs, so every job hashed to a fresh key and never hit.
+    - name: Restore verified PM tools
       id: tools-cache-restore
-      if: inputs.cache == 'true' && inputs.save-tools-cache == 'false'
+      if: inputs.cache == 'true'
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.prepare.outputs.store }}
-        key: setup-pm-tools-v1-${{ steps.prepare.outputs.target }}-${{ inputs.toolchain }}${{ steps.prepare.outputs.extra-packages }}-${{ hashFiles('pm/**', '.github/actions/setup-pm/**', 'scripts/ci/setup_toolchain.py') }}-${{ inputs.cache-suffix }}
+        key: setup-pm-tools-v1-${{ steps.prepare.outputs.target }}-${{ inputs.toolchain }}${{ steps.prepare.outputs.extra-packages }}-${{ hashFiles('pm/**', '.github/actions/setup-pm/**', 'scripts/ci/setup_toolchain.py', '!**/__pycache__/**') }}-${{ inputs.cache-suffix }}
 
     - name: Preserve and retrieve the pinned toolchain
       if: inputs.archive-inputs == 'true'
@@ -152,6 +150,17 @@ runs:
       run: |
         "$_PM_BOOTSTRAP" -S "$_PM_ACTION/../../../scripts/ci/setup_toolchain.py" install \
           --toolchain "$_PM_TOOLCHAIN" --packages "$_PM_PACKAGES" --home "$HERMES_HOME"
+
+    # dlz: saves the store as soon as install has verified it (was a post-job
+    # save on success). Trusted long-lived refs only; PRs and feature branches
+    # restore their base/default branch entry instead of writing their own.
+    - name: Save verified PM tools
+      id: tools-cache-save
+      if: inputs.cache == 'true' && inputs.save-tools-cache == 'true' && steps.tools-cache-restore.outputs.cache-hit != 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.prepare.outputs.store }}
+        key: ${{ steps.tools-cache-restore.outputs.cache-primary-key }}
 
     - name: Cache uv dependency downloads and builds
       id: python-cache

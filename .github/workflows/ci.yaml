@@ -47,6 +47,9 @@ on:
         type: boolean
         default: false
   pull_request:
+    # dlz: the defaults plus ready_for_review. Draft PRs skip every lane (see
+    # detect/all-checks-pass); marking the PR ready fans out the full run.
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
 
@@ -81,6 +84,10 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
+    # dlz: no runners for draft PRs (the account shares a 40-job concurrency
+    # cap). Every lane needs detect, so they all skip with it; non-draft PRs,
+    # push, dispatch and workflow_call (no pull_request payload) are unchanged.
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 3
     outputs:
@@ -380,7 +387,8 @@ jobs:
       # its own check. It was never required here, because it is too slow
       # to block a merge. A separate run also stops it from holding this
       # run open. That is what blocked ``gh run rerun``.
-    if: always()
+    # dlz: skipped (not a vacuous green) on drafts; ready_for_review re-runs it.
+    if: always() && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:

@@ -22,8 +22,10 @@ Supported ``uses:``:
                               ``steps`` context, ``github.action_path`` and
                               outputs (e.g. ./.github/actions/setup-pm installs
                               the pinned PM toolchain as in CI; ./.github/actions/retry)
-  actions/cache[/restore]     a cache miss (no outputs): the steps after it
-                              take CI's cold path; nothing is ever saved
+  actions/cache[/restore|/save]
+                              a cache miss (no outputs): the steps after it
+                              take CI's cold path; a save is a no-op, nothing
+                              is ever saved
   ./.github/actions/setup-pm/prune
                               skipped (prunes the uv cache before actions/cache
                               saves it; the gate never saves a cache)
@@ -212,6 +214,9 @@ class Context:
                 take(")")
                 if text in STATUS_FUNCTIONS and not args:
                     return lambda: self._status(text)
+                if text in STRING_FUNCTIONS and len(args) == 2:
+                    fn, (left, right) = STRING_FUNCTIONS[text], args
+                    return lambda: fn(left(), right())
 
                 def unsupported():
                     raise StepError(f"unsupported function: {text}()")
@@ -344,6 +349,20 @@ def _to_str(value: object) -> str:
     if isinstance(value, float):
         return str(int(value)) if value.is_integer() else str(value)
     return str(value)
+
+def _contains(search: object, item: object) -> bool:
+    """GitHub ``contains``: array membership, else case-insensitive substring."""
+    if isinstance(search, (list, tuple)):
+        return any(_equal(element, item) for element in search)
+    return _to_str(item).casefold() in _to_str(search).casefold()
+
+
+# GitHub's string functions compare case-insensitively.
+STRING_FUNCTIONS = {
+    "startsWith": lambda s, v: _to_str(s).casefold().startswith(_to_str(v).casefold()),
+    "endsWith": lambda s, v: _to_str(s).casefold().endswith(_to_str(v).casefold()),
+    "contains": _contains,
+}
 
 
 def workflow_inputs(workflow: dict, given: dict[str, str]) -> dict[str, object]:
@@ -562,7 +581,7 @@ def setup_uv(with_: dict, ctx: Context, tools: Path) -> None:
 TRANSLATED_ACTIONS = ("docker/build-push-action@", "astral-sh/setup-uv@")
 # A cache step is a miss locally (no outputs, nothing restored or saved), so the
 # steps after it take CI's cold path; cache contents never change a verdict.
-CACHE_ACTIONS = ("actions/cache@", "actions/cache/restore@")
+CACHE_ACTIONS = ("actions/cache@", "actions/cache/restore@", "actions/cache/save@")
 # Local actions a gate need not run, with the reason printed in the log.
 SKIPPED_LOCAL_ACTIONS = {
     "./.github/actions/setup-pm/prune": "prunes the uv cache before actions/cache"
