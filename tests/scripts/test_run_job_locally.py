@@ -270,6 +270,12 @@ def test_expressions_follow_github_semantics(repo):
         ctx.condition("hashFiles('x') == ''")
 
 
+def test_cache_save_is_a_local_no_op():
+    # setup-pm saves its tools cache only on push to main/release/**, which the
+    # gate simulates; a save must not fail the replay (nothing is saved locally).
+    assert "actions/cache/save@x".startswith(rjl.CACHE_ACTIONS)
+
+
 def test_string_functions_follow_github_semantics(repo):
     ctx = ctx_for(repo)
     ctx.inputs = {"ref": "refs/heads/release/v0.21.5-dlz", "labels": ["ci-reviewed"]}
