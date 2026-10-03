@@ -655,3 +655,120 @@ def test_gate_403_is_explained_and_retried_on_a_fresh_lease(tmp_path, monkeypatc
         assert result["stderr"].startswith("managed browser gate refused the lease (HTTP 403)")
     finally:
         httpd.shutdown()
+
+
+def _fake_control(monkeypatch, acquire):
+    """Route with no HTTP: ``_acquire`` is faked, every held lease is live."""
+    import tools.browser_control_route as route
+
+    monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("HERMES_BROWSER_CONTROL_KEY", "secret-key")
+    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+    monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
+    monkeypatch.setattr(route, "_acquire", acquire)
+    monkeypatch.setattr(route, "_lease_alive", lambda control, lease_id: True)
+    return route
+
+
+def _run_parallel(calls):
+    """Run ``(env, kwargs)`` resolve calls on threads released together."""
+    import threading
+
+    gate = threading.Barrier(len(calls))
+    errors = [None] * len(calls)
+
+    def _one(index, env, kwargs):
+        gate.wait(timeout=5)
+        errors[index] = resolve_managed_cdp(env, **kwargs)
+
+    threads = [
+        Thread(target=_one, args=(index, env, kwargs)) for index, (env, kwargs) in enumerate(calls)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "resolve_managed_cdp deadlocked"
+    return errors
+
+
+def test_parallel_same_key_acquires_once_and_shares_the_lease(monkeypatch):
+    import threading
+    import time
+
+    count_lock = threading.Lock()
+    acquired = []
+
+    def _slow_acquire(control, *, task, mode, identity, qa_targets):
+        with count_lock:
+            acquired.append(task)
+            n = len(acquired)
+        time.sleep(0.2)
+        return dict(DEFAULT_LEASE, lease_id=f"lease-{n}", command_token=f"tok-{n}")
+
+    route = _fake_control(monkeypatch, _slow_acquire)
+    kwargs = {"task_id": "t1", "mode": "research", "identity": "shopping"}
+    env_a, env_b = {}, {}
+    errors = _run_parallel([(env_a, kwargs), (env_b, kwargs)])
+    assert errors == [None, None]
+    assert acquired == ["t1"]
+    assert env_a[MANAGED_LEASE_ENV] == env_b[MANAGED_LEASE_ENV] == "lease-1"
+    assert env_a["BU_CDP_URL"] == env_b["BU_CDP_URL"]
+    assert route._key_locks == {}
+
+
+def test_parallel_different_keys_acquire_concurrently(monkeypatch):
+    import threading
+
+    # Both acquires must be in flight at once to pass the barrier; a
+    # serialized (global) lock would break it and fail the call.
+    both_in_flight = threading.Barrier(2)
+    acquired = []
+
+    def _rendezvous_acquire(control, *, task, mode, identity, qa_targets):
+        acquired.append(identity)
+        try:
+            both_in_flight.wait(timeout=5)
+        except threading.BrokenBarrierError:
+            return {"error": "unavailable", "detail": "acquires were serialized"}
+        return dict(DEFAULT_LEASE, lease_id=f"lease-{identity}")
+
+    _fake_control(monkeypatch, _rendezvous_acquire)
+    env_a, env_b = {}, {}
+    errors = _run_parallel(
+        [
+            (env_a, {"task_id": "t1", "identity": "shopping"}),
+            (env_b, {"task_id": "t1", "identity": "work:default"}),
+        ]
+    )
+    assert errors == [None, None]
+    assert sorted(acquired) == ["shopping", "work:default"]
+    assert env_a[MANAGED_LEASE_ENV] == "lease-shopping"
+    assert env_b[MANAGED_LEASE_ENV] == "lease-work:default"
+
+
+def test_parallel_same_key_waiter_reacquires_after_a_failed_acquire(monkeypatch):
+    import threading
+    import time
+
+    count_lock = threading.Lock()
+    acquired = []
+
+    def _fail_then_lease(control, *, task, mode, identity, qa_targets):
+        with count_lock:
+            acquired.append(task)
+            n = len(acquired)
+        time.sleep(0.1)
+        if n == 1:
+            return {"error": "busy", "detail": "slot queued"}
+        return dict(DEFAULT_LEASE, lease_id="lease-2", command_token="tok-2")
+
+    route = _fake_control(monkeypatch, _fail_then_lease)
+    kwargs = {"task_id": "t1", "identity": "shopping"}
+    env_a, env_b = {}, {}
+    errors = _run_parallel([(env_a, kwargs), (env_b, kwargs)])
+    assert len(acquired) == 2
+    assert sorted(err is None for err in errors) == [False, True]
+    assert any(err and err.startswith("busy:") for err in errors)
+    assert (env_a or env_b)[MANAGED_LEASE_ENV] == "lease-2"
+    assert route._key_locks == {}

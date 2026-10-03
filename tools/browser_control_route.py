@@ -16,7 +16,8 @@ import atexit
 import json
 import os
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -39,6 +40,9 @@ STATUS_TIMEOUT_S = 10.0
 
 _held_lock = threading.Lock()
 _held_leases: Dict[str, Dict[str, str]] = {}
+# Hold key -> [lock, users]. Guarded by ``_held_lock``; an entry lives only
+# while a caller is inside :func:`_single_flight` for that key.
+_key_locks: Dict[str, List[Any]] = {}
 
 
 class ManagedBrowserError(Exception):
@@ -247,6 +251,33 @@ def _forget_held(key: str) -> None:
         _held_leases.pop(key, None)
 
 
+@contextmanager
+def _single_flight(key: str) -> Iterator[None]:
+    """Serialize resolve calls for one hold key; other keys stay concurrent.
+
+    Two parallel ``browser_exec`` calls in one turn (same task, identity and
+    mode) both missed the cache and both acquired; on a single-slot identity
+    the second came back ``busy``, queued behind its own task's lease. The
+    second caller now waits here and reuses the lease the first one stored.
+    Lock order is always key lock -> ``_held_lock``: ``_held_lock`` is only
+    taken briefly to look up / refcount the key lock, never held across the
+    network call.
+    """
+    with _held_lock:
+        entry = _key_locks.get(key)
+        if entry is None:
+            entry = _key_locks[key] = [threading.Lock(), 0]
+        entry[1] += 1
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _held_lock:
+            entry[1] -= 1
+            if entry[1] == 0 and _key_locks.get(key) is entry:
+                del _key_locks[key]
+
+
 def _acquire(
     control: str,
     *,
@@ -310,6 +341,31 @@ def resolve_managed_cdp(
     payload_mode = _coerce_mode(mode)
     payload_identity = str(identity or "")
     key = _hold_key(task_id, session_name, payload_identity, payload_mode)
+    with _single_flight(key):
+        return _resolve_held(
+            env,
+            control,
+            key,
+            task=str(task_id or session_name or "browser-exec"),
+            mode=payload_mode,
+            identity=payload_identity,
+            qa_targets=_coerce_targets(qa_targets),
+            reconnect=reconnect,
+        )
+
+
+def _resolve_held(
+    env: Dict[str, str],
+    control: str,
+    key: str,
+    *,
+    task: str,
+    mode: str,
+    identity: str,
+    qa_targets: List[str],
+    reconnect: bool,
+) -> Optional[str]:
+    """Reuse the live held lease for ``key`` or acquire one. Caller holds the key lock."""
     with _held_lock:
         cached = None if reconnect else _held_leases.get(key)
     if cached:
@@ -323,23 +379,20 @@ def resolve_managed_cdp(
         # own resumed lease back, or a fresh slot).
         _forget_held(key)
 
-    payload_targets = _coerce_targets(qa_targets)
-    task = str(task_id or session_name or "browser-exec")
-
     lease = _acquire(
         control,
         task=task,
-        mode=payload_mode,
-        identity=payload_identity,
-        qa_targets=payload_targets,
+        mode=mode,
+        identity=identity,
+        qa_targets=qa_targets,
     )
     if lease.get("error") == "stale":
         lease = _acquire(
             control,
             task=task,
-            mode=payload_mode,
-            identity=payload_identity,
-            qa_targets=payload_targets,
+            mode=mode,
+            identity=identity,
+            qa_targets=qa_targets,
         )
     if lease.get("error"):
         return _format_error(lease)
