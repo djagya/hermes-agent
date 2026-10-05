@@ -730,7 +730,7 @@ class _KanbanNotification:
             except Exception as art_exc:
                 if (sub.get("delivery_metadata") or {}).get("kanban_source"):
                     raise
-                logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
+                logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc, exc_info=True)
         return True
 
     async def _send_pings(self) -> bool:

@@ -1097,7 +1097,9 @@ def _handle_create(args: dict, **kw) -> str:
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
-        subs = kb.list_notify_subs(conn, new_tid)
+        from hermes_cli.kanban_db_notify import list_notify_subs
+
+        subs = list_notify_subs(conn, new_tid)
         source_subscribed = any(
             (sub.get("delivery_metadata") or {}).get("kanban_source")
             and (source_target is None or (

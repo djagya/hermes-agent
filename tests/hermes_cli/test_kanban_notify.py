@@ -25,6 +25,13 @@ def kanban_home(tmp_path, monkeypatch):
     # test silently drops files because ``tmp_path`` isn't inside the
     # default ``MEDIA_DELIVERY_SAFE_ROOTS`` cache dirs.
     monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
+    # Gateway modules may have been collected before this fixture. Keep their
+    # frozen launch-root denylist in the same isolated test home; never enumerate
+    # the parent pytest process's real profiles during media validation.
+    import gateway.platforms.base as media_base
+    monkeypatch.setattr(media_base, "_HERMES_ROOT", home)
+    monkeypatch.setattr(media_base, "_HERMES_HOME", home)
+    monkeypatch.setattr(media_base, "MEDIA_DELIVERY_SAFE_ROOTS", (home / "cache",))
     kb.init_db()
     return home
 
@@ -827,8 +834,9 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
     assert len(subs) == 1
     assert subs[0]["chat_id"] == "chat1"
     assert subs[0]["thread_id"] == "20197"
+    assert subs[0]["chat_type"] == "dm"
     assert subs[0]["delivery_metadata"] == {
-        "chat_type": "dm",
+        "kanban_source": True,
         "direct_messages_topic_id": "20197",
         "telegram_dm_topic_reply_fallback": True,
         "telegram_reply_to_message_id": "462",
