@@ -1277,6 +1277,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    source_notify_target: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1286,6 +1287,9 @@ def create_task(
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
+    ``source_notify_target``: internal trusted platform route, bound before commit;
+    never parsed from task body or accepted as model-supplied routing arguments.
+    Duplicate/idempotent create preserves the original route, not the retry caller.
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
@@ -1295,7 +1299,8 @@ def create_task(
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_db_notify import (
-        _fixed_notify_target,
+        _fixed_notify_targets,
+        _replace_fixed_notify_subs,
         _insert_notify_sub,
         add_notify_sub,
     )
@@ -1337,7 +1342,7 @@ def create_task(
     skills_list = _normalize_task_skills(skills)
     required_skills_list = _normalize_task_skills(required_skills)
 
-    fixed_notify_target = _fixed_notify_target()
+    fixed_notify_targets = _fixed_notify_targets(board)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1348,11 +1353,13 @@ def create_task(
             "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
         ).fetchone()
         if row:
-            if fixed_notify_target:
+            if fixed_notify_targets:
                 add_notify_sub(
                     conn,
                     task_id=row["id"],
-                    **fixed_notify_target,
+                    platform="",
+                    chat_id="",
+                    board=board,
                 )
             return row["id"]
 
@@ -1448,19 +1455,15 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
-                if fixed_notify_target:
+                if source_notify_target:
                     _insert_notify_sub(
+                        conn, task_id=task_id, **source_notify_target,
+                    )
+                if fixed_notify_targets:
+                    _replace_fixed_notify_subs(
                         conn,
                         task_id=task_id,
-                        delivery_metadata={
-                            key: value
-                            for key, value in {
-                                "thread_id": fixed_notify_target.get("thread_id"),
-                                "chat_type": fixed_notify_target.get("chat_type"),
-                            }.items()
-                            if value
-                        } or None,
-                        **fixed_notify_target,
+                        targets=fixed_notify_targets,
                     )
             return task_id
         except sqlite3.IntegrityError:
@@ -1522,20 +1525,27 @@ def _inherit_notify_subs(
     ).fetchone()
     cursor = int(row["cursor"] if row is not None else 0)
     placeholders = ",".join("?" * len(parent_ids))
-    conn.execute(
-        f"""
-        INSERT OR IGNORE INTO kanban_notify_subs
-            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-             chat_type, notifier_profile, delivery_mode, delivery_metadata,
-             created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
-               COALESCE(chat_type, 'dm'), notifier_profile,
-               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
-          FROM kanban_notify_subs
-         WHERE task_id IN ({placeholders})
-        """,
-        (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
-    )
+    rows = conn.execute(
+        f"SELECT * FROM kanban_notify_subs WHERE task_id IN ({placeholders})", parent_ids,
+    ).fetchall()
+    from hermes_cli.kanban_db_notify import _decode_notify_delivery_metadata, _encode_notify_delivery_metadata
+    for row in rows:
+        metadata = _decode_notify_delivery_metadata(row["delivery_metadata"])
+        # Delivery holds concern one task/event, never a descendant's obligation.
+        metadata.pop("kanban_delivery_hold", None)
+        metadata.pop("kanban_delivery_old_cursor", None)
+        conn.execute(
+            """INSERT OR IGNORE INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+                 chat_type, notifier_profile, delivery_mode, delivery_metadata,
+                 created_at, last_event_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (child_id, row["platform"], row["chat_id"], row["thread_id"],
+             row["user_id"], row["user_id_alt"], row["chat_type"] or "dm",
+             row["notifier_profile"], row["delivery_mode"] or "notify",
+             _encode_notify_delivery_metadata(metadata),
+             int(created_at if created_at is not None else time.time()), cursor),
+        )
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:

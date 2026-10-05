@@ -43,8 +43,8 @@ _FIXED_NOTIFY_CONFIG = {
         "fixed_notify_target": {
             "enabled": True,
             "platform": "telegram",
-            "chat_id": "-1003892608742",
-            "thread_id": "36822",
+            "chat_id": "fixture-chat",
+            "thread_id": "101",
             "chat_type": "group",
             "notifier_profile": "default",
         }
@@ -57,10 +57,25 @@ def _enable_fixed_notify_target(home: Path) -> None:
         YAML().dump(_FIXED_NOTIFY_CONFIG, stream)
 
 
+def _enable_board_routed_fixed_notify_target(home: Path) -> None:
+    config = {
+        "kanban": {
+            "fixed_notify_target": {
+                **_FIXED_NOTIFY_CONFIG["kanban"]["fixed_notify_target"],
+                "delivery_mode": "notify+wake",
+                "board_thread_overrides": {"board-alpha": "102"},
+                "board_wake_thread_overrides": {"board-split": "103"},
+            }
+        }
+    }
+    with (home / "config.yaml").open("w", encoding="utf-8") as stream:
+        YAML().dump(config, stream)
+
+
 def _assert_fixed_notify_sub(sub: dict, *, delivery_mode: str) -> None:
     assert sub["platform"] == "telegram"
-    assert sub["chat_id"] == "-1003892608742"
-    assert sub["thread_id"] == "36822"
+    assert sub["chat_id"] == "fixture-chat"
+    assert sub["thread_id"] == "101"
     assert sub["chat_type"] == "group"
     assert sub["notifier_profile"] == "default"
     assert sub["delivery_mode"] == delivery_mode
@@ -117,6 +132,75 @@ def test_fixed_notify_target_covers_idempotent_recreate(kanban_home):
     assert second == first
     assert len(subs) == 1
     _assert_fixed_notify_sub(subs[0], delivery_mode="notify")
+
+
+@pytest.mark.parametrize(
+    ("board", "expected"),
+    [
+        ("board-alpha", [("102", "notify+wake")]),
+        ("board-unlisted", [("101", "notify+wake")]),
+        ("board-split", [("101", "notify"), ("103", "wake")]),
+    ],
+)
+def test_fixed_notify_target_applies_board_routes_at_creation(
+    kanban_home, board, expected
+):
+    """Creation installs the final board route before a fast task can finish."""
+    _enable_board_routed_fixed_notify_target(kanban_home)
+
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="fast route", assignee="worker", board=board,
+        )
+        subs = kbn.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+
+    assert [(sub["thread_id"], sub["delivery_mode"]) for sub in subs] == expected
+    assert {sub["notifier_profile"] for sub in subs} == {"default"}
+
+
+def test_board_fixed_route_reconcile_is_exact_and_idempotent(kanban_home):
+    """A late caller cannot restore KAN or leave an extra destination behind."""
+    _enable_board_routed_fixed_notify_target(kanban_home)
+
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="exact route",
+            assignee="worker",
+            board="board-alpha",
+            idempotency_key="exact-board-route",
+        )
+        kbn.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="wrong-chat",
+            thread_id="101",
+            notifier_profile="wrong-profile",
+            delivery_mode="wake",
+            board="board-alpha",
+        )
+        same_task = kb.create_task(
+            conn,
+            title="exact route",
+            assignee="worker",
+            board="board-alpha",
+            idempotency_key="exact-board-route",
+        )
+        subs = kbn.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+
+    assert same_task == task_id
+    assert len(subs) == 1
+    assert subs[0]["chat_id"] == "fixture-chat"
+    assert subs[0]["thread_id"] == "102"
+    assert subs[0]["delivery_mode"] == "notify+wake"
+    assert subs[0]["notifier_profile"] == "default"
 
 
 def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
@@ -862,14 +946,17 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     # Allow ``tmp_path`` through the media-delivery safety filter. See the
     # companion test for the full explanation.
     monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
+    _enable_board_routed_fixed_notify_target(kanban_home)
 
     real_pdf = tmp_path / "real.pdf"
     real_pdf.write_bytes(b"%PDF-fake")
 
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="worker1")
-        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        tid = kb.create_task(conn, title="t", assignee="worker1", board="board-alpha")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1", board="board-alpha",
+        )
         # A dispatcher-spawned worker completes a card it holds a run on: bind the
         # run id like the dispatcher does, or the ownership CAS refuses (#116239).
         assert kb.claim_task(conn, tid) is not None
@@ -898,12 +985,14 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     fake_adapter.name = "telegram"
 
     documents_uploaded: list = []
+    document_metadata: list[dict] = []
 
     async def _send(chat_id, msg, metadata=None):
         runner._running = False
 
     async def _send_document(chat_id, file_path, metadata=None, **_kw):
         documents_uploaded.append(file_path)
+        document_metadata.append(metadata or {})
 
     fake_adapter.send = AsyncMock(side_effect=_send)
     fake_adapter.send_document = AsyncMock(side_effect=_send_document)
@@ -924,9 +1013,10 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
             timeout=10.0,
         )
 
-    # Only the real file was uploaded.
+    # Only the real file was uploaded, using the task's exact board route.
     assert len(documents_uploaded) == 1
     assert "real.pdf" in documents_uploaded[0]
+    assert document_metadata[0]["thread_id"] == "102"
 
 @pytest.mark.asyncio
 async def test_notifier_uploads_review_handoff_artifacts(kanban_home, tmp_path, monkeypatch):
