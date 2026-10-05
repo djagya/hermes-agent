@@ -1,0 +1,30 @@
+name: Payment policy checkpoint tests
+
+on:
+  push:
+    branches: ['feat/payment-policy-checkpoint']
+  pull_request:
+    branches: ['release/v0.21.5-dlz']
+    paths:
+      - 'agent/vault_payment_policy.py'
+      - 'tests/agent/test_vault_payment_policy.py'
+      - '.github/workflows/payment-policy-checkpoint.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-pm
+        with:
+          extras: '[]'
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: Policy tests only (not browser or payment acceptance)
+        run: scripts/run_tests.sh -j 2 --file-timeout 180 --file-retries 0 tests/agent/test_vault_payment_policy.py
