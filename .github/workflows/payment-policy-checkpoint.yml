@@ -1,4 +1,4 @@
-name: Payment policy checkpoint tests
+name: Native payment fill verification
 
 on:
   push:
@@ -7,6 +7,12 @@ on:
     branches: ['release/v0.21.5-dlz']
     paths:
       - 'agent/vault_payment_policy.py'
+      - 'agent/vault_payment_card.py'
+      - 'agent/vault_backends/**'
+      - 'agent/vault_store.py'
+      - 'tools/browser*'
+      - 'tests/tools/test_browser_vault*'
+      - 'tests/agent/test_vault_payment_card.py'
       - 'tests/agent/test_vault_payment_policy.py'
       - '.github/workflows/payment-policy-checkpoint.yml'
 
@@ -14,7 +20,7 @@ permissions:
   contents: read
 
 jobs:
-  policy:
+  native:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -26,5 +32,24 @@ jobs:
           extras: '[]'
           test-environment: 'true'
           prune-python-cache: true
-      - name: Policy tests only (not browser or payment acceptance)
-        run: scripts/run_tests.sh -j 2 --file-timeout 180 --file-retries 0 tests/agent/test_vault_payment_policy.py
+      - name: Card and login resolution contracts
+        run: |
+          scripts/run_tests.sh -j 2 --file-timeout 180 --file-retries 0 \
+            tests/agent/test_vault_payment_policy.py tests/agent/test_vault_payment_card.py \
+            tests/agent/test_vault_backends.py tests/tools/test_browser_vault.py \
+            tests/tools/test_browser_use_cli.py
+      - name: Real Chromium native fill and hosted-field refusals
+        env:
+          HERMES_E2E_BROWSER: '1'
+        run: |
+          google-chrome --version
+          scripts/run_tests.sh -j 1 --file-timeout 180 --file-retries 0 \
+            tests/tools/test_browser_vault_payment_live.py -m integration \
+            --junitxml=payment-browser-receipt.xml -o junit_family=xunit1 -o junit_logging=all
+      - name: Synthetic browser receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: payment-browser-receipt-${{ github.sha }}
+          path: payment-browser-receipt.xml
+          if-no-files-found: error
+          retention-days: 14

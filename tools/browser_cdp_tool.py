@@ -270,6 +270,12 @@ def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id:
     ``{"success": True, "method", "result"}`` or ``{"error": ...}``."""
     effective_task_id = task_id or "default"
 
+    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
+
+    if payment_session_sensitive(effective_task_id) and method in {
+            "Page.captureScreenshot", "Page.printToPDF", "Page.startScreencast", "Page.captureSnapshot"}:
+        return json.dumps(screenshot_refusal())
+
     if frame_id:
         blocked = _browser_cdp_private_guard(task_id=effective_task_id, method=method, params=params or {})
         if blocked:

@@ -555,54 +555,21 @@ class TestBrowserVaultTools:
         finally:
             redact.clear_vault_redaction_values()
 
-    def test_payment_fill_requires_confirmation_then_fills_card_fields(self, store):
-        """A card is written only after the user confirms (a prompt injection reaching a checkout must not be
-        able to spend); the secret eval then targets the classified card controls and the result carries
-        the field tokens but never a value."""
+    def test_payment_never_uses_secret_eval_fallback(self, store):
+        """Native cards require a supervisor; generic eval cannot carry card values.
+
+        Actual consent, resolution and hosted-field writes are covered by the
+        real Chromium integration file, rather than a green fake eval response.
+        """
         from tools import browser_vault_tool
-        from agent import redact
-
         meta = store.add_item(kind="payment", label="Visa", origin="https://shop.test", secret=_CARD)
-        controls = [
-            {"autocomplete": "cc-number", "index": 0, "type": "text"},
-            {"label": "Expiry (MM/YY)", "index": 1, "type": "text"},
-            {"label": "CVC", "index": 2, "type": "text"},
-            {"autocomplete": "email", "index": 3, "type": "email"},
-        ]
-
-        def fake_eval(task_id, expression):
-            if "location.href" in expression:
-                return {"success": True, "result": "https://shop.test/checkout"}
-            return {"success": True, "result": json.dumps(controls)}
-
-        secret_exprs = []
-
-        def fake_eval_secret(task_id, expression):
-            secret_exprs.append(expression)
-            return {"success": True, "result": json.dumps({"filled": 3})}
-
-        try:
-            with patch("agent.vault_store.get_vault_store", return_value=store), \
-                 patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
-                 patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_eval_secret), \
-                 patch("tools.approval_prompt.request_elicitation_consent", return_value="decline"):
-                declined = json.loads(browser_vault_tool.browser_vault_fill(meta.id))
-            assert declined["success"] is False and declined["error_type"] == "payment_declined"
-            assert secret_exprs == []
-
-            with patch("agent.vault_store.get_vault_store", return_value=store), \
-                 patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
-                 patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_eval_secret), \
-                 patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
-                raw = browser_vault_tool.browser_vault_fill(meta.id)
-            out = json.loads(raw)
-            assert out["success"] is True and out["fields"] == ["cc-csc", "cc-exp", "cc-number"]
-            assert _CARD["card_number"] not in raw and _CARD["cvc"] not in raw
-            assert len(secret_exprs) == 1 and _CARD["card_number"] in secret_exprs[0] and "07/29" in secret_exprs[0]
-            assert '"index": 3' not in secret_exprs[0]  # the email box is never a card target
-            assert _CARD["card_number"] not in redact.redact_sensitive_text(f"dom says {_CARD['card_number']}")
-        finally:
-            redact.clear_vault_redaction_values()
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_ensure_supervisor", return_value=None), \
+             patch.object(browser_vault_tool, "_eval_js_secret") as generic_eval, \
+             patch.object(store, "resolve_secret") as resolve:
+            out = json.loads(browser_vault_tool.browser_vault_fill(meta.id))
+        assert out["error_type"] == "supervisor_required"
+        assert not generic_eval.called and not resolve.called
 
 
 class TestVaultHardening:

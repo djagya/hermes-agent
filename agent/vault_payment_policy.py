@@ -1,8 +1,8 @@
-"""Metadata and consent rules for the disabled global-payment capability.
+"""Metadata and legacy whole-envelope contracts.
 
-No backend, browser, secret resolver or model tool is wired here. A valid snapshot
-is NOT an atomic browser-side commit authorization. Global fill stays unavailable
-until a whole-envelope interlock has independent Chromium evidence.
+A snapshot is not a whole-checkout atomic commit. That global primitive remains
+unavailable. Native human-confirmed, single-document filling is implemented in
+tools.browser_supervisor_payment and tools.browser_vault_payment instead.
 """
 from __future__ import annotations
 

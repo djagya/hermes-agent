@@ -102,13 +102,25 @@ class OnePasswordLoginBackend(LoginBackend):
     def list_items(self) -> List[VaultItemMeta]:
         if not self.is_unlocked():
             return []
-        args = ["item", "list", "--categories", "Login", "--format", "json"]
+        args = ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]
         configured_vault = str(self.cfg.get("vault") or "").strip()
         if configured_vault:
             args += ["--vault", configured_vault]
         raw = json.loads(self._run(*args) or "[]")
         out: List[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
+            if item.get("category") == "CREDIT_CARD":
+                from agent.vault_payment_policy import onepassword_payment_metadata
+
+                payment = onepassword_payment_metadata(item, configured_vault)
+                if payment is not None:
+                    # Cards are selected by handle, then authorized for the inspected
+                    # page in the human prompt. A bank website is not a merchant binding.
+                    out.append(VaultItemMeta(
+                        id=payment.handle, kind="payment", label=str(item.get("title") or "Payment card"),
+                        origin=None, created_at=str(item.get("created_at") or ""),
+                        payment_scope="confirmed_page", payment_frame_origins=("https://js.stripe.com",)))
+                continue
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origins = _all_origins(urls)
             if not origins:
@@ -152,6 +164,21 @@ class OnePasswordLoginBackend(LoginBackend):
             args += ["--vault", vault_id]
         args += ["--fields", "label=password", "--reveal"]
         return self._run(*args).rstrip("\r\n")
+
+    def resolve_secret(self, handle: str) -> Dict[str, str]:
+        """Reveal a single card only inside the trusted native filler, never in tool output."""
+        from agent.vault_payment_card import parse_onepassword_card
+
+        vault_id, item_id = _split_handle(handle, self.prefix)
+        if not vault_id:
+            raise ValueError("A vault-qualified card handle is required")
+        try:
+            raw = self._run("item", "get", item_id, "--vault", vault_id, "--format", "json", "--reveal")
+            return parse_onepassword_card(json.loads(raw), item_id=item_id, vault_id=vault_id)
+        except UnlockRequired:
+            raise
+        except Exception:
+            raise ValueError("Payment card resolution failed") from None
 
     def resolve_otp(self, handle: str) -> Optional[str]:
         # `--otp` mints the current TOTP from the item's one-time-password field; items without one error out.

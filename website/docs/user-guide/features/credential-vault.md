@@ -69,13 +69,35 @@ or the switch in **Settings → Passwords & Logins**.
 
 ## Paying and filling addresses
 
-Cards and addresses work the same way as logins: saved once (**Settings →
-Passwords & Logins → Add**, or `hermes vault add`), bound to the checkout site,
-and filled by the agent on that site only. **Every card fill asks you first**,
-with the same approval prompt as a dangerous command; declining writes nothing.
-Headless sessions (cron, webhooks, the API server) cannot confirm and are
-refused, so a prompt injection that reaches a checkout page can ask, but it
-cannot spend. Address fills need no confirmation.
+Local cards and addresses are saved once (**Settings → Passwords & Logins →
+Add**, or `hermes vault add`) and remain bound to their saved checkout origin.
+1Password Credit Card items are also listed as vault-qualified payment handles.
+They can be used on a chosen HTTPS merchant after a fresh human confirmation;
+there is no need to add merchant URLs or a global tag to the card.
+
+**Every card fill asks you first.** The prompt names the merchant and the
+document receiving the card, and expires after 120 seconds. Declining or a
+changed document/field set refuses the fill. To select one exact open tab,
+the agent uses `browser_vault_fill(handle, merchant_origin="https://shop.example")`.
+The native path resolves values internally and supports all card fields in
+one document: the merchant itself, or a Stripe (`https://js.stripe.com`) iframe,
+including an out-of-process iframe. Separate number/expiry/CVC documents,
+ambiguous controls, unapproved hosted origins and missing card fields are refused.
+No sequential split-frame fallback exists.
+
+HTTPS, ancestry and field identity checks are **not a seller reputation check**.
+Verify the seller and payment terms independently before approving. The selected
+document and its scripts receive the card as they would with manual entry. The
+fill is pinned to that document and its actual element references; it is not an
+atomic transaction across the entire checkout or a guarantee against a malicious
+merchant. A transport failure after ingress is uncertain: inspect and obtain
+fresh consent rather than treating failure as proof of zero writes.
+
+Filled controls are visually masked. Standard browser screenshot/PDF/recording
+entry points are disabled for that task after card ingress; use redacted text
+inspection. Arbitrary code/terminal execution is not a containment boundary
+(see `SECURITY.md`). Headless sessions cannot confirm and are refused. The native
+tool never clicks submit; address fills need no confirmation.
 
 ## Managing what's saved
 

@@ -1247,6 +1247,10 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     """Screenshot the current page for visual inspection. Native-vision models get the image
     attached to the conversation; otherwise the auxiliary vision model returns a text
     analysis. The file is kept and its path returned (MEDIA:<path>)."""
+    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
+
+    if payment_session_sensitive(task_id):
+        return json.dumps(screenshot_refusal())
     if _is_camofox_mode():
         return _camofox("camofox_vision", question, annotate, task_id)
 

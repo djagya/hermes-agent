@@ -789,6 +789,10 @@ def _run_browser_command(
     ``timeout=None`` reads ``browser.command_timeout``; ``_engine_override`` forces an engine
     for this call only (Lightpanda fallback retries with Chrome without touching global state)."""
     command_timeout: int = timeout if timeout is not None else _bt._safe_command_timeout()
+    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
+
+    if command in {"screenshot", "record", "pdf"} and payment_session_sensitive(task_id):
+        return screenshot_refusal()
     args = args or []
 
     preflight = _browser_command_preflight()

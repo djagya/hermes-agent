@@ -240,6 +240,10 @@ def browser_vault_list() -> str:
         for meta in metas:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
                      "origin": meta.origin, "available": meta.kind == "login" or bool(meta.origin)}
+            if meta.kind == "payment":
+                entry.update(available=True, payment_scope=meta.payment_scope,
+                             confirmation_required=True, supported_layout="single_document",
+                             hosted_origins=list(meta.payment_frame_origins or ("https://js.stripe.com",)))
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
@@ -397,7 +401,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                        "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
 
-def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
+def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_origin: str = "") -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -442,12 +446,13 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+    if meta.kind == "payment":
+        from tools.browser_vault_payment import fill_payment
+
+        return fill_payment(backend, meta, effective_task_id, merchant_origin)
     if meta.kind != "login" and not meta.origin:
         return json.dumps({"success": False, "error_type": "no_origin",
                            "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})
-    if meta.kind == "payment" and not _confirm_payment_fill(meta.label, str(meta.origin)):
-        return json.dumps({"success": False, "error_type": "payment_declined",
-                           "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
 
     # ── Origin binding pre-check (cheap early exit; the authoritative check
     # runs synchronously inside the fill script itself) ──────────────────────
@@ -625,8 +630,11 @@ BROWSER_VAULT_FILL_SCHEMA = {
         "the password field (type the identifier/username yourself first with the browser's input tool); a "
         "payment item fills card number/name/expiry/CVC after the user confirms in their UI; an address item "
         "fills the address fields. Values are resolved server-side and never appear in the conversation. "
-        "Refused unless the page origin exactly matches the item's bound origin (re-checked atomically at "
-        "fill time). If a password manager is locked the user is prompted to unlock first. Never retry a "
+        "Login/address fills require their bound origin. A 1Password card can be approved for a selected "
+        "HTTPS merchant; use merchant_origin to select its exact tab. Native card fill supports one "
+        "card document, including a Stripe hosted iframe, and refuses split/ambiguous fields. HTTPS "
+        "is not a seller reputation check: verify the merchant and checkout terms before requesting "
+        "consent. It never submits. If a password manager is locked the user is prompted to unlock first. Never retry a "
         "payment_declined result."
     ),
     "parameters": {
@@ -635,7 +643,9 @@ BROWSER_VAULT_FILL_SCHEMA = {
             "handle": {
                 "type": "string",
                 "description": "Handle from browser_vault_list (vault_… local, op:… 1Password, bw:… Bitwarden)",
-            }
+            },
+            "merchant_origin": {"type": "string", "description":
+                "For card fill, exact HTTPS merchant origin to select one open tab. Omit to inspect the supervisor's current tab."},
         },
         "required": ["handle"],
     },
@@ -717,7 +727,8 @@ def _handle_vault_unlock(args: Dict[str, Any], **kwargs) -> str:
 
 def _handle_vault_fill(args: Dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
-    return _fenced_page_op(tid, lambda: browser_vault_fill(handle=str(args.get("handle") or ""), task_id=tid))
+    return _fenced_page_op(tid, lambda: browser_vault_fill(handle=str(args.get("handle") or ""), task_id=tid,
+                                                       merchant_origin=str(args.get("merchant_origin") or "")))
 
 
 from tools.registry import no_cache_check_fn, registry  # noqa: E402
