@@ -269,11 +269,12 @@ import asyncio
 from types import SimpleNamespace
 
 
-def _fake_response(status, url, body):
+def _fake_response(status, url, body, *, headers=None):
     """A minimal stand-in for the httpx.Response the SDK feeds our bridge."""
     resp = MagicMock()
     resp.status_code = status
     resp.request = SimpleNamespace(url=url)
+    resp.headers = headers or {}
 
     async def _aread():
         return body
@@ -633,6 +634,8 @@ async def test_refresh_400_rejects_disk_token_without_refresh_token(
 async def test_refresh_400_still_clears_when_disk_is_same_token(tmp_path, monkeypatch):
 
     """No peer wrote anything: the credential really is dead — clear it."""
+    from tools.mcp_oauth_provider import MCPRefreshError
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
@@ -644,15 +647,18 @@ async def test_refresh_400_still_clears_when_disk_is_same_token(tmp_path, monkey
     resp = _fake_response(
         400, "https://idp.example.com/oauth/token", b'{"error":"invalid_grant"}'
     )
-    result = await provider._handle_refresh_response(resp)
+    with pytest.raises(MCPRefreshError, match="oauth_rejected") as exc_info:
+        await provider._handle_refresh_response(resp)
 
-    assert result is False
+    assert exc_info.value.oauth_error == "invalid_grant"
     assert provider.context.current_tokens is None
 
 
 @pytest.mark.asyncio
 async def test_refresh_400_does_not_recover_expired_disk_token(tmp_path, monkeypatch):
     """A *different* but already-expired disk token is not a recovery."""
+    from tools.mcp_oauth_provider import MCPRefreshError
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
@@ -664,9 +670,8 @@ async def test_refresh_400_does_not_recover_expired_disk_token(tmp_path, monkeyp
     resp = _fake_response(
         400, "https://idp.example.com/oauth/token", b'{"error":"invalid_grant"}'
     )
-    result = await provider._handle_refresh_response(resp)
-
-    assert result is False
+    with pytest.raises(MCPRefreshError, match="oauth_rejected"):
+        await provider._handle_refresh_response(resp)
     assert provider.context.current_tokens is None
 
 
@@ -675,6 +680,8 @@ async def test_refresh_400_does_not_recover_tokenless_disk_entry(
     tmp_path, monkeypatch
 ):
     """A disk entry without an access token is not a recovery."""
+    from tools.mcp_oauth_provider import MCPRefreshError
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
@@ -688,9 +695,8 @@ async def test_refresh_400_does_not_recover_tokenless_disk_entry(
     resp = _fake_response(
         400, "https://idp.example.com/oauth/token", b'{"error":"invalid_grant"}'
     )
-    result = await provider._handle_refresh_response(resp)
-
-    assert result is False
+    with pytest.raises(MCPRefreshError, match="oauth_rejected"):
+        await provider._handle_refresh_response(resp)
     assert provider.context.current_tokens is None
 
 
@@ -940,6 +946,8 @@ async def test_refresh_400_recovery_rejects_disk_pair_from_another_issuer(tmp_pa
     is not a recovery, so the session is cleared as on any dead grant and the
     foreign refresh token never survives on disk.
     """
+    from tools.mcp_oauth_provider import MCPRefreshError
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     endpoint = "https://idp.example.com/oauth/token"
     provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
@@ -947,10 +955,184 @@ async def test_refresh_400_recovery_rejects_disk_pair_from_another_issuer(tmp_pa
     storage.bind_issuer("https://other-idp.example")
     await storage.set_tokens(_token("A2", "R2"))
 
-    recovered = await provider._handle_refresh_response(
-        _fake_response(400, endpoint, b'{"error":"invalid_grant"}')
-    )
+    with pytest.raises(MCPRefreshError, match="oauth_rejected"):
+        await provider._handle_refresh_response(
+            _fake_response(400, endpoint, b'{"error":"invalid_grant"}')
+        )
 
-    assert recovered is False
     assert provider.context.current_tokens is None
     assert (await storage.get_tokens()).refresh_token is None, "foreign refresh token must not survive on disk"
+
+
+@pytest.mark.parametrize(
+    ("transient_status", "headers", "expected_delay"),
+    [(503, {}, 1.0), (502, {}, 1.0), (429, {"retry-after": "2"}, 2.0)],
+)
+@pytest.mark.asyncio
+async def test_refresh_transient_retries_inside_real_sdk_flow_then_rotates(
+    tmp_path, monkeypatch, transient_status, headers, expected_delay
+):
+    """The SDK generator sees only the final success, never a false reauth signal."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    endpoint = "https://idp.example.com/oauth/token"
+    provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
+    await provider.context.storage.set_tokens(_token("A1", "R1"))
+    sleeps = AsyncMock()
+    monkeypatch.setattr("tools.mcp_oauth_provider._sleep", sleeps)
+    posted = 0
+
+    def responder(request):
+        nonlocal posted
+        if request.method != "POST":
+            return _fake_response(200, str(request.url), b"{}")
+        posted += 1
+        if posted == 1:
+            return _fake_response(
+                transient_status, endpoint, b"endpoint unavailable", headers=headers
+            )
+        body = json.dumps(_token("A2", "R2").model_dump(mode="json", exclude_none=True)).encode()
+        return _fake_response(200, endpoint, body)
+
+    await _drive_flow(provider, responder)
+
+    assert posted == 2
+    sleeps.assert_awaited_once_with(expected_delay)
+    assert provider.context.current_tokens.refresh_token == "R2"
+    assert (await provider.context.storage.get_tokens()).refresh_token == "R2"
+    assert provider._hermes_fence is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_429_excessive_retry_after_is_typed_without_sleep_or_reauth(
+    tmp_path, monkeypatch
+):
+    from unittest.mock import AsyncMock
+    from tools.mcp_oauth_provider import MCPRefreshError
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    endpoint = "https://idp.example.com/oauth/token"
+    provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
+    await provider.context.storage.set_tokens(_token("A1", "R1"))
+    sleep = AsyncMock()
+    monkeypatch.setattr("tools.mcp_oauth_provider._sleep", sleep)
+
+    def responder(request):
+        return _fake_response(
+            429, endpoint, b"rate limited", headers={"retry-after": "600"}
+        )
+
+    with pytest.raises(MCPRefreshError, match="endpoint_transient") as exc_info:
+        await _drive_flow(provider, responder)
+
+    assert exc_info.value.status == 429
+    assert exc_info.value.retry_after == 600
+    assert provider.context.current_tokens.refresh_token == "R1"
+    assert (await provider.context.storage.get_tokens()).refresh_token == "R1"
+    assert provider._hermes_fence is None
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_ambiguous_transport_fails_closed_without_replay(tmp_path, monkeypatch):
+    import httpx2
+    from tools.mcp_oauth_provider import MCPRefreshError
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    endpoint = "https://idp.example.com/oauth/token"
+    provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
+    await provider.context.storage.set_tokens(_token("A1", "R1"))
+    flow = provider.async_auth_flow(httpx2.Request("GET", "https://mcp.example.com/mcp"))
+    refresh_request = await flow.asend(None)
+
+    with pytest.raises(MCPRefreshError, match="transport_ambiguous") as exc_info:
+        await flow.athrow(httpx2.ReadError("refresh-secret", request=refresh_request))
+
+    assert exc_info.value.ambiguous_delivery is True
+    assert exc_info.value.__suppress_context__ is True
+    assert "refresh-secret" not in str(exc_info.value)
+    assert provider.context.current_tokens.refresh_token == "R1"
+    assert (await provider.context.storage.get_tokens()).refresh_token == "R1"
+    assert provider._hermes_fence is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_cancellation_propagates_and_releases_fence(tmp_path, monkeypatch):
+    import httpx2
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    endpoint = "https://idp.example.com/oauth/token"
+    provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
+    await provider.context.storage.set_tokens(_token("A1", "R1"))
+    flow = provider.async_auth_flow(
+        httpx2.Request("GET", "https://mcp.example.com/mcp")
+    )
+    await flow.asend(None)
+
+    with pytest.raises(asyncio.CancelledError):
+        await flow.athrow(asyncio.CancelledError())
+
+    assert provider.context.current_tokens.refresh_token == "R1"
+    assert (await provider.context.storage.get_tokens()).refresh_token == "R1"
+    assert provider._hermes_fence is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_proven_pre_send_connect_failure_retries(tmp_path, monkeypatch):
+    import httpx2
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    endpoint = "https://idp.example.com/oauth/token"
+    provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
+    await provider.context.storage.set_tokens(_token("A1", "R1"))
+    sleep = AsyncMock()
+    monkeypatch.setattr("tools.mcp_oauth_provider._sleep", sleep)
+    flow = provider.async_auth_flow(
+        httpx2.Request("GET", "https://mcp.example.com/mcp")
+    )
+    refresh_request = await flow.asend(None)
+
+    retried_request = await flow.athrow(
+        httpx2.ConnectError("private pre-send detail", request=refresh_request)
+    )
+    assert retried_request is refresh_request
+    sleep.assert_awaited_once_with(1.0)
+
+    body = json.dumps(
+        _token("A2", "R2").model_dump(mode="json", exclude_none=True)
+    ).encode()
+    resource_request = await flow.asend(_fake_response(200, endpoint, body))
+    with pytest.raises(StopAsyncIteration):
+        await flow.asend(_fake_response(200, str(resource_request.url), b"{}"))
+
+    assert provider.context.current_tokens.refresh_token == "R2"
+    assert (await provider.context.storage.get_tokens()).refresh_token == "R2"
+    assert provider._hermes_fence is None
+
+
+@pytest.mark.parametrize("oauth_error", ["invalid_grant", "invalid_client", "invalid_scope"])
+@pytest.mark.asyncio
+async def test_refresh_oauth_rejections_remain_distinct_and_never_authorize(
+    tmp_path, monkeypatch, oauth_error
+):
+    from tools.mcp_oauth_provider import MCPRefreshError
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    endpoint = "https://idp.example.com/oauth/token"
+    provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
+    await provider.context.storage.set_tokens(_token("A1", "R1"))
+
+    with pytest.raises(MCPRefreshError, match="oauth_rejected") as exc_info:
+        await _drive_flow(
+            provider,
+            lambda request: _fake_response(
+                400, endpoint, json.dumps({"error": oauth_error, "secret": "sentinel"}).encode()
+            ),
+        )
+
+    assert exc_info.value.oauth_error == oauth_error
+    assert "sentinel" not in str(exc_info.value)
+    assert provider.context.current_tokens is None
+    assert provider._hermes_fence is None
