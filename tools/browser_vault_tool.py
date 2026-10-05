@@ -30,6 +30,7 @@ import json
 import secrets
 import logging
 from typing import Any, Dict, Optional
+from agent.vault_payment_policy import PAYMENT_PSP_ORIGINS
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +244,7 @@ def browser_vault_list() -> str:
             if meta.kind == "payment":
                 entry.update(available=True, payment_scope=meta.payment_scope,
                              confirmation_required=True, supported_layout="single_document",
-                             hosted_origins=list(meta.payment_frame_origins or ("https://js.stripe.com",)))
+                             hosted_origins=list(meta.payment_frame_origins or PAYMENT_PSP_ORIGINS))
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:

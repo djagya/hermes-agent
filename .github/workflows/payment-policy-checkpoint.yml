@@ -38,6 +38,7 @@ jobs:
             tests/agent/test_vault_payment_policy.py tests/agent/test_vault_payment_card.py \
             tests/agent/test_vault_backends.py tests/tools/test_browser_vault.py \
             tests/tools/test_browser_use_cli.py
+          scripts/run_tests.sh -j 2 --file-timeout 180 --file-retries 0 tests/tools/test_computer_use.py
       - name: Real Chromium native fill and hosted-field refusals
         env:
           HERMES_E2E_BROWSER: '1'

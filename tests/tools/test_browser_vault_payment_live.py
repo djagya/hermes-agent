@@ -79,20 +79,13 @@ def payment_browser(tmp_path, record_property):
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path == "/hosted":
-                body = FIELDS
-            elif self.path == "/split":
-                body = '<input autocomplete="cc-number">'
-            elif self.path == "/cvc":
-                body = '<input autocomplete="cc-exp"><input autocomplete="cc-csc">'
-            elif self.path == "/merchant":
-                body = f'<iframe id="hosted" src="{origins["psp"]}/hosted"></iframe>'
-            elif self.path == "/split-merchant":
-                body = f'<iframe src="{origins["psp"]}/split"></iframe><iframe src="{origins["psp"]}/cvc"></iframe>'
-            elif self.path == "/ambiguous":
-                body = FIELDS + '<input autocomplete="cc-number">'
-            else:
-                body = FIELDS
+            body = {
+                "/split": '<input autocomplete="cc-number">',
+                "/cvc": '<input autocomplete="cc-exp"><input autocomplete="cc-csc">',
+                "/merchant": f'<iframe id="hosted" src="{origins["psp"]}/hosted"></iframe>',
+                "/split-merchant": f'<iframe src="{origins["psp"]}/split"></iframe><iframe src="{origins["psp"]}/cvc"></iframe>',
+                "/ambiguous": FIELDS + '<input autocomplete="cc-number">',
+            }.get(self.path, FIELDS)
             body = (
                 '<!doctype html><form onsubmit="window.submitted=true;return false">'
                 + body
@@ -243,6 +236,43 @@ def test_native_encrypted_vault_fill_and_refusals(
         ]
         == "payment_screenshot_blocked"
     )
+    from tools.computer_use.tool import handle_computer_use
+
+    assert (
+        json.loads(handle_computer_use({"action": "capture"}))["error_type"]
+        == "payment_screenshot_blocked"
+    )
+    assert (
+        json.loads(
+            handle_computer_use({
+                "action": "click",
+                "coordinate": [0, 0],
+                "capture_after": True,
+            })
+        )["error_type"]
+        == "payment_screenshot_blocked"
+    )
+    assert (
+        json.loads(browser_cdp("Page.captureScreenshot", task_id="sidecar-alias"))[
+            "error_type"
+        ]
+        == "payment_screenshot_blocked"
+    )
+    from tools.computer_use.tool import _capture_response
+    from tools.computer_use.backend import CaptureResult
+
+    with patch(
+        "tools.computer_use.tool._capture_view",
+        side_effect=AssertionError("must refuse before persistence"),
+    ):
+        assert (
+            json.loads(
+                _capture_response(
+                    CaptureResult(mode="som", width=1, height=1, png_b64="synthetic")
+                )
+            )["error_type"]
+            == "payment_screenshot_blocked"
+        )
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from tools.browser_payment_privacy import payment_session_sensitive
 
@@ -297,6 +327,76 @@ def test_native_encrypted_vault_fill_and_refusals(
     )
 
 
+def test_preloaded_second_tab_hosted_native_fill(
+    payment_browser, tmp_path, monkeypatch
+):
+    from agent.vault_store import VaultStore
+    from tools.browser_vault_tool import browser_vault_fill
+    from tools.browser_supervisor import _schedule
+
+    sup, origins = payment_browser
+    _schedule(
+        sup._cdp("Target.createTarget", {"url": origins["merchant"] + "/merchant"}),
+        sup._loop,
+        timeout=10,
+    )
+    time.sleep(1)
+    with sup._state_lock:
+        sup._frames.clear()  # Existing frames must be discovered without historical events.
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item(
+        "payment", "Synthetic hosted card", CARD, origin=origins["merchant"]
+    )
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    # Metadata is fresh from storage; bind the synthetic PSP through the backend.
+    original = store.get_meta
+
+    def metadata(handle):
+        from dataclasses import replace
+
+        meta = original(handle)
+        if meta:
+            meta = replace(meta, payment_frame_origins=(origins["psp"],))
+        return meta
+
+    monkeypatch.setattr(store, "get_meta", metadata)
+    with patch(
+        "tools.approval_prompt.request_elicitation_consent", return_value="accept"
+    ):
+        out = json.loads(
+            browser_vault_fill(
+                card.id, task_id="payment-live", merchant_origin=origins["merchant"]
+            )
+        )
+    assert out["success"] and out["target_origin"] == origins["psp"]
+    inspection = sup.inspect_payment(
+        origins["merchant"], frame_origins=(origins["psp"],)
+    )
+    try:
+        values = _schedule(
+            sup._cdp(
+                "Runtime.evaluate",
+                {
+                    "expression": "Array.from(document.querySelectorAll('input'), e=>e.value)",
+                    "returnByValue": True,
+                },
+                session_id=inspection.frame_session,
+            ),
+            sup._loop,
+            timeout=10,
+        )
+        assert values["result"]["result"]["value"] == [
+            CARD["card_number"],
+            "07/35",
+            CARD["cvc"],
+        ]
+    finally:
+        sup.discard_payment(inspection)
+    print(
+        "RECEIPT preloaded_second_tab=PASS hosted_native_vault_fill=PASS actual_values=PASS"
+    )
+
+
 def test_hosted_oopif_identity_races_and_single_use(payment_browser):
     from agent.vault_login_classifier import select_checkout_fills
     from agent.vault_store import PAYMENT_FIELDS
@@ -331,22 +431,19 @@ def test_hosted_oopif_identity_races_and_single_use(payment_browser):
                 sup._loop,
                 timeout=10,
             )
-        elif mutation == "navigate":
-            sup.evaluate_runtime(
-                "document.querySelector('iframe').src += '?replacement'"
-            )
+        elif mutation in {"navigate", "detach", "reembed"}:
+            expression = {
+                "navigate": "document.querySelector('iframe').src += '?replacement'",
+                "detach": "document.querySelector('iframe').remove()",
+                "reembed": "const e=document.querySelector('iframe');e.replaceWith(e.cloneNode())",
+            }[mutation]
+            sup.evaluate_runtime(expression)
             time.sleep(0.3)
-        elif mutation == "detach":
-            sup.evaluate_runtime("document.querySelector('iframe').remove()")
-        elif mutation == "reembed":
-            sup.evaluate_runtime(
-                "const e=document.querySelector('iframe');e.replaceWith(e.cloneNode())"
-            )
-            time.sleep(0.3)
-        elif mutation == "expire":
-            i.expires_at = time.monotonic() - 1
-        elif mutation == "stale_session":
-            sup._page_session_id = "not-the-approved-session"
+        elif mutation in {"expire", "stale_session"}:
+            if mutation == "expire":
+                i.expires_at = time.monotonic() - 1
+            else:
+                sup._page_session_id = "not-the-approved-session"
         out = sup.commit_payment(i, fills)
         if mutation == "normal":
             assert out == {"success": True, "filled_fields": 3}

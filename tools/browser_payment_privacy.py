@@ -22,7 +22,9 @@ def mark_payment_session(task_id: str) -> None:
 def payment_session_sensitive(task_id: str | None) -> bool:
     with _LOCK:
         home = str(get_hermes_home())
-        return (home, task_id or "default") in _SENSITIVE
+        # Sidecar aliases and desktop captures can view the same browser. Once
+        # card ingress occurs, capture is refused for the entire current profile.
+        return any(profile == home for profile, _task in _SENSITIVE)
 
 
 def screenshot_refusal() -> dict:

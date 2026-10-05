@@ -6,6 +6,7 @@ import json
 
 from agent.vault_login_classifier import select_checkout_fills
 from agent.vault_payment_card import validate_card
+from agent.vault_payment_policy import PAYMENT_PSP_ORIGINS, PaymentPolicyError
 from agent.vault_store import PAYMENT_FIELDS
 
 
@@ -25,7 +26,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
         inspected = supervisor.inspect_payment(
             merchant_origin,
             bound_origins=bound,
-            frame_origins=meta.payment_frame_origins or ("https://js.stripe.com",),
+            frame_origins=meta.payment_frame_origins or PAYMENT_PSP_ORIGINS,
         )
         prompt = inspected.prompt()
         consent = request_elicitation_consent(
@@ -75,8 +76,16 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             target_origin=inspected.frame_origin,
             fields=prompt["fields"],
             submitted=False,
+            page_checks=prompt["checks"],
+            merchant_reputation="human_review_required",
         )
         return json.dumps(result)
+    except PaymentPolicyError as exc:
+        return json.dumps({
+            "success": False,
+            "error_type": "payment_policy_refused",
+            "error": str(exc) + "; inspect the checkout and request fresh consent.",
+        })
     except Exception:
         # op/JS/transport exceptions can contain values. Do not interpolate them.
         return json.dumps({

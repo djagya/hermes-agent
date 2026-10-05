@@ -94,7 +94,7 @@ merchant. A transport failure after ingress is uncertain: inspect and obtain
 fresh consent rather than treating failure as proof of zero writes.
 
 Filled controls are visually masked. Standard browser screenshot/PDF/recording
-entry points are disabled for that task after card ingress; use redacted text
+and desktop capture entry points are disabled for the current profile after card ingress; use redacted text
 inspection. Arbitrary code/terminal execution is not a containment boundary
 (see `SECURITY.md`). Headless sessions cannot confirm and are refused. The native
 tool never clicks submit; address fills need no confirmation.

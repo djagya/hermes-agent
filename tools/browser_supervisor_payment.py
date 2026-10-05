@@ -12,9 +12,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agent.vault_login_classifier import LoginControl, classify_checkout_control
-from agent.vault_payment_policy import PaymentPolicyError, https_origin
-
-PSP_ORIGINS = ("https://js.stripe.com",)
+from agent.vault_payment_policy import (
+    PAYMENT_PSP_ORIGINS,
+    PaymentPolicyError,
+    https_origin,
+)
 
 
 @dataclass
@@ -62,7 +64,7 @@ class PaymentSupervisionMixin:
         merchant_origin: str = "",
         *,
         bound_origins: tuple = (),
-        frame_origins: tuple = PSP_ORIGINS,
+        frame_origins: tuple = PAYMENT_PSP_ORIGINS,
     ) -> PaymentInspection:
         from tools.browser_supervisor import _schedule
 
@@ -95,24 +97,69 @@ class PaymentSupervisionMixin:
         # Page.getFrameTree is renderer-scoped: OOPIF documents must be
         # read from their own sessions, then anchored with DOM.getFrameOwner.
         targets = (await self._cdp("Target.getTargets"))["result"]["targetInfos"]
-        with self._state_lock:
-            tracked = dict(self._frames)
         pending = [t for t in targets if t.get("type") == "iframe"]
         while pending:
             progress = False
             for target in list(pending):
                 fid = target["targetId"]
-                old = tracked.get(fid)
-                parent = old.parent_frame_id if old else None
-                if not parent or parent not in {f[0] for f in frames}:
+                parent = None
+                # Discover ownership from the current DOM, including frames that
+                # existed before this supervisor attached. Event history is not proof.
+                for record in frames:
+                    parent_sid = child_sessions.get(record[0], sid)
+                    obj = None
+                    try:
+                        owner = (
+                            await self._cdp(
+                                "DOM.getFrameOwner",
+                                {"frameId": fid},
+                                session_id=parent_sid,
+                            )
+                        )["result"]
+                        context = (
+                            await self._cdp(
+                                "Page.createIsolatedWorld",
+                                {
+                                    "frameId": record[0],
+                                    "worldName": "hermes-payment-ancestry",
+                                },
+                                session_id=parent_sid,
+                            )
+                        )["result"]["executionContextId"]
+                        obj = (
+                            await self._cdp(
+                                "DOM.resolveNode",
+                                {
+                                    "backendNodeId": owner["backendNodeId"],
+                                    "executionContextId": context,
+                                },
+                                session_id=parent_sid,
+                            )
+                        )["result"]["object"]["objectId"]
+                        belongs = _value(
+                            await self._cdp(
+                                "Runtime.callFunctionOn",
+                                {
+                                    "objectId": obj,
+                                    "functionDeclaration": "function(){return this.ownerDocument===document && this.isConnected}",
+                                    "returnByValue": True,
+                                },
+                                session_id=parent_sid,
+                            )
+                        )
+                        if belongs is True:
+                            parent = record[0]
+                            break
+                    except Exception:
+                        continue
+                    finally:
+                        if obj:
+                            await self._release_payment_object(parent_sid, obj)
+                if not parent:
                     continue
                 if len(frames) > 64:
                     raise PaymentPolicyError("Payment frame tree too large")
                 parent_sid = child_sessions.get(parent, sid)
-                # A stale bookkeeping entry cannot admit an unrelated iframe.
-                await self._cdp(
-                    "DOM.getFrameOwner", {"frameId": fid}, session_id=parent_sid
-                )
                 fsid = child_sessions.get(fid)
                 if not fsid:
                     fsid = (
@@ -156,27 +203,38 @@ class PaymentSupervisionMixin:
             ]
             if len(pages) != 1:
                 raise PaymentPolicyError("Merchant tab missing or ambiguous")
-            sid = (
-                await self._cdp(
-                    "Target.attachToTarget",
-                    {"targetId": pages[0]["targetId"], "flatten": True},
-                )
-            )["result"]["sessionId"]
-            await self._enable_page_domains(sid, timeout=5)
-            with self._state_lock:
-                self._page_session_id = sid
+            current = (await self._cdp("Target.getTargetInfo", session_id=sid))[
+                "result"
+            ]["targetInfo"]
+            if current["targetId"] != pages[0]["targetId"]:
+                old_sid = sid
+                sid = (
+                    await self._cdp(
+                        "Target.attachToTarget",
+                        {"targetId": pages[0]["targetId"], "flatten": True},
+                    )
+                )["result"]["sessionId"]
+                try:
+                    await self._enable_page_domains(sid, timeout=5)
+                    await self._install_dialog_bridge(sid)
+                except Exception:
+                    await self._release_payment_sessions({"new": sid})
+                    raise
+                with self._state_lock:
+                    self._page_session_id = sid
+                await self._release_payment_sessions({"old": old_sid})
         page = (await self._cdp("Target.getTargetInfo", session_id=sid))["result"][
             "targetInfo"
         ]
         child_sessions = {}
-        tree = await self._payment_tree(sid, child_sessions)
-        merchant = https_origin(tree[0][3])
-        if (origin and merchant != origin) or (bound and merchant not in bound):
-            raise PaymentPolicyError("Merchant origin mismatch")
         operation = secrets.token_hex(16)
         candidates = []
-        by_id = {f[0]: f for f in tree}
         try:
+            tree = await self._payment_tree(sid, child_sessions)
+            merchant = https_origin(tree[0][3])
+            if (origin and merchant != origin) or (bound and merchant not in bound):
+                raise PaymentPolicyError("Merchant origin mismatch")
+            by_id = {f[0]: f for f in tree}
             for fid, _loader, _url, frame_origin, parent in tree:
                 # Ignore unrelated ads, but never inspect/inject into an arbitrary PSP.
                 if frame_origin not in (merchant, *allowed_frames):

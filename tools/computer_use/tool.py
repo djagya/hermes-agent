@@ -329,6 +329,10 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     action = (args.get("action") or "").strip().lower()
     if not action:
         return json.dumps({"error": "missing `action`"})
+    if action == "capture" or args.get("capture_after"):
+        from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
+        if payment_session_sensitive(None):
+            return json.dumps(screenshot_refusal())
     session_id = str(kwargs.get("session_id") or "")  # approval-state / daemon-mode isolation key
     # Bot Desktop lease: while a human drives the screen every action, capture included, is refused.
     from tools.bot_desktop import lease as _bd_lease
@@ -675,6 +679,9 @@ def _capture_digest(cap: CaptureResult) -> str:
 
 def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS,
                       session_id: Optional[str] = None) -> Any:
+    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
+    if payment_session_sensitive(None):
+        return json.dumps(screenshot_refusal())
     v = _capture_view(cap, max_elements)
     lines = _capture_summary_lines(v)
     summary, extra = "\n".join(lines), None  # multimodal/aux paths use this; text paths append notes and rebuild
@@ -721,6 +728,9 @@ def _maybe_follow_capture(backend: ComputerUseBackend, res: ActionResult, do_cap
                           fence: Callable[[], None] = lambda: None, session_id: Optional[str] = None) -> Any:
     # No follow-up capture after a failed action: a normal-looking screenshot would suggest success.
     if not do_capture or not res.ok:
+        return _text_response(res)
+    from tools.browser_payment_privacy import payment_session_sensitive
+    if payment_session_sensitive(None):
         return _text_response(res)
     try:
         # Recapture the exact window when known: on Linux several unrelated windows may share an app name, so
