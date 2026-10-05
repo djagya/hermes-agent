@@ -143,7 +143,7 @@ class GatewayKanbanWatchersMixin:
         """Undo a claimed notification cursor after send failure."""
         self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
 
-    async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task) -> None:
+    async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task, strict: bool = False) -> None:
         """Upload artifact files referenced by a completed kanban task.
 
         Sources, in priority order: ``event_payload['artifacts']``,
@@ -158,15 +158,17 @@ class GatewayKanbanWatchersMixin:
             if isinstance(raw, (list, tuple)):
                 raw_paths += [item for item in raw if isinstance(item, str)]
             summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary:
+            if not strict and isinstance(summary, str) and summary:
                 prose_paths += adapter.extract_local_files(summary)[0]
-        if task is not None and getattr(task, "result", None):
+        if not strict and task is not None and getattr(task, "result", None):
             prose_paths += adapter.extract_local_files(str(task.result))[0]
         # A staged copy and the scratch original it was copied from are the
         # same deliverable; on a review handoff the original still exists, so
         # prose mentions of it must not upload the file a second time.
         staged_names = {os.path.basename(p) for p in raw_paths}
         raw_paths += [p for p in prose_paths if os.path.basename(p) not in staged_names]
+        if strict and any(not os.path.isfile(os.path.expanduser(p)) for p in raw_paths):
+            raise RuntimeError("Declared source artifact is missing")
         candidates: list[str] = []
         for path in raw_paths:
             expanded = os.path.expanduser(path) if path else ""
@@ -176,7 +178,10 @@ class GatewayKanbanWatchersMixin:
             return
 
         from gateway.platforms.base import BasePlatformAdapter
-        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        allowed = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        if strict and len(allowed) != len(candidates):
+            raise RuntimeError("Declared source artifact denied by delivery policy")
+        candidates = allowed
         if not candidates:
             return
 
@@ -188,16 +193,25 @@ class GatewayKanbanWatchersMixin:
         if image_paths:
             try:
                 batch = [(f"file://{_quote(p)}", "") for p in image_paths]
-                await adapter.send_multiple_images(chat_id=chat_id, images=batch, metadata=metadata)
+                result = await adapter.send_multiple_images(chat_id=chat_id, images=batch, metadata=metadata)
+                results = result if isinstance(result, (list, tuple)) else [result]
+                if strict and any(getattr(item, "success", None) is not True for item in results):
+                    raise RuntimeError("Image artifact delivery reported failure")
             except Exception as exc:
+                if strict:
+                    raise
                 logger.warning("kanban notifier: image batch upload failed: %s", exc)
         for path in other_paths:
             try:
                 if Path(path).suffix.lower() in _VIDEO_EXTS:
-                    await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+                    result = await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
                 else:
-                    await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                    result = await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                if strict and getattr(result, "success", None) is not True:
+                    raise RuntimeError("Artifact delivery reported failure")
             except Exception as exc:
+                if strict:
+                    raise
                 logger.warning("kanban notifier: artifact upload (%s) failed: %s", path, exc)
 
     def _kanban_dispatcher_boot(self) -> Optional[tuple]:

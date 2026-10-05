@@ -364,18 +364,18 @@ class GatewaySlashCommandsMixin(
                 action = tok
                 break
         try:
-            output = await asyncio.to_thread(run_slash, text)
+            source_target = self._kanban_source_target(event) if action == "create" else None
+            output = await asyncio.to_thread(run_slash, text, source_notify_target=source_target)
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 
-        # Auto-subscribe on create, parsing the task id from the CLI's standard success line
-        # ("Created t_abcd  (ready, ...)"). With --json there is no such line, so a scripting user
-        # gets no subscription and can call /kanban notify-subscribe explicitly.
+        # The native origin was bound atomically even with --json. The standard
+        # success line is parsed only to add a human-readable acknowledgement.
         m = re.search(r"Created\s+(t_[0-9a-f]+)\b", output) if action == "create" and output else None
         if m:
             task_id = m.group(1)
             try:
-                if await self._kanban_auto_subscribe(event, task_id, requested_board):
+                if source_target:
                     output = output.rstrip() + "\n" + t("gateway.kanban.subscribed_suffix", task_id=task_id)
             except Exception as exc:
                 logger.warning("kanban create auto-subscribe failed: %s", exc)
@@ -384,6 +384,25 @@ class GatewaySlashCommandsMixin(
         if len(output) > 3800:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
+
+    def _kanban_source_target(self, event: MessageEvent) -> Optional[dict]:
+        """Trusted inbound route passed into the CLI's atomic creation transaction."""
+        source = event.source
+        platform = getattr(source, "platform", None)
+        platform_str = (platform.value if hasattr(platform, "value") else str(platform or "")).lower()
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not platform_str or not chat_id:
+            return None
+        metadata = dict(self._reply_metadata(event) or {})
+        metadata["kanban_source"] = True
+        return dict(
+            platform=platform_str, chat_id=chat_id,
+            thread_id=str(getattr(source, "thread_id", "") or "") or None,
+            chat_type=getattr(source, "chat_type", None),
+            user_id=getattr(source, "user_id", None), user_id_alt=getattr(source, "user_id_alt", None),
+            notifier_profile=getattr(source, "profile", None) or self._active_profile_name(),
+            delivery_mode="notify+wake", delivery_metadata=metadata,
+        )
 
     async def _kanban_auto_subscribe(self, event: MessageEvent, task_id: str, requested_board) -> bool:
         """Subscribe the event's chat to *task_id* notifications (notify+wake). False when the
@@ -416,7 +435,8 @@ class GatewaySlashCommandsMixin(
                     user_id_alt=_field("user_id_alt"),
                     notifier_profile=_field("profile") or getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
                     # Subscribing from chat: deliver the passive message and wake the destination agent.
-                    delivery_mode="notify+wake", delivery_metadata=delivery_metadata)
+                    delivery_mode="notify+wake", delivery_metadata=delivery_metadata,
+                    board=requested_board)
             finally:
                 conn.close()
         await asyncio.to_thread(_sub)
