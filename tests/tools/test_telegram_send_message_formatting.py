@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,6 +11,17 @@ import pytest
 
 from gateway.platforms.base import utf16_len
 from tools.send_message_senders import _send_telegram, _telegram_format
+
+
+@pytest.fixture(autouse=True)
+def telegram_sdk_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Base CI omits the optional SDK; exercise the real serializer with inert SDK types.
+    constants = SimpleNamespace(ParseMode=SimpleNamespace(HTML="HTML", MARKDOWN_V2="MarkdownV2"))
+    monkeypatch.setitem(sys.modules, "telegram.constants", constants)
+    monkeypatch.setitem(
+        sys.modules, "telegram",
+        SimpleNamespace(MessageEntity=lambda **kwargs: SimpleNamespace(**kwargs), constants=constants),
+    )
 
 
 @pytest.mark.parametrize(
@@ -36,6 +48,9 @@ def test_telegram_format_selects_html_only_for_supported_tags_outside_markdown_c
     assert parse_mode == (ParseMode.HTML if expects_html else ParseMode.MARKDOWN_V2)
     if expects_html:
         assert formatted == message
+    elif "**" in message:
+        assert "**" not in formatted
+        assert "*" in formatted
 
 
 def test_standalone_telegram_payloads_use_readable_fallbacks_and_utf16_chunks(
@@ -79,7 +94,7 @@ def test_standalone_telegram_payloads_use_readable_fallbacks_and_utf16_chunks(
     result = asyncio.run(_send_telegram("token", "123", html, media_files=[(str(image), False)]))
 
     assert result["success"] is True
-    assert [call.kwargs["parse_mode"] for call in caption_bot.send_photo.await_args_list] == [
+    assert [call.kwargs.get("parse_mode") for call in caption_bot.send_photo.await_args_list] == [
         ParseMode.HTML,
         None,
     ]
