@@ -22,22 +22,22 @@ fetch() {
 
 case "$arch" in
   amd64)
-    gh_url="https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_linux_amd64.tar.gz"
-    gh_sha="9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8"
+    gh_url="https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz"
+    gh_sha="bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386"
     gl_url="https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz"
     gl_sha="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
-    ti_url="https://github.com/sheeki03/tirith/releases/download/v0.3.3/tirith-x86_64-unknown-linux-gnu.tar.gz"
-    ti_sha="6cdbe35e8f9ccf42e70ad95b501c93cd218ac18201c3df958d54f6ba0d995ce2"
+    ti_url="https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-x86_64-unknown-linux-gnu.tar.gz"
+    ti_sha="efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77"
     op_url="https://cache.agilebits.com/dist/1P/op2/pkg/v2.39.0/op_linux_amd64_v2.39.0.zip"
     op_sha="6fba7f376b6c6dec49f41b06408930a43ad064cce103c6a2ce5b3d0413a86434"
     ;;
   arm64)
-    gh_url="https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_linux_arm64.tar.gz"
-    gh_sha="b57e8063f18862647c9d22727c32e9da1b963f8bf9db648fe123a6975695640f"
+    gh_url="https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_arm64.tar.gz"
+    gh_sha="7862c86c72f43df3a2d93ddde6f473285b4e2af61b494849846827e513ef6484"
     gl_url="https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_arm64.tar.gz"
     gl_sha="e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080"
-    ti_url="https://github.com/sheeki03/tirith/releases/download/v0.3.3/tirith-aarch64-unknown-linux-gnu.tar.gz"
-    ti_sha="c784233083003a6a1533db9ebba30b1a7bb7cefaa239db6ca121598b384cca1a"
+    ti_url="https://github.com/sheeki03/tirith/releases/download/v0.4.2/tirith-aarch64-unknown-linux-gnu.tar.gz"
+    ti_sha="c550b1bfb0c8c872ab3421cd6ef756f260f7cf4981a18cedd49f141fa2d77569"
     op_url="https://cache.agilebits.com/dist/1P/op2/pkg/v2.39.0/op_linux_arm64_v2.39.0.zip"
     op_sha="829baeff1c07e055cfa132031b1d9f2282ccdf5076258e482caf2fda70aea5d0"
     ;;

@@ -1,0 +1,71 @@
+# Pin refresh
+
+Review-only. No unattended merge, publish, or deploy.
+This job does not rebuild. Size, CVE policy, and SBOM path
+below are the last accepted `image-budget.json` baseline.
+Do not merge until `fork-release-image` on this branch stays
+green (measure-image-budget, Trivy fixable CRITICAL/HIGH,
+named SPDX/CycloneDX artifact `hermes-agent-sbom`).
+
+## Last accepted image (size / CVE / SBOM)
+
+- digest: `sha256:d63fc55532a760f7981baa6de696d44ed8dd778c60f0aa707f703c3f7ca24c30`
+- git: `e3391400e6c04dc30c0bebe2c797f0f07ca0ef09`
+- measured_image_bytes: `4494315525`
+- max_image_bytes: `4960000000` (slack `465684475`)
+- max_largest_layer_bytes: `2500000000`
+- max_fixable_critical: `0`
+- max_fixable_high: `0`
+- SBOM: CI artifact `hermes-agent-sbom` on that green run
+  (not baked under `/etc/hermes`).
+- smoke: golden + adversarial in the same job (fail-closed).
+
+## Accepted budget
+
+```json
+{
+  "accepted_digest": "sha256:d63fc55532a760f7981baa6de696d44ed8dd778c60f0aa707f703c3f7ca24c30",
+  "accepted_git_sha": "e3391400e6c04dc30c0bebe2c797f0f07ca0ef09",
+  "max_cold_help_ms": 60000,
+  "max_fixable_critical": 0,
+  "max_fixable_high": 0,
+  "max_idle_rss_kb": 1048576,
+  "max_image_bytes": 4960000000,
+  "max_largest_layer_bytes": 2500000000,
+  "max_offline_cache_write_bytes": 67108864,
+  "max_shutdown_ms": 90000,
+  "max_warm_help_ms": 30000,
+  "measured_image_bytes": 4494315525,
+  "note": "Last published B.3 digest e3391400e / sha256:d63fc555. CI run 34107241626 measured 4494315525 bytes (4286 MiB) on the test-stage image. max_image_bytes started as first-B 4341e0fd plus 10% slack (4943659885). Raised to 4960000000 after the 20260928 snapshot upgrades of util-linux, gzip, libpcre2, and libsqlite3 measured 4947449996 on the test-stage image. Live B.2 unpacked size on the box is smaller (docker inspect Size) because layer accounting differs from the CI test target. Trivy still fails the job on any fixable CRITICAL/HIGH.",
+  "schema": 1
+}
+```
+
+## Old vs new
+
+| pin | current | latest | notes |
+|---|---|---|---|
+| debian:13.4 | `sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da` | `sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da` | same [release](https://hub.docker.com/_/debian) |
+| node:26-bookworm-slim | `` | `sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2` | bump [release](https://hub.docker.com/_/node) |
+| s6-overlay | `3.2.3.0` | `3.2.3.2` | bump [release](https://github.com/just-containers/s6-overlay/releases/tag/v3.2.3.2) |
+| gh | `2.101.0` | `2.102.0` | bump [release](https://github.com/cli/cli/releases/tag/v2.102.0) |
+| gitleaks | `8.30.1` | `8.30.1` | same [release](https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1) |
+| tirith | `0.3.3` | `0.4.2` | bump [release](https://github.com/sheeki03/tirith/releases/tag/v0.4.2) |
+| op | `2.39.0` | `2.39.0` | same [release](https://app-updates.agilebits.com/product_history/CLI2) |
+| uv image | `@` | `0.12.23-python3.13-trixie@sha256:8638cb5839a13bb229746704507a38ea7bfa01d1140aabe85dad35ed27de6ce3` | bump [release](https://github.com/astral-sh/uv/releases/tag/0.12.23) |
+| sqlite-autoconf | `3530400` | `3530400` | same [release](https://sqlite.org/download.html) |
+| DEBIAN_SNAPSHOT | `20260930T070000Z` | `20260930T070000Z` | same [release](https://snapshot.debian.org/) |
+| himalaya | `b1f6dece32c3` | `2.2.1` | bump [release](https://github.com/pimalaya/himalaya/releases/tag/v2.2.1) |
+| weasyprint | `` | `70.0` | bump [release](https://pypi.org/project/weasyprint/70.0/) |
+| python-docx | `` | `1.2.0` | bump [release](https://pypi.org/project/python-docx/1.2.0/) |
+| openpyxl | `` | `3.1.5` | bump [release](https://pypi.org/project/openpyxl/3.1.5/) |
+| yt-dlp | `` | `2026.8.19` | bump [release](https://pypi.org/project/yt-dlp/2026.8.19/) |
+| clickup-mcp | `1.8.0` | `1.9.0` | bump [release](https://www.npmjs.com/package/@hauptsache.net/clickup-mcp/v/1.9.0) |
+| caldav-mcp | `0.10.0` | `0.10.0` | same [release](https://www.npmjs.com/package/caldav-mcp/v/0.10.0) |
+
+## Applied on this branch
+
+- s6-overlay 3.2.3.0 -> 3.2.3.2
+- gh 2.101.0 -> 2.102.0
+- tirith 0.3.3 -> 0.4.2
+
