@@ -609,6 +609,8 @@ async def test_refresh_400_rejects_disk_token_without_refresh_token(
     defers the reauth to expiry, with no way to refresh in between. Recovery
     must require a refresh token to recover *onto*.
     """
+    from tools.mcp_oauth_provider import MCPRefreshError
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
@@ -621,10 +623,15 @@ async def test_refresh_400_rejects_disk_token_without_refresh_token(
     resp = _fake_response(
         400, "https://idp.example.com/oauth/token", b'{"error":"invalid_grant"}'
     )
-    result = await provider._handle_refresh_response(resp)
+    with pytest.raises(MCPRefreshError, match="oauth_rejected") as exc_info:
+        await provider._handle_refresh_response(resp)
 
-    assert result is False, "a token with no refresh token must not be adopted"
+    assert exc_info.value.status == 400
+    assert exc_info.value.oauth_error == "invalid_grant"
     assert provider.context.current_tokens is None
+    cached = await provider.context.storage.get_tokens()
+    assert cached.access_token == "A2"
+    assert cached.refresh_token is None
 
 
 
@@ -1076,6 +1083,8 @@ async def test_refresh_cancellation_propagates_and_releases_fence(tmp_path, monk
     assert provider.context.current_tokens.refresh_token == "R1"
     assert (await provider.context.storage.get_tokens()).refresh_token == "R1"
     assert provider._hermes_fence is None
+    await asyncio.wait_for(provider.context.lock.acquire(), timeout=1.0)
+    provider.context.lock.release()
 
 
 @pytest.mark.asyncio

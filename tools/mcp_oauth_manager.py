@@ -237,6 +237,12 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                 try:
                     incoming = yield outgoing
                 except GeneratorExit:
+                    # The SDK's ``async with context.lock`` still owns one
+                    # acquisition. Restore it before closing the inner flow,
+                    # whose ``__aexit__`` releases that acquisition.
+                    if resource_lock_released:
+                        await self.context.lock.acquire()
+                        resource_lock_released = False
                     await inner.aclose()
                     raise
                 except BaseException as exc:
