@@ -3,6 +3,8 @@
 from pm import install_hint
 import asyncio
 import contextlib
+import html
+from html.parser import HTMLParser
 import logging
 import os
 import re
@@ -180,6 +182,78 @@ def _strip_mdv2_safe(text):
         return text
 
 
+_TELEGRAM_HTML_TAGS = {
+    "a", "b", "blockquote", "code", "del", "em", "i", "ins", "pre", "s",
+    "span", "strike", "strong", "tg-emoji", "tg-spoiler", "u",
+}
+_TELEGRAM_HTML_TAG_RE = re.compile(
+    r"<\s*/?\s*(?:" + "|".join(re.escape(tag) for tag in sorted(_TELEGRAM_HTML_TAGS))
+    + r")(?:\s[^<>]*|\s*)/?>",
+    re.IGNORECASE,
+)
+_MARKDOWN_BACKTICK_CODE_RE = re.compile(r"(`+).*?\1", re.DOTALL)
+_MARKDOWN_TILDE_FENCE_RE = re.compile(
+    r"(?ms)^[ \t]*(~{3,})[^\n]*\n.*?^[ \t]*\1[ \t]*(?:\n|$)"
+)
+
+
+def _telegram_has_html(message: str) -> bool:
+    """Whether Markdown-external text contains a Telegram-supported HTML tag.
+
+    Angle placeholders and unsupported tags are ordinary Markdown text. Backtick code is
+    masked first so examples such as ``<b>literal</b>`` do not opt the whole payload into HTML.
+    """
+    outside_code = _MARKDOWN_BACKTICK_CODE_RE.sub("", message)
+    outside_code = _MARKDOWN_TILDE_FENCE_RE.sub("", outside_code)
+    return _TELEGRAM_HTML_TAG_RE.search(outside_code) is not None
+
+
+class _TelegramHTMLPlainTextParser(HTMLParser):
+    """Remove supported Telegram markup while retaining unsupported angle literals."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.parts: list[str] = []
+        self.links: list[tuple[int, str | None]] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in _TELEGRAM_HTML_TAGS:
+            self.parts.append(self.get_starttag_text() or f"<{tag}>")
+            return
+        if tag == "a":
+            self.links.append((len(self.parts), dict(attrs).get("href")))
+
+    def handle_startendtag(self, tag, attrs):
+        if tag not in _TELEGRAM_HTML_TAGS:
+            self.parts.append(self.get_starttag_text() or f"<{tag}/>")
+
+    def handle_endtag(self, tag):
+        if tag not in _TELEGRAM_HTML_TAGS:
+            self.parts.append(f"</{tag}>")
+            return
+        if tag == "a" and self.links:
+            start, href = self.links.pop()
+            label = "".join(self.parts[start:]).strip()
+            if href and href not in label:
+                self.parts.append(f" ({href})")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def handle_entityref(self, name):
+        self.parts.append(html.unescape(f"&{name};"))
+
+    def handle_charref(self, name):
+        self.parts.append(html.unescape(f"&#{name};"))
+
+
+def _telegram_html_to_plain(text: str) -> str:
+    parser = _TelegramHTMLPlainTextParser()
+    parser.feed(text)
+    parser.close()
+    return _strip_mdv2_safe("".join(parser.parts))
+
+
 def _adapter_media_method(ext, voice, force_document=False):
     """``(adapter method, kind)``: document when forced, else image / video / voice by
     extension (``voice`` already folds in the caller's audio rule)."""
@@ -220,7 +294,8 @@ async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, t
         if "parse" in err_text or "markdown" in err_text or "html" in err_text:
             logger.warning("Parse mode %s failed in _send_telegram, falling back to plain text: %s",
                            parse_mode, _sanitize_error_text(md_error))
-            return await send(chunk if has_html else _strip_mdv2_safe(chunk), None)
+            plain = _telegram_html_to_plain(chunk) if has_html else _strip_mdv2_safe(chunk)
+            return await send(plain, None)
         raise
 
 
@@ -267,8 +342,9 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
                     logger.warning("Caption parse failed for media send, retrying plain: %s",
                                    _sanitize_error_text(media_err))
                     media_kwargs.pop("parse_mode", None)
-                    if not has_html and media_kwargs.get("caption"):
-                        media_kwargs["caption"] = _strip_mdv2_safe(media_kwargs["caption"])
+                    if media_kwargs.get("caption"):
+                        fallback = _telegram_html_to_plain if has_html else _strip_mdv2_safe
+                        media_kwargs["caption"] = fallback(media_kwargs["caption"])
                 else:
                     raise
                 f.seek(0)
@@ -280,10 +356,9 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
 
 
 def _telegram_format(message):
-    """``(formatted, parse_mode, has_html)``: text already containing HTML tags is sent as
-    HTML; otherwise Markdown -> MarkdownV2 via the adapter's ``format_message``."""
+    """``(formatted, parse_mode, has_html)`` using explicit supported HTML or MarkdownV2."""
     from telegram.constants import ParseMode
-    if re.search(r'<[a-zA-Z/][^>]*>', message):
+    if _telegram_has_html(message):
         return message, ParseMode.HTML, True
     try:
         from plugins.platforms.telegram.adapter import TelegramAdapter
