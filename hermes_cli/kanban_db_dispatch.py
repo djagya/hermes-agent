@@ -2534,9 +2534,26 @@ def _rotate_worker_log(
 
 
 def _module_hermes_argv() -> list[str]:
-    """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
-    return [sys.executable, "-m", "hermes_cli.main"]
+    """Interpreter-bound Hermes CLI invocation pinned to THIS install.
+
+    Workers start with ``cwd=<task workspace>``; ``python -m`` would put that cwd
+    first on ``sys.path``, so a workspace that is itself a Hermes checkout (a fork
+    worktree) shadowed the installed ``hermes_cli`` and the worker ran that stale
+    tree under the current interpreter — every tool call failed, ``kanban_block``
+    included. ``-P`` drops the cwd entry and the bootstrap puts the dispatcher's
+    own package root first, so the child imports exactly what is dispatching it
+    (also when that root is importable only via the dispatcher's own cwd, as in a
+    source checkout). The source shape is a recognised ``runpy`` bootstrap
+    (``gateway.status._BOOTSTRAPS``), so process identity still reads it as
+    ``-m hermes_cli.main <argv>``. ``-P`` is per-invocation (unlike
+    ``PYTHONSAFEPATH``): the worker's own ``python script.py`` / pytest children
+    keep normal path semantics."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    source = (
+        f"import sys, runpy; sys.path.insert(0, {root!r}); "
+        "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"
+    )
+    return [sys.executable, "-P", "-c", source]
 
 
 def _absolute_hermes_path(path: str) -> str:
@@ -2600,8 +2617,8 @@ def _hermes_path_argv(path: str) -> list[str]:
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
     (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
+    same-directory file), then the running interpreter's pinned
+    ``hermes_cli.main`` bootstrap (exactly this install; also covers shim-less cron,
     systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
     search, batch shims fall back to the module form) only when ``hermes_cli``
     is not importable. The module argv must win over PATH: a PATH-first lookup
