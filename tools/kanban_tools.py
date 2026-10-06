@@ -1064,6 +1064,17 @@ def _handle_create(args: dict, **kw) -> str:
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+        # Resolve trusted channel context BEFORE the task can be dispatched.
+        # Workers inherit their owning task's origin, not their transient runtime.
+        source_target = None
+        if not self_task and cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
+            source_target = _resolve_notify_target()
+            if source_target:
+                source_target["delivery_metadata"] = {
+                    **(source_target.get("delivery_metadata") or {}),
+                    "kanban_source": True,
+                    "kanban_origin_session_id": session_id or "",
+                }
         new_tid = kb.create_task(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
@@ -1081,12 +1092,26 @@ def _handle_create(args: dict, **kw) -> str:
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
-            created_by=_persisted_identity(), session_id=session_id)
+            created_by=_persisted_identity(), session_id=session_id,
+            source_notify_target=source_target)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+        from hermes_cli.kanban_db_notify import list_notify_subs
+
+        subs = list_notify_subs(conn, new_tid)
+        source_subscribed = any(
+            (sub.get("delivery_metadata") or {}).get("kanban_source")
+            and (source_target is None or (
+                sub["platform"] == source_target["platform"]
+                and sub["chat_id"] == source_target["chat_id"]
+                and (sub["thread_id"] or "") == (source_target.get("thread_id") or "")
+            ))
+            for sub in subs
+        )
         return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=bool(source_subscribed or (self_task and subs)),
+                   source_subscribed=bool(source_subscribed))
 
 
 def _resolve_notify_target() -> Optional[dict[str, Any]]:
@@ -1131,7 +1156,12 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
         delivery_metadata=delivery_metadata or None)
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+def _maybe_auto_subscribe(
+    conn: Any,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
     """Subscribe the calling session to completion/block events; True iff a row was
     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
@@ -1153,7 +1183,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                and (sub["thread_id"] or "") == (target["thread_id"] or "")
                for sub in _kbn.list_notify_subs(conn, task_id)):
             return True
-        _kbn.add_notify_sub(conn, task_id=task_id, **target)
+        _kbn.add_notify_sub(conn, task_id=task_id, board=board, **target)
         return True
     except Exception as _exc:
         logger.warning(

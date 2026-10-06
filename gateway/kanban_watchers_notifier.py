@@ -524,6 +524,9 @@ class _KanbanNotification:
         self.adapter: Any = None
         self.is_push_adapter = True
         self.wake_kinds: set = set()
+        self.is_source = bool((sub.get("delivery_metadata") or {}).get("kanban_source"))
+        # Declared artifacts a native-origin upload could not deliver; surfaced in the wake.
+        self.artifact_failures: list[str] = []
 
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
@@ -579,7 +582,10 @@ class _KanbanNotification:
         if not self.wake_kinds:
             return
         if self.is_push_adapter:
-            self.session_key = getattr(task, "session_id", None) or ""
+            meta = sub.get("delivery_metadata") or {}
+            self.session_key = (meta.get("kanban_origin_session_id") or "") if meta.get("kanban_source") else (
+                "" if meta.get("kanban_telemetry") else getattr(task, "session_id", None) or ""
+            )
         else:
             # Non-push wakes target sub["chat_id"] (the raw session id the
             # subscriber registered). task.session_id may be a WORKER session
@@ -601,6 +607,19 @@ class _KanbanNotification:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
         self.synth += "\n" + _KANBAN_WAKE_DECISION_CONTRACT
+        if self.is_source:
+            self.synth += (
+                "\nThis is the task's native originating conversation, not queue telemetry. "
+                "Integrate the handoff and return a concise user-facing synthesis here; "
+                "inspect the native task before claiming acceptance. Do not resend files "
+                "already uploaded by the notifier. Never infer another route from task prose."
+            )
+            if self.artifact_failures:
+                self.synth += (
+                    "\nThe notifier could NOT upload these declared artifacts: "
+                    + "; ".join(self.artifact_failures)
+                    + ". Deliver them here yourself or tell the user why not."
+                )
 
     def _log_woke(self) -> None:
         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
@@ -678,7 +697,7 @@ class _KanbanNotification:
         from gateway.warning_notifications import present_notification
         sub, adapter = self.sub, self.adapter
         delivery_metadata = sub.get("delivery_metadata")
-        metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
+        metadata: dict[str, Any] = {k: v for k, v in delivery_metadata.items() if not k.startswith("kanban_")} if isinstance(delivery_metadata, dict) else {}
         if sub.get("thread_id") and not metadata.get("thread_id"):
             metadata["thread_id"] = sub["thread_id"]
         _send_res = None
@@ -700,13 +719,22 @@ class _KanbanNotification:
         # handoff time. Retry exposure matches ``completed`` (the sub cursor is
         # rewound only when a send failed).
         if ev.kind in ("completed", "review_requested"):
+            # The text already landed: an artifact failure must not rewind the
+            # claim (that would resend the text). Native-origin failures are
+            # carried into the origin wake so the woken agent can deliver them.
             try:
-                await self.runner._deliver_kanban_artifacts(
+                failures = await self.runner._deliver_kanban_artifacts(
                     adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
                     event_payload=getattr(ev, "payload", None), task=self.task,
+                    **({"strict": True} if self.is_source else {}),
                 )
             except Exception as art_exc:
-                logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
+                failures = [str(art_exc)] if self.is_source else []
+                logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc, exc_info=True)
+            if self.is_source and failures:
+                self.artifact_failures += list(failures)
+                logger.warning("kanban notifier: %d declared artifact(s) for %s not delivered to origin %s/%s: %s",
+                               len(failures), self.task_id, self.platform_str, sub["chat_id"], "; ".join(failures))
         return True
 
     async def _send_pings(self) -> bool:
