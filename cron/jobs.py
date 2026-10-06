@@ -2714,6 +2714,10 @@ def claim_job_for_fire(
         # (Trigger-now on a paused job) bypasses the gate and atomically resumes the job below.
         if not force and not is_job_runnable(job):
             return False
+        # An off-tick fire of a spent one-shot would only be rejected by claim_dispatch after the
+        # caller reported it started; ticks still claim so claim_dispatch retires the record.
+        if (force or manual) and oneshot_dispatch_exhausted(job):
+            return False
         now = _hermes_now()
         if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
             return False  # someone holds a fresh claim
@@ -2773,6 +2777,30 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
         return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
 
     return _with_job(job_id, apply, False)
+
+
+def release_fire_claim(job_id: str, *, expected_owner: str) -> bool:
+    """Drop *expected_owner*'s ``fire_claim`` when its fire ends without a run (no
+    ``mark_job_run`` will clear it). Owner-fenced so a newer claim is never released."""
+    def apply(jobs, _i, job):
+        claim = job.get("fire_claim")
+        if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+            return False
+        job["fire_claim"] = None
+        save_jobs(jobs)
+        return True
+
+    return _with_job(job_id, apply, False)
+
+
+def oneshot_dispatch_exhausted(job: Dict[str, Any]) -> bool:
+    """True for a finite one-shot whose ``repeat.completed`` already reached ``repeat.times``:
+    ``claim_dispatch`` will reject every further fire until it is re-armed."""
+    if (job.get("schedule") or {}).get("kind") != "once":
+        return False
+    repeat = job.get("repeat") or {}
+    times = repeat.get("times")
+    return isinstance(times, int) and times > 0 and int(repeat.get("completed") or 0) >= times
 
 
 # Completed one-shots are retained in jobs.json (final status stays inspectable) and pruned by

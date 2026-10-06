@@ -37,6 +37,7 @@ from cron.jobs import (
     is_job_runnable,
     list_jobs,
     mark_job_run,
+    oneshot_dispatch_exhausted,
     parse_schedule,
     pause_job,
     remove_job,
@@ -192,6 +193,12 @@ def _claim_for_manual_run(job_id: str, log_label: str):
         refreshed = get_job(job_id)
         if refreshed is None:
             reason = "Job no longer exists; nothing to run."
+        elif oneshot_dispatch_exhausted(refreshed):
+            repeat = refreshed.get("repeat") or {}
+            reason = (
+                f"One-shot job already used its dispatch budget "
+                f"({repeat.get('completed')}/{repeat.get('times')}); re-arm it with "
+                f"'hermes cron resume {job_id} --run-now' (or '--at <ISO-8601>') to run it again.")
         elif not is_job_runnable(refreshed):
             reason = "Job is paused/disabled; resume it before running."
         else:
