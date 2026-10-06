@@ -449,6 +449,12 @@ RUN mkdir -p /opt/hermes/bin && \
 # reports "(unknown)". updateMechanism is `external`: the image is rebuilt
 # and re-pulled, it never updates itself.
 #
+# runtimeDir names the sealed tool store in the stamp itself, so processes
+# started without the image ENV (operator s6 services with a plain `#!/bin/sh`
+# run script, `docker exec env -i ...`) resolve the same store instead of
+# falling back to $HERMES_HOME/tools and reporting the baked ffmpeg/node/npm/
+# ripgrep as "not installed or outdated".
+#
 # The versioned, non-secret provenance marker is the authoritative runtime
 # signal that this filesystem came from an immutable image.  It deliberately
 # lives outside both /opt/hermes (which operators sometimes bind-mount as a
@@ -461,7 +467,7 @@ RUN set -eu; \
             "${HERMES_GIT_SHA:-0000000000000000000000000000000000000000}" \
             > /opt/hermes/install-stamp.json; \
     fi; \
-    python3 -c 'import json; from pathlib import Path; path = Path("/opt/hermes/install-stamp.json"); stamp = json.loads(path.read_text()); stamp["pmRuntime"] = "/opt/hermes/pm-runtime"; path.write_text(json.dumps(stamp) + "\n")'; \
+    python3 -c 'import json; from pathlib import Path; path = Path("/opt/hermes/install-stamp.json"); stamp = json.loads(path.read_text()); stamp["pmRuntime"] = "/opt/hermes/pm-runtime"; stamp["runtimeDir"] = "/opt/hermes/tools"; path.write_text(json.dumps(stamp) + "\n")'; \
     mkdir -p /etc/hermes; \
     python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; stamp = json.loads(pathlib.Path("/opt/hermes/install-stamp.json").read_text(encoding="utf-8")); commit = stamp.get("commit"); revision = commit if commit and set(commit) != {"0"} else None; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": os.environ.get("HERMES_IMAGE_NAME", "nousresearch/hermes-agent"), "version": project["version"], "revision": revision}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 
