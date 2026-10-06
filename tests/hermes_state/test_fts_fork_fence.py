@@ -84,3 +84,23 @@ def test_deferred_index_lease_covers_create_index():
     assert "DEFERRED_INDEX_SQL" in source
     before, after = source.split("DEFERRED_INDEX_SQL", 1)
     assert "report_startup_progress(3600.0" in before
+
+
+def test_fenced_retry_is_silent_on_a_healthy_index(tmp_path, caplog):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    assert db._fts_stale is False
+    with caplog.at_level("DEBUG", logger="hermes_state"):
+        for _ in range(3):
+            assert db.retry_deferred_fts_recovery() is False
+    assert "fork FTS fence" not in caplog.text
+    db.close()
+
+
+def test_fenced_retry_reports_a_stale_index_once_per_handle(tmp_path, caplog):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db._fts_stale = True
+    with caplog.at_level("WARNING", logger="hermes_state"):
+        for _ in range(3):
+            assert db.retry_deferred_fts_recovery() is False
+    assert caplog.text.count("Skipped deferred FTS recovery") == 1
+    db.close()
