@@ -690,6 +690,11 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
+    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
+
+    if code and payment_session_sensitive(task_id) and any(token in code.lower() for token in
+            ("screenshot", "printtopdf", "screencast", "recording")):
+        return json.dumps(screenshot_refusal())
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 
