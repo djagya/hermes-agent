@@ -65,7 +65,10 @@ Live identity already uses native URL-only Todoist
 (`https://ai.todoist.net/mcp`). Do not put `mcp-remote` back.
 
 `disk-gate.sh --check` refuses tight disk and unopenable existing
-`*.db` files (`SELECT 1` only; no `PRAGMA quick_check`). Archive
+`*.db` files (`SELECT 1` only; no `PRAGMA quick_check`). It skips
+cache/scratch trees, kanban task workspaces, `.git`, `.worktrees` and
+`fixtures/` — agent repo clones ship the invalid `fixtures/bad.db`.
+Board `kanban.db` files are still checked. Archive
 wrappers inspect zip and tar members (`check-archive-members.py`).
 Debian snapshot date (`DEBIAN_SNAPSHOT`) is the apt version lock —
 no floating sid, no per-package `pkg=ver` pins (those rot on every
