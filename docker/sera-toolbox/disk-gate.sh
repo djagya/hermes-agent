@@ -132,13 +132,20 @@ db_open_check() {
     # Cache/scratch trees are disposable and may hold deliberately corrupt
     # fixture DBs (pytest-of-* from agent test runs): skip them, or one stray
     # fixture fails every boot (01-hermes-setup exits before the uid remap).
+    # Same for kanban task workspaces (kanban/workspaces, the default board,
+    # and kanban/boards/<slug>/workspaces): agent scratch that holds repo
+    # checkouts, never a live DB. Board DBs sit beside workspaces/, not in it.
+    # Checkouts elsewhere: .git, .worktrees and fixtures/ (bad.db).
     for root in "$home/cron" "$home/kanban" "$home/profiles"; do
         [ -d "$root" ] || continue
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             open_sqlite "$f" || return 1
         done <<EOF
-$(find "$root" \( -type d \( -name cache -o -name .cache -o -name scratch -o -name 'pytest-of-*' \) -prune \) -o \( -name '*.db' -type f -print \) 2>/dev/null)
+$(find "$root" \( -type d \( -name cache -o -name .cache -o -name scratch -o -name 'pytest-of-*' \
+    -o -name .git -o -name .worktrees -o -name fixtures \
+    -o -path "$home/kanban/workspaces" -o -path "$home/kanban/boards/*/workspaces" \) -prune \) \
+    -o \( -name '*.db' -type f -print \) 2>/dev/null)
 EOF
     done
     return 0
@@ -213,6 +220,35 @@ self_test() {
         return 1
     fi
     rm -rf "$tmp/profiles/p"
+    # Agent clones of this repo ship fixtures/bad.db under task workspaces.
+    for ws in "$tmp/kanban/boards/x/workspaces/t/repo" "$tmp/kanban/workspaces/t/repo"; do
+        mkdir -p "$ws/docker/sera-toolbox/fixtures" "$ws/.git" "$ws/.worktrees/t2"
+        printf 'not-a-db\n' > "$ws/docker/sera-toolbox/fixtures/bad.db"
+        printf 'not-a-db\n' > "$ws/.git/x.db"
+        printf 'not-a-db\n' > "$ws/.worktrees/t2/x.db"
+        printf 'not-a-db\n' > "$ws/scratch.db"
+    done
+    mkdir -p "$tmp/profiles/p/repo/fixtures"
+    printf 'not-a-db\n' > "$tmp/profiles/p/repo/fixtures/bad.db"
+    sqlite3 "$tmp/kanban/boards/x/kanban.db" "CREATE TABLE t(x INTEGER);"
+    db_open_check "$tmp" || {
+        echo "self-test: expected workspace/fixture DBs to be skipped" >&2
+        return 1
+    }
+    printf 'not-a-db\n' > "$tmp/kanban/boards/x/kanban.db"
+    if db_open_check "$tmp" 2>/dev/null; then
+        echo "self-test: expected open fail on corrupt live board kanban.db" >&2
+        return 1
+    fi
+    # A board slugged "workspaces" is still a live board.
+    rm -f "$tmp/kanban/boards/x/kanban.db"
+    mkdir -p "$tmp/kanban/boards/workspaces"
+    printf 'not-a-db\n' > "$tmp/kanban/boards/workspaces/kanban.db"
+    if db_open_check "$tmp" 2>/dev/null; then
+        echo "self-test: expected open fail on corrupt board named workspaces" >&2
+        return 1
+    fi
+    rm -rf "$tmp/kanban" "$tmp/profiles/p"
     dd if=/dev/zero of="$tmp/state.db" bs=1024 count=4 >/dev/null 2>&1
     mkdir -p "$tmp/profiles/stay"
     dd if=/dev/zero of="$tmp/profiles/stay/state.db" bs=1024 count=4 >/dev/null 2>&1
