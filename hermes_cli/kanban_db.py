@@ -1525,27 +1525,20 @@ def _inherit_notify_subs(
     ).fetchone()
     cursor = int(row["cursor"] if row is not None else 0)
     placeholders = ",".join("?" * len(parent_ids))
-    rows = conn.execute(
-        f"SELECT * FROM kanban_notify_subs WHERE task_id IN ({placeholders})", parent_ids,
-    ).fetchall()
-    from hermes_cli.kanban_db_notify import _decode_notify_delivery_metadata, _encode_notify_delivery_metadata
-    for row in rows:
-        metadata = _decode_notify_delivery_metadata(row["delivery_metadata"])
-        # Delivery holds concern one task/event, never a descendant's obligation.
-        metadata.pop("kanban_delivery_hold", None)
-        metadata.pop("kanban_delivery_old_cursor", None)
-        conn.execute(
-            """INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-                 chat_type, notifier_profile, delivery_mode, delivery_metadata,
-                 created_at, last_event_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (child_id, row["platform"], row["chat_id"], row["thread_id"],
-             row["user_id"], row["user_id_alt"], row["chat_type"] or "dm",
-             row["notifier_profile"], row["delivery_mode"] or "notify",
-             _encode_notify_delivery_metadata(metadata),
-             int(created_at if created_at is not None else time.time()), cursor),
-        )
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+             chat_type, notifier_profile, delivery_mode, delivery_metadata,
+             created_at, last_event_id)
+        SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
+               COALESCE(chat_type, 'dm'), notifier_profile,
+               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
+          FROM kanban_notify_subs
+         WHERE task_id IN ({placeholders})
+        """,
+        (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
+    )
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:

@@ -79,24 +79,7 @@ def test_origin_on_telemetry_topic_retains_identity(conn):
     assert subs[0]["delivery_metadata"]["kanban_source"] is True
 
 
-def test_quick_event_claim_crash_hold_and_explicit_reconciliation(conn):
-    tid = kb.create_task(conn, title="fast", board="board-unlisted", source_notify_target=source())
-    with kb.write_txn(conn):
-        kb._append_event(conn, tid, "completed", {"summary": "synthetic completion"})
-    old, claimed, events = notify.claim_unseen_events_for_sub(conn, task_id=tid, **route("201"))
-    assert events and events[-1].kind == "completed"
-    held = next(s for s in notify.list_notify_subs(conn, tid) if s["thread_id"] == "201")
-    assert held["delivery_metadata"]["kanban_delivery_hold"] == claimed
-    assert notify.claim_unseen_events_for_sub(conn, task_id=tid, **route("201"))[2] == []
-    notify.add_notify_sub(conn, task_id=tid, board="board-unlisted", **route("101"))
-    assert notify.claim_unseen_events_for_sub(conn, task_id=tid, **route("201"))[2] == []
-    notify.resolve_notify_delivery_hold(conn, task_id=tid, delivered=False, **route("201"))
-    assert notify.claim_unseen_events_for_sub(conn, task_id=tid, **route("201"))[2]
-    notify.advance_notify_cursor(conn, task_id=tid, new_cursor=claimed, **route("201"))
-    assert not next(s for s in notify.list_notify_subs(conn, tid) if s["thread_id"] == "201")["delivery_metadata"].get("kanban_delivery_hold")
-
-
-def test_child_inherits_default_source_not_parent_hold(conn):
+def test_child_inherits_default_source(conn):
     parent = kb.create_task(conn, title="creator", board="board-unlisted", session_id="fixture-origin",
                             source_notify_target=source())
     with kb.write_txn(conn):
@@ -108,7 +91,6 @@ def test_child_inherits_default_source_not_parent_hold(conn):
     origin = next(s for s in notify.list_notify_subs(conn, child) if s["thread_id"] == "201")
     assert origin["notifier_profile"] == "default"
     assert origin["delivery_metadata"]["kanban_source"] is True
-    assert not origin["delivery_metadata"].get("kanban_delivery_hold")
 
 
 @pytest.mark.parametrize("success", [True, False, None])
@@ -125,11 +107,8 @@ def test_strict_artifact_delivery_only_explicit_intended_paths(tmp_path, monkeyp
     kwargs: dict[str, Any] = dict(adapter=adapter, chat_id="fixture-chat", metadata={"thread_id": "201"},
                   event_payload={"artifacts": [str(intended)], "summary": str(internal)},
                   task=SimpleNamespace(result=str(internal)), strict=True)
-    if success is True:
-        asyncio.run(GatewayKanbanWatchersMixin()._deliver_kanban_artifacts(**kwargs))
-    else:
-        with pytest.raises(RuntimeError):
-            asyncio.run(GatewayKanbanWatchersMixin()._deliver_kanban_artifacts(**kwargs))
+    failures = asyncio.run(GatewayKanbanWatchersMixin()._deliver_kanban_artifacts(**kwargs))
+    assert failures == ([] if success is True else ["intended.md: upload not acknowledged"])
     adapter.send_document.assert_awaited_once_with(chat_id="fixture-chat", file_path=str(intended), metadata={"thread_id": "201"})
 
 
@@ -165,8 +144,8 @@ def test_strict_source_artifact_policy_denial_is_not_success(tmp_path, monkeypat
     intended.write_text("synthetic")
     monkeypatch.setattr(BasePlatformAdapter, "filter_local_delivery_paths", staticmethod(lambda p: []))
     adapter = SimpleNamespace(send_document=AsyncMock())
-    with pytest.raises(RuntimeError, match="denied"):
-        asyncio.run(GatewayKanbanWatchersMixin()._deliver_kanban_artifacts(
-            adapter=adapter, chat_id="fixture-chat", metadata={}, task=None,
-            event_payload={"artifacts": [str(intended)]}, strict=True))
+    failures = asyncio.run(GatewayKanbanWatchersMixin()._deliver_kanban_artifacts(
+        adapter=adapter, chat_id="fixture-chat", metadata={}, task=None,
+        event_payload={"artifacts": [str(intended), str(tmp_path / "gone.md")]}, strict=True))
+    assert failures == ["gone.md: missing", "intended.md: denied by delivery policy"]
     adapter.send_document.assert_not_awaited()

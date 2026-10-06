@@ -490,7 +490,7 @@ def purge_stale_done_notify_subs(conn: sqlite3.Connection, *, max_age_days: int 
     cutoff = int(time.time()) - days * 86400
     with _kb.write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM kanban_notify_subs WHERE COALESCE(delivery_metadata, '') NOT LIKE '%kanban_delivery_hold%' AND task_id IN ("
+            "DELETE FROM kanban_notify_subs WHERE task_id IN ("
             " SELECT t.id FROM tasks t"
             " WHERE t.status IN ('done', 'blocked')"
             " AND COALESCE("
@@ -563,12 +563,6 @@ def claim_unseen_events_for_sub(
     delivery failure.
     """
     with _kb.write_txn(conn):
-        row = conn.execute(
-            "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE,
-            _sub_key(task_id, platform, chat_id, thread_id),
-        ).fetchone()
-        if row and _decode_notify_delivery_metadata(row[0]).get("kanban_delivery_hold"):
-            return 0, 0, []  # uncertain send: operator reconciliation, never blind resend
         old_cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
         if old_cursor is None:
             return 0, 0, []
@@ -578,77 +572,8 @@ def claim_unseen_events_for_sub(
         )
         if not events:
             return old_cursor, old_cursor, []
-        key = _sub_key(task_id, platform, chat_id, thread_id)
-        _cas_cursor(conn, key, new_cursor, old_cursor)
-        metadata = _decode_notify_delivery_metadata(row[0]) if row else {}
-        if metadata.get("kanban_source"):
-            # Persist uncertainty BEFORE side effects; a process crash must not
-            # silently turn a claim into a source-delivery receipt.
-            metadata["kanban_delivery_hold"] = new_cursor
-            metadata["kanban_delivery_old_cursor"] = old_cursor
-            conn.execute("UPDATE kanban_notify_subs SET delivery_metadata = ? " + _SUB_KEY_WHERE,
-                         (_encode_notify_delivery_metadata(metadata), *key))
+        _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), new_cursor, old_cursor)
         return old_cursor, new_cursor, events
-
-
-def hold_notify_delivery(
-    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
-    thread_id: Optional[str] = None, event_id: int, old_cursor: int,
-) -> None:
-    """Retain an uncertain source obligation without automatic resends.
-
-    Operator reconciliation must inspect actual receipts before explicitly clearing
-    the hold. Fixed-policy reconciliation never clears or retries this obligation.
-    """
-    key = _sub_key(task_id, platform, chat_id, thread_id)
-    with _kb.write_txn(conn):
-        row = conn.execute("SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE, key).fetchone()
-        if row is None:
-            return
-        metadata = _decode_notify_delivery_metadata(row[0])
-        metadata["kanban_delivery_hold"] = int(event_id)
-        metadata["kanban_delivery_old_cursor"] = int(old_cursor)
-        conn.execute("UPDATE kanban_notify_subs SET delivery_metadata = ? " + _SUB_KEY_WHERE,
-                     (_encode_notify_delivery_metadata(metadata), *key))
-        _cas_cursor(conn, key, old_cursor, event_id)
-        _kb._append_event(conn, task_id, "notify_delivery_held", {
-            "platform": platform, "chat_id": chat_id, "thread_id": thread_id,
-            "event_id": int(event_id), "reason": "uncertain_source_delivery",
-        })
-
-
-def resolve_notify_delivery_hold(
-    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
-    thread_id: Optional[str] = None, delivered: bool,
-) -> None:
-    """Operator-only Python API: acknowledge receipt or permit a reconciled retry."""
-    key = _sub_key(task_id, platform, chat_id, thread_id)
-    with _kb.write_txn(conn):
-        row = conn.execute("SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE, key).fetchone()
-        if row is None:
-            return
-        metadata = _decode_notify_delivery_metadata(row[0])
-        held = metadata.pop("kanban_delivery_hold", None)
-        old_cursor = metadata.pop("kanban_delivery_old_cursor", 0)
-        if not held:
-            return
-        conn.execute("UPDATE kanban_notify_subs SET delivery_metadata = ? " + _SUB_KEY_WHERE,
-                     (_encode_notify_delivery_metadata(metadata), *key))
-        if delivered:
-            conn.execute("UPDATE kanban_notify_subs SET last_event_id = MAX(last_event_id, ?) " + _SUB_KEY_WHERE,
-                         (int(held), *key))
-        else:
-            _cas_cursor(conn, key, int(old_cursor), int(held))
-
-
-def _clear_delivery_hold(conn: sqlite3.Connection, key: tuple) -> None:
-    row = conn.execute("SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE, key).fetchone()
-    if row:
-        metadata = _decode_notify_delivery_metadata(row[0])
-        metadata.pop("kanban_delivery_hold", None)
-        metadata.pop("kanban_delivery_old_cursor", None)
-        conn.execute("UPDATE kanban_notify_subs SET delivery_metadata = ? " + _SUB_KEY_WHERE,
-                     (_encode_notify_delivery_metadata(metadata), *key))
 
 
 def _cas_cursor(conn: sqlite3.Connection, key: tuple, new_cursor: int, expected: int) -> sqlite3.Cursor:
@@ -673,7 +598,6 @@ def advance_notify_cursor(
             "UPDATE kanban_notify_subs SET last_event_id = ? " + _SUB_KEY_WHERE,
             (int(new_cursor), *_sub_key(task_id, platform, chat_id, thread_id)),
         )
-        _clear_delivery_hold(conn, _sub_key(task_id, platform, chat_id, thread_id))
 
 
 def record_notify_ping(
@@ -703,10 +627,7 @@ def rewind_notify_cursor(
     notifier advanced the row, so retries never clobber newer progress.
     """
     with _kb.write_txn(conn):
-        key = _sub_key(task_id, platform, chat_id, thread_id)
-        cur = _cas_cursor(conn, key, old_cursor, claimed_cursor)
-        if cur.rowcount:
-            _clear_delivery_hold(conn, key)
+        cur = _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), old_cursor, claimed_cursor)
     return cur.rowcount > 0
 
 
