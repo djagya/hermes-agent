@@ -25,12 +25,17 @@ from tools.browser_supervisor_dialogs import (
     DialogSupervisionMixin, PendingDialog,
 )
 from tools.browser_supervisor_frames import FrameInfo, FrameTrackingMixin
+from tools.browser_supervisor_payment import PaymentSupervisionMixin
 
 # ``websockets`` costs ~22 ms at import and is only needed once a supervisor connects.
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
+_transport_logger = logging.getLogger("hermes.cdp.transport")
+# WebSocket DEBUG frame logs include secret-bearing CDP payloads before the
+# general log redactor can see complete values. Never emit wire payloads.
+_transport_logger.setLevel(logging.WARNING)
 
 # Browserbase can transiently drop a CDP socket while a short-lived client
 # reconnects.  A locally owned browser endpoint, however, is gone for good
@@ -98,7 +103,7 @@ class SupervisorSnapshot:
         return out
 
 
-class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
+class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisionMixin):
     """One supervisor per (task_id, cdp_url) pair. ``start()`` spawns a daemon thread
     running its own asyncio loop, connects, attaches to the first page target, enables
     domains and auto-attach. ``snapshot()`` / ``respond_to_dialog()`` / ``evaluate_runtime()``
@@ -378,7 +383,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         reconnect_failures, last_success_at, backoff = 0, 0.0, 0.5
         import websockets  # deferred: only supervisors that connect pay the import
         from agent.proxy_bypass import loopback_connect_kwargs
-        connect_kwargs = {"max_size": 50 * 1024 * 1024, **loopback_connect_kwargs(self.cdp_url)}
+        connect_kwargs = {"max_size": 50 * 1024 * 1024, "logger": _transport_logger,
+                          **loopback_connect_kwargs(self.cdp_url)}
         while not self._stop_requested:
             try:
                 self._ws = await asyncio.wait_for(websockets.connect(self.cdp_url, **connect_kwargs), timeout=10.0)

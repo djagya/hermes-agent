@@ -171,6 +171,8 @@ class VaultItemMeta:
     # ``origin`` is the first/primary one). Fill matching stays exact-origin against
     # this list — no wildcard or subdomain inference is ever derived from it.
     allowed_origins: tuple = ()
+    payment_scope: str = "origin_bound"
+    payment_frame_origins: tuple = ()
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
