@@ -222,6 +222,15 @@ class MCPServerRunMixin:
                     "self-probe until it is re-enabled", self.name)
                 paused = True
                 continue
+            # An OAuth auth-failure park promises "parking until credentials change": without a new
+            # token/client file (``hermes mcp login`` from another process, a dashboard re-auth) or an
+            # edited endpoint/auth config, the probe can only replay the dead refresh token (a 400 at
+            # the token endpoint) and then fail the non-interactive authorize step, every interval.
+            if (outcome == "self-probe" and self._auth_park_credentials is not None
+                    and self._oauth_credential_snapshot() == self._auth_park_credentials):
+                logger.debug("MCP server '%s': parked on authentication; credentials unchanged, "
+                             "skipping self-probe", self.name)
+                continue
             # Nobody asked for this revival: a self-probe must never open a browser OAuth flow. The
             # OAuth provider runs inside THIS task (the SDK's auth flow sits in the transport), so a
             # task-local ContextVar reaches it; it stays set for the task's life — every later
@@ -231,6 +240,7 @@ class MCPServerRunMixin:
                 from tools.mcp_oauth import _oauth_interactive_enabled
 
                 _oauth_interactive_enabled.set(False)
+            self._auth_park_credentials = None
             logger.debug(
                 "MCP server '%s': attempting revival %s (%s); rebuilding transport.",
                 self.name,
@@ -238,6 +248,33 @@ class MCPServerRunMixin:
                 outcome,
             )
             return False
+
+    def _oauth_credential_snapshot(self) -> tuple:
+        """What an OAuth re-authorization changes: the stat of this server's token and client
+        files plus the on-disk endpoint/auth config. Stat only — no token bytes are read."""
+        from tools import mcp_tool_config as _config
+        from tools.mcp_oauth import HermesTokenStorage
+
+        storage = HermesTokenStorage(self.name)
+        files = []
+        for path in (storage._tokens_path(), storage._client_info_path()):
+            try:
+                st = path.stat()
+                files.append((st.st_mtime_ns, st.st_size, st.st_ino))
+            except OSError:
+                files.append(None)
+        try:
+            entry = (_config._load_mcp_config() or {}).get(self.name) or {}
+            cfg = repr([entry.get(k) for k in self._REMOTE_REBIND_KEYS])
+        except Exception:
+            cfg = None
+        return tuple(files), cfg
+
+    def _arm_auth_park(self, root: BaseException) -> None:
+        """Snapshot credentials before an OAuth auth-failure park (see ``_park``)."""
+        self._auth_park_credentials = (
+            self._oauth_credential_snapshot()
+            if self._auth_type == "oauth" and _errors._is_auth_error(root) else None)
 
     def _still_configured_enabled(self) -> bool:
         """Whether ``mcp_servers`` on disk still wants this server connected: entry present
@@ -475,6 +512,7 @@ class MCPServerRunMixin:
                       else "connection with a permanent error, parking without retries")
             self._log_park("MCP server '%s' failed initial %s (state: connecting → parked): %s: %s",
                            self.name, detail, type(root).__name__, root)
+            self._arm_auth_park(root)
             return await self._park_initial_failure(exc, "after permanent initial failure", budget)
         budget.initial_retries += 1
         if budget.initial_retries > _core._MAX_INITIAL_CONNECT_RETRIES:
@@ -509,6 +547,7 @@ class MCPServerRunMixin:
         self._log_park(
             "MCP server '%s' hit a permanent error, parking without retries; will self-probe every %ds "
             "(state: connected → parked): %s: %s", self.name, _core._PARKED_RETRY_INTERVAL, type(root).__name__, root)
+        self._arm_auth_park(root)
         return await self._park_and_rearm("from parked state (permanent error)", budget)
 
     async def start(self, config: dict):
