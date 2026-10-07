@@ -562,6 +562,11 @@ class SessionSchemaMixin:
         and tried again later, no new thread — the caller is an existing periodic tick (gateway
         housekeeping). See #100108, #97940.
         """
+        # Fork fence: the housekeeping tick calls this for every live instance, healthy or not, so
+        # report only a real stale index and only once per instance (search stays on LIKE meanwhile).
+        if not self._fts_stale or self._fts_fence_retry_reported:
+            return False
+        self._fts_fence_retry_reported = True
         logger.warning("Skipped deferred FTS recovery (fork FTS fence).")
         return False
 
