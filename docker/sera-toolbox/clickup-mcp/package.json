@@ -1,0 +1,12 @@
+{
+  "name": "@hermes-agent/sera-toolbox-clickup-mcp",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Lock for the baked ClickUp MCP server. Installed into /usr/local/lib/node_modules by the Dockerfile.",
+  "dependencies": {
+    "@hauptsache.net/clickup-mcp": "1.8.0"
+  },
+  "overrides": {
+    "@modelcontextprotocol/sdk": "1.31.0"
+  }
+}
