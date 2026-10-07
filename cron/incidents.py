@@ -147,6 +147,12 @@ def _classify_failure_type(error: str) -> str:
     text = _normalize_error(error)
     if not text:
         return "unknown"
+    # Exhausted credits first. The provider's wording overlaps the ``rate_limit`` ("quota") and
+    # ``script`` ("subscription") keywords, and xAI sends it as a 403 that reads like ``auth``.
+    from cron.provider_budget import BUDGET_FAILURE_TYPE, is_provider_budget_error
+
+    if is_provider_budget_error(text):
+        return BUDGET_FAILURE_TYPE
     for kind, patterns in _FAILURE_TYPE_ORDER:
         for pattern in patterns:
             if pattern.startswith("\\b") and pattern.endswith("\\b"):

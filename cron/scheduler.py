@@ -290,9 +290,10 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     Deterministic scheduler/script shapes are matched first (their text can contain "timed out"
     and would otherwise be blamed on the model service); everything else goes through the shared
     ``classify_api_error`` verdict and the copy table in ``scheduler_failure_copy``."""
+    from cron.provider_budget import TOOL_BUDGET_ERROR_PREFIX
     from cron.scheduler_failure_copy import (
         classify_cron_failure_reason, generic_failure_notice, inactivity_notice,
-        provider_failure_notice, script_timeout_notice)
+        provider_failure_notice, script_timeout_notice, tool_budget_notice)
 
     job_name = job.get("name") or job.get("id") or "cron job"
     job_id = job.get("id") or job_name
@@ -311,6 +312,11 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # provider and the operator debugged the wrong system).
     if re.search(r"idle for \d+s\s*\(limit \d+s\)", lower):
         return inactivity_notice(job_name, job_id)
+
+    # A tool's provider is out of credits (run_job's tool-result check). Not the model service,
+    # so the provider notice below would point at the wrong account.
+    if text.startswith(TOOL_BUDGET_ERROR_PREFIX):
+        return tool_budget_notice(job_name, job_id, text)
 
     # no_agent jobs never reach a model, so provider errors are structurally impossible for them:
     # gate on job MODE before classifying, or a script's own wording ("429", "timed out") would
@@ -2468,6 +2474,30 @@ class _FireAudit:
 
 
 
+def _tool_budget_failure_result(
+    job: dict, job_id: str, job_name: str, prompt: Optional[str], result: dict, final_response: str,
+    audit: "_FireAudit",
+) -> Optional[_RunResult]:
+    """Failed run result when a tool's provider reported exhausted credits during the turn.
+
+    The agent usually finishes with a plausible "could not check" report, which was recorded ``ok``
+    and hid a spent provider budget. The response stays in the saved run document, below the
+    failure, so the archive answer that later runs read is unchanged."""
+    from cron.provider_budget import tool_budget_failure
+
+    error = tool_budget_failure(result.get("messages") or [])
+    if error is None:
+        return None
+    logger.warning("Job '%s' failed: %s", job_name, error)
+    audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), error)
+    output = (
+        _run_doc_header(job, f"{job_name} (FAILED)", job_id, prompt or "")
+        + f"## Failure\n\n{error}\n\n"
+        + f"## Response\n\n{final_response or '(No response generated)'}\n"
+    )
+    return False, output, final_response, error
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
@@ -2534,6 +2564,10 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+        budget_failure = _tool_budget_failure_result(
+            job, job_id, job_name, prompt, result, final_response, _audit)
+        if budget_failure is not None:
+            return budget_failure
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
                 and _cron_failure_marker_error(final_response) is None):
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
