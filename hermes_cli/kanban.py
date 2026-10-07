@@ -379,6 +379,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
+            source_notify_target=getattr(args, "source_notify_target", None),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
@@ -1176,6 +1177,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             notifier_profile=args.notifier_profile or _profile_author(),
             delivery_mode=getattr(args, "delivery_mode", None),
             delivery_metadata=delivery_metadata or None,
+            board=getattr(args, "board", None),
         )
     print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
           + f" to {args.task_id}")
@@ -1372,7 +1374,7 @@ Read-only commands are safe while an agent is running.\
 """
 
 
-def run_slash(rest: str) -> str:
+def run_slash(rest: str, *, source_notify_target: Optional[dict] = None) -> str:
     """Execute a ``/kanban …`` string (``rest`` = everything after ``/kanban``) and return captured
     stdout/stderr. Shared by the interactive CLI and the gateway so formatting is identical."""
     import io
@@ -1429,6 +1431,7 @@ def run_slash(rest: str) -> str:
 
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         try:
+            args.source_notify_target = source_notify_target
             kanban_command(args)
         except SystemExit:
             pass
