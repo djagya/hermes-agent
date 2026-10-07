@@ -166,6 +166,42 @@ def test_failure_type_classification(monkeypatch, tmp_path):
         assert inc._classify_failure_type(error) == expected, (error, expected)
 
 
+def test_auth_type_requires_runtime_auth_evidence(monkeypatch, tmp_path):
+    """Real credential failures stay ``auth``; prose that merely mentions OAuth or an
+    auth-scoped route does not claim a credential failure."""
+    inc = _point_db(monkeypatch, tmp_path)
+    for error in (
+        "Error code: 401 - {'error': 'invalid token'}",
+        "HTTP 401 Unauthorized from provider",
+        "OAuthNonInteractiveError: Token refresh failed: 400 invalid_grant",
+        "AuthenticationError: invalid API key",
+    ):
+        assert inc._classify_failure_type(error) == "auth", error
+    for prose in (
+        "Readmodel answered HTTP 200 through the allowed scoped-auth route; account check incomplete.",
+        "Correction published to the OAuth PR, but CI could not start the full run.",
+        "The author's report is incomplete: open orders were not observable.",
+    ):
+        assert inc._classify_failure_type(prose) != "auth", prose
+
+
+def test_agent_declared_failure_records_agent_reported_type(monkeypatch, tmp_path):
+    """A ``[CRON_FAILURE]`` verdict is the agent's own judgement: even when its prose names a 401,
+    the incident is typed ``agent_reported`` instead of being re-diagnosed by keywords."""
+    from cron import scheduler
+
+    inc = _point_db(monkeypatch, tmp_path)
+    verdict = "home.example.test answered 401 without login; live channel still 502."
+
+    _, incident_id = scheduler._upsert_incident_for_failure(
+        _job(id="verdict-job"), verdict, agent_declared=True)
+    _, runtime_id = scheduler._upsert_incident_for_failure(
+        _job(id="runtime-job"), "Error code: 401 - unauthorized")
+
+    assert inc.get_incident(incident_id)["failure_type"] == inc.AGENT_REPORTED_FAILURE_TYPE
+    assert inc.get_incident(runtime_id)["failure_type"] == "auth"
+
+
 # ── Lifecycle / ack ────────────────────────────────────────────────────────
 
 
