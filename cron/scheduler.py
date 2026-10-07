@@ -384,7 +384,7 @@ def _repeat_alert_withheld(incident: dict) -> bool:
 
 
 def _upsert_incident_for_failure(
-    job: dict, error: str, *, output_file: Optional[Any] = None
+    job: dict, error: str, *, output_file: Optional[Any] = None, agent_declared: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Record a durable failure incident (grouped by job + error signature). Returns
     ``(withheld, incident_id)``; withheld=True when the signature's incident is already ``closed``
@@ -392,10 +392,11 @@ def _upsert_incident_for_failure(
     already went out) -> suppress the per-run ping. Store errors log at debug; the caller delivers
     as if none existed."""
     try:
-        from cron.incidents import get_incident, upsert_incident
+        from cron.incidents import AGENT_REPORTED_FAILURE_TYPE, get_incident, upsert_incident
 
         incident_id, _is_new = upsert_incident(
-            job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file)
+            job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file,
+            failure_type=AGENT_REPORTED_FAILURE_TYPE if agent_declared else None)
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
@@ -537,7 +538,8 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 from cron.jobs import (
     _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
-    save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
+    release_fire_claim, save_job_output, self_removal_delivery_allowed,
+    self_removal_delivery_scope, use_cron_store)
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
@@ -2861,7 +2863,7 @@ def _compose_run_delivery(
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
         # Best-effort: a ledger failure never breaks delivery.
         incident_acked, failure_incident_id = _upsert_incident_for_failure(
-            job, error or "", output_file=output_file
+            job, error or "", output_file=output_file, agent_declared=agent_declared
         )
         if incident_acked:
             deliver_content = ""
@@ -3186,6 +3188,9 @@ def _run_one_job_body(
             finish_execution(
                 execution_id, success=False,
                 error="Dispatch claim rejected; execution was not started.")
+            # No run follows, so mark_job_run will not clear this fire's claim.
+            if fire_owner:
+                release_fire_claim(job["id"], expected_owner=fire_owner)
             return True  # not an error — already handled/removed
 
         # Claimed durably before dispatch; becomes running only right before the actual run.

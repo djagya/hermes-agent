@@ -973,6 +973,8 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     to its own kanban_create result, and the response surfaces the
     ``subscribed`` flag so the orchestrator can react."""
     from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
     monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
@@ -1007,6 +1009,8 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     We should still auto-subscribe, with platform='tui' and
     chat_id=<key>."""
     from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)

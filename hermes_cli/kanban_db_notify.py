@@ -67,13 +67,17 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     return {str(key): value for key, value in data.items() if isinstance(value, _SCALAR_TYPES)}
 
 
-def _fixed_notify_target() -> Optional[dict[str, Any]]:
-    """Return the install-wide Kanban notification target, when configured.
+def _fixed_notify_targets(
+    board: Optional[str] = None,
+    *,
+    delivery_mode: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Return the exact install-owned routes for ``board``.
 
-    The target is operator policy, not a caller preference: every task is born
-    subscribed to it and every later subscription request converges on the same
-    route.  Resolving it at the DB seam covers CLI, dashboard, cron, slash
-    commands, and agent tools without duplicating policy in those callers.
+    A board may replace the default thread, or split passive notification from
+    the controller wake. Resolving this at the DB seam makes creation atomic
+    with subscription, so a fast task cannot finish before a later reconciler
+    corrects its route.
     """
     try:
         from hermes_cli.config import load_config
@@ -86,17 +90,19 @@ def _fixed_notify_target() -> Optional[dict[str, Any]]:
             else {}
         )
     except Exception:
-        return None
+        return []
     if not isinstance(raw, Mapping) or not raw.get("enabled"):
-        return None
+        return []
     platform = str(raw.get("platform") or "").strip().lower()
     chat_id = str(raw.get("chat_id") or "").strip()
     if not platform or not chat_id:
         _log.warning(
             "kanban.fixed_notify_target is enabled but platform/chat_id is missing"
         )
-        return None
-    return {
+        return []
+    configured_mode = str(raw.get("delivery_mode") or "").strip()
+    mode = configured_mode if configured_mode in _NOTIFY_DELIVERY_MODES else delivery_mode
+    target = {
         "platform": platform,
         "chat_id": chat_id,
         "thread_id": str(raw.get("thread_id") or "").strip() or None,
@@ -104,7 +110,107 @@ def _fixed_notify_target() -> Optional[dict[str, Any]]:
         "notifier_profile": (
             str(raw.get("notifier_profile") or "").strip() or None
         ),
+        "delivery_mode": mode,
     }
+    slug = str(board or _kb.get_current_board()).strip()
+    exact_overrides = raw.get("board_thread_overrides")
+    wake_overrides = raw.get("board_wake_thread_overrides")
+    exact_thread = (
+        str(exact_overrides.get(slug) or "").strip()
+        if isinstance(exact_overrides, Mapping)
+        else ""
+    )
+    wake_thread = (
+        str(wake_overrides.get(slug) or "").strip()
+        if isinstance(wake_overrides, Mapping)
+        else ""
+    )
+    if exact_thread and wake_thread:
+        _log.warning(
+            "kanban.fixed_notify_target board %s has overlapping exact/wake overrides; using exact",
+            slug,
+        )
+        wake_thread = ""
+    if exact_thread:
+        return [{**target, "thread_id": exact_thread}]
+    if wake_thread and wake_thread != target["thread_id"]:
+        return [
+            {**target, "delivery_mode": "notify"},
+            {**target, "thread_id": wake_thread, "delivery_mode": "wake"},
+        ]
+    return [target]
+
+
+def _fixed_notify_target(board: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Compatibility accessor for callers that only support one fixed route."""
+    targets = _fixed_notify_targets(board)
+    return targets[0] if targets else None
+
+
+def _replace_fixed_notify_subs(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    targets: list[dict[str, Any]],
+) -> None:
+    """Reconcile operator telemetry while retaining native source obligations."""
+    expected = {
+        _sub_key(task_id, target["platform"], target["chat_id"], target.get("thread_id"))
+        for target in targets
+    }
+    for row in conn.execute(
+        "SELECT task_id, platform, chat_id, thread_id, delivery_metadata FROM kanban_notify_subs WHERE task_id = ?",
+        (task_id,),
+    ).fetchall():
+        key = _sub_key(row[0], row[1], row[2], row[3])
+        # Trusted creation origins are obligations, not fixed-policy telemetry.
+        if _decode_notify_delivery_metadata(row[4]).get("kanban_source"):
+            expected.discard(key)
+            continue
+        if key not in expected:
+            conn.execute("DELETE FROM kanban_notify_subs " + _SUB_KEY_WHERE, key)
+    for target in targets:
+        key = _sub_key(task_id, target["platform"], target["chat_id"], target.get("thread_id"))
+        if key not in expected:
+            continue  # origin and telemetry coincide: retain the trusted identity/mode
+        metadata = {
+            key: value
+            for key, value in {
+                "thread_id": target.get("thread_id"),
+                "chat_type": target.get("chat_type"),
+            }.items()
+            if value
+        }
+        metadata["kanban_telemetry"] = True
+        _insert_notify_sub(
+            conn,
+            task_id=task_id,
+            delivery_metadata=metadata,
+            **target,
+        )
+        key = _sub_key(
+            task_id,
+            target["platform"],
+            target["chat_id"],
+            target.get("thread_id"),
+        )
+        mode = (
+            target.get("delivery_mode")
+            if target.get("delivery_mode") in _NOTIFY_DELIVERY_MODES
+            else "notify"
+        )
+        conn.execute(
+            "UPDATE kanban_notify_subs SET user_id = NULL, user_id_alt = NULL, "
+            "chat_type = ?, notifier_profile = ?, delivery_mode = ?, "
+            "delivery_metadata = ? " + _SUB_KEY_WHERE,
+            (
+                target.get("chat_type") or "dm",
+                target.get("notifier_profile"),
+                mode,
+                _encode_notify_delivery_metadata(metadata),
+                *key,
+            ),
+        )
 
 
 def _insert_notify_sub(
@@ -184,6 +290,7 @@ def add_notify_sub(
     notifier_profile: Optional[str] = None,
     delivery_mode: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
+    board: Optional[str] = None,
 ) -> None:
     """Register a gateway source wanting terminal-state notifications for
     ``task_id``; idempotent on (task, platform, chat, thread).
@@ -199,27 +306,20 @@ def add_notify_sub(
     ``MAX(task_events.id)``) so the notifier never replays history at boot.
 
     When ``kanban.fixed_notify_target`` is enabled, caller-supplied routing is
-    canonicalized here.  Delivery mode remains a caller choice; source identity
-    is cleared because an install-wide operator route is not owned by the
-    originating user/session.
+    replaced by the exact board-specific operator policy. A configured policy
+    delivery mode wins; otherwise the caller's mode is retained. Source
+    identity is cleared because an install-wide route is not caller-owned.
+    Native source rows bound by creation survive this reconciliation unchanged.
     """
-    fixed_target = _fixed_notify_target()
-    if fixed_target:
-        platform = str(fixed_target["platform"])
-        chat_id = str(fixed_target["chat_id"])
-        thread_id = fixed_target.get("thread_id")
-        chat_type = fixed_target.get("chat_type")
-        notifier_profile = fixed_target.get("notifier_profile")
-        user_id = None
-        user_id_alt = None
-        delivery_metadata = {
-            key: value
-            for key, value in {
-                "thread_id": thread_id,
-                "chat_type": chat_type,
-            }.items()
-            if value
-        } or None
+    fixed_targets = _fixed_notify_targets(board, delivery_mode=delivery_mode)
+    if fixed_targets:
+        with _kb.write_txn(conn):
+            _replace_fixed_notify_subs(
+                conn,
+                task_id=task_id,
+                targets=fixed_targets,
+            )
+        return
     with _kb.write_txn(conn):
         _insert_notify_sub(
             conn,

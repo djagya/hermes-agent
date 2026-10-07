@@ -30,10 +30,19 @@ EXECUTIONS_FILE: Optional[Path] = None
 # ``resolved``: the job ran OK after the failure (auto); ``closed``: the operator acked the signature
 # and wants it silent. Only ``closed`` is terminal; a repeat of a resolved error re-opens it.
 INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
+# Type for a failure the agent declared itself (``[CRON_FAILURE]``): its prose is a verdict about
+# the job's subject, not runtime evidence, so keyword classification would invent a cause.
+AGENT_REPORTED_FAILURE_TYPE = "agent_reported"
 _FAILURE_TYPE_ORDER = (
     ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
     ("timeout", ("timeout", "timed out")),
-    ("auth", (r"\b401\b", "unauthorized", "authentication", "auth")),
+    # Runtime auth evidence only: a bare "auth" substring matched agent prose ("OAuth",
+    # "scoped-auth route", "authorized") and mislabelled ordinary verdicts as credential failures.
+    ("auth", (
+        r"\b401\b", "unauthorized", "authentication failed", "authentication error",
+        "authenticationerror", "invalid api key", "invalid_api_key", "invalid_grant",
+        "oauthnoninteractiveerror", "token refresh failed",
+    )),
     ("delivery", ("delivery", "deliver", "delivering")),
     ("config", ("config", "configuration", "validation")),
     ("script", ("script", "no_agent")),

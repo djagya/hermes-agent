@@ -620,6 +620,7 @@ class SessionDB(
         self._wal_lock_guard: dict = {}  # hermes_state_lockguard.hold() record, see _open_writer
         self._db_corrupt, self._db_corrupt_reason = False, ""  # sticky quarantine (StateDbCorruptError)
         self._fts_usermerge_floor_applied = False  # one-shot usermerge-floor write guard
+        self._fts_fence_retry_reported = False  # fork FTS fence: stale-index warning once per handle
         self._fts_enabled = self._fts_stale = self._trigram_available = False
         # _fts_cjk_loaded: tokenizer on the writer connection; _fts_cjk_available: messages_fts_cjk
         # is queryable AND not marked stale.

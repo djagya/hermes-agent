@@ -97,6 +97,22 @@ def test_run_one_job_agent_declared_failure_is_delivered_verbatim(monkeypatch):
     assert "model service" not in delivered[0]
 
 
+def test_run_one_job_agent_declared_failure_incident_is_agent_reported(monkeypatch, tmp_path):
+    """The run path tags the declared verdict's incident ``agent_reported`` (not ``auth``)."""
+    from cron import incidents
+
+    monkeypatch.setattr(incidents, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    _patch_pipeline(
+        monkeypatch,
+        final="[CRON_FAILURE]\nReads OK via scoped-auth route; account reconciliation incomplete.",
+    )
+
+    s.run_one_job({"id": "verdict-type", "name": "monitor", "deliver": "telegram"})
+
+    rows = [r for r in incidents.list_incidents() if r["job_id"] == "verdict-type"]
+    assert [r["failure_type"] for r in rows] == [incidents.AGENT_REPORTED_FAILURE_TYPE]
+
+
 def test_run_one_job_marker_mentioned_in_report_stays_successful(monkeypatch):
     """Only the exact first line is control text; quoted markers remain report content."""
     calls = _patch_pipeline(

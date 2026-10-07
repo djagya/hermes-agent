@@ -17,7 +17,7 @@ docker buildx build \
     --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" \
     --build-arg HERMES_IMAGE_NAME=ghcr.io/djagya/hermes-agent \
     --build-arg HERMES_BUILD_REF="$(git rev-parse --abbrev-ref HEAD)" \
-    --build-arg DEBIAN_SNAPSHOT=20260930T070000Z \
+    --build-arg DEBIAN_SNAPSHOT=20261007T000000Z \
     -t ghcr.io/djagya/hermes-agent:local \
     -f Dockerfile \
     .
@@ -56,7 +56,10 @@ leaf — v0.21 has no supported managed-config key for it; do not
 invent precedence. `approvals.mode` / `deny` and
 `telegram.allowed_chats` stay in user config.
 
-ClickUp 1.8.0 and `caldav-mcp` 0.10.0 are baked. `start-baked-mcp.sh`
+ClickUp 1.8.0 and `caldav-mcp` 0.10.0 are baked. ClickUp installs from
+`clickup-mcp/package-lock.json` (npm `overrides` pins
+`@modelcontextprotocol/sdk`, which upstream pins to a vulnerable 1.15.1;
+`npm install -g` ignores overrides). `start-baked-mcp.sh`
 execs the baked bin (no `npx` — `npx pkg@ver` still hits the
 registry). `smoke.sh` starts both with the registry blocked
 (`http://127.0.0.1:9`). iCloud is `caldav-mcp`; there is no
