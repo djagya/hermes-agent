@@ -510,6 +510,25 @@ class TestBrowserVaultTools:
         assert "s3cret-pw" not in json.dumps([str(c) for c in run_cmd.call_args_list]) and "s3cret-pw" not in raw
 
 
+    def test_managed_mode_never_reaches_the_legacy_session_path(self, store, monkeypatch):
+        """Managed (monolith browser-control) mode: with no browser_exec page for this task the vault
+        says so by type. The legacy session path would acquire a second, identity-less lease on
+        another slot and read its blank page (the JetBrains "could not determine origin" report)."""
+        from tools import browser_use_cli, browser_vault_tool
+
+        meta = _add_login(store, origin="https://example.com")
+        monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://browser-control.invalid:8790")
+        monkeypatch.setattr(browser_use_cli, "_VAULT_ROUTES", {}, raising=False)
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch("tools.browser_supervisor.SUPERVISOR_REGISTRY") as reg, \
+             patch("tools.browser_tool_session._run_browser_command") as run_cmd, \
+             patch("tools.browser_control_route._acquire") as acquire:
+            reg.get.return_value = None
+            out = json.loads(browser_vault_tool._handle_vault_fill({"handle": meta.id}, task_id="t-managed"))
+        assert out["error_type"] == "no_browser_session", out
+        run_cmd.assert_not_called()
+        acquire.assert_not_called()
+
     def test_vault_canary_redacted_from_browser_cdp_results(self, store):
         """P1-1 regression: a filled, non-token-shaped canary password must be
         unrecoverable through a model-facing browser_cdp-style result."""
