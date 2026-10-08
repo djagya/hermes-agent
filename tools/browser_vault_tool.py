@@ -54,14 +54,78 @@ def _check_vault_available() -> bool:
 # JS evaluation plumbing (server-side; results never carry secret values)
 # ---------------------------------------------------------------------------
 
+class _PageUnavailable(Exception):
+    """Why the vault cannot reach the page the agent drives; surfaced as a typed tool result."""
+
+    def __init__(self, error_type: str, message: str) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+
+    def result(self) -> Dict[str, Any]:
+        return {"success": False, "error_type": self.error_type, "error": str(self)}
+
+
+def _is_managed() -> bool:
+    try:
+        from tools.browser_control_route import is_managed
+    except Exception:
+        return False
+    return is_managed()
+
+
+def _managed_supervisor(task_id: str, *, admit: bool = False):
+    """Managed mode: the supervisor on the browser browser_exec last drove for this task.
+
+    Never acquires: a fresh lease is a different browser without the page, and the legacy session
+    path acquires without the exec's identity. A dropped socket is re-attached to the same lease after
+    control confirms the agent still holds it; ``admit`` asks control even when the socket looks live
+    (start of every vault page operation, and again right before a secret is written)."""
+    from tools.browser_control_route import _lease_alive, control_url
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY, _redact_cdp_error_text
+    from tools.browser_use_cli import vault_route
+
+    route = vault_route(task_id)
+    if not route:
+        raise _PageUnavailable("no_browser_session", "This task has no managed browser page. Open the login page "
+                               "with browser_exec (same task), then retry.")
+    supervisor = SUPERVISOR_REGISTRY.get(task_id)
+    active = supervisor is not None and supervisor.snapshot().active
+    if active and not admit:
+        return supervisor
+    alive = _lease_alive(control_url(), route.get("lease", ""))
+    if alive is None:
+        raise _PageUnavailable("lease_unavailable", "Managed browser control did not answer the lease check. Retry.")
+    if not alive:
+        raise _PageUnavailable("lease_unavailable", "The managed browser lease ended (released, expired, recycled, "
+                               "or a human took control). Re-open the page with browser_exec, then retry.")
+    if active:
+        return supervisor
+    from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
+    policy, timeout_s = _get_dialog_policy_config()
+    try:
+        return SUPERVISOR_REGISTRY.get_or_start(task_id=task_id, cdp_url=_resolve_cdp_override(route["cdp"]),
+                                                dialog_policy=policy, dialog_timeout_s=timeout_s)
+    except Exception as exc:
+        cause = _redact_cdp_error_text(exc)[:200]
+        logger.warning("vault: supervisor attach to the managed browser failed: %s", cause)
+        raise _PageUnavailable("supervisor_unavailable",
+                               f"Could not open the vault's CDP connection to the managed browser: {cause}") from None
+
+
 def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     """Evaluate NON-SECRET JS on the current page (inspection, origin reads).
 
     Prefers the supervisor's persistent CDP WebSocket, falls back to the
-    agent-browser CLI ``eval`` command. Never use this for expressions that
+    agent-browser CLI ``eval`` command (never in managed mode, where that
+    session is a different browser). Never use this for expressions that
     embed secret values — the fallback places the expression in subprocess
     argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
     """
+    if _is_managed():
+        sup = _managed_supervisor(task_id).evaluate_runtime(expression)
+        if sup.get("ok"):
+            return {"success": True, "result": sup.get("result")}
+        return {"success": False, "error": str(sup.get("error") or "eval failed")}
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
@@ -94,9 +158,12 @@ def _ensure_supervisor(task_id: str):
     Cloud/CDP-override sessions and browser_exec attach their supervisor when the session is created;
     a local agent-browser ``--session`` has no ``cdp_url`` of its own, so nothing did. Ask the daemon
     for the packaged Chromium's endpoint (``get cdp-url``: same daemon, same reaper) and attach.
-    Returns None when no endpoint is reachable; the fill then refuses rather than touching argv."""
+    Returns None when no endpoint is reachable; the fill then refuses rather than touching argv.
+    Managed mode raises :class:`_PageUnavailable` instead (see :func:`_managed_supervisor`)."""
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
+    if _is_managed():
+        return _managed_supervisor(task_id)
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is not None:
         return supervisor
@@ -127,7 +194,9 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
     (``error_type='supervisor_required'``) and nothing is written.
     """
     try:
-        supervisor = _ensure_supervisor(task_id)
+        supervisor = _managed_supervisor(task_id, admit=True) if _is_managed() else _ensure_supervisor(task_id)
+    except _PageUnavailable as exc:
+        return exc.result()
     except Exception as exc:
         logger.debug("vault fill: supervisor unavailable (%s)", exc)
         supervisor = None
@@ -206,11 +275,18 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
     login page). Returns the origin when a tab was focused, else None (caller falls back to the current page)."""
     try:
         supervisor = _ensure_supervisor(task_id)
+    except _PageUnavailable:
+        raise
     except Exception:
         supervisor = None
     if supervisor is None:
         return None
     focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
+    if not focused.get("ok"):
+        # The probe reads only the top document, so a field in a shadow root or an iframe is invisible to it.
+        # The supervisor's previous page is usually the exec's blank first tab: a tab on the exact origin is
+        # still the better target, and the classifier decides whether it holds the form.
+        focused = supervisor.focus_page(origin)
     return (origin or focused.get("url")) if focused.get("ok") else None
 
 
@@ -466,11 +542,15 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
         page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
         if page_origin:
             break
-    page_origin = page_origin or _current_page_origin(effective_task_id)
     if not page_origin:
-        return json.dumps(
-            {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
-        )
+        # No tab on a bound origin. Read the page the browser IS on (not the supervisor's blank first tab),
+        # so the refusal below names the actual origin.
+        _focus_bound_origin(effective_task_id, "", meta.kind)
+        page_origin = _current_page_origin(effective_task_id)
+    if not page_origin:
+        return json.dumps({"success": False, "error_type": "no_page",
+                           "error": ("No http(s) page is open in the browser this task drives. Open the login page "
+                                     "with the browser tool first, then retry.")})
     if page_origin not in allowed:
         return json.dumps(
             {
@@ -703,8 +783,16 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     from tools.browser_tool import _active_sessions, _last_session_key
     from tools.browser_tool_session import run_fenced
 
+    def op() -> Dict[str, Any]:
+        try:
+            if _is_managed():
+                _managed_supervisor(task_id or "default", admit=True)
+            return {"raw": fn()}
+        except _PageUnavailable as exc:
+            return {"raw": json.dumps(exc.result())}
+
     session = _active_sessions.get(_last_session_key(task_id or "default")) or {}
-    res = run_fenced(session, lambda: {"raw": fn()})
+    res = run_fenced(session, op)
     return res["raw"] if "raw" in res else json.dumps(res)
 
 
