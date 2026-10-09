@@ -3219,10 +3219,15 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # model still believes its instructions are in context. See #32106.
         # Extra recency must also fit small models; the ten-message floor and
         # tail references retain their existing semantics. Pass 4 still overrides.
-        recent_token_budget = min(
-            _SKILL_PRUNE_RECENT_BUDGET_TOKENS,
-            int(self._effective_input_window(self.context_length, self.max_tokens) * TAIL_MAX_CONTEXT_FRACTION),
-        )
+        recent_token_budget = _SKILL_PRUNE_RECENT_BUDGET_TOKENS
+        # Pruning can run without a resolved model window; do not force a probe
+        # solely for this optional proportional cap.
+        context_length = getattr(self, "_resolved_context_length", None)
+        if context_length is not None:
+            recent_token_budget = min(
+                recent_token_budget,
+                int(self._effective_input_window(context_length, getattr(self, "max_tokens", None)) * TAIL_MAX_CONTEXT_FRACTION),
+            )
         protected_skills = _collect_protected_skill_names(result, prune_boundary, recent_token_budget)
         # Pass 2: summarize old tool results. Tool-call arguments are canonical execution
         # records and are never rewritten; summary input is bounded separately by
