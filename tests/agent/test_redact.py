@@ -1471,6 +1471,14 @@ class TestRedactCdpUrl:
         assert "aaa-secret" not in out
         assert "bbb-secret" not in out
 
+    def test_masks_managed_gate_command_token(self):
+        """monolith browser-control carries the lease's command token as ``?tok=`` on every gated
+        CDP URL, and browser_exec logs the discovery -> WebSocket resolution at INFO."""
+        out = redact_cdp_url("Resolved CDP endpoint http://browser-control:8790/slot/work-1/json/version"
+                             "?tok=tok-c4f8e2f7c6374a0e -> ws://browser-control:8790/devtools/browser/x?tok=tok-c4f8e2f7c6374a0e")
+        assert "tok-c4f8e2f7c6374a0e" not in out
+        assert "/slot/work-1/json/version?tok=***" in out
+
 
 
 

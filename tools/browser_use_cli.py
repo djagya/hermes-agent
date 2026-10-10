@@ -604,6 +604,17 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     return err or None
 
 
+# task id -> the browser its last exec drove: {"cdp", "lease", "error"}. The vault tools re-attach to
+# exactly this browser (managed mode never re-routes, a fresh lease is a different browser) and report a
+# failed attach by its cause instead of as a missing page.
+_VAULT_ROUTES: Dict[str, Dict[str, str]] = {}
+_VAULT_ROUTES_MAX = 256  # the gateway is long-lived; keep the most recently used tasks
+
+
+def vault_route(task_id: Optional[str]) -> Dict[str, str]:
+    return dict(_VAULT_ROUTES.get(task_id or "default") or {})
+
+
 def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
     """Attach the per-task CDP supervisor to the browser this exec drives so ``browser_vault_fill`` has
     a secret-capable WebSocket (never argv) into the SAME browser. Only CDP-routed backends expose an
@@ -611,6 +622,7 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
     cdp = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
     if not cdp:
         return
+    route = {"cdp": cdp, "lease": str(env.get("HERMES_BROWSER_LEASE_ID") or ""), "error": ""}
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
         from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
@@ -618,7 +630,14 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
         SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=_resolve_cdp_override(cdp),
                                          dialog_policy=policy, dialog_timeout_s=timeout_s)
     except Exception as exc:
-        logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
+        from tools.browser_supervisor import _redact_cdp_error_text
+        route["error"] = _redact_cdp_error_text(exc)[:300]
+        # Non-fatal for the exec, but the vault tools are blind until it succeeds: log the cause.
+        logger.warning("browser_exec: CDP supervisor attach failed: %s", route["error"])
+    _VAULT_ROUTES.pop(task_id or "default", None)
+    _VAULT_ROUTES[task_id or "default"] = route
+    while len(_VAULT_ROUTES) > _VAULT_ROUTES_MAX:
+        _VAULT_ROUTES.pop(next(iter(_VAULT_ROUTES)))
 
 
 def _route_backend(

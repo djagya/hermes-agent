@@ -734,12 +734,16 @@ def _redact_python_diagnostic_repr_fields(text: str) -> str:
     return "".join(lines)
 
 
-def _redact_query_string(query: str) -> str:
+# Managed browser-control puts the lease's command token in ``?tok=`` on every gated CDP URL.
+_CDP_QUERY_PARAMS = _SENSITIVE_QUERY_PARAMS | {"tok"}
+
+
+def _redact_query_string(query: str, sensitive: frozenset = _SENSITIVE_QUERY_PARAMS) -> str:
     """Replace values of sensitive ``k=v&k=v`` params with ``***``; others pass through."""
     if not query:
         return query
     return "&".join(
-        f"{key}=***" if sep and key.lower() in _SENSITIVE_QUERY_PARAMS else pair
+        f"{key}=***" if sep and key.lower() in sensitive else pair
         for pair in query.split("&") for key, sep, _ in (pair.partition("="),)
     )
 
@@ -778,7 +782,7 @@ def redact_cdp_url(value: object) -> str:
     if not text:
         return text
     text = _URL_WITH_QUERY_RE.sub(
-        lambda m: f"{m.group(1)}://{m.group(2)}{m.group(3)}?{_redact_query_string(m.group(4))}{m.group(5) or ''}",
+        lambda m: f"{m.group(1)}://{m.group(2)}{m.group(3)}?{_redact_query_string(m.group(4), _CDP_QUERY_PARAMS)}{m.group(5) or ''}",
         text,
     )
     return _URL_USERINFO_RE.sub(lambda m: f"{m.group(1)}://{m.group(2)}:***@", text)
