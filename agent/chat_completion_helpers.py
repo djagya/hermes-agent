@@ -2036,30 +2036,6 @@ def _reresolve_fallback_reasoning_config(agent) -> None:
         logger.debug("Failed to resolve reasoning_config for fallback %s; keeping current: %s", agent.model, _reasoning_err)
 
 
-def _rescope_fallback_extra_body(agent, old_model: str, old_provider: str, old_base_url: str) -> None:
-    """Drop the OLD provider's custom_providers-contributed extra_body keys, then merge the fallback
-    provider's own. KEY-SCOPED: a key is dropped only if its value still equals what the old provider's
-    config injected — a caller override of the same key won at init and differs, so it survives;
-    keys the new provider redefines are re-added by the merge."""
-    try:
-        from agent.agent_init import _custom_provider_extra_body_for_agent, _merge_custom_provider_extra_body
-        custom_providers = getattr(agent, "_custom_providers", None) or []
-        old_provider_eb = _custom_provider_extra_body_for_agent(provider=old_provider, model=old_model, base_url=old_base_url, custom_providers=custom_providers) or {}
-        overrides = dict(getattr(agent, "request_overrides", {}) or {})
-        existing_eb = overrides.get("extra_body")
-        if isinstance(existing_eb, dict) and old_provider_eb:
-            scrubbed = {k: v for k, v in existing_eb.items() if not (k in old_provider_eb and v == old_provider_eb[k])}
-            if scrubbed:
-                overrides["extra_body"] = scrubbed
-            else:
-                overrides.pop("extra_body", None)
-            agent.request_overrides = overrides
-        _merge_custom_provider_extra_body(agent, custom_providers)
-        logger.info("Fallback %s: extra_body resolved: %s", agent.model, (getattr(agent, "request_overrides", {}) or {}).get("extra_body"))
-    except Exception as _eb_err:
-        logger.debug("Failed to resolve extra_body for fallback %s; keeping current: %s", agent.model, _eb_err)
-
-
 def _buffer_fallback_notice(agent, notice: str) -> None:
     """Buffer the switch notice for terminal failure AND retain it as a durable one-shot for
     _emit_pending_fallback_notice (a successful fallback clears retry chatter)."""
@@ -2137,6 +2113,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
                     fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
 
             old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+            old_api_mode = agent.api_mode
 
             # Clear the per-config context_length override so the fallback model's own context
             # window is resolved instead of the previous model's stale value.
@@ -2166,7 +2143,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
             _update_fallback_context_compressor(agent)
             _reresolve_fallback_reasoning_config(agent)
-            _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+            from agent.fallback_request_overrides import rescope_request_overrides
+            rescope_request_overrides(
+                agent, old_model=old_model, old_provider=old_provider,
+                old_base_url=old_base_url, old_api_mode=old_api_mode,
+            )
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
             notice = (
