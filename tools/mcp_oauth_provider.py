@@ -8,10 +8,17 @@ modules keep their own subclass (logger name, disk-watch hooks) on top of it.
 
 from __future__ import annotations
 
+import asyncio
+import importlib
+import json
 import logging
 import re
+import time
+from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
+
+_sleep = asyncio.sleep
 
 if TYPE_CHECKING:
     from tools.mcp_oauth import HermesTokenStorage
@@ -24,6 +31,48 @@ _ISS_OMITTING_ISSUERS = frozenset({"https://api.figma.com"})
 # Authorization-server metadata documents the SDK tries in its 401 branch (RFC 8414 / OIDC discovery).
 _ASM_DISCOVERY_PATHS = ("/.well-known/oauth-authorization-server", "/.well-known/openid-configuration")
 _DISCOVERY_CONTEXT_LEAD = "Could not read authorization-server metadata"
+
+_REFRESH_TRANSIENT_STATUSES = frozenset({429, 502, 503})
+_REFRESH_TERMINAL_ERRORS = frozenset({"invalid_grant", "invalid_client", "invalid_scope"})
+_REFRESH_MAX_ATTEMPTS = 3
+_REFRESH_RETRY_DEADLINE_SECONDS = 15.0
+_REFRESH_BACKOFF_SECONDS = (1.0, 2.0)
+
+
+class MCPRefreshError(Exception):
+    """Safe, typed failure from the refresh endpoint.
+
+    Token responses, request bodies and transport exception messages are never
+    attached. Consumers may use the fixed ``kind`` plus status/retry metadata
+    without collapsing an endpoint outage into interactive authorization.
+    """
+
+    def __init__(self, kind: str, *, status: int | None = None,
+                 retry_after: float | None = None, oauth_error: str | None = None,
+                 ambiguous_delivery: bool = False):
+        self.kind = kind
+        self.status = status
+        self.retry_after = retry_after
+        self.oauth_error = oauth_error
+        self.ambiguous_delivery = ambiguous_delivery
+        detail = f" status={status}" if status is not None else ""
+        if oauth_error is not None:
+            detail += f" oauth_error={oauth_error}"
+        super().__init__(f"MCP OAuth refresh failed: {kind}{detail}")
+
+
+def _retry_after_seconds(value: str | None, *, wall_time: float | None = None) -> float | None:
+    """Parse Retry-After seconds or HTTP-date without ever raising."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        try:
+            target = parsedate_to_datetime(value)
+            return max(0.0, target.timestamp() - (time.time() if wall_time is None else wall_time))
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 def _default_auth_request_user_agent() -> str:
@@ -267,14 +316,47 @@ class HermesProviderMixin:
                     # asend(response), so `async for` would swallow the response and
                     # feed the inner generator None. Async generators have no
                     # `yield from`, hence the manual pump.
-                    try:
-                        sent = yield out
-                    except GeneratorExit:
-                        await inner.aclose()
-                        raise
-                    except BaseException as exc:
-                        sent, thrown = None, exc
-                    else:
+                    is_refresh = self._hermes_fence is not None and out is not request
+                    attempt = 1
+                    retry_deadline = time.monotonic() + _REFRESH_RETRY_DEADLINE_SECONDS
+                    while True:
+                        try:
+                            sent = yield out
+                        except GeneratorExit:
+                            await inner.aclose()
+                            raise
+                        except BaseException as exc:
+                            if isinstance(exc, asyncio.CancelledError):
+                                sent, thrown = None, exc
+                                break
+                            if not is_refresh:
+                                sent, thrown = None, exc
+                                break
+                            if not self._hermes_refresh_was_not_sent(out, exc):
+                                raise MCPRefreshError(
+                                    "transport_ambiguous", ambiguous_delivery=True
+                                ) from None
+                            delay = _REFRESH_BACKOFF_SECONDS[min(attempt - 1, len(_REFRESH_BACKOFF_SECONDS) - 1)]
+                            if attempt >= _REFRESH_MAX_ATTEMPTS or time.monotonic() + delay > retry_deadline:
+                                raise MCPRefreshError("transport_pre_send") from None
+                            attempt += 1
+                            await _sleep(delay)
+                            continue
+                        if is_refresh and getattr(sent, "status_code", None) in _REFRESH_TRANSIENT_STATUSES:
+                            retry_after = _retry_after_seconds(sent.headers.get("retry-after"))
+                            delay = retry_after if retry_after is not None else _REFRESH_BACKOFF_SECONDS[
+                                min(attempt - 1, len(_REFRESH_BACKOFF_SECONDS) - 1)
+                            ]
+                            if attempt >= _REFRESH_MAX_ATTEMPTS or time.monotonic() + delay > retry_deadline:
+                                raise MCPRefreshError(
+                                    "endpoint_transient", status=sent.status_code,
+                                    retry_after=retry_after,
+                                )
+                            attempt += 1
+                            await _sleep(delay)
+                            continue
+                        break
+                    if thrown is None:
                         failure = _asm_discovery_failure(sent)
                         if failure:
                             discovery_failures.append(failure)
@@ -282,6 +364,24 @@ class HermesProviderMixin:
                             sent = await self._hermes_accept_origin_issued_metadata(sent)
             finally:
                 await self._hermes_release_refresh_fence()
+
+    @staticmethod
+    def _hermes_refresh_was_not_sent(request, exc: BaseException) -> bool:
+        """True only for SDK HTTP failures that happen before request delivery.
+
+        Read/write/protocol failures are intentionally excluded: once bytes may
+        have reached a rotating-token endpoint, replay could burn the winner.
+        """
+        root_module = type(request).__module__.partition(".")[0]
+        try:
+            http_module = importlib.import_module(root_module)
+        except ImportError:
+            return False
+        pre_send = tuple(
+            cls for name in ("ConnectError", "ConnectTimeout")
+            if isinstance(cls := getattr(http_module, name, None), type)
+        )
+        return bool(pre_send) and isinstance(exc, pre_send)
 
     async def _refresh_token(self):
         """Take the refresh fence, then build the request from the token we own.
@@ -459,6 +559,13 @@ class HermesProviderMixin:
                     "Recovered a peer-rotated refresh token instead of clearing the session"
                 )
                 return True
+            oauth_error = await self._hermes_refresh_oauth_error(response)
+            if oauth_error in _REFRESH_TERMINAL_ERRORS:
+                self.context.clear_tokens()
+                raise MCPRefreshError(
+                    "oauth_rejected", status=response.status_code,
+                    oauth_error=oauth_error,
+                )
             self.context.clear_tokens()
             return False
         from httpx import HTTPError
@@ -482,6 +589,16 @@ class HermesProviderMixin:
                 token_response.scope = prior.scope
         await self._store_tokens(token_response)
         return True
+
+    @staticmethod
+    async def _hermes_refresh_oauth_error(response) -> str | None:
+        """Return only a standard OAuth error code; discard all other body data."""
+        try:
+            value = json.loads((await response.aread()).decode("utf-8"))
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        error = value.get("error") if isinstance(value, dict) else None
+        return error if isinstance(error, str) else None
 
     async def _hermes_reload_tokens_after_refresh_failure(self) -> bool:
         """Re-read tokens from disk after a rejected refresh.

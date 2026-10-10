@@ -15,6 +15,8 @@ real discovery request, then assert on its headers.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 
@@ -69,14 +71,14 @@ async def _make_flow(tmp_path, monkeypatch, *, registered=True):
         callback_handler=_noop_callback,
     )
     req = httpx.Request("POST", "https://example.com/mcp")
-    return httpx, req, provider.async_auth_flow(req)
+    return httpx, req, provider, provider.async_auth_flow(req)
 
 
 @pytest.mark.asyncio
 async def test_discovery_request_gets_default_user_agent(tmp_path, monkeypatch):
     from tools.mcp_oauth_provider import DEFAULT_AUTH_REQUEST_USER_AGENT
 
-    httpx, req, flow = await _make_flow(tmp_path, monkeypatch)
+    httpx, req, _provider, flow = await _make_flow(tmp_path, monkeypatch)
     outbound = await flow.__anext__()
 
     fake_401 = httpx.Response(
@@ -97,13 +99,25 @@ async def test_discovery_request_gets_default_user_agent(tmp_path, monkeypatch):
 async def test_callers_mcp_request_is_left_untouched(tmp_path, monkeypatch):
     """The bridge must not decorate the caller's own MCP request — those
     headers belong to the transport client, not the OAuth layer."""
-    _httpx, req, flow = await _make_flow(tmp_path, monkeypatch)
+    _httpx, req, _provider, flow = await _make_flow(tmp_path, monkeypatch)
     outbound = await flow.__anext__()
 
     assert outbound is req
     assert "user-agent" not in outbound.headers
 
     await flow.aclose()
+
+
+@pytest.mark.asyncio
+async def test_closing_resource_flow_leaves_sdk_lock_usable(tmp_path, monkeypatch):
+    """Closing while resource I/O is unlocked must balance the SDK lock once."""
+    _httpx, req, provider, flow = await _make_flow(tmp_path, monkeypatch)
+
+    assert await flow.__anext__() is req
+    await flow.aclose()
+
+    await asyncio.wait_for(provider.context.lock.acquire(), timeout=1.0)
+    provider.context.lock.release()
 
 
 @pytest.mark.asyncio
@@ -114,7 +128,9 @@ async def test_registration_failure_after_failed_discovery_leads_with_discovery(
     from mcp.client.auth.oauth2 import OAuthRegistrationError
     from tools.mcp_oauth import humanize_oauth_registration_error
 
-    httpx, req, flow = await _make_flow(tmp_path, monkeypatch, registered=False)
+    httpx, req, _provider, flow = await _make_flow(
+        tmp_path, monkeypatch, registered=False
+    )
     outbound = await flow.__anext__()
     response = httpx.Response(401, request=outbound, headers={"www-authenticate": "Bearer"})
     with pytest.raises(OAuthRegistrationError) as excinfo:

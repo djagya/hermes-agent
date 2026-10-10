@@ -234,7 +234,27 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                     sent_access_token = tokens.access_token if tokens is not None else None
                     self.context.lock.release()
                     resource_lock_released = True
-                incoming = yield outgoing
+                try:
+                    incoming = yield outgoing
+                except GeneratorExit:
+                    # The SDK's ``async with context.lock`` still owns one
+                    # acquisition. Restore it before closing the inner flow,
+                    # whose ``__aexit__`` releases that acquisition.
+                    if resource_lock_released:
+                        await self.context.lock.acquire()
+                        resource_lock_released = False
+                    await inner.aclose()
+                    raise
+                except BaseException as exc:
+                    # HTTPX drives auth generators bidirectionally for failures
+                    # too. Forward transport errors to the native provider so
+                    # it can distinguish proven pre-send refresh failures from
+                    # ambiguous post-submit delivery without replaying a grant.
+                    if resource_lock_released:
+                        await self.context.lock.acquire()
+                        resource_lock_released = False
+                    outgoing = await inner.athrow(exc)
+                    continue
                 if resource_lock_released:
                     await self.context.lock.acquire()
                     resource_lock_released = False
