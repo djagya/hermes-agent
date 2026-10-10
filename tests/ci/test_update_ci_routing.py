@@ -95,6 +95,12 @@ def _on(workflow: dict) -> dict:
     return workflow.get("on", workflow.get(True)) or {}
 
 
+# dlz: the replay models the upstream-repo branch of the fork's ``github.repository``
+# conditionals (FORK_LEAN, os_tests, the 32-core-only Windows journeys). On djagya/hermes-agent
+# push/PR those lanes are switched off on purpose; dispatch and release runs force every lane.
+_GITHUB = {"event_name": "pull_request", "repository": "NousResearch/hermes-agent"}
+
+
 def _detect_outputs(lanes: dict[str, bool]) -> dict[str, Any]:
     """The classifier's lines -> the composite action's outputs -> ci.yaml ``detect`` outputs."""
     raw = {k: gha.to_string(v) for k, v in lanes.items()}
@@ -106,7 +112,7 @@ def _detect_outputs(lanes: dict[str, bool]) -> dict[str, Any]:
     classify = next(s for s in detect["steps"] if s.get("id") == "classify")
     assert classify["uses"] == "./.github/actions/detect-changes"
     steps = {"classify": {"outputs": action_out}}
-    ctx = {"steps": steps, "github": {"event_name": "pull_request"}, "inputs": {}}
+    ctx = {"steps": steps, "github": _GITHUB, "inputs": {}}
     steps["gate-lanes"] = {"outputs": workflow_steps.outputs(gate, ctx)}
     return {k: gha.render(v, ctx) for k, v in detect["outputs"].items()}
 
@@ -145,7 +151,7 @@ def _run_workflow(rel: str, *, inputs: dict[str, Any], detect: dict[str, Any] | 
             all_ran = all(n in ran for n in needs)
             ctx = {
                 "inputs": inputs,
-                "github": {"event_name": "pull_request", "ref_type": "branch"},
+                "github": {**_GITHUB, "ref_type": "branch"},
                 "needs": {n: {"outputs": (ran.get(n) or {}).get("outputs", {}),
                               "result": "success" if n in ran else "skipped"} for n in needs},
                 "__status__": {"always": True, "success": all_ran, "failure": False, "cancelled": False},
@@ -373,8 +379,9 @@ def test_every_detect_output_a_lane_sets_is_consumed_by_some_job():
     ci = _yaml(".github/workflows/ci.yaml")
     text = json.dumps({k: v for k, v in ci["jobs"].items() if k != "detect"})
     # python_prod's only reader is the deferred Desktop E2E job (`if: false`, see ci.yaml).
+    # dlz: ``mode`` (full | selective) is the fork classifier's audit surface, not a lane.
     unread = [k for k in ci["jobs"]["detect"]["outputs"]
-              if k not in ("event_name", "python_prod") and f"needs.detect.outputs.{k}" not in text]
+              if k not in ("event_name", "python_prod", "mode") and f"needs.detect.outputs.{k}" not in text]
     assert unread == []
 
 

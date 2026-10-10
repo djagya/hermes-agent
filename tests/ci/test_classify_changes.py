@@ -178,7 +178,7 @@ CASES = {
     ),
     "desktop card-tool names → python + frontend": (
         ["apps/desktop/src/lib/tool-render-class.ts"],
-        _lanes(python=True, frontend=True),
+        _lanes(python=True, frontend=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"]),
     ),
     # The published CIMD document is asserted about by the Python suite, so a
     # lone edit there must not skip the lane that would catch a bad edit.
@@ -257,7 +257,7 @@ CASES = {
         ["apps/desktop/electron/updater-process.ts"],
         _lanes(frontend=True, desktop_updater=True, e2e_desktop_update=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
     ),
-    "python source alone → no desktop_updater lane": (["gateway/run.py"], _lanes(python=True, scan=True)),
+    "python source alone → no desktop_updater lane": (["gateway/run.py"], _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/gateway/test_run*.py", "tests/relay/test_run*.py", "tests/test_run*.py", "tests/gateway/", "tests/relay/"]])),
     # `.rs` lives under apps/, so it matches `frontend` too. That lane builds
     # TypeScript and cannot notice a Rust error — before `rust` existed it was
     # the ONLY lane a Rust change ran, and the crate's tests never executed.
@@ -378,7 +378,7 @@ CASES = {
     # tests/fakes and tests/fixtures reshape collection for the whole suite.
     "tests/fakes → full suite": (
         ["tests/fakes/fake_gateway.py"],
-        _lanes(python=True, python_prod=False, scan=True),
+        _lanes(python=True, python_prod=False, scan=True, e2e=True, e2e_upgrade=True),
     ),
     # A change mixing a mapped file and an unmapped one fails open to full —
     # selective coverage is only as strong as its weakest file.
@@ -414,69 +414,69 @@ CASES = {
     ),
     # Slow lanes on a pull request: an ordinary product change starts none of
     # them; the suite, its harness, or the code it guards starts its own.
-    "gateway python → no slow lane": (["gateway/run.py", "agent/x.py"], _lanes(python=True, scan=True)),
-    "desktop renderer → no slow lane": (["apps/desktop/src/app/chat/composer.tsx"], _lanes(frontend=True)),
+    "gateway python → no slow lane": (["gateway/run.py", "agent/x.py"], _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/gateway/test_run*.py", "tests/relay/test_run*.py", "tests/test_run*.py", "tests/gateway/", "tests/relay/"], ["tests/agent/test_x*.py", "tests/test_x*.py", "tests/agent/"]])),
+    "desktop renderer → no slow lane": (["apps/desktop/src/app/chat/composer.tsx"], _lanes(frontend=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"])),
     "python e2e suite → e2e only": (
         ["tests/e2e/core/sqlite/test_torture.py"],
-        _lanes(python=True, python_prod=False, scan=True, e2e=True),
+        _lanes(python=True, python_prod=False, scan=True, e2e=True, py_full=False, py_roots=[["tests/e2e/core/sqlite/test_torture.py"]]),
     ),
     "state db → e2e": (["hermes_state_wal.py"], _lanes(python=True, scan=True, e2e=True)),
     "upgrade suite → e2e_upgrade, not e2e": (
         ["tests/e2e/core/upgrade/pm/test_pm_lifecycle.py"],
-        _lanes(python=True, python_prod=False, scan=True, e2e_upgrade=True),
+        _lanes(python=True, python_prod=False, scan=True, e2e_upgrade=True, py_full=False, py_roots=[["tests/e2e/core/upgrade/pm/test_pm_lifecycle.py"]]),
     ),
     "updater → e2e_upgrade + desktop update": (
         ["hermes_cli/update_cmd_git.py"],
-        _lanes(python=True, scan=True, e2e_upgrade=True, e2e_desktop_update=True),
+        _lanes(python=True, scan=True, e2e_upgrade=True, e2e_desktop_update=True, os_tests=True, py_full=False, py_roots=[["tests/hermes_cli/test_update_cmd_git*.py", "tests/test_update_cmd_git*.py", "tests/hermes_cli/"]]),
     ),
     "PM → e2e_upgrade + docker": (["pm/environments.py"], _lanes(python=True, scan=True, e2e_upgrade=True, docker=True)),
     # The update pipeline lives beyond the update_* family too: the entry
     # point, launch-time recovery, the gateway restart/pause surface.
     # main.py is also `hermes desktop --build-only`, the update's Desktop rebuild.
     "cmd_update entry → both update suites": (
-        ["hermes_cli/main.py"], _lanes(python=True, scan=True, e2e_upgrade=True, e2e_desktop_update=True),
+        ["hermes_cli/main.py"], _lanes(python=True, scan=True, e2e_upgrade=True, e2e_desktop_update=True, os_tests=True, py_full=False, py_roots=[["tests/hermes_cli/test_main*.py", "tests/test_main*.py", "tests/hermes_cli/"]]),
     ),
-    "gateway status stamp → e2e_upgrade": (["gateway/status.py"], _lanes(python=True, scan=True, e2e_upgrade=True)),
+    "gateway status stamp → e2e_upgrade": (["gateway/status.py"], _lanes(python=True, scan=True, e2e_upgrade=True, py_full=False, py_roots=[["tests/gateway/test_status*.py", "tests/relay/test_status*.py", "tests/test_status*.py", "tests/gateway/", "tests/relay/"]])),
     "desktop verify → desktop_updater + both update suites": (
         ["hermes_cli/desktop_update_verify.py"],
-        _lanes(python=True, scan=True, desktop_updater=True, e2e_upgrade=True, e2e_desktop_update=True),
+        _lanes(python=True, scan=True, desktop_updater=True, e2e_upgrade=True, e2e_desktop_update=True, os_tests=True, py_full=False, py_roots=[["tests/hermes_cli/test_desktop_update_verify*.py", "tests/test_desktop_update_verify*.py", "tests/hermes_cli/"]]),
     ),
     "electron main → desktop update": (
         ["apps/desktop/electron/main.ts"],
-        _lanes(frontend=True, e2e_desktop_update=True),
+        _lanes(frontend=True, e2e_desktop_update=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"]),
     ),
     "handoff result reader → desktop_updater + desktop update": (
         ["apps/desktop/electron/handoff-result.ts"],
-        _lanes(frontend=True, desktop_updater=True, e2e_desktop_update=True),
+        _lanes(frontend=True, desktop_updater=True, e2e_desktop_update=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"]),
     ),
     "desktop backend spawn → desktop core": (
         ["apps/desktop/electron/backend-child.ts"],
-        _lanes(frontend=True, e2e_desktop_core=True),
+        _lanes(frontend=True, e2e_desktop_core=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"]),
     ),
     "desktop session resume → desktop core": (
         ["apps/desktop/src/app/session/hooks/use-session-actions/index.ts"],
-        _lanes(frontend=True, e2e_desktop_core=True),
+        _lanes(frontend=True, e2e_desktop_core=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"]),
     ),
     "desktop core spec → desktop core": (
         ["apps/desktop/e2e/core/transcript-integrity.spec.ts"],
-        _lanes(frontend=True, e2e_desktop_core=True),
+        _lanes(frontend=True, e2e_desktop_core=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"]),
     ),
     "desktop profile rail → desktop core": (
         ["apps/desktop/src/app/chat/sidebar/profile-switcher.tsx"],
-        _lanes(frontend=True, e2e_desktop_core=True),
+        _lanes(frontend=True, e2e_desktop_core=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"]),
     ),
     "desktop update spec → desktop update, not core": (
         ["apps/desktop/e2e/update/app-update.spec.ts"],
-        _lanes(frontend=True, e2e_desktop_update=True),
+        _lanes(frontend=True, e2e_desktop_update=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"]),
     ),
     # The update suite runs on the core suite's harness.
     "desktop core harness → both desktop suites": (
         ["apps/desktop/e2e/core/harness.ts"],
-        _lanes(frontend=True, e2e_desktop_core=True, e2e_desktop_update=True),
+        _lanes(frontend=True, e2e_desktop_core=True, e2e_desktop_update=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"]),
     ),
     "image tests → docker": (
         ["tests/docker/test_image_smoke.py"],
-        _lanes(python=True, python_prod=False, scan=True, docker=True),
+        _lanes(python=True, python_prod=False, scan=True, docker=True, py_full=False, py_roots=[["tests/docker/test_image_smoke.py"]]),
     ),
     # Fail open: CI-config / empty / blank diffs run everything.
     ".github change → all": ([".github/workflows/tests.yml"], DEFAULT),

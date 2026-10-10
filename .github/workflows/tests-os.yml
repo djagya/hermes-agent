@@ -210,9 +210,8 @@ jobs:
     # venv holders. Its own workflow so wine2e-install/** pushes can run it alone.
     # Upstream's 32-core Windows runner is the only host this journey fits. Fork
     # windows-latest spends most of an hour here and then trips the install cap.
-    if: github.repository == 'NousResearch/hermes-agent'
     name: Windows install + update E2E
-    if: inputs.e2e_upgrade
+    if: github.repository == 'NousResearch/hermes-agent' && inputs.e2e_upgrade
     uses: ./.github/workflows/windows-install-update-e2e.yml
     with:
       strict_acceptance: ${{ inputs.strict_acceptance }}
