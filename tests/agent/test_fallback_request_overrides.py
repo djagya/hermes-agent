@@ -86,7 +86,10 @@ def test_fallback_request_is_target_scoped(fast_agent, mode, provider, model, ur
         assert "speed" not in (kwargs.get("extra_body") or {})
         assert "betas" not in kwargs
         assert "betas" not in (kwargs.get("extra_body") or {})
-        assert kwargs["extra_headers"] == {"X-Caller": "keep"}
+        # Transport-owned headers (session/request ids) may be added; the caller's
+        # header survives and no Anthropic-scoped header leaks across the route change.
+        assert kwargs["extra_headers"]["X-Caller"] == "keep"
+        assert not [h for h in kwargs["extra_headers"] if h.lower().startswith("anthropic-")]
         # Same adapter preflight used by the real per-attempt assembly path.
         preflight = agent._get_transport().preflight_kwargs(kwargs, allow_stream=False)
         assert preflight["model"] == model
