@@ -94,6 +94,11 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = 4096
     _BACKOFF_STEPS = [5, 10, 30, 60]  # reconnect backoff (seconds)
+    # Cold boot: when the gateway and HA start together (one host or container), HA's port opens a
+    # minute or two after the gateway's first connect. Within this grace window the first connect
+    # retries quietly on a short backoff. Past it, the normal reconnect loop and its warnings apply.
+    _BOOT_GRACE_SECONDS = 180.0
+    _BOOT_BACKOFF_STEPS = [2, 3, 5, 5, 10]
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("homeassistant"))
@@ -113,6 +118,13 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         self._watch_all: bool = bool(extra.get("watch_all", False))
         self._cooldown_seconds: int = int(extra.get("cooldown_seconds", 30))
         self._last_event_time: Dict[str, float] = {}  # entity_id -> last event ts
+        # True while connect() returned without a live WebSocket (HA not up yet at cold boot).
+        self._awaiting_first_connect: bool = False
+
+    @property
+    def send_path_degraded(self) -> bool:
+        """Status reads ``retrying`` until the boot-time connect actually reaches HA."""
+        return self._awaiting_first_connect
 
     def _next_id(self) -> int:
         self._msg_id += 1
@@ -132,9 +144,21 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         if not self._hass_token:
             logger.warning("[%s] No HASS_TOKEN configured", self.name)
             return False
+        boot_deadline = time.monotonic() + self._BOOT_GRACE_SECONDS
         try:
-            if not await self._ws_connect():
-                return False
+            try:
+                if not await self._ws_connect():
+                    return False
+            except Exception as e:
+                if is_reconnect or not self._is_not_up_yet(e):
+                    raise
+                # Cold boot and HA is not listening yet: don't fail the platform (an ERROR here and a
+                # 30-60s watcher retry on every boot). Start listening and connect in the background.
+                await self._cleanup_ws()
+                self._awaiting_first_connect = True
+                logger.info(
+                    "[%s] %s not reachable yet (%s); retrying quietly for up to %ds while it starts",
+                    self.name, self._hass_url, e, int(self._BOOT_GRACE_SECONDS))
             self._rest_session = self._new_session()  # dedicated REST session for send()
             if not (self._watch_domains or self._watch_entities or self._watch_all):
                 logger.warning(
@@ -142,14 +166,61 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                     "All state_changed events will be dropped. Configure filters in "
                     "your HA platform config to receive events.",
                     self.name)
-            self._listen_task = asyncio.create_task(self._listen_loop())
             self._running = True
-            logger.info("[%s] Connected to %s", self.name, self._hass_url)
+            if self._awaiting_first_connect:
+                self._listen_task = asyncio.create_task(self._boot_connect_then_listen(boot_deadline))
+            else:
+                self._listen_task = asyncio.create_task(self._listen_loop())
+                logger.info("[%s] Connected to %s", self.name, self._hass_url)
             self._wire_plugin_handlers(None)
             return True
         except Exception as e:
             logger.error("[%s] Failed to connect: %s", self.name, _connect_error_detail(e))
             return False
+
+    @staticmethod
+    def _is_not_up_yet(exc: BaseException) -> bool:
+        """True for "nothing answering yet" errors a starting HA produces: refused or reset
+        connections, timeouts, and a 502/503/504 from a proxy in front of it. Auth and protocol
+        failures, and a macOS Local Network Privacy denial (#71206), are not."""
+        if _connect_error_detail(exc) != str(exc):
+            return False  # annotated with a remedy: retrying quietly would only hide it
+        if isinstance(exc, aiohttp.WSServerHandshakeError):
+            return exc.status in (502, 503, 504)
+        return isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError, ConnectionError))
+
+    async def _boot_connect_then_listen(self, deadline: float) -> None:
+        """Finish a cold-boot connect that found HA not up yet, then run the normal listen loop.
+
+        Retries on ``_BOOT_BACKOFF_STEPS`` and logs at debug until ``deadline``. Past the deadline
+        it warns once and hands over to ``_listen_loop``, whose reconnect backoff and warnings take
+        over from there."""
+        attempt = 0
+        while self._running:
+            await asyncio.sleep(self._BOOT_BACKOFF_STEPS[min(attempt, len(self._BOOT_BACKOFF_STEPS) - 1)])
+            attempt += 1
+            try:
+                await self._cleanup_ws()
+                if await self._ws_connect():
+                    self._awaiting_first_connect = False
+                    logger.info("[%s] Connected to %s", self.name, self._hass_url)
+                    self._mark_connected()
+                    break
+                # Reached HA but the handshake failed (already logged at error): normal loop from here.
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if time.monotonic() < deadline and self._is_not_up_yet(e):
+                    logger.debug("[%s] Home Assistant still starting (attempt %d): %s", self.name, attempt, e)
+                    continue
+                waited = (f"still unreachable after {int(self._BOOT_GRACE_SECONDS)}s"
+                          if time.monotonic() >= deadline else "connect failed")
+                logger.warning(
+                    "[%s] Home Assistant at %s %s: %s; retrying in the background",
+                    self.name, self._hass_url, waited, _connect_error_detail(e))
+                break
+        await self._listen_loop()
 
     async def _ws_connect(self) -> bool:
         """Open the WebSocket, authenticate, and subscribe to ``state_changed``."""
@@ -222,6 +293,9 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 if await self._ws_connect():
                     backoff_idx = 0
                     logger.info("[%s] Reconnected", self.name)
+                    if self._awaiting_first_connect:  # boot grace ran out before HA came up
+                        self._awaiting_first_connect = False
+                        self._mark_connected()
             except Exception as e:
                 logger.warning("[%s] Reconnection failed: %s", self.name, _connect_error_detail(e))
 
