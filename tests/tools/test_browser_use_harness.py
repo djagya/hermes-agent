@@ -55,7 +55,8 @@ def test_browser_exec_child_environment(tmp_path, monkeypatch):
     result = json.loads(bu.browser_exec("print('payload')", session="research", task_id="owner"))
     assert result["success"], result
     child = json.loads(result["output"])
-    assert child["stdin"] == "print('payload')"
+    # dlz: browser_exec pre-binds ``workspace`` (fork #72) ahead of the caller's code.
+    assert child["stdin"] == bu._WORKSPACE_PREAMBLE + "print('payload')"
     for key in ("PYTHONHOME", "OPENAI_API_KEY", "_HERMES_BU_PRIVATE_BROWSER"):
         assert key not in child["env"]
     assert child["env"].get("PYTHONPATH") == bu._harness_site_dir()

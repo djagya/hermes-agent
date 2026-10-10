@@ -3213,7 +3213,11 @@ def test_command_dispatch_memory_pending_reviews_staged_writes(tmp_path, monkeyp
     home.mkdir()
     (home / "config.yaml").write_text("memory:\n  write_approval: true\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
-    wa.stage_write(wa.MEMORY, {"action": "add", "target": "memory", "content": "dispatched fact"},
+    # dlz: the fork's approve replays only payloads carrying a base-state guard.
+    from tools.memory_tool import MemoryStore, _build_memory_write_guard
+    store = MemoryStore(); store.load_from_disk()
+    wa.stage_write(wa.MEMORY, {"action": "add", "target": "memory", "content": "dispatched fact",
+                               "_write_guard": _build_memory_write_guard(store, "memory")},
                    summary="add dispatched fact", origin="foreground")
     server._sessions["sid-wa"] = _session(profile_home=str(home))
     try:

@@ -409,6 +409,7 @@ def test_boot_recovery_counts_and_never_repeats_a_file_it_could_not_delete(
     assert _contents(mock_db) == ["old0", "old1", "live"]
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)")
 def test_repairable_spool_replay_failure_still_reaches_fts_rebuild(flush_dir, make_store):
     """A spool replay failure must keep its own type, so the FTS rebuild still runs. After the
     repair the older spooled row is written before the live one."""

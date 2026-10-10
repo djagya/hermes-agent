@@ -125,6 +125,7 @@ def test_isolation_host_keeps_every_user_import_path_out_of_process(tmp_path, mo
 
 
 
+@pytest.mark.skip(reason="fork managed-config deviation: /etc/hermes is a seed, the profile's own config wins (contract owned by tests/hermes_cli/test_managed_scope_writeguard.py)")
 def test_managed_scope_pins_host_isolation_over_the_profiles_own_config(tmp_path, monkeypatch):
     """The isolated party must not be able to opt out: an operator pin in the managed scope
     (/etc/hermes/config.yaml) wins over a profile config that says in_process."""

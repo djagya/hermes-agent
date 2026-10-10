@@ -57,6 +57,7 @@ def test_managed_scope_routes_reach_satellite_preflight_and_delivery(satellite_h
     assert shared.get("whatsapp", {"chat_id": "123@g.us"}) is not None
 
 
+@pytest.mark.skip(reason="fork managed-config deviation: /etc/hermes is a seed, the profile's own config wins (contract owned by tests/hermes_cli/test_managed_scope_writeguard.py)")
 def test_managed_routes_replace_user_file_routes(satellite_home):
     root, managed_dir = satellite_home
     (root / "config.yaml").write_text(yaml.safe_dump(_routes(TG_ROUTE)), encoding="utf-8")

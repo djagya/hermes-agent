@@ -45,6 +45,7 @@ def _corrupting_execute(match, command="rebuild", error=_MALFORMED):
     return wrap
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)")
 @pytest.mark.parametrize(
     "error,repair_hint",
     [(_MALFORMED, True), (sqlite3.IntegrityError("UNIQUE constraint failed"), False)],
@@ -63,7 +64,10 @@ def test_corruption_class_error_is_caught_and_reported(
     assert any("hermes sessions repair" in rec.message for rec in caplog.records) is repair_hint
 
 
-@pytest.mark.parametrize("method,command", [("rebuild_fts", "rebuild"), ("optimize_fts", "optimize")])
+@pytest.mark.parametrize("method,command", [
+    pytest.param("rebuild_fts", "rebuild", marks=pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)")),
+    ("optimize_fts", "optimize"),
+])
 def test_one_corrupt_index_does_not_stop_the_remaining_indexes(db, monkeypatch, method, command):
     """Only messages_fts is corrupt; trigram/cjk must still be processed — the loop survives
     a corruption-class failure on one index. The trailing ``(`` keeps the match off

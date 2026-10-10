@@ -1200,6 +1200,10 @@ def test_create_tui_subscription_binds_to_live_session_after_compaction_fork(mon
     from tools import kanban_tools as kt
 
     stale, live = "20260912_231110_stale", "20260913_000649_live"
+    # dlz: a dispatcher-owned worker inherits its task's origin instead of auto-subscribing,
+    # so this runs as the orchestrator session (like the sibling TUI test above).
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
     db = SessionDB(tmp_path / "state.db")
     db.create_session(stale, source="tui")
     db.append_message(stale, role="user", content="pre-fork turn")
