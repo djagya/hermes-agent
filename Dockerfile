@@ -678,7 +678,8 @@ RUN ldconfig && \
     test -f /usr/local/lib/node_modules/caldav-mcp/package.json
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/tools HERMES_RUNTIME_DIR=/opt/hermes/tools
-ENV HERMES_PYTHON=/usr/local/bin/python3
+# TUI gateway children need the sealed runtime, not the build-helper system Python (upstream 48353b2b89).
+ENV HERMES_PYTHON=/opt/hermes/.venv/bin/python
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist HERMES_TUI_DIR=/opt/hermes/ui-tui
 ENV HERMES_HOME=/opt/data HERMES_WRITE_SAFE_ROOT=/opt/data:/opt/vault:/tmp HERMES_DISABLE_LAZY_INSTALLS=1
 ENV HERMES_CHILD_HOME=/opt/data/home
