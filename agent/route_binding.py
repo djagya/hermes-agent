@@ -1,7 +1,7 @@
 """Bind a provider route onto a live agent in place, and put the primary route back.
 
 ``bind_route_entry`` is the fallback chain's swap (client, pool, compressor, reasoning,
-extra_body) shared with per-turn routes such as the voice-chat model; ``reinstall_primary_runtime``
+route-owned request overrides) shared with per-turn routes such as the voice-chat model; ``reinstall_primary_runtime``
 is the inverse that ``restore_primary_runtime`` runs once its gates pass.
 """
 
@@ -22,7 +22,7 @@ def bind_route_entry(agent: Any, entry: Dict[str, Any], provider: str, model: st
     from agent.auxiliary_client import resolve_provider_client
     from agent.chat_completion_helpers import (
         _fallback_api_mode_hint, _fallback_api_mode_resolved, _rebind_fallback_credential_pool,
-        _reresolve_fallback_reasoning_config, _rescope_fallback_extra_body, _update_fallback_context_compressor,
+        _reresolve_fallback_reasoning_config, _update_fallback_context_compressor,
     )
     from hermes_cli.fallback_config import resolve_entry_api_key
     # Pass the entry's base_url/api_key so custom endpoints (Ollama Cloud) resolve instead
@@ -60,6 +60,7 @@ def bind_route_entry(agent: Any, entry: Dict[str, Any], provider: str, model: st
             api_mode = _fallback_api_mode_resolved(agent, provider, model, base_url)
 
     old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+    old_api_mode = agent.api_mode
     # Clear the per-config context_length override so the new model's own context window is
     # resolved instead of the previous model's stale value (#22387).
     agent._config_context_length = None
@@ -89,7 +90,11 @@ def bind_route_entry(agent: Any, entry: Dict[str, Any], provider: str, model: st
     agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
     _update_fallback_context_compressor(agent)
     _reresolve_fallback_reasoning_config(agent)
-    _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+    from agent.fallback_request_overrides import rescope_request_overrides
+    rescope_request_overrides(
+        agent, old_model=old_model, old_provider=old_provider,
+        old_base_url=old_base_url, old_api_mode=old_api_mode,
+    )
     return old_model, old_provider
 
 
