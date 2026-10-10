@@ -1103,11 +1103,11 @@ def _build_anchor_index(turns: List[Dict[str, Any]]) -> str:
     )
 
 
-# Message-count window (distinct from the token-based tail boundary) in which a
-# just-loaded skill_view body must survive the Phase-1 prune.
-# A skill_view call within this many trailing messages counts as "just loaded": its full instruction body
-# must survive the Phase-1 prune even when the token-budget boundary would otherwise demote it (#32106).
+# Keep the original just-loaded floor; extend recency across small messages by
+# context volume instead of a larger fixed count. The look-back charges skill
+# bodies and call arguments; a bulky run expires the extension.
 _SKILL_PRUNE_RECENT_WINDOW = 10
+_SKILL_PRUNE_RECENT_BUDGET_TOKENS = 8_000
 
 
 def _skill_view_call_sites(messages: List[Dict[str, Any]]) -> list[tuple[int, str]]:
@@ -1127,7 +1127,9 @@ def _skill_view_call_sites(messages: List[Dict[str, Any]]) -> list[tuple[int, st
     return sites
 
 
-def _collect_protected_skill_names(messages: List[Dict[str, Any]], prune_boundary: int) -> set[str]:
+def _collect_protected_skill_names(
+    messages: List[Dict[str, Any]], prune_boundary: int, recent_token_budget: int,
+) -> set[str]:
     """Skill names (lower-cased) whose skill_view bodies must survive Phase-1 demotion.
     Recently loaded, loaded inside the protected tail, or named by a tail user message. Applies to
     Phase-1/2 only; the Pass-4 pressure demotion ignores it."""
@@ -1135,6 +1137,12 @@ def _collect_protected_skill_names(messages: List[Dict[str, Any]], prune_boundar
     if not total:
         return set()
     recent_start = max(0, total - _SKILL_PRUNE_RECENT_WINDOW)
+    recent_tokens = 0
+    for i in range(total - 1, -1, -1):
+        recent_tokens += _estimate_msg_budget_tokens(messages[i])
+        if recent_tokens > recent_token_budget:
+            break
+        recent_start = min(recent_start, i)
     tail_start = max(0, prune_boundary)
     tail_user_texts = [
         m["content"].lower() for m in messages[tail_start:]
@@ -3391,7 +3399,18 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
         # Just-loaded / tail-referenced skills keep full skill_view bodies through the ordinary passes.
         # Without this, a skill loaded moments before a compaction can be demoted to metadata while the
         # model still believes its instructions are in context. See #32106.
-        protected_skills = _collect_protected_skill_names(result, prune_boundary)
+        # Extra recency must also fit small models; the ten-message floor and
+        # tail references retain their existing semantics. Pass 4 still overrides.
+        recent_token_budget = _SKILL_PRUNE_RECENT_BUDGET_TOKENS
+        # Pruning can run without a resolved model window; do not force a probe
+        # solely for this optional proportional cap.
+        context_length = getattr(self, "_resolved_context_length", None)
+        if context_length is not None:
+            recent_token_budget = min(
+                recent_token_budget,
+                int(self._effective_input_window(context_length, getattr(self, "max_tokens", None)) * TAIL_MAX_CONTEXT_FRACTION),
+            )
+        protected_skills = _collect_protected_skill_names(result, prune_boundary, recent_token_budget)
         # Pass 2: summarize old tool results. Tool-call arguments are canonical execution
         # records and are never rewritten; summary input is bounded separately by
         # _render_tool_call_for_summary().
