@@ -14,7 +14,10 @@ import hermes_cli.left_core_migration as lcm
 
 
 @pytest.fixture(autouse=True)
-def _fresh(monkeypatch):
+def _fresh(monkeypatch, tmp_path):
+    # dlz: the fork bundles the homeassistant plugin (plugins/homeassistant); these cases model an
+    # install that does not, so point the bundled root at an empty dir.
+    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(tmp_path / "no-bundled-plugins"))
     monkeypatch.setattr(lcm, "_attempted", set())
     monkeypatch.setattr(lcm, "_undelivered", {})
     monkeypatch.delenv("HASS_TOKEN", raising=False)
@@ -278,3 +281,27 @@ def test_a_failed_startup_install_backs_off_and_reports_one_line(tmp_path, monke
     assert lookups == ["homeassistant"] and len(said) == 1
     assert lcm.migrate_home(home, install=failing, say=said.append) == []
     assert lookups == ["homeassistant", "homeassistant"]
+
+
+def test_dlz_a_bundled_plugin_is_present_so_it_is_scoped_not_fetched(tmp_path, monkeypatch):
+    """dlz: the image bundles the catalog plugin and refuses lazy installs. A home that uses Home
+    Assistant gets the one-time toolset-scope conversion and the installed marker, never an install."""
+    bundled = tmp_path / "bundled"
+    (bundled / "homeassistant").mkdir(parents=True)
+    (bundled / "homeassistant" / "plugin.yaml").write_text("name: homeassistant\nkind: platform\n")
+    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled))
+    home = _home(tmp_path, env="HASS_TOKEN=abc\n", config="platform_toolsets:\n  webhook: [web]\n")
+    said: list[str] = []
+    assert lcm.plugin_present("homeassistant", home)
+    assert lcm._pending(home, say=said.append) == []
+    assert said == []
+    import hermes_yaml
+    config = hermes_yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert config["_left_core_installed"] == ["homeassistant"]
+    assert config["_left_core_scoped"] == ["homeassistant"]
+    assert "homeassistant" in config["known_plugin_toolsets"]["webhook"]
+
+
+def test_dlz_the_repo_bundles_the_homeassistant_plugin(monkeypatch):
+    monkeypatch.delenv("HERMES_BUNDLED_PLUGINS", raising=False)
+    assert lcm.plugin_present("homeassistant", Path("/nonexistent-home"))

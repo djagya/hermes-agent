@@ -152,8 +152,14 @@ _undelivered: dict[str, list[str]] = {}
 
 
 def plugin_present(plugin: str, home: Path) -> bool:
-    """Installed in *home* (enabled or not: a user who disabled it chose to). Read-only."""
-    return (home / "plugins" / plugin).is_dir()
+    """Installed in *home* (enabled or not: a user who disabled it chose to), or bundled with this
+    install (a packaged image that ships the plugin and cannot fetch it). Read-only."""
+    if (home / "plugins" / plugin).is_dir():
+        return True
+    # dlz: the fork image bundles the catalog plugin (plugins/homeassistant, VENDORED.json) because
+    # HERMES_DISABLE_LAZY_INSTALLS keeps this migration from installing it at gateway start.
+    from hermes_cli.plugins import get_bundled_plugins_dir
+    return (get_bundled_plugins_dir() / plugin / "plugin.yaml").is_file()
 
 
 def _core_carried(feature: LeftCoreFeature, selection: list) -> bool:
