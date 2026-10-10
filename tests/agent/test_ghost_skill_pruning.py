@@ -155,6 +155,53 @@ class TestProtectedSkillPrune:
         assert pruned >= 1
         assert _skill_pruned_marker("fresh-skill") in skill_row["content"]
 
+    def test_skill_recency_follows_context_volume_not_only_message_count(self):
+        c = _make_compressor()
+        msgs = (
+            self._filler(2)
+            + _skill_view_pair("call_old", "older-skill", size=18000)
+            + _skill_view_pair("call_new", "working-skill", size=18000)
+            + self._filler(18, start=2)
+        )
+        # Both calls are outside the count tail and more than ten messages
+        # old. Only the newer body fits the bounded recency look-back.
+        result, _ = c._prune_old_tool_results(msgs, protect_tail_count=4)
+        assert result[5]["content"] == msgs[5]["content"]
+        assert _skill_pruned_marker("older-skill") in result[3]["content"]
+        assert result[4]["tool_calls"] == msgs[4]["tool_calls"]
+        repeated, _ = c._prune_old_tool_results(result, protect_tail_count=4)
+        assert repeated[5]["content"] == msgs[5]["content"]
+
+        # At the SAME age, substantial intervening context expires protection.
+        busy_msgs = [m.copy() for m in msgs]
+        busy_msgs[6]["content"] = "new work " * 6000
+        busy_result, _ = c._prune_old_tool_results(busy_msgs, protect_tail_count=4)
+        assert _skill_pruned_marker("working-skill") in busy_result[5]["content"]
+
+        # The extra look-back cannot pin a large body on a small input window.
+        small = _make_compressor(config_context_length=16000, max_tokens=4000)
+        small_result, _ = small._prune_old_tool_results(msgs, protect_tail_count=4)
+        assert _skill_pruned_marker("working-skill") in small_result[5]["content"]
+
+    def test_pressure_can_reclaim_skill_after_extended_recency_protection(self):
+        c = _make_compressor()
+        msgs = (
+            self._filler(2)
+            + _skill_view_pair("call_s", "working-skill", size=18000)
+            + self._filler(18, start=2)
+        )
+        ordinary, _ = c._prune_old_tool_results(msgs, protect_tail_count=4)
+        assert ordinary[3]["content"] == msgs[3]["content"]
+
+        # The same body in an over-budget tail must yield to Pass 4 even
+        # though the extended recency guard would keep it on an ordinary pass.
+        pressured, pruned = c._prune_old_tool_results(
+            msgs, protect_tail_count=4, protect_tail_tokens=3000
+        )
+        assert pruned >= 1
+        assert _skill_pruned_marker("working-skill") in pressured[3]["content"]
+        assert pressured[2]["tool_calls"] == msgs[2]["tool_calls"]
+
 class TestMarkerSurvivesRealCompress:
     """P2 layer: markers survive a real compress() with a mocked aux LLM."""
 

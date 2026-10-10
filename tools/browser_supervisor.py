@@ -31,6 +31,8 @@ from tools.browser_supervisor_payment import PaymentSupervisionMixin
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
 
+    from tools.browser_supervisor_capture import CapturedCDP
+
 logger = logging.getLogger(__name__)
 _transport_logger = logging.getLogger("hermes.cdp.transport")
 # WebSocket DEBUG frame logs include secret-bearing CDP payloads before the
@@ -42,6 +44,11 @@ _transport_logger.setLevel(logging.WARNING)
 # once its process exits; leave enough room for the former without leaking a
 # supervisor thread and warnings forever for the latter.
 MAX_POST_ATTACH_RECONNECT_FAILURES = 5
+# A persistent browser accumulates tabs whose renderer crashed: they stay in Target.getTargets, but
+# Page.enable / Runtime.evaluate never answer. Bound each page attach so one such tab is skipped,
+# and keep the initial-attach tries inside start()'s 15 s budget.
+PAGE_ATTACH_TIMEOUT_S = 4.0
+INITIAL_ATTACH_TRIES = 2
 
 
 def _redact_cdp_error_text(exc: object) -> str:
@@ -277,22 +284,35 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
         """Re-attach the supervisor's page session to an open page target on ``origin``
         (``scheme://host[:port]``). The initial attach picks the FIRST page target, but tools
         that open their own tabs (browser_exec) put the login form somewhere else. With
-        ``accept`` (a JS expression) the first same-origin tab where it evaluates truthy wins,
-        so a login and a checkout tab on one site resolve to the right one. Returns
-        ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure the previous session stays."""
+        ``accept`` (a JS expression) only same-origin tabs where it evaluates truthy qualify,
+        so a login and a checkout tab on one site resolve to the right one. Among qualifying
+        tabs the visible one wins: a persistent browser keeps stale tabs of the same site in
+        the background, and the agent's tab is the foreground one. Tabs that do not answer
+        (crashed renderer) are skipped. Returns ``{"ok": True, "url"}`` or
+        ``{"ok": False, "error"}``; on failure the previous session stays."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
+        probe_js = f"[!!({accept or 'true'}), document.visibilityState === 'visible']"
 
-        async def _attach(target_id: str) -> str:
-            attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
-            sid = attach["result"]["sessionId"]
-            await self._enable_page_domains(sid, timeout=timeout)
-            await self._install_dialog_bridge(sid)
-            return sid
+        async def _detach(sid: str) -> None:
+            with contextlib.suppress(Exception):
+                await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=2.0)
+
+        async def _probe(target_id: str) -> Tuple[str, bool, bool]:
+            sid = await self._attach_page(target_id, timeout=PAGE_ATTACH_TIMEOUT_S)
+            try:
+                probe = await self._cdp("Runtime.evaluate", {"expression": probe_js, "returnByValue": True},
+                                        session_id=sid, timeout=PAGE_ATTACH_TIMEOUT_S)
+            except Exception:
+                await _detach(sid)
+                raise
+            value = probe.get("result", {}).get("result", {}).get("value") or [False, False]
+            return sid, bool(value[0]), bool(value[1])
 
         async def _focus() -> Dict[str, Any]:
             from agent.vault_store import normalize_origin
+            deadline = loop.time() + timeout
             targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
             candidates = []
             for t in targets:
@@ -304,18 +324,30 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                         candidates.append((t["targetId"], url))
                 except Exception:
                     continue
+            chosen: Optional[Tuple[str, str]] = None
             for target_id, url in candidates:
-                sid = await _attach(target_id)
-                if accept:
-                    probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
-                                            session_id=sid, timeout=timeout)
-                    if not probe.get("result", {}).get("result", {}).get("value"):
-                        await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
-                        continue
-                with self._state_lock:
-                    self._page_session_id = sid
-                return {"ok": True, "url": url}
-            return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept and candidates else ""))
+                if deadline - loop.time() < PAGE_ATTACH_TIMEOUT_S:
+                    break
+                try:
+                    sid, passed, visible = await _probe(target_id)
+                except Exception as e:
+                    logger.debug("CDP supervisor %s: tab did not answer, skipping: %s",
+                                 self.task_id, _redact_cdp_error_text(e))
+                    continue
+                if not passed or (chosen and not visible):
+                    await _detach(sid)
+                    continue
+                if chosen:
+                    await _detach(chosen[0])
+                chosen = (sid, url)
+                if visible:
+                    break
+            if chosen is None:
+                return _fail(f"no open page on {origin or 'any site'}"
+                             + (" with the expected form" if accept and candidates else ""))
+            with self._state_lock:
+                self._page_session_id = chosen[0]
+            return {"ok": True, "url": chosen[1]}
 
         try:
             return _schedule(_focus(), loop, timeout=timeout + 1)
@@ -433,6 +465,12 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                     handle.cancel()
                 self._dialog_watchdogs.clear()
                 await self._close_ws()
+                # Replies to calls still in flight died with the socket: fail them now
+                # instead of letting each caller sit out its full timeout.
+                for fut in self._pending_calls.values():
+                    if not fut.done():
+                        fut.set_exception(ConnectionError("CDP connection closed before reply"))
+                self._pending_calls.clear()
 
             if self._stop_requested:
                 return
@@ -440,16 +478,35 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 10.0)
 
-    async def _attach_initial_page(self) -> None:
-        """Find (or create) a page target, attach flattened, enable domains, install dialog bridge."""
-        targets = (await self._cdp("Target.getTargets")).get("result", {}).get("targetInfos", [])
-        page_target = next((t for t in targets if t.get("type") == "page"), None)
-        if page_target is None:
-            page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"}))["result"]
-        attach = await self._cdp("Target.attachToTarget", {"targetId": page_target["targetId"], "flatten": True})
-        self._page_session_id = sid = attach["result"]["sessionId"]
-        await self._enable_page_domains(sid, timeout=10.0)
+    async def _attach_page(self, target_id: str, *, timeout: float) -> str:
+        """Attach flattened, enable domains, install the dialog bridge; returns the session id. A target
+        that does not answer (crashed renderer, hung tab) is detached again and the error re-raised."""
+        attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
+        sid = attach["result"]["sessionId"]
+        try:
+            await self._enable_page_domains(sid, timeout=timeout)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=2.0)
+            raise
         await self._install_dialog_bridge(sid)
+        return sid
+
+    async def _attach_initial_page(self) -> None:
+        """Attach the first page target that answers, else a new blank one. One crashed tab first in
+        the list used to fail the whole supervisor, and with it every vault fill."""
+        targets = (await self._cdp("Target.getTargets")).get("result", {}).get("targetInfos", [])
+        pages = [t for t in targets if t.get("type") == "page"]
+        for page_target in pages[:INITIAL_ATTACH_TRIES]:
+            try:
+                self._page_session_id = await self._attach_page(page_target["targetId"],
+                                                                timeout=PAGE_ATTACH_TIMEOUT_S)
+                return
+            except Exception as e:
+                logger.debug("CDP supervisor %s: page target did not answer, skipping: %s",
+                             self.task_id, _redact_cdp_error_text(e))
+        page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"}))["result"]
+        self._page_session_id = await self._attach_page(page_target["targetId"], timeout=10.0)
 
     async def _cdp(self, method: str, params: Optional[Dict[str, Any]] = None, *,
                    session_id: Optional[str] = None, timeout: float = 10.0) -> Dict[str, Any]:
@@ -516,6 +573,13 @@ class _SupervisorRegistry:
         with self._lock:
             return self._by_task.pop(task_id, None)
 
+    def capture(self, task_id: str, *, timeout: float = 10.0) -> "CapturedCDP":
+        """Public CDP seam for trusted in-process plugins: a handle pinned to this task's
+        current connection and default page session (``tools.browser_supervisor_capture``)."""
+        from tools.browser_supervisor_capture import capture
+
+        return capture(self, task_id, timeout=timeout)
+
     def get_or_start(self, task_id: str, cdp_url: str, *, dialog_policy: str = DEFAULT_DIALOG_POLICY,
                      dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0) -> CDPSupervisor:
         """Idempotently ensure a supervisor runs for ``(task_id, cdp_url)``; one bound to a
@@ -561,42 +625,3 @@ SUPERVISOR_REGISTRY = _SupervisorRegistry()
 
 
 __all__ = ["CDPSupervisor", "SUPERVISOR_REGISTRY", "SupervisorSnapshot", "_SupervisorRegistry"]
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-
-CONSOLE_HISTORY_MAX = 50
-
-@dataclass
-class ConsoleEvent:
-    """Ring buffer entry for console + exception traffic."""
-
-    ts: float
-    level: str  # "log" | "error" | "warning" | "exception"
-    text: str
-    url: Optional[str] = None
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'DIALOG_BRIDGE_HOST': ('tools.browser_supervisor_dialogs', 'DIALOG_BRIDGE_HOST'),
-    'DIALOG_BRIDGE_URL_PATTERN': ('tools.browser_supervisor_dialogs', 'DIALOG_BRIDGE_URL_PATTERN'),
-    'DIALOG_POLICY_AUTO_ACCEPT': ('tools.browser_supervisor_dialogs', 'DIALOG_POLICY_AUTO_ACCEPT'),
-    'DIALOG_POLICY_AUTO_DISMISS': ('tools.browser_supervisor_dialogs', 'DIALOG_POLICY_AUTO_DISMISS'),
-    'DIALOG_POLICY_MUST_RESPOND': ('tools.browser_supervisor_dialogs', 'DIALOG_POLICY_MUST_RESPOND'),
-    'FRAME_TREE_MAX_ENTRIES': ('tools.browser_supervisor_frames', 'FRAME_TREE_MAX_ENTRIES'),
-    'FRAME_TREE_MAX_OOPIF_DEPTH': ('tools.browser_supervisor_frames', 'FRAME_TREE_MAX_OOPIF_DEPTH'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----
