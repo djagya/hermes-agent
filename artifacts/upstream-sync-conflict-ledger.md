@@ -13,16 +13,25 @@ history at release/v0.21.5-dlz.
 
 - **Home Assistant left core upstream** (`fb9fc8a3dd`): the gateway platform and the
   `homeassistant` toolset are now the catalog plugin `homeassistant`
-  (NousResearch/hermes-homeassistant, catalog sha `ba30cb0c`, v2.0.1). The upstream deletion of
+  (NousResearch/hermes-homeassistant). The upstream deletion of
   `plugins/platforms/homeassistant/adapter.py` and `tests/gateway/test_homeassistant.py` is
-  accepted. Consequences:
-  - The image sets `HERMES_DISABLE_LAZY_INSTALLS=1`, so the left-core migration does NOT fetch the
-    plugin at gateway start; it reports "Home Assistant moved out of core … run
-    `hermes plugins install homeassistant`". Until that runs on the box, Sera has no HA platform
-    or `ha_*` tools. The install lands in `/opt/data/plugins` and survives later recreates.
-  - Fork carryover #97 (`9182a191b0`, quiet cold-boot connect grace) lived in the deleted
-    adapter. It is not in this candidate; it has to be re-landed in the plugin (a fork of
-    hermes-homeassistant, or upstream).
+  accepted. Decision (Danil, 2026-10-10): follow upstream, plugin it is. Because the image sets
+  `HERMES_DISABLE_LAZY_INSTALLS=1`, the migration cannot fetch it at gateway start, so the fork
+  **bundles** it the way packaged installs ship plugins:
+  - `plugins/homeassistant/` = the catalog pin `ba30cb0cf86c` (v2.0.1), byte-identical except
+    `adapter.py`; `VENDORED.json` records source, commit and per-file upstream sha256
+    (enforced by `tests/plugins/platforms/homeassistant/test_vendored_provenance.py`). Bump it
+    together with `plugin-catalog/homeassistant.yaml`.
+  - A bundled `kind: platform` plugin auto-loads deferred (no `plugins.enabled` entry); its
+    `provides_tools` pre-register `ha_*` in CLI/TUI processes. Its own tests run from
+    `tests/plugins/platforms/homeassistant/`.
+  - Fork patch on `adapter.py`: re-lands #97 (`9182a191b0`), the quiet cold-boot connect that
+    retries for up to 180 s. The plugin has no extension point for it.
+  - Fork patch on `hermes_cli/left_core_migration.py::plugin_present`: a bundled copy counts as
+    present, so the migration records the toolset scope and `_left_core_installed` instead of
+    reporting "not installed, so it is off" on every start.
+  - `hermes plugins install homeassistant` on the box remains a fallback only; a user copy
+    shadows the bundled one and needs `plugins.enabled`.
 - **Version derivation**: upstream main now carries `0.0.0` and releases are semver tags
   (`v0.21.6`). `scripts/fork-release-version.sh` now takes the highest stable `vX.Y.Z` tag merged
   into HEAD (same rule as `hermes_cli.version_info`) and falls back to the CalVer rule for older
@@ -30,9 +39,9 @@ history at release/v0.21.5-dlz.
 - **CI review-label gate removed** (upstream `059efe8b29`): `review-labels.yml`, the
   `ci_review` / `ci_review_files` / `mcp_catalog` classifier outputs and the rerun job are gone;
   upstream enforces the same paths through `.github/CODEOWNERS`, which names
-  `@NousResearch/hermes-agent-core` and therefore does nothing in djagya/hermes-agent. The
-  fork's `ci-reviewed` label rule now has no CI enforcement until CODEOWNERS points at a fork
-  owner (and the ruleset requires code-owner review) or the gate is restored.
+  `@NousResearch/hermes-agent-core` and so enforces nothing in djagya/hermes-agent. Decision
+  (Danil, 2026-10-10): follow upstream; the fork's `ci-reviewed` label rule is retired, not
+  restored.
 - **Messages schema**: both sides added columns after `display_order` as history event 16
   (fork: `platform_delivery`; upstream: `message_uid`, `absorbed_message_uids`,
   `tool_call_uids`, `tool_call_uid`). Fork stores already hold `platform_delivery`
@@ -65,3 +74,11 @@ history at release/v0.21.5-dlz.
 | `.github/workflows/tests-os.yml`, `windows-install-update-e2e.yml` | fork two-core worker counts and 90 min timeout; upstream test slice and 3600 s file timeout |
 | `.github/workflows/label-rerun.yml` | upstream `run-e2e` rerun job |
 | tests (`tests/ci/*`, `tests/gateway/test_status.py`, `tests/hermes_cli/*`, `tests/tools/test_write_approval.py`) | both sides' cases; expectations combined where one case gained fields from both; upstream staged-hint tests use distinct facts (the fork pending store deduplicates identical payloads) |
+
+## Folded into this release (2026-10-10)
+
+| Change | How |
+|---|---|
+| #99 `fix/skill-prune-recent-window` | merge commit of the PR head `12a577fe99` (clean) |
+| #98 `fix/vault-managed-route` | merge commit of the PR head `2ffdadc3fc` (clean) |
+| #100 `fix/fallback-provider-request-fields` | cherry-picked (`-x`) onto upstream's `agent/route_binding.py` move (`1541036775`): `bind_route_entry` captures `old_api_mode` and calls `rescope_request_overrides`; `_rescope_fallback_extra_body` is gone as in #100 |

@@ -130,8 +130,14 @@ class TestExplicitEmptySelection:
         import hermes_cli.config as config_mod
 
         no_desktop_env.setattr(cc, "coding_selection", lambda **_: None)
+        # dlz: the fork bundles the homeassistant plugin, whose toolset is on unless
+        # known_plugin_toolsets names it. A list saved through `hermes tools` records every plugin
+        # toolset there, so the saved-config fixture does too.
         no_desktop_env.setattr(
-            config_mod, "load_config", lambda: {"platform_toolsets": platform_toolsets}
+            config_mod, "load_config", lambda: {
+                "platform_toolsets": platform_toolsets,
+                "known_plugin_toolsets": {"cli": ["homeassistant"]},
+            }
         )
 
     def test_explicit_empty_list_yields_no_toolsets(self, no_desktop_env):
