@@ -75,6 +75,21 @@ class TestNormalizeProfileName:
         assert normalize_profile_name("Jules") == "jules"
         assert normalize_profile_name("  Librarian ") == "librarian"
 
+    def test_non_string_name_rejected(self):
+        # A numeric profile id (DB row id / falsy sentinel) must not be
+        # silently coerced into a real on-disk profile directory (#88842).
+        with pytest.raises(ValueError):
+            normalize_profile_name(0)
+        with pytest.raises(ValueError):
+            normalize_profile_name(None)
+        with pytest.raises(ValueError):
+            normalize_profile_name(42)
+
+    def test_literal_zero_string_is_a_valid_explicit_name(self):
+        # A literal "0" typed by the user is a legal profile id; only the
+        # non-string coercion created the phantom profile.
+        assert normalize_profile_name("0") == "0"
+
 
 class TestValidateProfileName:
     """Tests for validate_profile_name()."""
@@ -216,9 +231,161 @@ class TestCreateProfile:
         cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8-sig"))
         assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert cloned_config["model"] == "test"
-        assert (profile_dir / ".env").read_text().strip() == "KEY=val"
-        assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
-        assert (profile_dir / "ARCHITECTURE.md").read_text() == "Private topology."
+        assert (profile_dir / ".env").read_text(encoding="utf-8-sig").strip() == "KEY=val"
+        assert (profile_dir / "SOUL.md").read_text(encoding="utf-8-sig") == "Be helpful."
+        assert (profile_dir / "ARCHITECTURE.md").read_text(encoding="utf-8-sig") == "Private topology."
+
+    def test_clone_config_copies_only_the_active_memory_providers_config(self, profile_env):
+        """#120115: --clone carried ``memory.provider: hindsight`` but not hindsight's own config,
+        so the clone booted with memory silently unavailable. Only the ACTIVE provider's
+        ``<provider>/`` dir / ``<provider>.json`` travels; another provider's leftovers stay behind."""
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text("memory:\n  provider: hindsight\n")
+        (default_home / "hindsight").mkdir()
+        payload = '{"mode": "local_embedded", "bank_id": "hermes", "apiKey": "hs-secret"}'
+        (default_home / "hindsight" / "config.json").write_text(payload)
+        (default_home / "mem0.json").write_text('{"agent_id": "hermes"}')
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        cloned = profile_dir / "hindsight" / "config.json"
+        assert cloned.read_text() == payload
+        if os.name != "nt":
+            assert stat.S_IMODE(cloned.stat().st_mode) == 0o600
+        assert not (profile_dir / "mem0.json").exists()
+
+    def test_clone_config_copies_source_plugins(self, profile_env):
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        plugin_dir = default_home / "plugins" / "example-plugin"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text("name: example-plugin\n")
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        assert (
+            profile_dir
+            / "plugins"
+            / "example-plugin"
+            / "plugin.yaml"
+        ).read_text() == "name: example-plugin\n"
+
+    def test_clone_config_keeps_plugin_provenance_and_skips_install_staging(self, profile_env):
+        """A catalog-installed memory provider keeps its install record in the clone, so the clone
+        runs (and updates) the source's exact revision; an in-flight install staging dir stays behind."""
+        plugins = profile_env / ".hermes" / "plugins"
+        (plugins / "acme-memory").mkdir(parents=True)
+        (plugins / "acme-memory" / "plugin.yaml").write_text("name: acme-memory\nkind: memory\n")
+        (plugins / "acme-memory" / "__pycache__").mkdir()
+        (plugins / ".install-abc123" / "plugin").mkdir(parents=True)
+        record = '{"acme-memory": {"pinned": true, "revision": "%s", "source": "https://example.invalid/a.git"}}' % ("a" * 40)
+        (plugins / ".install-metadata.json").write_text(record)
+        (profile_env / ".hermes" / "config.yaml").write_text("memory:\n  provider: acme-memory\n")
+
+        cloned = create_profile("coder", clone_config=True, no_alias=True) / "plugins"
+
+        assert (cloned / ".install-metadata.json").read_text() == record
+        assert (cloned / "acme-memory" / "plugin.yaml").is_file()
+        assert not (cloned / "acme-memory" / "__pycache__").exists()
+        assert not (cloned / ".install-abc123").exists()
+
+    @pytest.mark.parametrize("provider", ["../outside", "a/b", "..", "hind sight"])
+    def test_clone_config_ignores_unsafe_memory_provider_names(self, profile_env, provider):
+        """A hand-edited ``memory.provider`` must never aim the copy outside the source profile."""
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text(f"memory:\n  provider: {provider!r}\n")
+        (tmp_path / "outside").mkdir()
+        (tmp_path / "outside" / "config.json").write_text("{}")
+        (default_home / "a").mkdir()
+        (default_home / "a" / "b").mkdir()
+        (default_home / "a" / "b" / "config.json").write_text("{}")
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        assert not (profile_dir / "a").exists()
+        assert not (profile_dir.parent / "outside").exists()
+        assert not (profile_dir / "hind sight").exists()
+
+    def test_clone_sync_imports_carries_manifest_but_never_links_profiles(self, profile_env):
+        """--sync-imports copies import-sync.json (a pointer at EXTERNAL agent trees) and nothing
+        else changes: the clone still gets its own config/skills copies, never a live link."""
+        from hermes_cli.agent_import_sync import SYNC_MANIFEST_NAME, load_sync_manifest
+
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("model: test", encoding="utf-8")
+        manifest = {"version": 1, "agents": {"claude-code": {
+            "source": str(profile_env / ".claude"), "digest": "d", "overwrite": False,
+            "last_import": 1, "imported_skills": ["s1"]}}}
+        (default_home / SYNC_MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+
+        plain = create_profile("plain", clone_config=True, no_alias=True)
+        assert not (plain / SYNC_MANIFEST_NAME).exists()
+
+        synced = create_profile("synced", clone_config=True, sync_imports=True, no_alias=True)
+        assert load_sync_manifest(synced)["agents"] == manifest["agents"]
+        # Editing the source afterwards does not reach the clone: still an independent island.
+        (default_home / "config.yaml").write_text("model: changed", encoding="utf-8")
+        assert yaml.safe_load((synced / "config.yaml").read_text(encoding="utf-8-sig"))["model"] == "test"
+
+    @staticmethod
+    def _home_with_linked_skill(profile_env):
+        """Source home: ``skills/foo`` links into an ``external_dirs`` root, ``skills/local`` is physical."""
+        default_home = profile_env / ".hermes"
+        external = profile_env / "agents-skills"
+        (external / "foo").mkdir(parents=True)
+        (external / "foo" / "SKILL.md").write_text("# external foo\n", encoding="utf-8")
+        (default_home / "skills" / "local").mkdir(parents=True)
+        (default_home / "skills" / "local" / "SKILL.md").write_text("# local\n", encoding="utf-8")
+        (default_home / "config.yaml").write_text(f"model: test\nskills:\n  external_dirs:\n    - {external}\n", encoding="utf-8")
+        return default_home, external
+
+    @pytest.mark.parametrize("clone_kwargs", [{"clone_config": True}, {"clone_all": True}])
+    def test_clone_recreates_skill_junctions_and_skips_dangling_ones(self, profile_env, monkeypatch, clone_kwargs):
+        """A junctioned skill stays a link (one candidate with its external original), a dangling
+        junction is skipped without failing the clone. The reparse-point predicate and CreateJunction
+        are Windows-only; simulate both so the copy/re-create contract runs on every host."""
+        default_home, external = self._home_with_linked_skill(profile_env)
+        # copytree sees plain directories (what a junction looks like to os.stat on Windows).
+        (default_home / "skills" / "foo").mkdir()
+        (default_home / "skills" / "foo" / "SKILL.md").write_text("# a physical copy would come from here\n", encoding="utf-8")
+        (default_home / "skills" / "gone").mkdir()
+        targets = {str(default_home / "skills" / "foo"): str(external / "foo"),
+                   str(default_home / "skills" / "gone"): str(profile_env / "nowhere")}
+        monkeypatch.setattr(profiles, "_junction_target", lambda path: targets.get(path), raising=False)
+
+        def _create_junction(target, dst):
+            if not os.path.isdir(target):
+                raise OSError("target missing")  # what _winapi.CreateJunction does for a dangling junction
+            os.symlink(target, dst, target_is_directory=True)
+        monkeypatch.setitem(sys.modules, "_winapi", types.SimpleNamespace(CreateJunction=_create_junction))
+
+        clone = create_profile("clone", no_alias=True, **clone_kwargs)
+        foo = clone / "skills" / "foo"
+        assert foo.is_symlink() and foo.resolve() == (external / "foo").resolve()
+        assert (foo / "SKILL.md").read_text(encoding="utf-8-sig") == "# external foo\n"
+        assert (clone / "skills" / "local" / "SKILL.md").is_file()
+        assert not (clone / "skills" / "gone").exists()
+        from tools.skills_tool import _collect_skill_candidates
+        assert len(_collect_skill_candidates("foo", None, [clone / "skills", external])) == 1
+
+    @pytest.mark.platforms("windows")
+    def test_clone_keeps_real_ntfs_junction(self, profile_env):
+        import _winapi
+        default_home, external = self._home_with_linked_skill(profile_env)
+        _winapi.CreateJunction(str(external / "foo"), str(default_home / "skills" / "foo"))
+
+        clone = create_profile("clone", clone_config=True, no_alias=True)
+        foo = clone / "skills" / "foo"
+        assert os.lstat(foo).st_reparse_tag == profiles.stat.IO_REPARSE_TAG_MOUNT_POINT
+        assert foo.resolve() == (external / "foo").resolve()
+        from tools.skills_tool import _collect_skill_candidates
+        assert len(_collect_skill_candidates("foo", None, [clone / "skills", external])) == 1
+
+    def test_sync_imports_requires_a_clone_source(self, profile_env):
+        with pytest.raises(ValueError, match="--sync-imports requires"):
+            create_profile("lonely", sync_imports=True, no_alias=True)
 
     def test_clone_all_does_not_copy_cron_jobs(self, profile_env):
         # Cron jobs are scheduled work bound to the source profile + origin channel; a clone

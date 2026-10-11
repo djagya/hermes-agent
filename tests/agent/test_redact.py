@@ -375,6 +375,21 @@ class TestJsonFields:
         result = redact_sensitive_text(text)
         assert result == text
 
+    @pytest.mark.parametrize("depth", [1, 2])
+    def test_json_field_inside_json_encoded_string_is_masked_and_stays_valid(self, depth):
+        # A tool result wrapping a config dump escapes its quotes; the plain JSON rule never saw the value.
+        import json
+        key = "AQ.Ab8RN6Jx2kq9Zs0VwT4yLm3PbQe7HcUfGdA1nX5oIr"
+        text = json.dumps({"api_key": key, "token": "CPU", "model": "gemini"})
+        for _ in range(depth):
+            text = json.dumps({"output": text})
+        result = redact_sensitive_text(text)
+        assert key not in result and '\\"token\\": \\"CPU\\"'.replace("\\", "\\" * (2 ** depth - 1)) in result
+        inner = result
+        for _ in range(depth):
+            inner = json.loads(inner)["output"]
+        assert json.loads(inner)["model"] == "gemini"
+
 
 class TestPythonReprFields:
     @pytest.mark.parametrize(
@@ -747,7 +762,12 @@ class TestStrictUrlCredentialRedaction:
             (
                 "//user:NET_SECRET@x.test/path",
                 "NET_SECRET",
-                "//user:***@x.test/path",
+                "//***:***@x.test/path",
+            ),
+            (
+                "https://Zq8vT3kP9wLm2xR7nB4cY6fH1dJ5sA0e:@llm-proxy.example/v1",
+                "Zq8vT3kP9wLm2xR7nB4cY6fH1dJ5sA0e",
+                "https://***:***@llm-proxy.example/v1",
             ),
         ],
     )
@@ -1450,6 +1470,14 @@ class TestRedactCdpUrl:
         out = redact_cdp_url(url)
         assert "aaa-secret" not in out
         assert "bbb-secret" not in out
+
+    def test_masks_managed_gate_command_token(self):
+        """monolith browser-control carries the lease's command token as ``?tok=`` on every gated
+        CDP URL, and browser_exec logs the discovery -> WebSocket resolution at INFO."""
+        out = redact_cdp_url("Resolved CDP endpoint http://browser-control:8790/slot/work-1/json/version"
+                             "?tok=tok-c4f8e2f7c6374a0e -> ws://browser-control:8790/devtools/browser/x?tok=tok-c4f8e2f7c6374a0e")
+        assert "tok-c4f8e2f7c6374a0e" not in out
+        assert "/slot/work-1/json/version?tok=***" in out
 
 
 

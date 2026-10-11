@@ -47,10 +47,19 @@ jobs:
           scripts/run_tests.sh -j 1 --file-timeout 180 --file-retries 0 \
             tests/tools/test_browser_vault_payment_live.py -m integration \
             --junitxml=payment-browser-receipt.xml -o junit_family=xunit1 -o junit_logging=all
+      - name: Real Chromium managed-route login fill and typed refusals
+        env:
+          HERMES_E2E_BROWSER: '1'
+        run: |
+          scripts/run_tests.sh -j 1 --file-timeout 180 --file-retries 0 \
+            tests/tools/test_browser_vault_managed_live.py -m integration \
+            --junitxml=managed-browser-receipt.xml -o junit_family=xunit1 -o junit_logging=all
       - name: Synthetic browser receipts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: payment-browser-receipt-${{ github.sha }}
-          path: payment-browser-receipt.xml
+          path: |
+            payment-browser-receipt.xml
+            managed-browser-receipt.xml
           if-no-files-found: error
           retention-days: 14

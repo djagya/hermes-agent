@@ -57,7 +57,7 @@ env:
   # Must match every Dockerfile `ARG DEBIAN_SNAPSHOT=` default. Build-args
   # override the Dockerfile; leaving May here after a Sept bump rebuilt
   # stale apt and failed smoke/Trivy.
-  DEBIAN_SNAPSHOT: 20260930T070000Z
+  DEBIAN_SNAPSHOT: 20261007T000000Z
 
 jobs:
   lint:

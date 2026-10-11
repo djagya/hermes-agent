@@ -22,6 +22,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
+from hermes_cli import kanban_workflow
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
@@ -379,6 +380,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
+            source_notify_target=getattr(args, "source_notify_target", None),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
@@ -1145,7 +1147,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     if _json_out(args, stats):
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in kanban_workflow.DEFAULT_WORKFLOW.keys():
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
@@ -1176,6 +1178,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             notifier_profile=args.notifier_profile or _profile_author(),
             delivery_mode=getattr(args, "delivery_mode", None),
             delivery_metadata=delivery_metadata or None,
+            board=getattr(args, "board", None),
         )
     print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
           + f" to {args.task_id}")
@@ -1372,7 +1375,7 @@ Read-only commands are safe while an agent is running.\
 """
 
 
-def run_slash(rest: str) -> str:
+def run_slash(rest: str, *, source_notify_target: Optional[dict] = None) -> str:
     """Execute a ``/kanban …`` string (``rest`` = everything after ``/kanban``) and return captured
     stdout/stderr. Shared by the interactive CLI and the gateway so formatting is identical."""
     import io
@@ -1429,6 +1432,7 @@ def run_slash(rest: str) -> str:
 
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         try:
+            args.source_notify_target = source_notify_target
             kanban_command(args)
         except SystemExit:
             pass
@@ -1439,11 +1443,3 @@ def run_slash(rest: str) -> str:
     if err and out:
         return f"{out}\n{err}"
     return err if err else (out or "(no output)")
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import Any  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----

@@ -48,7 +48,7 @@ import logging
 import os
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -891,6 +891,41 @@ class GateDecision:
         self.message = message
 
 
+def _slash_review_surface() -> bool:
+    """Whether the ACTIVE turn has a human who can type ``/<subsystem> pending``: the interactive
+    CLI, TUI/desktop (exec route), and chat-gateway sessions all answer it now. Headless worker
+    contexts — cron (``HERMES_CRON_SESSION``), kanban (``HERMES_KANBAN_TASK``) and the unattended
+    programmatic platforms (api_server, webhook delivery) — have nobody at a prompt, so the staged
+    hint must not name a command nobody can deliver (#98330); it names the pending dir instead."""
+    def _env(name: str) -> str:
+        try:
+            from gateway.session_context import get_session_env
+            return get_session_env(name, "") or ""
+        except Exception:  # standalone/tests: process env is the fallback
+            return os.environ.get(name, "") or ""
+    if _env("HERMES_KANBAN_TASK").strip():
+        return False
+    try:
+        from utils import is_truthy_value
+        if is_truthy_value(_env("HERMES_CRON_SESSION")):
+            return False
+    except Exception:
+        pass
+    platform = (_env("HERMES_SESSION_PLATFORM") or os.environ.get("HERMES_PLATFORM", "")).strip().lower()
+    return platform not in {"webhook", "msgraph_webhook", "api_server"}
+
+
+def _staged(subsystem: str) -> GateDecision:
+    command = f"/{subsystem} pending"
+    if _slash_review_surface():
+        where = f"review with {command}"
+    else:
+        where = (f"pending records live in {_pending_dir(subsystem)} "
+                 f"(review from an interactive CLI session with {command})")
+    return GateDecision(stage=True, message=(f"Staged for approval ({subsystem}.write_approval is on). "
+                                             f"Not yet saved — {where}."))
+
+
 def evaluate_gate(subsystem: str, *, inline_summary: str = "",
                   inline_detail: str = "") -> GateDecision:
     """Decide what to do with a pending write for ``subsystem``.
@@ -920,14 +955,7 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
     # Skills always stage — a SKILL.md is too large to review inline, and a
     # background skill write happens in a daemon thread with no user present.
     if subsystem == SKILLS or background:
-        where = "/skills pending" if subsystem == SKILLS else "/memory pending"
-        return GateDecision(
-            stage=True,
-            message=(
-                f"Staged for approval ({subsystem}.write_approval is on). "
-                f"Not yet saved — review with {where}."
-            ),
-        )
+        return _staged(subsystem)
 
     # Memory + foreground: if an interactive approval channel exists (a CLI
     # approval callback registered on this thread), prompt inline — entries
@@ -944,13 +972,7 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
             )
         # granted is None → prompt failed; fall through to staging.
 
-    return GateDecision(
-        stage=True,
-        message=(
-            "Staged for approval (memory.write_approval is on). "
-            "Not yet saved — review with /memory pending."
-        ),
-    )
+    return _staged(MEMORY)
 
 
 def _interactive_approval_available() -> bool:
@@ -987,7 +1009,13 @@ def _prompt_inline_memory_approval(summary: str, detail: str) -> Optional[bool]:
     wrapper falls back to ``input()`` (deadlock-prone under prompt_toolkit,
     see #15216) and converts callback errors into a silent deny; here a
     failed prompt must stage the write instead.
+
+    ``hermes chat -q`` (and so every kanban worker), cron and unattended platforms can register a
+    callback too, but nobody answers it: stage at once instead of waiting the approval timeout.
     """
+    from tools.approval_context import _no_user_can_answer
+    if _no_user_can_answer():
+        return None
     try:
         from tools.terminal_tool import _get_approval_callback
     except Exception:
@@ -1079,68 +1107,129 @@ def _find_skill_path(name: str) -> Optional[Path]:
     return found["path"] if found else None
 
 
-def skill_pending_diff(record: Dict[str, Any]) -> str:
-    """Build a full unified diff (or full content) for a staged skill write.
+def _staged_base(name: str, target_label: str, staged: Optional[Dict[str, Dict[str, str]]]) -> str:
+    """What an op diffs against: the content earlier ops of the same batch left in this file,
+    else the on-disk copy (empty for a file that does not exist yet)."""
+    files = (staged or {}).get(name)
+    if files and target_label in files:
+        return files[target_label]
+    skill_dir = _find_skill_path(name)
+    if not skill_dir:
+        return ""
+    with suppress(Exception):
+        p = skill_dir / target_label
+        if p.exists():
+            return p.read_text(encoding="utf-8-sig")
+    return ""
 
-    Used by /skills diff <id> on a surface that can render it (CLI pager, web
-    dashboard, or by opening the pending JSON file). For create this is the new
-    file content; for edit/patch it is a unified diff against the current
-    on-disk skill.
-    """
-    import difflib
+
+def skill_pending_diff(
+    record: Dict[str, Any], staged: Optional[Dict[str, Dict[str, str]]] = None
+) -> str:
+    """Full content (create) or unified diff vs. the base file (edit/patch/write_file),
+    rendered by /skills diff <id> on surfaces that can show it. ``staged`` carries the file
+    contents the earlier ops of a batch left behind, so op *i* diffs against ops 1..*i-1* and
+    disk is read only for files no earlier op touched. A staged batch renders each op's diff
+    under its gist header (single-op path below is unchanged)."""
     payload = record.get("payload", {})
     action = payload.get("action", "")
     name = payload.get("name", "")
-
+    if action == "batch":
+        return _batch_pending_diff(payload)
     if action == "create":
-        return (payload.get("content") or "")
+        return payload.get("content") or ""
+    if action not in {"edit", "patch", "write_file"}:
+        return {"remove_file": f"remove file: {payload.get('file_path')} from skill '{name}'",
+                "delete": f"delete skill '{name}'"}.get(action, f"({action} on '{name}')")
 
-    # Resolve current on-disk content for diffable actions.
-    try:
-        from tools.skill_manager_tool import _find_skill
-    except Exception:
-        _find_skill = None  # type: ignore
+    # patch/write_file target a file inside the skill; edit always targets SKILL.md.
+    target_label = "SKILL.md" if action == "edit" else (payload.get("file_path") or "SKILL.md")
+    current = _staged_base(name, target_label, staged)
 
-    current = ""
-    target_label = "SKILL.md"
-    if _find_skill is not None:
-        found = _find_skill(name)
-        if found:
-            base = found["path"]
-            if action == "edit":
-                p = base / "SKILL.md"
-            elif action in {"patch", "write_file"}:
-                rel = payload.get("file_path") or "SKILL.md"
-                p = base / rel
-                target_label = rel
-            else:
-                p = base / "SKILL.md"
-            try:
-                if p.exists():
-                    current = p.read_text(encoding="utf-8-sig")
-            except Exception:
-                current = ""
-
-    if action == "edit":
-        new = payload.get("content") or ""
-    elif action == "patch":
-        old_s = payload.get("old_string") or ""
-        new_s = payload.get("new_string") or ""
-        new = current.replace(old_s, new_s) if current else f"(patch {old_s!r} → {new_s!r})"
-    elif action == "write_file":
-        new = payload.get("file_content") or ""
-    elif action == "remove_file":
-        return f"remove file: {payload.get('file_path')} from skill '{name}'"
-    elif action == "delete":
-        return f"delete skill '{name}'"
+    if action == "patch":
+        old_s, new_s = payload.get("old_string") or "", payload.get("new_string") or ""
+        if not current:
+            new = f"(patch {old_s!r} → {new_s!r})"
+        else:
+            # Fold through the same matcher approve will run, so the preview can't
+            # fabricate a result the approve path would reject (repeated anchor without
+            # replace_all, whitespace-only anchor, escape drift, old_string == new_string).
+            folded, patch_err = _fold_patch(current, old_s, new_s, payload.get("replace_all"))
+            if patch_err:
+                return f"(patch would fail: {patch_err})"
+            new = folded
     else:
-        return f"({action} on '{name}')"
+        new = payload.get("content" if action == "edit" else "file_content") or ""
+    import difflib
+    diff = difflib.unified_diff(current.splitlines(keepends=True), new.splitlines(keepends=True),
+                                fromfile=f"a/{target_label}", tofile=f"b/{target_label}")
+    return "".join(diff) or "(no textual change)"
 
-    diff = difflib.unified_diff(
-        current.splitlines(keepends=True),
-        new.splitlines(keepends=True),
-        fromfile=f"a/{target_label}",
-        tofile=f"b/{target_label}",
-    )
-    text = "".join(diff)
-    return text or "(no textual change)"
+
+def _fold_patch(base: str, old_string: str, new_string: str, replace_all: Any = False
+                ) -> tuple[str, Optional[str]]:
+    """Fold one patch op through ``fuzzy_find_and_replace`` — the SAME matcher the approve
+    path runs (``_patch_skill`` / ``apply_skill_pending``) — so a previewed diff is exactly
+    what an approval would commit, and a patch approval would reject (repeated anchor with
+    ``replace_all`` unset, whitespace-only anchor, escape drift, ``old_string == new_string``)
+    renders as an explicit failed-patch note instead of a fabricated folded result.
+
+    Returns ``(folded_content, None)`` or ``(base, error)``; base is returned unchanged on
+    error so the caller can still render the unchanged content, matching the engine's own
+    ``(content, 0, None, error)`` contract. Local import: keeps write_approval importable
+    without the tool chain (fuzzy_match is core-adjacent but guarded for safety anyway).
+    """
+    from tools.fuzzy_match import fuzzy_find_and_replace
+    folded, match_count, _strategy, error = fuzzy_find_and_replace(
+        base, old_string, str(new_string), bool(replace_all))
+    if error or match_count == 0:
+        return base, error or "Could not find a match for old_string in the file"
+    return folded, None
+
+
+def _fold_staged(staged: Dict[str, Dict[str, str]], action: str, name: str,
+                 op: Dict[str, Any]) -> None:
+    """Record what one op leaves in the staged view the next op diffs against."""
+    if not name:
+        return
+    if action == "delete":
+        staged.pop(name, None)
+        return
+    label = "SKILL.md" if action == "edit" else (op.get("file_path") or "SKILL.md")
+    files = staged.setdefault(name, {})
+    if action in {"create", "edit"}:
+        files["SKILL.md"] = op.get("content") or ""
+    elif action == "write_file":
+        files[label] = op.get("file_content") or ""
+    elif action == "patch":
+        base = _staged_base(name, label, staged)
+        folded, patch_err = _fold_patch(base, op.get("old_string") or "",
+                                        op.get("new_string") or "", op.get("replace_all"))
+        if patch_err is None:
+            files[label] = folded
+        # On error the staged label keeps its prior content: approve would abort the batch
+        # at this op, so nothing later in the preview should diff against a folded result
+        # that will never be committed.
+    elif action == "remove_file":
+        files.pop(label, None)
+
+
+def _batch_pending_diff(payload: Dict[str, Any]) -> str:
+    """Per-op diffs for a staged ``batch`` payload (skill_manage operations[]). Ops apply in
+    order, so each op reuses the single-op path above with the earlier ops' staged content as
+    its base (disk only for files no earlier op touched) — a patch to a skill an earlier op
+    created shows a real diff, which is the case this renderer exists for."""
+    ops = [op for op in (payload.get("operations") or []) if isinstance(op, dict)]
+    total = len(ops)
+    staged: Dict[str, Dict[str, str]] = {}
+    parts = []
+    for i, op in enumerate(ops):
+        op_action, op_name = op.get("action", ""), op.get("name") or ""
+        gist = skill_gist(op_action, op_name, content=op.get("content") or "",
+                          file_path=op.get("file_path") or "",
+                          old_string=op.get("old_string") or "",
+                          new_string=op.get("new_string") or "")
+        diff = skill_pending_diff({"payload": {**op, "name": op_name}}, staged)
+        parts.append(f"## op {i + 1}/{total}: {gist}\n\n{diff}")
+        _fold_staged(staged, op_action, op_name, op)
+    return "\n\n".join(parts) or "(empty batch)"

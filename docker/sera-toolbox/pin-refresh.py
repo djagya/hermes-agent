@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE = ROOT / "Dockerfile"
 NET_BINS = ROOT / "docker/sera-toolbox/install-network-bins.sh"
+CLICKUP_PKG = ROOT / "docker/sera-toolbox/clickup-mcp/package.json"
 UA = "djagya-hermes-agent-pin-refresh/1"
 
 
@@ -138,10 +139,11 @@ def parse_dockerfile() -> dict[str, str]:
             if (m := re.search(r'"yt-dlp==([^"]+)"', text))
             else ""
         ),
-        "clickup": (
-            m.group(1)
-            if (m := re.search(r"@hauptsache\.net/clickup-mcp@([0-9.]+)", text))
-            else ""
+        # Lock project (SDK override), not the Dockerfile `npm install -g` line.
+        "clickup": str(
+            json.loads(CLICKUP_PKG.read_text(encoding="utf-8"))
+            .get("dependencies", {})
+            .get("@hauptsache.net/clickup-mcp", "")
         ),
         "caldav": (
             m.group(1) if (m := re.search(r"caldav-mcp@([0-9.]+)", text)) else ""

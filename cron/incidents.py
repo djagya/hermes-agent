@@ -30,10 +30,19 @@ EXECUTIONS_FILE: Optional[Path] = None
 # ``resolved``: the job ran OK after the failure (auto); ``closed``: the operator acked the signature
 # and wants it silent. Only ``closed`` is terminal; a repeat of a resolved error re-opens it.
 INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
+# Type for a failure the agent declared itself (``[CRON_FAILURE]``): its prose is a verdict about
+# the job's subject, not runtime evidence, so keyword classification would invent a cause.
+AGENT_REPORTED_FAILURE_TYPE = "agent_reported"
 _FAILURE_TYPE_ORDER = (
     ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
     ("timeout", ("timeout", "timed out")),
-    ("auth", (r"\b401\b", "unauthorized", "authentication", "auth")),
+    # Runtime auth evidence only: a bare "auth" substring matched agent prose ("OAuth",
+    # "scoped-auth route", "authorized") and mislabelled ordinary verdicts as credential failures.
+    ("auth", (
+        r"\b401\b", "unauthorized", "authentication failed", "authentication error",
+        "authenticationerror", "invalid api key", "invalid_api_key", "invalid_grant",
+        "oauthnoninteractiveerror", "token refresh failed",
+    )),
     ("delivery", ("delivery", "deliver", "delivering")),
     ("config", ("config", "configuration", "validation")),
     ("script", ("script", "no_agent")),
@@ -41,6 +50,11 @@ _FAILURE_TYPE_ORDER = (
 )
 MAX_ERROR_CHARS = 500
 _MAX_SIGNATURE_ERROR_CHARS = 200
+# Measured durations ("idle for 603s", "retry in 12.5 seconds") differ run to run for the same
+# failure, so they are masked out of the signature. Status codes and other numbers still count.
+_DURATION_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b"
+)
 
 _lock = threading.RLock()
 
@@ -125,7 +139,7 @@ def _redact_error(error: str) -> str:
 
 def _error_signature(job_id: str, error: str) -> str:
     """Dedup key: stable for same job + same normalized error prefix."""
-    normalized = _normalize_error(error)[:_MAX_SIGNATURE_ERROR_CHARS]
+    normalized = _DURATION_RE.sub("#s", _normalize_error(error))[:_MAX_SIGNATURE_ERROR_CHARS]
     return hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()[:12]
 
 
@@ -138,6 +152,12 @@ def _classify_failure_type(error: str) -> str:
     text = _normalize_error(error)
     if not text:
         return "unknown"
+    # Exhausted credits first. The provider's wording overlaps the ``rate_limit`` ("quota") and
+    # ``script`` ("subscription") keywords, and xAI sends it as a 403 that reads like ``auth``.
+    from cron.provider_budget import BUDGET_FAILURE_TYPE, is_provider_budget_error
+
+    if is_provider_budget_error(text):
+        return BUDGET_FAILURE_TYPE
     for kind, patterns in _FAILURE_TYPE_ORDER:
         for pattern in patterns:
             if pattern.startswith("\\b") and pattern.endswith("\\b"):
@@ -262,8 +282,11 @@ def list_incidents(state: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
     where, params = _state_filter(state)
     with _transaction() as conn:
+        # last_seen_at carries a DST-varying offset: order by instant, not text.
         rows = conn.execute(
-            "SELECT * FROM cron_incidents" + where + " ORDER BY last_seen_at DESC, id DESC", params
+            "SELECT * FROM cron_incidents" + where
+            + " ORDER BY julianday(last_seen_at) DESC, last_seen_at DESC, id DESC",
+            params,
         ).fetchall()
     return [dict(row) for row in rows]
 

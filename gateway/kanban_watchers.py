@@ -122,16 +122,22 @@ class GatewayKanbanWatchersMixin:
 
     def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> None:
         """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""
+        from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db_notify as _kbn
-        conn = _kbc.connect(board=board)
-        try:
-            getattr(_kbn, op)(
-                conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "", **extra,
-            )
-        finally:
-            conn.close()
+        # Cursor writes are machine flow: the sub's board slug must resolve
+        # through the env pin on a dispatcher-pinned box (same as the notifier
+        # tick), or advance/rewind land on a per-slug DB the notifier never
+        # reads and cursors silently reset.
+        with _kb.pin_first_board_resolution():
+            conn = _kbc.connect(board=board)
+            try:
+                getattr(_kbn, op)(
+                    conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "", **extra,
+                )
+            finally:
+                conn.close()
 
     def _kanban_advance(self, sub: dict, cursor: int, board: Optional[str] = None) -> None:
         self._kanban_sub_op(board, "advance_notify_cursor", sub, new_cursor=cursor)
@@ -143,14 +149,20 @@ class GatewayKanbanWatchersMixin:
         """Undo a claimed notification cursor after send failure."""
         self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
 
-    async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task) -> None:
+    async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task, strict: bool = False) -> list[str]:
         """Upload artifact files referenced by a completed kanban task.
 
         Sources, in priority order: ``event_payload['artifacts']``,
         ``event_payload['summary']``, then ``task.result`` (legacy). Paths are
         deduplicated, missing files are skipped (may be mentioned for
         reference only), and upload errors are logged, never raised.
+
+        ``strict`` (native source routes): only the explicitly declared
+        ``artifacts`` are uploaded, never paths inferred from prose, and every
+        declared file that is missing, denied by policy, or not positively
+        acknowledged is returned as a failure line so the caller can surface it.
         """
+        failures: list[str] = []
         raw_paths: list[str] = []
         prose_paths: list[str] = []
         if isinstance(event_payload, dict):
@@ -158,9 +170,9 @@ class GatewayKanbanWatchersMixin:
             if isinstance(raw, (list, tuple)):
                 raw_paths += [item for item in raw if isinstance(item, str)]
             summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary:
+            if not strict and isinstance(summary, str) and summary:
                 prose_paths += adapter.extract_local_files(summary)[0]
-        if task is not None and getattr(task, "result", None):
+        if not strict and task is not None and getattr(task, "result", None):
             prose_paths += adapter.extract_local_files(str(task.result))[0]
         # A staged copy and the scratch original it was copied from are the
         # same deliverable; on a review handoff the original still exists, so
@@ -172,13 +184,18 @@ class GatewayKanbanWatchersMixin:
             expanded = os.path.expanduser(path) if path else ""
             if expanded and expanded not in candidates and os.path.isfile(expanded):
                 candidates.append(expanded)
+            elif strict and path:
+                failures.append(f"{os.path.basename(path)}: missing")
         if not candidates:
-            return
+            return failures
 
         from gateway.platforms.base import BasePlatformAdapter
-        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        allowed = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        if strict:
+            failures += [f"{os.path.basename(p)}: denied by delivery policy" for p in candidates if p not in allowed]
+        candidates = allowed
         if not candidates:
-            return
+            return failures
 
         from urllib.parse import quote as _quote
 
@@ -188,17 +205,27 @@ class GatewayKanbanWatchersMixin:
         if image_paths:
             try:
                 batch = [(f"file://{_quote(p)}", "") for p in image_paths]
-                await adapter.send_multiple_images(chat_id=chat_id, images=batch, metadata=metadata)
+                result = await adapter.send_multiple_images(chat_id=chat_id, images=batch, metadata=metadata)
+                results = result if isinstance(result, (list, tuple)) else [result]
+                if strict and any(getattr(item, "success", None) is not True for item in results):
+                    failures.append(f"{len(image_paths)} image(s): upload not acknowledged")
             except Exception as exc:
                 logger.warning("kanban notifier: image batch upload failed: %s", exc)
+                if strict:
+                    failures.append(f"{len(image_paths)} image(s): {exc}")
         for path in other_paths:
             try:
                 if Path(path).suffix.lower() in _VIDEO_EXTS:
-                    await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+                    result = await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
                 else:
-                    await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                    result = await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                if strict and getattr(result, "success", None) is not True:
+                    failures.append(f"{os.path.basename(path)}: upload not acknowledged")
             except Exception as exc:
                 logger.warning("kanban notifier: artifact upload (%s) failed: %s", path, exc)
+                if strict:
+                    failures.append(f"{os.path.basename(path)}: {exc}")
+        return failures
 
     def _kanban_dispatcher_boot(self) -> Optional[tuple]:
         """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.
@@ -324,30 +351,3 @@ class GatewayKanbanWatchersMixin:
             await self._sleep_between_ticks(interval)
 
         self._release_kanban_dispatcher_lock()
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import Callable  # noqa: F401,E402
-from contextvars import Context  # noqa: F401,E402
-import logging  # noqa: F401,E402
-import re  # noqa: F401,E402
-import sqlite3  # noqa: F401,E402
-
-
-_PLUGIN_COMPAT_LAZY = {
-    't': ('agent.i18n', 't'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----

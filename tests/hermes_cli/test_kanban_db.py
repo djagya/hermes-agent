@@ -1586,7 +1586,9 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    argv = kbd._resolve_hermes_argv()
+    assert argv == kbd._module_hermes_argv()
+    assert argv[0] == sys.executable
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
@@ -1617,6 +1619,96 @@ def test_resolve_hermes_argv_module_actually_runs():
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
     )
+
+
+def test_module_worker_argv_ignores_hermes_checkout_in_workspace(tmp_path):
+    """A worker's cwd is its task workspace. When that workspace is a Hermes
+    checkout (fork worktree), ``python -m hermes_cli.main`` imported the
+    workspace's stale ``hermes_cli`` instead of the installed runtime — an old
+    tree under a newer interpreter broke every tool call, kanban_block included.
+    The worker argv must keep resolving the dispatcher's own install."""
+    import subprocess
+    import sys
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    shadow = tmp_path / "hermes_cli"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("")
+    (shadow / "main.py").write_text("raise SystemExit(97)\n")
+
+    legacy = subprocess.run([sys.executable, "-m", "hermes_cli.main", "--version"], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=60)
+    assert legacy.returncode == 97, "fixture no longer reproduces the cwd shadow"
+
+    r = subprocess.run(kbd._module_hermes_argv() + ["--version"], cwd=tmp_path,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"stderr={r.stderr[:300]!r}"
+
+
+def test_module_worker_argv_keeps_hermes_process_identity():
+    """Process-identity matchers must still read the bootstrap as
+    ``-m hermes_cli.main <argv>`` (holder/gateway detection, #107002)."""
+    import sys
+    from gateway.status import inline_bootstrap_argv
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli.update_cmd_windows import _hermes_holder_subcommand
+
+    argv = [*kbd._module_hermes_argv(), "-p", "worker", "--cli", "chat", "-q", "work kanban task t_1"]
+    assert inline_bootstrap_argv(argv) == [
+        sys.executable, "-m", "hermes_cli.main", "-p", "worker", "--cli", "chat", "-q", "work kanban task t_1"]
+    assert _hermes_holder_subcommand(" ".join(argv[:-1])) == "chat"
+
+
+def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monkeypatch):
+    """A module-form worker must carry the import context that selected it.
+
+    ``_resolve_hermes_argv`` proves ``hermes_cli`` importable in the gateway,
+    where a store-python shim has the repo root on ``sys.path`` in-process;
+    the worker env scrub strips Hermes-owned PYTHONPATH entries, so the bare
+    ``sys.executable -m hermes_cli.main`` child died on import and the board
+    auto-blocked (#122299, #122487, #122500). The spawned env must put the
+    running install's root first on PYTHONPATH — and never for a resolved shim
+    path, which owns its own imports.
+    """
+    import os
+    import sys
+    from pathlib import Path
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    root = str(Path(kbd.__file__).resolve().parents[1])
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env", {})
+            self.pid = 4242
+
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+    task = kb.Task(
+        id="t_import_root", title="x", body=None, assignee="coder", status="ready",
+        priority=0, created_by=None, created_at=0, started_at=None, completed_at=None,
+        workspace_kind="worktree", workspace_path=str(tmp_path / "ws"), claim_lock=None,
+        claim_expires=None, tenant=None, branch_name=None,
+    )
+
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
+    kbd._default_spawn(task, str(tmp_path / "ws"))
+    assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
+
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["/opt/hermes/bin/hermes"])
+    kbd._default_spawn(task, str(tmp_path / "ws"))
+    assert root not in captured["env"].get("PYTHONPATH", "").split(os.pathsep)
 
 
 # ---------------------------------------------------------------------------

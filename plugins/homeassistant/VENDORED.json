@@ -1,0 +1,50 @@
+{
+  "source": "https://github.com/NousResearch/hermes-homeassistant",
+  "commit": "ba30cb0cf86c52bdb5cde98974bc062e97966529",
+  "version": "2.0.1",
+  "catalog_entry": "plugin-catalog/homeassistant.yaml",
+  "why": "The image sets HERMES_DISABLE_LAZY_INSTALLS=1, so the left-core migration cannot fetch this catalog plugin at gateway start. Bundled here (a bundled kind: platform plugin auto-loads deferred; its client tools pre-register) at the catalog pin. Bump together with plugin-catalog/homeassistant.yaml.",
+  "omitted": [
+    "pyproject.toml (aiohttp>=3.9,<4 is already in the sealed venv via the [all]/[messaging] extras)",
+    ".gitignore",
+    "pytest.ini",
+    "tests/ (vendored to tests/plugins/platforms/homeassistant/)"
+  ],
+  "files": {
+    "__init__.py": {
+      "upstream_sha256": "646ca7f4f011e4db996f1590c187ee4e2fc6e6acc9b3b0b29494be137d809cdb"
+    },
+    "adapter.py": {
+      "upstream_sha256": "05f3826c09297216694b5c4ae11f7daadfc95660e1d58068b085bcbb127accf1",
+      "fork_patch": "cold-boot connect grace: the first connect retries quietly for up to 180 s (re-lands fork #97 9182a191b0; tests/plugins/platforms/homeassistant/test_boot_connect_grace.py)",
+      "fork_sha256": "1a87ec164b1fa9e99ff518d19742ff770be213a1c82bb22140e096e79d3e59cd"
+    },
+    "tools.py": {
+      "upstream_sha256": "05c0a2fd04a5746f360393b9d765d473c17e253a695a83c110d3936495416916"
+    },
+    "plugin.yaml": {
+      "upstream_sha256": "7a3655acde9c602acac819db47d9cb9e3124728d495dc8e15dd40171b7c51618"
+    },
+    "LICENSE": {
+      "upstream_sha256": "5f79d321c17de8ef6e5f34967dc5b484afebeeefd87180890d9741941f6b815f"
+    },
+    "README.md": {
+      "upstream_sha256": "4726a39d1dd3b804ca2c28253fceaceaf2c0bc13d54b9f3cc2ffaa1eb275cc88"
+    }
+  },
+  "tests": {
+    "conftest.py": {
+      "upstream_sha256": "01a90c4baf1b3a40a026c3bb04b02ab53875dae00893d9f69d704aa33732bd8d",
+      "fork_patch": "bundled plugin root; repo-root collection hook dropped"
+    },
+    "test_homeassistant_adapter.py": {
+      "upstream_sha256": "f06c04946a83cef839e66c3265394946b01dba57d369a0a43b76917e18d43b85"
+    },
+    "test_homeassistant_tools.py": {
+      "upstream_sha256": "3a6dcb7fe26fd56b78b2545b087fb951683c799f69fd2810c7f18b23a5f250f4"
+    },
+    "test_plugin_registration.py": {
+      "upstream_sha256": "d11e4d0d3fa27f8fce9bfc64bf6849ca3ff8d0c431b940651a413af3e1409b1e"
+    }
+  }
+}

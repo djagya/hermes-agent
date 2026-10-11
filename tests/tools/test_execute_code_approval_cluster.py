@@ -329,11 +329,6 @@ def test_terminal_smart_deny_owner_override_is_one_operation(gw_session, monkeyp
         "detect_dangerous_command",
         lambda command: (True, "owner-override-test-danger", f"risk:{command}"),
     )
-    monkeypatch.setattr(
-        "tools.tirith_security.check_command_security",
-        lambda _command: {"action": "allow", "findings": [], "summary": ""},
-        raising=False,
-    )
 
     shown = _register_capturing_resolver(gw_session, "always")
     result = A.check_all_command_guards("dangerous /tmp/first", "local")
@@ -390,11 +385,6 @@ def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):
         approval_detection, "detect_dangerous_command",
         lambda command: (True, key, f"risk:{command}"),
     )
-    monkeypatch.setattr(
-        "tools.tirith_security.check_command_security",
-        lambda _command: {"action": "allow", "findings": [], "summary": ""},
-        raising=False,
-    )
 
     shown = _register_capturing_resolver(gw_session, "session")
     result = A.check_all_command_guards("dangerous escalate", "local")
@@ -416,11 +406,6 @@ def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkey
     monkeypatch.setattr(
         approval_detection, "detect_dangerous_command",
         lambda command: (True, "pending-smart-deny", f"risk:{command}"),
-    )
-    monkeypatch.setattr(
-        "tools.tirith_security.check_command_security",
-        lambda _command: {"action": "allow", "findings": [], "summary": ""},
-        raising=False,
     )
 
     result = A.check_all_command_guards("dangerous pending", "local")

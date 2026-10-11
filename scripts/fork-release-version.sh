@@ -4,10 +4,12 @@
 # The fork carries upstream code past its release line, so a hand-kept pyproject
 # version goes stale: the upstream-sync release shipped all of v2026.9.24 (0.21.5)
 # and more while still saying 0.21.4, and its image stamp carried no base version
-# at all ("unknown" to plugins' requires_hermes). The base is the version the
-# nearest upstream CalVer release tag in HEAD's history shipped (read from that
-# tag's pyproject, the same rule as hermes_cli.version_info); the distance is the
-# commit count past it.
+# at all ("unknown" to plugins' requires_hermes). The base follows
+# hermes_cli.version_info: the highest stable upstream semver tag (vX.Y.Z, no
+# canary/rc suffix) merged into HEAD; trees that predate semver tags fall back to
+# the nearest CalVer release tag (vYYYY.M.D) and the version its pyproject shipped.
+# Upstream main carries 0.0.0 since v0.21.6; the fork still commits the base.
+# The distance is the commit count past the tag.
 #
 # Prints GITHUB_OUTPUT lines: tag=, base=, distance=, display=.
 # Exits 1 when no release tag is reachable, or with --check when the committed
@@ -23,12 +25,23 @@ set -euo pipefail
 check=0
 [ "${1:-}" = "--check" ] && check=1
 
-tag="$(git describe --tags --abbrev=0 --match 'v2[0-9][0-9][0-9].*' HEAD 2>/dev/null || true)"
-if [ -z "$tag" ]; then
-  echo "ERROR: no upstream vYYYY.M.D release tag reachable from HEAD; fetch upstream tags first" >&2
-  exit 1
+# Same pattern as hermes_cli.update_channel.STABLE_TAG_RE.
+tag="$(git tag --merged HEAD --list 'v[0-9]*' | python3 -c '
+import re, sys
+stable = re.compile(r"^v(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$")
+tags = [t for t in sys.stdin.read().split() if stable.fullmatch(t)]
+print(max(tags, key=lambda t: tuple(int(p) for p in t[1:].split("."))) if tags else "")
+')"
+if [ -n "$tag" ]; then
+  base="${tag#v}"
+else
+  tag="$(git describe --tags --abbrev=0 --match 'v2[0-9][0-9][0-9].*' HEAD 2>/dev/null || true)"
+  if [ -z "$tag" ]; then
+    echo "ERROR: no upstream vX.Y.Z or vYYYY.M.D release tag reachable from HEAD; fetch upstream tags first" >&2
+    exit 1
+  fi
+  base="$(git show "$tag:pyproject.toml" | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["project"]["version"])')"
 fi
-base="$(git show "$tag:pyproject.toml" | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["project"]["version"])')"
 if ! [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "ERROR: $tag pyproject version '$base' is not X.Y.Z" >&2
   exit 1

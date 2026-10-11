@@ -31,7 +31,12 @@ def classify_cron_failure_reason(text: str) -> str:
     ``status`` (a bare ``429`` inside a job id or hash never counts, #83188) and a leading
     ``ReadTimeout:``-style type prefix."""
     from agent.error_classifier import classify_api_error
+    from cron.provider_budget import is_provider_budget_error
 
+    # Exhausted credits are ``billing`` whatever the status. xAI sends its spending limit as a 403,
+    # which the shared classifier reads as ``auth`` and answers with "sign in again".
+    if is_provider_budget_error(text):
+        return "billing"
     status = _HTTP_STATUS_IN_TEXT.search(text)
     type_name = _LEADING_EXC_TYPE.match(text)
     exc_cls = type(type_name.group(1), (Exception,), {}) if type_name else Exception
@@ -124,6 +129,18 @@ def script_timeout_notice(job_name: str, job_id: str) -> str:
         f"⚠️ Cron '{job_name}' failed: its script timed out. No model was invoked. "
         f"Check the script's output under {cron_output_dir_display(job_id)} or `hermes cron runs {job_id}`, "
         f"then run it again with `hermes cron run {job_id}`."
+    )
+
+
+def tool_budget_notice(job_name: str, job_id: str, error: str) -> str:
+    """A tool's provider refused service for exhausted credits, so the job could not do its work."""
+    from cron.provider_budget import tool_budget_tool_label
+
+    return (
+        f"⚠️ Cron '{job_name}' failed: the provider behind {tool_budget_tool_label(error)} says the "
+        f"account is out of credits or over its spending limit, so the job could not do its work. "
+        f"Add credits or raise the limit with that provider, then `hermes cron run {job_id}` to retry. "
+        f"Run log: `hermes cron runs {job_id}`."
     )
 
 

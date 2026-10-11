@@ -94,6 +94,25 @@ def test_new_failure_creates_incident_and_is_new(monkeypatch, tmp_path):
     assert inc.count_incidents() == 1
 
 
+def test_incidents_list_newest_instant_first_across_dst_fall_back(monkeypatch, tmp_path):
+    """01:10-05:00 is 20 minutes after 01:50-04:00 but sorts first as text."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    inc = _point_db(monkeypatch, tmp_path)
+    new_york = ZoneInfo("America/New_York")
+    monkeypatch.setattr(
+        inc, "_hermes_now", lambda: datetime(2026, 11, 1, 1, 50, tzinfo=new_york, fold=0)
+    )
+    earlier, _ = inc.upsert_incident("job-1", "first failure")
+    monkeypatch.setattr(
+        inc, "_hermes_now", lambda: datetime(2026, 11, 1, 1, 10, tzinfo=new_york, fold=1)
+    )
+    later, _ = inc.upsert_incident("job-2", "second failure")
+
+    assert [row["id"] for row in inc.list_incidents()] == [later, earlier]
+
+
 def test_same_signature_dedups_same_incident(monkeypatch, tmp_path):
     inc = _point_db(monkeypatch, tmp_path)
 
@@ -164,6 +183,42 @@ def test_failure_type_classification(monkeypatch, tmp_path):
     ]
     for error, expected in cases:
         assert inc._classify_failure_type(error) == expected, (error, expected)
+
+
+def test_auth_type_requires_runtime_auth_evidence(monkeypatch, tmp_path):
+    """Real credential failures stay ``auth``; prose that merely mentions OAuth or an
+    auth-scoped route does not claim a credential failure."""
+    inc = _point_db(monkeypatch, tmp_path)
+    for error in (
+        "Error code: 401 - {'error': 'invalid token'}",
+        "HTTP 401 Unauthorized from provider",
+        "OAuthNonInteractiveError: Token refresh failed: 400 invalid_grant",
+        "AuthenticationError: invalid API key",
+    ):
+        assert inc._classify_failure_type(error) == "auth", error
+    for prose in (
+        "Readmodel answered HTTP 200 through the allowed scoped-auth route; account check incomplete.",
+        "Correction published to the OAuth PR, but CI could not start the full run.",
+        "The author's report is incomplete: open orders were not observable.",
+    ):
+        assert inc._classify_failure_type(prose) != "auth", prose
+
+
+def test_agent_declared_failure_records_agent_reported_type(monkeypatch, tmp_path):
+    """A ``[CRON_FAILURE]`` verdict is the agent's own judgement: even when its prose names a 401,
+    the incident is typed ``agent_reported`` instead of being re-diagnosed by keywords."""
+    from cron import scheduler
+
+    inc = _point_db(monkeypatch, tmp_path)
+    verdict = "home.example.test answered 401 without login; live channel still 502."
+
+    _, incident_id = scheduler._upsert_incident_for_failure(
+        _job(id="verdict-job"), verdict, agent_declared=True)
+    _, runtime_id = scheduler._upsert_incident_for_failure(
+        _job(id="runtime-job"), "Error code: 401 - unauthorized")
+
+    assert inc.get_incident(incident_id)["failure_type"] == inc.AGENT_REPORTED_FAILURE_TYPE
+    assert inc.get_incident(runtime_id)["failure_type"] == "auth"
 
 
 # ── Lifecycle / ack ────────────────────────────────────────────────────────
@@ -284,6 +339,26 @@ def test_ack_suppresses_alert_until_signature_changes(monkeypatch, tmp_path):
         _tick_failing(job, tmp_path, deliveries, error="boom signature B")
         assert len(deliveries) == 2, "changed signature must re-alert"
         assert inc.count_incidents() == 2
+
+
+def test_ack_holds_when_only_a_measured_duration_differs(monkeypatch, tmp_path):
+    """The inactivity watchdog polls every few seconds, so the same stall reports a slightly
+    different idle time each run. That is the same failure: the ack must keep it silent."""
+    inc = _point_db(monkeypatch, tmp_path)
+    deliveries = []
+    job = _job()
+    stall = "Cron job 'x' idle for {}s (limit 600s) — last activity: waiting for tool"
+    with cron_jobs.use_cron_store(tmp_path):
+        cron_jobs.save_jobs([job])
+        _tick_failing(job, tmp_path, deliveries, error=stall.format(601))
+        assert len(deliveries) == 1
+        (first,) = inc.list_incidents()
+        assert inc.ack_incident(first["id"]) is True
+
+        _tick_failing(job, tmp_path, deliveries, error=stall.format(604))
+
+        assert len(deliveries) == 1, "acked stall must not re-ping on a new idle reading"
+        assert [row["id"] for row in inc.list_incidents()] == [first["id"]]
 
 
 def test_mark_incident_alerted_sets_state_never_resurrects(monkeypatch, tmp_path):

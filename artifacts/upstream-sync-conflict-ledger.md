@@ -1,92 +1,84 @@
-# Upstream merge conflict ledger (local candidate)
+# Upstream merge conflict ledger (sync/v0.21.6-dlz candidate)
 
-Base HEAD: `8a237660c2fb70895ac0ea1c64ef66d8bbd2968f`
-Upstream MERGE_HEAD: `6f7a7991bb069db07ae74a479823ce8310f8c7e0`
-Upstream `55a93d8f70` is an ancestor of MERGE_HEAD and remains in the merged history. The cancelled duplicate task lane supplied no changes.
+Base HEAD: `4347000c0bb8e4c256c0699ef2a591cc873afe0a` (release/v0.21.5-dlz, the pinned image)
+Upstream MERGE_HEAD: `818c13be1dc4fd28987e1e881a9408224afd4535` (tag `v0.21.6`, 2026-10-08)
+Merge base: `6f7a7991bb069db07ae74a479823ce8310f8c7e0` (the upstream parent of the previous sync, #42)
 
-## Subsystem decisions and uncertainty
+Same method as #42: one two-parent merge of the upstream release onto the fork line, conflicts
+resolved hunk by hunk, everything outside a conflict taken from both histories. 33 paths
+conflicted (30 content, 3 modify/delete). The previous ledger (sync onto `6f7a7991bb`) is in git
+history at release/v0.21.5-dlz.
 
-All paths retained automatic non-overlapping changes from BOTH histories. The table below specifies only the contested hunks: “fork-overlap” means the fork side of those hunks, not a whole-file ours checkout; “upstream-overlap” is similarly local. “Mixed” and “interleaved” indicate hunk-specific or additional semantic edits.
+## Decisions that change behavior (operator review)
 
-- CI/release/build: upstream supplies release-mode callable jobs, strict result evaluation, Bot Screen container variant, PM-produced sealed environment and SQLite repair. Fork contributes GHCR-specific pipeline gates, selective-lane failure checks, image safety policy and parser/toolbox surface. Merge repairs the CI lane key `bootstrap` and keeps the upstream strict release check. Docker stage graph uses upstream runtime plus explicit fork `test` fixture target; upstream publisher selects `runtime`. Pinned himalaya stage and fork image provenance args retained. ROOT chose to preserve the toolbox using a production `sera-toolbox` extra, explicitly selected by the Docker sealed build. It declares previously reviewed fork pins for `PyMuPDF`, `weasyprint`, `python-docx`, `openpyxl`, `yt-dlp` and the previously dev-only `ruff`; `ddgs`, `fal_client` and `faster_whisper` come from reused extras, and `pillow_heif` from core. The old raw Python installer overlay and second runtime implementation remain removed. ROOT regenerated `uv.lock` through PM in a detached ephemeral worktree and committed the lock-only successor `3b2a4fbd1d40cddbc477ccfdaae144c2a895d692`; local static checks show the root lock advertises the extra and its distributions. The Docker build and new image import test remain unrun pending exact-head CI; no image smoke PASS claimed.
-- Kanban/notify: fork-owned attestation, typed holds, fixed notification target and dashboard behavior remain, with upstream source changes retained outside conflicts. Known unresolved product question: fixed target delivers to subscriber but does NOT return the result to the originating conversation. No invented dual-route path. Kanban guidance is gated by `owned_kanban_task()` in `agent/agent_init.py` and `agent/system_prompt.py`, preserving upstream PR #113205 behavior for ordinary interactive sessions.
-- Gateway/browser: upstream busy-turn and platform hooks coexist with fork Telegram group gating, supersession, transcript and slot lifetime. Uncertain: profile/gateway integration until exact-head CI.
-- Cron/delegation: upstream monitor content goes through `runtime_data_prompt`; fork monitor-state commitment waits until setup gates pass. Fork typed lifecycle verdict remains with upstream bounded referenced-script scanning, including rejection on budget exhaustion. Focused agent/cron/delegate targets required in CI.
-- Approvals/security: fork pending-write digest/capability and target byte guard remain; upstream pinned full memory entries, operation-level skill locks and reporting coexist. The CLI apply callback now preserves return payload while satisfying the two-value pending-store callback. Exact-head CI should exercise stale-write, two-homes and concurrent skill/memory paths.
-- Config/state: upstream schema, FTS and profile-scoped config changes merged with fork migration decisions. Lockfile aligns to fork `0.21.4` while upstream dependency graph and Python `<3.15` support are retained; exact-head CI must still validate installation and migration.
-- Vault: 1Password opaque handle logic retains fork payment metadata and upstream origin normalization.
+- **Home Assistant left core upstream** (`fb9fc8a3dd`): the gateway platform and the
+  `homeassistant` toolset are now the catalog plugin `homeassistant`
+  (NousResearch/hermes-homeassistant). The upstream deletion of
+  `plugins/platforms/homeassistant/adapter.py` and `tests/gateway/test_homeassistant.py` is
+  accepted. Decision (Danil, 2026-10-10): follow upstream, plugin it is. Because the image sets
+  `HERMES_DISABLE_LAZY_INSTALLS=1`, the migration cannot fetch it at gateway start, so the fork
+  **bundles** it the way packaged installs ship plugins:
+  - `plugins/homeassistant/` = the catalog pin `ba30cb0cf86c` (v2.0.1), byte-identical except
+    `adapter.py`; `VENDORED.json` records source, commit and per-file upstream sha256
+    (enforced by `tests/plugins/platforms/homeassistant/test_vendored_provenance.py`). Bump it
+    together with `plugin-catalog/homeassistant.yaml`.
+  - A bundled `kind: platform` plugin auto-loads deferred (no `plugins.enabled` entry); its
+    `provides_tools` pre-register `ha_*` in CLI/TUI processes. Its own tests run from
+    `tests/plugins/platforms/homeassistant/`.
+  - Fork patch on `adapter.py`: re-lands #97 (`9182a191b0`), the quiet cold-boot connect that
+    retries for up to 180 s. The plugin has no extension point for it.
+  - Fork patch on `hermes_cli/left_core_migration.py::plugin_present`: a bundled copy counts as
+    present, so the migration records the toolset scope and `_left_core_installed` instead of
+    reporting "not installed, so it is off" on every start.
+  - `hermes plugins install homeassistant` on the box remains a fallback only; a user copy
+    shadows the bundled one and needs `plugins.enabled`.
+- **Version derivation**: upstream main now carries `0.0.0` and releases are semver tags
+  (`v0.21.6`). `scripts/fork-release-version.sh` now takes the highest stable `vX.Y.Z` tag merged
+  into HEAD (same rule as `hermes_cli.version_info`) and falls back to the CalVer rule for older
+  trees. The fork keeps committing the base: `pyproject.toml` and `uv.lock` say `0.21.6`.
+- **CI review-label gate removed** (upstream `059efe8b29`): `review-labels.yml`, the
+  `ci_review` / `ci_review_files` / `mcp_catalog` classifier outputs and the rerun job are gone;
+  upstream enforces the same paths through `.github/CODEOWNERS`, which names
+  `@NousResearch/hermes-agent-core` and so enforces nothing in djagya/hermes-agent. Decision
+  (Danil, 2026-10-10): follow upstream; the fork's `ci-reviewed` label rule is retired, not
+  restored.
+- **Messages schema**: both sides added columns after `display_order` as history event 16
+  (fork: `platform_delivery`; upstream: `message_uid`, `absorbed_message_uids`,
+  `tool_call_uids`, `tool_call_uid`). Fork stores already hold `platform_delivery`
+  physically after `display_order`, so the declaration keeps it there and upstream's four
+  columns follow it as event 17. `_reconcile_columns` appends them on first open; the
+  `message_uid` backfill runs per open, independent of the fork's held `schema_version<30`
+  FTS fence.
 
 ## Per-path hunk decisions
 
-| Conflicted path | Hunk resolution |
+| Conflicted path | Resolution |
 |---|---|
-| `.github/workflows/ci.yaml` | interleaved upstream and fork semantics; see subsystem notes |
-| `.github/workflows/docker.yml` | upstream-overlap; fork nonoverlap retained |
-| `.github/workflows/install-e2e.yml` | fork-overlap; upstream nonoverlap retained |
-| `.github/workflows/js-tests.yml` | upstream-overlap; fork nonoverlap retained |
-| `.github/workflows/lint.yml` | both overlapping variants retained |
-| `.github/workflows/nix.yml` | upstream-overlap; fork nonoverlap retained |
-| `.github/workflows/publish-e2e-evidence.yml` | upstream deletion (workflow removed) |
-| `.github/workflows/tests-os.yml` | upstream-overlap; fork nonoverlap retained |
-| `.github/workflows/tests.yml` | mixed overlap resolution; nonoverlap retained |
-| `Dockerfile` | reconciled stage graph; upstream runtime + fork toolbox |
-| `agent/vault_backends/onepassword.py` | interleaved upstream and fork semantics; see subsystem notes |
-| `cli.py` | fork-overlap; upstream nonoverlap retained |
-| `cron/lifecycle_guard.py` | interleaved upstream and fork semantics; see subsystem notes |
-| `cron/scheduler.py` | interleaved upstream and fork semantics; see subsystem notes |
-| `gateway/platforms/base.py` | both overlapping variants retained |
-| `gateway/run_busy.py` | both overlapping variants retained |
-| `gateway/run_turn.py` | fork-overlap; upstream nonoverlap retained |
-| `gateway/session_transcript.py` | fork-overlap; upstream nonoverlap retained |
-| `hermes_cli/__init__.py` | interleaved upstream and fork semantics; see subsystem notes |
-| `hermes_cli/cli_commands_mixin.py` | upstream-overlap; fork nonoverlap retained |
-| `hermes_cli/kanban_db.py` | fork-overlap; upstream nonoverlap retained |
-| `hermes_cli/kanban_db_notify.py` | fork-overlap; upstream nonoverlap retained |
-| `hermes_cli/kanban_pr_acceptance.py` | fork-overlap; upstream nonoverlap retained |
-| `hermes_cli/write_approval_commands.py` | interleaved upstream and fork semantics; see subsystem notes |
-| `hermes_state_messages.py` | both overlapping variants retained |
-| `hermes_state_schema.py` | fork-overlap; upstream nonoverlap retained |
-| `hermes_state_search.py` | fork-overlap; upstream nonoverlap retained |
-| `package-lock.json` | mixed overlap resolution; nonoverlap retained |
-| `plugins/kanban/dashboard/plugin_api.py` | fork-overlap; upstream nonoverlap retained |
-| `pyproject.toml` | fork-overlap; upstream nonoverlap retained |
-| `tests/agent/test_compression_stall_fallback.py` | upstream-overlap; fork nonoverlap retained |
-| `tests/ci/test_classify_changes.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/docker/test_immutable_install_permissions.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/gateway/test_telegram_group_gating.py` | both overlapping variants retained |
-| `tests/hermes_cli/test_approvals_command.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/hermes_cli/test_config_effective.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/hermes_cli/test_kanban_notify.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/hermes_cli/test_local_quickstart.py` | upstream-overlap; fork nonoverlap retained |
-| `tests/hermes_cli/test_managed_scope_loaders.py` | upstream-overlap; fork nonoverlap retained |
-| `tests/hermes_cli/test_profiles.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/hermes_state/test_fts_tool_write_bounds.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/hermes_state/test_fts_trigram_subagent_exclusion.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/plugins/test_kanban_dashboard_plugin.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/tools/test_delegate_timeout_cleanup.py` | mixed overlap resolution; nonoverlap retained |
-| `tests/tools/test_launchctl_guard_diagnostic.py` | both overlapping variants retained |
-| `tests/tools/test_mcp_oauth.py` | both overlapping variants retained |
-| `tests/tools/test_mcp_oauth_manager.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/tools/test_skill_manage_batch.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/tools/test_skill_size_limits.py` | fork-overlap; upstream nonoverlap retained |
-| `tests/tools/test_write_approval.py` | fork-overlap; upstream nonoverlap retained |
-| `tools/approval.py` | fork-overlap; upstream nonoverlap retained |
-| `tools/approval_smart.py` | fork-overlap; upstream nonoverlap retained |
-| `tools/browser_cdp_tool.py` | fork-overlap; upstream nonoverlap retained |
-| `tools/browser_supervisor.py` | upstream-overlap; fork nonoverlap retained |
-| `tools/browser_tool_session.py` | fork-overlap; upstream nonoverlap retained |
-| `tools/code_execution_tool.py` | fork-overlap; upstream nonoverlap retained |
-| `tools/kanban_tools.py` | fork-overlap; upstream nonoverlap retained |
-| `tools/mcp_tool_lifecycle.py` | fork-overlap; upstream nonoverlap retained |
-| `tools/memory_tool.py` | interleaved upstream and fork semantics; see subsystem notes |
-| `tools/memory_tool_store.py` | interleaved upstream and fork semantics; see subsystem notes |
-| `tools/skill_manager_batch.py` | fork-overlap; upstream nonoverlap retained |
-| `tools/skill_manager_tool.py` | interleaved upstream and fork semantics; see subsystem notes |
-| `tools/terminal_tool_guards.py` | interleaved upstream and fork semantics; see subsystem notes |
-| `tools/write_approval.py` | interleaved upstream and fork semantics; see subsystem notes |
-| `uv.lock` | fork-overlap; upstream nonoverlap retained |
-| `website/docs/user-guide/features/kanban.md` | fork-overlap; upstream nonoverlap retained |
+| `Dockerfile` | fork runtime stage kept; its `HERMES_PYTHON` now the sealed `.venv` python (upstream `48353b2b89`, TUI gateway children) |
+| `cron/scheduler.py` | fork `release_fire_claim` import + 3-tuple prompt return; upstream `store_health` / execution-identity imports and `note_cron_skipped` |
+| `gateway/kanban_watchers_notifier.py` | both: fork wake-decision contract and upstream `_pin_first` |
+| `hermes_cli/cli_init_mixin.py` | upstream localized `t(...)` warning with the fork's `_error` binding |
+| `hermes_cli/kanban_pr_acceptance.py` | fork typed `_GhError` phases and secret-surface token for unassigned cards; upstream assignee-profile `gh` identity (`_gh_env`), `auth` receipts and null-repository check for assigned cards |
+| `hermes_cli/session_schema_history.py`, `hermes_state_common.py` | see Messages schema above |
+| `hermes_state_search.py` | fork: live FTS rebuild stays disabled (upstream's corruption-class logging applies only to the rebuild it guards) |
+| `tools/approval.py` | upstream dropped `permanent_capable` (tirith removal); fork `provenance` kept |
+| `tools/environments/local.py` | both: upstream Bot Desktop env, then fork `HERMES_OP_CACHE_ONLY` |
+| `tools/memory_tool.py`, `tools/memory_tool_store.py` | both: fork write guard / sha binding; upstream `FAILURE_CLASS` tags |
+| `tools/write_approval.py` | fork file kept; upstream surface-aware staged hint (#98330), headless inline-prompt skip, and batch-aware skill diff (`_fold_patch`, `_batch_pending_diff`) ported onto it |
+| `uv.lock` | relocked with `./hermes pm lock` from the merged `pyproject.toml` |
+| `plugins/platforms/homeassistant/adapter.py`, `tests/gateway/test_homeassistant.py` | upstream deletion (left core) |
+| `tests/tools/test_browser_use_pm.py` | upstream deletion (browser-use engine moved into the main venv) |
+| `.github/actions/detect-changes/action.yml`, `scripts/ci/classify_changes.py` | fork selective outputs (`py_scope`, `py_roots`, `frontend_workspaces`, `os_tests`, `mode`, installer surfaces) plus upstream slow lanes (`docker`, `nix`, `e2e*`, `run-e2e` label, shared-fixture consumers, which also widen the fork selectors); review-gate outputs dropped with upstream |
+| `.github/workflows/ci.yaml` | union of outputs; `FORK_LEAN` also turns off `e2e_upgrade` and both Desktop E2E lanes on push/PR; fork zero-job guard extended to the e2e lanes |
+| `.github/workflows/tests.yml` | fork sliced standard runners and `scope`/`roots` inputs; upstream `e2e`/`e2e_upgrade`/`strict_acceptance` inputs and job gates |
+| `.github/workflows/tests-os.yml`, `windows-install-update-e2e.yml` | fork two-core worker counts and 90 min timeout; upstream test slice and 3600 s file timeout |
+| `.github/workflows/label-rerun.yml` | upstream `run-e2e` rerun job |
+| tests (`tests/ci/*`, `tests/gateway/test_status.py`, `tests/hermes_cli/*`, `tests/tools/test_write_approval.py`) | both sides' cases; expectations combined where one case gained fields from both; upstream staged-hint tests use distinct facts (the fork pending store deduplicates identical payloads) |
 
-## Evidence / obligations
+## Folded into this release (2026-10-10)
 
-Locally inspected all 66 conflict paths and resolved markers, AST-parsed conflicting Python, checked undefined bindings via Ruff F821/F823, and checked the resolution diff for whitespace. These are **static checks only**, not exercised Hermes tests. `55a93d8f70` was independently confirmed as an ancestor of MERGE_HEAD (exit 0). ROOT's detached PM lock generation is separately recorded in the task thread; no Docker, gateway, test runner, push, deployment or service action in this worker's lane. ROOT must run isolated exact-head CI for focused regression, lock/build, and container lanes before asserting test success.
+| Change | How |
+|---|---|
+| #99 `fix/skill-prune-recent-window` | merge commit of the PR head `12a577fe99` (clean) |
+| #98 `fix/vault-managed-route` | merge commit of the PR head `2ffdadc3fc` (clean) |
+| #100 `fix/fallback-provider-request-fields` | cherry-picked (`-x`) onto upstream's `agent/route_binding.py` move (`1541036775`): `bind_route_entry` captures `old_api_mode` and calls `rescope_request_overrides`; `_rescope_fallback_extra_body` is gone as in #100 |
