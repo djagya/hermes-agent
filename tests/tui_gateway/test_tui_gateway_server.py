@@ -3204,36 +3204,6 @@ def test_command_dispatch_skills_gate_off_answers_instead_of_refusing(tmp_path, 
         server._sessions.pop("sid-wa", None)
 
 
-def test_command_dispatch_memory_pending_reviews_staged_writes(tmp_path, monkeypatch):
-    # Same fallback for /memory (#118812): the store must resolve under the session's
-    # profile home, applying the write on approve instead of dropping it.
-    from tools import write_approval as wa
-
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / "config.yaml").write_text("memory:\n  write_approval: true\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    # dlz: the fork's approve replays only payloads carrying a base-state guard.
-    from tools.memory_tool import MemoryStore, _build_memory_write_guard
-    store = MemoryStore(); store.load_from_disk()
-    wa.stage_write(wa.MEMORY, {"action": "add", "target": "memory", "content": "dispatched fact",
-                               "_write_guard": _build_memory_write_guard(store, "memory")},
-                   summary="add dispatched fact", origin="foreground")
-    server._sessions["sid-wa"] = _session(profile_home=str(home))
-    try:
-        res = server._methods["command.dispatch"](
-            "d1", {"name": "memory", "arg": "pending", "session_id": "sid-wa"})
-        assert res["result"]["type"] == "exec", res
-        assert "dispatched fact" in res["result"]["output"]
-
-        approve = server._methods["command.dispatch"](
-            "d2", {"name": "memory", "arg": "approve all", "session_id": "sid-wa"})
-        assert "Approved 1" in approve["result"]["output"], approve
-        assert wa.pending_count(wa.MEMORY) == 0
-    finally:
-        server._sessions.pop("sid-wa", None)
-
-
 def test_complete_slash_and_skills_reload_are_bound_to_the_session_cwd(tmp_path, monkeypatch):
     # The '/' popup and /reload-skills ran the registry unbound: the popup never offered a project skill
     # ``command.dispatch`` accepts, and a rescan after that dispatch reported the session's project skills

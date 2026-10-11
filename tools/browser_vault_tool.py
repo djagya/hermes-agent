@@ -68,7 +68,7 @@ class _PageUnavailable(Exception):
 def _is_managed() -> bool:
     try:
         from tools.browser_control_route import is_managed
-    except Exception:
+    except ImportError:
         return False
     return is_managed()
 
@@ -105,7 +105,7 @@ def _managed_supervisor(task_id: str, *, admit: bool = False):
     try:
         return SUPERVISOR_REGISTRY.get_or_start(task_id=task_id, cdp_url=_resolve_cdp_override(route["cdp"]),
                                                 dialog_policy=policy, dialog_timeout_s=timeout_s)
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- re-raised as _PageUnavailable; a traceback would leak the CDP endpoint
         cause = _redact_cdp_error_text(exc)[:200]
         logger.warning("vault: supervisor attach to the managed browser failed: %s", cause)
         raise _PageUnavailable("supervisor_unavailable",
@@ -288,6 +288,17 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
         # still the better target, and the classifier decides whether it holds the form.
         focused = supervisor.focus_page(origin)
     return (origin or focused.get("url")) if focused.get("ok") else None
+
+
+def _fill_page_origin(task_id: str, allowed: list[str], kind: str) -> Optional[str]:
+    """The first bound origin a tab could be focused on, else the origin of the page the browser IS on
+    (not the supervisor's blank first tab), so a refusal names the actual origin."""
+    for candidate in allowed:
+        page_origin = _focus_bound_origin(task_id, candidate, kind)
+        if page_origin:
+            return page_origin
+    _focus_bound_origin(task_id, "", kind)
+    return _current_page_origin(task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -537,16 +548,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
     # every saved origin is a valid fill target. Matching stays exact-origin —
     # nothing wildcard/parent-domain is ever inferred.
     allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
-    page_origin = None
-    for candidate in allowed:
-        page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
-        if page_origin:
-            break
-    if not page_origin:
-        # No tab on a bound origin. Read the page the browser IS on (not the supervisor's blank first tab),
-        # so the refusal below names the actual origin.
-        _focus_bound_origin(effective_task_id, "", meta.kind)
-        page_origin = _current_page_origin(effective_task_id)
+    page_origin = _fill_page_origin(effective_task_id, allowed, meta.kind)
     if not page_origin:
         return json.dumps({"success": False, "error_type": "no_page",
                            "error": ("No http(s) page is open in the browser this task drives. Open the login page "

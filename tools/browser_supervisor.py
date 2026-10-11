@@ -330,7 +330,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                     break
                 try:
                     sid, passed, visible = await _probe(target_id)
-                except Exception as e:
+                except Exception as e:  # health: allow BLE001 -- a dead tab is skipped; a traceback would leak the CDP endpoint
                     logger.debug("CDP supervisor %s: tab did not answer, skipping: %s",
                                  self.task_id, _redact_cdp_error_text(e))
                     continue
@@ -502,7 +502,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                 self._page_session_id = await self._attach_page(page_target["targetId"],
                                                                 timeout=PAGE_ATTACH_TIMEOUT_S)
                 return
-            except Exception as e:
+            except Exception as e:  # health: allow BLE001 -- one crashed tab must not fail the supervisor; logged redacted
                 logger.debug("CDP supervisor %s: page target did not answer, skipping: %s",
                              self.task_id, _redact_cdp_error_text(e))
         page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"}))["result"]
