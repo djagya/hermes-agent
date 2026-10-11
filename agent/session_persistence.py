@@ -20,6 +20,7 @@ from agent.context_compressor import (
 )
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static
 from agent.memory_manager import sanitize_context
+from agent.redact import redact_registered_vault_values
 
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
@@ -117,6 +118,26 @@ def _summary_display_kind(msg: Dict) -> Any:
     ):
         return "hidden"
     return msg.get("display_kind")
+
+
+def _durable_tool_calls(tool_calls: Any) -> Any:
+    """Persisted projection of an assistant's tool_calls: vault-registered values (a supplied one-time code
+    among them) are scrubbed, so an OTP passed to browser_vault_enter_code lands in the transcript as the
+    redaction sentinel, not as live credential bytes. Exact-value scrub only: the generic credential regexes
+    can cut a serialized ``arguments`` string mid-escape. Tool-call structure is preserved for replay: only
+    the offending substring inside each ``arguments`` string is replaced."""
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return tool_calls
+    out = []
+    for tc in tool_calls:
+        function = tc.get("function") if isinstance(tc, dict) else None
+        args = function.get("arguments") if isinstance(function, dict) else None
+        if isinstance(args, str) and args:
+            redacted = redact_registered_vault_values(args)
+            if redacted != args:
+                tc = {**tc, "function": {**function, "arguments": redacted}}
+        out.append(tc)
+    return out
 
 
 def _durable_content(content: Any) -> Any:
@@ -225,7 +246,7 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     row = {
         "role": role, "content": _durable_content(content),
         "tool_name": msg.get("tool_name") or (msg.get("name") if role == "tool" else None),
-        "tool_calls": msg["tool_calls"] if isinstance(msg.get("tool_calls"), list) else None,
+        "tool_calls": _durable_tool_calls(msg["tool_calls"]) if isinstance(msg.get("tool_calls"), list) else None,
         "tool_call_id": msg.get("tool_call_id"), "effect_disposition": msg.get("effect_disposition"),
         "token_count": msg.get("token_count"), "finish_reason": msg.get("finish_reason"),
         **{k: msg.get(k) for k in _ROW_REASONING_KEYS},
