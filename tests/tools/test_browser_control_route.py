@@ -620,6 +620,40 @@ def test_managed_exec_raises_harness_cdp_timeout(tmp_path, monkeypatch):
     httpd.shutdown()
     posted = stdin_path.read_text()
     assert "_hermes_ipc_timeout" in posted and posted.rstrip().endswith("print(1)")
+    # The agent works in the front tab: timeouts first, then the tab, then the code.
+    assert posted.index("_hermes_ipc_timeout") < posted.index("_hermes_front_tab") < posted.index("print(1)")
+
+
+def test_managed_front_tab_preamble_activates_and_defaults_switch_tab(monkeypatch):
+    """The preamble runs against the real harness helper signatures (no daemon)."""
+    import sys
+    import types
+
+    import tools.browser_use_cli as bu_cli
+
+    calls = []
+    fake = types.ModuleType("browser_harness.helpers")
+
+    def switch_tab(target, activate=False):
+        calls.append(("switch", target, activate))
+
+    def activate_tab(target):
+        calls.append(("activate", target["targetId"]))
+
+    fake.switch_tab = switch_tab
+    fake.activate_tab = activate_tab
+    fake.current_tab = lambda: {"targetId": "T1", "target_id": "T1", "url": "", "title": ""}
+    pkg = types.ModuleType("browser_harness")
+    pkg.helpers = fake
+    monkeypatch.setitem(sys.modules, "browser_harness", pkg)
+    monkeypatch.setitem(sys.modules, "browser_harness.helpers", fake)
+    namespace = {"switch_tab": switch_tab}
+    exec(bu_cli._MANAGED_FRONT_TAB_PREAMBLE + "switch_tab('T2')\n", namespace)
+    assert calls == [("activate", "T1"), ("switch", "T2", True)]
+    assert "_hermes_front_tab" not in namespace
+    # A harness that changed the default is left alone; a failing daemon never breaks the call.
+    fake.current_tab = lambda: (_ for _ in ()).throw(RuntimeError("not attached"))
+    exec(bu_cli._MANAGED_FRONT_TAB_PREAMBLE, {})
 
 
 def test_gate_403_is_explained_and_retried_on_a_fresh_lease(tmp_path, monkeypatch):
