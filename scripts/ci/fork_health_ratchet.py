@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     repo = Path(_git(Path.cwd(), "rev-parse", "--show-toplevel").strip())
 
     def stock() -> int:
-        return subprocess.call([sys.executable, *STOCK], cwd=repo)
+        return subprocess.run([sys.executable, *STOCK], cwd=repo, timeout=1800, check=False).returncode
 
     try:
         base = _git(repo, "rev-parse", "--verify", f"{args.base}^{{commit}}").strip()
@@ -139,7 +139,8 @@ def main(argv: list[str] | None = None) -> int:
     tagged = upstream_tag_commits(args.upstream)
 
     def on_base(commit: str) -> bool:
-        return subprocess.call(["git", "merge-base", "--is-ancestor", commit, base], cwd=repo) == 0
+        return subprocess.run(["git", "merge-base", "--is-ancestor", commit, base], cwd=repo,
+                              timeout=120, check=False).returncode == 0
 
     segments = plan(line, tagged.__contains__, on_base)
     if segments is None:
