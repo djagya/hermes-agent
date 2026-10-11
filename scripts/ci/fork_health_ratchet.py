@@ -44,7 +44,7 @@ class Segment:
 
 
 def _git(repo: Path, *args: str) -> str:
-    proc = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True,
+    proc = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, encoding="utf-8", errors="replace",
                           stdin=subprocess.DEVNULL, timeout=300, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
@@ -65,7 +65,7 @@ def parse_tag_commits(ls_remote: str) -> frozenset[str]:
 
 
 def upstream_tag_commits(url: str) -> frozenset[str]:
-    proc = subprocess.run(["git", "ls-remote", "--tags", url], capture_output=True, text=True,
+    proc = subprocess.run(["git", "ls-remote", "--tags", url], capture_output=True, text=True, encoding="utf-8", errors="replace",
                           stdin=subprocess.DEVNULL, timeout=120, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"git ls-remote --tags {url} failed: {proc.stderr.strip()}")
