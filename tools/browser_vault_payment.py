@@ -9,13 +9,44 @@ from agent.vault_payment_card import validate_card
 from agent.vault_payment_policy import PAYMENT_PSP_ORIGINS, PaymentPolicyError
 from agent.vault_store import PAYMENT_FIELDS
 
+# Fill values whose later appearance in tool output would expose the card. The bare expiry month and
+# year and the cardholder name are not secrets on their own and are short or common ("07", "2035",
+# your own name): registering them would scrub every later date and name from model-facing output.
+_REDACTED_TOKENS = frozenset({"cc-number", "cc-csc", "cc-exp"})
+
+
+def _register_card_redaction(secret: dict, fills: list) -> None:
+    from agent.redact import register_vault_redaction_value
+
+    number = secret["card_number"]
+    # Common card formatting is also scrubbed from ordinary browser text reads.
+    groups = [number[n : n + 4] for n in range(0, len(number), 4)]
+    for value in (number, secret["cvc"], " ".join(groups), "-".join(groups),
+                  *(f["value"] for f in fills if f["token"] in _REDACTED_TOKENS)):
+        register_vault_redaction_value(value)
+
+
+def _document_fills(inspected, secret: dict) -> list | None:
+    """Fills tagged with their card document, or None when a document's fields cannot all be filled."""
+    fills = []
+    for k, document in enumerate(inspected.documents):
+        document_fills = select_checkout_fills(list(document.controls), secret, PAYMENT_FIELDS)
+        if len(document_fills) != len(document.controls):
+            return None
+        fills += [dict(f, document=k) for f in document_fills]
+    return fills
+
 
 def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
-    from agent.redact import register_vault_redaction_value
     from tools import browser_vault_tool as vault
     from tools.approval_prompt import request_elicitation_consent
 
-    supervisor = vault._ensure_supervisor(task_id)
+    try:
+        supervisor = vault._ensure_supervisor(task_id)
+    except vault._PageUnavailable as exc:
+        return json.dumps(exc.result())
+    except Exception:  # health: allow BLE001 -- CDP attach errors can carry endpoint credentials; fixed type only
+        return json.dumps({"success": False, "error_type": "supervisor_required"})
     if supervisor is None:
         return json.dumps({"success": False, "error_type": "supervisor_required"})
     inspected = None
@@ -44,18 +75,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             return json.dumps({"success": False, "error_type": "payment_page_changed"})
         # Never resolve at inspection/list time, on decline or on stale consent.
         secret = validate_card(backend.resolve_secret(meta.id))
-        fills = select_checkout_fills(list(inspected.controls), secret, PAYMENT_FIELDS)
-        for value in (*secret.values(), *(f["value"] for f in fills)):
-            register_vault_redaction_value(value)
-        # Common card formatting is also scrubbed from ordinary browser text reads.
-        number = secret["card_number"]
-        register_vault_redaction_value(
-            " ".join(number[n : n + 4] for n in range(0, len(number), 4))
-        )
-        register_vault_redaction_value(
-            "-".join(number[n : n + 4] for n in range(0, len(number), 4))
-        )
-        if len(fills) != len(inspected.controls):
+        fills = _document_fills(inspected, secret)
+        _register_card_redaction(secret, fills or [])
+        if fills is None:
             return json.dumps({
                 "success": False,
                 "error_type": "payment_fields_incomplete",
@@ -74,6 +96,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             backend=backend.name,
             origin=inspected.merchant_origin,
             target_origin=inspected.frame_origin,
+            target_origins=list(inspected.target_origins),
             fields=prompt["fields"],
             submitted=False,
             page_checks=prompt["checks"],

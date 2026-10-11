@@ -85,6 +85,14 @@ def payment_browser(tmp_path, record_property):
                 "/merchant": f'<iframe id="hosted" src="{origins["psp"]}/hosted"></iframe>',
                 "/split-merchant": f'<iframe src="{origins["psp"]}/split"></iframe><iframe src="{origins["psp"]}/cvc"></iframe>',
                 "/ambiguous": FIELDS + '<input autocomplete="cc-number">',
+                # Datatrans Secure Fields shape: number and CVC each in their own PSP frame,
+                # expiry on the merchant page.
+                "/dt-number": '<input autocomplete="cc-number">',
+                "/dt-cvc": '<input autocomplete="cc-csc">',
+                "/dt-merchant": '<input autocomplete="cc-exp-month"><input autocomplete="cc-exp-year">'
+                f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
+                "/dt-duplicate": '<input autocomplete="cc-number"><input autocomplete="cc-exp">'
+                f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
             }.get(self.path, FIELDS)
             body = (
                 '<!doctype html><form onsubmit="window.submitted=true;return false">'
@@ -453,3 +461,68 @@ def test_hosted_oopif_identity_races_and_single_use(payment_browser):
         if mutation == "stale_session":
             sup._page_session_id = i.page_session
         print("RECEIPT hosted_oopif", mutation, "=PASS replay=REFUSED")
+
+
+def test_split_hosted_fields_fill_each_document_once(payment_browser, tmp_path, monkeypatch):
+    """Number and CVC in separate PSP frames (OOPIFs) plus expiry on the merchant page: one consent
+    names both origins, every document gets exactly its fields, and duplicates are refused."""
+    from dataclasses import replace
+
+    from agent.vault_store import VaultStore
+    from tools.browser_supervisor import _schedule
+    from tools.browser_vault_tool import browser_vault_fill
+
+    sup, origins = payment_browser
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item("payment", "Synthetic split card", CARD, origin=origins["merchant"])
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    original = store.get_meta
+    monkeypatch.setattr(store, "get_meta", lambda handle: (
+        replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
+
+    navigate(sup, origins["merchant"] + "/dt-duplicate")
+    with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept") as consent:
+        out = json.loads(browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"]))
+    assert not out["success"] and not consent.called
+
+    navigate(sup, origins["merchant"] + "/dt-merchant")
+    with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept") as consent:
+        out = json.loads(browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"]))
+    assert out["success"] and out["filled_fields"] == 4 and out["submitted"] is False, out
+    assert out["target_origins"] == [origins["merchant"], origins["psp"]]
+    body = consent.call_args.args[1]
+    assert origins["merchant"] in body and origins["psp"] in body
+    inspection = sup.inspect_payment(origins["merchant"], frame_origins=(origins["psp"],))
+    try:
+        seen = {}
+        for d in inspection.documents:
+            reply = _schedule(sup._cdp("Runtime.evaluate", {
+                "expression": "Array.from(document.querySelectorAll('input'), e => [e.autocomplete, e.value])",
+                "returnByValue": True}, session_id=d.frame_session), sup._loop, timeout=10)
+            seen.update(dict(reply["result"]["result"]["value"]))
+        assert seen == {"cc-exp-month": "07", "cc-exp-year": "2035", "cc-number": CARD["card_number"],
+                        "cc-csc": CARD["cvc"]}, seen
+        assert len({d.frame_session for d in inspection.documents}) == 3
+    finally:
+        sup.discard_payment(inspection)
+    assert sup.evaluate_runtime("!!window.submitted")["result"] is False
+    print("RECEIPT split_hosted_fields=PASS documents=3 each_field_once=PASS duplicate_refused=PASS")
+
+    # A frame swapped after consent: freshness covers every document, so nothing is written anywhere.
+    from agent.vault_login_classifier import select_checkout_fills
+    from agent.vault_store import PAYMENT_FIELDS
+
+    for mutation in ("remove_cvc_frame", "navigate_number_frame"):
+        navigate(sup, origins["merchant"] + "/dt-merchant")
+        i = sup.inspect_payment(origins["merchant"], frame_origins=(origins["psp"],))
+        fills = [dict(f, document=k) for k, d in enumerate(i.documents)
+                 for f in select_checkout_fills(list(d.controls), CARD, PAYMENT_FIELDS)]
+        sup.evaluate_runtime({
+            "remove_cvc_frame": "document.querySelectorAll('iframe')[1].remove()",
+            "navigate_number_frame": "document.querySelector('iframe').src += '?swapped'",
+        }[mutation])
+        time.sleep(0.3)
+        out = sup.commit_payment(i, fills)
+        assert not out["success"] and "partially_filled" not in out, (mutation, out)
+        assert sup.evaluate_runtime("Array.from(document.querySelectorAll('input'), e => e.value)")["result"] == ["", ""]
+        print("RECEIPT split_race", mutation, "=REFUSED zero_writes=PASS")

@@ -1,7 +1,9 @@
 """Document-pinned payment operations on the existing supervisor socket.
 
-No whole-checkout transaction is claimed. Exactly one document may contain
-card controls; secrets never go through CLI eval or a model tool argument.
+No whole-checkout transaction is claimed. Card controls sit in one document, or are split
+across documents on the merchant and at most ONE reviewed PSP origin with every card field
+exactly once (Datatrans Secure Fields, Stripe split elements); secrets never go through CLI
+eval or a model tool argument.
 """
 
 from __future__ import annotations
@@ -19,36 +21,100 @@ from agent.vault_payment_policy import (
 )
 
 
+_MAX_CARD_DOCUMENTS = 4
+
+
+@dataclass
+class PaymentDocument:
+    """One document holding card controls, pinned by frame, session and isolated-world object."""
+
+    frame_id: str
+    frame_session: str
+    object_id: str
+    origin: str
+    controls: tuple
+
+
 @dataclass
 class PaymentInspection:
     operation_id: str
     page_session: str
     page_id: str
     merchant_origin: str
-    frame_origin: str
-    frame_id: str
-    frame_session: str
-    object_id: str
+    documents: tuple
     tree: tuple
-    controls: tuple
     expires_at: float
     consumed: bool = False
     owner: Any = field(default=None, repr=False)
     child_sessions: dict = field(default_factory=dict, repr=False)
 
+    @property
+    def controls(self) -> tuple:
+        return tuple(c for d in self.documents for c in d.controls)
+
+    @property
+    def target_origins(self) -> tuple:
+        """Every origin that receives card fields, once each, in document order."""
+        return tuple(dict.fromkeys(d.origin for d in self.documents))
+
+    @property
+    def frame_origin(self) -> str:
+        """The hosted PSP origin when one receives fields, else the merchant."""
+        hosted = [o for o in self.target_origins if o != self.merchant_origin]
+        return hosted[0] if hosted else self.merchant_origin
+
+    @property
+    def frame_session(self) -> str:
+        """The card document's session (the first one of a split checkout)."""
+        return self.documents[0].frame_session
+
     def prompt(self) -> dict:
+        n = len(self.documents)
         return {
             "operation_id": self.operation_id,
             "merchant_origin": self.merchant_origin,
-            "target_origin": self.frame_origin,
+            "target_origin": ", ".join(self.target_origins),
+            "target_origins": list(self.target_origins),
             "fields": sorted(c.token for c in self.controls),
             "checks": [
                 "HTTPS origins",
                 "exact document and field references",
-                "single card document",
+                f"card fields split across {n} documents, each field once" if n > 1 else "single card document",
             ],
             "merchant_reputation": "not established; verify the seller independently",
         }
+
+
+def _card_documents(candidates: list, merchant: str) -> tuple:
+    """The documents to fill: one, or a split checkout where every card field appears exactly once
+    across documents and the fields reach at most the merchant plus ONE hosted PSP origin. Anything
+    else is ambiguous and refused. ``candidates`` holds ``(frame_id, session, object_id, origin,
+    controls)`` for each allowed document that has card controls."""
+    if not candidates or len(candidates) > _MAX_CARD_DOCUMENTS:
+        raise PaymentPolicyError("Missing, ambiguous or split payment documents")
+    if len({c[3] for c in candidates} - {merchant}) > 1:
+        raise PaymentPolicyError("Card fields split across payment providers")
+    tokens = [control.token for c in candidates for control in c[4]]
+    if len(tokens) != len(set(tokens)) or not {"cc-number", "cc-csc"} <= set(tokens):
+        raise PaymentPolicyError("Incomplete or ambiguous card fields")
+    if not ("cc-exp" in tokens or {"cc-exp-month", "cc-exp-year"} <= set(tokens)):
+        raise PaymentPolicyError("Missing card expiry fields")
+    if "cc-exp" in tokens and ("cc-exp-month" in tokens or "cc-exp-year" in tokens):
+        raise PaymentPolicyError("Ambiguous card expiry fields")
+    return tuple(PaymentDocument(*c) for c in candidates)
+
+
+def _fills_by_document(i: "PaymentInspection", fills: list) -> list:
+    """Group fills by their ``document`` index (default 0); every card document needs its fields."""
+    groups: list = [[] for _ in i.documents]
+    for f in fills:
+        k = f.get("document", 0) if isinstance(f, dict) else None
+        if type(k) is not int or not 0 <= k < len(groups):
+            raise PaymentPolicyError("Fill targets an unknown document")
+        groups[k].append({key: v for key, v in f.items() if key != "document"})
+    if not all(groups):
+        raise PaymentPolicyError("Every card document needs its fields")
+    return groups
 
 
 def _value(reply: dict) -> Any:
@@ -289,24 +355,7 @@ class PaymentSupervisionMixin:
                     await self._cdp(
                         "Runtime.releaseObject", {"objectId": obj}, session_id=fsid
                     )
-            if len(candidates) != 1:
-                raise PaymentPolicyError(
-                    "Missing, ambiguous or split payment documents"
-                )
-            fid, fsid, obj, frame_origin, controls = candidates[0]
-            tokens = [c.token for c in controls]
-            if len(tokens) != len(set(tokens)) or not {"cc-number", "cc-csc"} <= set(
-                tokens
-            ):
-                raise PaymentPolicyError("Incomplete or ambiguous card fields")
-            if not (
-                "cc-exp" in tokens or {"cc-exp-month", "cc-exp-year"} <= set(tokens)
-            ):
-                raise PaymentPolicyError("Missing card expiry fields")
-            if "cc-exp" in tokens and (
-                "cc-exp-month" in tokens or "cc-exp-year" in tokens
-            ):
-                raise PaymentPolicyError("Ambiguous card expiry fields")
+            documents = _card_documents(candidates, merchant)
             if await self._payment_tree(sid, child_sessions) != tree:
                 raise PaymentPolicyError("Payment page changed during inspection")
             return PaymentInspection(
@@ -314,12 +363,8 @@ class PaymentSupervisionMixin:
                 sid,
                 page["targetId"],
                 merchant,
-                frame_origin,
-                fid,
-                fsid,
-                obj,
+                documents,
                 tree,
-                controls,
                 time.monotonic() + 120,
                 owner=self,
                 child_sessions=child_sessions,
@@ -363,21 +408,22 @@ class PaymentSupervisionMixin:
         try:
             if await self._payment_tree(i.page_session, i.child_sessions) != i.tree:
                 return False
-            return (
-                _value(
+            for d in i.documents:
+                valid = _value(
                     await self._cdp(
                         "Runtime.callFunctionOn",
                         {
-                            "objectId": i.object_id,
+                            "objectId": d.object_id,
                             "functionDeclaration": "function(){return this.valid()}",
                             "returnByValue": True,
                         },
-                        session_id=i.frame_session,
+                        session_id=d.frame_session,
                     )
                 )
-                is True
-            )
-        except Exception:
+                if valid is not True:
+                    return False
+            return True
+        except Exception:  # health: allow BLE001 -- any CDP failure means the approved page is not current; fail closed
             return False
 
     def commit_payment(self, inspected: PaymentInspection, fills: list[dict]) -> dict:
@@ -390,48 +436,66 @@ class PaymentSupervisionMixin:
             return {"success": False, "error_type": "payment_consent_consumed"}
         if not await self._payment_is_current(i):
             i.consumed = True
-            await self._release_payment_object(i.frame_session, i.object_id)
-            await self._release_payment_sessions(i.child_sessions)
+            await self._release_payment_documents(i)
             return {"success": False, "error_type": "payment_page_changed"}
         # Consume before ingress; transport uncertainty is never a retry authorization.
         i.consumed = True
+        filled = 0
         try:
-            result = _value(
-                await self._cdp(
-                    "Runtime.callFunctionOn",
-                    {
-                        "objectId": i.object_id,
-                        "functionDeclaration": "function(fills){return this.commit(fills)}",
-                        "arguments": [{"value": fills}],
-                        "returnByValue": True,
-                    },
-                    session_id=i.frame_session,
-                )
-            )
-            if not isinstance(result, dict) or set(result) - {
-                "success",
-                "filled_fields",
-                "error_type",
-            }:
-                return {"success": False, "error_type": "payment_result_invalid"}
-            return result
-        except Exception:
-            return {"success": False, "error_type": "payment_transport_uncertain"}
+            # Every document was re-validated just above. A split checkout is written one
+            # document at a time: no cross-document transaction exists, so a later failure
+            # reports what an earlier document already received instead of retrying.
+            for document, document_fills in zip(i.documents, _fills_by_document(i, fills)):
+                result = await self._commit_payment_document(document, document_fills)
+                if not result.get("success"):
+                    return _partial(result, filled)
+                filled += result.get("filled_fields", 0)
+            return {"success": True, "filled_fields": filled}
+        except PaymentPolicyError:
+            return _partial({"success": False, "error_type": "payment_fields_invalid"}, filled)
+        except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
+            return _partial({"success": False, "error_type": "payment_transport_uncertain"}, filled)
         finally:
-            await self._release_payment_object(i.frame_session, i.object_id)
-            await self._release_payment_sessions(i.child_sessions)
+            await self._release_payment_documents(i)
+
+    async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict]) -> dict:
+        result = _value(
+            await self._cdp(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": d.object_id,
+                    "functionDeclaration": "function(fills){return this.commit(fills)}",
+                    "arguments": [{"value": fills}],
+                    "returnByValue": True,
+                },
+                session_id=d.frame_session,
+            )
+        )
+        if not isinstance(result, dict) or set(result) - {
+            "success",
+            "filled_fields",
+            "error_type",
+        }:
+            return {"success": False, "error_type": "payment_result_invalid"}
+        return result
+
+    async def _release_payment_documents(self, i: PaymentInspection) -> None:
+        for d in i.documents:
+            await self._release_payment_object(d.frame_session, d.object_id)
+        await self._release_payment_sessions(i.child_sessions)
 
     def discard_payment(self, i: PaymentInspection) -> None:
         from tools.browser_supervisor import _schedule
 
         i.consumed = True
+        _schedule(self._release_payment_documents(i), self._loop, timeout=12)
 
-        async def discard():
-            await self._release_payment_object(i.frame_session, i.object_id)
-            await self._release_payment_sessions(i.child_sessions)
 
-        _schedule(discard(), self._loop, timeout=12)
-
+def _partial(result: dict, filled_before: int) -> dict:
+    """A failed document after earlier documents of a split checkout already received values."""
+    if not filled_before:
+        return result
+    return {**result, "filled_fields": filled_before + result.get("filled_fields", 0), "partially_filled": True}
 
 _INSPECT = r"""(() => {
   const doc = document, href = location.href;

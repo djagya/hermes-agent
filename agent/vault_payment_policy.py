@@ -6,7 +6,10 @@ from dataclasses import dataclass
 from typing import Mapping
 from urllib.parse import urlsplit
 
-PAYMENT_PSP_ORIGINS = ("https://js.stripe.com",)
+# Reviewed hosted card-field origins a card fill may target besides the merchant page. Each entry
+# is a payment provider's own field iframe, never a merchant or bank site; add one per reviewed PSP.
+# Datatrans Secure Fields puts the number and the CVC in separate pay.datatrans.com frames.
+PAYMENT_PSP_ORIGINS = ("https://js.stripe.com", "https://pay.datatrans.com")
 
 
 class PaymentPolicyError(ValueError):
