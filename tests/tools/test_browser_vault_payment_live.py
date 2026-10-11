@@ -38,6 +38,40 @@ CARD = {
 FIELDS = '<input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc">'
 
 
+# Shopify checkout shape (checkout.pci.shopifyinc.com, build 09497de): one frame per card field;
+# each holds its real input plus a 1px aria-hidden, tabindex=-1 honeypot for every other token.
+# The Maestro-only issue date/number frames stay hidden in the merchant page until needed.
+_SHOPIFY_FIELDS = {
+    "number": ("cc-number", "Card number"), "expiry": ("cc-exp", "Expiration date (MM / YY)"),
+    "verification_value": ("cc-csc", "Security code"), "name": ("cc-name", "Name on card"),
+    "issue_date": ("off", "Issue date (MM / YY)"), "issue_number": ("off", "Issue number"),
+}
+_HONEYPOT_CSS = ("<style>.visually-hidden{position:absolute!important;width:1px!important;height:1px!important;"
+                 "overflow:hidden!important;clip:rect(0 0 0 0)!important}</style>")
+
+
+def _shopify_page(path, origins):
+    if path.startswith("/shopify-field/"):
+        real = path.rsplit("/", 1)[-1]
+        inputs = []
+        for field, (token, label) in _SHOPIFY_FIELDS.items():
+            if field == real:
+                inputs.append(f'<label for="{field}">{label}</label>'
+                              f'<input autocomplete="{token}" id="{field}" name="{field}" data-current-field="{field}">')
+            else:
+                inputs.append(f'<input autocomplete="{token}" id="{field}" name="{field}" class="visually-hidden" '
+                              'aria-hidden="true" data-honeypot-field tabindex="-1">')
+        return _HONEYPOT_CSS + "".join(inputs)
+    if path in ("/shopify-checkout", "/shopify-checkout-maestro"):
+        frames = "".join(f'<iframe title="{label}" src="{origins["psp"]}/shopify-field/{field}"></iframe>'
+                         for field, (_t, label) in list(_SHOPIFY_FIELDS.items())[:4])
+        hidden = "" if path.endswith("maestro") else ' style="display:none"'
+        issue = "".join(f'<iframe title="{label}" src="{origins["psp"]}/shopify-field/{field}"></iframe>'
+                        for field, (_t, label) in list(_SHOPIFY_FIELDS.items())[4:])
+        return frames + f"<div{hidden}>{issue}</div>"
+    return None
+
+
 @pytest.fixture
 def payment_browser(tmp_path, record_property):
     from cryptography import x509
@@ -85,7 +119,15 @@ def payment_browser(tmp_path, record_property):
                 "/merchant": f'<iframe id="hosted" src="{origins["psp"]}/hosted"></iframe>',
                 "/split-merchant": f'<iframe src="{origins["psp"]}/split"></iframe><iframe src="{origins["psp"]}/cvc"></iframe>',
                 "/ambiguous": FIELDS + '<input autocomplete="cc-number">',
-            }.get(self.path, FIELDS)
+                # Datatrans Secure Fields shape: number and CVC each in their own PSP frame,
+                # expiry on the merchant page.
+                "/dt-number": '<input autocomplete="cc-number">',
+                "/dt-cvc": '<input autocomplete="cc-csc">',
+                "/dt-merchant": '<input autocomplete="cc-exp-month"><input autocomplete="cc-exp-year">'
+                f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
+                "/dt-duplicate": '<input autocomplete="cc-number"><input autocomplete="cc-exp">'
+                f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
+            }.get(self.path) or _shopify_page(self.path, origins) or FIELDS
             body = (
                 '<!doctype html><form onsubmit="window.submitted=true;return false">'
                 + body
@@ -453,3 +495,111 @@ def test_hosted_oopif_identity_races_and_single_use(payment_browser):
         if mutation == "stale_session":
             sup._page_session_id = i.page_session
         print("RECEIPT hosted_oopif", mutation, "=PASS replay=REFUSED")
+
+
+def test_split_hosted_fields_fill_each_document_once(payment_browser, tmp_path, monkeypatch):
+    """Number and CVC in separate PSP frames (OOPIFs) plus expiry on the merchant page: one consent
+    names both origins, every document gets exactly its fields, and duplicates are refused."""
+    from dataclasses import replace
+
+    from agent.vault_store import VaultStore
+    from tools.browser_supervisor import _schedule
+    from tools.browser_vault_tool import browser_vault_fill
+
+    sup, origins = payment_browser
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item("payment", "Synthetic split card", CARD, origin=origins["merchant"])
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    original = store.get_meta
+    monkeypatch.setattr(store, "get_meta", lambda handle: (
+        replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
+
+    navigate(sup, origins["merchant"] + "/dt-duplicate")
+    with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept") as consent:
+        out = json.loads(browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"]))
+    assert not out["success"] and not consent.called
+
+    navigate(sup, origins["merchant"] + "/dt-merchant")
+    with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept") as consent:
+        out = json.loads(browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"]))
+    assert out["success"] and out["filled_fields"] == 4 and out["submitted"] is False, out
+    assert out["target_origins"] == [origins["merchant"], origins["psp"]]
+    body = consent.call_args.args[1]
+    assert origins["merchant"] in body and origins["psp"] in body
+    inspection = sup.inspect_payment(origins["merchant"], frame_origins=(origins["psp"],))
+    try:
+        seen = {}
+        for d in inspection.documents:
+            reply = _schedule(sup._cdp("Runtime.evaluate", {
+                "expression": "Array.from(document.querySelectorAll('input'), e => [e.autocomplete, e.value])",
+                "returnByValue": True}, session_id=d.frame_session), sup._loop, timeout=10)
+            seen.update(dict(reply["result"]["result"]["value"]))
+        assert seen == {"cc-exp-month": "07", "cc-exp-year": "2035", "cc-number": CARD["card_number"],
+                        "cc-csc": CARD["cvc"]}, seen
+        assert len({d.frame_session for d in inspection.documents}) == 3
+    finally:
+        sup.discard_payment(inspection)
+    assert sup.evaluate_runtime("!!window.submitted")["result"] is False
+    print("RECEIPT split_hosted_fields=PASS documents=3 each_field_once=PASS duplicate_refused=PASS")
+
+    # A frame swapped after consent: freshness covers every document, so nothing is written anywhere.
+    from agent.vault_login_classifier import select_checkout_fills
+    from agent.vault_store import PAYMENT_FIELDS
+
+    for mutation in ("remove_cvc_frame", "navigate_number_frame"):
+        navigate(sup, origins["merchant"] + "/dt-merchant")
+        i = sup.inspect_payment(origins["merchant"], frame_origins=(origins["psp"],))
+        fills = [dict(f, document=k) for k, d in enumerate(i.documents)
+                 for f in select_checkout_fills(list(d.controls), CARD, PAYMENT_FIELDS)]
+        sup.evaluate_runtime({
+            "remove_cvc_frame": "document.querySelectorAll('iframe')[1].remove()",
+            "navigate_number_frame": "document.querySelector('iframe').src += '?swapped'",
+        }[mutation])
+        time.sleep(0.3)
+        out = sup.commit_payment(i, fills)
+        assert not out["success"] and "partially_filled" not in out, (mutation, out)
+        assert sup.evaluate_runtime("Array.from(document.querySelectorAll('input'), e => e.value)")["result"] == ["", ""]
+        print("RECEIPT split_race", mutation, "=REFUSED zero_writes=PASS")
+
+
+def test_shopify_card_fields_skip_honeypots_and_hidden_issue_frames(payment_browser, tmp_path, monkeypatch):
+    """Shopify checkout: number, expiry, CVC and name each in their own PSP frame. Honeypot inputs and
+    the hidden Maestro issue frames are never filled; a visible issue date is not taken for the expiry."""
+    from dataclasses import replace
+
+    from agent.vault_store import VaultStore
+    from tools.browser_supervisor import _schedule
+    from tools.browser_vault_tool import browser_vault_fill
+
+    sup, origins = payment_browser
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item("payment", "Synthetic Shopify card", {**CARD, "cardholder_name": "Ada Lovelace"},
+                          origin=origins["merchant"])
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    original = store.get_meta
+    monkeypatch.setattr(store, "get_meta", lambda handle: (
+        replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
+
+    for path in ("/shopify-checkout", "/shopify-checkout-maestro"):
+        navigate(sup, origins["merchant"] + path)
+        with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
+            out = json.loads(browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"]))
+        assert out["success"] and out["filled_fields"] == 4 and out["target_origins"] == [origins["psp"]], (path, out)
+        targets = _schedule(sup._cdp("Target.getTargets"), sup._loop, timeout=10)["result"]["targetInfos"]
+        frames = [t for t in targets if t["type"] == "iframe" and "/shopify-field/" in t["url"]]
+        assert len(frames) == 6
+        for target in frames:
+            field = target["url"].rsplit("/", 1)[-1]
+            fsid = _schedule(sup._cdp("Target.attachToTarget", {"targetId": target["targetId"], "flatten": True}),
+                             sup._loop, timeout=10)["result"]["sessionId"]
+            try:
+                values = _schedule(sup._cdp("Runtime.evaluate", {
+                    "expression": "Object.fromEntries(Array.from(document.querySelectorAll('input'), e => [e.id, e.value]))",
+                    "returnByValue": True}, session_id=fsid), sup._loop, timeout=10)["result"]["result"]["value"]
+            finally:
+                _schedule(sup._cdp("Target.detachFromTarget", {"sessionId": fsid}), sup._loop, timeout=10)
+            want = {"number": CARD["card_number"], "expiry": "07/35", "verification_value": CARD["cvc"],
+                    "name": "Ada Lovelace"}.get(field, "")
+            assert values[field].replace(" ", "") == want.replace(" ", ""), (path, field, values)
+            assert all(v == "" for k, v in values.items() if k != field), (path, field, "honeypot filled", values)
+        print("RECEIPT shopify", path, "=PASS fields=4 honeypots_empty=PASS issue_frames_empty=PASS")
