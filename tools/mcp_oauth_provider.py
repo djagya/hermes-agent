@@ -75,6 +75,18 @@ def _retry_after_seconds(value: str | None, *, wall_time: float | None = None) -
             return None
 
 
+def _refresh_backoff(attempt: int) -> float:
+    return _REFRESH_BACKOFF_SECONDS[min(attempt - 1, len(_REFRESH_BACKOFF_SECONDS) - 1)]
+
+
+def _refresh_retry_delay(attempt: int, delay: float, retry_deadline: float, error: MCPRefreshError) -> float:
+    """``delay`` when another refresh attempt fits the attempt and deadline budget, else raise ``error``
+    (context suppressed: transport exception text never rides along)."""
+    if attempt >= _REFRESH_MAX_ATTEMPTS or time.monotonic() + delay > retry_deadline:
+        raise error from None
+    return delay
+
+
 def _default_auth_request_user_agent() -> str:
     """``Hermes-Agent/<version>`` for SDK-built OAuth requests that would otherwise carry no User-Agent at
     all; versioned so an operator debugging a WAF block can tell which client they are looking at."""
@@ -326,34 +338,21 @@ class HermesProviderMixin:
                             await inner.aclose()
                             raise
                         except BaseException as exc:
-                            if isinstance(exc, asyncio.CancelledError):
-                                sent, thrown = None, exc
-                                break
-                            if not is_refresh:
+                            if isinstance(exc, asyncio.CancelledError) or not is_refresh:
                                 sent, thrown = None, exc
                                 break
                             if not self._hermes_refresh_was_not_sent(out, exc):
-                                raise MCPRefreshError(
-                                    "transport_ambiguous", ambiguous_delivery=True
-                                ) from None
-                            delay = _REFRESH_BACKOFF_SECONDS[min(attempt - 1, len(_REFRESH_BACKOFF_SECONDS) - 1)]
-                            if attempt >= _REFRESH_MAX_ATTEMPTS or time.monotonic() + delay > retry_deadline:
-                                raise MCPRefreshError("transport_pre_send") from None
+                                raise MCPRefreshError("transport_ambiguous", ambiguous_delivery=True) from None
+                            await _sleep(_refresh_retry_delay(attempt, _refresh_backoff(attempt), retry_deadline,
+                                                              MCPRefreshError("transport_pre_send")))
                             attempt += 1
-                            await _sleep(delay)
                             continue
                         if is_refresh and getattr(sent, "status_code", None) in _REFRESH_TRANSIENT_STATUSES:
                             retry_after = _retry_after_seconds(sent.headers.get("retry-after"))
-                            delay = retry_after if retry_after is not None else _REFRESH_BACKOFF_SECONDS[
-                                min(attempt - 1, len(_REFRESH_BACKOFF_SECONDS) - 1)
-                            ]
-                            if attempt >= _REFRESH_MAX_ATTEMPTS or time.monotonic() + delay > retry_deadline:
-                                raise MCPRefreshError(
-                                    "endpoint_transient", status=sent.status_code,
-                                    retry_after=retry_after,
-                                )
+                            delay = _refresh_backoff(attempt) if retry_after is None else retry_after
+                            await _sleep(_refresh_retry_delay(attempt, delay, retry_deadline, MCPRefreshError(
+                                "endpoint_transient", status=sent.status_code, retry_after=retry_after)))
                             attempt += 1
-                            await _sleep(delay)
                             continue
                         break
                     if thrown is None:

@@ -283,7 +283,7 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                         resource_lock_released = False
                     await inner.aclose()
                     raise
-                except BaseException as exc:
+                except BaseException as exc:  # health: allow BLE001 -- forwarded into the SDK generator via athrow, which re-raises what it does not handle
                     # HTTPX drives auth generators bidirectionally for failures
                     # too. Forward transport errors to the native provider so
                     # it can distinguish proven pre-send refresh failures from
