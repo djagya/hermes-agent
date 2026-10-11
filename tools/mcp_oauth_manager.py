@@ -272,7 +272,27 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                     except Exception:
                         await inner.aclose()  # release the SDK's context.lock now, not at GC
                         raise
-                incoming = yield outgoing
+                try:
+                    incoming = yield outgoing
+                except GeneratorExit:
+                    # The SDK's ``async with context.lock`` still owns one
+                    # acquisition. Restore it before closing the inner flow,
+                    # whose ``__aexit__`` releases that acquisition.
+                    if resource_lock_released:
+                        await self.context.lock.acquire()
+                        resource_lock_released = False
+                    await inner.aclose()
+                    raise
+                except BaseException as exc:  # health: allow BLE001 -- forwarded into the SDK generator via athrow, which re-raises what it does not handle
+                    # HTTPX drives auth generators bidirectionally for failures
+                    # too. Forward transport errors to the native provider so
+                    # it can distinguish proven pre-send refresh failures from
+                    # ambiguous post-submit delivery without replaying a grant.
+                    if resource_lock_released:
+                        await self.context.lock.acquire()
+                        resource_lock_released = False
+                    outgoing = await inner.athrow(exc)
+                    continue
                 if resource_lock_released:
                     await self.context.lock.acquire()
                     resource_lock_released = False
