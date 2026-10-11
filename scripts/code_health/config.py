@@ -38,7 +38,12 @@ METRIC_FIX = {
     " judged); fix the syntax, or report the measurer bug",
 }
 
-PY_EXCLUDE = ("website/*", "*/node_modules/*", "node_modules/*")
+# dlz: vendored catalog plugin files (VENDORED.json, hash-pinned) are measured upstream at their
+# pin; the fork's own tests beside them stay in scope.
+PY_EXCLUDE = ("website/*", "*/node_modules/*", "node_modules/*", "plugins/homeassistant/*",
+              *(f"tests/plugins/platforms/homeassistant/{name}" for name in (
+                  "conftest.py", "test_homeassistant_adapter.py", "test_homeassistant_tools.py",
+                  "test_plugin_registration.py")))
 TS_EXCLUDE = PY_EXCLUDE + ("*.d.ts", "*/dist/*", "*/build/*", "*/generated/*", "*.generated.ts")
 TESTS = ("tests/*", "*/tests/*", "tests-js/*", "*/conftest.py")
 # One-shot processes that serve a single profile (CI/release scripts, skill scripts run as a

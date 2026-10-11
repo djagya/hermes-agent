@@ -164,7 +164,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
-          fetch-depth: 2 # the merge commit and its first parent (the base branch tip)
+          # dlz: full history; a release-tracking PR's first-parent line is split at its
+          # upstream sync merges (scripts/ci/fork_health_ratchet.py).
+          fetch-depth: 0
 
       - uses: ./.github/actions/setup-pm
         with:
@@ -177,7 +179,9 @@ jobs:
           command: python -m scripts.ci.python_packages "$(python -m scripts.code_health --print-pins)"
 
       - name: Ratchet the PR against the base branch tip
-        run: python scripts/check --only health --base HEAD^1
+        # dlz: a PR without an upstream sync merge runs the stock
+        # `python scripts/check --only health --base HEAD^1` unchanged.
+        run: python -m scripts.ci.fork_health_ratchet --base HEAD^1 --head HEAD^2
 
   windows-footguns:
     # Static guardrails on Windows-unsafe Python primitives — os.kill(pid, 0),
