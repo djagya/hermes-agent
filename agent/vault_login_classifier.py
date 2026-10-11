@@ -47,6 +47,9 @@ _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:country)\b"), "country-name"),
 )
 
+# "Issue date (MM / YY)" / "Start date" / "Valid from" fields (Maestro) share the expiry's MM/YY shape.
+_RE_NOT_EXPIRY = re.compile(r"\b(?:issue|start|valid\s*from)\b")
+
 _EXCLUDED_AUTOCOMPLETE = {"new-password", "one-time-code"}
 
 _RE_EXCLUDED_PASSWORD = re.compile(r"\b(?:new|confirm|create|repeat)\s*password\b")
@@ -191,6 +194,8 @@ def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogin
     searchable = _normalize_text(" ".join(part for part in (control.name, control.label) if part))
     for pattern, token in _CHECKOUT_HEURISTICS:
         if pattern.search(searchable):
+            if token.startswith("cc-exp") and _RE_NOT_EXPIRY.search(searchable):
+                return None  # an issue/start date (Maestro) is not the expiry
             return ClassifiedLoginControl(control, 70, token)
     return None
 
