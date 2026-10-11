@@ -64,9 +64,10 @@ def _redact_cdp_error_text(exc: object) -> str:
         return "<error redacted>"
 
 
-def _cdp_reconnect_is_handshake_race(attempt: int) -> bool:
-    """First reconnect after a live attach is the known Chrome handshake race."""
-    return attempt == 1
+def _cdp_reconnect_is_handshake_race(redial_failures: int) -> bool:
+    """The first failed dial after a live session is Chrome's known reconnect handshake race
+    (``InvalidMessage`` while the endpoint re-arms); log it at debug and warn from the second."""
+    return redial_failures == 1
 
 
 class _LoopUnavailable(RuntimeError):
@@ -413,6 +414,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
         disconnects, so on drop we reset per-session ids, re-attach, and keep going.
         A failure before the first successful attach is fatal for ``start()``."""
         reconnect_failures, last_success_at, backoff = 0, 0.0, 0.5
+        redial_failures = 0  # failed dials since the last live attach (budget counter also counts drops)
         import websockets  # deferred: only supervisors that connect pay the import
         from agent.proxy_bypass import loopback_connect_kwargs
         connect_kwargs = {"max_size": 50 * 1024 * 1024, "logger": _transport_logger,
@@ -424,11 +426,13 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                 if self._fail_start(e):
                     return
                 reconnect_failures += 1
+                redial_failures += 1
                 if self._reconnect_budget_spent(reconnect_failures, e):
                     return
-                logger.warning("CDP supervisor %s: connect failed (attempt %s/%s): %s",
-                               self.task_id, reconnect_failures, MAX_POST_ATTACH_RECONNECT_FAILURES,
-                               _redact_cdp_error_text(e))
+                log = logger.debug if _cdp_reconnect_is_handshake_race(redial_failures) else logger.warning
+                log("CDP supervisor %s: connect failed (attempt %s/%s): %s",
+                    self.task_id, reconnect_failures, MAX_POST_ATTACH_RECONNECT_FAILURES,
+                    _redact_cdp_error_text(e))
                 await asyncio.sleep(min(backoff, 10.0))
                 backoff = min(backoff * 2, 10.0)
                 continue
@@ -442,7 +446,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                 await self._attach_initial_page()
                 self._set_active(True)
                 last_success_at = time.time()
-                reconnect_failures = 0
+                reconnect_failures = redial_failures = 0
                 backoff = 0.5  # reset after a successful attach
                 self._ready_event.set()
                 await reader_task
