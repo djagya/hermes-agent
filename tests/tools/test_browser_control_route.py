@@ -636,24 +636,35 @@ def test_managed_front_tab_preamble_activates_and_defaults_switch_tab(monkeypatc
 
     def switch_tab(target, activate=False):
         calls.append(("switch", target, activate))
+        return "sid"
 
-    def activate_tab(target):
-        calls.append(("activate", target["targetId"]))
+    def cdp(method, session_id=None, **params):
+        calls.append(("cdp", method))
 
     fake.switch_tab = switch_tab
-    fake.activate_tab = activate_tab
-    fake.current_tab = lambda: {"targetId": "T1", "target_id": "T1", "url": "", "title": ""}
+    fake.cdp = cdp
     pkg = types.ModuleType("browser_harness")
     pkg.helpers = fake
     monkeypatch.setitem(sys.modules, "browser_harness", pkg)
     monkeypatch.setitem(sys.modules, "browser_harness.helpers", fake)
     namespace = {"switch_tab": switch_tab}
-    exec(bu_cli._MANAGED_FRONT_TAB_PREAMBLE + "switch_tab('T2')\n", namespace)
-    assert calls == [("activate", "T1"), ("switch", "T2", True)]
+    exec(bu_cli._MANAGED_FRONT_TAB_PREAMBLE + "switch_tab('T2')\nswitch_tab('T3', activate=False)\n", namespace)
+    # Front and focused at the start; every activating switch is focused too; an explicit
+    # activate=False is honoured (no focus call).
+    assert calls == [
+        ("cdp", "Page.bringToFront"),
+        ("switch", "T2", True),
+        ("cdp", "Page.bringToFront"),
+        ("switch", "T3", False),
+    ]
     assert "_hermes_front_tab" not in namespace
-    # A harness that changed the default is left alone; a failing daemon never breaks the call.
-    fake.current_tab = lambda: (_ for _ in ()).throw(RuntimeError("not attached"))
-    exec(bu_cli._MANAGED_FRONT_TAB_PREAMBLE, {})
+    # Helpers that call the module's switch_tab (new_tab, ensure_real_tab) get the patched one.
+    assert fake.switch_tab is namespace["switch_tab"]
+    # A second call does not wrap twice; a failing daemon never breaks the call.
+    calls.clear()
+    fake.cdp = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("not attached"))
+    exec(bu_cli._MANAGED_FRONT_TAB_PREAMBLE + "switch_tab('T4')\n", namespace)
+    assert calls == [("switch", "T4", True)]
 
 
 def test_gate_403_is_explained_and_retried_on_a_fresh_lease(tmp_path, monkeypatch):
