@@ -424,10 +424,13 @@ _TAB_PROBES["otp"] = ("!!document.querySelector('input[autocomplete=one-time-cod
                       "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]')")
 
 
+_MIN_SUPPLIED_OTP_LENGTH = 4
+
+
 def _validate_supplied_otp(code: str) -> tuple[Optional[str], Optional[str]]:
     """Validate an explicit one-time code. Returns ``(normalized, error)``.
 
-    Bounded, nonempty, no control characters, no whitespace; leading zeros and
+    Bounded (4-16 characters), no control characters, no whitespace; leading zeros and
     alphanumeric bodies are preserved (some sites use alphanumeric codes).
     Interior hyphens are preserved too — a site that issues ``123-456`` wants
     exactly those bytes, and silently stripping a separator would corrupt the
@@ -439,6 +442,9 @@ def _validate_supplied_otp(code: str) -> tuple[Optional[str], Optional[str]]:
     trimmed = code.strip()
     if len(trimmed) > 16:
         return None, "The supplied code is longer than any one-time code (max 16 characters)."
+    if len(trimmed) < _MIN_SUPPLIED_OTP_LENGTH:
+        # Also the redaction floor: a 1-3 character value would be scrubbed from every later output.
+        return None, "The supplied code is shorter than any one-time code (min 4 characters)."
     if any(ch.isspace() for ch in trimmed):
         return None, "The supplied code contains internal whitespace. Provide the code exactly as issued."
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in trimmed):

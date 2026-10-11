@@ -876,7 +876,7 @@ class TestExplicitCodeMode:
         # An empty/whitespace code is "not supplied" → the legacy path (no
         # error_type guarantee); every malformed NON-EMPTY shape must be a
         # typed refusal that never echoes the input.
-        for bad in ("12 34", "12345678901234567", "abc\x00def", "ab\ncd", "   "):
+        for bad in ("12 34", "12345678901234567", "abc\x00def", "ab\ncd", "   ", "0", "a1", "123"):
             out = json.loads(
                 browser_vault_tool.browser_vault_enter_code(
                     task_id="t", code=bad, expected_origin=self.PAGE_ORIGIN
@@ -887,6 +887,19 @@ class TestExplicitCodeMode:
             stripped = bad.strip()
             if stripped and len(stripped) > 3:  # short inputs are substrings of the message itself
                 assert stripped not in out.get("error", ""), bad
+
+    def test_only_codes_the_handler_accepts_are_registered_for_redaction(self):
+        """A 1-3 character or malformed value is refused before any fill; registering it early would
+        scrub that text (a "0", an "a1") from every later tool output and transcript row."""
+        from agent.tool_executor import _register_supplied_otp_for_redaction
+
+        registered = []
+        with patch("agent.redact.register_vault_redaction_value", registered.append):
+            for bad in ("0", "a1", "123", "12 34", "ab\ncd", "12345678901234567", ""):
+                _register_supplied_otp_for_redaction("browser_vault_enter_code", {"code": bad})
+            _register_supplied_otp_for_redaction("browser_vault_enter_code", {"code": " 0421-72 "})
+            _register_supplied_otp_for_redaction("browser_type", {"code": "999999"})
+        assert registered == ["0421-72"]
 
     def test_expected_origin_is_mandatory_and_exact(self):
         from tools import browser_vault_tool

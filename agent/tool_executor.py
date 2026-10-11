@@ -702,11 +702,14 @@ def _register_supplied_otp_for_redaction(function_name: str, function_args: dict
     if function_name != _SUPPLIED_OTP_TOOL or not isinstance(function_args, dict):
         return
     from agent.redact import register_vault_redaction_value
+    from tools.browser_vault_tool import _validate_supplied_otp
 
     for name in _OTP_TOOL_ARG_NAMES:
-        value = function_args.get(name)
-        if isinstance(value, str) and value:
-            register_vault_redaction_value(value)
+        # Only a value the handler would accept: a malformed or 1-3 character one is refused
+        # before any fill, and registering it would scrub that text from every later output.
+        code, _error = _validate_supplied_otp(function_args.get(name))
+        if code:
+            register_vault_redaction_value(code)
 
 
 def register_supplied_otps(tool_calls) -> None:
