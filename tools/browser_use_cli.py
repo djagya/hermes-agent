@@ -61,6 +61,26 @@ _hermes_ipc_timeout()
 del _hermes_ipc_timeout
 """
 
+# Prepended in monolith managed mode, after the timeout preamble. browser_harness opens every tab in the
+# background (new_tab() and a named daemon's own tab use Target.createTarget background=True) and
+# switch_tab() attaches without activating, so the page the agent drives is `hidden` and unfocused: sites
+# see a page nobody is looking at, Chrome throttles its timers, and a human handoff opened on whatever tab
+# happened to be in front. A managed slot belongs to one lease, so bringing the agent's tab forward
+# displaces nobody: switch_tab() activates by default, and each call starts with the attached tab in front.
+_MANAGED_FRONT_TAB_PREAMBLE = """\
+# hermes: managed slot works in the front tab
+def _hermes_front_tab():
+    try:
+        import browser_harness.helpers as _bh
+        if _bh.switch_tab.__defaults__ == (False,):
+            _bh.switch_tab.__defaults__ = (True,)
+        _bh.activate_tab(_bh.current_tab())
+    except Exception:
+        pass
+_hermes_front_tab()
+del _hermes_front_tab
+"""
+
 # The harness reports any 403 from the CDP endpoint as Chrome's "Allow remote debugging" popup. Behind
 # monolith browser-control a 403 is the gate refusing a lease token; say that instead.
 _GATE_REFUSED_HINT = (
@@ -805,7 +825,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         _code_is_managed = lambda: False  # noqa: E731
     managed = _code_is_managed()
     if managed:
-        code = _MANAGED_TIMEOUT_PREAMBLE + code
+        code = _MANAGED_TIMEOUT_PREAMBLE + _MANAGED_FRONT_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
     if workspace:
