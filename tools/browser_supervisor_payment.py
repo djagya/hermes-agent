@@ -312,6 +312,10 @@ class PaymentSupervisionMixin:
                     if record is None or record[3] not in (merchant, *allowed_frames):
                         raise PaymentPolicyError("Unapproved payment frame ancestry")
                     ancestor = record[4]
+                # A PSP field frame the page keeps hidden (Shopify's Maestro-only issue date and
+                # number) looks visible from inside its own document; judge its iframe element.
+                if parent and not await self._frame_rendered(fid, parent, child_sessions.get(parent, sid)):
+                    continue
                 fsid = child_sessions.get(fid, sid)
                 context = (
                     await self._cdp(
@@ -374,6 +378,31 @@ class PaymentSupervisionMixin:
                 await self._release_payment_object(fsid, obj)
             await self._release_payment_sessions(child_sessions)
             raise
+
+    async def _frame_rendered(self, fid: str, parent: str, parent_sid: str) -> bool:
+        """Whether the iframe element hosting ``fid`` is laid out and visible in its parent document."""
+        obj = None
+        try:
+            owner = (await self._cdp("DOM.getFrameOwner", {"frameId": fid}, session_id=parent_sid))["result"]
+            context = (await self._cdp(
+                "Page.createIsolatedWorld", {"frameId": parent, "worldName": "hermes-payment-ancestry"},
+                session_id=parent_sid))["result"]["executionContextId"]
+            obj = (await self._cdp(
+                "DOM.resolveNode", {"backendNodeId": owner["backendNodeId"], "executionContextId": context},
+                session_id=parent_sid))["result"]["object"]["objectId"]
+            return _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": obj,
+                "functionDeclaration": "function(){const r=this.getBoundingClientRect();return this.isConnected&&"
+                                       "this.getClientRects().length>0&&r.width>2&&r.height>2&&"
+                                       "getComputedStyle(this).visibility!=='hidden'}",
+                "returnByValue": True,
+            }, session_id=parent_sid)) is True
+        except (KeyError, TypeError, PaymentPolicyError):
+            # No resolvable owner element: not a frame the user can see or type into.
+            return False
+        finally:
+            if obj:
+                await self._release_payment_object(parent_sid, obj)
 
     async def _release_payment_sessions(self, sessions: dict) -> None:
         for sid in sessions.values():
@@ -505,9 +534,17 @@ _INSPECT = r"""(() => {
       (e.getAttribute('aria-label')||'')+' '+(e.placeholder||''),
     type:e.type, formIndex:e.form?Array.from(doc.forms).indexOf(e.form):null,
     maxLength:e.maxLength>0?e.maxLength:null}));
-  const visible = e => !e.disabled && !e.readOnly && e.isConnected &&
-    e.ownerDocument === doc && e.getClientRects().length>0 &&
-    getComputedStyle(e).visibility !== 'hidden';
+  // Honeypots and visually-hidden inputs are never fill targets: Shopify's PCI frames carry one
+  // aria-hidden, tabindex=-1, 1px input per card token around the real field, and filling one
+  // is a fraud signal.
+  const visible = e => {
+    if (e.disabled || e.readOnly || !e.isConnected || e.ownerDocument !== doc ||
+        e.getAttribute('aria-hidden') === 'true' || e.tabIndex < 0 || e.hasAttribute('data-honeypot-field'))
+      return false;
+    const r = e.getBoundingClientRect();
+    return e.getClientRects().length>0 && r.width > 2 && r.height > 2 &&
+      getComputedStyle(e).visibility !== 'hidden';
+  };
   const entries = elements.map((e,index)=>({e,index})).filter(x=>visible(x.e) &&
     !['hidden','submit','button','reset','file','image','checkbox','radio'].includes(x.e.type));
   const selected = new Set(entries.map(x=>x.index));

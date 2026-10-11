@@ -8,8 +8,9 @@ from urllib.parse import urlsplit
 
 # Reviewed hosted card-field origins a card fill may target besides the merchant page. Each entry
 # is a payment provider's own field iframe, never a merchant or bank site; add one per reviewed PSP.
-# Datatrans Secure Fields puts the number and the CVC in separate pay.datatrans.com frames.
-PAYMENT_PSP_ORIGINS = ("https://js.stripe.com", "https://pay.datatrans.com")
+# Datatrans Secure Fields puts the number and the CVC in separate pay.datatrans.com frames;
+# Shopify checkout puts every card field in its own checkout.pci.shopifyinc.com frame.
+PAYMENT_PSP_ORIGINS = ("https://js.stripe.com", "https://pay.datatrans.com", "https://checkout.pci.shopifyinc.com")
 
 
 class PaymentPolicyError(ValueError):

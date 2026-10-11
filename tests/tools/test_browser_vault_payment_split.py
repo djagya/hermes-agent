@@ -38,9 +38,18 @@ def _inspection(*documents):
     return PaymentInspection("op", "page", "target", MERCHANT, tuple(documents), (), 1e12)
 
 
-def test_datatrans_is_a_reviewed_canonical_psp_origin():
-    assert DATATRANS in PAYMENT_PSP_ORIGINS and STRIPE in PAYMENT_PSP_ORIGINS
+def test_reviewed_psp_origins_are_canonical():
+    assert {STRIPE, DATATRANS, "https://checkout.pci.shopifyinc.com"} == set(PAYMENT_PSP_ORIGINS)
     assert all(https_origin(o) == o for o in PAYMENT_PSP_ORIGINS)
+
+
+@pytest.mark.parametrize("label, token", [
+    ("Expiration date (MM / YY)", "cc-exp"), ("Expiry date", "cc-exp"),
+    ("Issue date (MM / YY)", None), ("Start date MM/YY", None), ("Valid from", None), ("Issue number", None),
+])
+def test_a_maestro_issue_or_start_date_is_never_the_expiry(label, token):
+    control = classify_checkout_control(LoginControl.from_dict({"index": 0, "autocomplete": "off", "label": label}))
+    assert (control.token if control else None) == token
 
 
 def test_one_document_is_accepted_as_before():
