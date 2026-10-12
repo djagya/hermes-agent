@@ -67,14 +67,29 @@ del _hermes_ipc_timeout
 # see a page nobody is looking at, Chrome throttles its timers, and a human handoff opened on whatever tab
 # happened to be in front. A managed slot belongs to one lease, so bringing the agent's tab forward
 # displaces nobody: switch_tab() activates by default, and each call starts with the attached tab in front.
+# Target.activateTarget (switch_tab(activate=True)) makes the tab visible but leaves the window without
+# keyboard focus (document.hasFocus() false, measured on a slot); Page.bringToFront also focuses it.
 _MANAGED_FRONT_TAB_PREAMBLE = """\
-# hermes: managed slot works in the front tab
+# hermes: managed slot works in the front, focused tab
 def _hermes_front_tab():
     try:
         import browser_harness.helpers as _bh
-        if _bh.switch_tab.__defaults__ == (False,):
-            _bh.switch_tab.__defaults__ = (True,)
-        _bh.activate_tab(_bh.current_tab())
+        if not getattr(_bh, "_hermes_front_tab_patched", False):
+            _switch = _bh.switch_tab
+
+            def switch_tab(target, activate=True):
+                sid = _switch(target, activate=activate)
+                if activate:
+                    try:
+                        _bh.cdp("Page.bringToFront")
+                    except Exception:
+                        pass
+                return sid
+
+            _bh.switch_tab = switch_tab
+            _bh._hermes_front_tab_patched = True
+        globals()["switch_tab"] = _bh.switch_tab
+        _bh.cdp("Page.bringToFront")
     except Exception:
         pass
 _hermes_front_tab()
