@@ -1,6 +1,6 @@
 {
-  "source": "https://github.com/NousResearch/hermes-homeassistant",
-  "commit": "ba30cb0cf86c52bdb5cde98974bc062e97966529",
+  "source": "https://github.com/NousResearch/hermes-official-plugins (subdir homeassistant)",
+  "commit": "682b22d019a1109421faa62efe43e16b23c2ebef",
   "version": "2.0.1",
   "catalog_entry": "plugin-catalog/homeassistant.yaml",
   "why": "The image sets HERMES_DISABLE_LAZY_INSTALLS=1, so the left-core migration cannot fetch this catalog plugin at gateway start. Bundled here (a bundled kind: platform plugin auto-loads deferred; its client tools pre-register) at the catalog pin. Bump together with plugin-catalog/homeassistant.yaml.",
@@ -23,13 +23,13 @@
       "upstream_sha256": "05c0a2fd04a5746f360393b9d765d473c17e253a695a83c110d3936495416916"
     },
     "plugin.yaml": {
-      "upstream_sha256": "7a3655acde9c602acac819db47d9cb9e3124728d495dc8e15dd40171b7c51618"
+      "upstream_sha256": "b50e58215d9d1add8c8a7aed3bafdec610bf2d88c7ef876d7eaf43fa41e4b40f"
     },
     "LICENSE": {
       "upstream_sha256": "5f79d321c17de8ef6e5f34967dc5b484afebeeefd87180890d9741941f6b815f"
     },
     "README.md": {
-      "upstream_sha256": "4726a39d1dd3b804ca2c28253fceaceaf2c0bc13d54b9f3cc2ffaa1eb275cc88"
+      "upstream_sha256": "3344abf94ea933597cb56aa8217e626b32d8a5595d70ea668b64f0fd8bf73b1c"
     }
   },
   "tests": {

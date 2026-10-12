@@ -3,7 +3,7 @@ label: Home Assistant
 kind: platform
 version: 2.0.1
 author: NousResearch
-homepage: https://github.com/NousResearch/hermes-homeassistant
+homepage: https://github.com/NousResearch/hermes-official-plugins/tree/main/homeassistant
 description: >
   Home Assistant for Hermes Agent: a gateway platform adapter plus four
   smart-home tools. The adapter subscribes to HA's WebSocket event bus and
