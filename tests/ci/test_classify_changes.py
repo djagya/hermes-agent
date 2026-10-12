@@ -419,21 +419,21 @@ CASES = {
     # Real SSH/Docker backend lane: the backends, the terminal tool, the real tests
     # and their sshd harness start it; neighbouring tools code does not.
     "ssh backend → remote_backends": (
-        ["tools/environments/ssh.py"], _lanes(python=True, scan=True, remote_backends=True)),
+        ["tools/environments/ssh.py"], _lanes(python=True, scan=True, remote_backends=True, py_full=False, py_roots=[["tests/tools/test_ssh*.py", "tests/test_ssh*.py", "tests/tools/"]], os_tests=True)),
     "docker backend → remote_backends": (
-        ["tools/environments/docker.py"], _lanes(python=True, scan=True, remote_backends=True)),
+        ["tools/environments/docker.py"], _lanes(python=True, scan=True, remote_backends=True, py_full=False, py_roots=[["tests/tools/test_docker*.py", "tests/test_docker*.py", "tests/tools/"]], os_tests=True)),
     "terminal tool sibling → remote_backends": (
-        ["tools/terminal_tool_backends.py"], _lanes(python=True, scan=True, remote_backends=True)),
+        ["tools/terminal_tool_backends.py"], _lanes(python=True, scan=True, remote_backends=True, py_full=False, py_roots=[["tests/tools/test_terminal_tool_backends*.py", "tests/test_terminal_tool_backends*.py", "tests/tools/"]], os_tests=True)),
     "real docker backend test → remote_backends": (
         ["tests/tools/test_docker_backend_real.py"],
-        _lanes(python=True, python_prod=False, scan=True, remote_backends=True)),
+        _lanes(python=True, python_prod=False, scan=True, remote_backends=True, py_full=False, py_roots=[["tests/tools/test_docker_backend_real.py"]], os_tests=True)),
     "mocked docker unit test → no remote_backends": (
-        ["tests/tools/test_docker_environment.py"], _lanes(python=True, python_prod=False, scan=True)),
+        ["tests/tools/test_docker_environment.py"], _lanes(python=True, python_prod=False, scan=True, py_full=False, py_roots=[["tests/tools/test_docker_environment.py"]], os_tests=True)),
     "sshd harness → remote_backends": (
-        ["scripts/ci/start_test_sshd.sh"], _lanes(python=True, remote_backends=True)),
+        ["scripts/ci/start_test_sshd.sh"], _lanes(python=True, remote_backends=True, py_full=False, py_roots=[["tests/ci/"]], os_tests=True)),
     "sshd container setup → remote_backends": (
-        ["scripts/ci/test_sshd_container_setup.sh"], _lanes(python=True, remote_backends=True)),
-    "other tool → no remote_backends": (["tools/file_tools.py"], _lanes(python=True, scan=True)),
+        ["scripts/ci/test_sshd_container_setup.sh"], _lanes(python=True, remote_backends=True, py_full=False, py_roots=[["tests/ci/"]], os_tests=True)),
+    "other tool → no remote_backends": (["tools/file_tools.py"], _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/tools/test_file_tools*.py", "tests/test_file_tools*.py", "tests/tools/"]], os_tests=True)),
     "gateway python → no slow lane": (["gateway/run.py", "agent/x.py"], _lanes(python=True, scan=True, py_full=False, py_roots=[["tests/gateway/test_run*.py", "tests/relay/test_run*.py", "tests/test_run*.py", "tests/gateway/", "tests/relay/"], ["tests/agent/test_x*.py", "tests/test_x*.py", "tests/agent/"]])),
     "desktop renderer → no slow lane": (["apps/desktop/src/app/chat/composer.tsx"], _lanes(frontend=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"])),
     "python e2e suite → e2e only": (

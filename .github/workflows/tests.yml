@@ -75,6 +75,12 @@ jobs:
           PY_SCOPE: ${{ inputs.scope }}
           PY_ROOTS: ${{ inputs.roots }}
         run: python3 scripts/ci/select_test_roots.py
+      - name: Check the checkout is clean
+        # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
+        # leaves an untracked or modified file in the checkout is reported here. Runs only when
+        # every earlier step passed: a step that failed midway can leave its own temp files
+        # (a half-extracted download, a worktree its later cleanup never removed).
+        uses: ./.github/actions/check-clean-worktree
 
   test:
     name: Run tests (${{ matrix.slice }})
