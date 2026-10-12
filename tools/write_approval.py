@@ -1107,7 +1107,7 @@ def _find_skill_path(name: str) -> Optional[Path]:
     return found["path"] if found else None
 
 
-def _staged_base(name: str, target_label: str, staged: Optional[Dict[str, Dict[str, str]]]) -> str:
+def _staged_base(name: str, target_label: str, staged: Optional[dict[str, dict[str, str]]]) -> str:
     """What an op diffs against: the content earlier ops of the same batch left in this file,
     else the on-disk copy (empty for a file that does not exist yet)."""
     files = (staged or {}).get(name)
@@ -1124,7 +1124,7 @@ def _staged_base(name: str, target_label: str, staged: Optional[Dict[str, Dict[s
 
 
 def skill_pending_diff(
-    record: Dict[str, Any], staged: Optional[Dict[str, Dict[str, str]]] = None
+    record: dict[str, Any], staged: Optional[dict[str, dict[str, str]]] = None
 ) -> str:
     """Full content (create) or unified diff vs. the base file (edit/patch/write_file),
     rendered by /skills diff <id> on surfaces that can show it. ``staged`` carries the file
@@ -1187,8 +1187,8 @@ def _fold_patch(base: str, old_string: str, new_string: str, replace_all: Any = 
     return folded, None
 
 
-def _fold_staged(staged: Dict[str, Dict[str, str]], action: str, name: str,
-                 op: Dict[str, Any]) -> None:
+def _fold_staged(staged: dict[str, dict[str, str]], action: str, name: str,
+                 op: dict[str, Any]) -> None:
     """Record what one op leaves in the staged view the next op diffs against."""
     if not name:
         return
@@ -1214,14 +1214,14 @@ def _fold_staged(staged: Dict[str, Dict[str, str]], action: str, name: str,
         files.pop(label, None)
 
 
-def _batch_pending_diff(payload: Dict[str, Any]) -> str:
+def _batch_pending_diff(payload: dict[str, Any]) -> str:
     """Per-op diffs for a staged ``batch`` payload (skill_manage operations[]). Ops apply in
     order, so each op reuses the single-op path above with the earlier ops' staged content as
     its base (disk only for files no earlier op touched) — a patch to a skill an earlier op
     created shows a real diff, which is the case this renderer exists for."""
     ops = [op for op in (payload.get("operations") or []) if isinstance(op, dict)]
     total = len(ops)
-    staged: Dict[str, Dict[str, str]] = {}
+    staged: dict[str, dict[str, str]] = {}
     parts = []
     for i, op in enumerate(ops):
         op_action, op_name = op.get("action", ""), op.get("name") or ""
