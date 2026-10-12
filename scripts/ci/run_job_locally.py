@@ -473,6 +473,7 @@ def run_shell(
             cmd = ["docker", "exec", "-i", "--user", step_user(), "-w", str(cwd)]
             for key, value in step_env.items():
                 cmd += ["-e", f"{key}={value}"]
+            # health: allow HX006 -- a CI step runs to its end; the job's own timeout-minutes bounds it
             proc = subprocess.run([*cmd, ctx.container, *shell], check=False)
         else:
             step_env["PATH"] = ":".join([
@@ -480,6 +481,7 @@ def run_shell(
                 *ctx.path_prepend,
                 os.environ["PATH"],
             ])
+            # health: allow HX006 -- a CI step runs to its end; the job's own timeout-minutes bounds it
             proc = subprocess.run(shell, cwd=cwd, env={**os.environ, **step_env}, check=False)
         ctx.env.update(_read_kv_file(genv))
         # GitHub prepends each GITHUB_PATH line in order: the last line ends up first.
@@ -547,6 +549,7 @@ def build_push(with_: dict, ctx: Context, cwd: Path) -> None:
             if line.strip():
                 cmd += [flag, line.strip()]
     print("+ " + " ".join(cmd), flush=True)
+    # health: allow HX006 -- the image build runs to its end; the job's own timeout-minutes bounds it
     if subprocess.run(cmd, cwd=cwd, env={**os.environ, **ctx.env}, check=False).returncode != 0:
         raise StepError("docker buildx build failed")
 
@@ -912,7 +915,7 @@ def start_container(image: str, workspace: Path, tools: Path) -> str:
     try:
         _setup_container(cid)
     except BaseException:
-        subprocess.run(["docker", "rm", "-f", cid], capture_output=True, check=False)
+        subprocess.run(["docker", "rm", "-f", cid], capture_output=True, check=False, timeout=120)
         raise
     return cid
 

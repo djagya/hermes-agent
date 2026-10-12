@@ -269,6 +269,7 @@ def load_cli_config() -> dict[str, Any]:
 
     # Only a file's terminal section may overwrite terminal env vars already set by .env.
     _file_has_terminal_config = False
+    file_config: dict[str, Any] = {}
 
     if config_path.exists():
         try:
@@ -286,11 +287,13 @@ def load_cli_config() -> dict[str, Any]:
     from hermes_cli.config import _expand_env_vars
     defaults = _expand_env_vars(defaults)
 
-    # Administrator-pinned (managed scope) values overlay LAST; cli.py builds its config
-    # independently of hermes_cli.config, so this keeps parity with `hermes config`. Fail-open.
+    # dlz: managed scope seeds the leaves the user omitted. Pass the raw user document so CLI
+    # schema defaults do not shadow those seeds; a present user leaf wins (live `config set`
+    # writes the user file). cli.py builds its config independently of hermes_cli.config, so
+    # without this the TUI/CLI surface would ignore managed seeds. Fail-open.
     from hermes_cli import managed_scope
 
-    defaults = managed_scope.apply_managed_overlay(defaults)
+    defaults = managed_scope.apply_managed_overlay(defaults, user_raw=file_config)
 
     _mirror_config_to_env(defaults, _file_has_terminal_config)
 
