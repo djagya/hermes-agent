@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
-import cron.incidents as incidents
-import cron.scheduler as scheduler
+from cron import incidents
+from cron import scheduler
 from cron.provider_budget import (
     BUDGET_FAILURE_TYPE, TOOL_BUDGET_ERROR_PREFIX, is_provider_budget_error, tool_budget_failure)
 from cron.scheduler_failure_copy import classify_cron_failure_reason
@@ -137,7 +137,7 @@ def test_xai_spending_limit_403_is_billing_not_auth():
 
 
 def test_tool_budget_notice_names_the_tool_and_the_fix(monkeypatch):
-    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+    monkeypatch.setattr(scheduler, "load_config", dict)
     monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])
     error = tool_budget_failure([_tool("x_search", XAI_SPENDING_LIMIT_RESULT)])
     assert error is not None

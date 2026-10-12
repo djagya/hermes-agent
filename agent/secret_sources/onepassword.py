@@ -246,7 +246,7 @@ def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: st
     return value
 
 
-def _split_reference(reference: str) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
+def _split_reference(reference: str) -> Optional[tuple[str, str, tuple[str, ...]]]:
     """``op://vault/item/[section/]field`` → ``(vault, item, field_path)``; None for shapes the
     item-JSON resolver does not handle (query attributes like ``?attribute=otp``, odd depth)."""
     if "?" in reference:
@@ -257,7 +257,7 @@ def _split_reference(reference: str) -> Optional[Tuple[str, str, Tuple[str, ...]
     return parts[0], parts[1], tuple(parts[2:])
 
 
-def _field_from_item(item: dict, field_path: Tuple[str, ...]) -> Optional[str]:
+def _field_from_item(item: dict, field_path: tuple[str, ...]) -> Optional[str]:
     """The value ``op read`` would return for ``field_path``, or None when the item JSON can't say
     unambiguously (no match, several matches, no value) — the caller then falls back to ``op read``."""
     want = field_path[-1]
@@ -279,11 +279,11 @@ def _field_from_item(item: dict, field_path: Tuple[str, ...]) -> Optional[str]:
     return value
 
 
-def _item_groups(refs: Dict[str, str]) -> Tuple[Dict[Tuple[str, str], Dict[str, Tuple[str, ...]]], Dict[str, str]]:
+def _item_groups(refs: dict[str, str]) -> tuple[dict[tuple[str, str], dict[str, tuple[str, ...]]], dict[str, str]]:
     """Split ``refs`` into ``{(vault, item): {name: field_path}}`` for items referenced 2+ times
     (one ``op item get`` each) and the remainder resolved one ``op read`` apiece."""
-    by_item: Dict[Tuple[str, str], Dict[str, Tuple[str, ...]]] = {}
-    singles: Dict[str, str] = {}
+    by_item: dict[tuple[str, str], dict[str, tuple[str, ...]]] = {}
+    singles: dict[str, str] = {}
     for name, ref in refs.items():
         split = _split_reference(ref)
         if split is None:
@@ -318,7 +318,7 @@ def _backoff_path(home_path: Optional[Path]) -> Path:
     return get_default_hermes_root(home=resolve_cache_home(home_path)) / "cache" / _BACKOFF_BASENAME
 
 
-def _read_backoffs(home_path: Optional[Path]) -> Dict[str, float]:
+def _read_backoffs(home_path: Optional[Path]) -> dict[str, float]:
     try:
         with open(_backoff_path(home_path), "r", encoding="utf-8-sig") as f:
             payload = json.load(f)
@@ -368,7 +368,7 @@ def _last_good_path(home_path: Optional[Path]) -> Path:
     return resolve_cache_home(home_path) / "cache" / _LAST_GOOD_BASENAME
 
 
-def _read_last_good(home_path: Optional[Path], identity: str) -> Dict[str, str]:
+def _read_last_good(home_path: Optional[Path], identity: str) -> dict[str, str]:
     try:
         with open(_last_good_path(home_path), "r", encoding="utf-8-sig") as f:
             payload = json.load(f)
@@ -380,7 +380,7 @@ def _read_last_good(home_path: Optional[Path], identity: str) -> Dict[str, str]:
     return {k: v for k, v in refs.items() if isinstance(k, str) and isinstance(v, str)}
 
 
-def _write_last_good(home_path: Optional[Path], identity: str, refs: Dict[str, str]) -> None:
+def _write_last_good(home_path: Optional[Path], identity: str, refs: dict[str, str]) -> None:
     path = _last_good_path(home_path)
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
@@ -451,7 +451,7 @@ def fetch_onepassword_secrets(
                     _write_last_good(home_path, identity, last)
             return dict(cached.secrets), warnings
 
-    def _fill_from_last_good(secrets: Dict[str, str], names: List[str], reason: str) -> None:
+    def _fill_from_last_good(secrets: dict[str, str], names: list[str], reason: str) -> None:
         if not keep_last_good or not names:
             return
         last = _read_last_good(home_path, identity)
@@ -464,11 +464,11 @@ def fetch_onepassword_secrets(
             warnings.append(f"{reason}; {len(names) - len(filled)} reference(s) have no last good value")
 
     if keep_last_good and _cache_only():
-        secrets_only: Dict[str, str] = {}
+        secrets_only: dict[str, str] = {}
         _fill_from_last_good(secrets_only, sorted(valid), f"{CACHE_ONLY_ENV} is set; op not called")
         return secrets_only, warnings
 
-    secrets: Dict[str, str] = {}
+    secrets: dict[str, str] = {}
     if use_cache:
         until = _active_backoff(auth_fp, home_path)
         if until is not None:
@@ -483,7 +483,7 @@ def fetch_onepassword_secrets(
                            "secrets.onepassword.binary_path to its absolute location.")
 
     read_errors = 0
-    transient_failed: List[str] = []
+    transient_failed: list[str] = []
     rate_limit_msg: Optional[str] = None
     rate_limit_detail = ""
 

@@ -2343,7 +2343,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
             return copy.deepcopy(hit) if want_deepcopy else hit
 
         config = copy.deepcopy(DEFAULT_CONFIG)
-        user_raw: Dict[str, Any] = {}
+        user_raw: dict[str, Any] = {}
 
         if user_sig is not None:
             try:
@@ -3523,7 +3523,6 @@ def _legacy_gateway_platforms_key(requested_key: str) -> Optional[str]:
 def _exit_if_key_managed(key: str, action: str) -> None:
     """Config leaves are live-settable; managed .env refuse lives on the env writers."""
     del key, action
-    return
 
 
 def _touch_skin_file(key: str, value: Any) -> None:

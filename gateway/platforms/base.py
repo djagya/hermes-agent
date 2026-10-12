@@ -1769,7 +1769,7 @@ _SEND_ERROR_CLASSIFIERS: tuple[tuple[str, Callable[[str], bool]], ...] = (
 
 def build_delivery_receipt(
     result: "SendResult", *, platform: str, chat_id: Optional[str], thread_id: Optional[str],
-    chat_kind: Optional[str] = None, chat_handle: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    chat_kind: Optional[str] = None, chat_handle: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Canonical delivery receipt from a SendResult, or ``None`` without a confirmed ACK.
 
     ``message_ids`` keeps send order with the primary id LAST (``SendResult.message_id``
@@ -1793,7 +1793,7 @@ def build_delivery_receipt(
         message_ids.append(str(primary))
     if not message_ids:
         return None
-    receipt: Dict[str, Any] = {
+    receipt: dict[str, Any] = {
         "platform": str(platform),
         "chat_id": str(chat_id) if chat_id is not None else None,
         "thread_id": str(thread_id) if thread_id is not None else None,

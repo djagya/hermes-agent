@@ -28,6 +28,7 @@ def test_image_bundles_the_homeassistant_plugin(built_image: str) -> None:
         ["docker", "run", "--rm", "--network=none", "--user", "hermes", "--entrypoint",
          "/opt/hermes/.venv/bin/python", "-w", "/opt/hermes", built_image, "-c", _PROBE],
         capture_output=True, text=True, timeout=120,
+        check=False,
     )
     assert r.returncode == 0, r.stderr[-2000:]
     out = json.loads(r.stdout.strip().splitlines()[-1])

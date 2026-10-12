@@ -1637,11 +1637,11 @@ def test_module_worker_argv_ignores_hermes_checkout_in_workspace(tmp_path):
     (shadow / "main.py").write_text("raise SystemExit(97)\n")
 
     legacy = subprocess.run([sys.executable, "-m", "hermes_cli.main", "--version"], cwd=tmp_path,
-                            capture_output=True, text=True, timeout=60)
+                            capture_output=True, text=True, timeout=60, check=False)
     assert legacy.returncode == 97, "fixture no longer reproduces the cwd shadow"
 
     r = subprocess.run(kbd._module_hermes_argv() + ["--version"], cwd=tmp_path,
-                       capture_output=True, text=True, timeout=60)
+                       capture_output=True, text=True, timeout=60, check=False)
     assert r.returncode == 0, f"stderr={r.stderr[:300]!r}"
 
 

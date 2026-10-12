@@ -12,19 +12,19 @@ from hermes_cli.cli_commands_mixin import CLICommandsMixin
 
 def test_managed_connect_refusal_from_env(monkeypatch):
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
     assert managed_connect_refusal() == MANAGED_CONNECT_REFUSAL
 
 
 def test_unmanaged_connect_refusal_is_none(monkeypatch):
     monkeypatch.delenv("HERMES_BROWSER_CONTROL_URL", raising=False)
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
     assert managed_connect_refusal() is None
 
 
 def test_managed_connect_refusal_fails_closed_on_probe_error(monkeypatch):
     monkeypatch.delenv("HERMES_BROWSER_CONTROL_URL", raising=False)
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
 
     def boom():
         raise RuntimeError("probe exploded")
@@ -37,7 +37,7 @@ def test_handle_browser_connect_refuses_without_writing_env(monkeypatch, capsys)
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_KEY", "secret-key")
     monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
     launched = []
     monkeypatch.setattr(
         "hermes_cli.cli_commands_mixin.launch_chrome_debug",
@@ -52,7 +52,7 @@ def test_handle_browser_connect_refuses_without_writing_env(monkeypatch, capsys)
 
 def test_launch_chrome_debug_does_not_spawn_when_managed(monkeypatch):
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
     monkeypatch.setattr(
         "hermes_cli.browser_connect.get_chrome_debug_candidates",
         lambda system: ["/bin/chrome"],

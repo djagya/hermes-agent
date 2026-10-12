@@ -86,6 +86,7 @@ def host_uses_containerd_store() -> bool:
             capture_output=True,
             text=True,
             timeout=30,
+            check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return False
@@ -472,14 +473,14 @@ def run_shell(
             cmd = ["docker", "exec", "-i", "--user", step_user(), "-w", str(cwd)]
             for key, value in step_env.items():
                 cmd += ["-e", f"{key}={value}"]
-            proc = subprocess.run([*cmd, ctx.container, *shell])
+            proc = subprocess.run([*cmd, ctx.container, *shell], check=False)
         else:
             step_env["PATH"] = ":".join([
                 str(shim),
                 *ctx.path_prepend,
                 os.environ["PATH"],
             ])
-            proc = subprocess.run(shell, cwd=cwd, env={**os.environ, **step_env})
+            proc = subprocess.run(shell, cwd=cwd, env={**os.environ, **step_env}, check=False)
         ctx.env.update(_read_kv_file(genv))
         # GitHub prepends each GITHUB_PATH line in order: the last line ends up first.
         for line in gpath.read_text(encoding="utf-8-sig").splitlines():
@@ -546,7 +547,7 @@ def build_push(with_: dict, ctx: Context, cwd: Path) -> None:
             if line.strip():
                 cmd += [flag, line.strip()]
     print("+ " + " ".join(cmd), flush=True)
-    if subprocess.run(cmd, cwd=cwd, env={**os.environ, **ctx.env}).returncode != 0:
+    if subprocess.run(cmd, cwd=cwd, env={**os.environ, **ctx.env}, check=False).returncode != 0:
         raise StepError("docker buildx build failed")
 
 
@@ -563,9 +564,9 @@ def setup_uv(with_: dict, ctx: Context, tools: Path) -> None:
         )
         dest.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(suffix=".tgz", dir=tools) as tgz:
-            urllib.request.urlretrieve(url, tgz.name)  # noqa: S310 — fixed https URL
+            urllib.request.urlretrieve(url, tgz.name)
             # The binary runs with docker-socket access: verify it like setup-uv does.
-            with urllib.request.urlopen(url + ".sha256") as resp:  # noqa: S310
+            with urllib.request.urlopen(url + ".sha256") as resp:
                 want = resp.read().decode().split()[0]
             got = hashlib.sha256(Path(tgz.name).read_bytes()).hexdigest()
             if got != want:
@@ -911,7 +912,7 @@ def start_container(image: str, workspace: Path, tools: Path) -> str:
     try:
         _setup_container(cid)
     except BaseException:
-        subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", cid], capture_output=True, check=False)
         raise
     return cid
 
@@ -973,6 +974,7 @@ def remove_job_outputs(
         subprocess.run(
             ["docker", "exec", container, "rm", "-rf", "--", *map(str, paths)],
             capture_output=True,
+            check=False,
         )
         return
     for path in paths:
@@ -1066,7 +1068,8 @@ def main(argv: list[str] | None = None) -> int:
             remove_job_outputs(workspace, before_job, ctx.container)
             if ctx.container:
                 subprocess.run(
-                    ["docker", "rm", "-f", ctx.container], capture_output=True
+                    ["docker", "rm", "-f", ctx.container], capture_output=True,
+                    check=False,
                 )
         if ctx.failed or ctx.skipped:
             blocked.add(job)

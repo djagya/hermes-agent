@@ -122,7 +122,7 @@ def test_underdetermined_receipt_yields_no_link(receipt):
 
 
 def test_failed_send_writes_no_receipt(db):
-    session_id, row_id = _session_with_assistant_row(db)
+    _session_id, row_id = _session_with_assistant_row(db)
     # The ledger marks the row failed; no receipt write may happen.
     dl.record_obligation(obligation_id="ob-f", session_key="k", platform="telegram",
                          chat_id="-1004500", thread_id=None, content="answer")
@@ -133,7 +133,7 @@ def test_failed_send_writes_no_receipt(db):
 
 
 def test_ambiguous_attempting_send_writes_no_receipt(db):
-    session_id, row_id = _session_with_assistant_row(db)
+    _session_id, row_id = _session_with_assistant_row(db)
     dl.record_obligation(obligation_id="ob-a", session_key="k", platform="telegram",
                          chat_id="-1004500", thread_id=None, content="answer")
     dl.mark_attempting("ob-a")  # crashed mid-await: the platform MAY have it
@@ -169,7 +169,7 @@ def test_receipt_write_never_lands_on_a_neighbour_row(db):
 
 
 def test_legacy_rows_without_receipts_stay_safe(db):
-    session_id, row_id = _session_with_assistant_row(db)
+    session_id, _row_id = _session_with_assistant_row(db)
     messages = db.get_messages(session_id)
     assert "platform_delivery" not in messages[0] or \
         messages[0]["platform_delivery"] is None

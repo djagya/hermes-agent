@@ -2832,7 +2832,7 @@ def release_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     return _with_job(job_id, apply, False)
 
 
-def oneshot_dispatch_exhausted(job: Dict[str, Any]) -> bool:
+def oneshot_dispatch_exhausted(job: dict[str, Any]) -> bool:
     """True for a finite one-shot whose ``repeat.completed`` already reached ``repeat.times``:
     ``claim_dispatch`` will reject every further fire until it is re-armed."""
     if (job.get("schedule") or {}).get("kind") != "once":

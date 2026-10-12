@@ -154,7 +154,7 @@ def _lock_fd(fd: int) -> None:
             os.write(fd, b"\0")
             os.fsync(fd)
         os.lseek(fd, 0, os.SEEK_SET)
-        getattr(_msvcrt, "locking")(fd, getattr(_msvcrt, "LK_LOCK"), 1)
+        _msvcrt.locking(fd, _msvcrt.LK_LOCK, 1)
         return
     raise PendingWriteError("no supported cross-process pending-store lock")
 
@@ -164,7 +164,7 @@ def _unlock_fd(fd: int) -> None:
         _fcntl.flock(fd, _fcntl.LOCK_UN)
     elif _msvcrt is not None:  # pragma: no cover - Windows
         os.lseek(fd, 0, os.SEEK_SET)
-        getattr(_msvcrt, "locking")(fd, getattr(_msvcrt, "LK_UNLCK"), 1)
+        _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -203,18 +203,18 @@ def _pending_lock(subsystem: str):
         os.close(fd)
 
 
-def _canonical_payload(payload: Dict[str, Any]) -> bytes:
+def _canonical_payload(payload: dict[str, Any]) -> bytes:
     """Stable bytes for semantic dedupe, including provenance/audit context."""
     return json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
 
 
-def _payload_sha256(payload: Dict[str, Any]) -> str:
+def _payload_sha256(payload: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_payload(payload)).hexdigest()
 
 
-def consume_pending_apply_capability(subsystem: str, payload: Dict[str, Any]) -> bool:
+def consume_pending_apply_capability(subsystem: str, payload: dict[str, Any]) -> bool:
     """Consume the one-shot capability installed by ``apply_pending_record``."""
     capability = _pending_apply_capability.get()
     if not isinstance(capability, dict) or capability.get("consumed"):
@@ -227,7 +227,7 @@ def consume_pending_apply_capability(subsystem: str, payload: Dict[str, Any]) ->
     return True
 
 
-def _load_pending_file(path: Path) -> Optional[Dict[str, Any]]:
+def _load_pending_file(path: Path) -> Optional[dict[str, Any]]:
     try:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
@@ -236,12 +236,12 @@ def _load_pending_file(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def _validated_pending_record(
-    record: Optional[Dict[str, Any]],
+    record: Optional[dict[str, Any]],
     subsystem: str,
     pending_id: str,
     *,
     require_current_schema: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Validate identity and payload binding for one pending record."""
     if not isinstance(record, dict):
         raise PendingWriteError("pending record is not an object")
@@ -273,8 +273,8 @@ def _validated_pending_record(
 
 
 def _atomic_write_pending_record(
-    directory: Path, path: Path, record: Dict[str, Any]
-) -> Dict[str, Any]:
+    directory: Path, path: Path, record: dict[str, Any]
+) -> dict[str, Any]:
     """Durably replace one pending record and verify its exact read-back."""
     data = (
         json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -306,8 +306,8 @@ def _atomic_write_pending_record(
     )
 
 
-def stage_write(subsystem: str, payload: Dict[str, Any],
-                *, summary: str, origin: str) -> Dict[str, Any]:
+def stage_write(subsystem: str, payload: dict[str, Any],
+                *, summary: str, origin: str) -> dict[str, Any]:
     """Durably persist or deduplicate one pending write.
 
     The call succeeds only after an atomic write and exact read-back. A disk or
@@ -415,14 +415,14 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
         ) from exc
 
 
-def list_pending(subsystem: str) -> List[Dict[str, Any]]:
+def list_pending(subsystem: str) -> list[dict[str, Any]]:
     """Return all verified pending records for ``subsystem``, oldest first."""
     if subsystem not in _SUBSYSTEMS:
         return []
     d = _pending_dir(subsystem)
     if not d.exists():
         return []
-    records: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     try:
         _ensure_private_dir(d.parent)
         _ensure_private_dir(d)
@@ -452,7 +452,7 @@ def _valid_pending_id(value: str) -> bool:
     )
 
 
-def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
+def get_pending(subsystem: str, pending_id: str) -> Optional[dict[str, Any]]:
     """Return one verified pending record by id, or ``None``."""
     if subsystem not in _SUBSYSTEMS or not _valid_pending_id(pending_id):
         return None
@@ -502,7 +502,7 @@ def apply_pending_record(subsystem: str, pending_id: str, callback,
     ):
         return False, "invalid expected_payload_sha256: must be a 64-character hex digest"
 
-    def _verify_live_claim(directory: Path) -> tuple[Path, Dict[str, Any]]:
+    def _verify_live_claim(directory: Path) -> tuple[Path, dict[str, Any]]:
         path = directory / f"{pending_id}.json"
         if not path.is_file():
             raise PendingWriteError(
@@ -882,7 +882,7 @@ class GateDecision:
         user-facing "staged for approval" note.
     """
 
-    __slots__ = ("allow", "blocked", "stage", "message")
+    __slots__ = ("allow", "blocked", "message", "stage")
 
     def __init__(self, *, allow=False, blocked=False, stage=False, message=""):
         self.allow = allow
@@ -1028,9 +1028,6 @@ def _prompt_inline_memory_approval(summary: str, detail: str) -> Optional[bool]:
         return None
 
     header = summary.strip() or "Save to memory?"
-    body = detail.strip()
-    description = f"Save to memory: {header}"
-    command = body if body else header
     # Invoke the callback directly instead of via prompt_dangerous_approval:
     # that wrapper swallows callback exceptions into "deny", which would
     # silently refuse the write. Direct invocation lets a crashed prompt fall

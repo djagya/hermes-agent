@@ -2105,7 +2105,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
 
     def _start_pending_voice_stt(
         self, event, adapter, source, *, log_context: str, metadata=_UNSET,
-    ) -> "asyncio.Task | None":
+    ) -> asyncio.Task | None:
         """Start this event's clip transcription as a tracked background task; never await it.
 
         Receipt/ordering fix: delivery proceeds while a long clip transcribes. Echo ownership is

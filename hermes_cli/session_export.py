@@ -142,7 +142,7 @@ def _append_session_messages(lines: list[str], session: dict[str, Any], *, headi
                 lines += [f"[View on platform]({platform_url})", ""]
 
 
-def _platform_message_url(message: Dict[str, Any]) -> Optional[str]:
+def _platform_message_url(message: dict[str, Any]) -> Optional[str]:
     """Direct platform link from a stored delivery receipt; ``None`` when the row
     carries no receipt or the receipt lacks enough truth to build one (never guessed)."""
     receipt = message.get("platform_delivery")

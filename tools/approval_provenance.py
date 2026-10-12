@@ -49,7 +49,7 @@ _MAX_MARKER_CHARS = 200
 # Effects that decide what a helper can DO. Name-based, deliberately coarse — this is
 # provenance for a reviewer, not a sandbox. Matched as call function names or dotted
 # roots anywhere in the def's body.
-_EFFECT_CALLS: Dict[str, str] = {
+_EFFECT_CALLS: dict[str, str] = {
     "open": "file open", "exec": "dynamic code exec", "eval": "dynamic code eval",
     "compile": "dynamic code compile", "input": "interactive input",
     "subprocess": "subprocess spawn", "os.system": "shell execution",
@@ -59,17 +59,17 @@ _EFFECT_CALLS: Dict[str, str] = {
     "socket": "raw network", "http.client": "HTTP client",
 }
 # Attribute/method reads that themselves signal network egress or code loading.
-_EFFECT_ATTRS: Dict[str, str] = {
+_EFFECT_ATTRS: dict[str, str] = {
     "urlopen": "HTTP fetch", "urllib.request.urlopen": "HTTP fetch",
     "getenv": "env read", "environ.get": "env read",
 }
 
 
 class _DefRecord:
-    __slots__ = ("name", "kind", "source", "args", "markers", "cell_index", "superseded")
+    __slots__ = ("args", "cell_index", "kind", "markers", "name", "source", "superseded")
 
     def __init__(self, name: str, kind: str, source: str, args: str,
-                 markers: List[str], cell_index: int) -> None:
+                 markers: list[str], cell_index: int) -> None:
         self.name = name
         self.kind = kind
         self.source = source
@@ -80,15 +80,15 @@ class _DefRecord:
 
 
 class _SessionDefs:
-    __slots__ = ("defs", "cell_count", "order")
+    __slots__ = ("cell_count", "defs", "order")
 
     def __init__(self) -> None:
-        self.defs: Dict[str, List[_DefRecord]] = {}
+        self.defs: dict[str, list[_DefRecord]] = {}
         self.cell_count = 0
-        self.order: List[str] = []
+        self.order: list[str] = []
 
 
-_sessions: Dict[str, _SessionDefs] = {}
+_sessions: dict[str, _SessionDefs] = {}
 _lock = threading.Lock()
 
 
@@ -124,9 +124,9 @@ def record_cell(session_key: str, code: str) -> None:
         state = _get_session(session_key)
         state.cell_count += 1
         index = state.cell_count
-        names_in_cell: List[str] = []
+        names_in_cell: list[str] = []
         for node in tree.body:
-            records: List[_DefRecord] = []
+            records: list[_DefRecord] = []
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 kind = "class" if isinstance(node, ast.ClassDef) else "def"
                 args = _format_args(node)
@@ -134,7 +134,7 @@ def record_cell(session_key: str, code: str) -> None:
                 source = _format_source(node, code)
                 records.append(_DefRecord(node.name, kind, source, args, markers, index))
                 names_in_cell.append(node.name)
-            elif isinstance(node, ast.Assign) or isinstance(node, ast.AnnAssign):
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
                 targets = (node.targets if isinstance(node, ast.Assign) else [node.target])
                 for target in targets:
                     for name in _collect_target_names(target):
@@ -182,11 +182,11 @@ def _format_source(node, code: str) -> str:
     return text
 
 
-def _collect_target_names(target: ast.AST) -> List[str]:
+def _collect_target_names(target: ast.AST) -> list[str]:
     if isinstance(target, ast.Name):
         return [target.id]
     if isinstance(target, (ast.Tuple, ast.List)):
-        names: List[str] = []
+        names: list[str] = []
         for element in target.elts:
             names.extend(_collect_target_names(element))
         return names
@@ -211,9 +211,9 @@ def _value_root_name(value: Optional[ast.AST]) -> Optional[str]:
     return None
 
 
-def _scan_effects(node: ast.AST) -> List[str]:
+def _scan_effects(node: ast.AST) -> list[str]:
     """Names of effect-bearing calls/dotted reads inside *node*'s body, bounded."""
-    markers: List[str] = []
+    markers: list[str] = []
     seen = set()
     for sub in ast.walk(node):
         dotted = None
@@ -272,7 +272,7 @@ def classify_name(session_key: str, name: str) -> str:
         return KNOWN
 
 
-def names_rebound_in_current_cell(code: str, names: List[str]) -> set:
+def names_rebound_in_current_cell(code: str, names: list[str]) -> set:
     """Names from *names* that *code* re-binds before any use — conservative:
     any top-level assignment to a name counts as a possible rebinding."""
     rebound: set = set()
@@ -282,7 +282,7 @@ def names_rebound_in_current_cell(code: str, names: List[str]) -> set:
         return rebound
     wanted = set(names)
     for node in tree.body:
-        if isinstance(node, ast.Assign) or isinstance(node, ast.AnnAssign):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = (node.targets if isinstance(node, ast.Assign) else [node.target])
             for target in targets:
                 for bound in _collect_target_names(target):
@@ -291,7 +291,7 @@ def names_rebound_in_current_cell(code: str, names: List[str]) -> set:
     return rebound
 
 
-def _module_level_undefined(tree: ast.Module) -> List[str]:
+def _module_level_undefined(tree: ast.Module) -> list[str]:
     """Names read at module level before any assignment in the same cell, ordered.
 
     Conservative approximation of "used but not defined here": a top-level call to
@@ -299,7 +299,7 @@ def _module_level_undefined(tree: ast.Module) -> List[str]:
     are filtered by the caller. Bound the walk by construction (top-level only).
     """
     defined: set = set()
-    ordered_uses: List[str] = []
+    ordered_uses: list[str] = []
     seen = set()
 
     def visit_reads(node: ast.AST) -> None:
@@ -314,7 +314,7 @@ def _module_level_undefined(tree: ast.Module) -> List[str]:
         visit_reads(node)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             defined.add(node.name)
-        elif isinstance(node, ast.Assign) or isinstance(node, ast.AnnAssign):
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = (node.targets if isinstance(node, ast.Assign) else [node.target])
             for target in targets:
                 defined.update(_collect_target_names(target))
@@ -324,7 +324,7 @@ def _module_level_undefined(tree: ast.Module) -> List[str]:
     return ordered_uses
 
 
-def undefined_names_in_cell(code: str) -> List[str]:
+def undefined_names_in_cell(code: str) -> list[str]:
     """Names the cell uses at top level without defining, in first-use order (AST-only)."""
     try:
         tree = ast.parse(code)
@@ -345,7 +345,7 @@ def describe_name(session_key: str, name: str, code: str) -> Optional[str]:
         bucket = list(state.defs.get(name, ())) if state else []
     if not bucket:
         return None
-    parts: List[str] = []
+    parts: list[str] = []
     for record in bucket[-2:]:  # bounded: latest two definitions at most
         head = f"{record.kind} {name}({record.args}) — defined in cell #{record.cell_index}"
         if record.superseded:
@@ -394,8 +394,8 @@ def _strip_comments_and_docstrings(source: str) -> str:
     except (SyntaxError, ValueError):
         return ""
     lines = source.splitlines()
-    keep: List[str] = []
-    docstring_spans: List[tuple] = []
+    keep: list[str] = []
+    docstring_spans: list[tuple] = []
 
     class _DocstringFinder(ast.NodeVisitor):
         def _visit_body(self, node) -> None:

@@ -300,7 +300,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             with contextlib.suppress(Exception):
                 await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=2.0)
 
-        async def _probe(target_id: str) -> Tuple[str, bool, bool]:
+        async def _probe(target_id: str) -> tuple[str, bool, bool]:
             sid = await self._attach_page(target_id, timeout=PAGE_ATTACH_TIMEOUT_S)
             try:
                 probe = await self._cdp("Runtime.evaluate", {"expression": probe_js, "returnByValue": True},
@@ -325,7 +325,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                         candidates.append((t["targetId"], url))
                 except Exception:
                     continue
-            chosen: Optional[Tuple[str, str]] = None
+            chosen: Optional[tuple[str, str]] = None
             for target_id, url in candidates:
                 if deadline - loop.time() < PAGE_ATTACH_TIMEOUT_S:
                     break

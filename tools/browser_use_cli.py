@@ -569,7 +569,7 @@ def _resolve_backend_cdp(
     session_name: str = "",
     mode: str = "",
     identity: str = "",
-    qa_targets: Optional[List[str]] = None,
+    qa_targets: Optional[list[str]] = None,
     force_local_sidecar: bool = False,
 ) -> Optional[str]:
     """Point the harness at the configured backend's CDP endpoint; error string on failure.
@@ -594,7 +594,7 @@ def _resolve_backend_cdp(
     try:
         from tools.browser_control_route import is_managed, resolve_managed_cdp
     except Exception:
-        is_managed = lambda: False  # noqa: E731
+        is_managed = lambda: False
         resolve_managed_cdp = None
     if is_managed():
         return resolve_managed_cdp(
@@ -693,11 +693,11 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
 # task id -> the browser its last exec drove: {"cdp", "lease", "error"}. The vault tools re-attach to
 # exactly this browser (managed mode never re-routes, a fresh lease is a different browser) and report a
 # failed attach by its cause instead of as a missing page.
-_VAULT_ROUTES: Dict[str, Dict[str, str]] = {}
+_VAULT_ROUTES: dict[str, dict[str, str]] = {}
 _VAULT_ROUTES_MAX = 256  # the gateway is long-lived; keep the most recently used tasks
 
 
-def vault_route(task_id: Optional[str]) -> Dict[str, str]:
+def vault_route(task_id: Optional[str]) -> dict[str, str]:
     return dict(_VAULT_ROUTES.get(task_id or "default") or {})
 
 
@@ -733,7 +733,7 @@ def _route_backend(
     local: bool,
     mode: str = "",
     identity: str = "",
-    qa_targets: Optional[List[str]] = None,
+    qa_targets: Optional[list[str]] = None,
     force_local_sidecar: bool = False,
 ) -> Optional[str]:
     """Resolve where the harness connects; returns an error string or None. Real-profile consent runs
@@ -747,7 +747,7 @@ def _route_backend(
     try:
         from tools.browser_control_route import is_managed as _control_is_managed
     except Exception:
-        _control_is_managed = lambda: False  # noqa: E731
+        _control_is_managed = lambda: False
     if _control_is_managed():
         if local:
             return "scope_denied: managed browser mode refuses local=true / real-profile"
@@ -854,7 +854,7 @@ def stop_harness_daemons() -> None:
 
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False,
-                 mode: str = "", identity: str = "", qa_targets: Optional[List[str]] = None):
+                 mode: str = "", identity: str = "", qa_targets: Optional[list[str]] = None):
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
@@ -880,7 +880,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         try:
             from tools.browser_control_route import is_managed as _sidecar_is_managed
         except Exception:
-            _sidecar_is_managed = lambda: False  # noqa: E731
+            _sidecar_is_managed = lambda: False
         if _sidecar_is_managed():
             local_sidecar = False
 
@@ -914,7 +914,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     try:
         from tools.browser_control_route import is_managed as _code_is_managed
     except Exception:
-        _code_is_managed = lambda: False  # noqa: E731
+        _code_is_managed = lambda: False
     managed = _code_is_managed()
     if managed:
         code = _MANAGED_TIMEOUT_PREAMBLE + _MANAGED_FRONT_TAB_PREAMBLE + code
@@ -929,7 +929,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     try:
         from tools.browser_control_route import is_managed as _spawn_is_managed
     except Exception:
-        _spawn_is_managed = lambda: False  # noqa: E731
+        _spawn_is_managed = lambda: False
     if (
         not _spawn_is_managed()
         and "BU_AUTOSPAWN" not in env
@@ -1097,7 +1097,7 @@ def _dynamic_schema_overrides() -> dict:
     try:
         from tools.browser_control_route import is_managed as _schema_is_managed
     except Exception:
-        _schema_is_managed = lambda: False  # noqa: E731
+        _schema_is_managed = lambda: False
     if _schema_is_managed():
         props = dict(
             (overrides.get("parameters") or BROWSER_EXEC_SCHEMA["parameters"])["properties"]

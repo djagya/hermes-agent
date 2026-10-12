@@ -146,7 +146,7 @@ async def test_queue_delivers_first_answer_before_slow_voice_stt(runner_env, mon
         runner._run_agent_drain_pending(result, adapter, source, "conversation"))
     try:
         pending_event, pending = await asyncio.wait_for(drain, 5)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         release.set()  # unblock the fixture's STT thread before failing
         await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
         raise
@@ -252,7 +252,7 @@ async def test_interrupt_receipt_then_drain_single_flight(runner_env, monkeypatc
         runner._interrupt_running_agent_for_busy_event(voice, adapter, agent))
     try:
         await asyncio.wait_for(receipt, 5)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         release.set()
         await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
         raise
@@ -277,7 +277,7 @@ async def test_interrupt_receipt_then_drain_single_flight(runner_env, monkeypatc
     assert Counter(head.media_urls) == Counter([head.media_urls[0], voice.media_urls[0]])
 
     # The post-turn drain must not block on STT either.
-    pending_event, pending = await asyncio.wait_for(
+    pending_event, _pending = await asyncio.wait_for(
         runner._run_agent_drain_pending({"interrupted": True}, adapter, source, "conversation"), 5)
     assert pending_event is head
 
@@ -399,7 +399,7 @@ async def test_drain_on_warm_cache_reuses_text_and_echoes_once(runner_env, monke
     voice._gateway_pending_stt_transcripts = ["warm words"]
     adapter._pending_messages["conversation"] = voice
 
-    pending_event, pending = await asyncio.wait_for(
+    _pending_event, pending = await asyncio.wait_for(
         runner._run_agent_drain_pending(
             {"final_response": "done", "interrupted": False}, adapter, source, "conversation"), 5)
     assert pending == '"warm words"'

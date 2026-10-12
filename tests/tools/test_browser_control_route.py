@@ -257,7 +257,7 @@ def test_release_lease_posts_id_and_token(monkeypatch):
 
 
 def test_cleanup_releases_managed_session(monkeypatch):
-    import tools.browser_tool as browser_tool
+    from tools import browser_tool
     import tools.browser_tool_cdp as bt_cdp
     import tools.browser_tool_lifecycle as lifecycle
     import tools.browser_tool_session as session
@@ -295,7 +295,7 @@ def test_resolve_backend_cdp_managed_refuses_override(monkeypatch):
 
 def test_unmanaged_keeps_existing_bu_env(monkeypatch):
     monkeypatch.delenv("HERMES_BROWSER_CONTROL_URL", raising=False)
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
     env = {"BU_CDP_WS": "ws://operator-override:9222"}
     assert _resolve_backend_cdp(env, "t1") is None
     assert env["BU_CDP_WS"] == "ws://operator-override:9222"
@@ -329,7 +329,7 @@ def test_create_session_fails_closed_when_route_import_breaks(monkeypatch):
     import tools.browser_tool_session as session
 
     monkeypatch.delenv("HERMES_BROWSER_CONTROL_URL", raising=False)
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
     real = sys.modules["tools.browser_control_route"]
     sys.modules["tools.browser_control_route"] = None
     try:
@@ -341,7 +341,7 @@ def test_create_session_fails_closed_when_route_import_breaks(monkeypatch):
 
 
 def test_builtin_session_refuses_cdp_url_override_in_managed(monkeypatch):
-    import tools.browser_tool as browser_tool
+    from tools import browser_tool
     import tools.browser_tool_lifecycle as lifecycle
     import tools.browser_tool_session as session
 
@@ -359,7 +359,7 @@ def test_builtin_session_refuses_cdp_url_override_in_managed(monkeypatch):
 
 
 def test_builtin_navigate_refuses_cdp_url_override_in_managed(monkeypatch):
-    import tools.browser_tool as browser_tool
+    from tools import browser_tool
     import tools.browser_tool_lifecycle as lifecycle
 
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
@@ -383,7 +383,7 @@ def test_auto_local_disabled_in_managed(monkeypatch):
 
 def test_managed_cdp_or_error_unmanaged_is_passthrough(monkeypatch):
     monkeypatch.delenv("HERMES_BROWSER_CONTROL_URL", raising=False)
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
     assert managed_cdp_or_error() == (None, None)
 
 
@@ -444,7 +444,7 @@ def test_browser_cdp_surfaces_managed_error(monkeypatch):
 
 def test_camofox_snapshot_skipped_in_managed(monkeypatch):
     import tools.browser_camofox as camofox
-    import tools.browser_tool as browser_tool
+    from tools import browser_tool
 
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_KEY", "secret-key")

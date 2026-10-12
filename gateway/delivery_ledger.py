@@ -320,7 +320,7 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
 
 
 def record_delivery_receipt(db, *, session_id: str, row_id: int,
-                            receipt: Dict[str, Any]) -> int:
+                            receipt: dict[str, Any]) -> int:
     """Persist a confirmed delivery receipt onto the exact assistant row (best-effort).
 
     Called ONLY on a confirmed successful platform ACK (``SendResult.success`` with ids);

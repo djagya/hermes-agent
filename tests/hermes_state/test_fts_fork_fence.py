@@ -82,7 +82,7 @@ def test_deferred_index_lease_covers_create_index():
     source = inspect.getsource(SessionSchemaMixin._init_schema)
     assert 'report_startup_progress(3600.0, phase="state_db_init_schema")' in source
     assert "DEFERRED_INDEX_SQL" in source
-    before, after = source.split("DEFERRED_INDEX_SQL", 1)
+    before, _after = source.split("DEFERRED_INDEX_SQL", 1)
     assert "report_startup_progress(3600.0" in before
 
 

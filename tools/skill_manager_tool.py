@@ -240,7 +240,7 @@ def _is_user_local_skill(name: str) -> bool:
 
 def apply_local_author_policy(
     action: str, name: str, content: str, *, existing: Optional[str] = None,
-) -> Tuple[str, Optional[str]]:
+) -> tuple[str, Optional[str]]:
     """User-local create/edit/patch: ``author: Sera`` is required. Origin-classified.
 
     Create with no author injects Sera. An explicit non-Sera author on create fails
@@ -558,7 +558,7 @@ def _clip(text: str, n: int, ellipsis: str) -> str:
 
 # --- Core actions -------------------------------------------------------------
 
-def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+def _create_skill(name: str, content: str, category: str | None = None) -> dict[str, Any]:
     # Author policy first: the size budget below measures the bytes that will
     # actually be persisted (an injected ``author:`` line counts against it).
     content, author_error = apply_local_author_policy("create", name, content)
@@ -828,8 +828,8 @@ def _skill_write_lock():
                     os.write(fd, b"\0")
                     os.fsync(fd)
                 os.lseek(fd, 0, os.SEEK_SET)
-                getattr(_skill_msvcrt, "locking")(
-                    fd, getattr(_skill_msvcrt, "LK_LOCK"), 1
+                _skill_msvcrt.locking(
+                    fd, _skill_msvcrt.LK_LOCK, 1
                 )
             else:  # pragma: no cover
                 raise RuntimeError("no supported cross-process skill-write lock")
@@ -844,8 +844,8 @@ def _skill_write_lock():
                     _skill_fcntl.flock(fd, _skill_fcntl.LOCK_UN)
                 elif _skill_msvcrt is not None:  # pragma: no cover
                     os.lseek(fd, 0, os.SEEK_SET)
-                    getattr(_skill_msvcrt, "locking")(
-                        fd, getattr(_skill_msvcrt, "LK_UNLCK"), 1
+                    _skill_msvcrt.locking(
+                        fd, _skill_msvcrt.LK_UNLCK, 1
                     )
             os.close(fd)
 
@@ -864,7 +864,7 @@ def _skill_tree_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _skill_write_target_state(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _skill_write_target_state(payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve the exact mutation target and its current preimage digest."""
     action = str(payload.get("action", ""))
     name = str(payload.get("name", ""))
@@ -911,13 +911,13 @@ def _skill_write_target_state(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _skill_batch_target_state(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _skill_batch_target_state(payload: dict[str, Any]) -> dict[str, Any]:
     """Snapshot every skill tree a staged batch would touch."""
     operations = payload.get("operations")
     if not isinstance(operations, list) or not operations:
         raise ValueError("Pending batch write has malformed operations; restage it.")
     default = str(payload.get("name") or "")
-    names: List[str] = []
+    names: list[str] = []
     for op in operations:
         if not isinstance(op, dict):
             raise ValueError("Pending batch write has a malformed operation; restage it.")
@@ -948,7 +948,7 @@ def _skill_batch_target_state(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"version": 1, "target_kind": "batch", "targets": targets}
 
 
-def build_skill_write_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
+def build_skill_write_guard(payload: dict[str, Any]) -> dict[str, Any]:
     """Public staging helper used by the skill tool and bounded plugins."""
     clean = {key: value for key, value in payload.items() if not key.startswith("_")}
     if str(clean.get("action", "")) == "batch":
@@ -956,7 +956,7 @@ def build_skill_write_guard(payload: Dict[str, Any]) -> Dict[str, Any]:
     return _skill_write_target_state(clean)
 
 
-def _verify_skill_write_guard(payload: Dict[str, Any]) -> None:
+def _verify_skill_write_guard(payload: dict[str, Any]) -> None:
     guard = payload.get("_write_guard")
     if not isinstance(guard, dict) or guard.get("version") != 1:
         raise ValueError("Pending skill write has no supported base-state guard; restage it.")
@@ -977,8 +977,8 @@ def _verify_skill_write_guard(payload: Dict[str, Any]) -> None:
 
 
 def stage_skill_write(
-    payload: Dict[str, Any], *, summary: str, origin: str, stage_context: Dict[str, Any] | None = None
-) -> Dict[str, Any]:
+    payload: dict[str, Any], *, summary: str, origin: str, stage_context: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Stage one guarded skill mutation and return its durable pending receipt."""
     from tools import write_approval as wa
 
@@ -1039,7 +1039,7 @@ def _skill_manage_from(payload: dict[str, Any], **extra) -> str:
         **{k: payload.get(k) for k in _FLAT_OP_KEYS}, **extra)
 
 
-def apply_skill_pending(payload: Dict[str, Any]) -> str:
+def apply_skill_pending(payload: dict[str, Any]) -> str:
     """Replay a staged skill write under a live one-shot approval capability."""
     try:
         with _skill_write_lock():

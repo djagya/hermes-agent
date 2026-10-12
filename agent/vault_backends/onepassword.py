@@ -148,7 +148,7 @@ class OnePasswordLoginBackend(LoginBackend):
                 return meta
         return None
 
-    def _resolve_handle(self, handle: str) -> Tuple[Optional[str], str]:
+    def _resolve_handle(self, handle: str) -> tuple[Optional[str], str]:
         vault_id, item_id = _split_handle(handle, self.prefix)
         if vault_id:
             return vault_id, item_id
@@ -166,7 +166,7 @@ class OnePasswordLoginBackend(LoginBackend):
         args += ["--fields", "label=password", "--reveal"]
         return self._run(*args).rstrip("\r\n")
 
-    def resolve_secret(self, handle: str) -> Dict[str, str]:
+    def resolve_secret(self, handle: str) -> dict[str, str]:
         """Reveal a single card only inside the trusted native filler, never in tool output."""
         from agent.vault_payment_card import parse_onepassword_card
 
@@ -219,7 +219,7 @@ def _all_origins(urls: list[str]) -> list[str]:
     return out
 
 
-def _split_handle(handle: str, prefix: str) -> Tuple[Optional[str], str]:
-    payload = handle[len(prefix):] if handle.startswith(prefix) else handle
+def _split_handle(handle: str, prefix: str) -> tuple[Optional[str], str]:
+    payload = handle.removeprefix(prefix)
     vault_id, separator, item_id = payload.partition(":")
     return (vault_id or None, item_id) if separator else (None, payload)

@@ -61,7 +61,7 @@ class _PageUnavailable(Exception):
         super().__init__(message)
         self.error_type = error_type
 
-    def result(self) -> Dict[str, Any]:
+    def result(self) -> dict[str, Any]:
         return {"success": False, "error_type": self.error_type, "error": str(self)}
 
 
@@ -112,7 +112,7 @@ def _managed_supervisor(task_id: str, *, admit: bool = False):
                                f"Could not open the vault's CDP connection to the managed browser: {cause}") from None
 
 
-def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
+def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     """Evaluate NON-SECRET JS on the current page (inspection, origin reads).
 
     Prefers the supervisor's persistent CDP WebSocket, falls back to the
@@ -452,7 +452,7 @@ def _validate_supplied_otp(code: str) -> tuple[Optional[str], Optional[str]]:
     return trimmed, None
 
 
-def _supplied_code_origin_refusal(handle: str, origin: str, expected_origin: str) -> Optional[Dict[str, Any]]:
+def _supplied_code_origin_refusal(handle: str, origin: str, expected_origin: str) -> Optional[dict[str, Any]]:
     """Explicit-code origin gate: ``expected_origin`` is mandatory and must equal the page origin exactly
     (after normalization), and a login ``handle``'s bound origin(s) must include it too. A handle whose
     metadata cannot be read adds no constraint (the expected_origin gate still governs, exactly as when no
@@ -891,7 +891,7 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     from tools.browser_tool import _active_sessions, _last_session_key
     from tools.browser_tool_session import run_fenced
 
-    def op() -> Dict[str, Any]:
+    def op() -> dict[str, Any]:
         try:
             if _is_managed():
                 _managed_supervisor(task_id or "default", admit=True)

@@ -379,7 +379,7 @@ _BINARY_MAGICS = (
 class LifecycleScanVerdict:
     """Typed outcome of a bounded lifecycle scan (see module docstring for the taxonomy)."""
 
-    __slots__ = ("kind", "detail")
+    __slots__ = ("detail", "kind")
 
     def __init__(self, kind: str, detail: str = "") -> None:
         self.kind = kind

@@ -61,7 +61,7 @@ def load_on_disk_store() -> MemoryStore:
     store.load_from_disk()
     return store
 
-def _build_memory_write_guard(store: "MemoryStore", target: str) -> Dict[str, Any]:
+def _build_memory_write_guard(store: "MemoryStore", target: str) -> dict[str, Any]:
     """Snapshot exact target bytes under the store's mutation lock."""
     path = store._path_for(target)
     with store._file_lock(path):

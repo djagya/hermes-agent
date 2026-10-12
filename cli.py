@@ -359,7 +359,7 @@ def _assistant_copy_text(content: Any) -> str:
     return _strip_reasoning_tags(_assistant_content_as_text(content))
 
 
-def _load_prefill_messages(file_path: str) -> List[Dict[str, Any]]:
+def _load_prefill_messages(file_path: str) -> list[dict[str, Any]]:
     """Load prefill messages (JSON array) from *file_path*; relative to ~/.hermes/; missing/empty -> []."""
     if not file_path:
         return []
@@ -381,7 +381,7 @@ def _load_prefill_messages(file_path: str) -> List[Dict[str, Any]]:
         return []
 
 
-def _resolve_prefill_messages_file(config: Dict[str, Any]) -> str:
+def _resolve_prefill_messages_file(config: dict[str, Any]) -> str:
     """Prefill file path: env, then top-level ``prefill_messages_file``, then legacy ``agent.*``."""
     agent_cfg = config.get("agent", {})
     return (
@@ -550,7 +550,7 @@ def _cli_config_defaults():
     }
 
 
-def _merge_file_config(defaults: Dict[str, Any], file_config: Dict[str, Any]) -> None:
+def _merge_file_config(defaults: dict[str, Any], file_config: dict[str, Any]) -> None:
     """Overlay a parsed config file onto *defaults* in place (model normalization, deep merge, legacy keys)."""
     # model: string (new format) or dict (old format with default/base_url)
     if "model" in file_config:
@@ -583,7 +583,7 @@ def _merge_file_config(defaults: Dict[str, Any], file_config: Dict[str, Any]) ->
         defaults["agent"]["max_turns"] = file_config["max_turns"]
 
 
-def load_cli_config() -> Dict[str, Any]:
+def load_cli_config() -> dict[str, Any]:
     """~/.hermes/config.yaml (else ./cli-config.yaml) over built-in defaults; env vars win.
 
     ``HERMES_IGNORE_USER_CONFIG=1`` skips the user config entirely (``.env`` still loads).
@@ -596,7 +596,7 @@ def load_cli_config() -> Dict[str, Any]:
 
     # Only a file's terminal section may overwrite terminal env vars already set by .env.
     _file_has_terminal_config = False
-    file_config: Dict[str, Any] = {}
+    file_config: dict[str, Any] = {}
 
     if config_path.exists():
         try:

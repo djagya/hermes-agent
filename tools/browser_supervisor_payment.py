@@ -104,7 +104,7 @@ def _card_documents(candidates: list, merchant: str) -> tuple:
     return tuple(PaymentDocument(*c) for c in candidates)
 
 
-def _fills_by_document(i: "PaymentInspection", fills: list) -> list:
+def _fills_by_document(i: PaymentInspection, fills: list) -> list:
     """Group fills by their ``document`` index (default 0); every card document needs its fields."""
     groups: list = [[] for _ in i.documents]
     for f in fills:

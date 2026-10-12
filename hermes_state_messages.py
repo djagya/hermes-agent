@@ -1126,7 +1126,7 @@ class SessionMessagesMixin:
             (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
 
     def set_message_delivery(
-        self, session_id: str, row_id: int, delivery: Optional[Dict[str, Any]]
+        self, session_id: str, row_id: int, delivery: Optional[dict[str, Any]]
     ) -> int:
         """Persist the outbound delivery receipt onto ONE known durable assistant row.
 

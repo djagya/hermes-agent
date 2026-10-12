@@ -59,7 +59,7 @@ def test_inconclusive_oversize_reference_does_not_imply_restart(tmp_path, monkey
     """The terminal sibling consumes typed verdicts: an oversized referenced file
     is refused WITHOUT the restart-implying message (cron-path parity)."""
     _supervised(monkeypatch)
-    import cron.lifecycle_guard as lifecycle_guard
+    from cron import lifecycle_guard
 
     huge = tmp_path / "huge.json"
     huge.write_bytes(b"echo ok\n" + b"x" * (lifecycle_guard._MAX_REFERENCED_SCRIPT_BYTES + 100))

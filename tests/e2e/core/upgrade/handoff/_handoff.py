@@ -198,6 +198,7 @@ def _materialize_n1_control_socket(checkout: Path) -> None:
         capture_output=True,
         text=True,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        check=False,
     )
     checkout_error = ""
     try:
@@ -209,6 +210,7 @@ def _materialize_n1_control_socket(checkout: Path) -> None:
             ["git", "show", "HEAD:gateway/control_socket.py"],
             cwd=checkout,
             capture_output=True,
+            check=False,
         )
         assert shown.returncode == 0 and shown.stdout, (
             f"could not materialize gateway/control_socket.py ({blob}) into {checkout}\n"

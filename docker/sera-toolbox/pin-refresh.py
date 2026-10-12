@@ -100,7 +100,7 @@ def sha256_url(url: str) -> str:
 def parse_dockerfile() -> dict[str, str]:
     text = DOCKERFILE.read_text(encoding="utf-8")
     def arg(name: str) -> str:
-        m = re.search(rf"^ARG {re.escape(name)}=(.+)$", text, re.M)
+        m = re.search(rf"^ARG {re.escape(name)}=(.+)$", text, re.MULTILINE)
         return m.group(1).strip() if m else ""
 
     debian = re.search(r"FROM debian:13\.4@(sha256:[0-9a-f]+)", text)
@@ -272,7 +272,7 @@ def main() -> int:
             n = replace_all(DOCKERFILE, pins["debian_digest"], debian_new)
             if n:
                 applied.append(f"debian digest x{n}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"debian: {exc}")
         row("debian:13.4", pins["debian_digest"], "", "")
 
@@ -283,7 +283,7 @@ def main() -> int:
             n = replace_all(DOCKERFILE, pins["node_digest"], node_new)
             if n:
                 applied.append(f"node digest x{n}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"node: {exc}")
         row("node:26-bookworm-slim", pins["node_digest"], "", "")
 
@@ -304,7 +304,7 @@ def main() -> int:
             text = text.replace(pins["s6_symlinks"], sym)
             DOCKERFILE.write_text(text, encoding="utf-8")
             applied.append(f"s6-overlay {pins['s6']} -> {s6_new}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"s6: {exc}")
         row("s6-overlay", pins["s6"], "", "https://github.com/just-containers/s6-overlay/releases")
 
@@ -335,7 +335,7 @@ def main() -> int:
             )
             NET_BINS.write_text(text, encoding="utf-8")
             applied.append(f"gh {bins['gh']} -> {gh_new}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"gh: {exc}")
         row("gh", bins["gh"], "", "https://github.com/cli/cli/releases")
 
@@ -365,7 +365,7 @@ def main() -> int:
             )
             NET_BINS.write_text(text, encoding="utf-8")
             applied.append(f"gitleaks {bins['gitleaks']} -> {gl_new}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"gitleaks: {exc}")
         row("gitleaks", bins["gitleaks"], "", "https://github.com/gitleaks/gitleaks/releases")
 
@@ -397,7 +397,7 @@ def main() -> int:
             )
             NET_BINS.write_text(text, encoding="utf-8")
             applied.append(f"tirith {bins['tirith']} -> {ti_new}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"tirith: {exc}")
         row("tirith", bins["tirith"], "", "https://github.com/sheeki03/tirith/releases")
 
@@ -410,7 +410,7 @@ def main() -> int:
             bins["op"],
             "https://app-updates.agilebits.com/product_history/CLI2",
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"op: {exc}")
         row("op", bins.get("op", ""), "", "https://developer.1password.com/docs/cli")
 
@@ -428,7 +428,7 @@ def main() -> int:
             if old in text:
                 DOCKERFILE.write_text(text.replace(old, new), encoding="utf-8")
                 applied.append(f"uv {pins['uv_tag']} -> {uv_new_tag}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"uv: {exc}")
         row("uv image", f"{pins['uv_tag']}@{pins['uv_digest']}", "", "https://github.com/astral-sh/uv/pkgs/container/uv")
 
@@ -441,49 +441,49 @@ def main() -> int:
     try:
         him_new, him_url = gh_latest_tag("pimalaya/himalaya")
         row("himalaya", pins["himalaya"][:12], him_new, him_url)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"himalaya: {exc}")
         row("himalaya", pins["himalaya"][:12], "", "https://github.com/pimalaya/himalaya/releases")
 
     try:
         wp_new, wp_url = pypi_latest("weasyprint")
         row("weasyprint", pins["weasyprint"], wp_new, wp_url)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"weasyprint: {exc}")
         row("weasyprint", pins["weasyprint"], "", "https://pypi.org/project/weasyprint/")
 
     try:
         dx_new, dx_url = pypi_latest("python-docx")
         row("python-docx", pins["python_docx"], dx_new, dx_url)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"python-docx: {exc}")
         row("python-docx", pins["python_docx"], "", "https://pypi.org/project/python-docx/")
 
     try:
         ox_new, ox_url = pypi_latest("openpyxl")
         row("openpyxl", pins["openpyxl"], ox_new, ox_url)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"openpyxl: {exc}")
         row("openpyxl", pins["openpyxl"], "", "https://pypi.org/project/openpyxl/")
 
     try:
         yt_new, yt_url = pypi_latest("yt-dlp")
         row("yt-dlp", pins["yt_dlp"], yt_new, yt_url)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"yt-dlp: {exc}")
         row("yt-dlp", pins["yt_dlp"], "", "https://pypi.org/project/yt-dlp/")
 
     try:
         cu_new, cu_url = npm_latest("@hauptsache.net/clickup-mcp")
         row("clickup-mcp", pins["clickup"], cu_new, cu_url)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"clickup-mcp: {exc}")
         row("clickup-mcp", pins["clickup"], "", "https://www.npmjs.com/package/@hauptsache.net/clickup-mcp")
 
     try:
         cd_new, cd_url = npm_latest("caldav-mcp")
         row("caldav-mcp", pins["caldav"], cd_new, cd_url)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         errors.append(f"caldav-mcp: {exc}")
         row("caldav-mcp", pins["caldav"], "", "https://www.npmjs.com/package/caldav-mcp")
 

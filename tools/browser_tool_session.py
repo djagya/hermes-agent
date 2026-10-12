@@ -369,7 +369,7 @@ def _create_session_for_key(task_id: str, force_local: bool) -> dict[str, Any]:
             raise ManagedBrowserError(
                 "scope_denied: managed browser mode; use browser_exec"
             )
-        hold: Dict[str, str] = {}
+        hold: dict[str, str] = {}
         url, err = managed_cdp_or_error(hold, task_id=str(task_id))
         if err:
             raise ManagedBrowserError(err)
@@ -940,7 +940,7 @@ def _run_browser_command(
         return preflight
     browser_cmd = preflight["browser_cmd"]
     engine = "auto"
-    result: Dict[str, Any] = {}
+    result: dict[str, Any] = {}
 
     for attempt in range(2):
         try:

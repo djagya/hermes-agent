@@ -990,7 +990,7 @@ class SessionSearchMixin:
         return [group for group in groups if any(not negated for _, negated in group)]
 
     @staticmethod
-    def _compile_like_boolean_query(query: str) -> Tuple[str, List[Any], Optional[str]]:
+    def _compile_like_boolean_query(query: str) -> tuple[str, list[Any], Optional[str]]:
         """Compile the supported FTS boolean subset into LIKE predicates: terms within an OR
         group are ANDed (FTS5's implicit conjunction) and ``NOT`` negates the next term."""
         groups = SessionSearchMixin._like_boolean_groups(query)
@@ -1010,7 +1010,7 @@ class SessionSearchMixin:
         return " OR ".join(compiled_groups), params, snippet_term
 
     @staticmethod
-    def _exact_token_match(query: str, row: Dict[str, Any]) -> bool:
+    def _exact_token_match(query: str, row: dict[str, Any]) -> bool:
         """FTS-like word boundaries on canonical columns, without consulting a stale index.
 
         LIKE is only a candidate filter: ``x12`` must not match ``x128``. An explicit
@@ -1050,7 +1050,7 @@ class SessionSearchMixin:
             sql = _search_select_sql(
                 _LIKE_SNIPPET_SQL + ", m.content AS _match_content, m.tool_calls AS _match_calls",
                 "messages m", where, f"ORDER BY m.timestamp {order}, m.id {order}", "LIMIT ? OFFSET ?")
-            found: List[Dict[str, Any]] = []
+            found: list[dict[str, Any]] = []
             cursor = 0
             while len(found) < offset + limit:
                 batch = self._read_all(sql, [snippet_term, *params, 256, cursor])

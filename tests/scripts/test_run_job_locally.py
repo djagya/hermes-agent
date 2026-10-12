@@ -512,7 +512,7 @@ def test_setup_pm_under_lint_inputs_runs_the_pinned_toolchain_steps(repo, monkey
     assert prepare[0] == "prepare" and prepare[2]["_PM_TOOLCHAIN"] == "python"
     assert prepare[2]["_PM_ACTION"] == str(ROOT / ".github/actions/setup-pm")
     assert install[0] == "install" and install[2]["_PM_BOOTSTRAP"] == "/usr/bin/python3"
-    assert [s for _, s, _ in ran[2:]][0] == "python scripts/check-windows-footguns.py --all"
+    assert next(s for _, s, _ in ran[2:]) == "python scripts/check-windows-footguns.py --all"
 
 
 def test_a_jobs_untracked_outputs_do_not_reach_the_next_job(repo, monkeypatch):

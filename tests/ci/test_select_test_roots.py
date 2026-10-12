@@ -48,7 +48,7 @@ def test_unparseable_or_empty_roots_fail_closed_to_full():
 
 def test_selective_resolution_includes_ci_self_tests_and_subtree():
     groups = [["tests/cron/test_jobs*.py", "tests/test_jobs*.py", "tests/cron/"]]
-    matrix, note = plan("selective", json.dumps(groups), str(_REPO))
+    matrix, _note = plan("selective", json.dumps(groups), str(_REPO))
     paths = set(matrix[0]["paths"].split(":"))
     # The mirrored subtree and the always-included CI self-tests are present.
     assert "tests/cron/" in paths

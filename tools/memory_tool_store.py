@@ -301,7 +301,7 @@ class MemoryStore:
                    usage=self._usage(target),
                    **({"closest_entries": closest_entries} if closest_entries else {})))
 
-    def _pending_guard_error(self, target: str, expected_sha256: Optional[str]) -> Optional[Dict[str, Any]]:
+    def _pending_guard_error(self, target: str, expected_sha256: Optional[str]) -> Optional[dict[str, Any]]:
         if expected_sha256 is None:
             return None
         path = self._path_for(target)
@@ -314,7 +314,7 @@ class MemoryStore:
         return None
 
     def _mutate(self, target: str, mutate, *, skip_drift: bool = False,
-                expected_sha256: Optional[str] = None, before_write=None) -> Dict[str, Any]:
+                expected_sha256: Optional[str] = None, before_write=None) -> dict[str, Any]:
         """Lock, re-read from disk, run ``mutate(entries, limit)`` -> ``(new_entries, message)``
         or an error dict, then persist and return the success response. The reload aborts
         on an existing-but-unreadable file (even append-only ``add`` rewrites the whole
@@ -353,7 +353,7 @@ class MemoryStore:
             return self._success_response(target, result[1], **extra_fields)
 
     def add(self, target: str, content: str, *, expected_sha256: Optional[str] = None,
-            before_write=None) -> Dict[str, Any]:
+            before_write=None) -> dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
         if not content:
@@ -379,7 +379,7 @@ class MemoryStore:
 
     def replace(self, target: str, old_text: str, new_content: str,
                 matched_entry: Optional[str] = None, *, expected_sha256: Optional[str] = None,
-                before_write=None) -> Dict[str, Any]:
+                before_write=None) -> dict[str, Any]:
         """Find the entry containing old_text (whole-entry exact match first) and
         replace the WHOLE entry with new_content — old_text only locates the entry;
         the matched span is not spliced into it."""
@@ -394,7 +394,7 @@ class MemoryStore:
                           expected_sha256=expected_sha256, before_write=before_write)
 
     def remove(self, target: str, old_text: str, matched_entry: Optional[str] = None,
-               *, expected_sha256: Optional[str] = None, before_write=None) -> Dict[str, Any]:
+               *, expected_sha256: Optional[str] = None, before_write=None) -> dict[str, Any]:
         """Remove the entry containing old_text substring."""
         if not old_text.strip():
             return _error("old_text cannot be empty.", "missing_old_text")
@@ -428,7 +428,7 @@ class MemoryStore:
 
     def _edit(self, target: str, old_text: str, new_content: Optional[str],
               matched_entry: Optional[str] = None, *, expected_sha256: Optional[str] = None,
-              before_write=None) -> Dict[str, Any]:
+              before_write=None) -> dict[str, Any]:
         """Locked replace (``new_content`` set) or remove (None) of the entry matching *old_text*."""
         def _apply(entries, limit):
             idx = self._locate(entries, old_text, "replace" if new_content else "remove", matched_entry)
@@ -484,8 +484,8 @@ class MemoryStore:
         working[idx:idx + 1] = [content] if act == "replace" else []
         return None, previous_content, "none"
 
-    def apply_batch(self, target: str, operations: List[Dict[str, Any]],
-                    *, expected_sha256: Optional[str] = None, before_write=None) -> Dict[str, Any]:
+    def apply_batch(self, target: str, operations: list[dict[str, Any]],
+                    *, expected_sha256: Optional[str] = None, before_write=None) -> dict[str, Any]:
         """Apply add/replace/remove ops atomically against the FINAL budget, so one call
         can free space and add entries. All-or-nothing: any malformed / unmatched op or
         an over-limit result writes NOTHING and returns the first failure. Aborts do not
@@ -500,8 +500,8 @@ class MemoryStore:
         entry its replace/remove selects now (None for add), in batch order."""
         return self._batch(target, operations, commit=False)
 
-    def _batch(self, target: str, operations: List[Dict[str, Any]], *, commit: bool,
-               expected_sha256: Optional[str] = None, before_write=None) -> Dict[str, Any]:
+    def _batch(self, target: str, operations: list[dict[str, Any]], *, commit: bool,
+               expected_sha256: Optional[str] = None, before_write=None) -> dict[str, Any]:
         if not operations:
             return _error("operations list is empty.", "invalid_args")
         ops = [op or {} for op in operations]

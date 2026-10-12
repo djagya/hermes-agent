@@ -9,7 +9,7 @@ Real store under a temp HERMES_HOME; only the agent run itself is stubbed.
 """
 import pytest
 
-import cron.scheduler as scheduler
+from cron import scheduler
 
 
 @pytest.fixture

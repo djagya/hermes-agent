@@ -30,6 +30,8 @@ exclude = [
     ".venv",
     ".vscode",
     "__pypackages__",
+    # dlz: vendored at the catalog pin (plugins/homeassistant/VENDORED.json); not fork-authored.
+    "plugins/homeassistant/**",
   ]
 
 # Allow fix for all enabled rules (when `--fix`) is provided.

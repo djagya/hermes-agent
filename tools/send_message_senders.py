@@ -118,7 +118,7 @@ async def _send_telegram_photo_album(bot, chat_id, image_paths, media_kwargs):
         media = [
             InputMediaPhoto(
                 media=InputFile(
-                    stack.enter_context(open(path, "rb")),
+                    stack.enter_context(open(path, "rb")),  # noqa: ASYNC230 - small local image handles for one upload
                     filename=os.path.basename(path),
                     attach=True,
                 )

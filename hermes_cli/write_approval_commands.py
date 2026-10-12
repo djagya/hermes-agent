@@ -46,7 +46,7 @@ def _fmt_pending_list(subsystem: str) -> str:
         lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
         if subsystem == wa.MEMORY:
             lines.extend(f"    {entry}" for entry in _matched_entries(r.get("payload") or {}))
-    where = "/{s} approve <id>".format(s=subsystem)
+    where = f"/{subsystem} approve <id>"
     lines.append("")
     lines.append(f"Apply: {where}   Reject: /{subsystem} reject <id>")
     if subsystem == wa.SKILLS:
@@ -111,7 +111,7 @@ def handle_pending_subcommand(
     return None  # not ours — caller handles
 
 
-def _resolve_one(subsystem: str, rest: List[str]):
+def _resolve_one(subsystem: str, rest: list[str]):
     if not rest:
         return None, f"Usage: /{subsystem} approve|reject <id>  (or 'all')"
     return rest[0], None
@@ -259,7 +259,7 @@ def _reject(subsystem: str, rest: list[str], expected_payload_sha256: Optional[s
     )
 
 
-def _resolve_applying(subsystem: str, rest: List[str]) -> str:
+def _resolve_applying(subsystem: str, rest: list[str]) -> str:
     if len(rest) != 2 or rest[1] not in {"applied", "not-applied"}:
         return (
             f"Usage: /{subsystem} resolve <id> applied|not-applied "

@@ -433,7 +433,6 @@ class SessionSchemaMixin:
         """Fork fence: never issue live ``'rebuild'`` / DELETE+reinsert on SessionDB."""
         del legacy, include_trigram
         logger.warning("Skipped live FTS index rebuild (fork FTS fence).")
-        return
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         """True = queryable, False = absent, None = FTS module/tokenizer missing or content
@@ -1207,7 +1206,6 @@ class SessionSchemaMixin:
         logger.warning(
             "Skipped admitted startup FTS rebuild (fork FTS fence); no stale upsert."
         )
-        return
 
     def _backfill_gateway_metadata_from_sessions_json(self, cursor: sqlite3.Cursor) -> None:
         """One-time v18 backfill of gateway metadata from sessions.json. Only fills NULL

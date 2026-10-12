@@ -41,7 +41,7 @@ def _internal_chat_id(chat_id: str) -> Optional[str]:
     return digits if digits.isdigit() else None
 
 
-def telegram_message_link(receipt: Optional[Dict[str, Any]]) -> Optional[str]:
+def telegram_message_link(receipt: Optional[dict[str, Any]]) -> Optional[str]:
     """The t.me link for a stored delivery receipt, or ``None`` when the receipt
     does not carry enough truth to build one."""
     if not isinstance(receipt, dict):

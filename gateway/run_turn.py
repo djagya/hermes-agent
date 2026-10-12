@@ -1914,8 +1914,8 @@ class GatewayTurnMixin:
         await self._refresh_agent_cache_message_count(session_key, sid)
 
     @staticmethod
-    def _hmwa_final_assistant_row_id(agent_result: Dict[str, Any], agent_messages: List[Dict[str, Any]],
-                                     history: List[Dict[str, Any]]) -> Optional[int]:
+    def _hmwa_final_assistant_row_id(agent_result: dict[str, Any], agent_messages: list[dict[str, Any]],
+                                     history: list[dict[str, Any]]) -> Optional[int]:
         """The durable row id of THIS turn's final assistant message, from the persist
         marker the SessionDB flush stamped on the live dict. Only an exact persisted
         identity counts: a caller that cannot prove which row is the final answer gets

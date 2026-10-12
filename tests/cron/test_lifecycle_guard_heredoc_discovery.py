@@ -22,7 +22,7 @@ import json
 
 import pytest
 
-import cron.lifecycle_guard as lifecycle_guard
+from cron import lifecycle_guard
 
 guard = lifecycle_guard.contains_gateway_lifecycle_command_or_referenced_script
 classify = lifecycle_guard.classify_gateway_lifecycle_scan
