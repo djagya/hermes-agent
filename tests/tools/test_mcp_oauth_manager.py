@@ -405,16 +405,19 @@ async def test_manager_token_read_error_does_not_expose_body(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_manager_malformed_201_refresh_response_clears_tokens(
+async def test_manager_malformed_201_refresh_response_is_typed_and_keeps_tokens(
     tmp_path, monkeypatch, caplog
 ):
     import logging
+
+    from tools.mcp_oauth_provider import MCPRefreshError
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
     )
-    provider.context.current_tokens = object()
+    provider.context.current_tokens = _token("access-good", "refresh-good")
+    await provider.context.storage.set_tokens(provider.context.current_tokens)
 
     response = _fake_response(
         201,
@@ -422,22 +425,28 @@ async def test_manager_malformed_201_refresh_response_clears_tokens(
         b'{"refresh_token": "refresh-secret"}',
     )
     with caplog.at_level(logging.WARNING, logger="tools.mcp_oauth_manager"):
-        result = await provider._handle_refresh_response(response)
+        with pytest.raises(MCPRefreshError, match="invalid_response") as exc_info:
+            await provider._handle_refresh_response(response)
 
-    assert result is False
-    assert provider.context.current_tokens is None
+    assert exc_info.value.status == 201
+    assert exc_info.value.ambiguous_delivery is True
+    assert provider.context.current_tokens.refresh_token == "refresh-good"
+    assert (await provider.context.storage.get_tokens()).refresh_token == "refresh-good"
     assert "refresh-secret" not in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_manager_refresh_read_error_clears_tokens(tmp_path, monkeypatch):
+async def test_manager_refresh_read_error_is_typed_and_keeps_tokens(tmp_path, monkeypatch):
     import httpx
+
+    from tools.mcp_oauth_provider import MCPRefreshError
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = _provider_with_token_endpoint(
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
     )
-    provider.context.current_tokens = object()
+    provider.context.current_tokens = _token("access-good", "refresh-good")
+    await provider.context.storage.set_tokens(provider.context.current_tokens)
 
     class _ReadErrorResponse:
         status_code = 201
@@ -445,10 +454,72 @@ async def test_manager_refresh_read_error_clears_tokens(tmp_path, monkeypatch):
         async def aread(self):
             raise httpx.ReadError("body read failed")
 
-    result = await provider._handle_refresh_response(_ReadErrorResponse())
+    with pytest.raises(MCPRefreshError, match="invalid_response") as exc_info:
+        await provider._handle_refresh_response(_ReadErrorResponse())
 
-    assert result is False
-    assert provider.context.current_tokens is None
+    assert exc_info.value.ambiguous_delivery is True
+    assert "body read failed" not in str(exc_info.value)
+    assert provider.context.current_tokens.refresh_token == "refresh-good"
+    assert (await provider.context.storage.get_tokens()).refresh_token == "refresh-good"
+
+
+@pytest.mark.asyncio
+async def test_manager_nonstandard_refresh_status_is_typed_and_keeps_tokens(
+    tmp_path, monkeypatch, caplog
+):
+    import logging
+
+    from tools.mcp_oauth_provider import MCPRefreshError
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    endpoint = "https://idp.example.com/oauth/token"
+    provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
+    assert provider is not None
+    await provider.context.storage.set_tokens(_token("A1", "R1"))
+
+    with caplog.at_level(logging.WARNING, logger="tools.mcp_oauth_manager"):
+        with pytest.raises(MCPRefreshError, match="endpoint_rejected") as exc_info:
+            await _drive_flow(
+                provider,
+                lambda _request: _fake_response(
+                    418, endpoint, b'{"detail":"refresh-secret"}'
+                ),
+            )
+
+    assert exc_info.value.status == 418
+    assert exc_info.value.oauth_error is None
+    assert "refresh-secret" not in str(exc_info.value)
+    assert "refresh-secret" not in caplog.text
+    assert provider.context.current_tokens.refresh_token == "R1"
+    assert (await provider.context.storage.get_tokens()).refresh_token == "R1"
+    assert provider._hermes_fence is None
+
+
+@pytest.mark.asyncio
+async def test_manager_oauth_transient_error_is_typed_and_keeps_tokens(
+    tmp_path, monkeypatch
+):
+    from tools.mcp_oauth_provider import MCPRefreshError
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    endpoint = "https://idp.example.com/oauth/token"
+    provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
+    assert provider is not None
+    await provider.context.storage.set_tokens(_token("A1", "R1"))
+
+    with pytest.raises(MCPRefreshError, match="endpoint_transient") as exc_info:
+        await _drive_flow(
+            provider,
+            lambda _request: _fake_response(
+                400, endpoint, b'{"error":"temporarily_unavailable"}'
+            ),
+        )
+
+    assert exc_info.value.status == 400
+    assert exc_info.value.oauth_error == "temporarily_unavailable"
+    assert provider.context.current_tokens.refresh_token == "R1"
+    assert (await provider.context.storage.get_tokens()).refresh_token == "R1"
+    assert provider._hermes_fence is None
 
 
 @pytest.mark.asyncio

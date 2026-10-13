@@ -1419,6 +1419,35 @@ class TestCronOutputRetention:
         assert _prune_job_output(d, keep=3) == 7
         assert sorted(p.name for p in d.glob("*.md")) == names[-3:]
 
+    def test_prune_expires_old_outputs_even_below_count_cap(self, tmp_path):
+        import os
+        import time
+
+        from cron.jobs import _prune_job_output
+
+        d = tmp_path / "job"
+        names = self._seed(d, 2)
+        old = d / names[0]
+        old_time = time.time() - 49 * 3600
+        os.utime(old, (old_time, old_time))
+
+        assert _prune_job_output(d, keep=10, retention_hours=48) == 1
+        assert [p.name for p in d.glob("*.md")] == [names[1]]
+
+    def test_nonpositive_count_preserves_external_cleanup_opt_out(self, tmp_path):
+        import os
+        import time
+
+        from cron.jobs import _prune_job_output
+
+        d = tmp_path / "job"
+        names = self._seed(d, 2)
+        old_time = time.time() - 49 * 3600
+        os.utime(d / names[0], (old_time, old_time))
+
+        assert _prune_job_output(d, keep=0, retention_hours=48) == 0
+        assert sorted(p.name for p in d.glob("*.md")) == names
+
 
 # =========================================================================
 # claim_dispatch — pre-run one-shot crash safety (issue #38758)

@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -195,6 +196,30 @@ def test_recently_finished_long_running_execution_survives_retention(
     assert finished["status"] == "completed"
     assert executions.get_execution(long_running["id"])["status"] == "completed"
     assert executions.get_execution(newer["id"]) is None
+
+
+def test_retention_expires_terminal_history_by_age_but_preserves_inflight(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    clock = {"now": datetime(2026, 10, 10, tzinfo=UTC)}
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock["now"])
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 100)
+
+    old = executions.create_execution("old", source="builtin")
+    executions.finish_execution(old["id"], success=False, error="actionable failure")
+    inflight = executions.create_execution("live", source="builtin")
+    executions.mark_execution_running(inflight["id"])
+
+    clock["now"] += timedelta(hours=executions.TERMINAL_RETENTION_HOURS, seconds=1)
+    recent = executions.create_execution("recent", source="builtin")
+    executions.finish_execution(recent["id"], success=True)
+
+    assert executions.get_execution(old["id"]) is None
+    recent_record = executions.get_execution(recent["id"])
+    inflight_record = executions.get_execution(inflight["id"])
+    assert recent_record is not None and recent_record["status"] == "completed"
+    assert inflight_record is not None and inflight_record["status"] == "running"
 
 
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):

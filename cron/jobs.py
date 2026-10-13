@@ -3397,8 +3397,11 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
 # the disk.
 # Unlike the quick-snapshot store (`hermes_cli.backup`, capped at 20) it had no retention, so a
 # frequently-scheduled job on a long-running deploy accumulated one file per run forever and could fill the
-# disk (#52383). Keep the most recent N files per job; a non-positive value disables pruning (opt-out).
-_CRON_OUTPUT_DEFAULT_KEEP = 50
+# disk (#52383). A minutely job emits 2,880 files in 48 hours; the default cap therefore preserves
+# that audit window while remaining bounded. A non-positive count keeps the existing full-pruning
+# opt-out for externally managed cleanup.
+_CRON_OUTPUT_DEFAULT_KEEP = 3000
+_CRON_OUTPUT_DEFAULT_RETENTION_HOURS = 48
 
 
 def _cron_output_keep() -> int:
@@ -3406,10 +3409,20 @@ def _cron_output_keep() -> int:
     return _cron_config_number("output_retention", _CRON_OUTPUT_DEFAULT_KEEP, int)
 
 
-def _prune_job_output(job_output_dir: Path, keep: int) -> int:
-    """Remove the oldest ``*.md`` run-output files beyond *keep*; returns count deleted. Filenames
-    are timestamps, so a reverse lexical sort is newest-first. Non-positive *keep* disables pruning;
-    failures are swallowed so they can never break output saving."""
+def _cron_output_retention_hours() -> float:
+    """Maximum age of per-run output files; non-positive disables age pruning."""
+    return _cron_config_number(
+        "output_retention_hours", _CRON_OUTPUT_DEFAULT_RETENTION_HOURS, float
+    )
+
+
+def _prune_job_output(job_output_dir: Path, keep: int, retention_hours: float = 48) -> int:
+    """Remove outputs beyond the count or age bounds; return the count deleted.
+
+    Filenames are timestamps, so a reverse lexical sort is newest-first. A non-positive count
+    disables pruning (the established external-cleanup opt-out); a non-positive age disables only
+    the age bound. Failures are swallowed so pruning can never break saving.
+    """
     if keep <= 0:
         return 0
     try:
@@ -3418,8 +3431,20 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
             key=lambda f: f.name, reverse=True)
     except OSError:
         return 0
+    cutoff = (
+        _hermes_now().timestamp() - retention_hours * 3600
+        if retention_hours > 0
+        else None
+    )
     deleted = 0
-    for stale in files[keep:]:
+    for index, stale in enumerate(files):
+        over_count = keep > 0 and index >= keep
+        try:
+            too_old = cutoff is not None and stale.stat().st_mtime < cutoff
+        except OSError:
+            continue
+        if not (over_count or too_old):
+            continue
         try:
             stale.unlink()
             deleted += 1
@@ -3438,7 +3463,9 @@ def save_job_output(job_id: str, output: str):
     atomic_write_text(output_file, output, tmp_prefix=".output_", mode=0o600)
     _secure_file(output_file)
     # Bound per-job output growth so long-running deploys don't fill the disk (#52383).
-    _prune_job_output(job_output_dir, _cron_output_keep())
+    _prune_job_output(
+        job_output_dir, _cron_output_keep(), _cron_output_retention_hours()
+    )
     return output_file
 
 

@@ -34,6 +34,7 @@ _DISCOVERY_CONTEXT_LEAD = "Could not read authorization-server metadata"
 
 _REFRESH_TRANSIENT_STATUSES = frozenset({429, 502, 503})
 _REFRESH_TERMINAL_ERRORS = frozenset({"invalid_grant", "invalid_client", "invalid_scope"})
+_REFRESH_TRANSIENT_ERRORS = frozenset({"server_error", "temporarily_unavailable"})
 _REFRESH_MAX_ATTEMPTS = 3
 _REFRESH_RETRY_DEADLINE_SECONDS = 15.0
 _REFRESH_BACKOFF_SECONDS = (1.0, 2.0)
@@ -565,8 +566,19 @@ class HermesProviderMixin:
                     "oauth_rejected", status=response.status_code,
                     oauth_error=oauth_error,
                 )
-            self.context.clear_tokens()
-            return False
+            if oauth_error in _REFRESH_TRANSIENT_ERRORS:
+                raise MCPRefreshError(
+                    "endpoint_transient", status=response.status_code,
+                    oauth_error=oauth_error,
+                )
+            # A non-standard response is not proof that the persisted grant is dead. Returning
+            # False tells the SDK to start authorization and used to turn an opaque endpoint/WAF
+            # response into a false browser reauth. Keep the known pair and surface a typed,
+            # body-free failure instead.
+            raise MCPRefreshError(
+                "endpoint_rejected", status=response.status_code,
+                oauth_error=oauth_error,
+            )
         from httpx import HTTPError
         from mcp.shared.auth import OAuthToken
         from pydantic import ValidationError
@@ -574,8 +586,13 @@ class HermesProviderMixin:
             token_response = OAuthToken.model_validate_json(await response.aread())
         except (HTTPError, ValidationError):
             self._hermes_logger.warning("Invalid refresh response: %s", response.status_code)
-            self.context.clear_tokens()
-            return False
+            # The refresh POST reached the endpoint, so replay may burn a rotated single-use
+            # grant. Preserve the last durable pair for diagnosis/recovery and fail closed without
+            # leaking response or transport text.
+            raise MCPRefreshError(
+                "invalid_response", status=response.status_code,
+                ambiguous_delivery=True,
+            ) from None
         # RFC 6749 §6: a refresh response may omit refresh_token (AS does not rotate) and scope
         # (unchanged). The SDK's own _handle_refresh_response carries both forward; this override
         # must too, or every non-rotating refresh erases the stored refresh_token and the server
@@ -592,9 +609,11 @@ class HermesProviderMixin:
     @staticmethod
     async def _hermes_refresh_oauth_error(response) -> str | None:
         """Return only a standard OAuth error code; discard all other body data."""
+        from httpx import HTTPError
+
         try:
             value = json.loads((await response.aread()).decode("utf-8"))
-        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+        except (AttributeError, HTTPError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         error = value.get("error") if isinstance(value, dict) else None
         return error if isinstance(error, str) else None
@@ -608,9 +627,8 @@ class HermesProviderMixin:
         pre-fence Hermes) having rotated the grant between our read and our
         POST -- a recoverable race, not a dead credential.
 
-        Returns False for the genuinely-expired case (nobody wrote a newer
-        pair), so the caller still clears state and surfaces the reauth
-        prompt.
+        Returns False when nobody wrote a newer pair, so the caller can classify
+        the endpoint response as terminal, transient or ambiguous.
         """
         candidate = await self._hermes_rotated_candidate()
         if candidate is None:
