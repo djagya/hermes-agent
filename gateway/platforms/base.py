@@ -4504,9 +4504,6 @@ class BasePlatformAdapter(ABC):
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
         is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> SendResult:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
-        # This route always owns attachment fallback, even if rich capability
-        # was latched off between extraction and the eventual send.
-        metadata = {**metadata, "inline_images_fallback": True}
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
@@ -4572,57 +4569,9 @@ class BasePlatformAdapter(ABC):
 
     async def _extract_response_content(self, response: str, event: MessageEvent, session_key: str,
                                         *, is_ephemeral_response: bool) -> _ExtractedResponse:
-        """Split a handler response into deliverable text + attachments. Order matters: MEDIA tags →
-        image URLs → residual directives → bare local paths (skipped for ephemeral notices so config
-        paths stay text; unknown-extension MEDIA tags survive for the bare-path detector). History
-        dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is recovered."""
-        # Captured before extract_media strips it: images then go via send_document (no recompression).
-        force_document = "[[as_document]]" in response
-        pre_extract = response
-        # The handler's routed profile scope is gone by now; Docker MEDIA translation and the
-        # bare-path validator infer the sandbox from the ACTIVE profile (#109024).
-        with self._media_delivery_scope(event.source):
-            media_files, response = self.extract_media(response)
-            media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
-            images, text_content = self.extract_images(response)
-            if not force_document and not media_files and self.preserves_inline_images(pre_extract):
-                text_content = response
-            # Strip any remaining internal directives from message body (fixes #1561). _strip_media_directives
-            # shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag with an unknown extension is intentionally left in
-            # the body for extract_local_files below to pick up rather than silently dropped (#34517).
-            text_content = _strip_media_directives(text_content).strip()
-            if images:
-                logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
-            local_files = []
-            if not is_ephemeral_response:
-                local_files, text_content = self.extract_local_files(text_content)
-                local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
-                if local_files:
-                    _, text_content = self.extract_images(text_content)
-        history = (await self._bounded_history_media_paths_for_session(session_key)
-                   if local_files else None)
-        if history:
-            suppressed = [p for p in local_files if p in history]
-            if suppressed:
-                logger.info("[%s] Suppressing %d bare local file path(s) already delivered in "
-                            "this session: %s", self.name, len(suppressed), suppressed)
-                local_files = [p for p in local_files if p not in history]
-        if local_files:
-            logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
-        # A2 (#29346): extraction can reduce a non-empty response to empty text with no attachment, and the
-        # `if text_content` guard below then drops it silently. Recover on every platform (#33842 was
-        # Discord-only); the guard avoids duplicating an attachment.
-        if not (text_content or images or local_files or media_files):
-            _recovered = _strip_media_directives(response).strip()
-            if _recovered:
-                logger.warning("[%s] response_delivery_recovered: extract pipeline "
-                               "reduced a non-empty response (%d chars) to empty with "
-                               "no attachment; delivering recovered original to %s", self.name,
-                               len(pre_extract), event.source.chat_id)
-                text_content = _recovered
-        return _ExtractedResponse(
-            text_content=text_content, images=images, media_files=media_files,
-            local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
+        from gateway.platforms.base_response import extract_response_content
+        return await extract_response_content(
+            self, response, event, session_key, is_ephemeral_response=is_ephemeral_response)
 
     async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
@@ -4699,8 +4648,6 @@ class BasePlatformAdapter(ABC):
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
-                if extracted.media_files or extracted.local_files or extracted.force_document_attachments:
-                    _final_thread_metadata = {**_final_thread_metadata, "legacy_attachment_delivery": True}
                 _tts_paths, _tts_requested_path = [], None
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
@@ -4731,8 +4678,9 @@ class BasePlatformAdapter(ABC):
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
+                    from gateway.platforms.base_response import final_text_metadata
                     final_result = await self._send_final_text(
-                        event, session_key, text_content, _final_thread_metadata,
+                        event, session_key, text_content, final_text_metadata(self, extracted, _final_thread_metadata),
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
                     if isinstance(getattr(final_result, "raw_response", None), dict) and final_result.raw_response.get("inline_images_consumed"):
                         extracted.images = []

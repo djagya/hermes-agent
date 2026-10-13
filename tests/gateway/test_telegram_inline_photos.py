@@ -29,21 +29,17 @@ def event():
                         message_id="2")
 
 
-def test_compile_preserves_order_and_schema():
+def test_native_markdown_preserves_order_and_schema():
     from pathlib import Path
     import plugins.platforms.telegram.adapter as module
     assert Path(module.__file__).resolve().parents[3] == Path(__file__).resolve().parents[2]
     adapter = _make_adapter()
     payload = adapter._rich_message_payload(CONTENT)
-    assert payload["media"] == [
-        {"id": "photo_0", "media": {"type": "photo", "media": PHOTO}},
-        {"id": "photo_1", "media": {"type": "photo", "media": "https://example.org/second.webp"}},
-    ]
+    assert "media" not in payload
     markdown = payload["markdown"]
-    positions = [markdown.index(part) for part in ["## First", "tg://photo?id=photo_0", "First description",
-                                                   "## Second", "tg://photo?id=photo_1", "Second description"]]
+    positions = [markdown.index(part) for part in ["## First", PHOTO, "First description",
+                                                   "## Second", "https://example.org/second.webp", "Second description"]]
     assert positions == sorted(positions)
-    assert "media" not in adapter._rich_message_payload(CONTENT, bind_media=False)
     assert adapter.preserves_inline_images(CONTENT)
 
 
@@ -58,19 +54,20 @@ def test_compile_preserves_order_and_schema():
 def test_exclusions(content):
     adapter = _make_adapter()
     assert not adapter.preserves_inline_images(content)
+    assert not adapter._inline_photos(content)
     assert "media" not in adapter._rich_message_payload(content)
 
 
 @pytest.mark.asyncio
-async def test_send_and_final_edit_bind_photos_but_not_previews_or_drafts(monkeypatch):
+async def test_send_and_final_edit_preserve_native_photos_and_preview_controls(monkeypatch):
     adapter = _make_adapter()
     monkeypatch.setattr(adapter, "_record_rich_sent", AsyncMock())
     assert (await adapter.send("111", CONTENT)).success
-    assert adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["media"]
+    assert PHOTO in adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
     adapter._bot.do_api_request.reset_mock()
     assert (await adapter.edit_message("111", "123", CONTENT, finalize=True)).success
     assert adapter._bot.do_api_request.call_args.args[0] == "editMessageText"
-    assert adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["media"]
+    assert PHOTO in adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
     adapter._bot.do_api_request.reset_mock()
     await adapter.edit_message("111", "123", CONTENT, finalize=False)
     adapter._bot.do_api_request.assert_not_called()
@@ -189,15 +186,12 @@ async def test_exact_prior_knife_selection_final_route(monkeypatch, failure):
     await adapter._process_message_background(event(), 'prior-knife-selection')
     adapter._bot.do_api_request.assert_awaited_once()
     payload = adapter._bot.do_api_request.call_args.kwargs['api_kwargs']['rich_message']
-    assert payload['media'] == [
-        {'id': f'photo_{i}', 'media': {'type': 'photo', 'media': url}}
-        for i, url in enumerate(KNIFE_URLS)
-    ]
+    assert 'media' not in payload
     markdown = payload['markdown']
     positions = [markdown.index(part) for i in range(3)
-                 for part in (f'## Knife {i}', f'tg://photo?id=photo_{i}', f'Description {i}')]
+                 for part in (f'## Knife {i}', KNIFE_URLS[i], f'Description {i}')]
     assert positions == sorted(positions)
-    assert not any(url in markdown for url in KNIFE_URLS)
+    assert all(url in markdown for url in KNIFE_URLS)
     if failure:
         adapter.send_multiple_images.assert_awaited_once()
         assert adapter.send_multiple_images.call_args.kwargs['images'] == [
@@ -219,7 +213,7 @@ def test_extensionless_formats_share_fallback_criterion(key, fmt):
     url = f'https://unlisted-cdn.example/image?id=42&{key}={fmt}'
     content = f'SKU `MC-193C`\n\n![item]({url})\n\nDescription'
     assert adapter.preserves_inline_images(content)
-    assert adapter._rich_message_payload(content)['media'][0]['media']['media'] == url
+    assert url in adapter._rich_message_payload(content)['markdown']
     images, cleaned = adapter.extract_images(content)
     assert images == [(url, 'item')]
     assert url not in cleaned and '`MC-193C`' in cleaned
@@ -230,9 +224,9 @@ def test_extensionless_formats_share_fallback_criterion(key, fmt):
     'https://cdn.example/image?other=jpg', 'https://cdn.example/image?fmt=jpg-extra',
     'https://user:password@cdn.example/image?fmt=jpg',
 ])
-def test_no_rich_binding_for_nonphoto_format_or_credentials(url):
+def test_no_inline_photo_ownership_for_nonphoto_format_or_credentials(url):
     adapter = _make_adapter()
-    assert 'media' not in adapter._rich_message_payload(f'Description ![item]({url})')
+    assert not adapter.preserves_inline_images(f'Description ![item]({url})')
 
 
 @pytest.mark.parametrize('wrapper', ['`{}`', '``{}``', '```markdown\n{}\n```',
@@ -248,7 +242,8 @@ async def test_code_image_literals_never_compile_or_deliver(monkeypatch, wrapper
     # Code next to real photos neither disables them nor becomes a fallback attachment.
     content = KNIFE_CONTENT + '\n\n' + literal
     payload = adapter._rich_message_payload(content)
-    assert len(payload['media']) == 3
+    assert 'media' not in payload
+    assert adapter.preserves_inline_images(content)
     # Existing rich newline normalization may add hard breaks to tilde/open fences;
     # the literal photo itself must remain unbound.
     assert f'![literal]({KNIFE_URLS[0]})' in payload['markdown']
