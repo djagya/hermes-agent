@@ -1860,8 +1860,7 @@ DEFAULT_CONFIG = {
         # Max due jobs run in parallel per tick. None/0 = unbounded (thread count only); 1 = serial.
         # Env override: HERMES_CRON_MAX_PARALLEL.
         "max_parallel_jobs": None,
-        # Per-job run evidence keeps a bounded 48h window at minutely frequency. A non-positive
-        # count disables all pruning (for external cleanup); a non-positive age disables age only.
+        # Bounded 48h evidence: count <= 0 disables pruning; age <= 0 disables age pruning only.
         "output_retention": 3000,
         "output_retention_hours": 48,
         # Timeout (seconds) for a no-agent cron script. Env: HERMES_CRON_SCRIPT_TIMEOUT. Keep in
