@@ -35,6 +35,7 @@ _DISCOVERY_CONTEXT_LEAD = "Could not read authorization-server metadata"
 _REFRESH_TRANSIENT_STATUSES = frozenset({429, 502, 503})
 _REFRESH_TERMINAL_ERRORS = frozenset({"invalid_grant", "invalid_client", "invalid_scope"})
 _REFRESH_TRANSIENT_ERRORS = frozenset({"server_error", "temporarily_unavailable"})
+_REFRESH_SAFE_OAUTH_ERRORS = _REFRESH_TERMINAL_ERRORS | _REFRESH_TRANSIENT_ERRORS
 _REFRESH_MAX_ATTEMPTS = 3
 _REFRESH_RETRY_DEADLINE_SECONDS = 15.0
 _REFRESH_BACKOFF_SECONDS = (1.0, 2.0)
@@ -608,7 +609,7 @@ class HermesProviderMixin:
 
     @staticmethod
     async def _hermes_refresh_oauth_error(response) -> str | None:
-        """Return only a standard OAuth error code; discard all other body data."""
+        """Return only an OAuth error code Hermes classifies; discard all other body data."""
         from httpx import HTTPError
 
         try:
@@ -616,7 +617,7 @@ class HermesProviderMixin:
         except (AttributeError, HTTPError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         error = value.get("error") if isinstance(value, dict) else None
-        return error if isinstance(error, str) else None
+        return error if isinstance(error, str) and error in _REFRESH_SAFE_OAUTH_ERRORS else None
 
     async def _hermes_reload_tokens_after_refresh_failure(self) -> bool:
         """Re-read tokens from disk after a rejected refresh.

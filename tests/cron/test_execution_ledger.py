@@ -222,6 +222,31 @@ def test_retention_expires_terminal_history_by_age_but_preserves_inflight(
     assert inflight_record is not None and inflight_record["status"] == "running"
 
 
+def test_retention_preserves_more_than_one_thousand_terminal_rows_inside_age_window(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    now = datetime(2026, 10, 10, tzinfo=UTC)
+    monkeypatch.setattr(executions, "_hermes_now", lambda: now)
+    total = 1_001
+    assert total < executions.MAX_TERMINAL_EXECUTIONS
+
+    stamp = now.isoformat()
+    with executions._transaction() as conn:
+        conn.executemany(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, status, claimed_at, finished_at)
+               VALUES (?, ?, 'builtin', 'test-process', 1, 'completed', ?, ?)""",
+            ((f"run-{index}", f"job-{index}", stamp, stamp) for index in range(total)),
+        )
+        executions._prune_unlocked(conn)
+        retained = conn.execute(
+            "SELECT COUNT(*) FROM executions WHERE status='completed'"
+        ).fetchone()[0]
+
+    assert retained == total
+
+
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     executions.EXECUTIONS_FILE.parent.mkdir(parents=True)

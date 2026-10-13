@@ -476,20 +476,25 @@ async def test_manager_nonstandard_refresh_status_is_typed_and_keeps_tokens(
     provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
     assert provider is not None
     await provider.context.storage.set_tokens(_token("A1", "R1"))
+    posted = 0
+
+    def rejected(request):
+        nonlocal posted
+        assert request.method == "POST"
+        posted += 1
+        return _fake_response(
+            418, endpoint, b'{"error":"synthetic-private-value"}'
+        )
 
     with caplog.at_level(logging.WARNING, logger="tools.mcp_oauth_manager"):
         with pytest.raises(MCPRefreshError, match="endpoint_rejected") as exc_info:
-            await _drive_flow(
-                provider,
-                lambda _request: _fake_response(
-                    418, endpoint, b'{"detail":"refresh-secret"}'
-                ),
-            )
+            await _drive_flow(provider, rejected)
 
     assert exc_info.value.status == 418
     assert exc_info.value.oauth_error is None
-    assert "refresh-secret" not in str(exc_info.value)
-    assert "refresh-secret" not in caplog.text
+    assert "synthetic-private-value" not in str(exc_info.value)
+    assert "synthetic-private-value" not in caplog.text
+    assert posted == 1, "an ambiguously delivered refresh POST must not be replayed"
     assert provider.context.current_tokens.refresh_token == "R1"
     assert (await provider.context.storage.get_tokens()).refresh_token == "R1"
     assert provider._hermes_fence is None
