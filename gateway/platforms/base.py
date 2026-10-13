@@ -3130,6 +3130,14 @@ class BasePlatformAdapter(ABC):
             cleaned = re.sub(pattern, _remove_if_extracted, cleaned)
         return images, re.sub(r'\n{3,}', '\n\n', cleaned).strip()  # leftover blank lines
 
+    def preserves_inline_images(self, content: str) -> bool:
+        """Whether final text owns inline images; attachments remain fallback candidates.
+
+        A consuming send must return raw_response.inline_images_consumed, including
+        uncertain delivery, to prevent separately sending the same photos.
+        """
+        return False
+
     async def send_voice(
         self, chat_id: str, audio_path: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -4494,14 +4502,18 @@ class BasePlatformAdapter(ABC):
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
-        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
+        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> SendResult:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
+        # This route always owns attachment fallback, even if rich capability
+        # was latched off between extraction and the eventual send.
+        metadata = {**metadata, "inline_images_fallback": True}
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+        return result
 
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
@@ -4573,6 +4585,8 @@ class BasePlatformAdapter(ABC):
             media_files, response = self.extract_media(response)
             media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
             images, text_content = self.extract_images(response)
+            if not force_document and not media_files and self.preserves_inline_images(pre_extract):
+                text_content = response
             # Strip any remaining internal directives from message body (fixes #1561). _strip_media_directives
             # shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag with an unknown extension is intentionally left in
             # the body for extract_local_files below to pick up rather than silently dropped (#34517).
@@ -4583,6 +4597,8 @@ class BasePlatformAdapter(ABC):
             if not is_ephemeral_response:
                 local_files, text_content = self.extract_local_files(text_content)
                 local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
+                if local_files:
+                    _, text_content = self.extract_images(text_content)
         history = (await self._bounded_history_media_paths_for_session(session_key)
                    if local_files else None)
         if history:
@@ -4683,6 +4699,8 @@ class BasePlatformAdapter(ABC):
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                if extracted.media_files or extracted.local_files or extracted.force_document_attachments:
+                    _final_thread_metadata = {**_final_thread_metadata, "legacy_attachment_delivery": True}
                 _tts_paths, _tts_requested_path = [], None
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
@@ -4713,9 +4731,11 @@ class BasePlatformAdapter(ABC):
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
-                    await self._send_final_text(
+                    final_result = await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                    if isinstance(getattr(final_result, "raw_response", None), dict) and final_result.raw_response.get("inline_images_consumed"):
+                        extracted.images = []
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
