@@ -685,8 +685,7 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
         return None, ref.args
 
 
-# ``browser_vault`` (action=enter_code) since upstream folded the five vault tools into one;
-# ``browser_vault_enter_code`` still names calls in older transcripts and staged replays.
+# Folded ``browser_vault`` (any action) plus the old ``browser_vault_enter_code`` name for older transcripts.
 _SUPPLIED_OTP_TOOLS = frozenset({"browser_vault", "browser_vault_enter_code"})
 _OTP_TOOL_ARG_NAMES = ("code", "otp", "one_time_code", "one_time_password")
 
@@ -700,10 +699,9 @@ def _register_supplied_otp_for_redaction(function_name: str, function_args: dict
     surface that scrubs registered vault values (session DB tool_calls projection, request dumps, log
     formatter) replaces the exact bytes. Runs at the dispatch chokepoint (before pre_tool_call hooks) and,
     earlier, from :func:`register_supplied_otps` before the turn's tool-call row is persisted.
-    The model itself still saw the code when it emitted the call (it read it from the mail tool); this
+    Any action counts: a code on another action is still live bytes. The model itself saw the code; this
     closes the persistence surfaces, not the model context, as the tool description says.
     """
-    # Any action: a code the model put on another action is still live credential bytes in the row.
     if function_name not in _SUPPLIED_OTP_TOOLS or not isinstance(function_args, dict):
         return
     from agent.redact import register_vault_redaction_value
@@ -722,8 +720,7 @@ def register_supplied_otps(tool_calls) -> None:
 
     ``run_tool_round`` writes that row before any tool runs (persist-before-execute), so registering only
     at dispatch would let that first flush store the live code. Structural only, no scope or schema probe:
-    a call that never dispatches is persisted all the same. ``tool_call`` bridge entries are unwrapped the
-    way the dispatcher unwraps them."""
+    a call that never dispatches is persisted all the same. ``tool_call`` bridge entries are unwrapped too."""
     from tools.tool_search_catalog import TOOL_CALL_NAME
     from tools.tool_search_validation import normalize_tool_call_entries
 
@@ -731,8 +728,7 @@ def register_supplied_otps(tool_calls) -> None:
         function = getattr(tool_call, "function", None)
         name = _canonical_tool_name(str(getattr(function, "name", "") or ""))
         raw_arguments = getattr(function, "arguments", None)
-        bridged = (name == TOOL_CALL_NAME and isinstance(raw_arguments, str)
-                   and any(tool in raw_arguments for tool in _SUPPLIED_OTP_TOOLS))
+        bridged = name == TOOL_CALL_NAME and isinstance(raw_arguments, str) and any(t in raw_arguments for t in _SUPPLIED_OTP_TOOLS)
         if name not in _SUPPLIED_OTP_TOOLS and not bridged:
             continue
         args, parse_error = _parse_tool_arguments(raw_arguments)
