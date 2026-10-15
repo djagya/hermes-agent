@@ -64,7 +64,7 @@ def _platform_kwargs() -> Dict[str, Any]:
         is_connected=env_is_connected("HASS_TOKEN"),
         required_env=["HASS_TOKEN"],
         install_hint="pip install aiohttp",
-        standalone_sender_fn=_standalone_send,  # out-of-process cron delivery via notify.notify
+        standalone_sender_fn=_standalone_send,  # out-of-process cron delivery via notify.<target>
         max_message_length=HomeAssistantAdapter.MAX_MESSAGE_LENGTH,
         emoji="🏠",
         allow_update_command=True,

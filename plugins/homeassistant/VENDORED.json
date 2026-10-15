@@ -1,6 +1,6 @@
 {
   "source": "https://github.com/NousResearch/hermes-official-plugins (subdir homeassistant)",
-  "commit": "682b22d019a1109421faa62efe43e16b23c2ebef",
+  "commit": "a4e311e433f1470b1fec15434deea6a05e8644eb",
   "version": "2.0.1",
   "catalog_entry": "plugin-catalog/homeassistant.yaml",
   "why": "The image sets HERMES_DISABLE_LAZY_INSTALLS=1, so the left-core migration cannot fetch this catalog plugin at gateway start. Bundled here (a bundled kind: platform plugin auto-loads deferred; its client tools pre-register) at the catalog pin. Bump together with plugin-catalog/homeassistant.yaml.",
@@ -12,24 +12,24 @@
   ],
   "files": {
     "__init__.py": {
-      "upstream_sha256": "646ca7f4f011e4db996f1590c187ee4e2fc6e6acc9b3b0b29494be137d809cdb"
+      "upstream_sha256": "fd8b189761c5eb51451a336a51cec38e136b6f521f2bc4f00c323b0179b3a4da"
     },
     "adapter.py": {
-      "upstream_sha256": "05f3826c09297216694b5c4ae11f7daadfc95660e1d58068b085bcbb127accf1",
+      "upstream_sha256": "f5657f04fb744deb896b490e459759f349223cd2cce59b89723a92e63a7002ba",
       "fork_patch": "cold-boot connect grace: the first connect retries quietly for up to 180 s (re-lands fork #97 9182a191b0; tests/plugins/platforms/homeassistant/test_boot_connect_grace.py)",
-      "fork_sha256": "1a87ec164b1fa9e99ff518d19742ff770be213a1c82bb22140e096e79d3e59cd"
+      "fork_sha256": "ee84c287b8251e2ce637be8e96dfa95e21ce87d808c6f9b9c571594f6d539974"
     },
     "tools.py": {
-      "upstream_sha256": "05c0a2fd04a5746f360393b9d765d473c17e253a695a83c110d3936495416916"
+      "upstream_sha256": "16422542d083d5888c56cc6d0bf9b7172b6869299d0a36b670837822d8c4abfe"
     },
     "plugin.yaml": {
-      "upstream_sha256": "b50e58215d9d1add8c8a7aed3bafdec610bf2d88c7ef876d7eaf43fa41e4b40f"
+      "upstream_sha256": "86524ca0f18f7993828ec30d35f65f29a94422ffbeeca850a7fd7d1b7fef5c69"
     },
     "LICENSE": {
       "upstream_sha256": "5f79d321c17de8ef6e5f34967dc5b484afebeeefd87180890d9741941f6b815f"
     },
     "README.md": {
-      "upstream_sha256": "3344abf94ea933597cb56aa8217e626b32d8a5595d70ea668b64f0fd8bf73b1c"
+      "upstream_sha256": "fb621f417759979f049b4737fa5e12598782ed81a725c0dfdf7b55a40a15062e"
     }
   },
   "tests": {
@@ -38,10 +38,13 @@
       "fork_patch": "bundled plugin root; repo-root collection hook dropped"
     },
     "test_homeassistant_adapter.py": {
-      "upstream_sha256": "f06c04946a83cef839e66c3265394946b01dba57d369a0a43b76917e18d43b85"
+      "upstream_sha256": "935048abae7dc60789d26b0a83b6eef3c9d65fafd15680959ab78b3d56c8db7e"
+    },
+    "test_homeassistant_standalone_send.py": {
+      "upstream_sha256": "c1d05f0cfd5b784705ab762c8bba3b3ddc81fc9da48f7647d113865c469ed9ae"
     },
     "test_homeassistant_tools.py": {
-      "upstream_sha256": "3a6dcb7fe26fd56b78b2545b087fb951683c799f69fd2810c7f18b23a5f250f4"
+      "upstream_sha256": "1e516d28b8877421710cc3f5196291c5b61444116740c6047c887dfbc57ffce5"
     },
     "test_plugin_registration.py": {
       "upstream_sha256": "d11e4d0d3fa27f8fce9bfc64bf6849ca3ff8d0c431b940651a413af3e1409b1e"
