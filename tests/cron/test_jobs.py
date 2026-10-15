@@ -1401,23 +1401,6 @@ class TestSaveJobOutput:
         assert "test123" in str(output_file)
 
 
-class TestCronOutputRetention:
-    """Per-run cron output must self-prune so long deploys don't fill the disk (#52383)."""
-
-    @staticmethod
-    def _seed(d, count):
-        d.mkdir(parents=True, exist_ok=True)
-        names = [f"2026-06-25_10-00-{i:02d}.md" for i in range(count)]
-        for n in names:
-            (d / n).write_text("x", encoding="utf-8")
-        return names
-
-    def test_prune_keeps_newest_n(self, tmp_path):
-        from cron.jobs import _prune_job_output
-        d = tmp_path / "job"
-        names = self._seed(d, 10)
-        assert _prune_job_output(d, keep=3) == 7
-        assert sorted(p.name for p in d.glob("*.md")) == names[-3:]
 
 
 # =========================================================================

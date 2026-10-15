@@ -73,6 +73,26 @@ cannot override, via a system-level managed directory. See
 [Managed Scope](./managed-scope.md).
 :::
 
+## Cron Output Retention
+
+Per-run cron output files are stored under `~/.hermes/cron/output/`. Two settings
+bound their retention for each job:
+
+```yaml
+cron:
+  output_retention: 3000
+  output_retention_hours: 48
+```
+
+`cron.output_retention` caps the number of files per job (default: 3000).
+`cron.output_retention_hours` caps their age in hours, using the file modification
+time (default: 48). After saving a new output, cleanup removes files outside
+either bound; a lower count can therefore shorten the retained time window.
+Set `output_retention_hours` to zero or a negative value to disable age pruning
+while retaining the count cap. Set `output_retention` to zero or a negative value
+to disable all output pruning, for example when external cleanup owns retention.
+These settings govern output files, not the execution ledger or chat history.
+
 ## Runtime Limits
 
 Long-running Hermes server surfaces (including the gateway and

@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -30,7 +30,11 @@ logger = logging.getLogger(__name__)
 # that temporarily enter another profile cannot leak that profile's records into the import-time
 # home.
 EXECUTIONS_FILE: Optional[Path] = None
-MAX_TERMINAL_EXECUTIONS = 1000
+# Keep a complete two-day operator-audit window at ordinary cron rates, while retaining a hard
+# global bound for a runaway/manual-fire loop. At one fire per minute, 100k rows covers more than
+# 34 continuously firing jobs for the full window.
+TERMINAL_RETENTION_HOURS = 48
+MAX_TERMINAL_EXECUTIONS = 100_000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
@@ -199,6 +203,13 @@ def touch_execution_progress(execution_id: str) -> bool:
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
+    cutoff = (_hermes_now() - timedelta(hours=TERMINAL_RETENTION_HOURS)).isoformat()
+    conn.execute(
+        """DELETE FROM executions
+           WHERE status IN ('completed','failed','unknown')
+             AND julianday(COALESCE(finished_at, claimed_at)) < julianday(?)""",
+        (cutoff,),
+    )
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
