@@ -78,7 +78,7 @@ there is no need to add merchant URLs or a global tag to the card.
 **Every card fill asks you first.** The prompt names the merchant and the
 document receiving the card, and expires after 120 seconds. Declining or a
 changed document/field set refuses the fill. To select one exact open tab,
-the agent uses `browser_vault_fill(handle, merchant_origin="https://shop.example")`.
+the agent uses `browser_vault(action="fill", handle=..., merchant_origin="https://shop.example")`.
 The native path resolves values internally and supports all card fields in
 one document: the merchant itself, or a Stripe (`https://js.stripe.com`) iframe,
 including an out-of-process iframe. Separate number/expiry/CVC documents,
