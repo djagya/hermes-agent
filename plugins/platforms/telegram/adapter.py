@@ -15,6 +15,8 @@ from datetime import datetime, timezone, UTC
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 from hermes_cli import setup_platforms
 
+from plugins.platforms.telegram.inline_photos import TelegramInlinePhotosMixin
+
 logger = logging.getLogger(__name__)
 
 from agent.deadline import run_bounded_async
@@ -511,7 +513,7 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramInlinePhotosMixin, TelegramHeldInboundMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -1364,20 +1366,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             and self._content_fits_rich_limits(content)
             and self._bot_supports_rich())
 
-    def _rich_eligible(self, content: str) -> bool:
-        """Rich eligibility ignoring ``expect_edits`` (a streamed preview's FINAL edit still upgrades)."""
-        return bool(
-            self._rich_delivery_enabled()
-            and not getattr(self, "_rich_send_disabled", False)
-            and content and content.strip()
-            and (
-                self._needs_rich_rendering(content)
-                or self._exceeds_legacy_message_limit(content)
-            )
-            and self._rich_content_ok(content))
 
     def _should_attempt_rich(self, content: str, metadata: Optional[dict[str, Any]] = None) -> bool:
-        return bool(not (metadata or {}).get("expect_edits") and self._rich_eligible(content))
+        metadata = metadata or {}
+        return bool(not metadata.get("expect_edits") and not metadata.get("legacy_attachment_delivery")
+                    and self._rich_eligible(content))
 
     def prefers_fresh_final_streaming(self, content: str, metadata: Optional[dict[str, Any]] = None) -> bool:
         """Replace a streamed preview with a fresh rich final — DM topics only. Root DMs stay off (a live
@@ -1404,13 +1397,6 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         isn't fragmented at 4,096. None (→ legacy limit) if rich is unavailable."""
         return self.RICH_MESSAGE_MAX_CHARS if self._rich_transport_available() else None
 
-    def _rich_message_payload(self, content: str, *, skip_entity_detection: bool = False) -> dict[str, Any]:
-        """``InputRichMessage`` from RAW markdown — never ``format_message(content)``, whose MarkdownV2
-        escaping destroys table pipes."""
-        payload: dict[str, Any] = {"markdown": _rich_normalize_linebreaks(content)}
-        if skip_entity_detection:
-            payload["skip_entity_detection"] = True
-        return payload
 
     def _is_rich_capability_error(self, exc: Exception) -> bool:
         """True ⇒ the rich endpoint itself is unavailable (old PTB/server); latches rich off.
@@ -3681,9 +3667,19 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             if self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
+                    if self._inline_photos(content):
+                        # Also consume on ambiguous transient failures: the rich request
+                        # may have landed, so sending attachment copies is unsafe.
+                        rich_result.raw_response = {
+                            **(rich_result.raw_response if isinstance(rich_result.raw_response, dict) else {}),
+                            "inline_images_consumed": True,
+                        }
                     if rich_result.success:
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
+            if self._inline_photos(content) and (metadata or {}).get("inline_images_fallback"):
+                # The gateway still owns attachment fallback; do not echo image links.
+                _, content = self.extract_images(content)
             chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.

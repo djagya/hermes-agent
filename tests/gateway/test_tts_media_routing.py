@@ -64,6 +64,8 @@ def _allowed_media_path(tmp_path, monkeypatch, name):
         "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
         (root,),
     )
+    # Collection caches this root; path validation must stay inside the test sandbox.
+    monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", tmp_path)
     return media_file.resolve()
 
 
