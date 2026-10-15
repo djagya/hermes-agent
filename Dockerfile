@@ -325,15 +325,27 @@ FROM runtime_base AS python_deps
 # Source binding is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-# dlz: no --cache /opt/hermes/uv-cache seed (upstream f4e70b9d84). It adds
-# about 1 GB of image layers, past the fork's image budget, and the fork's
-# deployment runs with lazy installs disabled, so the seed would rarely be read.
-# Without it pm.packages.uv_cache_dir() finds no payload cache and starts the
-# machine cache empty; a plugin install fetches (python-olm builds from source).
+# --cache puts uv's cache at /opt/hermes/uv-cache, the seed path that
+# pm.packages.uv_cache_dir() merges into $HERMES_HOME/cache/uv on first use.
+# Do not leave the cache at its default: HERMES_HOME is not set yet in this
+# stage, so the default is /root/.hermes/cache/uv, which nothing reads. A plugin
+# install then runs with an empty cache and builds python-olm from source.
+#
+# dlz: the seed is pruned with `uv cache prune --ci` right after the build.
+# The runtime image has no make, compiler or libolm headers, so a PM sync
+# that includes [matrix] fails building python-olm unless the seed carries
+# the wheel built here. The full seed is about 960 MB: archive-v0 holds an
+# unpacked copy of every wheel in .venv. Upstream keeps those as hardlinks
+# inside one layer, but the fork assembler COPYs .venv in a separate layer,
+# so the links break and every byte is stored twice. The pruned seed keeps
+# only locally built wheels (python-olm) and is about 1.2 MB; other wheels
+# download on a sync.
 RUN python3 -m pm.build_env --source /opt/hermes --python /usr/local/bin/python3 \
+    --cache /opt/hermes/uv-cache \
     --out /opt/hermes/.venv --no-install-project --sealed --record-selection \
     --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock \
     --extra azure-identity --extra matrix --extra google-chat --extra sera-toolbox
+RUN python3 -m pm.build_env --prune-cache --ci --cache /opt/hermes/uv-cache
 
 # Icons render on the runtime environment: Pillow and resvg-py are core
 # dependencies. A stage of its own so the frontend stage keeps building its
