@@ -685,14 +685,16 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
         return None, ref.args
 
 
-_SUPPLIED_OTP_TOOL = "browser_vault_enter_code"
+# ``browser_vault`` (action=enter_code) since upstream folded the five vault tools into one;
+# ``browser_vault_enter_code`` still names calls in older transcripts and staged replays.
+_SUPPLIED_OTP_TOOLS = frozenset({"browser_vault", "browser_vault_enter_code"})
 _OTP_TOOL_ARG_NAMES = ("code", "otp", "one_time_code", "one_time_password")
 
 
 def _register_supplied_otp_for_redaction(function_name: str, function_args: dict) -> None:
     """Register an explicitly supplied one-time code with the redaction boundary.
 
-    ``browser_vault_enter_code(code=...)`` carries a live OTP in its tool arguments; the handler
+    ``browser_vault(action=enter_code, code=...)`` carries a live OTP in its tool arguments; the handler
     registers the value only once it starts, but by then the arguments were already captured by the
     assistant's tool_calls row, request dumps and plugin-hook copies. Registering earlier means every
     surface that scrubs registered vault values (session DB tool_calls projection, request dumps, log
@@ -701,7 +703,8 @@ def _register_supplied_otp_for_redaction(function_name: str, function_args: dict
     The model itself still saw the code when it emitted the call (it read it from the mail tool); this
     closes the persistence surfaces, not the model context, as the tool description says.
     """
-    if function_name != _SUPPLIED_OTP_TOOL or not isinstance(function_args, dict):
+    # Any action: a code the model put on another action is still live credential bytes in the row.
+    if function_name not in _SUPPLIED_OTP_TOOLS or not isinstance(function_args, dict):
         return
     from agent.redact import register_vault_redaction_value
     from tools.browser_vault_tool import _validate_supplied_otp
@@ -728,8 +731,9 @@ def register_supplied_otps(tool_calls) -> None:
         function = getattr(tool_call, "function", None)
         name = _canonical_tool_name(str(getattr(function, "name", "") or ""))
         raw_arguments = getattr(function, "arguments", None)
-        bridged = name == TOOL_CALL_NAME and isinstance(raw_arguments, str) and _SUPPLIED_OTP_TOOL in raw_arguments
-        if name != _SUPPLIED_OTP_TOOL and not bridged:
+        bridged = (name == TOOL_CALL_NAME and isinstance(raw_arguments, str)
+                   and any(tool in raw_arguments for tool in _SUPPLIED_OTP_TOOLS))
+        if name not in _SUPPLIED_OTP_TOOLS and not bridged:
             continue
         args, parse_error = _parse_tool_arguments(raw_arguments)
         if parse_error is not None:
