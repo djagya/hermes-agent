@@ -375,13 +375,13 @@ class MemoryStore:
             result = mutate(self._entries_for(target), self._char_limit(target))
             if isinstance(result, dict):
                 if result.get("success") and before_write is not None and not before_write():
-                    return _error("Pending memory approval capability is not live.")
+                    return _error("Pending memory approval capability is not live.", "gate_refused")
                 return result
             from hermes_constants import mkdir_under_hermes_home
 
             mkdir_under_hermes_home(path.parent)
             if before_write is not None and not before_write():
-                return _error("Pending memory approval capability is not live.")
+                return _error("Pending memory approval capability is not live.", "gate_refused")
             self._set_entries(target, result[0])
             self._write_file(path, result[0])
             extra_fields = result[2] if len(result) > 2 else {}
