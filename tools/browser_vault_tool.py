@@ -328,8 +328,13 @@ def browser_vault_list() -> str:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
                      "origin": meta.origin, "available": meta.kind == "login" or bool(meta.origin)}
             if meta.kind == "payment":
+                from tools.browser_supervisor_payment import _MAX_CARD_DOCUMENTS
+
+                # What the native fill accepts (browser_supervisor_payment._card_documents): one card
+                # document, or fields split across the merchant and at most ONE hosted origin.
                 entry.update(available=True, payment_scope=meta.payment_scope,
-                             confirmation_required=True, supported_layout="single_document",
+                             confirmation_required=True, supported_layout="single_or_split_one_provider",
+                             max_card_documents=_MAX_CARD_DOCUMENTS,
                              hosted_origins=list(meta.payment_frame_origins or PAYMENT_PSP_ORIGINS))
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
@@ -775,9 +780,11 @@ BROWSER_VAULT_SCHEMA = {
         "yourself with the browser's input tool; locked password managers appear under `locked`); fill (handle: "
         "the password for a login, card fields after the user confirms, address fields; login/address fills require "
         "their bound origin; a 1Password card can be approved for a selected HTTPS merchant, use merchant_origin to "
-        "select its exact tab; native card fill supports one card document, including a Stripe hosted iframe, and "
-        "refuses split/ambiguous fields; HTTPS is not a seller reputation check: verify the merchant and checkout "
-        "terms before requesting consent; it never submits); save_login (nothing saved for this site: the user "
+        "select its exact tab; card fields may sit in one document or be split across the merchant and ONE hosted "
+        "payment provider from the card's hosted_origins, each field exactly once; fields across two providers, "
+        "duplicate or ambiguous fields, a missing number/CVC/expiry and unlisted origins are refused; HTTPS is not a "
+        "seller reputation check: verify the merchant and checkout terms before requesting consent; it never "
+        "submits); save_login (nothing saved for this site: the user "
         "enters it in a masked prompt, Hermes saves and fills it); enter_code (a one-time/2FA code after the "
         "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
         "their device; a code Hermes itself obtained through its own authorized mail workflow goes in code with "
