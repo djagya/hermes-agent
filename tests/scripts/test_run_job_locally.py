@@ -230,24 +230,13 @@ def test_publish_promotes_the_image_build_test_tested():
     assert "needs.build-test.outputs.config-digest" in yaml.safe_dump(publish)
 
 
-def test_store_dependent_step_is_advisory_only_on_containerd_hosts(repo):
+def test_image_size_budget_step_blocks_the_job(repo):
+    # measure-image-budget.sh measures like CI on a containerd-store host, so
+    # the box gate no longer downgrades this step to advisory.
     step = {"name": "Record image size budget", "run": "exit 1"}
     workflow = {"jobs": {"j": {"steps": [step]}}}
-
     ctx = rjl.Context(workflow, "r", repo)
-    ctx.containerd_store = True
-    assert rjl.run_job(workflow, "j", ctx, repo, repo / ".tools")[0][1] == "advisory"
-    assert not ctx.failed
-
-    ctx = rjl.Context(workflow, "r", repo)
-    ctx.containerd_store = False
     assert rjl.run_job(workflow, "j", ctx, repo, repo / ".tools")[0][1] == "failure"
-    assert ctx.failed
-
-    other = {"jobs": {"j": {"steps": [{"name": "Unit tests", "run": "exit 1"}]}}}
-    ctx = rjl.Context(other, "r", repo)
-    ctx.containerd_store = True
-    assert rjl.run_job(other, "j", ctx, repo, repo / ".tools")[0][1] == "failure"
     assert ctx.failed
 
 

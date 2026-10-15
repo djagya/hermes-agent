@@ -32,8 +32,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-bytes="$(docker image inspect --format '{{.Size}}' "$IMAGE")"
-echo "image_bytes=$bytes"
+# On overlay2 (GitHub runners) `.Size` is the uncompressed layer bytes. On the
+# containerd image store (Docker 29 default, the box) `.Size` adds the
+# compressed blobs to the unpacked snapshots, about 1.45x the CI number. There,
+# measure the apparent size of the image filesystem instead: it lands within
+# about 0.6% below CI's `.Size` for the same image, and check-image-budget.py
+# applies du_margin_ratio to cover that gap.
+case "$(docker info --format '{{json .DriverStatus}}')" in
+  *io.containerd.snapshotter*)
+    bytes="$(docker run --rm --network none --user 0 --entrypoint du "$IMAGE" -sxb /)"
+    bytes="${bytes%%[[:space:]]*}"
+    method=du
+    ;;
+  *)
+    bytes="$(docker image inspect --format '{{.Size}}' "$IMAGE")"
+    method=inspect
+    ;;
+esac
+echo "image_bytes=$bytes image_bytes_method=$method"
 echo "image_mib=$((bytes / 1024 / 1024))"
 docker history --format '{{.Size}}\t{{.CreatedBy}}' "$IMAGE" | head -40
 
@@ -105,7 +121,7 @@ wipe_bind "$shut_home"
 shut_home=""
 
 echo "largest_layer_bytes=$largest cold_ms=$cold_ms warm_ms=$warm_ms rss_kb=$rss_kb cache_bytes=$cache_bytes shutdown_ms=$shutdown_ms"
-IMAGE_BYTES="$bytes" LARGEST_LAYER_BYTES="$largest" \
+IMAGE_BYTES="$bytes" IMAGE_BYTES_METHOD="$method" LARGEST_LAYER_BYTES="$largest" \
   COLD_HELP_MS="$cold_ms" WARM_HELP_MS="$warm_ms" \
   IDLE_RSS_KB="$rss_kb" CACHE_WRITE_BYTES="$cache_bytes" \
   SHUTDOWN_MS="$shutdown_ms" \

@@ -71,28 +71,6 @@ SKIPPED_ACTIONS = (
 )
 
 
-# Steps whose verdict depends on how the host's Docker stores images. GitHub
-# runners use overlay2, where `docker image inspect .Size` is the uncompressed
-# image; the containerd image store (Docker 29 default) reports compressed
-# content (+ unpacked snapshots), so the same image measured 1.95 GB, 4.95 GB
-# (CI) and 7.18 GB. On such a host a failure here is advisory; CI decides.
-STORE_DEPENDENT_STEPS = ("Record image size budget",)
-
-
-def host_uses_containerd_store() -> bool:
-    try:
-        out = subprocess.run(
-            ["docker", "info", "--format", "{{json .DriverStatus}}"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return "io.containerd.snapshotter" in out
-
-
 class StepError(RuntimeError):
     pass
 
@@ -127,7 +105,6 @@ class Context:
         }
         self.inputs: dict[str, object] = workflow_inputs(workflow, inputs or {})
         self.steps: dict[str, dict] = {}
-        self.containerd_store = False
         self.failed = False
         self.skipped = False  # the job's own `if:` was false
         self.job = ""
@@ -772,14 +749,7 @@ def run_steps(
         except StepError as exc:
             outcome = shown = "failure"
             print(f"!!! {name}: {exc}", flush=True)
-            if name in STORE_DEPENDENT_STEPS and ctx.containerd_store:
-                outcome = shown = "advisory"
-                print(
-                    f"!!! {name}: advisory on this host (containerd image store"
-                    " measures differently from CI's overlay2); CI decides",
-                    flush=True,
-                )
-            elif advisory:
+            if advisory:
                 shown = "advisory"  # outcome stays failure; the job goes on, as in CI
                 print(f"!!! {name}: continue-on-error, the job goes on", flush=True)
             else:
@@ -1053,7 +1023,6 @@ def main(argv: list[str] | None = None) -> int:
             continue
         ctx = Context(workflow, args.ref_name, workspace, args.before, given)
         ctx.tmp_root = tools
-        ctx.containerd_store = host_uses_containerd_store()
         before_job = checkout_extras(workspace)
         try:
             if args.container:

@@ -2,6 +2,9 @@
 """Compare built-image measurements against docker/sera-toolbox/image-budget.json.
 
 Null max_* means record-only for that metric. IMAGE_BYTES is required.
+IMAGE_BYTES_METHOD=du (a containerd-store host: apparent `du -sxb /` of the
+image) checks against max_image_bytes lowered by du_margin_ratio, because du
+reads slightly below CI's overlay2 `.Size` for the same image.
 Optional env: LARGEST_LAYER_BYTES, COLD_HELP_MS, WARM_HELP_MS,
 IDLE_RSS_KB, CACHE_WRITE_BYTES, SHUTDOWN_MS.
 """
@@ -51,6 +54,14 @@ def main() -> int:
     print(f"accepted_digest={budget.get('accepted_digest')}")
     ok = True
     limit = budget.get("max_image_bytes")
+    method = os.environ.get("IMAGE_BYTES_METHOD", "inspect").strip() or "inspect"
+    if method not in ("inspect", "du"):
+        print(f"ERROR: IMAGE_BYTES_METHOD must be inspect or du: {method!r}", file=sys.stderr)
+        return 2
+    if limit is not None and method == "du":
+        margin = float(budget.get("du_margin_ratio", 0))
+        limit = int(int(limit) * (1 - margin))
+        print(f"budget: du measurement, max_image_bytes lowered by {margin:.2%} to {limit}")
     if limit is None:
         print("budget: record-only (max_image_bytes is null)")
     elif image_bytes > int(limit):
