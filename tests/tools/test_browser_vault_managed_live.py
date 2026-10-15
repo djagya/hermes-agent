@@ -367,9 +367,9 @@ def _exec(task, url, **kw):
 
 
 def _fill(task):
-    from tools.browser_vault_tool import _handle_vault_fill
+    from tools.browser_vault_tool import _handle_vault
 
-    raw = _handle_vault_fill({"handle": "op:synthetic"}, task_id=task)
+    raw = _handle_vault({"action": "fill", "handle": "op:synthetic"}, task_id=task)
     return raw, json.loads(raw)
 
 

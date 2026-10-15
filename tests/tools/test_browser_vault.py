@@ -524,7 +524,7 @@ class TestBrowserVaultTools:
              patch("tools.browser_tool_session._run_browser_command") as run_cmd, \
              patch("tools.browser_control_route._acquire") as acquire:
             reg.get.return_value = None
-            out = json.loads(browser_vault_tool._handle_vault_fill({"handle": meta.id}, task_id="t-managed"))
+            out = json.loads(browser_vault_tool._handle_vault({"action": "fill", "handle": meta.id}, task_id="t-managed"))
         assert out["error_type"] == "no_browser_session", out
         run_cmd.assert_not_called()
         acquire.assert_not_called()
@@ -644,7 +644,7 @@ class TestVaultHardening:
 def test_every_registered_tool_schema_declares_openai_style_parameters():
     """The registry emits ``parameters`` (OpenAI function shape) and every provider adapter converts from
     it; a schema that spells it ``input_schema`` (Anthropic shape) ships with NO parameters, so the model is
-    told the tool takes nothing and calls browser_vault_fill without a handle."""
+    told the tool takes nothing and calls browser_vault fill without a handle."""
     import model_tools
     from tools.registry import registry
 
@@ -719,7 +719,8 @@ def test_every_vault_tool_is_in_the_browser_toolset():
     from tools import browser_vault_tool
     from tools.registry import registry
 
-    registered = {e.name for e in registry.get_all_entries() if e.name.startswith("browser_vault_")}
+    registered = {e.name for e in registry.get_all_entries() if e.name.startswith("browser_vault")}
+    assert registered == {"browser_vault"}
     assert registered <= set(toolsets.TOOLSETS["browser"]["tools"]), registered - set(toolsets.TOOLSETS["browser"]["tools"])
 
 
@@ -1049,8 +1050,8 @@ class TestExplicitCodeMode:
             return SimpleNamespace(function=SimpleNamespace(name=name, arguments=json.dumps(args)))
 
         calls = [
-            call("browser_vault_enter_code", {"code": "042172", "expected_origin": self.PAGE_ORIGIN}),
-            call("tool_call", {"calls": [{"name": "browser_vault_enter_code", "arguments": {"code": "A7-99Z"}}]}),
+            call("browser_vault", {"action": "enter_code", "code": "042172", "expected_origin": self.PAGE_ORIGIN}),
+            call("tool_call", {"calls": [{"name": "browser_vault", "arguments": {"action": "enter_code", "code": "A7-99Z"}}]}),
             call("browser_type", {"text": "555111"}),
         ]
         try:
@@ -1089,11 +1090,12 @@ class TestExplicitCodeMode:
         monkeypatch.setattr(round_module, "stage_tool_call_message", _capture)
         agent = AIAgent.__new__(AIAgent)
         agent.provider, agent.model, agent.session_id, agent.tools = "nous", "m", "s1", []
-        agent.valid_tool_names = {"browser_vault_enter_code"}
+        agent.valid_tool_names = {"browser_vault"}
         agent.log_prefix, agent.quiet_mode, agent.verbose_logging = "", True, False
         agent._invalid_tool_retries = agent._invalid_json_retries = 0
         tool_call = SimpleNamespace(id="call_0", type="function", function=SimpleNamespace(
-            name="browser_vault_enter_code", arguments=json.dumps({"code": "042172", "expected_origin": self.PAGE_ORIGIN})))
+            name="browser_vault", arguments=json.dumps({"action": "enter_code", "code": "042172",
+                                                        "expected_origin": self.PAGE_ORIGIN})))
         try:
             with pytest.raises(_Staged):
                 round_module.run_tool_round(
@@ -1113,10 +1115,20 @@ class TestExplicitCodeMode:
         seen = {}
         with patch.object(browser_vault_tool, "browser_vault_enter_code", side_effect=lambda **kw: seen.update(kw) or "{}"), \
              patch.object(browser_vault_tool, "_fenced_page_op", side_effect=lambda tid, fn: fn()) as fence:
-            browser_vault_tool._handle_vault_enter_code(
-                {"handle": "h", "code": "042172", "expected_origin": self.PAGE_ORIGIN}, task_id="t")
+            browser_vault_tool._handle_vault(
+                {"action": "enter_code", "handle": "h", "code": "042172", "expected_origin": self.PAGE_ORIGIN}, task_id="t")
         assert fence.call_count == 1
         assert seen == {"handle": "h", "task_id": "t", "code": "042172", "expected_origin": self.PAGE_ORIGIN}
+
+    def test_handler_passes_merchant_origin_to_card_fill(self):
+        from tools import browser_vault_tool
+
+        seen = {}
+        with patch.object(browser_vault_tool, "browser_vault_fill", side_effect=lambda **kw: seen.update(kw) or "{}"), \
+             patch.object(browser_vault_tool, "_fenced_page_op", side_effect=lambda tid, fn: fn()):
+            browser_vault_tool._handle_vault(
+                {"action": "fill", "handle": "op:card", "merchant_origin": "https://shop.example"}, task_id="t")
+        assert seen == {"handle": "op:card", "task_id": "t", "merchant_origin": "https://shop.example"}
 
     def test_handle_bound_to_several_origins_accepts_any_of_them(self):
         from types import SimpleNamespace
@@ -1138,7 +1150,8 @@ class TestExplicitCodeMode:
         from agent.display import build_tool_preview, redact_tool_args_for_display
 
         args = {"code": "042172", "expected_origin": self.PAGE_ORIGIN}
-        shown = redact_tool_args_for_display("browser_vault_enter_code", args)
+        args = {"action": "enter_code", **args}
+        shown = redact_tool_args_for_display("browser_vault", args)
         assert "042172" not in json.dumps(shown) and shown["expected_origin"] == self.PAGE_ORIGIN
-        assert "042172" not in (build_tool_preview("browser_vault_enter_code", args) or "")
+        assert "042172" not in (build_tool_preview("browser_vault", args) or "")
         assert args["code"] == "042172"  # the dispatched args are untouched

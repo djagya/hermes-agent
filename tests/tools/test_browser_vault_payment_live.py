@@ -245,7 +245,7 @@ def test_native_encrypted_vault_fill_and_refusals(
         "tools.approval_prompt.request_elicitation_consent", return_value="accept"
     ):
         raw = registry.dispatch(
-            "browser_vault_fill", {"handle": card.id}, task_id="payment-live"
+            "browser_vault", {"action": "fill", "handle": card.id}, task_id="payment-live"
         )
     result = json.loads(raw)
     assert (
