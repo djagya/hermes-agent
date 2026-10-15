@@ -464,6 +464,12 @@ def btbn_versions(target: str) -> list[str]:
     return list(btbn_index().get(target, {}))
 
 
+# python-build-standalone asset flavor. dlz: the stripped build drops debug
+# symbols (the unstripped python3.14 binary is 116 MB and libpython 248 MB on
+# linux-x64); the interpreter and stdlib are the same build.
+PBS_FLAVOR = "install_only_stripped"
+
+
 def pbs_versions(minor: str, triple: str) -> list[str]:
     """Return the exact interpreter identity advertised by the newest matching release."""
     for page in range(1, 3):
@@ -476,7 +482,7 @@ def pbs_versions(minor: str, triple: str) -> list[str]:
             tag = release.get("tag_name", "")
             if not re.fullmatch(r"[0-9]{8}", tag):
                 continue
-            pattern = rf"cpython-({re.escape(minor)}\.[0-9]+\+{tag})-{re.escape(triple)}-install_only\.tar\.gz"
+            pattern = rf"cpython-({re.escape(minor)}\.[0-9]+\+{tag})-{re.escape(triple)}-{PBS_FLAVOR}\.tar\.gz"
             for asset in release.get("assets", []):
                 match = re.fullmatch(pattern, asset.get("name", ""))
                 if match:

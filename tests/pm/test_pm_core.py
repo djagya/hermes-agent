@@ -624,7 +624,7 @@ def test_python_package_url_carries_release_tag():
     python = get_package("python")
     url = python.fetch_url("3.14.7+20260901", "win32-arm64")
     assert "download/20260901/" in url
-    assert "cpython-3.14.7+20260901-aarch64-pc-windows-msvc-install_only" in url
+    assert "cpython-3.14.7+20260901-aarch64-pc-windows-msvc-install_only_stripped.tar.gz" in url
 
     try:
         python.fetch_url("3.14.7", "win32-arm64")

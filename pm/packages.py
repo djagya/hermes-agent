@@ -34,6 +34,7 @@ from pm.update import (
     martin_riedl_versions,
     node_latest_versions,
     npm_dist_tags,
+    PBS_FLAVOR,
     pbs_versions,
 )
 
@@ -272,7 +273,7 @@ class Python(_BionicDebArm, BinaryPackage, DebPackage):
         triple = _RUST_TRIPLE[target]
         return (
             "https://github.com/astral-sh/python-build-standalone/releases/download/"
-            f"{tag}/cpython-{pyver}+{tag}-{triple}-install_only.tar.gz"
+            f"{tag}/cpython-{pyver}+{tag}-{triple}-{PBS_FLAVOR}.tar.gz"
         )
 
     def latest_versions(self, target: str, locked=None) -> list[str]:
