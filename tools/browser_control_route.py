@@ -39,10 +39,10 @@ CONTROL_TIMEOUT_S = 60.0
 STATUS_TIMEOUT_S = 10.0
 
 _held_lock = threading.Lock()
-_held_leases: Dict[str, Dict[str, str]] = {}
+_held_leases: dict[str, dict[str, str]] = {}
 # Hold key -> [lock, users]. Guarded by ``_held_lock``; an entry lives only
 # while a caller is inside :func:`_single_flight` for that key.
-_key_locks: Dict[str, List[Any]] = {}
+_key_locks: dict[str, list[Any]] = {}
 
 
 class ManagedBrowserError(Exception):
@@ -110,7 +110,7 @@ def _coerce_mode(mode: Optional[str]) -> str:
     return value if value in {"research", "qa"} else "research"
 
 
-def _coerce_targets(raw: Any) -> List[str]:
+def _coerce_targets(raw: Any) -> list[str]:
     if raw is None:
         return []
     if isinstance(raw, str):
@@ -136,7 +136,7 @@ def _ambient_cdp_override() -> str:
     return ""
 
 
-def _refuse_overrides(env: Dict[str, str], raw_cdp_override: str = "") -> Optional[str]:
+def _refuse_overrides(env: dict[str, str], raw_cdp_override: str = "") -> Optional[str]:
     if env.get("BU_CDP_WS") or env.get("BU_CDP_URL"):
         return "scope_denied: managed mode refuses BU_CDP_* overrides"
     if (os.environ.get("BROWSER_CDP_URL") or "").strip() or (raw_cdp_override or "").strip():
@@ -147,7 +147,7 @@ def _refuse_overrides(env: Dict[str, str], raw_cdp_override: str = "") -> Option
     return None
 
 
-def _apply_lease(env: Dict[str, str], lease: Dict[str, Any], control: str) -> Optional[str]:
+def _apply_lease(env: dict[str, str], lease: dict[str, Any], control: str) -> Optional[str]:
     slot_id = str(lease.get("slot_id") or "")
     generation = str(lease.get("browser_generation") or "")
     epoch = int(lease.get("ownership_epoch") or 0)
@@ -162,7 +162,7 @@ def _apply_lease(env: Dict[str, str], lease: Dict[str, Any], control: str) -> Op
     return None
 
 
-def _format_error(lease: Dict[str, Any]) -> str:
+def _format_error(lease: dict[str, Any]) -> str:
     code = str(lease.get("error") or "unavailable")
     detail = str(lease.get("detail") or "").strip()
     if code == "busy":
@@ -176,7 +176,7 @@ def _format_error(lease: Dict[str, Any]) -> str:
     return code
 
 
-def _post(control: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _post(control: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     key = control_key()
@@ -284,8 +284,8 @@ def _acquire(
     task: str,
     mode: str,
     identity: str,
-    qa_targets: List[str],
-) -> Dict[str, Any]:
+    qa_targets: list[str],
+) -> dict[str, Any]:
     if control == CONFIG_UNREADABLE_URL:
         return {
             "error": "unavailable",
@@ -308,7 +308,7 @@ def _acquire(
 
 
 def resolve_managed_cdp(
-    env: Dict[str, str],
+    env: dict[str, str],
     task_id: Optional[str] = "",
     session_name: str = "",
     mode: str = "",
@@ -355,14 +355,14 @@ def resolve_managed_cdp(
 
 
 def _resolve_held(
-    env: Dict[str, str],
+    env: dict[str, str],
     control: str,
     key: str,
     *,
     task: str,
     mode: str,
     identity: str,
-    qa_targets: List[str],
+    qa_targets: list[str],
     reconnect: bool,
 ) -> Optional[str]:
     """Reuse the live held lease for ``key`` or acquire one. Caller holds the key lock."""
@@ -413,7 +413,7 @@ def _resolve_held(
 
 
 def managed_cdp_or_error(
-    env: Optional[Dict[str, str]] = None,
+    env: Optional[dict[str, str]] = None,
     *,
     task_id: str = "",
     session_name: str = "",
@@ -422,7 +422,7 @@ def managed_cdp_or_error(
     qa_targets: Any = None,
     raw_cdp_override: Optional[str] = None,
     reconnect: bool = False,
-) -> Tuple[Optional[str], Optional[str]]:
+) -> tuple[Optional[str], Optional[str]]:
     """Single choke-point helper for built-in and CLI paths.
 
     Returns ``(None, None)`` when unmanaged, ``(cdp_url, None)`` on
@@ -446,7 +446,7 @@ def managed_cdp_or_error(
     return hold.get("BU_CDP_URL") or None, None
 
 
-def release_lease(env: Dict[str, str]) -> Optional[str]:
+def release_lease(env: dict[str, str]) -> Optional[str]:
     """Best-effort ``POST /v1/release`` with lease id + command token."""
     control = control_url()
     lease_id = str(env.get(MANAGED_LEASE_ENV) or "").strip()

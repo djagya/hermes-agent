@@ -252,29 +252,33 @@ class MCPServerRunMixin:
     def _oauth_credential_snapshot(self) -> tuple:
         """What an OAuth re-authorization changes: the stat of this server's token and client
         files plus the on-disk endpoint/auth config. Stat only — no token bytes are read."""
+        from hermes_constants import get_hermes_home
         from tools import mcp_tool_config as _config
         from tools.mcp_oauth import HermesTokenStorage
 
-        storage = HermesTokenStorage(self.name)
-        files = []
-        for path in (storage._tokens_path(), storage._client_info_path()):
-            try:
-                st = path.stat()
-                files.append((st.st_mtime_ns, st.st_size, st.st_ino))
-            except OSError:
-                files.append(None)
+        files = HermesTokenStorage(self.name, hermes_home=get_hermes_home()).credential_stamp()
         try:
             entry = (_config._load_mcp_config() or {}).get(self.name) or {}
             cfg = repr([entry.get(k) for k in self._REMOTE_REBIND_KEYS])
         except Exception:
             cfg = None
-        return tuple(files), cfg
+        return files, cfg
 
     def _arm_auth_park(self, root: BaseException) -> None:
-        """Snapshot credentials before an OAuth auth-failure park (see ``_park``)."""
-        self._auth_park_credentials = (
-            self._oauth_credential_snapshot()
-            if self._auth_type == "oauth" and _errors._is_auth_error(root) else None)
+        """Record the OAuth credentials an auth-failure park failed with (see ``_park``). Until a
+        re-authorization rewrites them, neither a discovery pass (``_auth_park``, checked by
+        ``_select_new_servers``) nor the timed self-probe (``_auth_park_credentials``, which also
+        covers an edited endpoint/auth config) has anything new to try: each replayed the same
+        rejected refresh token, enough for an authorization-server rate-limit ban."""
+        self._auth_park = None
+        self._auth_park_credentials = None
+        if self._auth_type == "oauth" and _errors._is_auth_error(root):
+            from hermes_constants import get_hermes_home
+            from tools.mcp_oauth import HermesTokenStorage
+
+            storage = HermesTokenStorage(self.name, hermes_home=get_hermes_home())
+            self._auth_park = (storage, storage.credential_stamp())
+            self._auth_park_credentials = self._oauth_credential_snapshot()
 
     def _still_configured_enabled(self) -> bool:
         """Whether ``mcp_servers`` on disk still wants this server connected: entry present
@@ -389,6 +393,7 @@ class MCPServerRunMixin:
                             from agent.secret_scope import reset_secret_scope
                             reset_secret_scope(scope_token)
                 rebuild = True
+                self._auth_park = None
                 run_transport = self._run_http if self._is_http() else self._run_stdio
                 self._resolved_identity = None  # the transport publishes the inputs it connects with
                 if not await self._on_clean_return(await run_transport(config), budget):
@@ -411,7 +416,7 @@ class MCPServerRunMixin:
                 # Stale PIDs must never fast-fail the NEXT transport's calls.
                 self._stdio_child_pids = set()
 
-    async def _on_clean_return(self, lifecycle_reason: str, budget: "_RetryBudget") -> bool:
+    async def _on_clean_return(self, lifecycle_reason: str, budget: _RetryBudget) -> bool:
         """Clean transport return: shutdown, stdio recycle, or a requested rebuild (not a failure
         for the retry counters)."""
         if self._shutdown_event.is_set():
@@ -452,7 +457,7 @@ class MCPServerRunMixin:
         self.session = None
         return True
 
-    async def _park_and_rearm(self, revival_reason: str, budget: "_RetryBudget") -> bool:
+    async def _park_and_rearm(self, revival_reason: str, budget: _RetryBudget) -> bool:
         """Park; on revival leave ONE probe per wake so a still-dead server re-parks instead of
         burning 5 rapid retries. False on shutdown."""
         if await self._park(revival_reason):
@@ -460,7 +465,7 @@ class MCPServerRunMixin:
         self._reconnect_retries, budget.backoff = _core._MAX_RECONNECT_RETRIES, 1.0
         return True
 
-    async def _park_initial_failure(self, exc: Exception, revival_reason: str, budget: "_RetryBudget") -> bool:
+    async def _park_initial_failure(self, exc: Exception, revival_reason: str, budget: _RetryBudget) -> bool:
         """Publish ``exc`` to ``start()``, park, and on revival reset every counter. False on shutdown."""
         self._publish_error(exc)
         if await self._park(revival_reason):
@@ -471,11 +476,11 @@ class MCPServerRunMixin:
         self._ready.clear()
         return True
 
-    async def _backoff_sleep(self, budget: "_RetryBudget") -> None:
+    async def _backoff_sleep(self, budget: _RetryBudget) -> None:
         await asyncio.sleep(_jittered(budget.backoff))
         budget.backoff = min(budget.backoff * 2, _core._MAX_BACKOFF_SECONDS)
 
-    async def _on_transport_error(self, exc: Exception, budget: "_RetryBudget") -> bool:
+    async def _on_transport_error(self, exc: Exception, budget: _RetryBudget) -> bool:
         """Transport raised: classify, then run the initial-connect or reconnect ladder. False = exit."""
         # Unwrap anyio TaskGroup wrappers: the group's str() hides the root cause.
         root = _errors._unwrap_exception_group(exc)
@@ -514,7 +519,7 @@ class MCPServerRunMixin:
         return not self._shutdown_event.is_set()
 
     async def _on_initial_connect_error(self, exc: Exception, root: BaseException,
-                                        failure_class: str, budget: "_RetryBudget") -> bool:
+                                        failure_class: str, budget: _RetryBudget) -> bool:
         if failure_class == "permanent":
             # Deterministic failure (bad command, non-MCP URL, 401/403): park at once; auth
             # failures park (not return) so the task can pick up fresh tokens later.
@@ -541,7 +546,7 @@ class MCPServerRunMixin:
             self._publish_error(exc)
         return not self._shutdown_event.is_set()
 
-    async def _on_permanent_error(self, root: BaseException, budget: "_RetryBudget") -> bool:
+    async def _on_permanent_error(self, root: BaseException, budget: _RetryBudget) -> bool:
         # Auth failure on a PROVEN session is often a raced-teardown OAuth lock, not revoked
         # credentials: grant ONE suspect+reconnect cycle first.
         if _errors._is_auth_error(root) and self._session_proven and not self._permanent_grace_used:
@@ -585,7 +590,7 @@ class MCPServerRunMixin:
         if self._task and not self._task.done():
             try:
                 await asyncio.wait_for(self._task, timeout=10)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("MCP server '%s' shutdown timed out, cancelling task", self.name)
                 self._task.cancel()
                 try:

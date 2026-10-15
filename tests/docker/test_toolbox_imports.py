@@ -39,5 +39,6 @@ for module in ('ddgs', 'fal_client', 'faster_whisper', 'pillow_heif'):
         ["docker", "run", "--rm", "--entrypoint", "/opt/hermes/.venv/bin/python",
          built_image, "-c", probe],
         capture_output=True, text=True, timeout=90,
+        check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr

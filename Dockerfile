@@ -5,7 +5,7 @@
 # Pinned by the multi-arch index digest: uv and node already come from pm's
 # sha-verified lock, and a tag alone would let the base drift under them.
 FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS sqlite_build
-ARG DEBIAN_SNAPSHOT=20261011T000000Z
+ARG DEBIAN_SNAPSHOT=20261014T061051Z
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
@@ -315,13 +315,37 @@ FROM runtime_base AS python_deps
 # [sera-toolbox] supplies smoke-required parsers and ruff in the production
 # venv; dependency groups are intentionally excluded.
 #
+# --record-selection writes these extras to the store's facts.json as the venv
+# selection, as a bundle build does. Without it, the first opt-in extra a
+# container installs on use (FAL, a plugin's deps) records a selection of
+# just that extra, and every later boot runs a generation without the extras
+# baked here (aiohttp, so no API server). stage2's dependency refresh
+# restores this baseline into volumes that already lost it.
+#
 # Source binding is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
+# --cache puts uv's cache at /opt/hermes/uv-cache, the seed path that
+# pm.packages.uv_cache_dir() merges into $HERMES_HOME/cache/uv on first use.
+# Do not leave the cache at its default: HERMES_HOME is not set yet in this
+# stage, so the default is /root/.hermes/cache/uv, which nothing reads. A plugin
+# install then runs with an empty cache and builds python-olm from source.
+#
+# dlz: the seed is pruned with `uv cache prune --ci` right after the build.
+# The runtime image has no make, compiler or libolm headers, so a PM sync
+# that includes [matrix] fails building python-olm unless the seed carries
+# the wheel built here. The full seed is about 960 MB: archive-v0 holds an
+# unpacked copy of every wheel in .venv. Upstream keeps those as hardlinks
+# inside one layer, but the fork assembler COPYs .venv in a separate layer,
+# so the links break and every byte is stored twice. The pruned seed keeps
+# only locally built wheels (python-olm) and is about 1.2 MB; other wheels
+# download on a sync.
 RUN python3 -m pm.build_env --source /opt/hermes --python /usr/local/bin/python3 \
-    --out /opt/hermes/.venv --no-install-project --sealed \
+    --cache /opt/hermes/uv-cache \
+    --out /opt/hermes/.venv --no-install-project --sealed --record-selection \
     --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock \
     --extra azure-identity --extra matrix --extra google-chat --extra sera-toolbox
+RUN python3 -m pm.build_env --prune-cache --ci --cache /opt/hermes/uv-cache
 
 # Icons render on the runtime environment: Pillow and resvg-py are core
 # dependencies. A stage of its own so the frontend stage keeps building its
@@ -620,7 +644,7 @@ ARG HERMES_GIT_SHA=
 LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
       org.opencontainers.image.revision="${HERMES_GIT_SHA}"
 ARG HERMES_BOT_DESKTOP=0
-ARG DEBIAN_SNAPSHOT=20261011T000000Z
+ARG DEBIAN_SNAPSHOT=20261014T061051Z
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
 RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     apt-get -o Acquire::Retries=3 update && \

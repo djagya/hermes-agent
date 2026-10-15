@@ -72,6 +72,9 @@ def _allowed_image(tmp_path, monkeypatch, name: str = "photo.png"):
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 64)
     monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (root,))
+    # This module caches its root at collection; enumerate only the per-test sandbox.
+    # Keep real validation and the home-I/O guard enabled.
+    monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", tmp_path)
     return f.resolve()
 
 

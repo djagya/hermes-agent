@@ -15,7 +15,7 @@ import logging
 
 import pytest
 
-import tools.approval_smart as approval_smart
+from tools import approval_smart
 from agent.redact import redact_sensitive_text
 
 # A secret SHAPE the production redactor actually matches (the ``sk-`` vendor-prefix

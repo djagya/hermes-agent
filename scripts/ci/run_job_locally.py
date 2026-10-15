@@ -71,27 +71,6 @@ SKIPPED_ACTIONS = (
 )
 
 
-# Steps whose verdict depends on how the host's Docker stores images. GitHub
-# runners use overlay2, where `docker image inspect .Size` is the uncompressed
-# image; the containerd image store (Docker 29 default) reports compressed
-# content (+ unpacked snapshots), so the same image measured 1.95 GB, 4.95 GB
-# (CI) and 7.18 GB. On such a host a failure here is advisory; CI decides.
-STORE_DEPENDENT_STEPS = ("Record image size budget",)
-
-
-def host_uses_containerd_store() -> bool:
-    try:
-        out = subprocess.run(
-            ["docker", "info", "--format", "{{json .DriverStatus}}"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return "io.containerd.snapshotter" in out
-
-
 class StepError(RuntimeError):
     pass
 
@@ -126,7 +105,6 @@ class Context:
         }
         self.inputs: dict[str, object] = workflow_inputs(workflow, inputs or {})
         self.steps: dict[str, dict] = {}
-        self.containerd_store = False
         self.failed = False
         self.skipped = False  # the job's own `if:` was false
         self.job = ""
@@ -472,14 +450,16 @@ def run_shell(
             cmd = ["docker", "exec", "-i", "--user", step_user(), "-w", str(cwd)]
             for key, value in step_env.items():
                 cmd += ["-e", f"{key}={value}"]
-            proc = subprocess.run([*cmd, ctx.container, *shell])
+            # health: allow HX006 -- a CI step runs to its end; the job's own timeout-minutes bounds it
+            proc = subprocess.run([*cmd, ctx.container, *shell], check=False)
         else:
             step_env["PATH"] = ":".join([
                 str(shim),
                 *ctx.path_prepend,
                 os.environ["PATH"],
             ])
-            proc = subprocess.run(shell, cwd=cwd, env={**os.environ, **step_env})
+            # health: allow HX006 -- a CI step runs to its end; the job's own timeout-minutes bounds it
+            proc = subprocess.run(shell, cwd=cwd, env={**os.environ, **step_env}, check=False)
         ctx.env.update(_read_kv_file(genv))
         # GitHub prepends each GITHUB_PATH line in order: the last line ends up first.
         for line in gpath.read_text(encoding="utf-8-sig").splitlines():
@@ -546,7 +526,8 @@ def build_push(with_: dict, ctx: Context, cwd: Path) -> None:
             if line.strip():
                 cmd += [flag, line.strip()]
     print("+ " + " ".join(cmd), flush=True)
-    if subprocess.run(cmd, cwd=cwd, env={**os.environ, **ctx.env}).returncode != 0:
+    # health: allow HX006 -- the image build runs to its end; the job's own timeout-minutes bounds it
+    if subprocess.run(cmd, cwd=cwd, env={**os.environ, **ctx.env}, check=False).returncode != 0:
         raise StepError("docker buildx build failed")
 
 
@@ -563,9 +544,9 @@ def setup_uv(with_: dict, ctx: Context, tools: Path) -> None:
         )
         dest.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(suffix=".tgz", dir=tools) as tgz:
-            urllib.request.urlretrieve(url, tgz.name)  # noqa: S310 — fixed https URL
+            urllib.request.urlretrieve(url, tgz.name)
             # The binary runs with docker-socket access: verify it like setup-uv does.
-            with urllib.request.urlopen(url + ".sha256") as resp:  # noqa: S310
+            with urllib.request.urlopen(url + ".sha256") as resp:
                 want = resp.read().decode().split()[0]
             got = hashlib.sha256(Path(tgz.name).read_bytes()).hexdigest()
             if got != want:
@@ -768,14 +749,7 @@ def run_steps(
         except StepError as exc:
             outcome = shown = "failure"
             print(f"!!! {name}: {exc}", flush=True)
-            if name in STORE_DEPENDENT_STEPS and ctx.containerd_store:
-                outcome = shown = "advisory"
-                print(
-                    f"!!! {name}: advisory on this host (containerd image store"
-                    " measures differently from CI's overlay2); CI decides",
-                    flush=True,
-                )
-            elif advisory:
+            if advisory:
                 shown = "advisory"  # outcome stays failure; the job goes on, as in CI
                 print(f"!!! {name}: continue-on-error, the job goes on", flush=True)
             else:
@@ -911,7 +885,7 @@ def start_container(image: str, workspace: Path, tools: Path) -> str:
     try:
         _setup_container(cid)
     except BaseException:
-        subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", cid], capture_output=True, check=False, timeout=120)
         raise
     return cid
 
@@ -973,6 +947,7 @@ def remove_job_outputs(
         subprocess.run(
             ["docker", "exec", container, "rm", "-rf", "--", *map(str, paths)],
             capture_output=True,
+            check=False,
         )
         return
     for path in paths:
@@ -1048,7 +1023,6 @@ def main(argv: list[str] | None = None) -> int:
             continue
         ctx = Context(workflow, args.ref_name, workspace, args.before, given)
         ctx.tmp_root = tools
-        ctx.containerd_store = host_uses_containerd_store()
         before_job = checkout_extras(workspace)
         try:
             if args.container:
@@ -1066,7 +1040,8 @@ def main(argv: list[str] | None = None) -> int:
             remove_job_outputs(workspace, before_job, ctx.container)
             if ctx.container:
                 subprocess.run(
-                    ["docker", "rm", "-f", ctx.container], capture_output=True
+                    ["docker", "rm", "-f", ctx.container], capture_output=True,
+                    check=False,
                 )
         if ctx.failed or ctx.skipped:
             blocked.add(job)

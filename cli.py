@@ -3,26 +3,27 @@
 
 # Must be the very first import (UTF-8 stdio on Windows). Missing only mid-``hermes update``.
 try:
-    import hermes_bootstrap  # noqa: F401
+    import hermes_bootstrap
 except ModuleNotFoundError as exc:
     if exc.name != "hermes_bootstrap":
         raise  # the bootstrap exists but cannot load: skipping it would skip PM activation
 
 import logging
-import json
 import os
 import functools
-import shutil  # noqa: F401 — tests patch shutil/time through the cli facade
+# Tests patch shutil/time/datetime through the cli facade; siblings also resolve datetime
+# lazily through it — these imports are load-bearing despite being unused in this file.
+import shutil
 import sys
 import re
 import atexit
 import errno
-import time  # noqa: F401 — see shutil
+import time
 from collections import deque
 from dataclasses import dataclass
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from datetime import datetime  # noqa: F401 — siblings import it lazily through cli
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ from hermes_cli.cli_process_notifications import CLIProcessNotificationsMixin
 from hermes_cli.cli_init_mixin import CLIInitMixin
 from hermes_cli.cli_tui_runtime_mixin import CLITuiRuntimeMixin
 # Extracted clusters (mechanical split, #116911); re-exported here so `cli.<name>` stays the seam.
-from hermes_cli.cli_shutdown import (  # noqa: F401,E402
+from hermes_cli.cli_shutdown import (
     _CLEANUP_STEPS,
     _arm_exit_watchdog,
     _emit_interrupted_session_end,
@@ -69,11 +70,11 @@ from hermes_cli.cli_shutdown import (  # noqa: F401,E402
     _sync_process_session_id,
     _wait_for_oneshot_background_completions,
 )
-from hermes_cli.cli_auto_maintenance import (  # noqa: F401,E402
+from hermes_cli.cli_auto_maintenance import (
     _run_checkpoint_auto_maintenance,
     _run_state_db_auto_maintenance,
 )
-from hermes_cli.cli_render import (  # noqa: F401,E402
+from hermes_cli.cli_render import (
     ChatConsole,
     _ACCENT,
     _ACCENT_ANSI_DEFAULT,
@@ -140,7 +141,7 @@ from hermes_cli.cli_render import (  # noqa: F401,E402
     _wrap_panel_text,
     _wrap_panel_text_keep_ws,
 )
-from hermes_cli.cli_config_load import (  # noqa: F401,E402
+from hermes_cli.cli_config_load import (
     _AUXILIARY_TASK_ENV,
     _CWD_PLACEHOLDERS,
     _TERMINAL_ENV_MAPPINGS,
@@ -154,7 +155,7 @@ from hermes_cli.cli_config_load import (  # noqa: F401,E402
     _resolve_prefill_messages_file,
     load_cli_config,
 )
-from hermes_cli.cli_terminal_input import (  # noqa: F401,E402
+from hermes_cli.cli_terminal_input import (
     _BACKSLASH_LINE_CONTINUATION_RE,
     _DSR_CPR_ESC_RE,
     _DSR_CPR_VISIBLE_RE,
@@ -192,7 +193,7 @@ from hermes_cli.cli_terminal_input import (  # noqa: F401,E402
     _terminal_supports_extended_enter_keys,
     _termux_example_image_path,
 )
-from hermes_cli.cli_single_query import (  # noqa: F401,E402
+from hermes_cli.cli_single_query import (
     _TERMINAL_PROVIDER_REASONS,
     _TRANSIENT_PROVIDER_REASONS,
     _collect_kanban_task_images,
@@ -332,300 +333,11 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 # ~/.hermes/.env first, project .env as dev fallback; user env files override stale shell exports.
 from hermes_constants import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
-from agent.i18n import t as _t  # noqa: E402
+from agent.i18n import t as _t
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
-
-
-# Keep the facade bindings imported from cli_render.
-
-
-def _assistant_content_as_text(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = [str(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text"]
-        return "\n".join(p for p in parts if p)
-    return str(content)
-
-
-def _assistant_copy_text(content: Any) -> str:
-    return _strip_reasoning_tags(_assistant_content_as_text(content))
-
-
-def _load_prefill_messages(file_path: str) -> List[Dict[str, Any]]:
-    """Load prefill messages (JSON array) from *file_path*; relative to ~/.hermes/; missing/empty -> []."""
-    if not file_path:
-        return []
-    path = Path(file_path).expanduser()
-    if not path.is_absolute():
-        path = _hermes_home / path
-    if not path.exists():
-        logger.warning("Prefill messages file not found: %s", path)
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            logger.warning("Prefill messages file must contain a JSON array: %s", path)
-            return []
-        return data
-    except Exception as e:
-        logger.warning("Failed to load prefill messages from %s: %s", path, e)
-        return []
-
-
-def _resolve_prefill_messages_file(config: Dict[str, Any]) -> str:
-    """Prefill file path: env, then top-level ``prefill_messages_file``, then legacy ``agent.*``."""
-    agent_cfg = config.get("agent", {})
-    return (
-        os.getenv("HERMES_PREFILL_MESSAGES_FILE", "").strip()
-        or str(config.get("prefill_messages_file", "") or "").strip()
-        or (str(agent_cfg.get("prefill_messages_file", "") or "").strip() if isinstance(agent_cfg, dict) else "")
-    )
-
-
-def _parse_reasoning_config(effort) -> dict | None:
-    """Parse a reasoning effort level (string or YAML bool; ``false``/``off`` = disabled)."""
-    from hermes_constants import parse_reasoning_effort
-    result = parse_reasoning_effort(effort)
-    if effort and str(effort).strip() and result is None:
-        logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
-    return result
-
-
-def _parse_service_tier_config(raw: str) -> str | None:
-    """Parse a persisted fast-mode preference: None, "priority", "auto", or "cold"."""
-    value = str(raw or "").strip().lower()
-    if not value or value in {"normal", "default", "standard", "off", "none"}:
-        return None
-    if value in {"fast", "priority", "on"}:
-        return "priority"
-    if value in {"auto", "cold"}:
-        return value
-    logger.warning("Unknown service_tier '%s', ignoring", raw)
-    return None
-
-
-# terminal.<key> -> TERMINAL_<KEY> env var. Container-resource keys apply to docker,
-# singularity, modal, daytona and vercel_sandbox only (ignored for local/ssh).
-_TERMINAL_ENV_MAPPINGS = {
-    key: f"TERMINAL_{key.upper()}"
-    for key in (
-        "degraded_mode", "cwd", "timeout", "home_mode", "lifetime_seconds", "docker_image",
-        "docker_forward_env", "singularity_image", "modal_image", "daytona_image", "vercel_runtime", "vercel_image",
-        "ssh_host", "ssh_user", "ssh_port", "ssh_key", "container_cpu", "container_memory",
-        "container_disk", "container_persistent", "docker_volumes", "docker_env", "docker_extra_args",
-        "docker_shm_size", "docker_mount_cwd_to_workspace", "docker_network", "docker_run_as_host_user",
-        "docker_snap_compat",
-        "docker_persist_across_processes", "docker_shared_container_key", "docker_orphan_reaper",
-        "sandbox_dir", "persistent_shell",
-    )
-}
-_TERMINAL_ENV_MAPPINGS = {"env_type": "TERMINAL_ENV", **_TERMINAL_ENV_MAPPINGS, "sudo_password": "SUDO_PASSWORD"}
-# Per-task auxiliary endpoint tuples (config key -> env var).
-_AUXILIARY_TASK_ENV = {
-    "vision": {
-        "provider": "AUXILIARY_VISION_PROVIDER",
-        "model": "AUXILIARY_VISION_MODEL",
-        "base_url": "AUXILIARY_VISION_BASE_URL",
-        "api_key": "AUXILIARY_VISION_API_KEY",
-    },
-    "approval": {
-        "provider": "AUXILIARY_APPROVAL_PROVIDER",
-        "model": "AUXILIARY_APPROVAL_MODEL",
-        "base_url": "AUXILIARY_APPROVAL_BASE_URL",
-        "api_key": "AUXILIARY_APPROVAL_API_KEY",
-    },
-}
-_CWD_PLACEHOLDERS = (".", "auto", "cwd")
-
-
-def _mirror_config_to_env(defaults, _file_has_terminal_config):
-    """Project config.yaml values into the env vars the tool modules read (terminal/browser/auxiliary/security/sessions). Env always wins when already set."""
-    terminal_config = defaults.get("terminal", {})
-
-    # "backend" (documented) and legacy "env_type" are both accepted; "backend" wins.
-    if "backend" in terminal_config:
-        terminal_config["env_type"] = terminal_config["backend"]
-
-    # Local backend: cwd is always os.getcwd(). Non-local: a placeholder is popped so
-    # terminal_tool uses its per-backend default; an explicit path is kept.
-    effective_backend = terminal_config.get("env_type", "local")
-    if effective_backend == "local":
-        terminal_config["cwd"] = os.getcwd()
-        defaults["terminal"]["cwd"] = terminal_config["cwd"]
-    elif terminal_config.get("cwd") in _CWD_PLACEHOLDERS:
-        terminal_config.pop("cwd", None)
-
-    # TERMINAL_CWD is force-exported (beats stale .env) except inside a gateway process,
-    # whose config bridge already set it.
-    _is_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
-    for config_key, env_var in _TERMINAL_ENV_MAPPINGS.items():
-        if config_key not in terminal_config:
-            continue
-        val = terminal_config[config_key]
-        if env_var == "TERMINAL_CWD":
-            if not _is_gateway:
-                os.environ[env_var] = str(val)
-        elif _file_has_terminal_config or env_var not in os.environ:
-            os.environ[env_var] = json.dumps(val) if isinstance(val, (list, dict)) else str(val)
-
-    browser_config = defaults.get("browser", {})
-    if "inactivity_timeout" in browser_config:
-        os.environ["BROWSER_INACTIVITY_TIMEOUT"] = str(browser_config["inactivity_timeout"])
-
-    # Only non-empty / non-"auto" auxiliary values are bridged so auto-detection still works.
-    auxiliary_config = defaults.get("auxiliary", {})
-    for task_key, env_map in _AUXILIARY_TASK_ENV.items():
-        task_cfg = auxiliary_config.get(task_key, {})
-        if not isinstance(task_cfg, dict):
-            continue
-        for field, env_var in env_map.items():
-            val = str(task_cfg.get(field, "")).strip()
-            if val and not (field == "provider" and val == "auto"):
-                os.environ[env_var] = val
-
-    security_config = defaults.get("security", {})
-    if isinstance(security_config, dict):
-        redact = security_config.get("redact_secrets")
-        if redact is not None:
-            os.environ["HERMES_REDACT_SECRETS"] = str(redact).lower()
-
-    # Session-search index knobs (hermes_state reads the env carriers).
-    sessions_config = defaults.get("sessions", {})
-    if isinstance(sessions_config, dict):
-        if "cjk_fts" in sessions_config:
-            os.environ["HERMES_CJK_FTS"] = str(sessions_config["cjk_fts"])
-        if "search_slow_ms" in sessions_config:
-            os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_config["search_slow_ms"])
-
-
-def _cli_config_defaults():
-    """Built-in defaults for every config key the CLI reads (the file overlays these)."""
-    img = "nikolaik/python-nodejs:python3.11-nodejs20"
-    return {
-        "model": {"default": "", "base_url": "", "provider": "auto"},
-        "terminal": {
-            "env_type": "local", "cwd": ".", "home_mode": "auto", "lifetime_seconds": 300,  # cwd "." -> os.getcwd()
-            "docker_image": img, "docker_forward_env": [], "singularity_image": f"docker://{img}",
-            "modal_image": img, "daytona_image": img, "docker_volumes": [],
-            "docker_mount_cwd_to_workspace": False,  # opt-in only: sandbox isolation
-            "docker_shared_container_key": "",
-        },
-        "browser": {
-            "inactivity_timeout": 120, "record_sessions": False, "engine": "auto",  # auto (Chrome) | lightpanda | chrome
-            "camofox": {"rewrite_loopback_urls": False, "loopback_host_alias": "host.docker.internal"},
-        },
-        # threshold: fraction of the model's context limit; min_tail: real user messages kept in the tail
-        "compression": {"enabled": True, "threshold": 0.50, "min_tail_user_messages": 1},
-        "agent": {
-            "max_turns": 500, "verbose": False, "system_prompt": "", "prefill_messages_file": "",  # max_turns shared with subagents
-            "reasoning_effort": "", "service_tier": "",
-            "personalities": {},  # user overrides merged by name over hermes_cli.personality builtins
-        },
-        "display": {
-            "compact": False,
-            # /resume recap tuning and show_reasoning: keep in sync with hermes_cli/config.py DEFAULT_CONFIG
-            "resume_display": "full", "resume_exchanges": 10, "resume_max_user_chars": 300,
-            "resume_max_assistant_chars": 200, "resume_max_assistant_lines": 3, "resume_skip_tool_only": True,
-            "show_reasoning": True, "reasoning_full": False, "streaming": True, "busy_input_mode": "interrupt",
-            "persistent_output": True, "persistent_output_max_lines": 200,
-            # Also clear scrollback on redraw/resize recovery; off because users prefer history.
-            "cli_rebuild_scrollback_on_redraw": False,
-            "persist_prompts": True,  # one-line summary of resolved modal prompts into scrollback
-            "skin": "default",
-        },
-        "code_execution": {"timeout": 300, "max_tool_calls": 50},
-        "auxiliary": {"vision": {"provider": "auto", "model": "", "base_url": "", "api_key": ""}},
-        # delegation: empty model/provider = inherit parent; api_key falls back to OPENAI_API_KEY
-        "delegation": {"max_iterations": 45, "model": "", "provider": "", "base_url": "", "api_key": ""},
-        "onboarding": {"seen": {}},  # first-touch hint flags (agent/onboarding.py), latched once shown
-    }
-
-
-def _merge_file_config(defaults: Dict[str, Any], file_config: Dict[str, Any]) -> None:
-    """Overlay a parsed config file onto *defaults* in place (model normalization, deep merge, legacy keys)."""
-    # model: string (new format) or dict (old format with default/base_url)
-    if "model" in file_config:
-        if isinstance(file_config["model"], str):
-            defaults["model"]["default"] = file_config["model"]
-        elif isinstance(file_config["model"], dict):
-            defaults["model"].update(file_config["model"])
-            # Promote model.model -> model.default (HermesCLI checks "default" first).
-            if "model" in file_config["model"] and "default" not in file_config["model"]:
-                defaults["model"]["default"] = file_config["model"]["model"]
-
-    # Deep-merge dict sections, overwrite scalars; a None section keeps the defaults;
-    # unknown keys (platform_toolsets, memory, ...) are carried over.
-    for key, value in file_config.items():
-        if key == "model":
-            continue
-        if isinstance(defaults.get(key), dict):
-            if isinstance(value, dict):
-                defaults[key].update(value)
-            elif value is not None:
-                defaults[key] = value
-        else:
-            defaults[key] = value
-
-    # Legacy root-level max_turns -> agent.max_turns whenever the nested key is missing.
-    agent_file_config = file_config.get("agent")
-    if "max_turns" in file_config and not (
-        isinstance(agent_file_config, dict) and agent_file_config.get("max_turns") is not None
-    ):
-        defaults["agent"]["max_turns"] = file_config["max_turns"]
-
-
-def load_cli_config() -> Dict[str, Any]:
-    """~/.hermes/config.yaml (else ./cli-config.yaml) over built-in defaults; env vars win.
-
-    ``HERMES_IGNORE_USER_CONFIG=1`` skips the user config entirely (``.env`` still loads).
-    """
-    config_path = _hermes_home / 'config.yaml'
-    if not config_path.exists() or os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
-        config_path = Path(__file__).parent / 'cli-config.yaml'
-
-    defaults = _cli_config_defaults()
-
-    # Only a file's terminal section may overwrite terminal env vars already set by .env.
-    _file_has_terminal_config = False
-    file_config: Dict[str, Any] = {}
-
-    if config_path.exists():
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                from hermes_cli.config import _normalize_root_model_keys
-                from utils import fast_safe_load
-
-                file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
-
-            _file_has_terminal_config = "terminal" in file_config
-            _merge_file_config(defaults, file_config)
-        except Exception as e:
-            logger.warning("Failed to load cli-config.yaml: %s", e)
-
-    # Expand ${ENV_VAR} references before bridging to env vars.
-    from hermes_cli.config import _expand_env_vars
-    defaults = _expand_env_vars(defaults)
-
-    # Managed scope: seed leaves the user omitted. Pass the raw user document
-    # so CLI schema defaults do not shadow those seeds. A present user leaf
-    # wins; unset falls back to the seed (live `config set` writes the user
-    # file and wins). cli.py builds its config independently of
-    # hermes_cli.config._load_config_impl, so without this the TUI/CLI
-    # surface would ignore managed seeds.
-    from hermes_cli import managed_scope
-
-    defaults = managed_scope.apply_managed_overlay(defaults, user_raw=file_config)
-
-    _mirror_config_to_env(defaults, _file_has_terminal_config)
-
-    return defaults
 
 CLI_CONFIG = load_cli_config()
 
@@ -698,6 +410,7 @@ _cleanup_all_browsers = _lazy_shim("tools.browser_tool_lifecycle", "_emergency_c
 
 _cleanup_done = False  # _run_cleanup runs exactly once
 _cleanup_in_progress = False
+_session_end_messages: list[str] = []  # plugin on_session_finalize text awaiting the exit summary
 _cli_wake_owner = None
 # One-shot finalization runs before process cleanup (plugins see the boundary while the
 # agent is attached); atexit cleanup must not finalize those sessions again.
@@ -809,7 +522,9 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
         if notify_session_finalize:
             cleanup_session_id = _active_agent_ref.session_id if _active_agent_ref else None
             if _should_emit_cleanup_session_finalize(cleanup_session_id):
-                _notify_session_finalize(session_id=cleanup_session_id, platform="cli", reason="shutdown")
+                # Printed by _print_exit_summary, which clears the screen first.
+                _session_end_messages.extend(
+                    _notify_session_finalize(session_id=cleanup_session_id, platform="cli", reason="shutdown"))
         try:
             _shutdown_agent_memory_provider(_active_agent_ref)
         except Exception as e:
@@ -862,10 +577,10 @@ from hermes_cli.worktree_ops import (
 
 # ============================================================================= Git Worktree Isolation
 # (#652) =============================================================================
-_active_worktree: Optional[Dict[str, str]] = None
+_active_worktree: Optional[dict[str, str]] = None
 
 
-def _cleanup_worktree(info: Dict[str, str] = None) -> None:
+def _cleanup_worktree(info: dict[str, str] | None = None) -> None:
     """Remove a clean worktree and its branch on exit; preserve recoverable work."""
     global _active_worktree
     info = info or _active_worktree
@@ -1134,7 +849,7 @@ class _VoiceInputMessage:
 class _SeededQueryMessage:
     """Sentinel for a ``-q`` prompt seeded into an interactive session; treated LITERALLY (no slash/!/file-drop)."""
 
-    __slots__ = ("text", "images")
+    __slots__ = ("images", "text")
 
     def __init__(self, text: str, images=None):
         self.text = text or ""
@@ -1184,23 +899,23 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
 
     # Seeded -q first message (see _should_seed_interactive); run() re-creates
     # _pending_input, so it is enqueued only after the fresh queue exists.
-    _seeded_first_message: Optional["_SeededQueryMessage"] = None
+    _seeded_first_message: Optional[_SeededQueryMessage] = None
     # Inspection surfaces (banner, /tools, status line) read this on partially built instances too.
-    disabled_toolsets: Optional[List[str]] = None
+    disabled_toolsets: Optional[list[str]] = None
 
     def __init__(
         self,
-        model: str = None,
-        toolsets: List[str] = None,
-        provider: str = None,
-        reasoning: str = None,
-        api_key: str = None,
-        base_url: str = None,
-        max_turns: int = None,
-        run_budget: float = None,
+        model: str | None = None,
+        toolsets: list[str] | None = None,
+        provider: str | None = None,
+        reasoning: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        max_turns: int | None = None,
+        run_budget: float | None = None,
         verbose: Optional[bool] = None,
         compact: bool = False,
-        resume: str = None,
+        resume: str | None = None,
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
@@ -1560,7 +1275,8 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             result = subprocess.run(
                 exec_cmd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=30, env=build_subprocess_env(),
-                creationflags=windows_hide_flags(),  # no console flash on Windows (#56747)
+                creationflags=windows_hide_flags(),  # no console flash on Windows (#56747),
+                check=False,
             )
             # See #56747.
             output = result.stdout.strip() or result.stderr.strip()
@@ -1932,7 +1648,7 @@ def _start_worktree_setup(list_tools, list_toolsets, worktree, w):
         _prune_stale_worktrees(repo)
         _maintain_pack_health(repo)
 
-    def _join_worktree() -> Optional[Dict[str, str]]:
+    def _join_worktree() -> Optional[dict[str, str]]:
         _wt_thread.join(timeout=120)
         info = _wt_result.get("info")
         if not info:
@@ -1953,27 +1669,27 @@ def _start_worktree_setup(list_tools, list_toolsets, worktree, w):
 
 
 def main(
-    query: str = None,
-    q: str = None,
+    query: str | None = None,
+    q: str | None = None,
     oneshot: bool = False,
-    image: str = None,
-    toolsets: str = None,
-    skills: str | list[str] | tuple[str, ...] = None,
+    image: str | None = None,
+    toolsets: str | None = None,
+    skills: str | list[str] | tuple[str, ...] | None = None,
     required_skills: str | list[str] | tuple[str, ...] | None = None,
-    model: str = None,
-    provider: str = None,
-    reasoning: str = None,
-    api_key: str = None,
-    base_url: str = None,
-    max_turns: int = None,
-    run_budget: float = None,
+    model: str | None = None,
+    provider: str | None = None,
+    reasoning: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    max_turns: int | None = None,
+    run_budget: float | None = None,
     verbose: Optional[bool] = None,
     quiet: bool = False,
     compact: bool = False,
     list_tools: bool = False,
     list_toolsets: bool = False,
     gateway: bool = False,
-    resume: str = None,
+    resume: str | None = None,
     worktree: bool = False,
     w: bool = False,
     checkpoints: bool = False,

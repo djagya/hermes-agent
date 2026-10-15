@@ -15,7 +15,7 @@ from pm.lock import Lockfile
 from pm.registry import get_package
 from pm.store import ALL_TARGETS
 from tests.pm._fixtures import make_tar
-from tests.pm._range_server import RangeHandler, dl_server, url  # noqa: F401
+from tests.pm._range_server import RangeHandler, dl_server, url
 
 
 @pytest.fixture
@@ -80,8 +80,8 @@ def test_resolution_reuses_successful_responses_but_refreshes_next_operation(ups
             expected_targets = ["linux-x64"]
             payloads["/repos/astral-sh/python-build-standalone/releases?per_page=30&page=1"] = [{
                 "tag_name": "20990102", "assets": [
-                    {"name": f"cpython-{version}-x86_64-unknown-linux-gnu-install_only.tar.gz"},
-                    {"name": "cpython-3.15.0+20990102-aarch64-apple-darwin-install_only.tar.gz"},
+                    {"name": f"cpython-{version}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"},
+                    {"name": "cpython-3.15.0+20990102-aarch64-apple-darwin-install_only_stripped.tar.gz"},
                 ],
             }]
         elif name == "llamacpp-cpu":
@@ -209,7 +209,7 @@ def test_pinning_hashes_new_npm_url_once_and_keeps_existing_rows(upstream, tmp_p
                                per_target=dict.fromkeys(ALL_TARGETS, version))
     pinned = cli._pin_artifacts(package, decision, current)
     assert current == {"any": old, "unresolved-target": old}
-    assert pinned == {**current, **dict.fromkeys(ALL_TARGETS, {"url": artifact_url, "sha256": digest})}
+    assert pinned == {**current, **{key: {"url": artifact_url, "sha256": digest} for key in ALL_TARGETS}}
     assert Counter(path for path, _ in calls) == {artifact_path: 1}
 
     # Existing pins need no download; a separate pin invocation must not retain new hashes.

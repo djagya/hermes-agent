@@ -68,6 +68,12 @@ def test_manager_card_metadata_and_native_resolution_are_separate(
     item = json.loads(listed)["items"][0]
     assert item["handle"] == "op:vault:card" and item["kind"] == "payment"
     assert item["available"] and item["payment_scope"] == "confirmed_page"
+    # The layout the native fill accepts: one document, or merchant plus ONE hosted provider.
+    from agent.vault_payment_policy import PAYMENT_PSP_ORIGINS
+    from tools.browser_supervisor_payment import _MAX_CARD_DOCUMENTS
+    assert item["supported_layout"] == "single_or_split_one_provider"
+    assert item["max_card_documents"] == _MAX_CARD_DOCUMENTS == 4
+    assert item["hosted_origins"] == list(PAYMENT_PSP_ORIGINS)
     assert all(f["value"] not in listed for f in CARD["fields"])
     calls = [
         json.loads(line) for line in script.with_suffix(".log").read_text().splitlines()

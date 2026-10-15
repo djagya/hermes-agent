@@ -22,6 +22,7 @@ def _run_check(home: Path, extra_path: str | None = None) -> subprocess.Complete
         text=True,
         timeout=10,
         env=env,
+        check=False,
     )
 
 
@@ -32,6 +33,7 @@ class HealthcheckSelfTest(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
 

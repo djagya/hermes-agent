@@ -91,6 +91,9 @@ outputs:
   mode:
     description: full when the classifier failed open, else selective. Audit surface.
     value: ${{ steps.classify.outputs.mode }}
+  remote_backends:
+    description: Run the SSH and Docker terminal backends against a real sshd and Docker daemon.
+    value: ${{ steps.classify.outputs.remote_backends }}
 
 runs:
   using: composite

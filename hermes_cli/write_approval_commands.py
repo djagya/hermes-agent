@@ -46,7 +46,7 @@ def _fmt_pending_list(subsystem: str) -> str:
         lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
         if subsystem == wa.MEMORY:
             lines.extend(f"    {entry}" for entry in _matched_entries(r.get("payload") or {}))
-    where = "/{s} approve <id>".format(s=subsystem)
+    where = f"/{subsystem} approve <id>"
     lines.append("")
     lines.append(f"Apply: {where}   Reject: /{subsystem} reject <id>")
     if subsystem == wa.SKILLS:
@@ -60,7 +60,7 @@ def _fmt_pending_list(subsystem: str) -> str:
 
 def handle_pending_subcommand(
     subsystem: str,
-    args: List[str],
+    args: list[str],
     *,
     memory_store=None,
     set_mode_fn=None,
@@ -111,13 +111,13 @@ def handle_pending_subcommand(
     return None  # not ours — caller handles
 
 
-def _resolve_one(subsystem: str, rest: List[str]):
+def _resolve_one(subsystem: str, rest: list[str]):
     if not rest:
         return None, f"Usage: /{subsystem} approve|reject <id>  (or 'all')"
     return rest[0], None
 
 
-def _approve(subsystem: str, rest: List[str], memory_store,
+def _approve(subsystem: str, rest: list[str], memory_store,
              expected_payload_sha256: Optional[str] = None) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
@@ -141,7 +141,7 @@ def _approve(subsystem: str, rest: List[str], memory_store,
             return f"No pending {subsystem} write with id '{target}'."
         targets = [rec]
 
-    applied, failed, overwritten, removed = 0, [], [], []
+    applied, failed, overwritten, patched, removed = 0, [], [], [], []
     for rec in targets:
         pending_id = rec["id"]
         applied_result = {}
@@ -164,6 +164,7 @@ def _approve(subsystem: str, rest: List[str], memory_store,
         if ok:
             applied += 1
             overwritten.extend(f"  {rec['id']}: {text}" for text in _changed_entries(applied_result, "replaced"))
+            patched.extend(f"  {rec['id']}: {text}" for text in _changed_entries(applied_result, "patched"))
             removed.extend(f"  {rec['id']}: {text}" for text in _changed_entries(applied_result, "removed"))
         else:
             failed.append(f"{pending_id}: {msg}")
@@ -174,6 +175,10 @@ def _approve(subsystem: str, rest: List[str], memory_store,
         # is the last person who can notice a clause went missing, so show what was lost.
         out.append("Overwrote entire entry (re-add anything you still need):")
         out.extend(overwritten)
+    if patched:
+        # A patch keeps the rest of the entry, so show it as it was, not as lost text.
+        out.append("Patched entry (as it was before the edit):")
+        out.extend(patched)
     if removed:
         out.append("Removed entry (re-add anything you still need):")
         out.extend(removed)
@@ -183,15 +188,16 @@ def _approve(subsystem: str, rest: List[str], memory_store,
     return "\n".join(out)
 
 
-def _changed_entries(result: dict, kind: str) -> List[str]:
-    """Full text of every entry a memory replace overwrote (``kind="replaced"``) or remove
-    deleted (``"removed"``), single-op or batch shape."""
+def _changed_entries(result: dict, kind: str) -> list[str]:
+    """Full text of every entry a memory write changed, single-op or batch shape."""
     single = result.get(f"{kind}_entry")
+    if kind == "patched" and single is None:
+        single = result.get("patched_entry_before")
     batch = result.get(f"{kind}_entries") or {}
     return ([single] if single else []) + [batch[k] for k in sorted(batch, key=int)]
 
 
-def _matched_entries(payload) -> List[str]:
+def _matched_entries(payload) -> list[str]:
     """The full entry each staged memory replace/remove is pinned to: the summary shows only
     the old_text search string, and approval applies to this entry, not to that search."""
     from tools.memory_tool import destructive_ops
@@ -218,7 +224,7 @@ def _apply_one(subsystem: str, rec, memory_store):
         return False, str(e), {}
 
 
-def _reject(subsystem: str, rest: List[str], expected_payload_sha256: Optional[str] = None) -> str:
+def _reject(subsystem: str, rest: list[str], expected_payload_sha256: Optional[str] = None) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
         return err or f"Usage: /{subsystem} reject <id>"
@@ -259,7 +265,7 @@ def _reject(subsystem: str, rest: List[str], expected_payload_sha256: Optional[s
     )
 
 
-def _resolve_applying(subsystem: str, rest: List[str]) -> str:
+def _resolve_applying(subsystem: str, rest: list[str]) -> str:
     if len(rest) != 2 or rest[1] not in {"applied", "not-applied"}:
         return (
             f"Usage: /{subsystem} resolve <id> applied|not-applied "
@@ -272,7 +278,7 @@ def _resolve_applying(subsystem: str, rest: List[str]) -> str:
     return f"Could not resolve pending {subsystem} write '{pending_id}': {message}."
 
 
-def _diff(rest: List[str]) -> str:
+def _diff(rest: list[str]) -> str:
     if not rest:
         return "Usage: /skills diff <id>"
     rec = wa.get_pending(wa.SKILLS, rest[0])
@@ -283,7 +289,7 @@ def _diff(rest: List[str]) -> str:
     return header + "\n" + diff
 
 
-def _set_approval(subsystem: str, rest: List[str], set_mode_fn) -> str:
+def _set_approval(subsystem: str, rest: list[str], set_mode_fn) -> str:
     """Turn the approval gate on/off for a subsystem.
 
     ``set_mode_fn`` (when provided) persists the new boolean to config.

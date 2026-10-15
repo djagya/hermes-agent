@@ -19,7 +19,7 @@ def test_registered_block_tool_preserves_cause_key(tmp_path, monkeypatch):
         run_id = task.current_run_id
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
-    from tools import kanban_tools  # noqa: F401 — register the real handler
+    from tools import kanban_tools
     from tools.registry import registry
 
     result = json.loads(registry.dispatch("kanban_block", {

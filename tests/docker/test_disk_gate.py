@@ -16,6 +16,7 @@ class DiskGateSelfTest(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
 

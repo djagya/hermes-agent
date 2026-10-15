@@ -78,12 +78,18 @@ there is no need to add merchant URLs or a global tag to the card.
 **Every card fill asks you first.** The prompt names the merchant and the
 document receiving the card, and expires after 120 seconds. Declining or a
 changed document/field set refuses the fill. To select one exact open tab,
-the agent uses `browser_vault_fill(handle, merchant_origin="https://shop.example")`.
-The native path resolves values internally and supports all card fields in
-one document: the merchant itself, or a Stripe (`https://js.stripe.com`) iframe,
-including an out-of-process iframe. Separate number/expiry/CVC documents,
-ambiguous controls, unapproved hosted origins and missing card fields are refused.
-No sequential split-frame fallback exists.
+the agent uses `browser_vault(action="fill", handle=..., merchant_origin="https://shop.example")`.
+The native path resolves values internally. Card fields may sit in one
+document (the merchant itself or a hosted provider iframe, including an
+out-of-process iframe) or be split across up to four documents on the merchant
+and ONE reviewed hosted provider: Stripe (`https://js.stripe.com`), Datatrans
+Secure Fields (`https://pay.datatrans.com`) or Shopify checkout
+(`https://checkout.pci.shopifyinc.com`), with every card field exactly once.
+Fields across two providers, duplicate or ambiguous controls, unapproved hosted
+origins and a missing number, CVC or expiry are refused; provider frames the
+page keeps hidden are never fill targets.
+A split checkout is written one document at a time; there is no transaction
+across documents.
 
 HTTPS, ancestry and field identity checks are **not a seller reputation check**.
 Verify the seller and payment terms independently before approving. The selected

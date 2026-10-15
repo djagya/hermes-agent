@@ -25,12 +25,12 @@ from utils import fast_safe_load
 
 # path -> raw user mapping from the last successful parse in this process; served (through the
 # normal pipeline) when the file is later found mid-edit as broken YAML.
-_LAST_GOOD_USER_RAW: Dict[str, Dict[str, Any]] = {}
+_LAST_GOOD_USER_RAW: dict[str, dict[str, Any]] = {}
 # path -> (*user_signature, *managed_signature, effective, env_snapshot); see utils.file_signature.
-_EFFECTIVE_CACHE: Dict[str, Tuple[Any, ...]] = {}
+_EFFECTIVE_CACHE: dict[str, tuple[Any, ...]] = {}
 
 
-def _effective(raw: Dict[str, Any]) -> Dict[str, Any]:
+def _effective(raw: dict[str, Any]) -> dict[str, Any]:
     presence = raw if isinstance(raw, dict) else {}
     expanded = _config._expand_env_vars(presence)
     merged = managed_scope.apply_managed_overlay(
@@ -40,7 +40,7 @@ def _effective(raw: Dict[str, Any]) -> Dict[str, Any]:
     return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
 
 
-def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> Dict[str, Any]:
+def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[str, Any]:
     """Last-known-good raw user mapping after a parse failure: this process's last good parse,
     else the newest ``good`` copy in backups/config/, else ``{}`` (warned as defaults)."""
     raw = _LAST_GOOD_USER_RAW.get(path_key)
@@ -53,7 +53,7 @@ def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> Dict[
     return copy.deepcopy(raw) if raw is not None else {}
 
 
-def load_user_config_effective(config_path: Optional[Path] = None, *, fail_closed: bool = False) -> Dict[str, Any]:
+def load_user_config_effective(config_path: Optional[Path] = None, *, fail_closed: bool = False) -> dict[str, Any]:
     """User ``config.yaml`` → ``${VAR}`` expansion → managed overlay → model-key canonicalization.
     NO ``DEFAULT_CONFIG`` merge: a key absent from the file (and from the managed layer) is absent
     here, so ``{}`` sentinels and presence-sensitive bridges keep working. An absent file is an
@@ -74,7 +74,7 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
             if all(_config._env_ref_lookup(k) == v for k, v in cached[9].items()):
                 return copy.deepcopy(cached[8])
 
-        raw: Dict[str, Any] = {}
+        raw: dict[str, Any] = {}
         recovered = False
         raw_hit = _config._RAW_CONFIG_CACHE.get(path_key)
         if user_sig is not None and raw_hit is not None and raw_hit[:4] == user_sig:

@@ -12,6 +12,9 @@ on:
           everything, never nothing.
         type: string
         required: false
+      commit:
+        description: Commit to test and build. Empty keeps the triggering commit.
+        type: string
         default: ''
 
 jobs:
@@ -23,6 +26,8 @@ jobs:
       checks: ${{ steps.set-matrix.outputs.checks }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.commit }}
       - uses: ./.github/actions/setup-pm
         with:
           toolchain: node
@@ -51,6 +56,12 @@ jobs:
             if (!checks.length) throw Error("no check scripts in selected workspaces");
             appendFileSync(process.env.GITHUB_OUTPUT, `checks=${JSON.stringify(checks)}\n`);
           '
+      - name: Check the checkout is clean
+        # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
+        # leaves an untracked or modified file in the checkout is reported here. Runs only when
+        # every earlier step passed: a step that failed midway can leave its own temp files
+        # (a half-extracted download, a worktree its later cleanup never removed).
+        uses: ./.github/actions/check-clean-worktree
 
   check:
     name: ${{ matrix.package }} / ${{ matrix.script }}
@@ -63,6 +74,8 @@ jobs:
         include: ${{ fromJSON(needs.workspaces.outputs.checks) }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
       - name: Set up the locked JS build toolchain
         id: node
         uses: ./.github/actions/setup-pm
@@ -114,3 +127,9 @@ jobs:
         with:
           command: npm ci
       - run: npm run --prefix ${{ matrix.package }} ${{ matrix.script }}
+      - name: Check the checkout is clean
+        # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
+        # leaves an untracked or modified file in the checkout is reported here. Runs only when
+        # every earlier step passed: a step that failed midway can leave its own temp files
+        # (a half-extracted download, a worktree its later cleanup never removed).
+        uses: ./.github/actions/check-clean-worktree

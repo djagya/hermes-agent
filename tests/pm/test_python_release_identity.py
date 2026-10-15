@@ -14,11 +14,12 @@ from pm import packages, update
 def test_python_candidate_preserves_the_advertised_patch_and_build(monkeypatch, target, triple):
     tag = '20990102'
     identity = f'3.14.8+{tag}'
-    advertised = f'cpython-{identity}-{triple}-install_only.tar.gz'
+    advertised = f'cpython-{identity}-{triple}-install_only_stripped.tar.gz'
     release = {'tag_name': tag, 'assets': [{'name': name} for name in [
-        f'cpython-3.15.0+{tag}-{triple}-install_only.tar.gz',
-        f'cpython-{identity}-{triple}-freethreaded-install_only.tar.gz',
-        f'cpython-{identity}-freethreaded-{triple}-install_only.tar.gz',
+        f'cpython-3.15.0+{tag}-{triple}-install_only_stripped.tar.gz',
+        f'cpython-{identity}-{triple}-install_only.tar.gz',  # unstripped flavor
+        f'cpython-{identity}-{triple}-freethreaded-install_only_stripped.tar.gz',
+        f'cpython-{identity}-freethreaded-{triple}-install_only_stripped.tar.gz',
         advertised,
     ]]}
     monkeypatch.setattr(update, '_get_json', lambda _url: [release])
@@ -34,12 +35,12 @@ def test_python_candidates_reject_nonmatching_assets_and_leave_manual_targets_al
     tag = '20990102'
     triple = 'x86_64-unknown-linux-gnu'
     rejected = [
-        f'cpython-3.14.8+20981231-{triple}-install_only.tar.gz',
-        f'cpython-3.15.0+{tag}-{triple}-install_only.tar.gz',
-        f'cpython-3.14.8+{tag}-{triple}-freethreaded-install_only.tar.gz',
-        f'cpython-3.14.8+{tag}-freethreaded-{triple}-install_only.tar.gz',
-        f'cpython-3.14.8+{tag}-{triple}-install_only.tar.gz.extra',
-        f'cpython-3.14.8+{tag}-{triple}-install_only.tar.gz\n',
+        f'cpython-3.14.8+20981231-{triple}-install_only_stripped.tar.gz',
+        f'cpython-3.15.0+{tag}-{triple}-install_only_stripped.tar.gz',
+        f'cpython-3.14.8+{tag}-{triple}-freethreaded-install_only_stripped.tar.gz',
+        f'cpython-3.14.8+{tag}-freethreaded-{triple}-install_only_stripped.tar.gz',
+        f'cpython-3.14.8+{tag}-{triple}-install_only_stripped.tar.gz.extra',
+        f'cpython-3.14.8+{tag}-{triple}-install_only_stripped.tar.gz\n',
     ]
     calls = []
     for name in rejected:

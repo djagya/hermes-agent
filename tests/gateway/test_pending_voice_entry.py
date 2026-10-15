@@ -177,7 +177,6 @@ async def telegram_gateway(monkeypatch, tmp_path, busy_text_mode, echo):
     monkeypatch.setattr("gateway.run._hermes_home", hermes_home)
     monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda **kwargs: {"api_key": "fixture"})
     monkeypatch.setattr("run_agent.AIAgent", WaitingModel)
-    monkeypatch.setattr("tools.tirith_security._install_tirith", lambda **kwargs: (None, "offline test"))
     WaitingModel.instances, WaitingModel.messages, WaitingModel.redirects = [], [], []
     WaitingModel.started, WaitingModel.release = threading.Event(), threading.Event()
     platform_config = PlatformConfig(enabled=True, token="999:fixture")
@@ -260,13 +259,12 @@ async def test_telegram_voice_followups_reach_model_once(case, echo, busy_text_m
                 if busy_text_mode == "queue":
                     assert added_text in pending.text
                 else:
-                    # Interrupt mode supersedes the buffered text: the voice receipt interrupts
-                    # FIRST (immediate receipt), so the flush's redirect is refused — with the
-                    # buffered text a redirect would steer a turn the user superseded. The text
-                    # still reaches the model exactly once, carried on the superseding pending
-                    # voice event (merge semantics) instead of the refused redirect.
+                    # Interrupt mode: the voice receipt interrupts FIRST (immediate receipt), so the
+                    # flush's redirect is refused (it would steer a turn the user superseded). Text
+                    # no longer merges into a pending VOICE event (#114363): it takes its own FIFO
+                    # turn and still reaches the model exactly once.
                     assert not any(added_text in redirect for redirect in WaitingModel.redirects)
-                    assert added_text in pending.text
+                    assert added_text not in pending.text
                 stt_release.set()
                 transport.echo_release.set()
                 await asyncio.wait_for(voice_task, 10)
@@ -291,17 +289,22 @@ async def test_telegram_voice_followups_reach_model_once(case, echo, busy_text_m
             WaitingModel.release.set()
             await until(lambda: not adapter._background_tasks, timeout=10)
             assert not errors, errors
-            assert len(WaitingModel.messages) == 2, WaitingModel.messages
-            delivered = "\n".join(WaitingModel.messages + WaitingModel.redirects)
             expected_clips = ["A"] if case.startswith("buffered_text") else ["A", "B"]
             assert Counter(calls) == Counter(expected_clips), (calls, WaitingModel.messages)
-            for clip in expected_clips:
-                model_input = WaitingModel.messages[0 if case == "active_a" and clip == "A" else 1]
-                assert model_input.count(f"voice {clip} request") == 1
-            if case.startswith("buffered_text"):
-                assert added_text in delivered
-            elif case != "active_a":
-                assert WaitingModel.messages[1].index("voice A request") < WaitingModel.messages[1].index("voice B request")
+            # Voice follow-ups keep their own FIFO turn (#114363; only photo bursts merge), so each
+            # clip reaches the model once, as its own turn, in arrival order.
+            turns = [f'"voice {clip} request"' for clip in expected_clips]
+            if case.startswith("buffered_text") and busy_text_mode == "queue":
+                turns = [turns[0] + "\n\n" + added_text]  # the debounce flush merges into the voice
+            elif case.startswith("buffered_text"):
+                turns.append(added_text)
+            older = [] if case == "active_a" else ["older task X"]
+            assert WaitingModel.messages[:len(older)] == older, WaitingModel.messages
+            # Interrupt mode does not pin voice-vs-text order: the text flushes after the voice receipt.
+            assert Counter(WaitingModel.messages[len(older):]) == Counter(turns), WaitingModel.messages
+            if not case.startswith("buffered_text"):
+                assert WaitingModel.messages[len(older):] == turns
+            assert not WaitingModel.redirects
             assert Counter(transport.echoes) == Counter(
                 [f'🎙️ "voice {clip} request"' for clip in expected_clips] if echo else []
             )

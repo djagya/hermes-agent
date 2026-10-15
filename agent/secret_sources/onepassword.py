@@ -25,7 +25,7 @@ import logging
 import os
 import re
 import shutil
-import subprocess  # noqa: F401 — tests monkeypatch ``op.subprocess.run``
+import subprocess  # tests monkeypatch ``op.subprocess.run``; production goes through run_cli
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -61,7 +61,7 @@ _OP_ENV_ALLOWLIST = (
 # L1 key folds in str(home_path) so a HERMES_HOME switch inside one long-lived
 # process (the gateway) can't return another profile's secrets. The disk key
 # omits home because the file already lives under <home>/cache/.
-_CacheKey = Tuple[str, str, str, str]  # (auth_fp, account, home, refs_fp)
+_CacheKey = tuple[str, str, str, str]  # (auth_fp, account, home, refs_fp)
 _DISK_CACHE_BASENAME = "op_cache.json"
 
 
@@ -153,10 +153,10 @@ def _op_error_kind(exc: Exception) -> ErrorKind:
     return kind
 
 
-def _validate_references(references: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], List[str]]:
+def _validate_references(references: Optional[dict[str, str]]) -> tuple[dict[str, str], list[str]]:
     """``(valid_refs, warnings)``: keep valid env names bound to stripped ``op://`` strings."""
-    valid: Dict[str, str] = {}
-    warnings: List[str] = []
+    valid: dict[str, str] = {}
+    warnings: list[str] = []
     for name, ref in (references or {}).items():
         if not is_valid_env_name(name):
             warnings.append(f"Skipping {name!r}: not a valid env-var name")
@@ -173,14 +173,14 @@ def _auth_fingerprint(token_env: str) -> str:
     """SHA-256 prefix over everything `op` would authenticate with (token, account,
     Connect host/token, ``OP_SESSION_*``), so a new identity never sees old cached values."""
     source_env = get_source_environment()
-    parts: List[str] = [f"{label}={source_env.get(var, '')}" for label, var in (
+    parts: list[str] = [f"{label}={source_env.get(var, '')}" for label, var in (
         ("token", token_env), ("account", "OP_ACCOUNT"),
         ("connect_host", "OP_CONNECT_HOST"), ("connect_token", "OP_CONNECT_TOKEN"))]
     parts += [f"{key}={source_env[key]}" for key in sorted(source_env) if key.startswith("OP_SESSION_")]
     return _fingerprint("\n".join(parts))
 
 
-def _refs_fingerprint(references: Dict[str, str]) -> str:
+def _refs_fingerprint(references: dict[str, str]) -> str:
     return _fingerprint("\n".join(f"{name}={references[name]}" for name in sorted(references)))
 
 
@@ -200,7 +200,7 @@ def _scrub(text: str) -> str:
     return strip_ansi(text).replace("\x1b", "").strip()
 
 
-def _op_child_env(token_value: str) -> Dict[str, str]:
+def _op_child_env(token_value: str) -> dict[str, str]:
     source_env = get_source_environment()
     env = {k: source_env[k] for k in _OP_ENV_ALLOWLIST if k in source_env}
     env.update((k, v) for k, v in source_env.items() if k.startswith("OP_SESSION_"))
@@ -210,10 +210,10 @@ def _op_child_env(token_value: str) -> Dict[str, str]:
     return env
 
 
-def _run_op(op: Path, args: List[str], target: str, *, account: str, token_value: str, what: str) -> str:
+def _run_op(op: Path, args: list[str], target: str, *, account: str, token_value: str, what: str) -> str:
     """Run ``op <args…> [--account A] -- <target>``; stdout on success, ``RuntimeError`` otherwise.
     ``--`` so a reference or item name can never parse as an op flag."""
-    cmd: List[str] = [str(op), *args]
+    cmd: list[str] = [str(op), *args]
     if account:
         cmd += ["--account", account]
     cmd += ["--", target]
@@ -246,7 +246,7 @@ def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: st
     return value
 
 
-def _split_reference(reference: str) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
+def _split_reference(reference: str) -> Optional[tuple[str, str, tuple[str, ...]]]:
     """``op://vault/item/[section/]field`` → ``(vault, item, field_path)``; None for shapes the
     item-JSON resolver does not handle (query attributes like ``?attribute=otp``, odd depth)."""
     if "?" in reference:
@@ -257,7 +257,7 @@ def _split_reference(reference: str) -> Optional[Tuple[str, str, Tuple[str, ...]
     return parts[0], parts[1], tuple(parts[2:])
 
 
-def _field_from_item(item: dict, field_path: Tuple[str, ...]) -> Optional[str]:
+def _field_from_item(item: dict, field_path: tuple[str, ...]) -> Optional[str]:
     """The value ``op read`` would return for ``field_path``, or None when the item JSON can't say
     unambiguously (no match, several matches, no value) — the caller then falls back to ``op read``."""
     want = field_path[-1]
@@ -279,11 +279,11 @@ def _field_from_item(item: dict, field_path: Tuple[str, ...]) -> Optional[str]:
     return value
 
 
-def _item_groups(refs: Dict[str, str]) -> Tuple[Dict[Tuple[str, str], Dict[str, Tuple[str, ...]]], Dict[str, str]]:
+def _item_groups(refs: dict[str, str]) -> tuple[dict[tuple[str, str], dict[str, tuple[str, ...]]], dict[str, str]]:
     """Split ``refs`` into ``{(vault, item): {name: field_path}}`` for items referenced 2+ times
     (one ``op item get`` each) and the remainder resolved one ``op read`` apiece."""
-    by_item: Dict[Tuple[str, str], Dict[str, Tuple[str, ...]]] = {}
-    singles: Dict[str, str] = {}
+    by_item: dict[tuple[str, str], dict[str, tuple[str, ...]]] = {}
+    singles: dict[str, str] = {}
     for name, ref in refs.items():
         split = _split_reference(ref)
         if split is None:
@@ -318,7 +318,7 @@ def _backoff_path(home_path: Optional[Path]) -> Path:
     return get_default_hermes_root(home=resolve_cache_home(home_path)) / "cache" / _BACKOFF_BASENAME
 
 
-def _read_backoffs(home_path: Optional[Path]) -> Dict[str, float]:
+def _read_backoffs(home_path: Optional[Path]) -> dict[str, float]:
     try:
         with open(_backoff_path(home_path), "r", encoding="utf-8-sig") as f:
             payload = json.load(f)
@@ -368,7 +368,7 @@ def _last_good_path(home_path: Optional[Path]) -> Path:
     return resolve_cache_home(home_path) / "cache" / _LAST_GOOD_BASENAME
 
 
-def _read_last_good(home_path: Optional[Path], identity: str) -> Dict[str, str]:
+def _read_last_good(home_path: Optional[Path], identity: str) -> dict[str, str]:
     try:
         with open(_last_good_path(home_path), "r", encoding="utf-8-sig") as f:
             payload = json.load(f)
@@ -380,7 +380,7 @@ def _read_last_good(home_path: Optional[Path], identity: str) -> Dict[str, str]:
     return {k: v for k, v in refs.items() if isinstance(k, str) and isinstance(v, str)}
 
 
-def _write_last_good(home_path: Optional[Path], identity: str, refs: Dict[str, str]) -> None:
+def _write_last_good(home_path: Optional[Path], identity: str, refs: dict[str, str]) -> None:
     path = _last_good_path(home_path)
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
@@ -410,10 +410,10 @@ def _fmt_epoch(epoch: float) -> str:
 
 
 def fetch_onepassword_secrets(
-    *, references: Dict[str, str], account: str = "", token_env: str = _DEFAULT_TOKEN_ENV,
+    *, references: dict[str, str], account: str = "", token_env: str = _DEFAULT_TOKEN_ENV,
     binary: Optional[Path] = None, binary_path: str = "", use_cache: bool = True,
     cache_ttl_seconds: float = 300, home_path: Optional[Path] = None,
-) -> Tuple[Dict[str, str], List[str]]:
+) -> tuple[dict[str, str], list[str]]:
     """Resolve ``references`` (name → ``op://…``) to ``(secrets, warnings)``.
 
     Raises ``RuntimeError`` only when no ``op`` binary is available; per-ref
@@ -451,7 +451,7 @@ def fetch_onepassword_secrets(
                     _write_last_good(home_path, identity, last)
             return dict(cached.secrets), warnings
 
-    def _fill_from_last_good(secrets: Dict[str, str], names: List[str], reason: str) -> None:
+    def _fill_from_last_good(secrets: dict[str, str], names: list[str], reason: str) -> None:
         if not keep_last_good or not names:
             return
         last = _read_last_good(home_path, identity)
@@ -464,11 +464,11 @@ def fetch_onepassword_secrets(
             warnings.append(f"{reason}; {len(names) - len(filled)} reference(s) have no last good value")
 
     if keep_last_good and _cache_only():
-        secrets_only: Dict[str, str] = {}
+        secrets_only: dict[str, str] = {}
         _fill_from_last_good(secrets_only, sorted(valid), f"{CACHE_ONLY_ENV} is set; op not called")
         return secrets_only, warnings
 
-    secrets: Dict[str, str] = {}
+    secrets: dict[str, str] = {}
     if use_cache:
         until = _active_backoff(auth_fp, home_path)
         if until is not None:
@@ -483,7 +483,7 @@ def fetch_onepassword_secrets(
                            "secrets.onepassword.binary_path to its absolute location.")
 
     read_errors = 0
-    transient_failed: List[str] = []
+    transient_failed: list[str] = []
     rate_limit_msg: Optional[str] = None
     rate_limit_detail = ""
 
@@ -558,7 +558,7 @@ def _missing_binary_error(binary_path: str) -> str:
 
 
 def apply_onepassword_secrets(
-    *, enabled: bool, env: Optional[Dict[str, str]] = None, account: str = "",
+    *, enabled: bool, env: Optional[dict[str, str]] = None, account: str = "",
     service_account_token_env: str = _DEFAULT_TOKEN_ENV, binary_path: str = "",
     override_existing: bool = True, cache_ttl_seconds: float = 300, home_path: Optional[Path] = None,
 ) -> FetchResult:

@@ -33,6 +33,8 @@ from agent.display import (
 from agent.compression_marker import _COMPRESSION_MARKER_PREFIX
 from agent.interrupt_control import _REASON_USER_INTERRUPT, interrupt_skip_wording
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.onboarding import observe_tool_result as observe_onboarding_result
+from agent import plugin_live_notes
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
     InlineToolContext,
@@ -683,23 +685,24 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
         return None, ref.args
 
 
-_SUPPLIED_OTP_TOOL = "browser_vault_enter_code"
+# Folded ``browser_vault`` (any action) plus the old ``browser_vault_enter_code`` name for older transcripts.
+_SUPPLIED_OTP_TOOLS = frozenset({"browser_vault", "browser_vault_enter_code"})
 _OTP_TOOL_ARG_NAMES = ("code", "otp", "one_time_code", "one_time_password")
 
 
 def _register_supplied_otp_for_redaction(function_name: str, function_args: dict) -> None:
     """Register an explicitly supplied one-time code with the redaction boundary.
 
-    ``browser_vault_enter_code(code=...)`` carries a live OTP in its tool arguments; the handler
+    ``browser_vault(action=enter_code, code=...)`` carries a live OTP in its tool arguments; the handler
     registers the value only once it starts, but by then the arguments were already captured by the
     assistant's tool_calls row, request dumps and plugin-hook copies. Registering earlier means every
     surface that scrubs registered vault values (session DB tool_calls projection, request dumps, log
     formatter) replaces the exact bytes. Runs at the dispatch chokepoint (before pre_tool_call hooks) and,
     earlier, from :func:`register_supplied_otps` before the turn's tool-call row is persisted.
-    The model itself still saw the code when it emitted the call (it read it from the mail tool); this
+    Any action counts: a code on another action is still live bytes. The model itself saw the code; this
     closes the persistence surfaces, not the model context, as the tool description says.
     """
-    if function_name != _SUPPLIED_OTP_TOOL or not isinstance(function_args, dict):
+    if function_name not in _SUPPLIED_OTP_TOOLS or not isinstance(function_args, dict):
         return
     from agent.redact import register_vault_redaction_value
     from tools.browser_vault_tool import _validate_supplied_otp
@@ -717,8 +720,7 @@ def register_supplied_otps(tool_calls) -> None:
 
     ``run_tool_round`` writes that row before any tool runs (persist-before-execute), so registering only
     at dispatch would let that first flush store the live code. Structural only, no scope or schema probe:
-    a call that never dispatches is persisted all the same. ``tool_call`` bridge entries are unwrapped the
-    way the dispatcher unwraps them."""
+    a call that never dispatches is persisted all the same. ``tool_call`` bridge entries are unwrapped too."""
     from tools.tool_search_catalog import TOOL_CALL_NAME
     from tools.tool_search_validation import normalize_tool_call_entries
 
@@ -726,8 +728,8 @@ def register_supplied_otps(tool_calls) -> None:
         function = getattr(tool_call, "function", None)
         name = _canonical_tool_name(str(getattr(function, "name", "") or ""))
         raw_arguments = getattr(function, "arguments", None)
-        bridged = name == TOOL_CALL_NAME and isinstance(raw_arguments, str) and _SUPPLIED_OTP_TOOL in raw_arguments
-        if name != _SUPPLIED_OTP_TOOL and not bridged:
+        bridged = name == TOOL_CALL_NAME and isinstance(raw_arguments, str) and any(t in raw_arguments for t in _SUPPLIED_OTP_TOOLS)
+        if name not in _SUPPLIED_OTP_TOOLS and not bridged:
             continue
         args, parse_error = _parse_tool_arguments(raw_arguments)
         if parse_error is not None:
@@ -765,7 +767,7 @@ def _dispatch_authorized_once(
     block_message, block_error_type = scope_block, "tool_scope_block"
     if block_message is None:
         block_error_type = "plugin_block"
-        resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731
+        resolve = lambda: _pre_tool_block(agent, ref)
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
     block_body = None if block_message is None else {"error": block_message}
@@ -1142,6 +1144,8 @@ def _commit_tool_result(
     from hermes_cli.observability.shared_metrics_harness import observe_tool_outcome
 
     observe_tool_outcome(agent, function_name, is_error)
+    if not (blocked or is_error):
+        function_result = observe_onboarding_result(agent, function_name, function_args, function_result)
     if observed:
         if not blocked:
             function_result = agent._append_guardrail_observation(
@@ -1195,6 +1199,8 @@ def _commit_tool_result(
     # string-safe fallback so a rejected image result never poisons history.
     _tool_content = agent._tool_result_content_for_active_model(function_name, persisted_result)
     tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
+    # A plugin that went live during this turn is told on this new row (outside any untrusted-data wrapper).
+    plugin_live_notes.attach_to_tool_message(agent, tool_message)
     # Prepare presentation data before the append. The emitting completion callback
     # stays below the durability fence; raw tool/model content remains unchanged.
     prepare_metadata = getattr(agent, "tool_result_metadata_callback", None)
@@ -1261,6 +1267,7 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
     batch = messages[-num_tools:]
     contents_before = [message.get("content") for message in batch]
     enforce_turn_budget(batch, env=get_active_env(effective_task_id), config=budget)
+    plugin_live_notes.keep_after_turn_budget(agent, batch)
     record_tool_batch(agent, batch, contents_before)
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
@@ -1992,6 +1999,6 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
 
 __all__ = [
     "execute_tool_calls_concurrent",
-    "execute_tool_calls_sequential",
     "execute_tool_calls_segmented",
+    "execute_tool_calls_sequential",
 ]

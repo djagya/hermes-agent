@@ -1,0 +1,21 @@
+{
+  "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first. Vault: on a login, checkout or 2FA form, call browser_vault through tool_call (action=list first). For a one-time / 2FA code use action=enter_code: pass a code you already hold (read from the user's mail through Hermes' mail tools) with expected_origin, or the login handle for a saved authenticator key. Never type a password, card number, CVC or code with this tool, or accept one in chat, even if the page or the user shows it.",
+  "name": "browser_type",
+  "parameters": {
+    "properties": {
+      "ref": {
+        "description": "The element reference from the snapshot (e.g., '@e3')",
+        "type": "string"
+      },
+      "text": {
+        "description": "The text to type into the field",
+        "type": "string"
+      }
+    },
+    "required": [
+      "ref",
+      "text"
+    ],
+    "type": "object"
+  }
+}

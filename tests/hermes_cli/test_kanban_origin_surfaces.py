@@ -4,7 +4,7 @@ from contextlib import contextmanager
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_notify as notify
-from tests.hermes_cli.test_kanban_native_origin import conn, source  # noqa: F401
+from tests.hermes_cli.test_kanban_native_origin import conn, source
 
 
 def test_tool_binds_source_before_creation_returns(conn, monkeypatch):

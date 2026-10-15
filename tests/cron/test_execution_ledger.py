@@ -7,11 +7,12 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
 def _point_ledger(monkeypatch, tmp_path):
-    import cron.executions as executions
+    from cron import executions
 
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     return executions
@@ -136,7 +137,7 @@ def test_foreign_process_cannot_start_or_finish_execution(monkeypatch, tmp_path)
 
 
 def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path):
-    import cron.executions as executions
+    from cron import executions
 
     current_home = {"path": tmp_path / "default"}
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", None)
@@ -195,6 +196,55 @@ def test_recently_finished_long_running_execution_survives_retention(
     assert finished["status"] == "completed"
     assert executions.get_execution(long_running["id"])["status"] == "completed"
     assert executions.get_execution(newer["id"]) is None
+
+
+def test_retention_expires_terminal_history_by_age_but_preserves_inflight(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    clock = {"now": datetime(2026, 10, 10, tzinfo=UTC)}
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock["now"])
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 100)
+
+    old = executions.create_execution("old", source="builtin")
+    executions.finish_execution(old["id"], success=False, error="actionable failure")
+    inflight = executions.create_execution("live", source="builtin")
+    executions.mark_execution_running(inflight["id"])
+
+    clock["now"] += timedelta(hours=executions.TERMINAL_RETENTION_HOURS, seconds=1)
+    recent = executions.create_execution("recent", source="builtin")
+    executions.finish_execution(recent["id"], success=True)
+
+    assert executions.get_execution(old["id"]) is None
+    recent_record = executions.get_execution(recent["id"])
+    inflight_record = executions.get_execution(inflight["id"])
+    assert recent_record is not None and recent_record["status"] == "completed"
+    assert inflight_record is not None and inflight_record["status"] == "running"
+
+
+def test_retention_preserves_more_than_one_thousand_terminal_rows_inside_age_window(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    now = datetime(2026, 10, 10, tzinfo=UTC)
+    monkeypatch.setattr(executions, "_hermes_now", lambda: now)
+    total = 1_001
+    assert total < executions.MAX_TERMINAL_EXECUTIONS
+
+    stamp = now.isoformat()
+    with executions._transaction() as conn:
+        conn.executemany(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, status, claimed_at, finished_at)
+               VALUES (?, ?, 'builtin', 'test-process', 1, 'completed', ?, ?)""",
+            ((f"run-{index}", f"job-{index}", stamp, stamp) for index in range(total)),
+        )
+        executions._prune_unlocked(conn)
+        retained = conn.execute(
+            "SELECT COUNT(*) FROM executions WHERE status='completed'"
+        ).fetchone()[0]
+
+    assert retained == total
 
 
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
@@ -298,7 +348,7 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
 
 
 def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     class BrokenPool:
         def submit(self, _callable):
@@ -328,7 +378,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     events = []
     run_execution_ids = []
@@ -476,7 +526,7 @@ def test_early_return_still_closes_connection(monkeypatch, tmp_path):
 
 
 def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
-    import cron.jobs as jobs
+    from cron import jobs
 
     monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")

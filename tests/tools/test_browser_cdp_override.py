@@ -93,7 +93,7 @@ class TestResolveCdpOverride:
         assert logged_version_url.startswith("https://cdp.example")
 
     def test_normalizes_provider_returned_http_cdp_url_when_creating_session(self, monkeypatch):
-        import tools.browser_tool as browser_tool
+        from tools import browser_tool
 
         provider = Mock()
         provider.create_session.return_value = {
@@ -127,7 +127,7 @@ class TestResolveCdpOverride:
 
 class TestGetCdpOverride:
     def test_prefers_env_var_over_config(self, monkeypatch):
-        import tools.browser_tool as browser_tool
+        from tools import browser_tool
 
         monkeypatch.setenv("BROWSER_CDP_URL", HTTP_URL)
         monkeypatch.setattr(
@@ -333,7 +333,7 @@ class TestCDPSupervisorStartErrorRedaction:
         err = ValueError(f"{raw} isn't a valid URI: hostname isn't provided")
         try:
             self._run_start_hitting_error(raw, err)
-        except Exception as exc:  # noqa: BLE001 - asserting on the surface
+        except Exception as exc:
             msg = str(exc)
             assert "super-secret-999" not in msg, (
                 "raw token must not appear in the re-raised error message"
@@ -349,7 +349,7 @@ class TestCDPSupervisorStartErrorRedaction:
         err = ValueError(f"{raw} isn't a valid URI: hostname isn't provided")
         try:
             self._run_start_hitting_error(raw, err)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             assert "p4ssw0rd" not in str(exc)
         else:
             raise AssertionError("start() did not re-raise the start error")

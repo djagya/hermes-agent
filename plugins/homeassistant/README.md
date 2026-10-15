@@ -1,4 +1,8 @@
-# hermes-homeassistant
+<p align="center"><img src="../assets/homeassistant.jpg" alt="Home Assistant: official Hermes Agent plugin" width="100%"></p>
+
+# Home Assistant for Hermes Agent
+
+> Part of the [Hermes Official Plugins](../README.md), Nous Research's official plugins for Hermes Agent. Formerly [`NousResearch/hermes-homeassistant`](https://github.com/NousResearch/hermes-homeassistant), which is archived; this directory carries its full history.
 
 Official [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin for
 [Home Assistant](https://www.home-assistant.io/). It provides two things:
@@ -6,8 +10,8 @@ Official [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin for
 1. **Gateway platform `homeassistant`**: subscribes to Home Assistant's WebSocket event bus and
    forwards `state_changed` events to the agent, with domain/entity filters and per-entity cooldowns.
    The agent's replies show up as Home Assistant persistent notifications titled "Hermes Agent".
-   Cron jobs can deliver to `deliver=homeassistant[:target]` through the `notify.notify` service,
-   without a running gateway.
+   Cron jobs can deliver to `deliver=homeassistant[:target]` through the target's own notify service
+   (`notify.mobile_app_my_phone` for `target=mobile_app_my_phone`), without a running gateway.
 2. **Toolset `homeassistant`**: four tools the model can call to query and control devices over the
    REST API: `ha_list_entities`, `ha_get_state`, `ha_list_services`, `ha_call_service`.
 

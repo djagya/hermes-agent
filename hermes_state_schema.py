@@ -433,7 +433,6 @@ class SessionSchemaMixin:
         """Fork fence: never issue live ``'rebuild'`` / DELETE+reinsert on SessionDB."""
         del legacy, include_trigram
         logger.warning("Skipped live FTS index rebuild (fork FTS fence).")
-        return
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         """True = queryable, False = absent, None = FTS module/tokenizer missing or content
@@ -644,7 +643,7 @@ class SessionSchemaMixin:
     # ── Declarative column reconciliation ──────────────────────────────────
 
     @staticmethod
-    def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
+    def _parse_schema_columns(schema_sql: str) -> dict[str, dict[str, str]]:
         """Expected columns per table: execute SCHEMA_SQL in an in-memory database and read
         PRAGMA table_info (no regex). Memoized on disk keyed by a DDL hash (~85ms per
         startup otherwise); only the reference-side parse is cached — diffing the LIVE
@@ -665,11 +664,11 @@ class SessionSchemaMixin:
         ref = sqlite3.connect(":memory:")
         try:
             ref.executescript(schema_sql)
-            table_columns: Dict[str, Dict[str, str]] = {}
+            table_columns: dict[str, dict[str, str]] = {}
             for (tbl,) in ref.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall():
-                cols: Dict[str, str] = {}
+                cols: dict[str, str] = {}
                 info = ref.execute(f'PRAGMA table_info("{tbl}")').fetchall()
                 for _cid, col_name, col_type, notnull, default, pk in info:
                     # Reconstruct the type expression for ALTER TABLE ADD COLUMN
@@ -724,7 +723,7 @@ class SessionSchemaMixin:
                     )
 
     @staticmethod
-    def _live_pk_columns(cursor: sqlite3.Cursor, table: str) -> Optional[List[str]]:
+    def _live_pk_columns(cursor: sqlite3.Cursor, table: str) -> Optional[list[str]]:
         """PRIMARY KEY column names of *table* in key order; None when the table is
         missing or has no columns (SCHEMA_SQL creates it correctly)."""
         try:
@@ -933,7 +932,7 @@ class SessionSchemaMixin:
             cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
             # Store provenance so fresh vs wiped stores are distinguishable.
             # See #97568.
-            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            now_iso = datetime.datetime.now(datetime.UTC).isoformat()
             cursor.executemany(
                 "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
                 [("store_instance_id", str(uuid.uuid4())), ("store_created_at_utc", now_iso),
@@ -1133,7 +1132,7 @@ class SessionSchemaMixin:
                     "SELECT rowid, title, title_source, started_at FROM sessions WHERE title IN "
                     "(SELECT title FROM sessions WHERE title IS NOT NULL GROUP BY title HAVING COUNT(*) > 1)"
                 ).fetchall()
-                groups: Dict[str, list] = {}
+                groups: dict[str, list] = {}
                 for row in sorted(rows, key=lambda r: (self._title_rank(r[2]), r[3], r[0]), reverse=True):
                     groups.setdefault(row[1], []).append(row)
                 user_rank = self._TITLE_SOURCE_RANK[self.TITLE_SOURCE_USER]
@@ -1207,7 +1206,6 @@ class SessionSchemaMixin:
         logger.warning(
             "Skipped admitted startup FTS rebuild (fork FTS fence); no stale upsert."
         )
-        return
 
     def _backfill_gateway_metadata_from_sessions_json(self, cursor: sqlite3.Cursor) -> None:
         """One-time v18 backfill of gateway metadata from sessions.json. Only fills NULL

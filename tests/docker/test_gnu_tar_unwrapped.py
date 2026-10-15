@@ -13,7 +13,7 @@ WRAP = ROOT / "docker/sera-toolbox/wrap"
 class GnuTarUnwrapped(unittest.TestCase):
     def test_install_wrappers_omits_gnu_tar(self) -> None:
         text = INSTALL.read_text(encoding="utf-8")
-        match = re.search(r"tools=\((.*?)\)", text, flags=re.S)
+        match = re.search(r"tools=\((.*?)\)", text, flags=re.DOTALL)
         self.assertIsNotNone(match)
         tools = match.group(1)
         names = set(re.findall(r"[A-Za-z0-9._+-]+", tools))

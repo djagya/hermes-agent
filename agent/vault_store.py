@@ -24,7 +24,7 @@ import threading
 import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
@@ -174,7 +174,7 @@ class VaultItemMeta:
     payment_scope: str = "origin_bound"
     payment_frame_origins: tuple = ()
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         out = {
             "id": self.id,
             "kind": self.kind,
@@ -269,7 +269,7 @@ class VaultStore:
 
     # -- persistence -------------------------------------------------------
 
-    def _read_all(self) -> List[Dict[str, Any]]:
+    def _read_all(self) -> list[dict[str, Any]]:
         if not self._vault_path.exists():
             return []
         blob = self._vault_path.read_bytes()
@@ -294,7 +294,7 @@ class VaultStore:
         items = data.get("items", [])
         return items if isinstance(items, list) else []
 
-    def _write_all(self, items: List[Dict[str, Any]]) -> None:
+    def _write_all(self, items: list[dict[str, Any]]) -> None:
         self._ensure_dir()
         payload = json.dumps({"version": 1, "items": items}).encode("utf-8")
         blob = self._fernet().encrypt(payload)
@@ -307,7 +307,7 @@ class VaultStore:
         self,
         kind: str,
         label: str,
-        secret: Dict[str, Any],
+        secret: dict[str, Any],
         origin: Optional[str] = None,
     ) -> VaultItemMeta:
         """Add an item. ``secret`` is the sensitive payload (encrypted at rest).
@@ -360,7 +360,7 @@ class VaultStore:
             "kind": kind,
             "label": label,
             "origin": norm_origin,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
             "identifier_type": identifier_type,
             "identifier": identifier,
             "secret": dict(secret),
@@ -371,7 +371,7 @@ class VaultStore:
             self._write_all(items)
         return self._meta(record)
 
-    def list_items(self) -> List[VaultItemMeta]:
+    def list_items(self) -> list[VaultItemMeta]:
         """Metadata-only listing. Secret payloads are never included."""
         with self._locked():
             return [self._meta(rec) for rec in self._read_all()]
@@ -399,7 +399,7 @@ class VaultStore:
                     return self._meta(rec)
         return None
 
-    def resolve_secret(self, item_id: str) -> Dict[str, Any]:
+    def resolve_secret(self, item_id: str) -> dict[str, Any]:
         """Resolve the decrypted secret payload for server-side use ONLY.
 
         Callers must never place the returned values into tool results,
@@ -412,7 +412,7 @@ class VaultStore:
         raise VaultError(f"no vault item with id {item_id!r}")
 
     @staticmethod
-    def _meta(rec: Dict[str, Any]) -> VaultItemMeta:
+    def _meta(rec: dict[str, Any]) -> VaultItemMeta:
         identifier = rec.get("identifier")
         return VaultItemMeta(
             id=str(rec.get("id", "")),
@@ -431,7 +431,7 @@ def get_vault_store() -> VaultStore:
     return VaultStore()
 
 
-def scrub_secret_from_text(text: str, secret: Dict[str, Any]) -> str:
+def scrub_secret_from_text(text: str, secret: dict[str, Any]) -> str:
     """Defensively strip any secret values from a string (e.g. an exception
     message) before it can be surfaced. Case-sensitive exact substring scrub."""
     scrubbed = text

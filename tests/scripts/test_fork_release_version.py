@@ -41,7 +41,8 @@ def _run(
     if branch is not None:
         env["RELEASE_BRANCH"] = branch
     return subprocess.run(
-        ["bash", str(SCRIPT), *args], cwd=repo, env=env, capture_output=True, text=True
+        ["bash", str(SCRIPT), *args], cwd=repo, env=env, capture_output=True, text=True,
+        check=False,
     )
 
 

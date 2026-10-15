@@ -13,7 +13,7 @@ import ssl
 import subprocess
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -88,7 +88,7 @@ def payment_browser(tmp_path, record_property):
         pytest.fail("A real Chromium is required for this receipt")
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "synthetic.test")])
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cert = (
         x509
         .CertificateBuilder()
@@ -245,7 +245,7 @@ def test_native_encrypted_vault_fill_and_refusals(
         "tools.approval_prompt.request_elicitation_consent", return_value="accept"
     ):
         raw = registry.dispatch(
-            "browser_vault_fill", {"handle": card.id}, task_id="payment-live"
+            "browser_vault", {"action": "fill", "handle": card.id}, task_id="payment-live"
         )
     result = json.loads(raw)
     assert (

@@ -24,7 +24,7 @@ def _cli():
     return cli
 
 
-def _load_prefill_messages(file_path: str, base_dir: Path | None = None) -> List[Dict[str, Any]]:
+def _load_prefill_messages(file_path: str, base_dir: Path | None = None) -> list[dict[str, Any]]:
     """Load prefill messages (JSON array) from *file_path*; missing/empty -> [].
 
     Relative paths resolve against *base_dir*, defaulting to the CLI's hermes home.
@@ -49,7 +49,7 @@ def _load_prefill_messages(file_path: str, base_dir: Path | None = None) -> List
         return []
 
 
-def _resolve_prefill_messages_file(config: Dict[str, Any]) -> str:
+def _resolve_prefill_messages_file(config: dict[str, Any]) -> str:
     """Prefill file path: env, then top-level ``prefill_messages_file``, then legacy ``agent.*``."""
     agent_cfg = config.get("agent", {})
     return (
@@ -222,7 +222,7 @@ def _cli_config_defaults():
     }
 
 
-def _merge_file_config(defaults: Dict[str, Any], file_config: Dict[str, Any]) -> None:
+def _merge_file_config(defaults: dict[str, Any], file_config: dict[str, Any]) -> None:
     """Overlay a parsed config file onto *defaults* in place (model normalization, deep merge, legacy keys)."""
     # model: string (new format) or dict (old format with default/base_url)
     if "model" in file_config:
@@ -255,7 +255,7 @@ def _merge_file_config(defaults: Dict[str, Any], file_config: Dict[str, Any]) ->
         defaults["agent"]["max_turns"] = file_config["max_turns"]
 
 
-def load_cli_config() -> Dict[str, Any]:
+def load_cli_config() -> dict[str, Any]:
     """~/.hermes/config.yaml (else ./cli-config.yaml) over built-in defaults; env vars win.
 
     ``HERMES_IGNORE_USER_CONFIG=1`` skips the user config entirely (``.env`` still loads).
@@ -269,6 +269,7 @@ def load_cli_config() -> Dict[str, Any]:
 
     # Only a file's terminal section may overwrite terminal env vars already set by .env.
     _file_has_terminal_config = False
+    file_config: dict[str, Any] = {}
 
     if config_path.exists():
         try:
@@ -286,11 +287,13 @@ def load_cli_config() -> Dict[str, Any]:
     from hermes_cli.config import _expand_env_vars
     defaults = _expand_env_vars(defaults)
 
-    # Administrator-pinned (managed scope) values overlay LAST; cli.py builds its config
-    # independently of hermes_cli.config, so this keeps parity with `hermes config`. Fail-open.
+    # dlz: managed scope seeds the leaves the user omitted. Pass the raw user document so CLI
+    # schema defaults do not shadow those seeds; a present user leaf wins (live `config set`
+    # writes the user file). cli.py builds its config independently of hermes_cli.config, so
+    # without this the TUI/CLI surface would ignore managed seeds. Fail-open.
     from hermes_cli import managed_scope
 
-    defaults = managed_scope.apply_managed_overlay(defaults)
+    defaults = managed_scope.apply_managed_overlay(defaults, user_raw=file_config)
 
     _mirror_config_to_env(defaults, _file_has_terminal_config)
 
