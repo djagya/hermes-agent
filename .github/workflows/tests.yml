@@ -17,6 +17,9 @@ on:
           (selective scope only). Consumed by scripts/ci/select_test_roots.py.
         type: string
         required: false
+      commit:
+        description: Commit to test and build. Empty keeps the triggering commit.
+        type: string
         default: ''
       # The E2E jobs below are slow lanes (scripts/ci/classify_changes.py).
       # ci.yaml passes the classifier's answer; a caller that passes nothing
@@ -55,8 +58,8 @@ permissions:
 # must survive together. Contract asserted in
 # tests/ci/test_workflow_concurrency.py.
 concurrency:
-  group: tests-${{ github.ref_type == 'tag' && github.run_id || github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  group: tests-${{ (github.ref_type == 'tag' || inputs.commit != '') && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && inputs.commit == '' }}
 
 jobs:
   plan:
@@ -110,6 +113,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
 
       - name: Install ripgrep (prebuilt binary)
         run: |
@@ -207,6 +212,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
 
       - name: Set up locked Python, Node and test dependencies
         # toolchain: all puts PM's locked Node in the runner's PM store, not
@@ -305,6 +312,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
+          ref: ${{ inputs.commit }}
           # The clean-worktree step below loads its action from the checkout.
           sparse-checkout: |
             tests/e2e/core/upgrade
@@ -353,7 +361,8 @@ jobs:
           # pull_request checkouts are the synthetic merge into the base.
           # That merge's first parent is the base, so `git describe HEAD~1`
           # (N-1) would follow the base branch instead of the candidate.
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
+          ref: ${{ inputs.commit || (github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha) }}
           fetch-depth: 0
           fetch-tags: true
 

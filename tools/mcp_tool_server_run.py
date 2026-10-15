@@ -252,29 +252,33 @@ class MCPServerRunMixin:
     def _oauth_credential_snapshot(self) -> tuple:
         """What an OAuth re-authorization changes: the stat of this server's token and client
         files plus the on-disk endpoint/auth config. Stat only — no token bytes are read."""
+        from hermes_constants import get_hermes_home
         from tools import mcp_tool_config as _config
         from tools.mcp_oauth import HermesTokenStorage
 
-        storage = HermesTokenStorage(self.name)
-        files = []
-        for path in (storage._tokens_path(), storage._client_info_path()):
-            try:
-                st = path.stat()
-                files.append((st.st_mtime_ns, st.st_size, st.st_ino))
-            except OSError:
-                files.append(None)
+        files = HermesTokenStorage(self.name, hermes_home=get_hermes_home()).credential_stamp()
         try:
             entry = (_config._load_mcp_config() or {}).get(self.name) or {}
             cfg = repr([entry.get(k) for k in self._REMOTE_REBIND_KEYS])
         except Exception:
             cfg = None
-        return tuple(files), cfg
+        return files, cfg
 
     def _arm_auth_park(self, root: BaseException) -> None:
-        """Snapshot credentials before an OAuth auth-failure park (see ``_park``)."""
-        self._auth_park_credentials = (
-            self._oauth_credential_snapshot()
-            if self._auth_type == "oauth" and _errors._is_auth_error(root) else None)
+        """Record the OAuth credentials an auth-failure park failed with (see ``_park``). Until a
+        re-authorization rewrites them, neither a discovery pass (``_auth_park``, checked by
+        ``_select_new_servers``) nor the timed self-probe (``_auth_park_credentials``, which also
+        covers an edited endpoint/auth config) has anything new to try: each replayed the same
+        rejected refresh token, enough for an authorization-server rate-limit ban."""
+        self._auth_park = None
+        self._auth_park_credentials = None
+        if self._auth_type == "oauth" and _errors._is_auth_error(root):
+            from hermes_constants import get_hermes_home
+            from tools.mcp_oauth import HermesTokenStorage
+
+            storage = HermesTokenStorage(self.name, hermes_home=get_hermes_home())
+            self._auth_park = (storage, storage.credential_stamp())
+            self._auth_park_credentials = self._oauth_credential_snapshot()
 
     def _still_configured_enabled(self) -> bool:
         """Whether ``mcp_servers`` on disk still wants this server connected: entry present
@@ -389,6 +393,7 @@ class MCPServerRunMixin:
                             from agent.secret_scope import reset_secret_scope
                             reset_secret_scope(scope_token)
                 rebuild = True
+                self._auth_park = None
                 run_transport = self._run_http if self._is_http() else self._run_stdio
                 self._resolved_identity = None  # the transport publishes the inputs it connects with
                 if not await self._on_clean_return(await run_transport(config), budget):

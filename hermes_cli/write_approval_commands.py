@@ -141,7 +141,7 @@ def _approve(subsystem: str, rest: list[str], memory_store,
             return f"No pending {subsystem} write with id '{target}'."
         targets = [rec]
 
-    applied, failed, overwritten, removed = 0, [], [], []
+    applied, failed, overwritten, patched, removed = 0, [], [], [], []
     for rec in targets:
         pending_id = rec["id"]
         applied_result = {}
@@ -164,6 +164,7 @@ def _approve(subsystem: str, rest: list[str], memory_store,
         if ok:
             applied += 1
             overwritten.extend(f"  {rec['id']}: {text}" for text in _changed_entries(applied_result, "replaced"))
+            patched.extend(f"  {rec['id']}: {text}" for text in _changed_entries(applied_result, "patched"))
             removed.extend(f"  {rec['id']}: {text}" for text in _changed_entries(applied_result, "removed"))
         else:
             failed.append(f"{pending_id}: {msg}")
@@ -174,6 +175,10 @@ def _approve(subsystem: str, rest: list[str], memory_store,
         # is the last person who can notice a clause went missing, so show what was lost.
         out.append("Overwrote entire entry (re-add anything you still need):")
         out.extend(overwritten)
+    if patched:
+        # A patch keeps the rest of the entry, so show it as it was, not as lost text.
+        out.append("Patched entry (as it was before the edit):")
+        out.extend(patched)
     if removed:
         out.append("Removed entry (re-add anything you still need):")
         out.extend(removed)
@@ -184,9 +189,10 @@ def _approve(subsystem: str, rest: list[str], memory_store,
 
 
 def _changed_entries(result: dict, kind: str) -> list[str]:
-    """Full text of every entry a memory replace overwrote (``kind="replaced"``) or remove
-    deleted (``"removed"``), single-op or batch shape."""
+    """Full text of every entry a memory write changed, single-op or batch shape."""
     single = result.get(f"{kind}_entry")
+    if kind == "patched" and single is None:
+        single = result.get("patched_entry_before")
     batch = result.get(f"{kind}_entries") or {}
     return ([single] if single else []) + [batch[k] for k in sorted(batch, key=int)]
 
