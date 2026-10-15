@@ -108,3 +108,16 @@ def test_missing_target_can_be_corrected_without_writing_to_the_other_store(rout
     assert fresh._entries_for(target) == [f"Existing {target} fact", operation["content"]]
     assert store._path_for(other).read_bytes() == other_before
     assert store.format_for_system_prompt(target) == snapshot
+
+
+def test_replay_without_a_live_approval_capability_is_refused_not_raised():
+    """dlz: the commit boundary refuses a replay whose one-shot capability is gone (it raised TypeError)."""
+    store = MemoryStore()
+    store.load_from_disk()
+    assert store.add("user", "Existing user fact")["success"]
+    before = store._path_for("user").read_bytes()
+    payload = {"action": "batch", "target": "user", "operations": [{"action": "add", "content": "Fact"}],
+               "_write_guard": _build_memory_write_guard(store, "user")}
+    result = apply_memory_pending(payload, store)
+    assert result["success"] is False and "capability is not live" in result["error"]
+    assert store._path_for("user").read_bytes() == before
