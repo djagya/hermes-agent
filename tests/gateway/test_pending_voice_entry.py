@@ -177,7 +177,6 @@ async def telegram_gateway(monkeypatch, tmp_path, busy_text_mode, echo):
     monkeypatch.setattr("gateway.run._hermes_home", hermes_home)
     monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda **kwargs: {"api_key": "fixture"})
     monkeypatch.setattr("run_agent.AIAgent", WaitingModel)
-    monkeypatch.setattr("tools.tirith_security._install_tirith", lambda **kwargs: (None, "offline test"))
     WaitingModel.instances, WaitingModel.messages, WaitingModel.redirects = [], [], []
     WaitingModel.started, WaitingModel.release = threading.Event(), threading.Event()
     platform_config = PlatformConfig(enabled=True, token="999:fixture")

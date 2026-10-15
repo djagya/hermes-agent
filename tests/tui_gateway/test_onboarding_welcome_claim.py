@@ -212,4 +212,8 @@ def test_the_cached_due_answer_follows_shared_auth_and_the_managed_layer(portal,
 
     write(managed)
 
-    assert _call("onboarding.state")["result"][moved] is False
+    # dlz: the fork runs managed-SEED semantics (a present user leaf wins; managed fills omitted
+    # leaves). The bootstrap latched onboarding.run: true in the user config, so a managed
+    # run: false does not override it here; upstream's managed-veto expectation is False.
+    expected = change == "managed_onboarding_off"
+    assert _call("onboarding.state")["result"][moved] is expected

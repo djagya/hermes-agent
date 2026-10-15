@@ -3,12 +3,13 @@
 import copy
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS
 from hermes_cli.config import load_config, save_config
-from tools.memory_tool import MemoryStore, apply_memory_pending
+from tools.memory_tool import MemoryStore, _build_memory_write_guard, apply_memory_pending
 from tools.registry import registry
 from tools.skill_provenance import reset_current_write_origin, set_current_write_origin
 from tools import write_approval as wa
@@ -18,7 +19,12 @@ def _call(route, store, args):
     if route == "store":
         return store.apply_batch(args.get("target"), args["operations"])
     if route == "replay":
-        return apply_memory_pending({"action": "batch", **args}, store)
+        payload = {"action": "batch", **args}
+        # dlz: replay needs the staged base-state guard and the one-shot approval capability.
+        if args.get("target") in ("memory", "user"):
+            payload["_write_guard"] = _build_memory_write_guard(store, args["target"])
+        with patch.object(wa, "consume_pending_apply_capability", return_value=True):
+            return apply_memory_pending(payload, store)
     if route == "inline":
         agent = SimpleNamespace(_memory_store=store, _memory_manager=None)
         return json.loads(INLINE_TOOL_EXECUTORS["memory"](agent, args, None))

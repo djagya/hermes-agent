@@ -217,13 +217,14 @@ def test_handle_approve_lists_a_patch_as_the_entry_before_the_edit(hermes_home):
     """An approved patch keeps the rest of its entry; the approve output called it an
     overwrite and told the user to re-add text they had deliberately changed."""
     from hermes_cli.write_approval_commands import handle_pending_subcommand
-    from tools.memory_tool import MemoryStore
+    from tools.memory_tool import MemoryStore, _build_memory_write_guard
     from tools import write_approval as wa
     store = MemoryStore(); store.load_from_disk()
     entry = "RULE A: gate merges. RULE B: ci per HEAD. RULE C: never squash."
     store.add("memory", entry)
     wa.stage_write("memory", {"action": "batch", "target": "memory", "operations": [
-        {"action": "patch", "old_text": "ci per HEAD", "content": "CI is per-head", "matched_entry": entry}]},
+        {"action": "patch", "old_text": "ci per HEAD", "content": "CI is per-head", "matched_entry": entry}],
+        "_write_guard": _build_memory_write_guard(store, "memory")},  # dlz: staged base-state guard
         summary="batch", origin="background_review")
     out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
     assert "Patched entry (as it was before the edit):" in out and entry in out
