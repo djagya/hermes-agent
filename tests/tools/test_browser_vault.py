@@ -591,6 +591,29 @@ class TestBrowserVaultTools:
         assert not generic_eval.called and not resolve.called
 
 
+    @pytest.mark.parametrize("number, groups", [
+        ("4111111111111111", ("4111", "1111", "1111", "1111")),
+        ("378282246310005", ("3782", "822463", "10005")),
+        ("36227206271667", ("3622", "720627", "1667")),
+    ])
+    def test_payment_fill_registers_only_card_secrets_for_redaction(self, number, groups):
+        """Every later tool result is scrubbed of the registered values, so a payment fill registers
+        the card number (as typed, spaced or dashed) and CVC, and never the
+        holder name, expiry or postcode, which are common strings elsewhere."""
+        from tools.browser_vault_payment import _register_card_redaction
+        from agent import redact
+
+        try:
+            _register_card_redaction({**_CARD, "card_number": number})
+            text = "A User, 94110, renews 2029, month 7, build 1.27.3, date 07/29, ratio 107/290, blog /2025/07/29/"
+            assert redact.redact_sensitive_text(text) == text
+            for secret in (number, " ".join(groups), "-".join(groups)):
+                assert secret not in redact.redact_sensitive_text(f"page says {secret}."), secret
+            assert "cvc 123." not in redact.redact_sensitive_text("cvc 123.")
+        finally:
+            redact.clear_vault_redaction_values()
+
+
 class TestVaultHardening:
     """Read-deny, backup perms-tightening, canonical dir securing.
 
