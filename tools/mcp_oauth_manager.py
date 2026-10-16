@@ -12,6 +12,7 @@ import logging
 import re
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -334,6 +335,8 @@ class MCPOAuthManager:
     def __init__(self) -> None:
         self._entries: dict[tuple[str, str], _ProviderEntry] = {}
         self._entries_lock = threading.Lock()
+        # MCP loops already detached by _stop_mcp_loop; their draining tasks must not rebuild providers.
+        self._retired_loops: weakref.WeakSet = weakref.WeakSet()
         # Strong refs to in-flight 401 tasks so the loop's weak bookkeeping cannot GC them mid-run.
         self._inflight_tasks: set[asyncio.Task] = set()
 
@@ -341,7 +344,13 @@ class MCPOAuthManager:
         """Cached OAuth provider for ``server_name``, built on first use (rebuilt when ``server_url`` changes);
         None if the MCP SDK's OAuth support is unavailable."""
         key = self._key(server_name)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
         with self._entries_lock:
+            if loop is not None and loop in self._retired_loops:
+                raise RuntimeError("MCP OAuth provider requested from a stopped event loop")
             entry = self._entries.get(key)
             if entry is not None and entry.server_url != server_url:
                 logger.info("MCP OAuth '%s': URL changed from %s to %s, discarding cache", server_name, entry.server_url, server_url)
@@ -471,13 +480,17 @@ class MCPOAuthManager:
             logger.warning("MCP OAuth '%s': awaiting 401 handler failed: %s", server_name, exc)
             return False
 
-    def clear_cached_providers(self) -> int:
+    def clear_cached_providers(self, *, retired_loop: Optional[asyncio.AbstractEventLoop] = None) -> int:
         """Drop every in-process provider while preserving OAuth files.
 
         A full MCP shutdown also replaces the dedicated asyncio event loop.
         OAuth providers are not safe to carry across that boundary.
+        ``retired_loop`` is the loop being detached: its tasks still run until the drain cancels
+        them, and must not repopulate the cache with a provider bound to that loop.
         """
         with self._entries_lock:
+            if retired_loop is not None:
+                self._retired_loops.add(retired_loop)
             count = len(self._entries)
             self._entries.clear()
         if count:
