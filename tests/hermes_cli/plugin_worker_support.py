@@ -41,17 +41,19 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def version(repo: Path, *, name="plugin-worker-proof", surface="python_dependencies", suffix="yaml", pin="1.0", capabilities=(), dependency="plugin-proof-dep") -> str:
+def version(repo: Path, *, name="plugin-worker-proof", surface="python_dependencies", suffix="yaml", pin="1.0", capabilities=(), dependency: str | None = "plugin-proof-dep") -> str:
     manifest: dict = {"name": name, "version": pin}
     if capabilities:
         manifest["capabilities"] = list(capabilities)
-    specs = [f"{dependency}=={pin}"]
-    if surface and surface != "pyproject":
+    specs = [f"{dependency}=={pin}"] if dependency else []
+    if surface and surface != "pyproject" and specs:
         manifest[surface] = specs
     (repo / f"plugin.{suffix}").write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    imported = f"import {dependency.replace('-', '_')} as plugin_proof_dep\n" if dependency else ""
+    result = "(VERSION, plugin_proof_dep.__version__)" if dependency else "VERSION"
     (repo / "__init__.py").write_text(
-        f"import {dependency.replace('-', '_')} as plugin_proof_dep\nVERSION = {pin!r}\n"
-        "def register(ctx):\n    return (VERSION, plugin_proof_dep.__version__)\n", encoding="utf-8")
+        f"{imported}VERSION = {pin!r}\n"
+        f"def register(ctx):\n    return {result}\n", encoding="utf-8")
     if surface == "pyproject":
         (repo / "pyproject.toml").write_text(
             f'[project]\nname={json.dumps(name)}\nversion="{pin}"\nrequires-python=">=3.11"\n'

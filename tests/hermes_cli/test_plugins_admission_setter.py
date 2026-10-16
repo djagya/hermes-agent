@@ -1,5 +1,6 @@
 """Publication failures through the command and real worker, not a fake sync."""
 import shutil
+import subprocess
 import sys
 
 import pytest
@@ -58,6 +59,34 @@ def test_failed_publication_preserves_selection_and_imports(plugin_world, monkey
     assert world.selected() == selected
     world.imports()
     assert receipt.latest()["outcome"] == "failed"
+
+
+def test_resolvable_selection_admits_dependency_and_dependency_free_plugins(plugin_world):
+    world = plugin_world
+    dependent, dependent_sha = world.origin()
+    world.command("install", identifier=dependent.as_uri(), ref=dependent_sha, no_enable=True, allow_removed=True)
+    world.command("enable", name="plugin-worker-proof", no_allow_tool_override=True)
+    selected = world.selected()
+
+    dependency_free, dependency_free_sha = world.origin(name="dependency-free", dependency=None)
+    world.command("install", identifier=dependency_free.as_uri(), ref=dependency_free_sha,
+                  no_enable=True, allow_removed=True)
+    world.command("enable", name="dependency-free", no_allow_tool_override=True)
+
+    assert set(world.enabled()) == {"dependency-free", "plugin-worker-proof"}
+    assert world.selected() == selected  # no dependency member means no needless generation
+    world.imports()
+    python = selected / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    plugin = world.home / "plugins/dependency-free/__init__.py"
+    code = (
+        "import importlib.util; "
+        f"spec = importlib.util.spec_from_file_location('dependency_free', {str(plugin)!r}); "
+        "module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); "
+        "assert module.register(None) == '1.0'"
+    )
+    result = subprocess.run([str(python), "-I", "-B", "-c", code], capture_output=True, text=True,
+                            timeout=30, check=False)
+    assert result.returncode == 0, result.stderr
 
 
 def test_historical_writer_hands_off_without_mutating_config(plugin_world, monkeypatch):
