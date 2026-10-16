@@ -1,6 +1,8 @@
 """Tests for the /refine focus parameter on spawn_background_review_thread."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from agent.background_review import (
     _COMBINED_REVIEW_PROMPT,
@@ -53,3 +55,32 @@ def test_focus_works_with_memory_only_prompt():
     )
     assert prompt.startswith(_MEMORY_REVIEW_PROMPT)
     assert "remember my timezone" in prompt
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_refine_runs_on_main_model_while_automatic_review_keeps_route(explicit):
+    """/refine (explicit) ignores the auxiliary.background_review model route and runs on the
+    parent runtime with the full snapshot; the automatic review keeps the configured route."""
+    from agent import background_review as br
+
+    route = {"provider": "openai-codex", "model": "cheap-model", "reasoning_effort": "low",
+             "max_input_tokens": 1234}
+    captured = {}
+
+    def fake_worker(agent, messages_snapshot, prompt, task_cfg=None, **_kw):
+        captured["task_cfg"] = task_cfg
+
+    agent = _bare_agent()
+    agent.provider, agent.model = "openrouter", "main-model"
+    agent._current_main_runtime.return_value = {"api_mode": "chat_completions"}
+    with patch.object(br, "_run_review_in_thread", fake_worker):
+        target, _prompt = spawn_background_review_thread(
+            agent, [], review_memory=True, task_cfg=route, explicit=explicit)
+        target()
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+               return_value={"provider": "openai-codex", "model": "cheap-model"}):
+        rt = br._resolve_review_runtime(agent, captured["task_cfg"])
+    assert rt["routed"] is not explicit
+    assert rt["model"] == ("main-model" if explicit else "cheap-model")
+    assert captured["task_cfg"]["max_input_tokens"] == 1234  # non-route keys still apply
+    assert route["model"] == "cheap-model"  # caller's block is not mutated

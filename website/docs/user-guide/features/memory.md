@@ -416,6 +416,12 @@ identical and skill capture near-identical to the main-model review.
 Leave it at `auto` (or set it to your main model) and nothing changes — the
 review keeps running on the main model with the full warm-cache replay.
 
+The route applies to **automatic** post-turn reviews only. An on-demand
+`/refine` (CLI, TUI and messaging gateway) always runs on the session's main
+model with the full conversation snapshot; the block's `provider`, `model`,
+`base_url`, `api_key` and `reasoning_effort` are ignored for it, while
+`max_input_tokens` and `extra_tools` still apply.
+
 ### Same-model review reasoning
 
 A review using the same model as the parent **always inherits the parent's reasoning effort**. Setting `auxiliary.background_review.reasoning_effort` does not override it, whether the route is `auto` or explicitly selects the parent provider/model.

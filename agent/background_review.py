@@ -242,6 +242,16 @@ def load_background_review_settings() -> tuple[bool, dict[str, Any]]:
         return True, {}
 
 
+# Keys that pick the review's model; the rest of the block (budgets, extra_tools) applies to every review.
+_REVIEW_ROUTE_KEYS = frozenset({"provider", "model", "base_url", "api_key", "reasoning_effort"})
+
+
+def _main_model_task_config(task_cfg: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """``task_cfg`` without the route keys: an on-demand /refine runs on the session's main model
+    with the full snapshot; only automatic post-turn reviews follow the configured route."""
+    return {k: v for k, v in _background_review_task_config(task_cfg).items() if k not in _REVIEW_ROUTE_KEYS}
+
+
 def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Resolve provider/model/credentials for the review fork. Default (auto / unset / same as
     parent): the parent's live runtime with ``routed=False`` (codex_app_server -> codex_responses
@@ -1310,9 +1320,11 @@ def spawn_background_review_thread(
     to the chosen prompt; automatic reviews pass ``None``. ``task_cfg`` is the pre-loaded
     ``auxiliary.background_review`` block; when omitted it is read once here. ``explicit``
     (/refine) propagates to the fork's write origin so user-requested reviews keep the full
-    memory operation set."""
+    memory operation set and runs on the main model (the block's route is ignored)."""
     if task_cfg is None:
         task_cfg = _background_review_task_config()
+    if explicit:
+        task_cfg = _main_model_task_config(task_cfg)
     # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
     name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
     prompt = getattr(agent, name, globals()[name])
