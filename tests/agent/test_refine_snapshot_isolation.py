@@ -115,3 +115,5 @@ async def test_gateway_refine_snapshot_does_not_alias_live_history():
     agent._spawn_background_review_now.assert_called_once()
     snapshot = agent._spawn_background_review_now.call_args.kwargs["messages_snapshot"]
     _assert_isolated(agent._session_messages, snapshot)
+    # Same contract as the CLI/TUI: explicit, so the fork runs on the main model.
+    assert agent._spawn_background_review_now.call_args.kwargs["explicit"] is True
