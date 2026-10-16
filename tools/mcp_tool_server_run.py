@@ -269,16 +269,23 @@ class MCPServerRunMixin:
         re-authorization rewrites them, neither a discovery pass (``_auth_park``, checked by
         ``_select_new_servers``) nor the timed self-probe (``_auth_park_credentials``, which also
         covers an edited endpoint/auth config) has anything new to try: each replayed the same
-        rejected refresh token, enough for an authorization-server rate-limit ban."""
+        rejected refresh token, enough for an authorization-server rate-limit ban.
+
+        The probe gate compares against the credentials the failed attempt STARTED with, so a
+        login that landed while it was in flight still wakes the probe. It is not armed when the
+        last token refresh was inconclusive (5xx or throttled token endpoint): the refresh token
+        may still be good, and only the timed probe can find out once the server recovers."""
         self._auth_park = None
         self._auth_park_credentials = None
         if self._auth_type == "oauth" and _errors._is_auth_error(root):
             from hermes_constants import get_hermes_home
             from tools.mcp_oauth import HermesTokenStorage
+            from tools.mcp_oauth_manager import get_manager
 
             storage = HermesTokenStorage(self.name, hermes_home=get_hermes_home())
             self._auth_park = (storage, storage.credential_stamp())
-            self._auth_park_credentials = self._oauth_credential_snapshot()
+            if self._attempt_credentials is not None and not get_manager().refresh_was_inconclusive(self.name):
+                self._auth_park_credentials = self._attempt_credentials
 
     def _still_configured_enabled(self) -> bool:
         """Whether ``mcp_servers`` on disk still wants this server connected: entry present
@@ -394,6 +401,10 @@ class MCPServerRunMixin:
                             reset_secret_scope(scope_token)
                 rebuild = True
                 self._auth_park = None
+                # Every attempt starts ungated; only an auth-failure park of THIS attempt re-arms.
+                self._auth_park_credentials = None
+                self._attempt_credentials = (
+                    self._oauth_credential_snapshot() if self._auth_type == "oauth" else None)
                 run_transport = self._run_http if self._is_http() else self._run_stdio
                 self._resolved_identity = None  # the transport publishes the inputs it connects with
                 if not await self._on_clean_return(await run_transport(config), budget):
