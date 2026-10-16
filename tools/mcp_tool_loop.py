@@ -267,6 +267,13 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
             return False
         loop, thread = _origin._mcp_loop, _origin._mcp_thread
         _origin._mcp_loop = _origin._mcp_thread = None
+        if loop is not None:
+            # Cached OAuth providers are bound to the loop detached here (entry lock, pending-401
+            # futures, SDK auth-flow state). Clear them under the lock that guards the handle, so
+            # every stop (including the idle stop after a probe) is covered and the next loop
+            # builds its own providers.
+            from tools.mcp_oauth_manager import get_manager
+            get_manager().clear_cached_providers(retired_loop=loop)
     if loop is None:
         return True
     # Drain before stopping: tasks still suspended when the loop closes get resumed by the GC

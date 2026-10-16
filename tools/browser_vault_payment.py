@@ -9,21 +9,24 @@ from agent.vault_payment_card import validate_card
 from agent.vault_payment_policy import PAYMENT_PSP_ORIGINS, PaymentPolicyError
 from agent.vault_store import PAYMENT_FIELDS
 
-# Fill values whose later appearance in tool output would expose the card. The bare expiry month and
-# year and the cardholder name are not secrets on their own and are short or common ("07", "2035",
-# your own name): registering them would scrub every later date and name from model-facing output.
-_REDACTED_TOKENS = frozenset({"cc-number", "cc-csc", "cc-exp"})
 
-
-def _register_card_redaction(secret: dict, fills: list) -> None:
+def _register_card_redaction(secret: dict) -> None:
+    """Register the card secrets for redaction: the number (also grouped with spaces or dashes, as
+    card inputs reformat it) and CVC. Holder name, expiry and billing postcode are not secrets on
+    their own; the scrub is an exact-substring replace over every later tool result, so registering
+    them would scrub common names, dates and postcodes from model-facing output."""
     from agent.redact import register_vault_redaction_value
 
-    number = secret["card_number"]
-    # Common card formatting is also scrubbed from ordinary browser text reads.
-    groups = [number[n : n + 4] for n in range(0, len(number), 4)]
-    for value in (number, secret["cvc"], " ".join(groups), "-".join(groups),
-                  *(f["value"] for f in fills if f["token"] in _REDACTED_TOKENS)):
-        register_vault_redaction_value(value)
+    number = str(secret.get("card_number") or "")
+    digits = "".join(ch for ch in number if ch.isdigit())
+    groupings = [[digits[i : i + 4] for i in range(0, len(digits), 4)]]
+    if len(digits) in (14, 15):  # Diners Club prints 4-6-4, American Express 4-6-5
+        groupings.append([digits[:4], digits[4:10], digits[10:]])
+    values = [number, digits, str(secret.get("cvc") or "")]
+    values += [sep.join(groups) for groups in groupings for sep in (" ", "-")]
+    for value in dict.fromkeys(values):
+        if value:
+            register_vault_redaction_value(value)
 
 
 def _document_fills(inspected, secret: dict) -> list | None:
@@ -76,7 +79,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
         # Never resolve at inspection/list time, on decline or on stale consent.
         secret = validate_card(backend.resolve_secret(meta.id))
         fills = _document_fills(inspected, secret)
-        _register_card_redaction(secret, fills or [])
+        _register_card_redaction(secret)
         if fills is None:
             return json.dumps({
                 "success": False,

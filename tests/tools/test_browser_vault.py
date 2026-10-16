@@ -202,6 +202,24 @@ class TestClassifier:
     def test_unmatched_returns_none(self):
         assert classify_login_control(_ctrl(label="Search the docs")) is None
 
+    def test_issue_and_start_dates_are_not_the_card_expiry(self):
+        """Maestro-style "Issue date" / "Start date" / "Valid from" boxes share the MM/YY shape;
+        the expiry must land in the real expiry box even when one of them comes first."""
+        from agent.vault_login_classifier import classify_checkout_control, select_checkout_fills
+        from agent.vault_store import PAYMENT_FIELDS
+
+        for name, label in (("", "Issue date (MM / YY)"), ("", "Start date (MM/YY)"),
+                            ("", "Valid from MM/YY"), ("issueDate", "MM/YY"),
+                            ("startDate", "MM/YY"), ("", "Issued (MM/YY)"),
+                            ("", "Starts (MM/YY)"), ("", "Valid since MM/YY"),
+                            ("", "Issue date (not expiry; MM/YY)")):
+            assert classify_checkout_control(_ctrl(name=name, label=label)) is None, (name, label)
+        for label in ("Expiry date (MM / YY)", "Expiry date. Start typing MM/YY",
+                      "Expiration date (do not enter the issue date)"):
+            controls = [_ctrl(name="issueDate", label="MM/YY", index=0), _ctrl(label=label, index=1)]
+            classified = [c for c in map(classify_checkout_control, controls) if c is not None]
+            assert select_checkout_fills(classified, _CARD, PAYMENT_FIELDS) == [{"index": 1, "token": "cc-exp", "value": "07/29"}]
+
     def test_select_password_fill_picks_best_password(self):
         user = ClassifiedLoginControl(_ctrl(index=0, form_index=0, autocomplete="username"), 100, "username")
         pw_heur = ClassifiedLoginControl(_ctrl(index=1, form_index=0, type="password"), 90, "current-password")
@@ -589,6 +607,29 @@ class TestBrowserVaultTools:
             out = json.loads(browser_vault_tool.browser_vault_fill(meta.id))
         assert out["error_type"] == "supervisor_required"
         assert not generic_eval.called and not resolve.called
+
+
+    @pytest.mark.parametrize("number, groups", [
+        ("4111111111111111", ("4111", "1111", "1111", "1111")),
+        ("378282246310005", ("3782", "822463", "10005")),
+        ("36227206271667", ("3622", "720627", "1667")),
+    ])
+    def test_payment_fill_registers_only_card_secrets_for_redaction(self, number, groups):
+        """Every later tool result is scrubbed of the registered values, so a payment fill registers
+        the card number (as typed, spaced or dashed) and CVC, and never the
+        holder name, expiry or postcode, which are common strings elsewhere."""
+        from tools.browser_vault_payment import _register_card_redaction
+        from agent import redact
+
+        try:
+            _register_card_redaction({**_CARD, "card_number": number})
+            text = "A User, 94110, renews 2029, month 7, build 1.27.3, date 07/29, ratio 107/290, blog /2025/07/29/"
+            assert redact.redact_sensitive_text(text) == text
+            for secret in (number, " ".join(groups), "-".join(groups)):
+                assert secret not in redact.redact_sensitive_text(f"page says {secret}."), secret
+            assert "cvc 123." not in redact.redact_sensitive_text("cvc 123.")
+        finally:
+            redact.clear_vault_redaction_values()
 
 
 class TestVaultHardening:

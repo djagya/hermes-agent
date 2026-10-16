@@ -958,66 +958,40 @@ def test_human_reply_unaffected_by_bots_require_mention():
     )
 
 
-def _empty_text_event():
-    return MessageEvent(
-        text="continue",
-        message_type=MessageType.TEXT,
-        source=SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id="-100",
-            chat_type="group",
-            user_id="111",
-            user_name="Alice",
-        ),
-        media_urls=[],
-        media_types=[],
-    )
-
-
-def test_replied_voice_keeps_voice_semantics_for_gateway_stt(monkeypatch):
+@pytest.mark.parametrize("is_voice, from_bot", [(True, False), (True, True), (False, False)])
+def test_typed_reply_to_a_voice_note_keeps_its_type_and_reaches_stt(is_voice, from_bot):
+    """A typed reply to a person's voice note stays TEXT (no voice-mode auto-TTS) with the
+    attachment still STT input (retyped AUDIO it silently skipped STT), and the typed text stays
+    the answer to a pending clarify. The bot's own voice note and a replied-to audio file are
+    never transcribed."""
+    spoken = is_voice and not from_bot
     async def _run():
+        from gateway.run import GatewayRunner, _event_media_is_stt_input
+
         adapter = _make_adapter()
         cached = SimpleNamespace(
-            path="/tmp/replied-voice.ogg",
-            media_type="audio/ogg",
-            kind="audio",
-            display_name="voice.ogg",
-        )
-        async def _download(_msg, _what):
-            return "ok", cached
-        monkeypatch.setattr(adapter, "_download_observed_media", _download)
-        msg = SimpleNamespace(reply_to_message=SimpleNamespace(voice=object(), audio=None))
-        event = _empty_text_event()
+            path="cache/audio/voice.ogg", media_type="audio/ogg", kind="audio", display_name="voice.ogg")
+        adapter._download_observed_media = AsyncMock(return_value=("ok", cached))
+        media = SimpleNamespace(file_name="voice.ogg")
+        msg = SimpleNamespace(reply_to_message=SimpleNamespace(
+            voice=media if is_voice else None, audio=None if is_voice else media,
+            from_user=SimpleNamespace(is_bot=from_bot)))
+        event = MessageEvent(
+            text="continue", message_type=MessageType.TEXT, media_urls=[], media_types=[],
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id="-100", chat_type="group", user_id="111"))
+
         await adapter._cache_replied_media(msg, event)
-        from gateway.run import _event_media_is_stt_input
-        assert event.message_type == MessageType.VOICE
-        assert event.media_urls == [cached.path]
-        assert _event_media_is_stt_input(event, 0) is True
-        assert "[Replied-to audio 'voice.ogg' saved at:" in event.text
+
+        assert event.message_type == (MessageType.TEXT if spoken else MessageType.AUDIO)
+        assert _event_media_is_stt_input(event, 0) is spoken
+        assert ("not this message" in event.text) is spoken
+        runner = object.__new__(GatewayRunner)
+        runner._transcribe_pending_audio_event_once = AsyncMock(return_value=("", ["replied-to speech"]))
+        assert not spoken or (await runner._prepare_clarify_reply_text(event)).startswith("continue")
 
     asyncio.run(_run())
 
 
-def test_replied_audio_file_remains_non_stt_audio(monkeypatch):
-    async def _run():
-        adapter = _make_adapter()
-        cached = SimpleNamespace(
-            path="/tmp/replied-audio.mp3",
-            media_type="audio/mpeg",
-            kind="audio",
-            display_name="recording.mp3",
-        )
-        async def _download(_msg, _what):
-            return "ok", cached
-        monkeypatch.setattr(adapter, "_download_observed_media", _download)
-        msg = SimpleNamespace(reply_to_message=SimpleNamespace(voice=None, audio=object()))
-        event = _empty_text_event()
-        await adapter._cache_replied_media(msg, event)
-        from gateway.run import _event_media_is_stt_input
-        assert event.message_type == MessageType.AUDIO
-        assert _event_media_is_stt_input(event, 0) is False
-
-    asyncio.run(_run())
 def test_sibling_bot_wake_word_message_is_observed_not_dropped():
     """#115119: the bot-to-bot loop breaker drops a sibling bot's message that carries no explicit
     @mention, so a wake-word (``mention_patterns``) match from that bot is never dispatched. It must
