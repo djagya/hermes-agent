@@ -849,6 +849,7 @@ const sidebars: SidebarsConfig = {
           items: [
             'developer-guide/tools-runtime',
             'developer-guide/browser-supervisor',
+            'developer-guide/payment-providers',
             'developer-guide/acp-internals',
             'developer-guide/cron-internals',
             'developer-guide/chronos-managed-cron-contract',

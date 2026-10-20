@@ -29,7 +29,7 @@ import json
 import secrets
 import logging
 from typing import Any, Dict, Optional
-from agent.vault_payment_policy import PAYMENT_PSP_ORIGINS
+from agent.vault_payment_policy import PaymentPolicyError, effective_frame_origins
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +304,14 @@ def _fill_page_origin(task_id: str, allowed: list[str], kind: str) -> Optional[s
 # Handlers
 # ---------------------------------------------------------------------------
 
+def _hosted_origins(meta) -> list:
+    """What a fill on this card would actually admit: the same rule the fill applies."""
+    try:
+        return list(effective_frame_origins(meta.payment_frame_origins))
+    except PaymentPolicyError:
+        return []  # the fill refuses this card's metadata; report no hosted origin rather than the claim
+
+
 def browser_vault_list() -> str:
     """List login handles + metadata across every enabled backend. Passwords are never included.
 
@@ -335,7 +343,7 @@ def browser_vault_list() -> str:
                 entry.update(available=True, payment_scope=meta.payment_scope,
                              confirmation_required=True, supported_layout="single_or_split_one_provider",
                              max_card_documents=_MAX_CARD_DOCUMENTS,
-                             hosted_origins=list(meta.payment_frame_origins or PAYMENT_PSP_ORIGINS))
+                             hosted_origins=_hosted_origins(meta))
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:

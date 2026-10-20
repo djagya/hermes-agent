@@ -22,7 +22,6 @@ from agent.secret_sources.onepassword import _OP_ENV_ALLOWLIST, _scrub, find_op
 from agent.vault_backends.base import LoginBackend, UnlockRequired, run_with_stdin_secret
 from agent.vault_backends import unlock as _unlock
 from agent.vault_store import VaultItemMeta, normalize_origin
-from agent.vault_payment_policy import PAYMENT_PSP_ORIGINS
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +119,7 @@ class OnePasswordLoginBackend(LoginBackend):
                     out.append(VaultItemMeta(
                         id=payment.handle, kind="payment", label=str(item.get("title") or "Payment card"),
                         origin=None, created_at=str(item.get("created_at") or ""),
-                        payment_scope="confirmed_page", payment_frame_origins=PAYMENT_PSP_ORIGINS))
+                        payment_scope="confirmed_page"))  # hosted origins: the reviewed set at fill time
                 continue
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origins = _all_origins(urls)

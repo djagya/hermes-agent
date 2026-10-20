@@ -72,6 +72,54 @@ def _shopify_page(path, origins):
     return None
 
 
+# Structures observed on real provider sandboxes (website/docs/developer-guide/payment-providers.md),
+# reduced to the behaviour that broke the native fill.
+_RESHAPE_RELAY = "<script>addEventListener('message',e=>{if(e.data==='brand')for(const f of frames)f.postMessage('brand','*')})</script>"
+_PROVIDER_PAGES = {
+    # Controlled form (Stripe Card/Payment Element): every input event re-renders all fields from state
+    # that each field only updates through its OWN event.
+    "/controlled-frame": '<input autocomplete="cc-number" id="n"><input autocomplete="cc-exp" id="e">'
+    '<input autocomplete="cc-csc" id="c"><script>const st={};for(const el of document.querySelectorAll("input"))'
+    'el.addEventListener("input",()=>{st[el.id]=el.value;for(const o of document.querySelectorAll("input"))'
+    'o.value=st[o.id]||""})</script>',
+    # Brand detection on the number re-shapes the CVC in another frame (Braintree, Mollie, Worldpay Access).
+    "/reshape-number": '<input autocomplete="cc-number"><script>document.querySelector("input")'
+    '.addEventListener("input",()=>parent.postMessage("brand","*"))</script>',
+    "/reshape-cvc": '<input autocomplete="cc-csc" maxlength="4"><script>addEventListener("message",'
+    '()=>{document.querySelector("input").maxLength=3})</script>',
+    # Mollie: a transparent, click-through focus trap beside the real field.
+    "/decoy-number": '<input autocomplete="cc-number" id="cardNumber"><input id="hidden--cardNumber" '
+    'autocomplete="false" style="position:absolute;opacity:0;pointer-events:none;width:300px;height:18px">',
+    "/decoy-rest": '<input autocomplete="cc-exp"><input autocomplete="cc-csc">',
+    # Unzer UI v2: every input inside an open shadow root, the CVC masked.
+    "/shadow-frame": '<div id="h"></div><script>const r=document.getElementById("h").attachShadow({mode:"open"});'
+    'r.innerHTML=\'<input name="cardNumber" aria-label="Card number"><input name="expiryDate" aria-label="Expiry date">'
+    '<input type="password" name="cvc" placeholder="CVC" maxlength="4">\'</script>',
+    # Worldpay HPP in German, labels only, separate month and a two-character year.
+    "/worldpay-de": '<meta charset="utf-8"><label for="a">Kartennummer *</label><input id="a">'
+    '<label for="b">Name des Karteninhabers *</label><input id="b">'
+    '<label for="m">Ablaufmonat</label><input id="m" maxlength="2"><label for="y">Ablaufjahr</label><input id="y" maxlength="2">'
+    '<label for="s">Prüfnummer</label><input id="s" maxlength="4">',
+    # One provider origin serving card fields AND a wallet page with card-like inputs (PayPal).
+    "/smart/buttons/w": FIELDS,
+    "/smart/card-field/f": FIELDS,
+}
+
+
+def _provider_page(path, origins):
+    psp = origins.get("psp", "")
+    merchants = {
+        "/controlled": f'<iframe src="{psp}/controlled-frame"></iframe>',
+        "/reshape": '<input autocomplete="cc-exp">' + _RESHAPE_RELAY
+        + f'<iframe src="{psp}/reshape-cvc"></iframe><iframe src="{psp}/reshape-number"></iframe>',
+        "/decoy": f'<iframe src="{psp}/decoy-number"></iframe><iframe src="{psp}/decoy-rest"></iframe>',
+        "/shadow": f'<iframe src="{psp}/shadow-frame"></iframe>',
+        "/worldpay": f'<iframe src="{psp}/worldpay-de"></iframe>',
+        "/wallet": f'<iframe src="{psp}/smart/buttons/w"></iframe><iframe src="{psp}/smart/card-field/f"></iframe>',
+    }
+    return merchants.get(path) or _PROVIDER_PAGES.get(path)
+
+
 @pytest.fixture
 def payment_browser(tmp_path, record_property):
     from cryptography import x509
@@ -127,7 +175,7 @@ def payment_browser(tmp_path, record_property):
                 f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
                 "/dt-duplicate": '<input autocomplete="cc-number"><input autocomplete="cc-exp">'
                 f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
-            }.get(self.path) or _shopify_page(self.path, origins) or FIELDS
+            }.get(self.path) or _shopify_page(self.path, origins) or _provider_page(self.path, origins) or FIELDS
             body = (
                 '<!doctype html><form onsubmit="window.submitted=true;return false">'
                 + body
@@ -327,7 +375,9 @@ def test_native_encrypted_vault_fill_and_refusals(
         reset_hermes_home_override(other_home)
     assert payment_session_sensitive("payment-live")
     assert CARD["cvc"] not in redact_sensitive_text(CARD["cvc"], force=True)
-    for value in (CARD["card_number"], CARD["cvc"], "07/35"):
+    # The expiry is not a secret on its own and is deliberately not registered for redaction
+    # (browser_vault_payment._register_card_redaction): it would scrub common dates everywhere.
+    for value in (CARD["card_number"], CARD["cvc"]):
         assert (
             value not in raw
             and value not in caplog.text
@@ -402,6 +452,8 @@ def test_preloaded_second_tab_hosted_native_fill(
         return meta
 
     monkeypatch.setattr(store, "get_meta", metadata)
+    # The synthetic PSP joins the REVIEWED list; card metadata alone may only narrow it.
+    monkeypatch.setattr("agent.vault_payment_policy.PAYMENT_PSP_ORIGINS", (origins["psp"],))
     with patch(
         "tools.approval_prompt.request_elicitation_consent", return_value="accept"
     ):
@@ -513,6 +565,8 @@ def test_split_hosted_fields_fill_each_document_once(payment_browser, tmp_path, 
     original = store.get_meta
     monkeypatch.setattr(store, "get_meta", lambda handle: (
         replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
+    # The synthetic PSP joins the REVIEWED list; card metadata alone may only narrow it.
+    monkeypatch.setattr("agent.vault_payment_policy.PAYMENT_PSP_ORIGINS", (origins["psp"],))
 
     navigate(sup, origins["merchant"] + "/dt-duplicate")
     with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept") as consent:
@@ -579,6 +633,8 @@ def test_shopify_card_fields_skip_honeypots_and_hidden_issue_frames(payment_brow
     original = store.get_meta
     monkeypatch.setattr(store, "get_meta", lambda handle: (
         replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
+    # The synthetic PSP joins the REVIEWED list; card metadata alone may only narrow it.
+    monkeypatch.setattr("agent.vault_payment_policy.PAYMENT_PSP_ORIGINS", (origins["psp"],))
 
     for path in ("/shopify-checkout", "/shopify-checkout-maestro"):
         navigate(sup, origins["merchant"] + path)
@@ -603,3 +659,47 @@ def test_shopify_card_fields_skip_honeypots_and_hidden_issue_frames(payment_brow
             assert values[field].replace(" ", "") == want.replace(" ", ""), (path, field, values)
             assert all(v == "" for k, v in values.items() if k != field), (path, field, "honeypot filled", values)
         print("RECEIPT shopify", path, "=PASS fields=4 honeypots_empty=PASS issue_frames_empty=PASS")
+
+
+
+def test_provider_shapes_fill_once_without_submit(payment_browser, tmp_path, monkeypatch):
+    """Each shape that broke on a real provider sandbox, filled through the native tool."""
+    from dataclasses import replace
+
+    from agent import vault_payment_policy as policy
+    from agent.vault_store import VaultStore
+    from tools.browser_vault_tool import browser_vault_fill
+
+    sup, origins = payment_browser
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item("payment", "Synthetic card", {**CARD, "cardholder_name": "Ada Lovelace"},
+                          origin=origins["merchant"])
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    monkeypatch.setattr(policy, "PAYMENT_PSP_ORIGINS", (origins["psp"],))
+    # The synthetic PSP is a reviewed provider whose card fields live under /smart/card-field only.
+    monkeypatch.setattr(policy, "PAYMENT_PROVIDERS", policy.PAYMENT_PROVIDERS + (
+        replace(policy.OPT_IN_PROVIDERS[0], name="synthetic", origins=(origins["psp"],), max_documents=4,
+                paths=("/controlled-frame", "/reshape-cvc", "/reshape-number", "/decoy-number", "/decoy-rest", "/shadow-frame",
+                       "/worldpay-de", "/smart/card-field")),))
+
+    def fill(path):
+        navigate(sup, origins["merchant"] + path)
+        with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
+            out = json.loads(browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"]))
+        assert out["success"] and out["submitted"] is False and CARD["card_number"] not in json.dumps(out), (path, out)
+        return out
+
+    def frame_values(fragment):
+        from tools.browser_supervisor import _schedule
+
+        targets = _schedule(sup._cdp("Target.getTargets"), sup._loop, timeout=10)["result"]["targetInfos"]
+        return [t for t in targets if t["type"] == "iframe" and fragment in t["url"]]
+
+    assert fill("/controlled")["filled_fields"] == 3  # the Stripe Card/Payment Element failure
+    assert fill("/reshape")["filled_fields"] == 3  # number written last, after the CVC frame
+    assert fill("/decoy")["filled_fields"] == 3
+    assert fill("/shadow")["filled_fields"] == 3
+    out = fill("/worldpay")
+    assert out["filled_fields"] == 5 and out["fields"] == ["cc-csc", "cc-exp-month", "cc-exp-year", "cc-name", "cc-number"]
+    # The wallet page on the same origin holds a full card form and is never a target.
+    assert fill("/wallet")["target_origins"] == [origins["psp"]] and len(frame_values("/smart/")) == 2

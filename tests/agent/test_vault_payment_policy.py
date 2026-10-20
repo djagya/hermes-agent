@@ -45,3 +45,33 @@ def test_only_canonical_https_origin_is_accepted():
     ):
         with pytest.raises(PaymentPolicyError):
             https_origin(origin)
+
+
+def test_opt_in_providers_need_config_and_metadata_only_narrows(monkeypatch):
+    from agent import vault_payment_policy as policy
+
+    monkeypatch.setattr(policy, "enabled_providers", lambda: policy.DEFAULT_PROVIDERS)
+    assert "https://payments.worldpay.com" not in policy.effective_frame_origins()
+    with pytest.raises(PaymentPolicyError):  # card metadata cannot widen trust to an unreviewed origin
+        policy.effective_frame_origins(("https://payments.worldpay.com",))
+    assert policy.effective_frame_origins(("https://js.stripe.com",)) == ("https://js.stripe.com",)
+
+    monkeypatch.undo()
+    monkeypatch.setattr("hermes_cli.config.load_config",
+                        lambda: {"vault": {"payment_providers": ["worldpay-hpp", "no-such-provider"]}})
+    assert "https://payments.worldpay.com" in policy.effective_frame_origins()
+    assert "https://www.paypal.com" not in policy.effective_frame_origins()
+    assert all(https_origin(o) == o for p in policy.PAYMENT_PROVIDERS for o in p.origins)
+
+
+@pytest.mark.parametrize("url, admitted", [
+    ("https://www.paypal.com/smart/card-field?token=x", True),
+    ("https://www.paypal.com/smart/card-field/sub", True),
+    ("https://www.paypal.com/smart/buttons", False),
+    ("https://www.paypal.com/signin", False),
+    ("https://www.paypal.com/smart/card-fieldx", False),
+])
+def test_shared_origin_provider_admits_only_its_card_field_paths(url, admitted):
+    from agent.vault_payment_policy import provider_for_origin
+
+    assert provider_for_origin("https://www.paypal.com").admits(url) is admitted
