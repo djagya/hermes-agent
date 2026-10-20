@@ -50,6 +50,46 @@ Sites that ask for a code after the password are handled the same way:
   to type. The agent tells you to complete it on your device and waits for
   the page to move on.
 
+## Letters with a temporary login
+
+Insurers, tax offices and banks often post a one-off login: a customer or
+insurance number plus a one-time password for one questionnaire. Turn on
+letter intake for a messaging gateway:
+
+```yaml
+vault:
+  letter_intake:
+    enabled: true   # one extra vision call per photo you send
+    ttl_hours: 24   # how long a sealed letter stays usable (memory only)
+```
+
+Then send a photo or screenshot of the letter and say what to do with it.
+
+- Before the agent sees the photo, the auxiliary vision model reads the
+  credentials twice. The password is kept in memory under a `letter-…` handle;
+  the photo is deleted from the media cache; the agent gets the handle, the
+  sender, the portal printed in the letter, the number and a summary of the
+  letter, never the password.
+- The agent opens the portal and calls `browser_vault action=letter_login`,
+  which types the number and the password into the login form. It recognises
+  fields like `Einmal-Kennwort` even when they are plain text inputs; when it
+  cannot tell which field is which, the agent names the field
+  (`secret_field` / `identifier_field`) instead of guessing.
+- The page must be on a site printed in the letter (or a subdomain of it).
+  Anything else needs your confirmation.
+- If the two reads disagree or a character is unclear, nothing is kept for
+  filling and the agent asks for a sharper photo.
+- The handle allows one fill, plus one retry after the page itself showed the
+  login failed, so a timed-out submit is never replayed and a one-time
+  password is not used up by repeated tries.
+- Signing in is not permission to submit the questionnaire, sign or accept
+  terms: those still need your go-ahead.
+
+Nothing is saved: no vault item, no password record for the site. After a
+gateway restart or `ttl_hours`, send the photo again. While intake is on, a
+photo the vision model cannot check is withheld and deleted, and the agent asks
+you to resend it. PDFs are not screened: send the letter as a photo.
+
 ## Already using 1Password or Bitwarden?
 
 Nothing to enable. If the `op` or `bw` command-line tool is installed and signed

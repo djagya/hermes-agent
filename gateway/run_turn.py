@@ -2498,13 +2498,13 @@ class GatewayTurnMixin:
 
             # Enrich the prompt with image descriptions (same as the main flow).
             enriched_prompt = prompt
-            image_paths = [
-                path for i, path in enumerate(media_urls)
-                if (media_types[i] if i < len(media_types) else "").startswith("image/")
-            ]
+            image_paths = [path for i, path in enumerate(media_urls)
+                           if (media_types[i] if i < len(media_types) else "").startswith("image/")]
             if image_paths:
                 try:
-                    enriched_prompt = await self._enrich_message_with_vision(prompt, image_paths)
+                    from agent.vault_letter import seal_into_message  # credential letters never reach the model
+                    enriched_prompt, _ = await seal_into_message(
+                        prompt, image_paths, self._prepend_media_prefix, self._enrich_message_with_vision)
                 except Exception as e:
                     logger.warning("Background task vision enrichment failed: %s", e)
 

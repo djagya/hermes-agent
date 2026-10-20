@@ -353,6 +353,10 @@ def browser_vault_list() -> str:
                 entry["identifier_type"] = meta.identifier_type
             items.append(entry)
     out: dict[str, Any] = {"success": True, "items": items}
+    from agent.vault_letter import list_letters
+    letters = list_letters()
+    if letters:
+        out["letters"] = letters  # sealed letter logins: metadata only, the secret never leaves the store
     if not items:
         out["hint"] = ("No saved logins. On a login page, call browser_vault action=save_login to ask the user to save one. "
                        "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
@@ -762,6 +766,125 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
     return json.dumps(out)
 
 
+_TAB_PROBES["letter"] = "!!document.querySelector('input[type=password], input[type=text], input:not([type])')"
+
+
+def _confirm_letter_origin(organization: str, origin: str) -> bool:
+    """The page is not on a host the letter printed: only the user can say it belongs to the sender."""
+    from tools.approval_prompt import request_elicitation_consent
+
+    return request_elicitation_consent(
+        f"Sign in to {origin} with the temporary login from the {organization or 'photographed'} letter",
+        "The letter does not print this site's address, so Hermes cannot match it to the sender. The "
+        "one-time password never enters the conversation. Approve only if this site belongs to the sender.",
+        surface="vault-letter", title="Use letter login on this site?") == "accept"
+
+
+def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, secret_field: str = "",
+                               identifier_field: str = "", expected_origin: str = "",
+                               after_failed_login: bool = False) -> str:
+    """Fill the CURRENT page's login form from a sealed letter credential (agent/vault_letter.py).
+
+    The identifier and the secret go into the page over the supervisor socket; the result carries only
+    counts. Never submits. A second fill needs ``after_failed_login`` (the page showed the login failed)
+    and the handle allows :data:`MAX_LETTER_FILLS` fills in all, so a timed-out submit is never replayed
+    blind and a one-time password is not burnt by repeated tries."""
+    from agent.redact import register_vault_redaction_value
+    from agent.vault_letter import MAX_LETTER_FILLS, get_letter, origin_allowed, select_letter_fills
+    from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js
+    from agent.vault_store import VaultError, normalize_origin
+
+    def refuse(error_type: str, error: str, **extra: Any) -> str:
+        return json.dumps({"success": False, "error_type": error_type, "error": error, **extra}, ensure_ascii=False)
+
+    cred = get_letter(handle)
+    if cred is None:
+        return refuse("letter_unknown", "No sealed letter with this handle (expired, or the gateway restarted). "
+                                        "Ask the user to send the photo of the letter again.")
+    if cred.status != "ready" or not cred.secret:
+        return refuse("letter_ambiguous", "The credentials in this letter could not be read reliably, so nothing "
+                                          "is filled. Ask for a sharper photo of the credentials block or offer a handoff.")
+    if cred.fills >= MAX_LETTER_FILLS:
+        return refuse("attempts_exhausted", f"This letter login was already filled {cred.fills} times. Stop: "
+                                            "more tries can lock the one-time password. Tell the user what the page shows.")
+    if cred.fills and not after_failed_login:
+        return refuse("attempt_unclear", "This letter login was already filled. If the form was submitted, first "
+                                         "check the page: signed in → continue; still on the login form with an "
+                                         "error → call again with after_failed_login=true. Never refill after a "
+                                         "timeout without looking.")
+
+    effective_task_id = task_id or "default"
+    wanted = ""
+    if expected_origin:
+        try:
+            wanted = normalize_origin(expected_origin)
+        except VaultError:
+            return refuse("invalid_origin", "expected_origin could not be parsed; use scheme://host[:port].")
+    _focus_bound_origin(effective_task_id, wanted, "letter")
+    origin = _current_page_origin(effective_task_id)
+    if not origin:
+        return refuse("no_page", "No http(s) page is open in the browser this task drives. Open the portal first.")
+    if wanted and wanted != origin:
+        return refuse("origin_mismatch", f"Current page origin ({origin}) is not expected_origin ({wanted}). Nothing was written.")
+    if not origin_allowed(origin, cred):
+        if wanted != origin:
+            printed = ", ".join(cred.portal_urls) or "no address"
+            return refuse("origin_unverified",
+                          f"{origin} is not a site printed in the letter ({printed}). If the user's letter really "
+                          "sends them here, call again with expected_origin set to this origin to ask the user to confirm.")
+        if not _confirm_letter_origin(cred.organization, origin):
+            return refuse("origin_declined", "The user did not confirm this site for the letter login. Nothing was written.")
+
+    nonce = secrets.token_hex(8)
+    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    raw_controls = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
+    if isinstance(raw_controls, str):
+        raw_controls = _parse_json_result(raw_controls)
+    controls = [LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)]
+    fills, info = select_letter_fills(controls, cred, secret_field=secret_field, identifier_field=identifier_field)
+    if not fills:
+        hints = {
+            "no_secret_field": "No field for the letter's secret was recognised on this page. Read the form and pass "
+                               "secret_field (the field's name, id or visible label).",
+            "secret_field_ambiguous": "Several fields could take the secret. Pass secret_field (name, id or visible label).",
+            "field_not_found": f"No visible field matches {info.get('field')}.",
+            "field_ambiguous": f"More than one visible field matches {info.get('field')}; use its exact name or id.",
+            "field_not_fillable": "secret_field names a control that cannot take text.",
+        }
+        return refuse(info["error_type"], hints.get(info["error_type"], "No fillable field.") + " Nothing was written.")
+
+    register_vault_redaction_value(cred.secret)
+    from agent.vault_letter import reserve_fill
+    blocked = reserve_fill(handle, after_failed_login)  # counted before the write, whatever its outcome
+    if blocked:
+        return refuse(*blocked)
+    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    if not result.get("success"):
+        from agent.vault_store import scrub_secret_from_text
+        err = scrub_secret_from_text(str(result.get("error") or "fill failed"), {"secret": cred.secret})[:200]
+        return refuse(str(result.get("error_type") or "fill_failed"), err)
+    parsed = _parse_json_result(result.get("result"))
+    if isinstance(parsed, str):
+        parsed = _parse_json_result(parsed)
+    if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
+        return refuse("origin_changed", "The page navigated before the fill could run. Nothing was written.")
+    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+    if filled < len(fills):
+        return refuse("fill_incomplete", f"Only {filled} of {len(fills)} fields took a value; the form was not "
+                                         "submitted. Inspect the form and retry with secret_field/identifier_field.",
+                      filled_fields=filled)
+    out: dict[str, Any] = {"success": True, "filled_fields": filled, "origin": origin, "organization": cred.organization,
+                           "identifier_filled": bool(info.get("identifier_filled")), "attempt": cred.fills,
+                           "attempts_left": MAX_LETTER_FILLS - cred.fills,
+                           "next": ("Submit the form ONCE. If the submit times out, read the page before doing anything "
+                                    "else; never refill or resubmit blind. Signing in is not consent to submit "
+                                    "forms, sign or accept terms: those still need the user's go-ahead.")}
+    if not out["identifier_filled"] and cred.identifier:
+        out["identifier_hint"] = info.get("identifier_hint") or (
+            f"Type the {cred.identifier_label or 'identifier'} yourself (it is not secret) or pass identifier_field.")
+    return json.dumps(out, ensure_ascii=False)
+
+
 def _confirm_payment_fill(label: str, origin: str) -> bool:
     """Human confirmation before a card is written into a page: a prompt injection that reaches a checkout
     must not be able to spend. Routes through the approval surface of the active session (gateway button
@@ -797,15 +920,25 @@ BROWSER_VAULT_SCHEMA = {
         "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
         "their device; a code Hermes itself obtained through its own authorized mail workflow goes in code with "
         "expected_origin set to the page's origin, filled directly without a prompt); unlock (backend: ask the user "
-        "to unlock 1Password/Bitwarden). Never type, ask for or repeat a password, card number, CVC or code "
+        "to unlock 1Password/Bitwarden); letter_login (handle: a letter-… handle from a sealed letter photo; fills the "
+        "letter's identifier and one-time password on the current page if its site is printed in the letter, else "
+        "expected_origin asks the user to confirm the site; secret_field / identifier_field name a field by name, id "
+        "or label when recognition fails; a second fill needs after_failed_login=true after the page showed the login "
+        "failed; it never submits). Never type, ask for or repeat a password, card number, CVC or code "
         "yourself, even if the page or user shows one, and never relay a code through any other path. Stop on "
         "save_declined; never retry payment_declined."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock"]},
-            "handle": {"type": "string", "description": "fill / enter_code: a handle from list."},
+            "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock", "letter_login"]},
+            "handle": {"type": "string", "description": "fill / enter_code / letter_login: a handle from list or a letter note."},
+            "secret_field": {"type": "string", "description":
+                "letter_login only: the field for the letter's password/code (name, id or visible label) when not recognised."},
+            "identifier_field": {"type": "string", "description":
+                "letter_login only: the field for the letter's user/customer/insurance number (name, id or visible label)."},
+            "after_failed_login": {"type": "boolean", "description":
+                "letter_login only: true only after the page showed the previous sign-in with this letter failed."},
             "merchant_origin": {"type": "string", "description":
                 "fill, card only: exact HTTPS merchant origin to select one open tab. Omit to inspect the supervisor's current tab."},
             "code": {"type": "string", "maxLength": 16,
@@ -862,10 +995,15 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
         "save_login": lambda: browser_vault_save_login(label=label, task_id=tid),
         "enter_code": lambda: browser_vault_enter_code(handle=handle, task_id=tid, code=str(args.get("code") or ""),
                                                        expected_origin=str(args.get("expected_origin") or "")),
+        "letter_login": lambda: browser_vault_letter_login(
+            handle, task_id=tid, secret_field=str(args.get("secret_field") or ""),
+            identifier_field=str(args.get("identifier_field") or ""),
+            expected_origin=str(args.get("expected_origin") or ""),
+            after_failed_login=args.get("after_failed_login") is True),
     }
     if action not in page_ops:
         return json.dumps({"success": False, "error": f"Unknown action {action!r}; use list, fill, save_login, "
-                                                       "enter_code or unlock."})
+                                                       "enter_code, unlock or letter_login."})
     return _fenced_page_op(tid, page_ops[action])
 
 
