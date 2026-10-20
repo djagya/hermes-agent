@@ -159,6 +159,17 @@ class TestCommandCodeFetchModelsPickerContract:
         assert anth is not None and anth.id == "commandcode-anthropic"
         assert anth.transport == "anthropic_messages"
 
+    def test_resolve_provider_keeps_commandcode_key_contract_offline(self, monkeypatch):
+        import hermes_cli.providers as cli_providers
+
+        monkeypatch.setattr(cli_providers, "_models_dev_info", lambda *_args: None)
+        chat = cli_providers.get_provider("commandcode", allow_network=False)
+
+        assert chat is not None
+        assert chat.api_key_env_vars == ("COMMANDCODE_API_KEY",)
+        assert chat.base_url == "https://api.commandcode.ai/provider/v1"
+        assert chat.base_url_env_var == "COMMANDCODE_BASE_URL"
+
 
 # ── base_url endpoint override ───────────────────────────────────────────────
 

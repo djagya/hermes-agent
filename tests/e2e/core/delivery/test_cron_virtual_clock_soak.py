@@ -515,9 +515,20 @@ class Soak:
         assert not stuck, f"{where} non-terminal executions left: {stuck}"
         assert set(starts) - ends == self.killed_execs, f"{where} runs without an end"
         assert len(starts) == len(set(starts)), f"{where} duplicate execution ids"
-        for exec_id, start in starts.items():
-            row = rows.get(exec_id)
-            assert row is not None, f"{where} run {exec_id} ({start['name']}) has no ledger row"
+        # The scenario spans four virtual weeks, while the production ledger deliberately keeps a
+        # bounded 48-hour operator-audit window. Require every run in that window and reconcile all
+        # rows that remain; older JSONL fixture events are expected to outlive their ledger rows.
+        from cron.executions import TERMINAL_RETENTION_HOURS
+
+        cutoff = self.end_ts - TERMINAL_RETENTION_HOURS * 3600
+        missing_recent = {
+            exec_id for exec_id, start in starts.items()
+            if start["fired_at"] > cutoff and exec_id not in rows
+        }
+        assert not missing_recent, f"{where} recent runs have no ledger row: {sorted(missing_recent)}"
+        for exec_id in set(starts) & set(rows):
+            start = starts[exec_id]
+            row = rows[exec_id]
             sent = [s for s in sink if s["exec"] == exec_id]
             ok_sent = [s for s in sent if s["ok"]]
             label = f"{where} {start['name']} exec={exec_id} status={row['status']} " \
@@ -544,13 +555,18 @@ class Soak:
         for exec_id, row in rows.items():
             if exec_id not in starts:  # attempts that never ran must say so truthfully
                 assert row["status"] in ("failed", "unknown", "skipped"), f"{where} ghost row {row}"
-        if hasattr(self, "long_run_exec"):
+        if hasattr(self, "long_run_exec") and self.long_run_exec in rows:
             row = rows[self.long_run_exec]
             assert (row["status"], row["delivery_outcome"]) == ("completed", "delivered"), (
                 f"{where} long run lost its lease: {row}")
         for job in H.store_jobs(self.home):
             assert not job.get("pending_slot"), f"{where} leftover pending_slot {job}"
-        return {"ticks": self.ticks, "executions": len(rows), "sink": len(sink)}
+        return {
+            "ticks": self.ticks,
+            "executions": len(starts),
+            "retained_executions": len(rows),
+            "sink": len(sink),
+        }
 
 
 @pytest.fixture

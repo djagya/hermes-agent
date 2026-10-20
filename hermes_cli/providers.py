@@ -21,6 +21,7 @@ class HermesOverlay:
     is_aggregator: bool = False
     auth_type: str = "api_key"            # api_key | oauth_device_code | oauth_external | external_process
     extra_env_vars: tuple[str, ...] = ()  # env vars models.dev doesn't list
+    env_vars_override: tuple[str, ...] = ()  # replacement when the catalog's key metadata is wrong
     base_url_override: str = ""           # override if models.dev URL is wrong/missing
     base_url_env_var: str = ""            # env var for user-custom base URL
 
@@ -33,6 +34,13 @@ HERMES_OVERLAYS: dict[str, HermesOverlay] = {
                                   base_url_override="https://chatgpt.com/backend-api/codex"),
     "openai-api": HermesOverlay(transport="codex_responses", base_url_override="https://api.openai.com/v1",
                                 base_url_env_var="OPENAI_BASE_URL"),
+    # The shipped integration and setup contract use COMMANDCODE_API_KEY; models.dev currently
+    # advertises CMD_API_KEY instead. Keep the local provider contract authoritative.
+    "commandcode": HermesOverlay(
+        env_vars_override=("COMMANDCODE_API_KEY",),
+        base_url_override="https://api.commandcode.ai/provider/v1",
+        base_url_env_var="COMMANDCODE_BASE_URL",
+    ),
     "xai-oauth": HermesOverlay(transport="codex_responses", auth_type="oauth_external",
                                base_url_override="https://api.x.ai/v1", base_url_env_var="XAI_BASE_URL"),
     "qwen-oauth": HermesOverlay(auth_type="oauth_external", base_url_override="https://portal.qwen.ai/v1",
@@ -199,14 +207,16 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     overlay = HERMES_OVERLAYS.get(canonical)
     if mdev_info is not None:
         ov = overlay or HermesOverlay()
-        env_vars = list(mdev_info.env)
-        for ev in ov.extra_env_vars:
-            if ev not in env_vars:
-                env_vars.append(ev)
+        env_vars = list(ov.env_vars_override or mdev_info.env)
+        if not ov.env_vars_override:
+            for ev in ov.extra_env_vars:
+                if ev not in env_vars:
+                    env_vars.append(ev)
         return _overlay_pdef(canonical, ov, mdev_info.name, tuple(env_vars), ov.base_url_override or mdev_info.api,
                              mdev_info.doc, "models.dev")
     if overlay is not None:
-        return _overlay_pdef(canonical, overlay, _LABEL_OVERRIDES.get(canonical, canonical), overlay.extra_env_vars,
+        env_vars = overlay.env_vars_override or overlay.extra_env_vars
+        return _overlay_pdef(canonical, overlay, _LABEL_OVERRIDES.get(canonical, canonical), env_vars,
                              overlay.base_url_override, "", "hermes")
     # Plugin-registered profiles (plugins/model-providers/<name>/) absent from models.dev and
     # HERMES_OVERLAYS would otherwise be "Unknown provider" in /model, --provider and model-switch

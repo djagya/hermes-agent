@@ -26,18 +26,40 @@ function Invoke-HermesProbe {
     $psi.RedirectStandardError = $true
     # Launchers print UTF-8; PowerShell 5.1 would decode with the OEM code page (#124526).
     $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-    $process = [System.Diagnostics.Process]::Start($psi)
-    try { $process.StandardInput.Close() } catch {}
-    $stdout = $process.StandardOutput.ReadToEndAsync()
-    $stderr = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit($timeout * 1000)) {
-        & taskkill.exe /T /F /PID $process.Id 2>&1 | Out-Null
-        return @{ Code = 124; Output = ''; TimedOut = $true }
+    $job = [IntPtr]::Zero
+    if ("HermesUpdateJob" -as [type]) {
+        # Assign while suspended: a launcher cannot exit after spawning a descendant which keeps
+        # our redirected pipe handles open but escapes timeout cleanup.
+        $started = [HermesUpdateJob]::StartAssigned($psi)
+        $job = $started.Job
+        $process = $started.Process
+        [HermesUpdateJob]::Resume($started.Thread)
+        $stdout = $started.StandardOutput.ReadToEndAsync()
+        $stderr = $started.StandardError.ReadToEndAsync()
+    } else {
+        # The standalone installer also sources runtime.ps1, without update-job.ps1.
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
     }
-    # A descendant may hold the pipes open; never wait on it.
-    $text = if ($stdout.Wait(5000)) { $stdout.Result } else { '' }
-    [void]$stderr
-    return @{ Code = $process.ExitCode; Output = $text; TimedOut = $false }
+    try {
+        try { $process.StandardInput.Close() } catch {}
+        if (-not $process.WaitForExit($timeout * 1000)) {
+            if ($job -ne [IntPtr]::Zero) {
+                [HermesUpdateJob]::TerminateAndWait($job, 124, 5000)
+            } else {
+                & taskkill.exe /T /F /PID $process.Id 2>&1 | Out-Null
+            }
+            return @{ Code = 124; Output = ''; TimedOut = $true }
+        }
+        # A descendant may hold the pipes open; never wait on it.
+        $text = if ($stdout.Wait(5000)) { $stdout.Result } else { '' }
+        [void]$stderr
+        return @{ Code = $process.ExitCode; Output = $text; TimedOut = $false }
+    } finally {
+        $process.Dispose()
+        if ($job -ne [IntPtr]::Zero) { [HermesUpdateJob]::CloseJob($job) }
+    }
 }
 
 function Get-HermesRuntimeCommand {
