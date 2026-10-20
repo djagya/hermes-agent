@@ -6,11 +6,84 @@ from dataclasses import dataclass
 from typing import Mapping
 from urllib.parse import urlsplit
 
-# Reviewed hosted card-field origins a card fill may target besides the merchant page. Each entry
-# is a payment provider's own field iframe, never a merchant or bank site; add one per reviewed PSP.
-# Datatrans Secure Fields puts the number and the CVC in separate pay.datatrans.com frames;
-# Shopify checkout puts every card field in its own checkout.pci.shopifyinc.com frame.
-PAYMENT_PSP_ORIGINS = ("https://js.stripe.com", "https://pay.datatrans.com", "https://checkout.pci.shopifyinc.com")
+@dataclass(frozen=True)
+class PaymentProvider:
+    """One reviewed hosted card-field product. ``origins`` are the exact PRODUCTION origins that host
+    its card inputs (never its script, API, wallet or 3DS origins); a checkout uses one of them.
+    ``max_documents`` bounds the card documents of one checkout (merchant page included), set from the
+    provider's observed topology. Sandbox origins are never listed: a sandbox frame must not receive
+    a real card. Evidence per row: docs/payment-providers.md."""
+
+    name: str
+    origins: tuple
+    max_documents: int = 4
+    # Path prefixes of the card-field documents when the origin also serves other pages (PayPal's
+    # www.paypal.com hosts card fields AND its wallet and login); empty = any path on the origin.
+    paths: tuple = ()
+
+    def admits(self, url: str) -> bool:
+        if not self.paths:
+            return True
+        path = urlsplit(url).path
+        return any(path == p or path.startswith(p.rstrip("/") + "/") for p in self.paths)
+
+
+# Always on (the reviewed set before provider profiles existed). Datatrans Secure Fields puts the
+# number and the CVC in separate pay.datatrans.com frames; Shopify checkout puts every card field in
+# its own checkout.pci.shopifyinc.com frame.
+DEFAULT_PROVIDERS = (
+    PaymentProvider("stripe-elements", ("https://js.stripe.com",)),
+    PaymentProvider("datatrans-secure-fields", ("https://pay.datatrans.com",)),
+    PaymentProvider("shopify-checkout", ("https://checkout.pci.shopifyinc.com",)),
+)
+# Reviewed, OFF until the operator lists the name in config ``vault.payment_providers``. Each row was
+# rendered from the provider's real sandbox and filled by the native path; production origins and
+# paths come from the provider's docs/SDK (website/docs/developer-guide/payment-providers.md).
+OPT_IN_PROVIDERS = (
+    PaymentProvider("worldpay-hpp", ("https://payments.worldpay.com",), 2, ("/app/hpp/",)),
+    PaymentProvider("worldpay-access-checkout", ("https://access.worldpay.com",), 4, ("/access-checkout/",)),
+    PaymentProvider("braintree-hosted-fields", ("https://assets.braintreegateway.com",), 4, ("/web/",)),
+    PaymentProvider("paypal-card-fields", ("https://www.paypal.com",), 4, ("/smart/card-field",)),
+    PaymentProvider("checkoutcom-frames", ("https://js.checkout.com",), 4, ("/framesv2/",)),
+    PaymentProvider("mollie-components", ("https://js.mollie.com",), 4, ("/v1/component/",)),
+    PaymentProvider("unzer-ui-v2", ("https://static-cc.unzer.com",), 2, ("/v2/card-ui/",)),
+    PaymentProvider("unzer-ui-v1", ("https://payment.unzer.com",), 4, ("/v1/cardframe/",)),
+    PaymentProvider("saferpay-fields", ("https://www.saferpay.com",), 4, ("/Fields/",)),
+)
+PAYMENT_PROVIDERS = DEFAULT_PROVIDERS + OPT_IN_PROVIDERS
+PAYMENT_PSP_ORIGINS = tuple(o for p in DEFAULT_PROVIDERS for o in p.origins)
+
+
+def enabled_providers() -> tuple:
+    """Default providers plus the opt-in ones named in ``vault.payment_providers``; unknown names
+    are ignored (a typo never admits anything)."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        names = cfg_get(load_config(), "vault", "payment_providers", default=[]) or []
+    except Exception:  # health: allow BLE001 -- unreadable config means the default set, never more
+        names = []
+    wanted = {str(n) for n in names} if isinstance(names, (list, tuple)) else set()
+    return DEFAULT_PROVIDERS + tuple(p for p in OPT_IN_PROVIDERS if p.name in wanted)
+
+
+def reviewed_origins() -> tuple:
+    extra = tuple(o for p in enabled_providers() if p not in DEFAULT_PROVIDERS for o in p.origins)
+    return tuple(dict.fromkeys(PAYMENT_PSP_ORIGINS + extra))
+
+
+def provider_for_origin(origin: str) -> PaymentProvider | None:
+    return next((p for p in PAYMENT_PROVIDERS if origin in p.origins), None)
+
+
+def effective_frame_origins(override: tuple = ()) -> tuple:
+    """The hosted origins a card may be filled into. Item metadata can only NARROW the reviewed
+    set: an override naming an unreviewed origin is refused, never silently admitted."""
+    reviewed = reviewed_origins()
+    if not override:
+        return reviewed
+    if any(o not in reviewed for o in override):
+        raise PaymentPolicyError("Card metadata names an unreviewed payment origin")
+    return tuple(dict.fromkeys(override))
 
 
 class PaymentPolicyError(ValueError):

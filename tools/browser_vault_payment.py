@@ -6,8 +6,9 @@ import json
 
 from agent.vault_login_classifier import select_checkout_fills
 from agent.vault_payment_card import validate_card
-from agent.vault_payment_policy import PAYMENT_PSP_ORIGINS, PaymentPolicyError
+from agent.vault_payment_policy import PaymentPolicyError, effective_frame_origins
 from agent.vault_store import PAYMENT_FIELDS
+from tools.browser_supervisor_payment import OPTIONAL_CARD_TOKENS
 
 
 def _register_card_redaction(secret: dict) -> None:
@@ -30,11 +31,13 @@ def _register_card_redaction(secret: dict) -> None:
 
 
 def _document_fills(inspected, secret: dict) -> list | None:
-    """Fills tagged with their card document, or None when a document's fields cannot all be filled."""
+    """Fills tagged with their card document, or None when a required field cannot be filled. An
+    optional field (holder name, billing postcode) the saved card has no value for is skipped."""
     fills = []
     for k, document in enumerate(inspected.documents):
         document_fills = select_checkout_fills(list(document.controls), secret, PAYMENT_FIELDS)
-        if len(document_fills) != len(document.controls):
+        filled = {f["index"] for f in document_fills}
+        if any(c.control.index not in filled and c.token not in OPTIONAL_CARD_TOKENS for c in document.controls):
             return None
         fills += [dict(f, document=k) for f in document_fills]
     return fills
@@ -60,7 +63,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
         inspected = supervisor.inspect_payment(
             merchant_origin,
             bound_origins=bound,
-            frame_origins=meta.payment_frame_origins or PAYMENT_PSP_ORIGINS,
+            frame_origins=effective_frame_origins(meta.payment_frame_origins),
         )
         prompt = inspected.prompt()
         consent = request_elicitation_consent(

@@ -81,10 +81,15 @@ changed document/field set refuses the fill. To select one exact open tab,
 the agent uses `browser_vault(action="fill", handle=..., merchant_origin="https://shop.example")`.
 The native path resolves values internally. Card fields may sit in one
 document (the merchant itself or a hosted provider iframe, including an
-out-of-process iframe) or be split across up to four documents on the merchant
-and ONE reviewed hosted provider: Stripe (`https://js.stripe.com`), Datatrans
-Secure Fields (`https://pay.datatrans.com`) or Shopify checkout
-(`https://checkout.pci.shopifyinc.com`), with every card field exactly once.
+out-of-process iframe) or be split across documents on the merchant and ONE
+reviewed hosted provider, with every card field exactly once. Stripe
+(`https://js.stripe.com`), Datatrans Secure Fields (`https://pay.datatrans.com`)
+and Shopify checkout (`https://checkout.pci.shopifyinc.com`) are on by default.
+Worldpay, Braintree, PayPal Card Fields, Checkout.com Frames, Mollie, Unzer and
+Saferpay are reviewed but off until listed in `vault.payment_providers`; the
+[provider matrix](../../developer-guide/payment-providers.md) has each one's
+origins, evidence and limits. A holder-name field the card has no name for is
+left for you.
 Fields across two providers, duplicate or ambiguous controls, unapproved hosted
 origins and a missing number, CVC or expiry are refused; provider frames the
 page keeps hidden are never fill targets.

@@ -33,13 +33,23 @@ LOGIN_AUTOFILL_TOKENS = ("username", "email", "tel", "current-password")
 PAYMENT_AUTOFILL_TOKENS = ("cc-number", "cc-name", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc")
 ADDRESS_AUTOFILL_TOKENS = ("address-line1", "address-line2", "address-level2", "address-level1",
                            "postal-code", "country-name", "country")
+# Labels are matched after _normalize_text (lower-case ASCII, umlauts/accents folded: "Prüfnummer" ->
+# "prufnummer"). Besides English: German, French, Dutch, Spanish and Italian checkout labels; the CVC row
+# comes before the number row because "Kartenprüfnummer" also names a number.
 _CHECKOUT_HEURISTICS = (
-    (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num|pan)\b"), "cc-number"),
-    (re.compile(r"\b(?:name\s*on\s*card|cardholder|cc\s*name|ccname)\b"), "cc-name"),
-    (re.compile(r"\b(?:cvc|cvv|csc|security\s*code|card\s*code)\b"), "cc-csc"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?\s*month|exp\s*mm|ccmonth)\b"), "cc-exp-month"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?\s*year|exp\s*yy(?:yy)?|ccyear)\b"), "cc-exp-year"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?(?:\s*date)?|mm\s*yy|valid\s*thru)\b"), "cc-exp"),
+    (re.compile(r"\b(?:cvc|cvv|csc|cvn|ccv|security\s*code|card\s*code|(?:karten)?prufnummer|prufziffer|"
+                r"sicherheitscode|cryptogramme|code\s*de\s*securite|beveiligingscode|codigo\s*de\s*seguridad|"
+                r"codice\s*di\s*sicurezza)\b"), "cc-csc"),
+    (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num|pan|kartennummer|numero\s*de\s*(?:la\s*)?carte|"
+                r"kaartnummer|numero\s*de\s*(?:la\s*)?tarjeta|numero\s*(?:della\s*)?carta)\b"), "cc-number"),
+    (re.compile(r"\b(?:name\s*on\s*card|cardholder|cc\s*name|ccname|karteninhaber(?:in|s)?|name\s*auf\s*der\s*karte|"
+                r"titulaire(?:\s*de\s*la\s*carte)?|kaarthouder|titular(?:\s*de\s*la\s*tarjeta)?|"
+                r"intestatario(?:\s*della\s*carta)?)\b"), "cc-name"),
+    (re.compile(r"\b(?:exp(?:iry|iration)?\s*month|exp\s*mm|ccmonth|ablaufmonat)\b"), "cc-exp-month"),
+    (re.compile(r"\b(?:exp(?:iry|iration)?\s*year|exp\s*yy(?:yy)?|ccyear|ablaufjahr)\b"), "cc-exp-year"),
+    (re.compile(r"\b(?:exp(?:iry|iration)?(?:\s*date)?|mm\s*yy|valid\s*thru|ablaufdatum|gultig\s*bis|"
+                r"verfallsdatum|date\s*d\s*expiration|vervaldatum|fecha\s*de\s*(?:caducidad|vencimiento)|"
+                r"data\s*di\s*scadenza|scadenza)\b"), "cc-exp"),
     (re.compile(r"\b(?:address\s*(?:line\s*)?2|apt|suite|unit)\b"), "address-line2"),
     (re.compile(r"\b(?:address(?:\s*line\s*1)?|street)\b"), "address-line1"),
     (re.compile(r"\b(?:city|town|locality)\b"), "address-level2"),
@@ -50,8 +60,8 @@ _CHECKOUT_HEURISTICS = (
 
 # "Issue date (MM / YY)" / "Start date" / "Valid from" fields (Maestro and some debit cards) share
 # the expiry's MM/YY shape but are not the expiry.
-_RE_NOT_EXPIRY = re.compile(r"\b(?:issue(?:d)?|start(?:s)?|valid\s*(?:from|since))\b")
-_RE_EXPLICIT_EXPIRY = re.compile(r"\b(?:exp(?:iry|iration)?|valid\s*thru)\b")
+_RE_NOT_EXPIRY = re.compile(r"\b(?:issue(?:d)?|start(?:s)?|valid\s*(?:from|since)|gultig\s*ab|ausstellungsdatum)\b")
+_RE_EXPLICIT_EXPIRY = re.compile(r"\b(?:exp(?:iry|iration)?|valid\s*thru|ablaufdatum|gultig\s*bis|verfallsdatum)\b")
 
 _EXCLUDED_AUTOCOMPLETE = {"new-password", "one-time-code"}
 
@@ -64,7 +74,9 @@ _RE_USERNAME = re.compile(
 
 
 def _normalize_text(value: str) -> str:
-    value = unicodedata.normalize("NFKD", value).lower()
+    # Drop the combining marks NFKD splits off ("Prüfnummer" -> "prufnummer"); replacing them with a
+    # space split words ("pru fnummer") and no accented label could ever match.
+    value = "".join(ch for ch in unicodedata.normalize("NFKD", value) if not unicodedata.combining(ch)).lower()
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
 
 
@@ -190,10 +202,12 @@ def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogin
     for token in PAYMENT_AUTOFILL_TOKENS + ADDRESS_AUTOFILL_TOKENS:
         if token in tokens:
             return ClassifiedLoginControl(control, 100, "country-name" if token == "country" else token)
-    if control.type in ("password", "email"):
+    if control.type == "email":
         return None
     raw_text = " ".join(part for part in (control.name, control.label) if part)
     searchable = _normalize_text(raw_text)
+    if _RE_EMAIL.search(searchable):
+        return None  # "CARDHOLDER_EMAIL" (Nexi Build) is not the holder name
     date_words = _normalize_text(re.sub(r"([a-z])([A-Z])", r"\1 \2", raw_text))  # issueDate -> issue date
     label_words = _normalize_text(control.label)
     expiry = _RE_EXPLICIT_EXPIRY.search(label_words)
@@ -201,10 +215,23 @@ def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogin
     explicit_expiry = expiry is not None and (other_date is None or expiry.start() < other_date.start())
     for pattern, token in _CHECKOUT_HEURISTICS:
         if pattern.search(searchable):
+            if control.type == "password" and token != "cc-csc":
+                return None  # a masked input is only ever the CVC (Unzer UI v2), never a login password
             if token.startswith("cc-exp") and _RE_NOT_EXPIRY.search(date_words) and not explicit_expiry:
                 return None  # an issue/start date (Maestro) is not the expiry
             return ClassifiedLoginControl(control, 70, token)
     return None
+
+
+def _fit_expiry(token: str, value: str, max_length: Optional[int]) -> str:
+    """Separate expiry inputs in the shape the field takes: a two-digit month, and a two-digit year
+    where the input holds only two characters (Worldpay HPP). A script-set value ignores maxlength,
+    so a four-digit year would sit in the field and fail the provider's own check on submit."""
+    if token == "cc-exp-month" and value.isdigit():
+        return value.zfill(2)
+    if token == "cc-exp-year" and value.isdigit() and max_length == 2:
+        return value[-2:]
+    return value
 
 
 def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict[str, str],
@@ -223,7 +250,8 @@ def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict
     for token, value in values.items():
         candidates = sorted((c for c in classified if c.token == token), key=lambda c: (-c.score, c.control.index))
         if candidates:
-            fills.append({"index": candidates[0].control.index, "token": token, "value": value})
+            fills.append({"index": candidates[0].control.index, "token": token,
+                          "value": _fit_expiry(token, value, candidates[0].control.max_length)})
     if any(f["token"] == "cc-exp" for f in fills):
         fills = [f for f in fills if f["token"] not in ("cc-exp-month", "cc-exp-year")]
     return fills
