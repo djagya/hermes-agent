@@ -31,7 +31,7 @@ async def _noop_callback():
     return ("code", None)
 
 
-async def _make_flow(tmp_path, monkeypatch, *, registered=True):
+async def _make_flow(tmp_path, monkeypatch, *, registered=True, refresh_grant=True):
     from tools.mcp_tool import sdk_httpx
     httpx = sdk_httpx()
     from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
@@ -47,7 +47,12 @@ async def _make_flow(tmp_path, monkeypatch, *, registered=True):
 
     storage = HermesTokenStorage("srv")
     await storage.set_tokens(
-        OAuthToken(access_token="old_access", token_type="Bearer", expires_in=3600, refresh_token="old_refresh")
+        OAuthToken(
+            access_token="old_access",
+            token_type="Bearer",
+            expires_in=3600,
+            refresh_token="old_refresh" if refresh_grant else None,
+        )
     )
     if registered:
         await storage.set_client_info(
@@ -78,7 +83,11 @@ async def _make_flow(tmp_path, monkeypatch, *, registered=True):
 async def test_discovery_request_gets_default_user_agent(tmp_path, monkeypatch):
     from tools.mcp_oauth_provider import DEFAULT_AUTH_REQUEST_USER_AGENT
 
-    httpx, req, _provider, flow = await _make_flow(tmp_path, monkeypatch)
+    # With no refresh grant, a resource 401 must keep taking the SDK's
+    # authorization-discovery path, whose request header is this test's subject.
+    httpx, req, _provider, flow = await _make_flow(
+        tmp_path, monkeypatch, refresh_grant=False
+    )
     outbound = await flow.__anext__()
 
     fake_401 = httpx.Response(

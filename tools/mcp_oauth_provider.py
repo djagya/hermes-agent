@@ -288,7 +288,7 @@ class HermesProviderMixin:
     _hermes_fence: int | None = None
 
     async def async_auth_flow(self, request):
-        """Guarantee fence release even if the auth generator is abandoned.
+        """Guarantee fence release and prefer one native refresh after a resource 401.
 
         The SDK drives the refresh as a generator: ``_refresh_token`` yields a
         request and ``_handle_refresh_response`` consumes the response. If the
@@ -303,7 +303,15 @@ class HermesProviderMixin:
         the SDK flow is then restarted so it re-evaluates validity and sends
         the original request with the winner's access token, never POSTing
         the burned refresh token.
+
+        The SDK otherwise takes every resource 401 directly to interactive
+        authorization, even when the rejected access token has a refresh
+        grant. Restarting its native flow with that token marked expired gives
+        the grant one fenced refresh and one resource retry first. A second
+        401 stays on the SDK authorization path; refresh failures keep their
+        existing terminal/transient/ambiguous classification.
         """
+        refreshed_after_resource_401 = False
         while True:
             inner = super().async_auth_flow(request)
             discovery_failures: list[str] = []
@@ -358,6 +366,18 @@ class HermesProviderMixin:
                                 "endpoint_transient", status=sent.status_code, retry_after=retry_after)))
                             attempt += 1
                             continue
+                        break
+                    if (out is request and getattr(sent, "status_code", None) == 401
+                            and not refreshed_after_resource_401
+                            and self.context.can_refresh_token()):
+                        refreshed_after_resource_401 = True
+                        await inner.aclose()
+                        # The restarted SDK flow uses its ordinary refresh
+                        # branch, including Hermes' refresh fence and response
+                        # classification. The resource already rejected this
+                        # access token, so treating it as expired is accurate
+                        # even when its local TTL has not elapsed.
+                        self.context.token_expiry_time = time.time() - 1
                         break
                     if thrown is None:
                         failure = _asm_discovery_failure(sent)
