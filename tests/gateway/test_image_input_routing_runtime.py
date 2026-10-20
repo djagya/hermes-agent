@@ -167,3 +167,29 @@ async def test_prepare_route_identity_check_keeps_event_loop_responsive(monkeypa
     assert result == "inspect @AGENTS.md"
     assert seen["event_loop_progressed"] is True
     assert seen["thread"] is not main_thread
+
+
+@pytest.mark.parametrize("mode", ["native", "text"])
+def test_sealed_letter_photo_is_never_routed_to_the_model(monkeypatch, mode):
+    """A credential-letter photo is sealed before routing: no native pixels, no vision description."""
+    import asyncio
+
+    from agent import vault_letter
+
+    runner = _make_runner()
+    routed = []
+
+    async def fake_seal(paths):
+        return [p for p in paths if "letter" not in p], ["[sealed letter note]"]
+
+    async def fake_vision(text, paths):
+        routed.extend(paths)
+        return text
+
+    monkeypatch.setattr(vault_letter, "seal_letter_images", fake_seal)
+    monkeypatch.setattr(runner, "_decide_image_input_mode", lambda **_: mode)
+    monkeypatch.setattr(runner, "_enrich_message_with_vision", fake_vision, raising=False)
+    monkeypatch.setattr(runner, "_resolve_session_agent_runtime", lambda **_: ("m", {}), raising=False)
+    out = asyncio.run(runner._enrich_inbound_images(_source(), "sk", "do it", ["/c/letter.jpg", "/c/cat.png"]))
+    native = runner._session_state("sk").persistent.native_image_paths if mode == "native" else routed
+    assert out.startswith("[sealed letter note]") and list(native) == ["/c/cat.png"]

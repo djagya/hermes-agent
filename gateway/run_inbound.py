@@ -1471,6 +1471,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str]
     ) -> str:
         """Route images natively (attach pixels at run_conversation) or pre-analyze them into text."""
+        from agent.vault_letter import seal_into_message  # credential letters never reach the model
+        message_text, image_paths = await seal_into_message(message_text, image_paths, self._prepend_media_prefix)
+        if not image_paths:
+            return message_text
         # See agent/image_routing.py. Offloaded to a thread: the decision does blocking network I/O
         # (models.dev fetch on cache miss, Ollama /api/show probe) that would stall the event loop.
         _img_mode = await asyncio.to_thread(
@@ -1478,15 +1482,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         )
         if _img_mode == "native":
             self._session_state(session_key).persistent.native_image_paths = list(image_paths)
-            logger.info(
-                "Image routing: native (model supports vision). %d image(s) will be attached inline.",
-                len(image_paths),
-            )
+            logger.info("Image routing: native (model supports vision). %d image(s) will be attached inline.", len(image_paths))
             return message_text
-        logger.info(
-            "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
-            _img_mode, len(image_paths),
-        )
+        logger.info("Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.", _img_mode, len(image_paths))
         # Vision enrichment runs before AIAgent.run_conversation(), so bind this session's resolved
         # runtime explicitly rather than consulting process-global compatibility mirrors.
         vision_runtime = None
