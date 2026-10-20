@@ -375,7 +375,9 @@ def test_native_encrypted_vault_fill_and_refusals(
         reset_hermes_home_override(other_home)
     assert payment_session_sensitive("payment-live")
     assert CARD["cvc"] not in redact_sensitive_text(CARD["cvc"], force=True)
-    for value in (CARD["card_number"], CARD["cvc"], "07/35"):
+    # The expiry is not a secret on its own and is deliberately not registered for redaction
+    # (browser_vault_payment._register_card_redaction): it would scrub common dates everywhere.
+    for value in (CARD["card_number"], CARD["cvc"]):
         assert (
             value not in raw
             and value not in caplog.text

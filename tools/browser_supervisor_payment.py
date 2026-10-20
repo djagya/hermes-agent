@@ -109,6 +109,28 @@ def _card_documents(candidates: list, merchant: str) -> tuple:
     return tuple(PaymentDocument(*c) for c in candidates)
 
 
+def _frame_admitted(record: tuple, by_id: dict, merchant: str, allowed: tuple) -> bool:
+    """Whether a frame ``(id, loader, url, origin, parent)`` may hold card fields: the merchant or a
+    reviewed provider origin, on that provider's card-field path, under an ancestry of the same. False
+    = not a candidate (ads, a provider's wallet/login page); raises on a reviewed frame placed under an
+    unapproved ancestor."""
+    def on_card_path(r: tuple) -> bool:
+        provider = provider_for_origin(r[3]) if r[3] != merchant else None
+        return provider is None or provider.admits(r[2])
+
+    # Ignore unrelated ads, but never inspect/inject into an arbitrary PSP.
+    if record[3] not in (merchant, *allowed) or not on_card_path(record):
+        return False
+    https_origin(record[3])
+    ancestor = record[4]
+    while ancestor:
+        above = by_id.get(ancestor)
+        if above is None or above[3] not in (merchant, *allowed) or not on_card_path(above):
+            raise PaymentPolicyError("Unapproved payment frame ancestry")  # e.g. inside a wallet page
+        ancestor = above[4]
+    return True
+
+
 def _fills_by_document(i: PaymentInspection, fills: list) -> list:
     """Group fills by their ``document`` index (default 0); every card document needs its fields."""
     groups: list = [[] for _ in i.documents]
@@ -308,21 +330,14 @@ class PaymentSupervisionMixin:
             merchant = https_origin(tree[0][3])
             if (origin and merchant != origin) or (bound and merchant not in bound):
                 raise PaymentPolicyError("Merchant origin mismatch")
+            on_provider = provider_for_origin(merchant)
+            if on_provider is not None and not on_provider.admits(tree[0][2]):
+                # The tab itself is a provider's non-card page (PayPal wallet or login), not a checkout.
+                raise PaymentPolicyError("Merchant origin mismatch")
             by_id = {f[0]: f for f in tree}
             for fid, _loader, _url, frame_origin, parent in tree:
-                # Ignore unrelated ads, but never inspect/inject into an arbitrary PSP.
-                if frame_origin not in (merchant, *allowed_frames):
+                if not _frame_admitted(by_id[fid], by_id, merchant, allowed_frames):
                     continue
-                provider = provider_for_origin(frame_origin) if frame_origin != merchant else None
-                if provider is not None and not provider.admits(_url):
-                    continue  # the provider's own non-card page (wallet, login) on a shared origin
-                https_origin(frame_origin)
-                ancestor = parent
-                while ancestor:
-                    record = by_id.get(ancestor)
-                    if record is None or record[3] not in (merchant, *allowed_frames):
-                        raise PaymentPolicyError("Unapproved payment frame ancestry")
-                    ancestor = record[4]
                 # A PSP field frame the page keeps hidden (Shopify's Maestro-only issue date and
                 # number) looks visible from inside its own document; judge its iframe element.
                 if parent and not await self._frame_rendered(fid, parent, child_sessions.get(parent, sid)):
@@ -515,6 +530,7 @@ class PaymentSupervisionMixin:
             "success",
             "filled_fields",
             "error_type",
+            "partially_filled",
         }:
             return {"success": False, "error_type": "payment_result_invalid"}
         return result
@@ -576,7 +592,9 @@ _INSPECT = r"""(() => {
     const r = e.getBoundingClientRect(), s = getComputedStyle(e);
     // Mollie keeps a transparent, click-through focus-trap input beside each real field.
     return e.getClientRects().length>0 && r.width > 2 && r.height > 2 && s.visibility !== 'hidden' &&
-      Number(s.opacity) > 0 && s.pointerEvents !== 'none';
+      Number(s.opacity) > 0 && s.pointerEvents !== 'none' &&
+      (typeof e.checkVisibility !== 'function' ||
+       e.checkVisibility({opacityProperty: true, visibilityProperty: true}));  // a transparent ancestor too
   };
   const entries = elements.map((e,index)=>({e,index})).filter(x=>visible(x.e) &&
     !['hidden','submit','button','reset','file','image','checkbox','radio'].includes(x.e.type));
@@ -603,8 +621,16 @@ _INSPECT = r"""(() => {
       // re-shapes the CVC (Braintree, Mollie). Writes only reach the pinned element references.
       for (const f of fills) elements[f.index].style.setProperty('-webkit-text-security','disc','important');
       const ordered = fills.slice().sort((a,b)=>(a.token==='cc-number')-(b.token==='cc-number'));
+      // Page handlers run between these writes, so each target is re-checked first, and success is
+      // judged on the inputs still in the document: a re-render that replaced a node must not let
+      // its detached copy report a value the live form does not hold.
+      const live = el => el.isConnected && el.ownerDocument === doc && allInputs().includes(el);
+      let attempted = 0;
       for (const f of ordered) {
         const el = elements[f.index];
+        if (!live(el) || location.href !== href)
+          return {success:false,error_type:'payment_fields_changed',filled_fields:attempted,partially_filled:attempted>0};
+        attempted += 1;
         el.focus();
         setter.call(el,f.value);
         el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
@@ -612,9 +638,10 @@ _INSPECT = r"""(() => {
         el.dispatchEvent(new FocusEvent('blur'));
         el.blur();
       }
-      const accepted = fills.every(f=>elements[f.index].value.replace(/[ -]/g,'') === f.value.replace(/[ -]/g,''));
-      return accepted ? {success:true,filled_fields:fills.length} :
-        {success:false,error_type:'payment_validation_failed',filled_fields:fills.length};
+      const held = fills.filter(f=>live(elements[f.index]) &&
+        elements[f.index].value.replace(/[ -]/g,'') === f.value.replace(/[ -]/g,'')).length;
+      return held === fills.length && location.href === href ? {success:true,filled_fields:held} :
+        {success:false,error_type:'payment_validation_failed',filled_fields:held,partially_filled:true};
     }
   };
 })()"""
