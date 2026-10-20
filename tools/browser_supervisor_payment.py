@@ -18,10 +18,13 @@ from agent.vault_payment_policy import (
     PAYMENT_PSP_ORIGINS,
     PaymentPolicyError,
     https_origin,
+    provider_for_origin,
 )
 
 
 _MAX_CARD_DOCUMENTS = 4
+# Card fields a saved card may lack: left empty for the user instead of refusing the whole fill.
+OPTIONAL_CARD_TOKENS = frozenset({"cc-name", "postal-code"})
 
 
 @dataclass
@@ -90,10 +93,12 @@ def _card_documents(candidates: list, merchant: str) -> tuple:
     across documents and the fields reach at most the merchant plus ONE hosted PSP origin. Anything
     else is ambiguous and refused. ``candidates`` holds ``(frame_id, session, object_id, origin,
     controls)`` for each allowed document that has card controls."""
-    if not candidates or len(candidates) > _MAX_CARD_DOCUMENTS:
-        raise PaymentPolicyError("Missing, ambiguous or split payment documents")
-    if len({c[3] for c in candidates} - {merchant}) > 1:
+    hosted = {c[3] for c in candidates} - {merchant}
+    if len(hosted) > 1:
         raise PaymentPolicyError("Card fields split across payment providers")
+    provider = provider_for_origin(next(iter(hosted))) if hosted else None
+    if not candidates or len(candidates) > (provider.max_documents if provider else _MAX_CARD_DOCUMENTS):
+        raise PaymentPolicyError("Missing, ambiguous or split payment documents")
     tokens = [control.token for c in candidates for control in c[4]]
     if len(tokens) != len(set(tokens)) or not {"cc-number", "cc-csc"} <= set(tokens):
         raise PaymentPolicyError("Incomplete or ambiguous card fields")
@@ -104,6 +109,28 @@ def _card_documents(candidates: list, merchant: str) -> tuple:
     return tuple(PaymentDocument(*c) for c in candidates)
 
 
+def _frame_admitted(record: tuple, by_id: dict, merchant: str, allowed: tuple) -> bool:
+    """Whether a frame ``(id, loader, url, origin, parent)`` may hold card fields: the merchant or a
+    reviewed provider origin, on that provider's card-field path, under an ancestry of the same. False
+    = not a candidate (ads, a provider's wallet/login page); raises on a reviewed frame placed under an
+    unapproved ancestor."""
+    def on_card_path(r: tuple) -> bool:
+        provider = provider_for_origin(r[3]) if r[3] != merchant else None
+        return provider is None or provider.admits(r[2])
+
+    # Ignore unrelated ads, but never inspect/inject into an arbitrary PSP.
+    if record[3] not in (merchant, *allowed) or not on_card_path(record):
+        return False
+    https_origin(record[3])
+    ancestor = record[4]
+    while ancestor:
+        above = by_id.get(ancestor)
+        if above is None or above[3] not in (merchant, *allowed) or not on_card_path(above):
+            raise PaymentPolicyError("Unapproved payment frame ancestry")  # e.g. inside a wallet page
+        ancestor = above[4]
+    return True
+
+
 def _fills_by_document(i: PaymentInspection, fills: list) -> list:
     """Group fills by their ``document`` index (default 0); every card document needs its fields."""
     groups: list = [[] for _ in i.documents]
@@ -112,7 +139,10 @@ def _fills_by_document(i: PaymentInspection, fills: list) -> list:
         if type(k) is not int or not 0 <= k < len(groups):
             raise PaymentPolicyError("Fill targets an unknown document")
         groups[k].append({key: v for key, v in f.items() if key != "document"})
-    if not all(groups):
+    # A document may go unwritten only when everything in it is optional (a holder-only frame and a
+    # saved card without a holder name); a document with a required card field always needs its fill.
+    if not any(groups) or any(not g and any(c.token not in OPTIONAL_CARD_TOKENS for c in d.controls)
+                              for d, g in zip(i.documents, groups)):
         raise PaymentPolicyError("Every card document needs its fields")
     return groups
 
@@ -300,18 +330,14 @@ class PaymentSupervisionMixin:
             merchant = https_origin(tree[0][3])
             if (origin and merchant != origin) or (bound and merchant not in bound):
                 raise PaymentPolicyError("Merchant origin mismatch")
+            on_provider = provider_for_origin(merchant)
+            if on_provider is not None and not on_provider.admits(tree[0][2]):
+                # The tab itself is a provider's non-card page (PayPal wallet or login), not a checkout.
+                raise PaymentPolicyError("Merchant origin mismatch")
             by_id = {f[0]: f for f in tree}
             for fid, _loader, _url, frame_origin, parent in tree:
-                # Ignore unrelated ads, but never inspect/inject into an arbitrary PSP.
-                if frame_origin not in (merchant, *allowed_frames):
+                if not _frame_admitted(by_id[fid], by_id, merchant, allowed_frames):
                     continue
-                https_origin(frame_origin)
-                ancestor = parent
-                while ancestor:
-                    record = by_id.get(ancestor)
-                    if record is None or record[3] not in (merchant, *allowed_frames):
-                        raise PaymentPolicyError("Unapproved payment frame ancestry")
-                    ancestor = record[4]
                 # A PSP field frame the page keeps hidden (Shopify's Maestro-only issue date and
                 # number) looks visible from inside its own document; judge its iframe element.
                 if parent and not await self._frame_rendered(fid, parent, child_sessions.get(parent, sid)):
@@ -474,7 +500,7 @@ class PaymentSupervisionMixin:
             # Every document was re-validated just above. A split checkout is written one
             # document at a time: no cross-document transaction exists, so a later failure
             # reports what an earlier document already received instead of retrying.
-            for document, document_fills in zip(i.documents, _fills_by_document(i, fills)):
+            for document, document_fills in _commit_order(i, _fills_by_document(i, fills)):
                 result = await self._commit_payment_document(document, document_fills)
                 if not result.get("success"):
                     return _partial(result, filled)
@@ -504,6 +530,7 @@ class PaymentSupervisionMixin:
             "success",
             "filled_fields",
             "error_type",
+            "partially_filled",
         }:
             return {"success": False, "error_type": "payment_result_invalid"}
         return result
@@ -520,6 +547,14 @@ class PaymentSupervisionMixin:
         _schedule(self._release_payment_documents(i), self._loop, timeout=12)
 
 
+def _commit_order(i: PaymentInspection, groups: list) -> list:
+    """Documents with something to write, the one holding the card number LAST: providers re-shape
+    the other fields once they detect the brand (Mollie drops the CVC maxLength from 4 to 3), which a
+    later write would correctly see as a changed document."""
+    pairs = [(d, g) for d, g in zip(i.documents, groups) if g]
+    return sorted(pairs, key=lambda p: any(c.token == "cc-number" for c in p[0].controls))
+
+
 def _partial(result: dict, filled_before: int) -> dict:
     """A failed document after earlier documents of a split checkout already received values."""
     if not filled_before:
@@ -528,7 +563,20 @@ def _partial(result: dict, filled_before: int) -> dict:
 
 _INSPECT = r"""(() => {
   const doc = document, href = location.href;
-  const elements = Array.from(doc.querySelectorAll('input'));
+  // Inputs in document order, including those inside open shadow roots (Unzer UI v2 renders every
+  // card input in one); closed roots stay out of reach and therefore out of scope.
+  const allInputs = () => {
+    const out = [];
+    const walk = root => {
+      for (const n of root.querySelectorAll('*')) {
+        if (n.tagName === 'INPUT') out.push(n);
+        if (n.shadowRoot) walk(n.shadowRoot);
+      }
+    };
+    walk(doc);
+    return out;
+  };
+  const elements = allInputs();
   const describe = () => elements.map((e,index) => ({index, autocomplete:e.autocomplete,
     name:e.name+' '+e.id, label:(e.labels?Array.from(e.labels,l=>l.textContent).join(' '):'')+' '+
       (e.getAttribute('aria-label')||'')+' '+(e.placeholder||''),
@@ -541,9 +589,12 @@ _INSPECT = r"""(() => {
     if (e.disabled || e.readOnly || !e.isConnected || e.ownerDocument !== doc ||
         e.getAttribute('aria-hidden') === 'true' || e.tabIndex < 0 || e.hasAttribute('data-honeypot-field'))
       return false;
-    const r = e.getBoundingClientRect();
-    return e.getClientRects().length>0 && r.width > 2 && r.height > 2 &&
-      getComputedStyle(e).visibility !== 'hidden';
+    const r = e.getBoundingClientRect(), s = getComputedStyle(e);
+    // Mollie keeps a transparent, click-through focus-trap input beside each real field.
+    return e.getClientRects().length>0 && r.width > 2 && r.height > 2 && s.visibility !== 'hidden' &&
+      Number(s.opacity) > 0 && s.pointerEvents !== 'none' &&
+      (typeof e.checkVisibility !== 'function' ||
+       e.checkVisibility({opacityProperty: true, visibilityProperty: true}));  // a transparent ancestor too
   };
   const entries = elements.map((e,index)=>({e,index})).filter(x=>visible(x.e) &&
     !['hidden','submit','button','reset','file','image','checkbox','radio'].includes(x.e.type));
@@ -551,8 +602,8 @@ _INSPECT = r"""(() => {
   const signature = JSON.stringify(describe());
   const valid = () => document === doc && location.href === href &&
     JSON.stringify(describe()) === signature &&
-    Array.from(doc.querySelectorAll('input')).every((e,n)=>e === elements[n]) &&
-    doc.querySelectorAll('input').length === elements.length && entries.every(x=>visible(x.e));
+    (now => now.length === elements.length && now.every((e,n)=>e === elements[n]))(allInputs()) &&
+    entries.every(x=>visible(x.e));
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
   let used = false;
   return {
@@ -564,17 +615,33 @@ _INSPECT = r"""(() => {
           fills.some(f=>!selected.has(f.index) || typeof f.value !== 'string' || !f.value) ||
           new Set(fills.map(f=>f.index)).size !== fills.length)
         return {success:false,error_type:'payment_fields_invalid'};
-      // Native setters in an isolated world: no page-defined setters/event handlers
-      // execute between the field validation and these writes. Events follow all writes.
+      // Native setters in an isolated world, one field at a time with its own events, the card number
+      // last: a controlled form (Stripe Card/Payment Element) re-renders on each input event and would
+      // reset sibling fields written before the event they never saw; brand detection on the number
+      // re-shapes the CVC (Braintree, Mollie). Writes only reach the pinned element references.
       for (const f of fills) elements[f.index].style.setProperty('-webkit-text-security','disc','important');
-      for (const f of fills) setter.call(elements[f.index],f.value);
-      for (const f of fills) {
-        elements[f.index].dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
-        elements[f.index].dispatchEvent(new Event('change',{bubbles:true}));
+      const ordered = fills.slice().sort((a,b)=>(a.token==='cc-number')-(b.token==='cc-number'));
+      // Page handlers run between these writes, so each target is re-checked first, and success is
+      // judged on the inputs still in the document: a re-render that replaced a node must not let
+      // its detached copy report a value the live form does not hold.
+      const live = el => el.isConnected && el.ownerDocument === doc && allInputs().includes(el);
+      let attempted = 0;
+      for (const f of ordered) {
+        const el = elements[f.index];
+        if (!live(el) || location.href !== href)
+          return {success:false,error_type:'payment_fields_changed',filled_fields:attempted,partially_filled:attempted>0};
+        attempted += 1;
+        el.focus();
+        setter.call(el,f.value);
+        el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
+        el.dispatchEvent(new Event('change',{bubbles:true}));
+        el.dispatchEvent(new FocusEvent('blur'));
+        el.blur();
       }
-      const accepted = fills.every(f=>elements[f.index].value.replace(/[ -]/g,'') === f.value.replace(/[ -]/g,''));
-      return accepted ? {success:true,filled_fields:fills.length} :
-        {success:false,error_type:'payment_validation_failed',filled_fields:fills.length};
+      const held = fills.filter(f=>live(elements[f.index]) &&
+        elements[f.index].value.replace(/[ -]/g,'') === f.value.replace(/[ -]/g,'')).length;
+      return held === fills.length && location.href === href ? {success:true,filled_fields:held} :
+        {success:false,error_type:'payment_validation_failed',filled_fields:held,partially_filled:true};
     }
   };
 })()"""

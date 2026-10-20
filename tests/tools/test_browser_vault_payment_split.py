@@ -91,7 +91,8 @@ def test_ambiguous_or_cross_provider_splits_are_refused(candidates, message):
 
 
 def test_fills_are_grouped_per_document_and_every_document_needs_fields():
-    i = _inspection(PaymentDocument("a", "s", "o", MERCHANT, ()), PaymentDocument("b", "s", "o", DATATRANS, ()))
+    i = _inspection(PaymentDocument("a", "s", "o", MERCHANT, _controls("cc-exp")),
+                    PaymentDocument("b", "s", "o", DATATRANS, _controls("cc-number")))
     groups = sp._fills_by_document(i, [{"index": 0, "value": "07/35", "document": 0},
                                        {"index": 0, "value": "4242", "document": 1}])
     assert groups == [[{"index": 0, "value": "07/35"}], [{"index": 0, "value": "4242"}]]
@@ -99,6 +100,11 @@ def test_fills_are_grouped_per_document_and_every_document_needs_fields():
                 [{"index": 0, "value": "x"}]):
         with pytest.raises(PaymentPolicyError):
             sp._fills_by_document(i, bad)
+    # Only a document holding nothing but optional fields (a holder frame, a card without a holder
+    # name) may go unwritten.
+    holder = _inspection(PaymentDocument("h", "s", "o", MERCHANT, _controls("cc-name")),
+                         PaymentDocument("b", "s", "o", DATATRANS, _controls("cc-number")))
+    assert sp._fills_by_document(holder, [{"index": 0, "value": "4242", "document": 1}])[0] == []
 
 
 class _FakeSupervisor(sp.PaymentSupervisionMixin):
@@ -192,3 +198,29 @@ def test_supervisor_attach_errors_never_reach_the_result(monkeypatch):
     monkeypatch.setattr("tools.browser_vault_tool._ensure_supervisor", boom)
     raw = bvp.fill_payment(SimpleNamespace(), SimpleNamespace(), "task")
     assert json.loads(raw) == {"success": False, "error_type": "supervisor_required"} and "secret-token" not in raw
+
+
+@pytest.mark.parametrize("control, token", [
+    ({"label": "Kartenprüfnummer"}, "cc-csc"), ({"label": "Gültig bis (MM/JJ)"}, "cc-exp"),
+    ({"label": "Gültig ab"}, None), ({"label": "Name des Karteninhabers *"}, "cc-name"),
+    ({"label": "Numéro de carte"}, "cc-number"), ({"label": "Fecha de caducidad"}, "cc-exp"),
+    ({"name": "card-ccv"}, "cc-csc"),  # Unzer UI v1
+    ({"name": "cvc", "type": "password"}, "cc-csc"),  # Unzer UI v2 masks the CVC
+    ({"label": "Card number", "type": "password"}, None),  # a masked input is never the number
+    ({"name": "CARDHOLDER_EMAIL"}, None),  # Nexi Build: not the holder name
+])
+def test_localized_and_provider_labels(control, token):
+    c = classify_checkout_control(LoginControl.from_dict({"index": 0, "autocomplete": "off", "type": "text", **control}))
+    assert (c.token if c else None) == token
+
+
+def test_expiry_fits_the_field_length():
+    from agent.vault_login_classifier import select_checkout_fills
+    from agent.vault_store import PAYMENT_FIELDS
+
+    two = [classify_checkout_control(LoginControl.from_dict(r)) for r in (
+        {"index": 0, "autocomplete": "cc-exp-month"}, {"index": 1, "autocomplete": "cc-exp-year", "maxLength": 2})]
+    four = [two[0], classify_checkout_control(LoginControl.from_dict({"index": 1, "autocomplete": "cc-exp-year"}))]
+    card = {**CARD, "exp_month": "7"}
+    assert [f["value"] for f in select_checkout_fills(two, card, PAYMENT_FIELDS)] == ["07", "35"]
+    assert [f["value"] for f in select_checkout_fills(four, card, PAYMENT_FIELDS)] == ["07", "2035"]
