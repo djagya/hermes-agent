@@ -846,6 +846,10 @@ def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, se
         return refuse(info["error_type"], hints.get(info["error_type"], "No fillable field.") + " Nothing was written.")
 
     register_vault_redaction_value(cred.secret)
+    from agent.vault_letter import reserve_fill
+    blocked = reserve_fill(handle, after_failed_login)  # counted before the write, whatever its outcome
+    if blocked:
+        return refuse(*blocked)
     result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
     if not result.get("success"):
         from agent.vault_store import scrub_secret_from_text
@@ -861,7 +865,6 @@ def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, se
         return refuse("fill_incomplete", f"Only {filled} of {len(fills)} fields took a value; the form was not "
                                          "submitted. Inspect the form and retry with secret_field/identifier_field.",
                       filled_fields=filled)
-    cred.fills += 1
     out: dict[str, Any] = {"success": True, "filled_fields": filled, "origin": origin, "organization": cred.organization,
                            "identifier_filled": bool(info.get("identifier_filled")), "attempt": cred.fills,
                            "attempts_left": MAX_LETTER_FILLS - cred.fills,

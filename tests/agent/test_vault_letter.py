@@ -106,10 +106,11 @@ def test_letter_photo_is_sealed_and_login_fills_both_fields_without_leaking(tmp_
 @pytest.mark.parametrize("replies", [
     [FIRST, {**VERIFY, "secret": "Kq7-xP2rn"}],  # the two reads disagree (m vs rn)
     [{**FIRST, "uncertain": True}, VERIFY],       # the reader flagged a character
+    [{**FIRST, "identifier": SECRET}, {**VERIFY, "identifier": SECRET}],  # code read as the number too
 ])
 def test_unclear_read_keeps_no_secret_and_never_fills(tmp_path, replies):
     _, kept, notes = _seal(tmp_path, replies)
-    assert kept == [] and "AMBIGUOUS" in notes[0] and SECRET not in notes[0]
+    assert kept == [] and "AMBIGUOUS" in notes[0] and SECRET not in notes[0] and "K q" not in notes[0]
     handle = notes[0].split("letter handle: ")[1].split()[0]
     assert vl.get_letter(handle).secret == ""
     out, _, writes = _login(handle)
@@ -119,6 +120,9 @@ def test_unclear_read_keeps_no_secret_and_never_fills(tmp_path, replies):
 def test_unprinted_site_needs_user_confirmation_and_plain_photos_pass_through(tmp_path):
     photo, kept, notes = _seal(tmp_path, [{"has_login_secret": False}])
     assert kept == [str(photo)] and notes == [] and photo.exists()
+    # Fail closed: an answer that is not a clear boolean withholds and deletes the photo.
+    photo, kept, notes = _seal(tmp_path, [{"has_login_secret": "true", "secret": SECRET}])
+    assert kept == [] and not photo.exists() and "withheld" in notes[0] and SECRET not in notes[0]
 
     _, _, notes = _seal(tmp_path, [FIRST, VERIFY])
     handle = notes[0].split("letter handle: ")[1].split()[0]

@@ -86,9 +86,9 @@ Then send a photo or screenshot of the letter and say what to do with it.
   terms: those still need your go-ahead.
 
 Nothing is saved: no vault item, no password record for the site. After a
-gateway restart or `ttl_hours`, send the photo again. If the vision model
-cannot be reached, the photo is handled as before (the agent sees it). PDFs
-are not screened.
+gateway restart or `ttl_hours`, send the photo again. While intake is on, a
+photo the vision model cannot check is withheld and deleted, and the agent asks
+you to resend it. PDFs are not screened: send the letter as a photo.
 
 ## Already using 1Password or Bitwarden?
 

@@ -92,27 +92,49 @@ def _scope() -> str:
     return str(get_hermes_home())
 
 
+def _bucket() -> dict[str, LetterCredential]:
+    """The profile's letters with expired ones dropped and their secret zeroed. Caller holds _LOCK."""
+    bucket = _LETTERS.setdefault(_scope(), {})
+    now = time.time()
+    for key in [k for k, v in bucket.items() if v.expires_at <= now]:
+        bucket.pop(key).secret = ""
+    return bucket
+
+
 def put_letter(cred: LetterCredential) -> None:
     with _LOCK:
-        bucket = _LETTERS.setdefault(_scope(), {})
+        bucket = _bucket()
         bucket[cred.handle] = cred
         while len(bucket) > _MAX_PER_PROFILE:
-            del bucket[next(iter(bucket))]
+            bucket.pop(next(iter(bucket))).secret = ""
 
 
 def get_letter(handle: str) -> Optional[LetterCredential]:
     with _LOCK:
-        bucket = _LETTERS.get(_scope(), {})
-        now = time.time()
-        for key in [k for k, v in bucket.items() if v.expires_at <= now]:
-            del bucket[key]
-        return bucket.get(handle)
+        return _bucket().get(handle)
 
 
 def list_letters() -> list[dict[str, Any]]:
     with _LOCK:
-        now = time.time()
-        return [c.public() for c in _LETTERS.get(_scope(), {}).values() if c.expires_at > now]
+        return [c.public() for c in _bucket().values()]
+
+
+def reserve_fill(handle: str, after_failed_login: bool) -> Optional[tuple[str, str]]:
+    """Count one fill attempt atomically, right before the secret is written. Every dispatched
+    fill counts, whatever its result. Returns ``(error_type, message)`` when no attempt is left."""
+    with _LOCK:
+        cred = _bucket().get(handle)
+        if cred is None or not cred.secret:
+            return "letter_unknown", "The letter login expired. Ask the user to send the photo again."
+        if cred.fills >= MAX_LETTER_FILLS:
+            return ("attempts_exhausted", f"This letter login was already filled {cred.fills} times. Stop: more "
+                    "tries can lock the one-time password. Tell the user what the page shows.")
+        if cred.fills and not after_failed_login:
+            return ("attempt_unclear", "This letter login was already filled. If the form was submitted, first "
+                    "check the page: signed in → continue; still on the login form with an error → call again "
+                    "with after_failed_login=true. Never refill after a timeout without looking.")
+        cred.fills += 1
+        return None
 
 
 def clear_letters() -> None:
@@ -204,15 +226,17 @@ def _secret_value(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _squash(text: str) -> str:
+    return re.sub(r"[\s\-_.·]", "", text).casefold()
+
+
 def _scrub(text: str, *values: str) -> str:
-    """Summary without the secret. A summary that still holds it in another spelling (spaced,
-    hyphenated, case-folded) is dropped whole rather than patched."""
-    def squash(t: str) -> str:
-        return re.sub(r"[\s\-_.·]", "", t).casefold()
+    """Text without the secret. Text that still holds it in another spelling (spaced, hyphenated,
+    case-folded) is dropped whole rather than patched."""
     for v in values:
         if v and len(v) >= 3:
             text = text.replace(v, "[sealed]")
-            if squash(v) in squash(text):
+            if _squash(v) in _squash(text):
                 return ""
     return text
 
@@ -224,8 +248,11 @@ async def extract_letter(image_path: str) -> Optional[LetterCredential]:
     from agent.redact import register_vault_redaction_value
 
     first = await _ask_vision(image_path, _EXTRACT_PROMPT)
-    if first.get("has_login_secret") is not True:
+    flag = first.get("has_login_secret")
+    if flag is False:
         return None
+    if flag is not True:  # "true", missing key, any other shape: the screen did not answer
+        raise LetterExtractionError("vision reply had no has_login_secret boolean")
     secret = _secret_value(first.get("secret"))
     identifier = _clean(first.get("identifier"), 120)
     register_vault_redaction_value(secret)
@@ -239,16 +266,21 @@ async def extract_letter(image_path: str) -> Optional[LetterCredential]:
     register_vault_redaction_value(check)
     agrees = bool(secret) and check == secret and _clean(second.get("identifier"), 120) == identifier
     unsure = bool(first.get("uncertain")) or bool(second.get("uncertain"))
-    status = "ready" if agrees and not unsure and len(secret) >= 4 else "ambiguous"
-    portal_urls = [u for u in (_clean(x, 200) for x in (first.get("portal_urls") or []) if isinstance(x, str)) if u][:5]
+    # Every field reaches the model: one that holds the secret in any spelling is blanked, and an
+    # identifier that IS the secret means the read mixed them up.
+    def safe(value: str) -> str:
+        return value if _scrub(value, secret, check) == value else ""
+    mixed_up = bool(identifier) and _squash(identifier) in {_squash(secret), _squash(check)}
+    status = "ready" if agrees and not unsure and not mixed_up and len(secret) >= 4 else "ambiguous"
+    portal_urls = [safe(u) for u in (_clean(x, 200) for x in (first.get("portal_urls") or []) if isinstance(x, str))]
     return LetterCredential(
         handle=LETTER_HANDLE_PREFIX + secrets.token_hex(4),
-        organization=_clean(first.get("organization"), 120),
-        purpose=_clean(first.get("purpose"), 200),
-        portal_urls=portal_urls,
-        identifier_label=_clean(first.get("identifier_label"), 60),
-        identifier=identifier,
-        secret_label=_clean(first.get("secret_label"), 60),
+        organization=safe(_clean(first.get("organization"), 120)),
+        purpose=safe(_clean(first.get("purpose"), 200)),
+        portal_urls=[u for u in portal_urls if u][:5],
+        identifier_label=safe(_clean(first.get("identifier_label"), 60)),
+        identifier=safe(identifier),
+        secret_label=safe(_clean(first.get("secret_label"), 60)),
         secret=secret if status == "ready" else "",
         status=status,
         expires_at=time.time() + _ttl_seconds(),
@@ -285,8 +317,8 @@ async def seal_letter_images(image_paths: list[str]) -> tuple[list[str], list[st
     """Gateway intake: returns ``(images still to route, notes for the sealed ones)``.
 
     A sealed photo is deleted from the media cache, so no later tool call can re-read the secret.
-    When the screen cannot run, the image passes through unchanged (the pre-existing behaviour) and
-    a warning is logged."""
+    Fail closed: a photo the screen could not judge is withheld and deleted too (it may hold a
+    password); the model is told to ask the user to resend it."""
     if not image_paths or not letter_intake_enabled():
         return list(image_paths or []), []
     kept, notes = [], []
@@ -294,20 +326,34 @@ async def seal_letter_images(image_paths: list[str]) -> tuple[list[str], list[st
         try:
             cred = await extract_letter(path)
         except LetterExtractionError as exc:
-            logger.warning("letter intake: screen failed, image routed normally (%s)", exc)
-            kept.append(path)
+            logger.warning("letter intake: screen failed, photo withheld (%s)", exc)
+            await _destroy(path)
+            notes.append("[The user sent a photo, but Hermes could not check it for sign-in credentials, so it was "
+                         "withheld and deleted. Tell the user and ask them to send it again in a moment.]")
             continue
         if cred is None:
             kept.append(path)
             continue
         put_letter(cred)
         notes.append(render_note(cred))
-        try:
-            await asyncio.to_thread(Path(path).unlink, missing_ok=True)
-        except OSError as exc:
-            logger.warning("letter intake: could not delete the sealed photo (%s)", type(exc).__name__)
+        await _destroy(path)
         logger.info("letter intake: sealed one letter as %s (status=%s)", cred.handle, cred.status)
     return kept, notes
+
+
+async def _destroy(path: str) -> None:
+    """Delete a withheld photo; if deletion fails, overwrite it so its pixels are gone either way."""
+    def run() -> None:
+        p = Path(path)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            with open(p, "wb"):
+                pass
+    try:
+        await asyncio.to_thread(run)
+    except OSError as exc:
+        logger.error("letter intake: could not delete or blank a withheld photo (%s)", type(exc).__name__)
 
 
 async def seal_into_message(message_text: str, image_paths: list[str], prepend, enrich=None) -> tuple[str, list[str]]:
@@ -317,7 +363,10 @@ async def seal_into_message(message_text: str, image_paths: list[str], prepend, 
     if notes:
         message_text = prepend("\n\n".join(notes), message_text)
     if kept and enrich is not None:
-        message_text = await enrich(message_text, kept)
+        try:
+            message_text = await enrich(message_text, kept)
+        except Exception as exc:  # health: allow BLE001 -- the sealed notes must survive a failed description
+            logger.warning("image enrichment failed after letter intake (%s)", type(exc).__name__)
     return message_text, kept
 
 
@@ -330,8 +379,11 @@ _SHARED_SUFFIXES = (
     "github.io", "gitlab.io", "pages.dev", "workers.dev", "vercel.app", "netlify.app", "herokuapp.com",
     "web.app", "firebaseapp.com", "appspot.com", "blogspot.com", "azurewebsites.net", "cloudfront.net",
     "amazonaws.com", "onrender.com", "fly.dev", "glitch.me", "ngrok.io", "ngrok-free.app", "wixsite.com",
+    "wordpress.com", "sharepoint.com", "trycloudflare.com", "notion.site", "r2.dev", "myshopify.com",
+    "squarespace.com", "webflow.io", "framer.app", "carrd.co", "jimdosite.com", "strato-hosting.eu",
 )
-_TWO_LEVEL_TLDS = ("co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "co.at", "or.at", "gv.at", "co.jp", "com.br")
+_TWO_LEVEL_TLDS = ("co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "co.at", "or.at", "gv.at", "co.jp", "com.br",
+                   "co.nz", "com.tr", "co.za", "com.mx", "co.in", "com.cn", "com.pl", "com.es")
 
 
 def _host_of(url: str) -> str:
@@ -405,7 +457,7 @@ def _label_match(c: LoginControl, printed_label: str) -> bool:
 
 
 def _score_secret(c: LoginControl, cred: LetterCredential) -> int:
-    if c.type not in _FILLABLE_TYPES or "one-time-code" in c.autocomplete.lower().split():
+    if c.type not in _FILLABLE_TYPES:
         return 0
     text = _search_text(c)
     if _RE_NOT_SECRET.search(text) or "new-password" in c.autocomplete.lower():
