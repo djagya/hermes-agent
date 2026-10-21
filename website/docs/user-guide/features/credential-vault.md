@@ -82,6 +82,17 @@ Then send a photo or screenshot of the letter and say what to do with it.
 - The handle allows one fill, plus one retry after the page itself showed the
   login failed, so a timed-out submit is never replayed and a one-time
   password is not used up by repeated tries.
+- Once signed in, the agent calls `action=letter_signed_in`. Hermes checks the
+  page itself (on the letter's site, no login form left) and keeps that as
+  proof the letter works. If the portal's session later expires and the login
+  form comes back, `letter_login` with `session_expired=true` signs in again:
+  only in the same browser task, on the same login page, within 12 hours of
+  the confirmed sign-in, at most 3 times, and only after you confirm that the
+  letter's password can be reused (some portals say it stays valid until you
+  send the form; others do not). Each renewed sign-in needs its own
+  confirmation from the page before the next one.
+- After the form the letter is for is sent, the agent calls
+  `action=letter_done`, which retires the password.
 - Signing in is not permission to submit the questionnaire, sign or accept
   terms: those still need your go-ahead.
 

@@ -6,11 +6,14 @@ PNG; a local portal serves a login form whose secret field is a plain type=text 
 "Einmal-Kennwort" and, after a correct sign-in, a questionnaire behind a session cookie. The run proves:
 the photo is sealed (no pixels routed, photo deleted, note without the secret), letter_login fills both
 fields, one submit signs in, the agent keeps working in the same browser session, a blind second fill is
-refused, a site not printed in the letter is refused, and the secret is absent from every model-facing
-string and from the logs written under HERMES_HOME during the run.
+refused, the confirmed sign-in is renewed once after the portal's session expires (only with the user's yes,
+never through after_failed_login, never twice on one confirmation), a site not printed in the letter is
+refused, a sent form retires the letter, and the secret is absent from every model-facing string and from
+the logs written under HERMES_HOME during the run.
 
 Run (needs auxiliary.vision configured in HERMES_HOME and a Chromium binary):
   HERMES_E2E_CHROME=/path/to/chrome <venv>/bin/python evals/letter_login_live_e2e.py
+HERMES_E2E_FAKE_VISION=1 replaces the vision model with a synthetic read and keeps the real browser.
 """
 from __future__ import annotations
 
@@ -149,6 +152,15 @@ def main() -> int:
         photo = work / "letter.png"
         _render_letter(photo, portal)
         vault_letter._intake_cfg = lambda: {"enabled": True}
+        if os.environ.get("HERMES_E2E_FAKE_VISION") == "1":
+            reads = iter([{"has_login_secret": True, "organization": "Beispiel Krankenkasse", "purpose": "Fragebogen",
+                           "portal_urls": [portal], "identifier_label": "Versichertennummer", "identifier": IDENT,
+                           "secret_label": "Einmal-Kennwort", "secret": SECRET, "uncertain": False, "summary": ""},
+                          {"identifier": IDENT, "secret": SECRET, "uncertain": False}])
+
+            async def fake_vision(path, prompt):
+                return next(reads)
+            vault_letter._ask_vision = fake_vision
         kept, notes = asyncio.run(vault_letter.seal_letter_images([str(photo)]))
         seen += notes
         print("note:\n" + "\n".join(notes))
@@ -192,8 +204,36 @@ def main() -> int:
         assert STATE["answers"] == {"inc": "3200"}, STATE["answers"]
         print("4. one submit signed in; questionnaire answered in the same browser session")
 
+        def call(fn, *args, **kw):
+            raw = fn(*args, **kw)
+            seen.append(raw)
+            return json.loads(raw)
+
+        assert call(bvt.browser_vault_letter_signed_in, handle, task_id=TASK)["success"]
+        STATE["sessions"].clear()  # the portal's session expires
+        sup.evaluate_runtime("location.href = '/anketa'")
+        assert _wait(sup, "!!document.querySelector('#ekw')", True), "expired session did not show the login form"
+        _wait(sup, "document.readyState", "complete")
+        assert call(bvt.browser_vault_letter_login, handle, task_id=TASK,
+                    after_failed_login=True)["error_type"] == "reauth_required"
+        bvt._confirm_letter_reuse = lambda *a: False
+        cred.last_fill_at -= 120
+        assert call(bvt.browser_vault_letter_login, handle, task_id=TASK,
+                    session_expired=True)["error_type"] == "reuse_declined"
+        assert _wait(sup, "document.querySelector('#ekw').value", "") == ""
+        bvt._confirm_letter_reuse = lambda *a: True
+        out = call(bvt.browser_vault_letter_login, handle, task_id=TASK, session_expired=True)
+        assert out["success"] and out["filled_fields"] == 2, out
+        assert call(bvt.browser_vault_letter_login, handle, task_id=TASK,
+                    session_expired=True)["error_type"] == "reauth_unproven"
+        sup.evaluate_runtime("document.querySelector('form').requestSubmit()")
+        assert _wait(sup, "location.pathname", "/anketa") == "/anketa", "renewed sign-in did not reach the questionnaire"
+        assert STATE["attempts"] == 2, STATE
+        assert call(bvt.browser_vault_letter_signed_in, handle, task_id=TASK)["success"]
+        print("5. expired session renewed once with the user's yes; failed-login path and a second renewal refused")
+
         other = f"http://localhost:{srv.server_address[1]}/fragebogen"  # not printed in the letter
-        cred.fills = 0
+        cred.fills, cred.state = 0, "new"
         sup.evaluate_runtime(f"location.href = {json.dumps(other)}")
         _wait(sup, "location.host", f"localhost:{srv.server_address[1]}")
         _wait(sup, "document.readyState", "complete")
@@ -201,7 +241,13 @@ def main() -> int:
         seen.append(wrong)
         assert json.loads(wrong)["error_type"] == "origin_unverified", wrong
         assert _wait(sup, "document.querySelector('#ekw').value", "") == ""
-        print("5. site not printed in the letter refused, nothing written")
+        print("6. site not printed in the letter refused, nothing written")
+
+        assert call(bvt.browser_vault_letter_done, handle)["success"]
+        assert call(bvt.browser_vault_letter_login, handle, task_id=TASK,
+                    session_expired=True)["error_type"] == "letter_consumed"
+        assert vault_letter.get_letter(handle).secret == ""
+        print("7. a sent form retires the letter")
 
         seen.append(bvt.browser_vault_list())
         leaks = [s[:80] for s in seen if SECRET in s]
@@ -209,7 +255,7 @@ def main() -> int:
                 if os.path.isfile(p) and os.path.getmtime(p) >= started]
         log_leaks = [p for p in logs if SECRET.encode() in Path(p).read_bytes()]
         assert not leaks and not log_leaks, (leaks, log_leaks)
-        print(f"6. secret absent from {len(seen)} model-facing strings and {len(logs)} log files touched by the run")
+        print(f"8. secret absent from {len(seen)} model-facing strings and {len(logs)} log files touched by the run")
         print("E2E OK")
         return 0
     finally:
