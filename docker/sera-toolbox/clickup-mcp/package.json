@@ -7,6 +7,6 @@
     "@hauptsache.net/clickup-mcp": "1.8.0"
   },
   "overrides": {
-    "@modelcontextprotocol/sdk": "1.31.0"
+    "@modelcontextprotocol/sdk": "1.32.1"
   }
 }

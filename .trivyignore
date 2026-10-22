@@ -30,3 +30,37 @@ CVE-2026-102278 exp:2026-10-29
 # sidecar's own undici is locked to a fixed release. Expires with the
 # entries above.
 CVE-2026-19534 exp:2026-10-29
+# markdown-it 15.0.1 inside the baked markdownlint-cli2 0.23.3, which pins it
+# exactly. Denial of service when parsing a crafted document; the CLI only
+# lints local files Sera chooses, never inbound messages. The fix needs
+# markdownlint-cli2 0.24.0 (2026-10-21) with markdown-it 15.0.3, markdownlint
+# 0.42.0 and smol-toml 1.9.1, all inside the 14-day npm release-age window.
+# Expires when 0.24.0 clears it: bump the Dockerfile pin then.
+CVE-2026-111758 exp:2026-11-04
+CVE-2026-111759 exp:2026-11-04
+# Pillow 12.3.0: decoder memory-safety (JPEG and others; 4 critical) and
+# denial-of-service advisories, fixed only in Pillow 13.0.0 (2026-10-16).
+# browser-harness 0.1.13, the latest release and browser_exec's engine,
+# pins pillow==12.3.0 exactly, so a uv override still fails PM's install
+# check (`uv pip check`: "browser-harness requires pillow==12.3.0"). Upstream
+# main is on 12.3.0 too. The running image already ships 12.3.0, so this
+# release adds no exposure. Short expiry so the next build forces the move.
+CVE-2026-112390 exp:2026-10-29
+CVE-2026-112392 exp:2026-10-29
+CVE-2026-112393 exp:2026-10-29
+CVE-2026-112397 exp:2026-10-29
+CVE-2026-112399 exp:2026-10-29
+CVE-2026-112400 exp:2026-10-29
+CVE-2026-112402 exp:2026-10-29
+CVE-2026-112403 exp:2026-10-29
+CVE-2026-112404 exp:2026-10-29
+CVE-2026-112405 exp:2026-10-29
+CVE-2026-112406 exp:2026-10-29
+CVE-2026-112892 exp:2026-10-29
+CVE-2026-112893 exp:2026-10-29
+CVE-2026-112894 exp:2026-10-29
+CVE-2026-112895 exp:2026-10-29
+CVE-2026-112896 exp:2026-10-29
+CVE-2026-112897 exp:2026-10-29
+CVE-2026-112900 exp:2026-10-29
+CVE-2026-112902 exp:2026-10-29
