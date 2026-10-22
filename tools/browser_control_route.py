@@ -26,6 +26,10 @@ MANAGED_CONTROL_ENV = "HERMES_BROWSER_CONTROL_URL"
 MANAGED_KEY_ENV = "HERMES_BROWSER_CONTROL_KEY"
 MANAGED_LEASE_ENV = "HERMES_BROWSER_LEASE_ID"
 MANAGED_TOKEN_ENV = "HERMES_BROWSER_COMMAND_TOKEN"
+# The slot and Chrome generation control granted; the post-card-fill capture
+# guard keys on them (tools/browser_payment_privacy.py).
+MANAGED_SLOT_ENV = "HERMES_BROWSER_SLOT_ID"
+MANAGED_GENERATION_ENV = "HERMES_BROWSER_GENERATION"
 # Sentinel returned by control_url() when config.yaml cannot be read: keeps
 # the install in managed mode (no local/cloud Chrome) with a clear error.
 CONFIG_UNREADABLE_URL = "managed://config-unreadable"
@@ -157,6 +161,8 @@ def _apply_lease(env: dict[str, str], lease: dict[str, Any], control: str) -> Op
     env["BU_CDP_URL"] = f"{control.rstrip('/')}/slot/{slot_id}/json/version?tok={token}"
     env[MANAGED_LEASE_ENV] = str(lease.get("lease_id") or "")
     env[MANAGED_TOKEN_ENV] = token
+    env[MANAGED_SLOT_ENV] = slot_id
+    env[MANAGED_GENERATION_ENV] = generation
     env["BU_NAME"] = daemon_cache_key(slot_id, generation, epoch)
     env["_HERMES_BU_PRIVATE_BROWSER"] = "1"
     return None
@@ -404,6 +410,8 @@ def _resolve_held(
         "BU_CDP_URL": env["BU_CDP_URL"],
         MANAGED_LEASE_ENV: env.get(MANAGED_LEASE_ENV, ""),
         MANAGED_TOKEN_ENV: env.get(MANAGED_TOKEN_ENV, ""),
+        MANAGED_SLOT_ENV: env.get(MANAGED_SLOT_ENV, ""),
+        MANAGED_GENERATION_ENV: env.get(MANAGED_GENERATION_ENV, ""),
         "BU_NAME": env.get("BU_NAME", ""),
         "_HERMES_BU_PRIVATE_BROWSER": "1",
     }
