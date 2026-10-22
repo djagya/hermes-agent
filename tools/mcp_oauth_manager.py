@@ -316,10 +316,13 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                     if resource_401_refresh_attempted:
                         await inner.aclose()
                         break  # expose the second 401; no reauthorization loop
+                    from tools.mcp_tool import sdk_httpx
+                    transport_httpx = sdk_httpx()
+                    assert transport_httpx is not None  # this flow requires the SDK transport
                     try:
                         request.content  # never consume/replay an unbuffered stream
                         buffered = True
-                    except Exception:
+                    except transport_httpx.RequestNotRead:
                         buffered = False
                     from tools.mcp_oauth_provider import enforce_refresh_token_issuer
                     enforce_refresh_token_issuer(self.context)

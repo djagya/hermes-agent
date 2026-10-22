@@ -112,17 +112,20 @@ async def test_resource_invalid_token(native_provider, monkeypatch, caplog, caps
                                       scenario, status, error, expected_events):
     provider, storage = native_provider
     events = []
-    if scenario == "no_refresh":
+    async def remove_refresh():
         tokens = await storage.get_tokens()
         tokens.refresh_token = None
         await storage.set_tokens(tokens)
-    elif scenario == "issuer_mismatch":
+
+    async def mismatch_issuer():
         storage.bind_issuer("https://other.invalid")
         await storage.set_tokens(await storage.get_tokens())
-    elif scenario == "proactive_then_401":
+
+    async def expire_access():
         await provider._initialize()
         provider.context.token_expiry_time = time.time() - 1
-    elif scenario == "peer_rotation":
+
+    async def arrange_peer_rotation():
         # Deterministic fence interleaving: a peer publishes a live rotated
         # pair just before this provider obtains the real file fence.
         acquire = provider._hermes_acquire_refresh_fence
@@ -136,6 +139,15 @@ async def test_resource_invalid_token(native_provider, monkeypatch, caplog, caps
 
         monkeypatch.setattr(provider, "_hermes_acquire_refresh_fence",
                             acquire_after_peer_rotation)
+
+    setups = {
+        "no_refresh": remove_refresh,
+        "issuer_mismatch": mismatch_issuer,
+        "proactive_then_401": expire_access,
+        "peer_rotation": arrange_peer_rotation,
+    }
+    if setup := setups.get(scenario):
+        await setup()
 
     async def handler(request):
         path = request.url.path
