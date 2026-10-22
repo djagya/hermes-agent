@@ -189,7 +189,7 @@ def test_x_search_uses_xai_oauth_when_only_oauth_available(monkeypatch):
         return {
             "provider": "xai-oauth",
             "api_key": "oauth-bearer-token",
-            "base_url": "https://api.x.ai/v1",
+            "base_url": "https://cli-chat-proxy.grok.com/v1",
         }
 
     monkeypatch.setattr(
@@ -203,7 +203,7 @@ def test_x_search_uses_xai_oauth_when_only_oauth_available(monkeypatch):
 
     def _fake_post(url, headers=None, json=None, timeout=None):
         captured["headers"] = headers
-        return _FakeResponse({"output_text": "Found posts via OAuth."})
+        return _FakeResponse({"output_text": "Found posts via OAuth.", "citations": ["https://x.com/example/status/1"]})
 
     monkeypatch.setattr("requests.post", _fake_post)
 
@@ -212,6 +212,7 @@ def test_x_search_uses_xai_oauth_when_only_oauth_available(monkeypatch):
     assert result["success"] is True
     assert result["credential_source"] == "xai-oauth"
     assert captured["headers"]["Authorization"] == "Bearer oauth-bearer-token"
+    assert captured["headers"]["x-grok-client-version"] == "1.0.67"
 
 def test_x_search_returns_tool_error_when_no_credentials(monkeypatch):
     """No credentials anywhere: tool returns a clear error, not a 401 from xAI."""
@@ -244,13 +245,8 @@ def test_x_search_returns_tool_error_when_no_credentials(monkeypatch):
 # unsourced fluff when narrowing filters returned nothing.
 # ---------------------------------------------------------------------------
 
-def test_x_search_not_degraded_when_no_filters_active(monkeypatch):
-    """A broad query that returns no citations isn't necessarily degraded.
-
-    Without any narrowing filter, an empty-citations response is a generic
-    unsourced answer, not a "filter miss". The caller can already tell from
-    ``inline_citations == []`` if they care.
-    """
+def test_x_search_fails_honestly_without_sources_even_without_filters(monkeypatch):
+    """An unsourced answer must not masquerade as a successful native search."""
     from tools.x_search_tool import x_search_tool
 
     monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
@@ -261,9 +257,26 @@ def test_x_search_not_degraded_when_no_filters_active(monkeypatch):
 
     result = json.loads(x_search_tool(query="anything"))
 
-    assert result["success"] is True
-    assert result["degraded"] is False
-    assert result["degraded_reason"] is None
+    assert result["success"] is False
+    assert result["degraded"] is True
+    assert "unconfirmed" in result["error"]
+
+
+def test_x_search_ignored_native_tool_is_degraded_with_or_without_filters(monkeypatch):
+    from tools.x_search_tool import _handle_x_search
+    monkeypatch.setenv("XAI_API_KEY", "synthetic-key")
+    monkeypatch.setattr("requests.post", lambda *a, **k: _FakeResponse({
+        "output_text": "An unsourced explanation is not a search result.",
+        "tools": [], "citations": [], "output": [],
+        "usage": {"num_sources_used": 0, "server_side_tool_usage": {}},
+    }))
+    for filters in ({}, {"allowed_x_handles": ["xai"]}):
+        result = json.loads(_handle_x_search({"query": "latest news", **filters}))
+        assert result["success"] is False
+        assert result["degraded"] is True
+        assert result["error"]
+        assert result["citations"] == []
+
 
 def _xcred(prefix: str) -> str:
     """Synthesize a distinct fake credential value (never a bare literal)."""
@@ -327,7 +340,7 @@ def test_x_search_prefers_explicit_api_key_over_oauth(monkeypatch):
 
     def _fake_post(url, headers=None, json=None, timeout=None):
         captured["headers"] = headers
-        return _FakeResponse({"output_text": "Real posts with citations."})
+        return _FakeResponse({"output_text": "Real posts with citations.", "citations": ["https://x.com/example/status/1"]})
 
     monkeypatch.setattr("requests.post", _fake_post)
 

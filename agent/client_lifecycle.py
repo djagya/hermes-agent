@@ -49,7 +49,8 @@ _ROUTE_DEFAULT_HEADERS = (
     ("chatgpt.com", lambda self, url: _lazy_attr("agent.codex_headers", "codex_cloudflare_headers")(
         self._client_kwargs.get("api_key", ""), base_url=url)),
     # Covers provider=xai and provider=xai-oauth (api.x.ai).
-    ("x.ai", lambda self, url: _lazy_attr("tools.xai_http", "hermes_xai_default_headers")()),
+    ("x.ai", lambda self, url: _lazy_attr("tools.xai_http", "hermes_xai_default_headers")(url)),
+    ("cli-chat-proxy.grok.com", lambda self, url: _lazy_attr("tools.xai_http", "hermes_xai_default_headers")(url)),
 )
 
 
@@ -610,6 +611,10 @@ class ClientLifecycleMixin:
         if old_key and api_key.strip() == old_key:
             logger.debug("%s credential refresh returned the same token; refresh likely failed silently", self.provider)
             return False
+        if self.provider == "xai-oauth":
+            # Refresh changes the bearer, not an explicit compatible route belonging
+            # to that credential. Pool rotation handles intentional account/route swaps.
+            base_url = _auth._xai_validate_inference_base_url(self.base_url, fallback=base_url)
         return self._adopt_openai_credentials(api_key, base_url, reason=f"{self.provider}_credential_refresh")
 
     def _try_refresh_nous_client_credentials(self, *, force: bool = True, require_account: str | None = None) -> bool:
