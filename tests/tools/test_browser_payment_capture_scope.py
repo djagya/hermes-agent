@@ -122,7 +122,7 @@ def test_marks_survive_a_gateway_restart_and_clear_only_by_operator(tmp_path):
     guard.mark_payment_session("checkout", {"slot_id": "shopping", "browser_generation": "g1"})
     probe = ("from tools.browser_payment_privacy import capture_blocked_for_surface as b;"
              "print(b('shopping', 'g2'), b('research-1', 'g1'))")
-    fresh = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+    fresh = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, encoding="utf-8",
                            env=dict(os.environ), cwd=os.getcwd(), check=True)
     assert fresh.stdout.split() == ["True", "False"]
     assert oct(guard._state_path().stat().st_mode & 0o777) == "0o600"
@@ -131,5 +131,5 @@ def test_marks_survive_a_gateway_restart_and_clear_only_by_operator(tmp_path):
         guard.clear_payment_surface("shopping", confirmed_by="")
     assert guard.main(["clear", "shopping", "--confirmed-by", "operator: tab closed"]) == 0
     assert guard.capture_blocked_for_surface("shopping", "g2") is False
-    audit = [json.loads(line) for line in guard._state_path().with_suffix(".log").read_text().splitlines()]
+    audit = [json.loads(line) for line in guard._state_path().with_suffix(".log").read_text(encoding="utf-8-sig").splitlines()]
     assert audit[-1]["slot_id"] == "shopping" and audit[-1]["confirmed_by"] == "operator: tab closed"

@@ -53,7 +53,7 @@ def _now() -> str:
 def _read_marks(path: Path) -> list[dict[str, Any]] | None:
     """Marks on disk; [] when there is no file, None when it cannot be trusted."""
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return []
     except OSError:
