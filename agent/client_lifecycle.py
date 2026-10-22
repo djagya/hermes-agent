@@ -612,9 +612,13 @@ class ClientLifecycleMixin:
             logger.debug("%s credential refresh returned the same token; refresh likely failed silently", self.provider)
             return False
         if self.provider == "xai-oauth":
-            # Refresh changes the bearer, not an explicit compatible route belonging
-            # to that credential. Pool rotation handles intentional account/route swaps.
-            base_url = _auth._xai_validate_inference_base_url(self.base_url, fallback=base_url)
+            # Preserve custom routes, but migrate the old persisted API default.
+            # Environment overrides remain deliberate, including the API URL.
+            from hermes_cli.config import get_env_value
+            base_url = _auth._xai_oauth_runtime_base_url(
+                self.base_url,
+                override=get_env_value("HERMES_XAI_BASE_URL") or get_env_value("XAI_BASE_URL") or "",
+            )
         return self._adopt_openai_credentials(api_key, base_url, reason=f"{self.provider}_credential_refresh")
 
     def _try_refresh_nous_client_credentials(self, *, force: bool = True, require_account: str | None = None) -> bool:

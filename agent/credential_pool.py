@@ -316,12 +316,9 @@ class PooledCredential:
             # (client_lifecycle._swap_credential), or a rotation silently leaves the proxy.
             return get_secret_str("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or self.base_url
         if self.provider == "xai-oauth":
-            base = auth_mod._xai_validate_inference_base_url(
-                self.base_url or "", fallback=auth_mod.DEFAULT_XAI_OAUTH_BASE_URL,
-            )
-            return auth_mod._xai_validate_inference_base_url(
-                get_secret_str("HERMES_XAI_BASE_URL", "") or get_secret_str("XAI_BASE_URL", ""),
-                fallback=base,
+            return auth_mod._xai_oauth_runtime_base_url(
+                self.base_url or "",
+                override=get_secret_str("HERMES_XAI_BASE_URL", "") or get_secret_str("XAI_BASE_URL", ""),
             )
         return self.base_url
 

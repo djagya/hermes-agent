@@ -244,15 +244,10 @@ def resolve_xai_http_credentials(
             # the next healthy account rather than resurrecting the stale row.
             entry = pool.select()
         access_token = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
-        fallback_base_url = str(
-            getattr(entry, "runtime_base_url", None)
-            or getattr(entry, "base_url", "")
-            or auth_mod.DEFAULT_XAI_OAUTH_BASE_URL
-        ).strip().rstrip("/")
-        fallback_base_url = auth_mod._xai_validate_inference_base_url(
-            fallback_base_url, fallback=auth_mod.DEFAULT_XAI_OAUTH_BASE_URL,
+        base_url = auth_mod._xai_oauth_runtime_base_url(
+            getattr(entry, "base_url", "") or getattr(entry, "runtime_base_url", "") or "",
+            override=_xai_base_url_override(),
         )
-        base_url = auth_mod._xai_validate_inference_base_url(_xai_base_url_override(), fallback=fallback_base_url)
         if str(access_token).strip():
             return {"provider": "xai-oauth", "api_key": str(access_token).strip(), "base_url": base_url}
     except Exception:

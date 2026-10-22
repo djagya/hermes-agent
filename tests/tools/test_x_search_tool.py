@@ -351,7 +351,7 @@ def test_x_search_prefers_explicit_api_key_over_oauth(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer " + paid_key
 
 def test_x_search_bearer_helper_falls_back_to_oauth_without_api_key(monkeypatch):
-    """No explicit XAI_API_KEY: the OAuth resolver path is unchanged."""
+    """No explicit API key: a legacy persisted OAuth default adopts the proxy."""
     from tools.x_search_tool import _resolve_xai_bearer
 
     oauth_token = _xcred("oauth")
@@ -366,6 +366,6 @@ def test_x_search_bearer_helper_falls_back_to_oauth_without_api_key(monkeypatch)
     api_key, base_url, source = _resolve_xai_bearer()
     assert (api_key, base_url, source) == (
         oauth_token,
-        "https://api.x.ai/v1",
+        "https://cli-chat-proxy.grok.com/v1",
         "xai-oauth",
     )

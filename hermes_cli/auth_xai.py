@@ -422,11 +422,24 @@ def _quarantine_xai_oauth_tokens(exc: AuthError) -> None:
         logger.debug("xAI OAuth: failed to persist quarantined state: %s", save_exc)
 
 
+def _xai_oauth_runtime_base_url(value: str = "", *, override: str = "") -> str:
+    """Migrate legacy OAuth defaults at read time, without rewriting auth rows.
+
+    The canonical API URL used to be persisted as the OAuth default, so it is
+    not evidence of customization. Noncanonical compatible routes survive;
+    explicit environment overrides (even the canonical API URL) win separately.
+    """
+    candidate = str(value or "").strip().rstrip("/")
+    if candidate == "https://api.x.ai/v1":
+        candidate = ""
+    base = _xai_validate_inference_base_url(candidate, fallback=DEFAULT_XAI_OAUTH_BASE_URL)
+    return _xai_validate_inference_base_url(override, fallback=base)
+
+
 def _xai_oauth_inference_base_url() -> str:
-    return _xai_validate_inference_base_url(
-        os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/") or os.getenv("XAI_BASE_URL", "").strip().rstrip("/"),
-        fallback=DEFAULT_XAI_OAUTH_BASE_URL,
-    )
+    return _xai_oauth_runtime_base_url(override=(
+        os.getenv("HERMES_XAI_BASE_URL", "").strip() or os.getenv("XAI_BASE_URL", "").strip()
+    ))
 
 
 def resolve_xai_oauth_runtime_credentials(

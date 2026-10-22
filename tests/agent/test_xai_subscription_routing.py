@@ -44,29 +44,47 @@ def test_headers_merge_case_insensitively_and_clear_on_route_change():
     assert kwargs["default_headers"] == {"Custom": "keep"}
 
 
-@pytest.mark.parametrize("base", [None, "https://api.x.ai/v1", "https://staging.x.ai/v1", "https://evil.example/v1"])
-def test_pool_routes_and_aux_http_consumers_agree(monkeypatch, base):
+@pytest.mark.parametrize("base", [None, "", "https://api.x.ai/v1", "https://api.x.ai/v1/", "https://staging.x.ai/v1", "https://evil.example/v1"])
+@pytest.mark.parametrize("force_refresh", [False, True])
+def test_pool_routes_and_aux_http_consumers_agree(monkeypatch, base, force_refresh):
     from agent.credential_pool import PooledCredential
     from agent import auxiliary_client as aux
     from tools.xai_http import resolve_xai_http_credentials
     entry = PooledCredential(id="row", provider="xai-oauth", source="manual", label="test", priority=0,
                              auth_type="oauth", access_token="synthetic-access", base_url=base)
-    pool = SimpleNamespace(select=lambda: entry, has_credentials=lambda: True)
+    pool = SimpleNamespace(select=lambda: entry, has_credentials=lambda: True,
+                           try_refresh_matching=lambda hint: entry if hint == "synthetic-access" else None)
     monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: pool)
     monkeypatch.setattr(aux, "load_pool", lambda _provider: pool)
     monkeypatch.delenv("HERMES_XAI_BASE_URL", raising=False)
     monkeypatch.delenv("XAI_BASE_URL", raising=False)
-    expected = base if base and base.endswith(".x.ai/v1") else PROXY
+    expected = base if base == "https://staging.x.ai/v1" else PROXY
     assert entry.runtime_base_url == expected
     assert aux._resolve_xai_oauth_for_aux() == ("synthetic-access", expected)
-    assert resolve_xai_http_credentials()["base_url"] == expected
+    assert resolve_xai_http_credentials(force_refresh=force_refresh, api_key_hint="synthetic-access")["base_url"] == expected
+    assert entry.base_url == base  # Runtime migration never rewrites the stored row.
+    for env_name in ("XAI_BASE_URL", "HERMES_XAI_BASE_URL"):
+        monkeypatch.setenv(env_name, DEFAULT_XAI_BASE_URL)
+        assert entry.runtime_base_url == DEFAULT_XAI_BASE_URL
+        assert aux._resolve_xai_oauth_for_aux() == ("synthetic-access", DEFAULT_XAI_BASE_URL)
+        assert resolve_xai_http_credentials(force_refresh=force_refresh, api_key_hint="synthetic-access")["base_url"] == DEFAULT_XAI_BASE_URL
+        monkeypatch.delenv(env_name)
+    monkeypatch.setenv("XAI_BASE_URL", DEFAULT_XAI_BASE_URL)
     monkeypatch.setenv("HERMES_XAI_BASE_URL", PROXY)
     assert entry.runtime_base_url == PROXY
     assert aux._resolve_xai_oauth_for_aux()[1] == PROXY
-    assert resolve_xai_http_credentials()["base_url"] == PROXY
+    assert resolve_xai_http_credentials(force_refresh=force_refresh, api_key_hint="synthetic-access")["base_url"] == PROXY
 
 
-def test_primary_and_aux_sdk_construction_and_credential_rotation(monkeypatch):
+@pytest.mark.parametrize("refresh_base,override,expected", [
+    (None, None, PROXY),
+    (DEFAULT_XAI_BASE_URL, None, PROXY),
+    (DEFAULT_XAI_BASE_URL + "/", None, PROXY),
+    ("https://staging.x.ai/v1", None, "https://staging.x.ai/v1"),
+    (DEFAULT_XAI_BASE_URL, "XAI_BASE_URL", DEFAULT_XAI_BASE_URL),
+    (DEFAULT_XAI_BASE_URL, "HERMES_XAI_BASE_URL", DEFAULT_XAI_BASE_URL),
+])
+def test_primary_and_aux_sdk_construction_and_credential_rotation(monkeypatch, refresh_base, override, expected):
     from agent import agent_runtime_helpers as runtime, auxiliary_client as aux
     from agent.client_lifecycle import ClientLifecycleMixin
     from agent.credential_pool import PooledCredential
@@ -102,6 +120,8 @@ def test_primary_and_aux_sdk_construction_and_credential_rotation(monkeypatch):
             self.client = runtime.create_openai_client(self, self._client_kwargs, reason=reason, shared=True)
             return True
 
+    monkeypatch.delenv("HERMES_XAI_BASE_URL", raising=False)
+    monkeypatch.delenv("XAI_BASE_URL", raising=False)
     harness = Harness()
     row = PooledCredential(id="next", provider="xai-oauth", source="manual", label="test", priority=0, auth_type="oauth",
                            access_token="synthetic-new", base_url=PROXY)
@@ -111,10 +131,21 @@ def test_primary_and_aux_sdk_construction_and_credential_rotation(monkeypatch):
     assert captured[-1]["default_headers"]["x-grok-client-version"] == "1.0.67"
     aux._create_openai_client(api_key=row.access_token, base_url=row.runtime_base_url)
     assert captured[-1]["default_headers"] == XAI_GROK_PROXY_REQUIRED_HEADERS
+    # Rotation to a legacy persisted default stays on the subscription proxy.
     row.base_url = DEFAULT_XAI_BASE_URL
     assert harness._swap_credential(row)
+    assert harness.base_url == PROXY
+    assert captured[-1]["default_headers"]["x-grok-client-version"] == "1.0.67"
+    assert row.base_url == DEFAULT_XAI_BASE_URL
+    # A genuinely customized route still rotates away, clearing proxy headers.
+    row.base_url = "https://staging.x.ai/v1"
+    assert harness._swap_credential(row)
+    assert harness.base_url == row.base_url
     assert "x-grok-client-version" not in captured[-1].get("default_headers", {})
-    # A singleton token refresh must retain the credential's explicitly compatible route.
+    # Refresh migrates stale runtime defaults but preserves custom/env routes.
+    harness.base_url = refresh_base
+    if override:
+        monkeypatch.setenv(override, DEFAULT_XAI_BASE_URL)
     old = harness.api_key
     monkeypatch.setattr("hermes_cli.auth.resolve_xai_oauth_runtime_credentials", lambda **kw: {
         "api_key": "synthetic-refreshed" if kw.get("force_refresh") else old,
@@ -122,5 +153,5 @@ def test_primary_and_aux_sdk_construction_and_credential_rotation(monkeypatch):
     })
     assert harness._try_refresh_codex_client_credentials()
     assert harness.api_key == "synthetic-refreshed"
-    assert harness.base_url == DEFAULT_XAI_BASE_URL
-    assert "x-grok-client-version" not in captured[-1].get("default_headers", {})
+    assert harness.base_url == expected
+    assert ("x-grok-client-version" in captured[-1].get("default_headers", {})) == (expected == PROXY)
