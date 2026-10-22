@@ -718,7 +718,9 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
     cdp = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
     if not cdp:
         return
-    route = {"cdp": cdp, "lease": str(env.get("HERMES_BROWSER_LEASE_ID") or ""), "error": ""}
+    route = {"cdp": cdp, "lease": str(env.get("HERMES_BROWSER_LEASE_ID") or ""), "error": "",
+             "slot_id": str(env.get("HERMES_BROWSER_SLOT_ID") or ""),
+             "browser_generation": str(env.get("HERMES_BROWSER_GENERATION") or "")}
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
         from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
@@ -868,11 +870,13 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
-    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
+    from tools.browser_payment_privacy import exec_capture_refusal, exec_slot_capture_refusal
 
-    if code and payment_session_sensitive(task_id) and any(token in code.lower() for token in
-            ("screenshot", "printtopdf", "screencast", "recording")):
-        return json.dumps(screenshot_refusal())
+    # Unmanaged: a card fill blocks capture for the whole profile. Managed: the slot control
+    # grants this call is checked in dispatch(), so a re-route is checked too.
+    refused = exec_capture_refusal(code, task_id)
+    if refused:
+        return refused
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 
@@ -951,6 +955,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     started = time.time()
 
     def dispatch() -> dict[str, Any]:
+        refused = exec_slot_capture_refusal(code, env)
+        if refused:
+            return {"error_result": refused}
         _attach_vault_supervisor(env, task_id)
         with _driven_daemons_lock:
             _driven_daemons.add(env.get("BU_NAME", "default"))
