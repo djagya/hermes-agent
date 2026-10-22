@@ -64,7 +64,7 @@ CVE-2026-112896 exp:2026-10-29
 CVE-2026-112897 exp:2026-10-29
 CVE-2026-112900 exp:2026-10-29
 CVE-2026-112902 exp:2026-10-29
-# 2026-10-22 evening: seven more Pillow 12.3.0 advisories, same 13.0.0-only
+# 2026-10-22 evening: eight more Pillow 12.3.0 advisories, same 13.0.0-only
 # fix and the same browser-harness pin; same expiry.
 CVE-2026-96637 exp:2026-10-29
 CVE-2026-96639 exp:2026-10-29
@@ -73,3 +73,4 @@ CVE-2026-96642 exp:2026-10-29
 CVE-2026-96643 exp:2026-10-29
 CVE-2026-96644 exp:2026-10-29
 CVE-2026-96778 exp:2026-10-29
+GHSA-78g4-xqwv-q3g8 exp:2026-10-29
