@@ -780,38 +780,87 @@ def _confirm_letter_origin(organization: str, origin: str) -> bool:
         surface="vault-letter", title="Use letter login on this site?") == "accept"
 
 
-def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, secret_field: str = "",
-                               identifier_field: str = "", expected_origin: str = "",
-                               after_failed_login: bool = False) -> str:
-    """Fill the CURRENT page's login form from a sealed letter credential (agent/vault_letter.py).
+def _confirm_letter_reuse(organization: str, origin: str) -> bool:
+    """Whether a letter's password may be used again is printed by the sender, not knowable here."""
+    from tools.approval_prompt import request_elicitation_consent
 
-    The identifier and the secret go into the page over the supervisor socket; the result carries only
-    counts. Never submits. A second fill needs ``after_failed_login`` (the page showed the login failed)
-    and the handle allows :data:`MAX_LETTER_FILLS` fills in all, so a timed-out submit is never replayed
-    blind and a one-time password is not burnt by repeated tries."""
-    from agent.redact import register_vault_redaction_value
-    from agent.vault_letter import MAX_LETTER_FILLS, get_letter, origin_allowed, select_letter_fills
-    from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js
-    from agent.vault_store import VaultError, normalize_origin
+    return request_elicitation_consent(
+        f"Sign in to {origin} again with the {organization or 'photographed'} letter login",
+        "The earlier sign-in worked and its session has expired. Approve only if this letter's password stays "
+        "valid for another sign-in (for example, the site says it works until you send the form). Signing in "
+        "again does not send, sign or change anything.",
+        surface="vault-letter", title="Sign in again with the letter?") == "accept"
 
-    def refuse(error_type: str, error: str, **extra: Any) -> str:
-        return json.dumps({"success": False, "error_type": error_type, "error": error, **extra}, ensure_ascii=False)
+
+def _letter_refusal(error_type: str, error: str, **extra: Any) -> str:
+    return json.dumps({"success": False, "error_type": error_type, "error": error, **extra}, ensure_ascii=False)
+
+
+def _usable_letter(handle: str):
+    """``(cred, None)`` for a letter that can still sign in, else ``(None, refusal)``."""
+    from agent.vault_letter import get_letter
 
     cred = get_letter(handle)
     if cred is None:
-        return refuse("letter_unknown", "No sealed letter with this handle (expired, or the gateway restarted). "
-                                        "Ask the user to send the photo of the letter again.")
+        return None, _letter_refusal("letter_unknown", "No sealed letter with this handle (expired, or the gateway "
+                                                       "restarted). Ask the user to send the photo of the letter again.")
+    if cred.state == "done":
+        return None, _letter_refusal("letter_consumed", "The form this letter was for was already sent, so its "
+                                                        "password is retired. Nothing was written.")
     if cred.status != "ready" or not cred.secret:
-        return refuse("letter_ambiguous", "The credentials in this letter could not be read reliably, so nothing "
-                                          "is filled. Ask for a sharper photo of the credentials block or offer a handoff.")
-    if cred.fills >= MAX_LETTER_FILLS:
-        return refuse("attempts_exhausted", f"This letter login was already filled {cred.fills} times. Stop: "
-                                            "more tries can lock the one-time password. Tell the user what the page shows.")
-    if cred.fills and not after_failed_login:
-        return refuse("attempt_unclear", "This letter login was already filled. If the form was submitted, first "
-                                         "check the page: signed in → continue; still on the login form with an "
-                                         "error → call again with after_failed_login=true. Never refill after a "
-                                         "timeout without looking.")
+        return None, _letter_refusal("letter_ambiguous", "The credentials in this letter could not be read reliably, "
+                                                         "so nothing is filled. Ask for a sharper photo of the "
+                                                         "credentials block or offer a handoff.")
+    return cred, None
+
+
+def _renewal_refusal(cred, task: str, origin: str) -> Optional[str]:
+    """A session-expiry sign-in may run only on the proven task and login origin, and only after the
+    user says the letter's password can be reused. Checked before asking, re-checked when reserving."""
+    from agent.vault_letter import fill_refusal
+
+    early = fill_refusal(cred, session_expired=True, task=task, origin=origin)
+    if early:
+        return _letter_refusal(*early)
+    if not _confirm_letter_reuse(cred.organization, origin):
+        return _letter_refusal("reuse_declined", "The user did not confirm that this letter's password can be used "
+                                                 "again. Nothing was written.")
+    return None
+
+
+def _page_controls(task_id: str, nonce: str) -> list:
+    from agent.vault_login_classifier import LoginControl, build_inspection_js
+
+    inspect = _eval_js(task_id, build_inspection_js(nonce))
+    raw_controls = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
+    if isinstance(raw_controls, str):
+        raw_controls = _parse_json_result(raw_controls)
+    return [LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)]
+
+
+def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, secret_field: str = "",
+                               identifier_field: str = "", expected_origin: str = "",
+                               after_failed_login: bool = False, session_expired: bool = False) -> str:
+    """Fill the CURRENT page's login form from a sealed letter credential (agent/vault_letter.py).
+
+    The identifier and the secret go into the page over the supervisor socket; the result carries only
+    counts. Never submits. A refill needs either ``after_failed_login`` (the page showed the sign-in
+    failed; once) or ``session_expired``: a sign-in the backend confirmed with
+    :func:`browser_vault_letter_signed_in`, in this task and on the same login origin, a login form on
+    the page again, and the user's yes that the password can be reused (:data:`MAX_REAUTHS` times). So a
+    timed-out submit is never replayed blind and a one-time password is not burnt by repeated tries."""
+    from agent.redact import register_vault_redaction_value
+    from agent.vault_letter import MAX_FAILED_RETRIES, MAX_REAUTHS, fill_refusal, origin_allowed, select_letter_fills
+    from agent.vault_login_classifier import build_fill_js
+    from agent.vault_store import VaultError, normalize_origin
+
+    refuse = _letter_refusal
+    cred, refused = _usable_letter(handle)
+    if refused:
+        return refused
+    early = fill_refusal(cred, after_failed_login=after_failed_login, session_expired=session_expired)
+    if early:
+        return refuse(*early)
 
     effective_task_id = task_id or "default"
     wanted = ""
@@ -836,11 +885,7 @@ def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, se
             return refuse("origin_declined", "The user did not confirm this site for the letter login. Nothing was written.")
 
     nonce = secrets.token_hex(8)
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
-    raw_controls = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
-    if isinstance(raw_controls, str):
-        raw_controls = _parse_json_result(raw_controls)
-    controls = [LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)]
+    controls = _page_controls(effective_task_id, nonce)
     fills, info = select_letter_fills(controls, cred, secret_field=secret_field, identifier_field=identifier_field)
     if not fills:
         hints = {
@@ -853,9 +898,15 @@ def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, se
         }
         return refuse(info["error_type"], hints.get(info["error_type"], "No fillable field.") + " Nothing was written.")
 
+    if session_expired:
+        refused = _renewal_refusal(cred, effective_task_id, origin)
+        if refused:
+            return refused
     register_vault_redaction_value(cred.secret)
     from agent.vault_letter import reserve_fill
-    blocked = reserve_fill(handle, after_failed_login)  # counted before the write, whatever its outcome
+    # Counted before the write, whatever its outcome; re-checks every rule under the store lock.
+    blocked = reserve_fill(handle, after_failed_login=after_failed_login, session_expired=session_expired,
+                           task=effective_task_id, origin=origin)
     if blocked:
         return refuse(*blocked)
     result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
@@ -875,14 +926,55 @@ def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, se
                       filled_fields=filled)
     out: dict[str, Any] = {"success": True, "filled_fields": filled, "origin": origin, "organization": cred.organization,
                            "identifier_filled": bool(info.get("identifier_filled")), "attempt": cred.fills,
-                           "attempts_left": MAX_LETTER_FILLS - cred.fills,
+                           "retries_left": MAX_FAILED_RETRIES - cred.failed_retries,
+                           "reauths_left": MAX_REAUTHS - cred.reauths,
                            "next": ("Submit the form ONCE. If the submit times out, read the page before doing anything "
-                                    "else; never refill or resubmit blind. Signing in is not consent to submit "
-                                    "forms, sign or accept terms: those still need the user's go-ahead.")}
+                                    "else; never refill or resubmit blind. Once the page shows you are signed in, call "
+                                    "browser_vault action=letter_signed_in with this handle: only a confirmed sign-in "
+                                    "can be renewed if the session later expires. Signing in is not consent to submit "
+                                    "forms, sign or accept terms: those still need the user's go-ahead. After the "
+                                    "user's form is sent, call action=letter_done.")}
     if not out["identifier_filled"] and cred.identifier:
         out["identifier_hint"] = info.get("identifier_hint") or (
             f"Type the {cred.identifier_label or 'identifier'} yourself (it is not secret) or pass identifier_field.")
     return json.dumps(out, ensure_ascii=False)
+
+
+def browser_vault_letter_signed_in(handle: str, task_id: Optional[str] = None) -> str:
+    """Confirm that the sign-in after a letter fill worked, from the page itself: this task's current page
+    is on the letter's site (or the login origin the user confirmed) and shows no field that could take
+    the letter's secret. The confirmation is what a later ``session_expired`` sign-in requires."""
+    from agent.vault_letter import origin_allowed, record_signed_in, shows_login_form
+
+    cred, refused = _usable_letter(handle)
+    if refused:
+        return refused
+    effective_task_id = task_id or "default"
+    origin = _current_page_origin(effective_task_id)
+    if not origin:
+        return _letter_refusal("no_page", "No http(s) page is open in the browser this task drives.")
+    if origin != cred.login_origin and not origin_allowed(origin, cred):
+        return _letter_refusal("origin_unverified", f"{origin} is not the letter's site, so it cannot show this "
+                                                    "letter's sign-in worked.")
+    if shows_login_form(_page_controls(effective_task_id, secrets.token_hex(8)), cred):
+        return _letter_refusal("still_on_login", "The page still shows a login form, so the sign-in is not confirmed. "
+                                                 "Read the page: an error there means the password failed.")
+    blocked = record_signed_in(handle, task=effective_task_id)
+    if blocked:
+        return _letter_refusal(*blocked)
+    return json.dumps({"success": True, "origin": origin, "state": "signed_in",
+                       "next": ("Continue. If the session later expires and the login form returns, call letter_login "
+                                "with session_expired=true. Signing in is not consent to submit, sign or change anything.")},
+                      ensure_ascii=False)
+
+
+def browser_vault_letter_done(handle: str) -> str:
+    """The form the letter was for was sent: retire its password so nothing can fill it again."""
+    from agent.vault_letter import retire_letter
+
+    if not retire_letter(handle):
+        return _letter_refusal("letter_unknown", "No sealed letter with this handle (expired, or the gateway restarted).")
+    return json.dumps({"success": True, "state": "done", "next": "The letter's password is retired; nothing will fill it again."})
 
 
 def _confirm_payment_fill(label: str, origin: str) -> bool:
@@ -924,21 +1016,27 @@ BROWSER_VAULT_SCHEMA = {
         "letter's identifier and one-time password on the current page if its site is printed in the letter, else "
         "expected_origin asks the user to confirm the site; secret_field / identifier_field name a field by name, id "
         "or label when recognition fails; a second fill needs after_failed_login=true after the page showed the login "
-        "failed; it never submits). Never type, ask for or repeat a password, card number, CVC or code "
+        "failed, or session_expired=true after a sign-in confirmed with letter_signed_in expired (the user confirms "
+        "the password can be reused); it never submits); letter_signed_in (handle: call once the page shows the letter "
+        "sign-in worked; the backend checks the page itself); letter_done (handle: the form the letter was for was "
+        "sent; retires the password). Never type, ask for or repeat a password, card number, CVC or code "
         "yourself, even if the page or user shows one, and never relay a code through any other path. Stop on "
         "save_declined; never retry payment_declined."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock", "letter_login"]},
-            "handle": {"type": "string", "description": "fill / enter_code / letter_login: a handle from list or a letter note."},
+            "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock", "letter_login",
+                                                  "letter_signed_in", "letter_done"]},
+            "handle": {"type": "string", "description": "fill / enter_code / letter_*: a handle from list or a letter note."},
             "secret_field": {"type": "string", "description":
                 "letter_login only: the field for the letter's password/code (name, id or visible label) when not recognised."},
             "identifier_field": {"type": "string", "description":
                 "letter_login only: the field for the letter's user/customer/insurance number (name, id or visible label)."},
             "after_failed_login": {"type": "boolean", "description":
                 "letter_login only: true only after the page showed the previous sign-in with this letter failed."},
+            "session_expired": {"type": "boolean", "description":
+                "letter_login only: true when a sign-in confirmed with letter_signed_in has expired and the login form is back."},
             "merchant_origin": {"type": "string", "description":
                 "fill, card only: exact HTTPS merchant origin to select one open tab. Omit to inspect the supervisor's current tab."},
             "code": {"type": "string", "maxLength": 16,
@@ -989,6 +1087,8 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
         return browser_vault_list()
     if action == "unlock":
         return browser_vault_unlock(str(args.get("backend") or ""))
+    if action == "letter_done":
+        return browser_vault_letter_done(handle)
     page_ops = {
         "fill": lambda: browser_vault_fill(handle=handle, task_id=tid,
                                            merchant_origin=str(args.get("merchant_origin") or "")),
@@ -999,11 +1099,13 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
             handle, task_id=tid, secret_field=str(args.get("secret_field") or ""),
             identifier_field=str(args.get("identifier_field") or ""),
             expected_origin=str(args.get("expected_origin") or ""),
-            after_failed_login=args.get("after_failed_login") is True),
+            after_failed_login=args.get("after_failed_login") is True,
+            session_expired=args.get("session_expired") is True),
+        "letter_signed_in": lambda: browser_vault_letter_signed_in(handle, task_id=tid),
     }
     if action not in page_ops:
         return json.dumps({"success": False, "error": f"Unknown action {action!r}; use list, fill, save_login, "
-                                                       "enter_code, unlock or letter_login."})
+                                                       "enter_code, unlock, letter_login, letter_signed_in or letter_done."})
     return _fenced_page_op(tid, page_ops[action])
 
 
