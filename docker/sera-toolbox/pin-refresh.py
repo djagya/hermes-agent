@@ -268,8 +268,7 @@ def main() -> int:
         rows.append((name, old, new or "(lookup failed)", link))
 
     try:
-        if not pins["debian_tag"]:
-            raise ValueError("no pinned debian base in the Dockerfile")
+        # An unparsed base leaves the tag empty: the lookup fails and lands in errors below.
         debian_new = dockerhub_digest("debian", pins["debian_tag"])
         row(f"debian:{pins['debian_tag']}", pins["debian_digest"], debian_new, "https://hub.docker.com/_/debian")
         if args.apply and debian_new and pins["debian_digest"] and debian_new != pins["debian_digest"]:
