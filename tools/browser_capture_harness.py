@@ -194,6 +194,11 @@ def png_size(data: bytes) -> tuple[int, int]:
     return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
 
 
+def guard_sentinel(guard: str) -> Path:
+    """``$HERMES_HOME/payment-capture-guard.sentinel`` beside ``$HERMES_HOME/browser/<marks>.json``."""
+    return Path(guard).parent.parent / "payment-capture-guard.sentinel"
+
+
 def capture_blocked(env: dict[str, str] | None = None) -> bool:
     """Same rule as ``tools.browser_payment_privacy.capture_blocked_for_surface``.
 
@@ -208,7 +213,8 @@ def capture_blocked(env: dict[str, str] | None = None) -> bool:
     try:
         raw = Path(guard).read_text(encoding="utf-8-sig")
     except FileNotFoundError:
-        return False
+        # No mark file is a fresh install, unless the first mark's sentinel says marks were lost.
+        return guard_sentinel(guard).exists()
     except OSError:
         return True
     try:

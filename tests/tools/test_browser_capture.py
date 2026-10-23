@@ -378,9 +378,15 @@ def test_axe_markup_is_scrubbed_before_it_is_written(cap, tmp_path):
     [{"scope": "slot", "slot_id": "", "browser_generation": "g1"}],
     "{not json", {"marks": "nope"},
 ])
-def test_harness_guard_matches_gateway_guard(marks):
+@pytest.mark.parametrize("sentinel", [False, True])
+def test_harness_guard_matches_gateway_guard(marks, sentinel):
+    if sentinel and not hasattr(guard, "_sentinel_path"):
+        pytest.skip("gateway guard without the lost-marks sentinel")
     path = guard._state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    if sentinel:
+        guard._sentinel_path().write_text("{}\n", encoding="utf-8")
+        assert h.guard_sentinel(str(path)) == guard._sentinel_path()
     if marks is None:
         path.unlink(missing_ok=True)
     elif isinstance(marks, str):
