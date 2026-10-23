@@ -21,6 +21,13 @@ after confirming the slot's payment tab is gone. Each clear, automatic or
 operator, is appended to ``payment-capture-guard.log`` beside the file. An
 unreadable mark file refuses every capture.
 
+The first mark also writes a sentinel outside the ``browser/`` directory
+(``$HERMES_HOME/payment-capture-guard.sentinel``). A missing mark file while
+the sentinel exists (a restore or reset that dropped ``browser/``, an ``rm``)
+refuses every capture; a fresh install that never marked has neither and stays
+clean. Restores and resets keep or drop both together; the operator reset is
+deleting both after confirming no payment tab survives.
+
 This prevents accidental capture through standard browser tools; arbitrary
 terminal/code execution is not a containment boundary (see SECURITY.md).
 """
@@ -50,6 +57,10 @@ def _state_path() -> Path:
     return Path(get_hermes_home()) / "browser" / "payment-capture-guard.json"
 
 
+def _sentinel_path() -> Path:
+    return Path(get_hermes_home()) / "payment-capture-guard.sentinel"
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
@@ -59,7 +70,8 @@ def _read_marks(path: Path) -> list[dict[str, Any]] | None:
     try:
         raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
-        return []
+        # Never marked = clean; marked once and the file vanished = untrusted.
+        return None if _sentinel_path().exists() else []
     except OSError:
         return None
     try:
@@ -101,12 +113,16 @@ def mark_payment_session(task_id: str, surface: dict[str, str] | None = None) ->
     slot_id = str((surface or {}).get("slot_id") or "").strip()
     generation = str((surface or {}).get("browser_generation") or "").strip()
     wipe_count = str((surface or {}).get("wipe_count") or "").strip()
+    profile_kind = str((surface or {}).get("profile_kind") or "").strip()
     mark: dict[str, Any] = {"task_id": str(task_id or ""), "marked_at": _now()}
     if slot_id and generation:
         mark.update(scope=SLOT_SCOPE, slot_id=slot_id, browser_generation=generation)
-        # Control's wipe counter for the slot when the card went in; only a
-        # plain decimal is recorded, so a mark without it never auto-clears.
-        if wipe_count.isdecimal() and wipe_count.isascii():
+        if profile_kind:
+            mark["profile_kind"] = profile_kind
+        # Control's wipe counter for a TEMPORARY slot when the card went in; only
+        # a plain decimal is recorded, so a mark without it never auto-clears and
+        # a persistent mark never costs a control lookup.
+        if profile_kind == "temporary" and wipe_count.isdecimal() and wipe_count.isascii():
             mark["wipe_count"] = int(wipe_count)
     else:
         mark["scope"] = PROFILE_SCOPE
@@ -116,6 +132,10 @@ def mark_payment_session(task_id: str, surface: dict[str, str] | None = None) ->
         # An unreadable file already refuses every capture; leave it for the operator.
         if disk is None:
             raise OSError(f"payment capture guard state unreadable: {path}")
+        sentinel = _sentinel_path()
+        if not sentinel.exists():
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.write_text(json.dumps({"guard": str(path), "since": _now()}) + "\n", encoding="utf-8")
         _write_marks(path, disk + [mark])
 
 
@@ -145,7 +165,8 @@ def _prune_wiped(marks: list[dict[str, Any]] | None) -> list[dict[str, Any]] | N
         return marks
     candidates = {
         str(m.get("slot_id")) for m in marks
-        if m.get("scope") == SLOT_SCOPE and m.get("slot_id") and _int_field(m.get("wipe_count")) is not None
+        if m.get("scope") == SLOT_SCOPE and m.get("slot_id") and m.get("profile_kind") == "temporary"
+        and _int_field(m.get("wipe_count")) is not None
     }
     if not candidates:
         return marks
@@ -166,7 +187,8 @@ def _prune_wiped(marks: list[dict[str, Any]] | None) -> list[dict[str, Any]] | N
 
     def stale(mark: dict[str, Any]) -> bool:
         row = rows.get(str(mark.get("slot_id") or ""))
-        return mark.get("scope") == SLOT_SCOPE and row is not None and _wiped_since(mark, row)
+        return (mark.get("scope") == SLOT_SCOPE and mark.get("profile_kind") == "temporary" and row is not None
+                and _wiped_since(mark, row))
 
     with _LOCK:
         path = _state_path()
@@ -250,6 +272,19 @@ def clear_payment_surface(slot_id: str, *, confirmed_by: str) -> int:
         return len(removed)
 
 
+def reset_guard(*, confirmed_by: str) -> None:
+    """Operator-only: start an empty mark file (after a restore lost it, with the sentinel kept).
+    Only after confirming no slot still shows a payment tab; audited like a clear."""
+    if not str(confirmed_by or "").strip():
+        raise ValueError("confirmed_by is required")
+    with _LOCK:
+        path = _state_path()
+        _write_marks(path, [])
+        with path.with_suffix(".log").open("a", encoding="utf-8") as log:
+            log.write(json.dumps({"cleared_at": _now(), "slot_id": "*reset*", "confirmed_by": confirmed_by,
+                                  "marks": []}, sort_keys=True) + "\n")
+
+
 _CAPTURE_TOKENS = ("screenshot", "printtopdf", "screencast", "recording")
 
 
@@ -299,7 +334,13 @@ def main(argv: list[str] | None = None) -> int:
     clear = sub.add_parser("clear", help="only after confirming the slot's payment tab is gone")
     clear.add_argument("slot_id", help="managed slot id, or 'profile' for profile-wide marks")
     clear.add_argument("--confirmed-by", required=True)
+    reset = sub.add_parser("reset", help="mark file lost (sentinel present): start empty, after confirming no payment tab")
+    reset.add_argument("--confirmed-by", required=True)
     ns = parser.parse_args(argv)
+    if ns.cmd == "reset":
+        reset_guard(confirmed_by=ns.confirmed_by)
+        print("payment capture guard reset to no marks")
+        return 0
     if ns.cmd == "list":
         marks = _read_marks(_state_path())
         if marks is None:

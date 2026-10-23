@@ -445,6 +445,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                 self._page_session_id = None
                 self._reset_dialog_tabs()
                 await self._attach_initial_page()
+                await self._rewatch_dialog_tabs()
                 self._set_active(True)
                 last_success_at = time.time()
                 reconnect_failures = redial_failures = 0

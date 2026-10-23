@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -62,3 +64,52 @@ def test_status_hides_lease_ids(monkeypatch, held):
     out = _call(action="status")
     assert out["slots"] == [{"slot_id": "research-1", "state": "agent", "mine": True}]
     assert "lease-1" not in json.dumps(out)
+
+
+@pytest.fixture
+def upload_ready(monkeypatch, held):
+    sent = []
+
+    class Resp:
+        def read(self):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(tool, "urlopen", lambda req, timeout: (sent.append(req.full_url), Resp())[1])
+    return sent
+
+
+def test_upload_refuses_hermes_secrets_and_symlink_escapes(upload_ready, held):
+    from hermes_constants import get_hermes_home
+
+    home = Path(get_hermes_home())
+    secret = home / ".env"
+    secret.write_text("KEY=1\n", encoding="utf-8")
+    assert "error" in _call(action="upload", path=str(secret))
+    (held / ".env").write_text("KEY=1\n", encoding="utf-8")
+    assert "credential or hidden" in _call(action="upload", path=str(held / ".env"))["error"]
+    outside = Path(tempfile.mkdtemp()) / "notes.txt"
+    outside.write_text("private\n", encoding="utf-8")
+    (held / "report.pdf").symlink_to(outside)  # an innocent name inside the workspace, pointing out of it
+    assert "Uploads come only" in _call(action="upload", path=str(held / "report.pdf"))["error"]
+    assert upload_ready == []
+
+
+def test_upload_from_the_workspace_is_staged(upload_ready, held):
+    (held / "cv.pdf").write_bytes(b"%PDF-1")
+    out = _call(action="upload", path=str(held / "cv.pdf"))
+    assert out["staged"] == "/staging/cv.pdf" and len(upload_ready) == 1
+
+
+def test_cancel_refuses_a_ticket_this_task_was_not_issued(monkeypatch, held):
+    posts = []
+    monkeypatch.setattr(route, "post_json", lambda path, payload: (posts.append(payload), {"cancelled": "q"})[1])
+    assert "not issued to this task" in _call(action="cancel", request_id="q-other")["error"]
+    route._remember_ticket("t1", "q-mine")
+    assert _call(action="cancel", request_id="q-mine")["cancelled"] == "q-mine"
+    assert posts == [{"request_id": "q-mine", "task": "t1"}]

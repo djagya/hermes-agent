@@ -247,6 +247,8 @@ def busy_fields(reply: dict[str, Any]) -> dict[str, Any]:
     retry = _retry_after(reply)
     if retry is not None:
         fields["retry_after_s"] = retry
+    if reply.get("left_queue"):
+        fields["left_queue"] = True
     return fields
 
 
@@ -263,9 +265,11 @@ def _format_error(lease: dict[str, Any]) -> str:
             queue.append(f"position {fields['position']}")
         if "retry_after_s" in fields:
             queue.append(f"retry after {fields['retry_after_s']:g}s")
+        if fields.get("left_queue"):
+            queue.append("waited, then left the line; call again later")
         where = f" ({', '.join(queue)})" if queue else ""
         return RouteError(
-            f"busy: {extra}{where} — retry this call later or cancel the ticket; "
+            f"busy: {extra}{where} — retry this call later (or cancel a ticket you still hold); "
             "do not use a local, cloud, or CDP fallback",
             fields,
         )
@@ -410,6 +414,41 @@ def held_leases_for_task(task_id: Optional[str]) -> list[dict[str, str]]:
     return out
 
 
+# Handoffs this process minted: (task, slot, agent lease) -> expiry (monotonic). The gateway's
+# handback route wakes a session only for a handoff it minted or a lease it still holds.
+_HANDOFF_MAX_S = 2 * 3600.0
+_handoffs_lock = threading.Lock()
+_minted_handoffs: dict[tuple[str, str, str], float] = {}
+
+
+def note_handoff(task_id: Optional[str], slot_id: str, lease_id: str, expires_in: Any = None) -> None:
+    try:
+        ttl = min(max(float(expires_in or 0), 0.0) + 1800.0, _HANDOFF_MAX_S)
+    except (TypeError, ValueError):
+        ttl = _HANDOFF_MAX_S
+    key = (str(task_id or "").strip() or "default", str(slot_id or ""), str(lease_id or ""))
+    now = _monotonic()
+    with _handoffs_lock:
+        for stale in [k for k, until in _minted_handoffs.items() if until <= now]:
+            _minted_handoffs.pop(stale, None)
+        _minted_handoffs[key] = now + ttl
+
+
+def claim_handback(task_id: str, slot_id: str, lease_id: str) -> bool:
+    """True (once) when ``task_id`` minted a handoff for this slot + agent lease, or still
+    holds that lease. A minted handoff is consumed by the claim."""
+    key = (str(task_id or "").strip() or "default", str(slot_id or ""), str(lease_id or ""))
+    if not key[1] or not key[2]:
+        return False
+    now = _monotonic()
+    with _handoffs_lock:
+        until = _minted_handoffs.pop(key, 0.0)
+    if until > now:
+        return True
+    return any(lease.get(MANAGED_SLOT_ENV) == key[1] and lease.get(MANAGED_LEASE_ENV) == key[2]
+               for lease in held_leases_for_task(key[0]))
+
+
 def _forget_held(key: str) -> None:
     with _held_lock:
         _held_leases.pop(key, None)
@@ -488,26 +527,86 @@ def _acquire_waiting(
     human for this task, or a refusal without a ticket, returns at once.
     A ``stale`` reply (reconnect with an old generation/epoch) is retried once.
     """
-    deadline = _monotonic() + max(wait_s, 0.0)
+    started = _monotonic()
+    deadline = started + max(wait_s, 0.0)
     ticket = ""
     stale_retried = False
+    try:
+        while True:
+            lease = _acquire(
+                control, task=task, mode=mode, identity=identity, qa_targets=qa_targets,
+                **({"ticket": ticket} if ticket else {}),
+            )
+            if lease.get("error") == "stale" and not stale_retried:
+                stale_retried = True
+                continue
+            if lease.get("error") != "busy":
+                return lease
+            ticket = str(lease.get("ticket") or lease.get("queued") or "")
+            if not ticket:
+                return lease
+            _remember_ticket(task, ticket)
+            pause = _retry_after(lease) or DEFAULT_RETRY_AFTER_S
+            if wait_s <= 0:
+                return lease  # no budget: report the ticket, the caller decides
+            if _monotonic() + pause > deadline or not _pause(pause):
+                # Gave up or /stop: leave the line so an idle slot is not held for a waiter that left.
+                _cancel_ticket(control, task, ticket)
+                lease = {k: v for k, v in lease.items() if k not in {"queued", "ticket"}}
+                lease["left_queue"] = True
+                return lease
+    finally:
+        _wait_state.waited = _monotonic() - started
+
+
+def _pause(seconds: float) -> bool:
+    """Sleep in short slices; False as soon as the turn is interrupted (/stop)."""
+    end = _monotonic() + seconds
     while True:
-        lease = _acquire(
-            control, task=task, mode=mode, identity=identity, qa_targets=qa_targets,
-            **({"ticket": ticket} if ticket else {}),
-        )
-        if lease.get("error") == "stale" and not stale_retried:
-            stale_retried = True
-            continue
-        if lease.get("error") != "busy":
-            return lease
-        ticket = str(lease.get("ticket") or lease.get("queued") or "")
-        if not ticket:
-            return lease
-        pause = _retry_after(lease) or DEFAULT_RETRY_AFTER_S
-        if _monotonic() + pause > deadline:
-            return lease
-        _sleep(pause)
+        if _interrupted():
+            return False
+        left = end - _monotonic()
+        if left <= 0:
+            return True
+        _sleep(min(left, 1.0))
+
+
+def _interrupted() -> bool:
+    try:
+        from tools.interrupt import is_interrupted
+    except ImportError:
+        return False
+    return is_interrupted()
+
+
+_tickets_lock = threading.Lock()
+_issued_tickets: dict[str, set[str]] = {}
+_wait_state = threading.local()
+
+
+def _remember_ticket(task: str, ticket: str) -> None:
+    with _tickets_lock:
+        tickets = _issued_tickets.setdefault(task, set())
+        tickets.add(ticket)
+        if len(tickets) > 64:
+            tickets.pop()
+
+
+def ticket_issued_to(task_id: Optional[str], ticket: str) -> bool:
+    with _tickets_lock:
+        return ticket in _issued_tickets.get(str(task_id or "browser-exec"), set())
+
+
+def _cancel_ticket(control: str, task: str, ticket: str) -> None:
+    """Best effort ``POST /v1/cancel``; control refuses another task's ticket."""
+    _post(control, "/v1/cancel", {"request_id": ticket, "task": task})
+    with _tickets_lock:
+        _issued_tickets.get(task, set()).discard(ticket)
+
+
+def last_busy_wait_s() -> float:
+    """Seconds this thread's last managed acquire spent waiting in line."""
+    return float(getattr(_wait_state, "waited", 0.0) or 0.0)
 
 
 def resolve_managed_cdp(
@@ -528,9 +627,10 @@ def resolve_managed_cdp(
 
     A ``stale`` acquire (reconnect with an old generation/epoch) is retried
     once. ``busy`` waits in control's fair queue for up to ``wait_s``
-    (default :func:`busy_wait_budget`), then returns a :class:`RouteError`
-    carrying the ticket; never fall back.
+    (default 0: no wait), then leaves the queue and returns a
+    :class:`RouteError` carrying the position; never fall back.
     """
+    _wait_state.waited = 0.0
     control = control_url()
     if not control:
         return "unavailable: managed control URL missing"
@@ -556,7 +656,8 @@ def resolve_managed_cdp(
             identity=payload_identity,
             qa_targets=_coerce_targets(qa_targets),
             reconnect=reconnect,
-            wait_s=busy_wait_budget() if wait_s is None else max(float(wait_s), 0.0),
+            # Only browser_exec passes a budget; built-in paths and gates never wait.
+            wait_s=0.0 if wait_s is None else max(float(wait_s), 0.0),
         )
 
 
@@ -713,3 +814,15 @@ def release_all_held_leases() -> None:
 
 
 atexit.register(release_all_held_leases)
+
+
+def _harden_key_holder() -> None:
+    """The process that holds the control key (the gateway) keeps it out of same-uid
+    ``/proc/<pid>/environ`` reads (``tools/browser_process_hardening.py``)."""
+    if (os.environ.get(MANAGED_KEY_ENV) or os.environ.get(MANAGED_KEY_FILE_ENV) or "").strip():
+        from tools.browser_process_hardening import make_undumpable
+
+        make_undumpable()
+
+
+_harden_key_holder()

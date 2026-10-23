@@ -10,6 +10,7 @@ service-account authentication works as well as interactive sessions.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -136,26 +137,25 @@ class OnePasswordLoginBackend(LoginBackend):
     def _classify(self, err: str) -> Exception:
         """The typed failure for an ``op`` error (``UnlockRequired`` locks the interactive session)."""
         low = err.lower()
-        if any(m in low for m in ("one-time", "totp", " otp")):
-            return BackendError(self.display_name, f"op failed: {err}")  # no OTP field: not an outage
         if any(m in low for m in _RATE_MARKERS):
             return BackendRateLimited(self.display_name, err)
-        if any(m in low for m in _NOT_FOUND_MARKERS):
-            return ItemNotFound(self.display_name, err)
-        if self._service_token and (any(m in low for m in _AUTH_MARKERS) or any(m in low for m in _SESSION_MARKERS)):
+        auth = any(m in low for m in _AUTH_MARKERS) or any(m in low for m in _SESSION_MARKERS)
+        if auth and self._service_token:
             # A service-account / Connect token cannot be fixed by an interactive unlock.
             return BackendAuthExpired(self.display_name, err)
-        if any(m in low for m in _SESSION_MARKERS) or any(m in low for m in _AUTH_MARKERS):
+        if auth:
             _unlock.lock(self.name)
             return UnlockRequired(self)
+        if any(m in low for m in _NOT_FOUND_MARKERS):
+            return ItemNotFound(self.display_name, err)
         if any(m in low for m in _NETWORK_MARKERS):
             return BackendNetwork(self.display_name, err)
         return BackendError(self.display_name, f"op failed: {err}")
 
     def _list_cache_key(self) -> tuple:
         home, generation = _unlock.generation(self.name)
-        return (home, generation, str(self.cfg.get("account") or ""), str(self.cfg.get("vault") or "").strip(),
-                bool(self._service_token))
+        token = hashlib.sha256(self._service_token.encode()).hexdigest()[:16] if self._service_token else ""
+        return (home, generation, str(self.cfg.get("account") or ""), str(self.cfg.get("vault") or "").strip(), token)
 
     # ── backend contract ───────────────────────────────────────────────────
     def list_items(self) -> list[VaultItemMeta]:
@@ -263,11 +263,19 @@ class OnePasswordLoginBackend(LoginBackend):
             if vault_id:
                 args += ["--vault", vault_id]
             code = self._run(*args, "--otp").strip()
-        except (ItemNotFound, BackendRateLimited, BackendAuthExpired, BackendNetwork):
+        except BackendError as exc:
+            if _no_otp_field(exc.detail) or type(exc) is BackendError:
+                return None  # the item has no TOTP seed: the user is asked instead
             raise
         except Exception:
             return None
         return code if code.isdigit() else None
+
+
+def _no_otp_field(detail: str) -> bool:
+    """op's "this item has no one-time password" refusal (not an outage)."""
+    low = (detail or "").lower()
+    return "one-time password" in low and any(m in low for m in ("no ", "doesn't have", "does not have", "not have"))
 
 
 def _web_origins(origins: list[str]) -> tuple:

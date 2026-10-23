@@ -723,7 +723,8 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
     route = {"cdp": cdp, "lease": str(env.get("HERMES_BROWSER_LEASE_ID") or ""), "error": "",
              "slot_id": str(env.get("HERMES_BROWSER_SLOT_ID") or ""),
              "browser_generation": str(env.get("HERMES_BROWSER_GENERATION") or ""),
-             "wipe_count": str(env.get("HERMES_BROWSER_WIPE_COUNT") or "")}
+             "wipe_count": str(env.get("HERMES_BROWSER_WIPE_COUNT") or ""),
+             "profile_kind": str(env.get("HERMES_BROWSER_PROFILE_KIND") or "")}
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
         from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
@@ -878,6 +879,13 @@ def _managed_busy_wait(timeout_s: Any) -> Optional[float]:
     return busy_wait_budget(_clamp_timeout(timeout_s))
 
 
+def _managed_waited_s(managed: bool) -> float:
+    if not managed:
+        return 0.0
+    from tools.browser_control_route import last_busy_wait_s
+    return last_busy_wait_s()
+
+
 def _arm_dialogs(managed: bool, task_id: Optional[str], env: dict, on_dialog: str, identity: str) -> None:
     """Managed slots: this call's page-dialog policy on the task's supervisor (``tools.browser_exec_dialogs``)."""
     if managed:
@@ -986,6 +994,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         # The controller key stays in Hermes: browser_control does control calls for the model.
         env.pop("HERMES_BROWSER_CONTROL_KEY", None)
         env.pop("HERMES_BROWSER_CONTROL_KEY_FILE", None)
+        # Harness processes carry the slot's command token: make them undumpable (Linux).
+        from tools.browser_process_hardening import harden_harness_env
+        harden_harness_env(env)
 
     workspace = _workspace_dir(task_id)
     if workspace:
@@ -1005,7 +1016,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     ):
         env["BU_AUTOSPAWN"] = "1"
 
-    timeout = _clamp_timeout(timeout_s)
+    # The time spent waiting in control's queue comes out of this call's budget.
+    timeout = max(_MIN_TIMEOUT_S, _clamp_timeout(timeout_s) - int(_managed_waited_s(managed)))
     started = time.time()
 
     def dispatch() -> dict[str, Any]:
@@ -1044,7 +1056,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         rerouted.pop("BU_CDP_URL", None)
         rerouted.pop("BU_CDP_WS", None)
         if not _route_backend(
-            rerouted, session, task_id, False, mode=mode, identity=identity, qa_targets=qa_targets,
+            rerouted, session, task_id, False, mode=mode, identity=identity, qa_targets=qa_targets, wait_s=0,
         ) and rerouted.get("BU_CDP_URL") and rerouted.get("BU_CDP_URL") != before:
             rerouted.pop(_PRIVATE_BROWSER_SENTINEL, None)
             rerouted.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)

@@ -122,6 +122,8 @@ class PendingDialog:
     bridge_request_id: Optional[str] = None
     # Page URL (or origin) the dialog came from, when CDP reported one; feeds the decider.
     url: str = ""
+    # The tab's top-level URL: a cross-origin widget on /checkout raises dialogs from its own URL.
+    top_url: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return _dialog_dict(self, ("id", "type", "message", "default_prompt", "opened_at", "frame_id"))
@@ -236,6 +238,16 @@ class DialogSupervisionMixin:
             self.dialog_policy
         )
 
+    def _dialog_top_url(self, session_id: Optional[str]) -> str:
+        """Top-level URL of the tab the dialog's session belongs to (best effort, "" when unknown)."""
+        tabs = self._dialog_tabs()
+        for target, sid in tabs.items():
+            if sid and sid == session_id:
+                return self._dialog_tab_urls().get(target, "")
+        with self._state_lock:
+            tops = [f for f in self._frames.values() if not f.parent_frame_id and not f.is_oopif and f.url]
+        return tops[0].url if tops else ""
+
     def _admit_dialog(self, *, type: str, message: str, default_prompt: str, session_id: Optional[str],
                       frame_id: Optional[str], bridge_request_id: Optional[str] = None, url: str = "") -> None:
         """Create the dialog and apply the policy: auto-respond, or queue + arm the watchdog.
@@ -246,6 +258,7 @@ class DialogSupervisionMixin:
             id=f"d-{self._dialog_seq}", type=type, message=message, default_prompt=default_prompt,
             opened_at=time.time(), cdp_session_id=session_id or self._page_session_id or "",
             frame_id=frame_id, bridge_request_id=bridge_request_id, url=self._dialog_page_url(frame_id, url),
+            top_url=self._dialog_top_url(session_id),
         )
         auto = self._decide_dialog(dialog)
         if auto is not None:
@@ -347,23 +360,46 @@ class DialogSupervisionMixin:
     # the frame tree and payment inspection still describe the main page.
 
     def _dialog_tabs(self) -> dict[str, str]:
+        """target id -> session id ("" while the attach is in flight: reserves the target)."""
         tabs = getattr(self, "_dialog_tab_sessions", None)
         if tabs is None:
-            tabs = self._dialog_tab_sessions = {}  # target id -> session id
+            tabs = self._dialog_tab_sessions = {}
         return tabs
+
+    def _dialog_tab_urls(self) -> dict[str, str]:
+        urls = getattr(self, "_dialog_tab_url_map", None)
+        if urls is None:
+            urls = self._dialog_tab_url_map = {}
+        return urls
 
     def _reset_dialog_tabs(self) -> None:
         """A new connection: every per-tab session died with the old socket."""
         self._dialog_tabs().clear()
+        self._dialog_tab_urls().clear()
 
     def _dialog_tab_event_ignored(self, method: str, params: dict[str, Any], session_id: Optional[str]) -> bool:
         tabs = self._dialog_tabs()
+        if method == "Target.attachedToTarget":
+            # Flattened attach announces the session before the attach reply resumes _watch_tab:
+            # bind it now so none of the tab's frame events reach the main page's frame tree.
+            target = str((params.get("targetInfo") or {}).get("targetId") or "")
+            if target in tabs and not tabs[target]:
+                tabs[target] = str(params.get("sessionId") or "")
+                return True
+            return False
         if method == "Target.detachedFromTarget":
             sid = params.get("sessionId")
             for target, tab_sid in list(tabs.items()):
-                if tab_sid == sid:
+                if tab_sid and tab_sid == sid:
                     tabs.pop(target, None)
+                    self._dialog_tab_urls().pop(target, None)
                     return True
+            return False
+        if method == "Target.targetInfoChanged":
+            info = params.get("targetInfo") or {}
+            target = str(info.get("targetId") or "")
+            if target in tabs:
+                self._dialog_tab_urls()[target] = str(info.get("url") or "")
             return False
         if method == "Target.targetCreated":
             return False
@@ -371,15 +407,20 @@ class DialogSupervisionMixin:
             return False
         return method not in {"Page.javascriptDialogOpening", "Page.javascriptDialogClosed", "Fetch.requestPaused"}
 
-    async def _watch_tab(self, target_id: str) -> None:
+    async def _watch_tab(self, target_id: str, url: str = "") -> None:
         tabs = self._dialog_tabs()
         if not target_id or target_id in tabs or target_id == getattr(self, "_main_page_target", None):
             return
+        tabs[target_id] = ""  # reserved before the await: a concurrent caller sees it and returns
+        if url:
+            self._dialog_tab_urls()[target_id] = url
         try:
             attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=3.0)
             sid = attach["result"]["sessionId"]
         except Exception as e:  # health: allow BLE001 -- a closed or hung tab is skipped; the others stay watched
             logger.debug("dialog tab attach failed for %s: %s", target_id[:12], e)
+            if not tabs.get(target_id):
+                tabs.pop(target_id, None)
             return
         tabs[target_id] = sid
         await self._cdp_quiet("Page.enable", {}, session_id=sid, timeout=3.0, what="dialog tab")
@@ -392,8 +433,17 @@ class DialogSupervisionMixin:
         targets = (await self._cdp("Target.getTargets", timeout=3.0)).get("result", {}).get("targetInfos", [])
         for target in targets:
             if target.get("type") == "page":
-                await self._watch_tab(str(target.get("targetId") or ""))
+                await self._watch_tab(str(target.get("targetId") or ""), str(target.get("url") or ""))
         return len(self._dialog_tabs())
+
+    async def _rewatch_dialog_tabs(self) -> None:
+        """After a reconnect: discovery and the per-tab sessions died with the socket; restore them."""
+        if not getattr(self, "_watch_new_tabs", False):
+            return
+        try:
+            await self._watch_dialog_tabs()
+        except Exception as e:  # health: allow BLE001 -- best effort; the next browser_exec re-arms
+            logger.debug("dialog tab re-watch failed: %s", e)
 
     def watch_dialog_tabs(self, timeout: float = 8.0) -> int:
         """Capture dialogs on every tab of this browser, now and as tabs open. Sync bridge;
@@ -413,7 +463,7 @@ class DialogSupervisionMixin:
             # Off the reader: _watch_tab awaits replies only the reader can deliver. _watch_tab
             # swallows its own failures; the set keeps the task referenced until it finishes.
             tasks = self.__dict__.setdefault("_dialog_tab_tasks", set())
-            task = asyncio.create_task(self._watch_tab(str(info.get("targetId") or "")))
+            task = asyncio.create_task(self._watch_tab(str(info.get("targetId") or ""), str(info.get("url") or "")))
             tasks.add(task)
             task.add_done_callback(tasks.discard)
 

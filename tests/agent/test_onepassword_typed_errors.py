@@ -80,3 +80,24 @@ def test_item_list_is_cached_until_lock():
         onepassword._unlock.lock(backend.name)
         _backend("svc").list_items()
         assert run.call_count == 2
+
+
+def test_a_missing_session_is_unlock_not_item_not_found():
+    backend = _backend("")
+    with patch.object(onepassword, "find_op", return_value="/bin/op"), \
+         patch.object(onepassword._unlock, "get_session_token", return_value="sess"), \
+         patch.object(onepassword, "run_cli", return_value=_fail("[ERROR] session abc does not exist")):
+        with pytest.raises(UnlockRequired):
+            backend._run("item", "list")
+
+
+def test_str_of_a_typed_error_carries_no_cli_text():
+    assert "Secret Bank" not in str(ItemNotFound("1Password", "\"Secret Bank\" isn't an item"))
+
+
+def test_a_different_service_token_misses_the_cache():
+    items = json.dumps([{"id": "a", "title": "Shop", "urls": [{"href": "https://shop.example"}]}])
+    with patch.object(OnePasswordLoginBackend, "_run", return_value=items) as run:
+        _backend("token-a").list_items()
+        _backend("token-b").list_items()
+        assert run.call_count == 2

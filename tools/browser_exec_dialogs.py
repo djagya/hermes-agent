@@ -9,24 +9,27 @@ hidden in Browser Use mode).
 Managed mode arms a decider on the task's CDP supervisor for each exec:
 
 - ``alert`` is closed (it has one button; closing it decides nothing);
-- on an ordinary page ``confirm``/``prompt`` are dismissed and
-  ``beforeunload`` is accepted (the navigation the code asked for goes on),
-  or every dialog follows the call's ``on_dialog`` (``accept``/``dismiss``);
-- on a consequential page (this slot holds a card-fill mark, the
-  ``sensitive`` identity, a payment-provider frame, or payment/checkout/
-  delete/transfer wording in the URL or message) nothing but an alert is
-  answered automatically, whatever ``on_dialog`` says: the dialog stays
-  pending and is reported, and the agent answers it explicitly with
-  ``browser_control action=dialog`` after reading its text.
+- ``beforeunload`` is accepted (it only leaves the page) unless the call says
+  ``on_dialog=dismiss``, and held on the first exec after a human handoff,
+  where it would throw away what Danil typed;
+- ``confirm``/``prompt`` are never accepted automatically. On an ordinary page
+  they are dismissed (``auto``/``dismiss``) or held for an explicit answer
+  (``on_dialog=accept``). On a consequential page they are always held: the
+  ``shopping``, ``work:*`` or ``sensitive`` identity, a slot with a card-fill
+  mark, a payment-provider frame, or buy/checkout/payment/order/delete/
+  transfer/subscription/confirm/cancel wording (EN, DE, FR, ES, IT, NL) in the
+  dialog's URL, the tab's top-level URL or the message.
 
-The exec result carries ``dialogs``: what is still pending and what was
-answered during the call.
+A held dialog is answered with ``browser_control action=dialog`` after the
+agent has read its text. The exec result carries ``dialogs``: what is still
+pending and what was answered during the call.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
@@ -35,15 +38,27 @@ logger = logging.getLogger(__name__)
 
 ON_DIALOG_CHOICES = ("auto", "accept", "dismiss")
 
-# Words that make a dialog consequential when they appear in the page URL or
-# the dialog text (English and German: the slots browse German sites).
-_CONSEQUENTIAL_RE = re.compile(
-    r"checkout|payment|\bpay\b|/pay|billing|purchase|\border\b|/order|bestell|kaufen|kostenpflichtig|zahlung|bezahl|"
-    r"subscription|abonnement|\bdelete\b|l[öo]schen|remove account|transfer|[üu]berweis|"
-    r"cancel (?:my )?(?:account|subscription|order)|k[üu]ndig|confirm (?:payment|purchase|order)",
-    re.IGNORECASE,
+# Words that make a dialog consequential when they appear in the page URLs or the dialog
+# text. Over-matching only costs an explicit answer; under-matching can accept an order.
+_CONSEQUENTIAL_WORDS = (
+    # English
+    r"checkout|check-out|payment|\bpay\b|/pay|billing|purchase|\bbuy|\border|/order|subscri|unsubscri|"
+    r"\bdelete|\bremove|discard|deactivate|close (?:my |your )?account|\bcancel|\bconfirm|transfer|refund|"
+    r"\bcart\b|basket"
+    # German
+    r"|kasse|warenkorb|bestell|kaufen|\bkauf|kostenpflichtig|zahlung|bezahl|best[äa]tig|abschlie[ßs]|storn|"
+    r"entfern|widerruf|l[öo]sch|k[üu]ndig|abonn|[üu]berweis"
+    # French
+    r"|paiement|payer|commande|acheter|achat|panier|supprimer|confirmer|annuler|d[ée]sabonn|virement"
+    # Spanish
+    r"|\bpago|pagar|pedido|comprar|\bcompra|carrito|eliminar|borrar|confirmar|cancelar|suscripci|transferencia"
+    # Italian
+    r"|pagamento|pagare|ordine|acquist|carrello|elimina|conferma|annulla|bonifico"
+    # Dutch
+    r"|betal|bestelling|kopen|winkelwagen|verwijder|bevestig|annuleer|overboeking|afrekenen"
 )
-
+_CONSEQUENTIAL_RE = re.compile(_CONSEQUENTIAL_WORDS, re.IGNORECASE)
+_CONSEQUENTIAL_IDENTITIES = ("shopping", "sensitive")
 
 def _origin(url: str) -> str:
     try:
@@ -68,38 +83,60 @@ def _payment_provider_origin(url: str) -> bool:
 
 
 def consequential(dialog: Any, *, slot_marked: bool, identity: str) -> bool:
-    """Whether a dialog must be held for an explicit answer."""
-    if slot_marked or (identity or "").strip().lower() == "sensitive":
+    """Whether a confirm/prompt must be held for an explicit answer."""
+    ident = (identity or "").strip().lower()
+    if slot_marked or ident in _CONSEQUENTIAL_IDENTITIES or ident.startswith("work:"):
         return True
-    url = str(getattr(dialog, "url", "") or "")
-    if _payment_provider_origin(url):
+    urls = [str(getattr(dialog, "url", "") or ""), str(getattr(dialog, "top_url", "") or "")]
+    if any(_payment_provider_origin(url) for url in urls):
         return True
-    text = f"{url} {getattr(dialog, 'message', '') or ''}"
+    text = " ".join(urls + [str(getattr(dialog, "message", "") or "")])
     return bool(_CONSEQUENTIAL_RE.search(text))
 
 
-def make_decider(*, on_dialog: str, slot_marked: bool, identity: str) -> Callable[[Any], str]:
+def make_decider(*, on_dialog: str, slot_marked: bool, identity: str,
+                 after_handoff: bool = False) -> Callable[[Any], str]:
     choice = on_dialog if on_dialog in ON_DIALOG_CHOICES else "auto"
 
     def decide(dialog: Any) -> str:
         kind = str(getattr(dialog, "type", "") or "")
         if kind == "alert":
             return "accept"
+        if kind == "beforeunload":
+            if choice == "dismiss":
+                return "dismiss"
+            # Leaving only drops unsaved input; right after a handoff that input is Danil's.
+            return "hold" if after_handoff else "accept"
         if consequential(dialog, slot_marked=slot_marked, identity=identity):
             return "hold"
-        if choice in {"accept", "dismiss"}:
-            return choice
-        return "accept" if kind == "beforeunload" else "dismiss"
+        # A confirm/prompt is accepted only by an explicit answer after reading it.
+        return "hold" if choice == "accept" else "dismiss"
 
     return decide
 
 
-def _slot_marked(env: dict) -> bool:
-    """Any card-fill mark on this lease's slot (raw marks, no control lookup: fail closed)."""
-    try:
-        from tools.browser_payment_privacy import slot_has_mark
+# Tasks whose next exec follows a human handoff (minted by browser_control, or a handback wake).
+_after_handoff: set[str] = set()
+_after_handoff_lock = threading.Lock()
 
-        return slot_has_mark(str(env.get("HERMES_BROWSER_SLOT_ID") or ""))
+
+def note_handoff(task_id: Optional[str]) -> None:
+    with _after_handoff_lock:
+        _after_handoff.add(task_id or "default")
+
+
+def _take_handoff_flag(task_id: Optional[str]) -> bool:
+    with _after_handoff_lock:
+        return (task_id or "default") in _after_handoff
+
+
+def _slot_marked(env: dict) -> bool:
+    """Any card-fill mark on this lease's slot, after control-attested wipes are pruned (fail closed)."""
+    try:
+        from tools.browser_payment_privacy import capture_blocked_for_surface
+
+        return capture_blocked_for_surface(str(env.get("HERMES_BROWSER_SLOT_ID") or ""),
+                                           str(env.get("HERMES_BROWSER_GENERATION") or ""))
     except Exception:  # health: allow BLE001 -- unreadable marks: treat the page as consequential
         return True
 
@@ -120,18 +157,24 @@ def arm(task_id: Optional[str], env: dict, *, on_dialog: str, identity: str) -> 
     supervisor = _supervisor(task_id)
     if supervisor is None:
         return started
-    supervisor.dialog_decider = make_decider(on_dialog=on_dialog, slot_marked=_slot_marked(env), identity=identity)
+    supervisor.dialog_decider = make_decider(on_dialog=on_dialog, slot_marked=_slot_marked(env), identity=identity,
+                                             after_handoff=_take_handoff_flag(task_id))
     watch = getattr(supervisor, "watch_dialog_tabs", None)
     if callable(watch):
         watch()
     return started
 
 
-def disarm(task_id: Optional[str], env: dict, *, identity: str) -> None:
-    """Back to the default decider between calls (a call's ``on_dialog`` never outlives it)."""
+def disarm(task_id: Optional[str], env: dict, *, identity: str, dispatched: bool = True) -> None:
+    """Back to the default decider between calls (a call's ``on_dialog`` never outlives it). A call
+    that reached the browser consumes the post-handoff flag."""
+    if dispatched:
+        with _after_handoff_lock:
+            _after_handoff.discard(task_id or "default")
     supervisor = _supervisor(task_id)
     if supervisor is not None:
-        supervisor.dialog_decider = make_decider(on_dialog="auto", slot_marked=_slot_marked(env), identity=identity)
+        supervisor.dialog_decider = make_decider(on_dialog="auto", slot_marked=_slot_marked(env), identity=identity,
+                                                 after_handoff=_take_handoff_flag(task_id))
 
 
 def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
@@ -148,6 +191,7 @@ def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
         row = dialog.to_dict()
         row.pop("opened_at", None)
         row["url"] = _origin(getattr(dialog, "url", "")) or ""
+        row["page"] = _origin(getattr(dialog, "top_url", "")) or ""
         pending.append(row)
     handled = []
     for record in snap.recent_dialogs:

@@ -38,8 +38,9 @@ class BackendError(RuntimeError):
 
     def __init__(self, backend: str, detail: str = ""):
         self.backend = backend
+        # Scrubbed CLI text (may name items): kept for classification, never in str()/logs.
         self.detail = (detail or "")[:200]
-        super().__init__(f"{backend}: {self.detail or self.error_type}")
+        super().__init__(f"{backend}: {self.error_type}")
 
     def message(self) -> str:
         return f"{self.backend}: {self.advice}"

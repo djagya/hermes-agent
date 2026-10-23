@@ -108,7 +108,9 @@ def _status(task_id: Optional[str]) -> str:
         "slots": [_public_row(row, mine) for row in slots.values() if isinstance(row, dict)],
         "held_by_this_task": [{"slot_id": lease.get(route.MANAGED_SLOT_ENV, ""), "identity": lease.get("identity", ""),
                                "mode": lease.get("mode", "")} for lease in held],
-        "queue_length": len(data.get("queue") or []),
+        # Live waiters only (newer control); older control listed every request id.
+        "queue_length": data.get("queue_length") if isinstance(data.get("queue_length"), int)
+        else len(data.get("queue") or []),
         "handoff_available": bool(handoff.get("available")),
     })
 
@@ -126,10 +128,13 @@ def _release(task_id: Optional[str], identity: str, mode: str) -> str:
                         "note": "The slot is free; the next browser_exec acquires afresh."})
 
 
-def _cancel(request_id: str) -> str:
+def _cancel(task_id: Optional[str], request_id: str) -> str:
     if not request_id:
         return tool_error("request_id is required: the queued_id (ticket) from a busy browser_exec result.")
-    reply = _route().post_json("/v1/cancel", {"request_id": request_id})
+    route = _route()
+    if not route.ticket_issued_to(task_id, request_id):
+        return tool_error("That ticket was not issued to this task; only your own queued acquire can be cancelled.")
+    reply = route.post_json("/v1/cancel", {"request_id": request_id, "task": str(task_id or "browser-exec")})
     err = _control_error(reply)
     return tool_error(err) if err else tool_result({"success": True, "cancelled": request_id})
 
@@ -145,6 +150,12 @@ def _handoff(task_id: Optional[str], identity: str, mode: str, target_id: str) -
     err = _control_error(reply)
     if err:
         return tool_error(err, target_id=target_id)
+    route = _route()
+    route.note_handoff(task_id, lease.get(route.MANAGED_SLOT_ENV, ""), lease.get(route.MANAGED_LEASE_ENV, ""),
+                       reply.get("expires_in"))
+    from tools import browser_exec_dialogs
+
+    browser_exec_dialogs.note_handoff(task_id)  # the next exec holds beforeunload (Danil's input)
     workspace = _workspace(task_id)
     if workspace:
         try:
@@ -195,9 +206,11 @@ def _http_error(exc: HTTPError) -> dict[str, Any]:
 def _upload(task_id: Optional[str], identity: str, mode: str, path: str, name: str) -> str:
     if not path:
         return tool_error("path is required: the local file to stage into the browser.")
-    source = Path(path).expanduser()
-    if not source.is_file():
-        return tool_error(f"{path!r} is not a readable file on the Hermes side.")
+    from tools.browser_upload_policy import check_upload_source
+
+    source, refusal = check_upload_source(path, _workspace(task_id))
+    if source is None:
+        return tool_error(refusal)
     name = name or source.name
     if not _NAME_RE.match(name) or ".." in name:
         return tool_error("name must match [A-Za-z0-9._-]{1,128} with no '..' (it becomes /staging/<name>).")
@@ -281,7 +294,7 @@ def browser_control(args: dict, task_id: Optional[str] = None) -> str:
     if action == "release":
         return _release(task_id, identity, mode)
     if action == "cancel":
-        return _cancel(str(args.get("request_id") or "").strip())
+        return _cancel(task_id, str(args.get("request_id") or "").strip())
     if action == "handoff":
         return _handoff(task_id, identity, mode, str(args.get("target_id") or "").strip())
     if action == "native_cancel":

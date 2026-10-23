@@ -16,7 +16,8 @@ def control(monkeypatch):
 
 
 def _mark(slot="research-1", gen="g1", wipe="4"):
-    guard.mark_payment_session("checkout", {"slot_id": slot, "browser_generation": gen, "wipe_count": wipe})
+    guard.mark_payment_session("checkout", {"slot_id": slot, "browser_generation": gen, "wipe_count": wipe,
+                                            "profile_kind": "temporary"})
 
 
 def _row(slot="research-1", kind="temporary", wipe=5, gen="g2"):
@@ -51,3 +52,20 @@ def test_mark_without_counter_never_auto_clears(control):
     _mark(wipe="")
     control["research-1"] = _row(wipe=99)
     assert guard.capture_blocked_for_surface("research-1", "g2") is True
+
+
+def test_persistent_marks_never_ask_control(monkeypatch, control):
+    calls = []
+    monkeypatch.setattr(browser_control_route, "slot_status", lambda slot: calls.append(slot) or {})
+    guard.mark_payment_session("checkout", {"slot_id": "shopping", "browser_generation": "g1", "wipe_count": "3",
+                                            "profile_kind": "persistent"})
+    assert guard.capture_blocked_for_surface("shopping", "g1") is True and calls == []
+
+
+def test_lost_mark_file_after_a_mark_fails_closed_but_fresh_install_is_clean(control):
+    assert guard.payment_session_sensitive(None) is False  # never marked: no sentinel
+    _mark()
+    guard._state_path().unlink()
+    assert guard.payment_session_sensitive(None) is True
+    guard.reset_guard(confirmed_by="test")
+    assert guard.payment_session_sensitive(None) is False
