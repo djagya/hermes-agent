@@ -25,6 +25,53 @@ class UnlockRequired(Exception):
         self.backend = backend
 
 
+class BackendError(RuntimeError):
+    """A password-manager call failed for a reason the model can act on.
+
+    Subclasses name the cause (``error_type``) and carry a model-facing
+    message that says what to do next; ``detail`` is scrubbed CLI text for
+    logs. A bare ``BackendError`` is an unclassified CLI failure.
+    """
+
+    error_type = "vault_backend_error"
+    advice = "The password manager call failed. Do not retry in a loop; tell Danil if the task is blocked."
+
+    def __init__(self, backend: str, detail: str = ""):
+        self.backend = backend
+        self.detail = (detail or "")[:200]
+        super().__init__(f"{backend}: {self.detail or self.error_type}")
+
+    def message(self) -> str:
+        return f"{self.backend}: {self.advice}"
+
+    def result(self) -> dict:
+        return {"success": False, "error_type": self.error_type, "error": self.message(), "backend": self.backend}
+
+
+class ItemNotFound(BackendError):
+    error_type = "vault_item_not_found"
+    advice = ("no item matches this handle (deleted, moved, renamed vault, or not shared with this account). "
+              "Call browser_vault action=list for current handles; do not retry the old handle.")
+
+
+class BackendRateLimited(BackendError):
+    error_type = "vault_rate_limited"
+    advice = ("the request rate or daily request budget is spent. Stop calling the vault for this task; "
+              "wait at least an hour before one retry, and tell Danil if the task cannot wait.")
+
+
+class BackendAuthExpired(BackendError):
+    error_type = "vault_auth_expired"
+    advice = ("its access token expired or was revoked. Unlocking does not fix this: tell Danil the operator "
+              "must refresh the password-manager token. Do not retry.")
+
+
+class BackendNetwork(BackendError):
+    error_type = "vault_network"
+    advice = ("could not reach the password-manager service (network failure or timeout). Retry once in a "
+              "minute; if it fails again, tell Danil.")
+
+
 class LoginBackend(ABC):
     name: str                # config key: local | onepassword | bitwarden
     display_name: str        # user-facing

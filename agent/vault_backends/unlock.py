@@ -110,6 +110,14 @@ def begin_unlock(backend: str) -> int:
         return _generation.get(_key(backend), 0)
 
 
+def generation(backend: str) -> tuple[str, int]:
+    """``(profile home, lock generation)`` for ``backend``: changes on every lock, so caches keyed by it
+    never outlive a lock or a profile switch."""
+    key = _key(backend)
+    with _lock:
+        return key[0], _generation.get(key, 0)
+
+
 def store_session_token(backend: str, token: str, generation: Optional[int] = None) -> bool:
     """Commit an unlock. Returns False (and drops the token) when a Lock happened since ``begin_unlock``."""
     key = _key(backend)
