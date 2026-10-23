@@ -188,7 +188,7 @@ def _rating(metric: str, value: float | None) -> str | None:
     return "good" if value <= good else ("poor" if value > poor else "needs-improvement")
 
 
-_VITALS_JS = r"""
+_VITALS_SCRIPT = r"""
 (async (wait) => {
   const out = {lcp_ms: null, cls: 0, inp_ms: null, fcp_ms: null, ttfb_ms: null, interactions: 0};
   const lcp = [], shifts = [], events = [];
@@ -226,7 +226,7 @@ _VITALS_JS = r"""
 })(%d)
 """
 
-_AXE_RUN_JS = r"""
+_AXE_RUN_SCRIPT = r"""
 (async (tags, selector) => {
   const ctx = selector ? document.querySelector(selector) : document;
   if (!ctx) return JSON.stringify({error: 'selector not found: ' + selector});
@@ -239,15 +239,15 @@ _AXE_RUN_JS = r"""
 })(%s, %s)
 """
 
-_ELEMENT_RECT_JS = r"""
+_ELEMENT_RECT_SCRIPT = r"""
 (() => { const el = document.querySelector(%s); if (!el) return null;
   el.scrollIntoView({block: 'center', inline: 'nearest'});
   const r = el.getBoundingClientRect();
   return JSON.stringify({x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height}); })()
 """
 
-_SETTLE_JS = "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))"
-_PAGE_JS = "JSON.stringify({url: location.href, title: document.title, scroll_width: document.documentElement.scrollWidth, client_width: document.documentElement.clientWidth})"
+_SETTLE_SCRIPT = "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))"
+_PAGE_SCRIPT = "JSON.stringify({url: location.href, title: document.title, scroll_width: document.documentElement.scrollWidth, client_width: document.documentElement.clientWidth})"
 
 
 class Run:
@@ -332,7 +332,7 @@ class Run:
         truncated = False
         dsf = float((vp or {}).get("dsf") or 1)
         if selector:
-            rect = self.cap.js(_ELEMENT_RECT_JS % json.dumps(selector))
+            rect = self.cap.js(_ELEMENT_RECT_SCRIPT % json.dumps(selector))
             if not rect:
                 raise ValueError(f"selector not found: {selector}")
             rect = json.loads(rect)
@@ -395,7 +395,7 @@ class Run:
         """Run axe-core on the current page; writes the slim result JSON and returns a summary."""
         self.cap.check_guard()
         self.cap.inject_axe()
-        raw = self.cap.evaluate_isolated(_AXE_RUN_JS % (json.dumps(list(tags)), json.dumps(selector)),
+        raw = self.cap.evaluate_isolated(_AXE_RUN_SCRIPT % (json.dumps(list(tags)), json.dumps(selector)),
                                          timeout=120.0)
         data = json.loads(raw)
         if data.get("error"):
@@ -425,7 +425,7 @@ class Run:
                 self.cap.cdp("Page.reload", ignoreCache=True)
                 self.cap.wait_for_load()
             self.cap.cdp("Performance.enable")
-            vitals = json.loads(self.cap.js(_VITALS_JS % int(min(max(observe_seconds, 0.5), 20.0) * 1000)))
+            vitals = json.loads(self.cap.js(_VITALS_SCRIPT % int(min(max(observe_seconds, 0.5), 20.0) * 1000)))
             metrics = {m["name"]: m["value"] for m in self.cap.cdp("Performance.getMetrics").get("metrics", [])}
             self.cap.cdp("Performance.disable")
         ratings = {k: _rating(k, vitals.get(k)) for k in VITALS_THRESHOLDS}
@@ -700,11 +700,11 @@ class UXCapture:
         if seconds > 0:
             time.sleep(seconds)
         with contextlib.suppress(Exception):
-            self.js(_SETTLE_JS)
+            self.js(_SETTLE_SCRIPT)
 
     def page_state(self) -> dict[str, Any]:
         try:
-            return json.loads(self.js(_PAGE_JS))
+            return json.loads(self.js(_PAGE_SCRIPT))
         except (RuntimeError, OSError, ValueError, TypeError):  # page state is decoration, never fatal
             return {}
 
