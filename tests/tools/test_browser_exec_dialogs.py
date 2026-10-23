@@ -95,11 +95,13 @@ def test_a_failing_decider_holds_instead_of_accepting():
 def _tab_supervisor():
     sup = CDPSupervisor("t", "ws://unused")
     attaches = []
+    sup.attach_reply = None  # an asyncio.Event the test sets: the attach reply arrives later
 
     async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
         if method == "Target.attachToTarget":
             attaches.append(params["targetId"])
-            await asyncio.sleep(0.01)  # the attach reply arrives after other work ran
+            if sup.attach_reply is not None:
+                await sup.attach_reply.wait()
             return {"result": {"sessionId": "tab-sid"}}
         return {"result": {}}
 
@@ -112,10 +114,14 @@ def test_a_new_tab_is_watched_once_and_its_frames_stay_out_of_the_main_tree():
     sup._watch_new_tabs = True
 
     async def run():
+        sup.attach_reply = asyncio.Event()
         info = {"targetInfo": {"targetId": "TAB2", "type": "page", "url": "https://shop.example/checkout"}}
         await sup._on_target_created(info, None)
+        await asyncio.sleep(0)  # the first attach is now in flight
         await sup._on_target_created(info, None)  # discovery + arm race on the same tab
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0)
+        sup.attach_reply.set()
+        await asyncio.gather(*list(sup._dialog_tab_tasks))
 
     asyncio.run(run())
     assert attaches == ["TAB2"]

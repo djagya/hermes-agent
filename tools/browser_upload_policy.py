@@ -60,7 +60,9 @@ def check_upload_source(path: str, workspace: Optional[str]) -> tuple[Optional[P
         return None, f"{path!r} is not a readable file on the Hermes side."
     if not resolved.is_file():
         return None, f"{path!r} is not a regular file."
-    key_file = (os.environ.get("HERMES_BROWSER_CONTROL_KEY_FILE") or "").strip()
+    from tools.browser_control_route import MANAGED_KEY_FILE_ENV
+
+    key_file = (os.environ.get(MANAGED_KEY_FILE_ENV) or "").strip()
     if key_file:
         try:
             if resolved == Path(key_file).resolve(strict=False):
