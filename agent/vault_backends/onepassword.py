@@ -39,6 +39,7 @@ class OnePasswordLoginBackend(LoginBackend):
         from agent.secret_scope import get_secret
         env_name = str(self.cfg.get("service_account_token_env") or "OP_SERVICE_ACCOUNT_TOKEN")
         self._service_token = get_secret(env_name, "") or ""
+        self._item_vaults: dict[str, str] = {}  # item id -> vault id from the latest ``item list``
 
     # ── auth ────────────────────────────────────────────────────────────────
 
@@ -92,7 +93,9 @@ class OnePasswordLoginBackend(LoginBackend):
                        timeout_message="op timed out", stdin=subprocess.DEVNULL)
         if proc.returncode != 0:
             err = _scrub(proc.stderr or "")
-            if "session" in err.lower() or "sign in" in err.lower() or "not signed in" in err.lower():
+            # A service account never holds a session, so an auth failure there is not a lock to undo:
+            # surface op's own error instead of an unlock prompt that reports "already unlocked".
+            if not self._service_token and any(w in err.lower() for w in ("session", "sign in", "not signed in")):
                 _unlock.lock(self.name)
                 raise UnlockRequired(self)
             raise RuntimeError(f"op failed: {err[:200]}")
@@ -108,6 +111,7 @@ class OnePasswordLoginBackend(LoginBackend):
             args += ["--vault", configured_vault]
         raw = json.loads(self._run(*args) or "[]")
         out: list[VaultItemMeta] = []
+        self._item_vaults = {}
         for item in raw if isinstance(raw, list) else []:
             if item.get("category") == "CREDIT_CARD":
                 from agent.vault_payment_policy import onepassword_payment_metadata

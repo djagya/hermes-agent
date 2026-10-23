@@ -73,7 +73,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.workspaces.outputs.checks) }}
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
           ref: ${{ inputs.commit }}
       - name: Set up the locked JS build toolchain
@@ -96,15 +96,14 @@ jobs:
 
       # setup-pm caches npm downloads, not the installed workspace tree.
       # The job then extracts the full workspace node_modules
-      # again and runs the postinstalls again, which includes the Electron
-      # binary fetch. This caches the installed tree itself, keyed on the
+      # again and runs the native postinstalls again. Electron's binary is
+      # prepared explicitly below. This caches the installed tree itself, keyed on the
       # lockfile, and skips ``npm ci`` on an exact hit. There are no
       # restore-keys: a partial hit leaves a stale tree, so anything other
       # than an exact lockfile match reinstalls from the start.
       #
-      # This install runs WITH scripts, so the tree holds the postinstall
-      # artifacts. The postinstall of electron unpacks its binary into
-      # node_modules/electron/dist, which is inside the cached tree.
+      # This install runs WITH scripts, so the tree holds native lifecycle
+      # artifacts and the explicitly prepared Electron dist, both inside the cached tree.
       #
       # The ~/.cache/electron download cache stays out of the key on purpose.
       # ``npm ci`` is skipped on a hit, so nothing reads that cache. It only
@@ -126,6 +125,10 @@ jobs:
         if: steps.node-modules-cache.outputs.cache-hit != 'true'
         with:
           command: npm ci
+      # Electron 42 no longer fetches its binary in postinstall (upstream v0.22.5).
+      - name: Prepare locked Electron runtime
+        if: matrix.package == 'apps/desktop'
+        run: node scripts/build/electron-runtime.mjs --source .
       - run: npm run --prefix ${{ matrix.package }} ${{ matrix.script }}
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that

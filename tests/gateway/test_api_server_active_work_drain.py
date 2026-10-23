@@ -129,11 +129,13 @@ class TestDrainWaitsForApiWork:
         allow_task = asyncio.Event()
 
         def delayed_create_task(coro, **kwargs):
-            # The patch replaces asyncio.create_task for everyone (the module is shared), and since
-            # 3.14.4 aiohttp starts its own request handlers through it (eager_start=...). Delay only
-            # the run the API server schedules; hand everything else straight through.
-            code = getattr(coro, "cr_code", None)
-            if code is None or "api_server" not in code.co_filename:
+            # The patch replaces asyncio.create_task process-wide, and aiohttp >= 3.14.4
+            # schedules its own client/connector tasks through it (with eager_start=True).
+            # Hold only the /v1/runs task; everything else runs unchanged.
+            if getattr(coro, "__name__", None) not in {
+                "_execute_run",
+                "_execute_run_via_live_owner",
+            }:
                 return original_create_task(coro, **kwargs)
 
             async def delayed():
