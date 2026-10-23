@@ -38,39 +38,3 @@ CVE-2026-19534 exp:2026-10-29
 # Expires when 0.24.0 clears it: bump the Dockerfile pin then.
 CVE-2026-111758 exp:2026-11-04
 CVE-2026-111759 exp:2026-11-04
-# Pillow 12.3.0: decoder memory-safety (JPEG and others; 4 critical) and
-# denial-of-service advisories, fixed only in Pillow 13.0.0 (2026-10-16).
-# browser-harness 0.1.13, the latest release and browser_exec's engine,
-# pins pillow==12.3.0 exactly, so a uv override still fails PM's install
-# check (`uv pip check`: "browser-harness requires pillow==12.3.0"). Upstream
-# main is on 12.3.0 too. The running image already ships 12.3.0, so this
-# release adds no exposure. Short expiry so the next build forces the move.
-CVE-2026-112390 exp:2026-10-29
-CVE-2026-112392 exp:2026-10-29
-CVE-2026-112393 exp:2026-10-29
-CVE-2026-112397 exp:2026-10-29
-CVE-2026-112399 exp:2026-10-29
-CVE-2026-112400 exp:2026-10-29
-CVE-2026-112402 exp:2026-10-29
-CVE-2026-112403 exp:2026-10-29
-CVE-2026-112404 exp:2026-10-29
-CVE-2026-112405 exp:2026-10-29
-CVE-2026-112406 exp:2026-10-29
-CVE-2026-112892 exp:2026-10-29
-CVE-2026-112893 exp:2026-10-29
-CVE-2026-112894 exp:2026-10-29
-CVE-2026-112895 exp:2026-10-29
-CVE-2026-112896 exp:2026-10-29
-CVE-2026-112897 exp:2026-10-29
-CVE-2026-112900 exp:2026-10-29
-CVE-2026-112902 exp:2026-10-29
-# 2026-10-22 evening: eight more Pillow 12.3.0 advisories, same 13.0.0-only
-# fix and the same browser-harness pin; same expiry.
-CVE-2026-96637 exp:2026-10-29
-CVE-2026-96639 exp:2026-10-29
-CVE-2026-96640 exp:2026-10-29
-CVE-2026-96642 exp:2026-10-29
-CVE-2026-96643 exp:2026-10-29
-CVE-2026-96644 exp:2026-10-29
-CVE-2026-96778 exp:2026-10-29
-GHSA-78g4-xqwv-q3g8 exp:2026-10-29

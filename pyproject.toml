@@ -131,7 +131,12 @@ dependencies = [
   # wrapper over it). Pure Python, and its pins match Pillow/websockets above,
   # so it rides in the main venv and every install, Desktop bundle included,
   # ships it without a separate tool environment.
-  "browser-harness==0.1.13; python_version >= '3.14'",
+  # The v0.1.13 release pins pillow==12.3.0, which every October 2026 Pillow
+  # advisory affects (13.0.0 is the only fix), and PM's `uv pip check` rejects
+  # an override. This is the v0.1.13 tag plus only that pin moved to 13.0.0
+  # (upstream PR browser-use/browser-harness#931). Return to the PyPI release
+  # once one ships with pillow 13.
+  "browser-harness @ git+https://github.com/djagya/browser-harness.git@d6fea693ec607b76d89eeef19d88c7085ae19560 ; python_version >= '3.14'",
   # .gitignore-aware file matching for desktop build stamp.
   "pathspec==1.1.1; python_version >= '3.14'",
   "fastapi>=0.104.0,<1; python_version >= '3.14'",
@@ -170,7 +175,7 @@ dependencies = [
   # libs required for the codecs we use, so it's safe to ship in the base
   # install rather than gating it behind an extra + a mid-session lazy install
   # (which deadlocked the CLI under prompt_toolkit — see #40490).
-  "Pillow==12.3.0; python_version >= '3.14'",
+  "Pillow==13.0.0; python_version >= '3.14'",
   # HEIF/HEIC/AVIF decode for the vision tools. iPhone photos and screenshots
   # are HEIC (frequently mislabeled .jpg by upload pipelines); Pillow has no
   # built-in HEIF codec, so without this the vision resolver rejects them as
