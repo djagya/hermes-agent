@@ -6,6 +6,7 @@ import io
 import json
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -31,10 +32,13 @@ class FakeHarness:
 
     def __init__(self):
         self.calls, self.events, self.scheme, self.fail_shot = [], [], "light", False
-        self.axe_loaded, self.isolated_sources = False, []
+        self.axe_loaded, self.isolated_sources, self.fail, self.worlds = False, [], {}, 0
 
     def cdp(self, method, session_id=None, _response_timeout=5.0, **params):
         self.calls.append((method, params))
+        if self.fail.get(method):
+            msg = self.fail.pop(method)
+            raise RuntimeError(msg)
         if method == "Emulation.setEmulatedMedia":
             feats = {f["name"]: f["value"] for f in params.get("features", [])}
             self.scheme = feats.get("prefers-color-scheme", "light")
@@ -47,6 +51,7 @@ class FakeHarness:
         if method == "Page.getFrameTree":
             return {"frameTree": {"frame": {"id": "F1"}}}
         if method == "Page.createIsolatedWorld":
+            self.worlds += 1
             return {"executionContextId": 7}
         if method == "Runtime.evaluate":
             return self._evaluate(params["expression"])
@@ -62,9 +67,11 @@ class FakeHarness:
         if expr.startswith("typeof axe"):
             return {"result": {"value": self.axe_loaded}}
         if "axe.run" in expr:
+            node = {"target": ['input[value="4111111111111111"]'], "summary": 'Fix: <b data-u="danil">x</b>',
+                    "html": '<input id="cc" type="text" value="4111111111111111" data-token="s3cr3t" aria-label="Card">'}
             out = {"version": "4.14.0", "url": "https://example.test/", "passes": 30, "incomplete": [],
                    "violations": [{"id": "color-contrast", "impact": "serious", "help": "contrast", "nodes": 3,
-                                   "helpUrl": "", "targets": []}]}
+                                   "helpUrl": "", "targets": [node]}]}
             return {"result": {"value": json.dumps(out)}}
         return {"result": {"value": None}}
 
@@ -247,6 +254,10 @@ def test_recording_acks_frames_keeps_other_events_and_writes_mp4(cap):
     mp4 = open(out["path"], "rb").read()
     assert mp4[4:8] == b"ftyp" and out["frames"] == 6 and out["gif"]["bytes"] > 0
     assert not list(run.dir.glob(".frames-*"))
+    base = run.baseline("flow", run.shot("still"))["baseline"]
+    for f in [*run.dir.iterdir(), Path(base)]:
+        if f.is_file() and f.name != ".index.lock":
+            assert oct(f.stat().st_mode & 0o777) == "0o600", f.name
 
 
 def test_harness_auto_recording_is_always_forced_off(monkeypatch, managed_exec):
@@ -263,3 +274,120 @@ def test_harness_auto_recording_is_always_forced_off(monkeypatch, managed_exec):
     for code in ("import os; os.environ['BH_RECORD'] = '1'", "from browser_harness import recorder"):
         assert json.loads(browser_use_cli.browser_exec(code, task_id="t"))["error_type"] == "payment_screenshot_blocked"
     assert len(runs) == 1
+
+
+def test_emulation_is_restored_when_apply_fails_midway(cap):
+    fake, ux = cap
+    fake.fail["Emulation.setTouchEmulationEnabled"] = "boom"  # after setDeviceMetricsOverride succeeded
+    with pytest.raises(RuntimeError, match="boom"):
+        ux.run("r").shot("x", viewport="phone")
+    assert "Emulation.clearDeviceMetricsOverride" in _methods(fake)
+
+
+def test_slot_marked_mid_run_stops_matrix_and_discards_recording(cap, monkeypatch):
+    fake, ux = cap
+    run = ux.run("mid")
+    real_shoot = run._shoot
+
+    def shoot_then_mark(*a, **kw):
+        out = real_shoot(*a, **kw)
+        guard.mark_payment_session("checkout", {"slot_id": "research-1", "browser_generation": "g1"})
+        return out
+
+    monkeypatch.setattr(run, "_shoot", shoot_then_mark)
+    with pytest.raises(h.CaptureRefused):
+        run.matrix("m", viewports=("phone", "desktop"))
+    assert len([m for m in _methods(fake) if m == "Page.captureScreenshot"]) == 1
+    assert _methods(fake)[-1] == "Emulation.setEmulatedMedia"  # restore ran
+    guard.clear_payment_surface("research-1", confirmed_by="test")
+
+    monkeypatch.setattr(h.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    rec = run.record("flow").start()
+    frame = {"method": "Page.screencastFrame", "params": {"data": _jpeg((1, 2, 3)), "sessionId": 1,
+                                                         "metadata": {"timestamp": 1.0}}}
+    fake.events.append(frame)
+    rec._pump()
+    assert len(rec.frames) == 1 and oct(rec.frames_dir.stat().st_mode & 0o777) == "0o700"
+    assert oct(rec.frames[0][0].stat().st_mode & 0o777) == "0o600"
+    guard.mark_payment_session("checkout", {"slot_id": "research-1", "browser_generation": "g1"})
+    fake.events.append(dict(frame, params={**frame["params"], "sessionId": 2}))
+    rec._pump()
+    with pytest.raises(h.CaptureRefused):
+        rec.stop()
+    assert rec.frames == [] and not rec.frames_dir.exists() and not list(run.dir.glob("*.mp4"))
+    assert ux.active_recording is None and ux.g["drain_events"] == fake.drain_events
+
+
+def test_second_recording_is_refused_and_a_failed_start_restores_drain(cap, monkeypatch):
+    fake, ux = cap
+    monkeypatch.setattr(h.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    run = ux.run("r")
+    first = run.record("a").start()
+    with pytest.raises(RuntimeError, match="still running"):
+        run.record("b").start()
+    first._teardown()
+    fake.fail["Page.startScreencast"] = "screencast refused"
+    broken = run.record("c")
+    with pytest.raises(RuntimeError, match="screencast refused"):
+        broken.start()
+    assert ux.g["drain_events"] == fake.drain_events and ux.active_recording is None
+    assert not broken.frames_dir.exists() or not any(broken.frames_dir.iterdir())
+
+
+def test_stale_isolated_world_is_recreated_once(cap):
+    fake, ux = cap
+    assert ux.evaluate_isolated("1") is None and fake.worlds == 1
+    fake.fail["Runtime.evaluate"] = "Cannot find context with specified id"
+    ux.evaluate_isolated("1")
+    assert fake.worlds == 2
+
+
+def test_index_seq_is_unique_under_concurrency_and_malformed_index_raises(cap):
+    import threading
+
+    _, ux = cap
+    run = ux.run("idx")
+    threads = [threading.Thread(target=lambda: [run.note("n") for _ in range(10)]) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    seqs = [e["seq"] for e in run.index()["entries"]]
+    assert len(seqs) == 40 and len(set(seqs)) == 40
+    run.index_path.write_text("{broken", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        run.note("lost?")
+    assert run.index_path.read_text(encoding="utf-8-sig") == "{broken"
+
+
+def test_axe_markup_is_scrubbed_before_it_is_written(cap, tmp_path):
+    _, ux = cap
+    axe = tmp_path / "axe.min.js"
+    axe.write_text("window.axe={};", encoding="utf-8")
+    ux.env[h.AXE_PATH_ENV] = str(axe)
+    ux.env[h.AXE_PATH_ENV + "_SHA256"] = hashlib.sha256(axe.read_bytes()).hexdigest()
+    out = ux.run("a").audit_a11y()
+    text = open(out["path"], encoding="utf-8-sig").read()
+    assert "4111" not in text and "s3cr3t" not in text and "danil" not in text and "Card" not in text
+    assert 'id=\\"cc\\"' in text and 'type=\\"text\\"' in text
+
+
+@pytest.mark.parametrize("marks", [
+    None, [], [{"scope": "profile"}],
+    [{"scope": "slot", "slot_id": "shopping", "browser_generation": "g1"}],
+    [{"scope": "slot", "slot_id": "", "browser_generation": "g1"}],
+    "{not json", {"marks": "nope"},
+])
+def test_harness_guard_matches_gateway_guard(marks):
+    path = guard._state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if marks is None:
+        path.unlink(missing_ok=True)
+    elif isinstance(marks, str):
+        path.write_text(marks, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(marks if isinstance(marks, dict) else {"version": 1, "marks": marks}),
+                        encoding="utf-8")
+    for slot, gen in (("shopping", "g1"), ("research-1", "g2"), ("", "g1"), ("research-1", "")):
+        env = {h.GUARD_ENV: str(path), h.SLOT_ENV: slot, h.GENERATION_ENV: gen}
+        assert h.capture_blocked(env) == guard.capture_blocked_for_surface(slot, gen), (marks, slot, gen)

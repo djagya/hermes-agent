@@ -20,6 +20,7 @@ import contextlib
 import datetime as _dt
 import hashlib
 import html
+import io
 import json
 import os
 import re
@@ -123,6 +124,67 @@ def _atomic_write(path: Path, data: bytes) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def _private_write(path: Path, data: bytes) -> None:
+    """Create ``path`` mode 0600 from the first byte (frames are written straight, not renamed)."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+
+
+def _private_dir(path: Path) -> Path:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
+@contextlib.contextmanager
+def _locked(lock_path: Path) -> Iterator[None]:
+    """Exclusive advisory lock on ``lock_path`` (POSIX fcntl; a no-op where fcntl is missing)."""
+    try:
+        import fcntl
+    except ImportError:  # Windows: one writer per run is the documented contract there
+        yield
+        return
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+# Attribute values in axe node markup can carry what the user typed (value=), app state (data-*),
+# tokens in URLs (href/src) or private text (aria-label, title). Keep only structural ones.
+_KEEP_ATTRS = {"id", "class", "role", "type"}
+_ATTR_RE = re.compile(r"""(\s)([^\s=<>"'/]+)(\s*=\s*)("[^"]*"|'[^']*'|[^\s"'>]+)""")
+_SELECTOR_ATTR_RE = re.compile(r"""\[([^\]=\s~|^$*]+)([~|^$*]?=)("[^"]*"|'[^']*'|[^\]]*)\]""")
+
+
+def scrub_markup(text: str) -> str:
+    """Drop every attribute value except id/class/role/type from an HTML snippet."""
+    def keep(m: re.Match) -> str:
+        name = m.group(2).lower()
+        return m.group(0) if name in _KEEP_ATTRS else f'{m.group(1)}{m.group(2)}="…"'
+    return _ATTR_RE.sub(keep, str(text or ""))
+
+
+def scrub_selector(text: Any) -> Any:
+    if isinstance(text, list):
+        return [scrub_selector(t) for t in text]
+    return _SELECTOR_ATTR_RE.sub(lambda m: m.group(0) if m.group(1).lower() in _KEEP_ATTRS
+                                 else f'[{m.group(1)}{m.group(2)}"…"]', str(text))
+
+
+def scrub_axe(data: dict[str, Any]) -> dict[str, Any]:
+    for group in ("violations", "incomplete"):
+        for rule in data.get(group) or []:
+            for node in rule.get("targets") or []:
+                node["html"] = scrub_markup(node.get("html", ""))
+                node["summary"] = scrub_markup(node.get("summary", ""))
+                node["target"] = scrub_selector(node.get("target", []))
+    return data
 
 
 def png_size(data: bytes) -> tuple[int, int]:
@@ -265,31 +327,49 @@ class Run:
         return self.dir / "index.json"
 
     def index(self) -> dict[str, Any]:
+        """The run index; a missing file is a new run, a malformed one is an error (never reset)."""
         try:
-            data = json.loads(self.index_path.read_text(encoding="utf-8-sig"))
-            if isinstance(data, dict) and isinstance(data.get("entries"), list):
-                return data
-        except (FileNotFoundError, ValueError):
-            pass
-        return {"run": self.name, "created": _now(), "task": self.cap.env.get(TASK_ENV, ""), "entries": []}
+            raw = self.index_path.read_text(encoding="utf-8-sig")
+        except FileNotFoundError:
+            return {"run": self.name, "created": _now(), "task": self.cap.env.get(TASK_ENV, ""), "entries": []}
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError(f"{self.index_path} is malformed ({exc}); move it aside to start over") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+            raise ValueError(f"{self.index_path} is malformed (no entries list); move it aside to start over")
+        return data
 
-    def _add(self, entry: dict[str, Any]) -> dict[str, Any]:
-        data = self.index()
-        entry = {"seq": len(data["entries"]) + 1, "at": _now(), **entry}
-        data["entries"].append(entry)
-        data["updated"] = _now()
-        _atomic_write(self.index_path, json.dumps(data, indent=2).encode("utf-8"))
-        _atomic_write(self.dir / "index.md", _index_markdown(data).encode("utf-8"))
-        return entry
+    def _lock(self) -> contextlib.AbstractContextManager[None]:
+        return _locked(self.dir / ".index.lock")
 
     def _next_seq(self) -> int:
-        return len(self.index()["entries"]) + 1
+        """Reserve the next sequence number (file prefix and index seq), safe across concurrent calls."""
+        counter = self.dir / ".seq"
+        with self._lock():
+            try:
+                last = int(counter.read_text(encoding="utf-8-sig").strip() or 0)
+            except (FileNotFoundError, ValueError):
+                last = 0
+            seq = max(last, len(self.index()["entries"])) + 1
+            _atomic_write(counter, str(seq).encode("utf-8"))
+        return seq
 
-    def _file_entry(self, kind: str, path: Path, **extra: Any) -> dict[str, Any]:
-        with contextlib.suppress(OSError):
-            path.chmod(0o600)  # captures can show private pages; ffmpeg/Pillow default to 0644
+    def _add(self, entry: dict[str, Any], seq: int | None = None) -> dict[str, Any]:
+        seq = seq or self._next_seq()
+        with self._lock():
+            data = self.index()
+            entry = {"seq": seq, "at": _now(), **entry}
+            data["entries"].append(entry)
+            data["updated"] = _now()
+            _atomic_write(self.index_path, json.dumps(data, indent=2).encode("utf-8"))
+            _atomic_write(self.dir / "index.md", _index_markdown(data).encode("utf-8"))
+        return entry
+
+    def _file_entry(self, kind: str, path: Path, seq: int, **extra: Any) -> dict[str, Any]:
+        path.chmod(0o600)  # every writer already creates 0600; keep the invariant explicit
         return self._add({"kind": kind, "file": path.name, "path": str(path),
-                          "bytes": path.stat().st_size, "sha256": _sha256(path), **extra})
+                          "bytes": path.stat().st_size, "sha256": _sha256(path), **extra}, seq=seq)
 
     def note(self, text: str, **extra: Any) -> dict[str, Any]:
         """Add a free-text step note (shows in the storyboard timeline)."""
@@ -328,6 +408,7 @@ class Run:
 
     def _shoot(self, name: str, *, full: bool, selector: str | None, vp: dict[str, Any] | None,
                scheme: str | None, reduced_motion: bool, note: str) -> dict[str, Any]:
+        self.cap.check_guard()  # every shot, so a slot marked mid-matrix stops the matrix
         params: dict[str, Any] = {"format": "png"}
         truncated = False
         dsf = float((vp or {}).get("dsf") or 1)
@@ -352,11 +433,12 @@ class Run:
         data = base64.b64decode(result.get("data") or "")
         width_px, height_px = png_size(data)
         tag = "-".join(p for p in ((vp or {}).get("name"), scheme, "rm" if reduced_motion else "") if p)
-        path = self.dir / f"{self._next_seq():03d}-{_slug(name)}{'-' + _slug(tag) if tag else ''}.png"
+        seq = self._next_seq()
+        path = self.dir / f"{seq:03d}-{_slug(name)}{'-' + _slug(tag) if tag else ''}.png"
         _atomic_write(path, data)
         page = self.cap.page_state()
         return self._file_entry(
-            "screenshot", path, name=name, mode="element" if selector else ("full" if full else "viewport"),
+            "screenshot", path, seq, name=name, mode="element" if selector else ("full" if full else "viewport"),
             selector=selector, viewport=vp, scheme=scheme or "page-default", reduced_motion=reduced_motion,
             width_px=width_px, height_px=height_px, truncated=truncated, note=note, **page)
 
@@ -364,9 +446,10 @@ class Run:
     def diff(self, name: str, before: Any, after: Any, *, tolerance: int = 16) -> dict[str, Any]:
         """Pixel diff of two PNGs (paths or entries): a diff image plus the changed-pixel ratio."""
         before_p, after_p = Path(_entry_path(before)), Path(_entry_path(after))
-        path = self.dir / f"{self._next_seq():03d}-diff-{_slug(name)}.png"
+        seq = self._next_seq()
+        path = self.dir / f"{seq:03d}-diff-{_slug(name)}.png"
         stats = diff_images(before_p, after_p, path, tolerance=tolerance)
-        return self._file_entry("diff", path, name=name, before=str(before_p), after=str(after_p), **stats)
+        return self._file_entry("diff", path, seq, name=name, before=str(before_p), after=str(after_p), **stats)
 
     def baseline(self, key: str, entry: dict[str, Any], *, update: bool = False,
                  max_ratio: float = 0.001) -> dict[str, Any]:
@@ -380,8 +463,7 @@ class Run:
         base = self.cap.root / "baselines" / _slug(key, 80) / f"{variant}.png"
         src = Path(entry["path"])
         if update or not base.exists():
-            base.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, base)
+            _atomic_write(base, src.read_bytes())  # mkstemp: 0600
             return self._add({"kind": "baseline", "name": key, "status": "stored", "baseline": str(base),
                               "sha256": _sha256(base), "source": str(src)})
         result = self.diff(f"{key}-{variant}-vs-baseline", base, src)
@@ -397,16 +479,17 @@ class Run:
         self.cap.inject_axe()
         raw = self.cap.evaluate_isolated(_AXE_RUN_SCRIPT % (json.dumps(list(tags)), json.dumps(selector)),
                                          timeout=120.0)
-        data = json.loads(raw)
+        data = scrub_axe(json.loads(raw))
         if data.get("error"):
             raise ValueError(data["error"])
-        path = self.dir / f"{self._next_seq():03d}-{_slug(name)}.json"
+        seq = self._next_seq()
+        path = self.dir / f"{seq:03d}-{_slug(name)}.json"
         _atomic_write(path, json.dumps(data, indent=2).encode("utf-8"))
         counts: dict[str, int] = {}
         for v in data["violations"]:
             counts[v.get("impact") or "unknown"] = counts.get(v.get("impact") or "unknown", 0) + 1
         top = [f"{v['impact']}: {v['id']} ({v['nodes']}) - {v['help']}" for v in data["violations"][:10]]
-        return self._file_entry("a11y", path, name=name, url=data.get("url"), axe_version=data.get("version"),
+        return self._file_entry("a11y", path, seq, name=name, url=data.get("url"), axe_version=data.get("version"),
                                 violations=len(data["violations"]), incomplete=len(data["incomplete"]),
                                 by_impact=counts, top=top)
 
@@ -425,17 +508,21 @@ class Run:
                 self.cap.cdp("Page.reload", ignoreCache=True)
                 self.cap.wait_for_load()
             self.cap.cdp("Performance.enable")
-            vitals = json.loads(self.cap.js(_VITALS_SCRIPT % int(min(max(observe_seconds, 0.5), 20.0) * 1000)))
-            metrics = {m["name"]: m["value"] for m in self.cap.cdp("Performance.getMetrics").get("metrics", [])}
-            self.cap.cdp("Performance.disable")
+            try:
+                vitals = json.loads(self.cap.js(_VITALS_SCRIPT % int(min(max(observe_seconds, 0.5), 20.0) * 1000)))
+                metrics = {m["name"]: m["value"] for m in self.cap.cdp("Performance.getMetrics").get("metrics", [])}
+            finally:
+                with contextlib.suppress(Exception):
+                    self.cap.cdp("Performance.disable")
         ratings = {k: _rating(k, vitals.get(k)) for k in VITALS_THRESHOLDS}
         keep = ("JSHeapUsedSize", "JSHeapTotalSize", "Nodes", "Documents", "LayoutCount", "RecalcStyleCount",
                 "LayoutDuration", "RecalcStyleDuration", "ScriptDuration", "TaskDuration", "JSEventListeners")
         data = {"vitals": vitals, "ratings": ratings, "network": network, "cpu": cpu, "reload": reload,
                 "metrics": {k: metrics[k] for k in keep if k in metrics}, **self.cap.page_state()}
-        path = self.dir / f"{self._next_seq():03d}-{_slug(name)}.json"
+        seq = self._next_seq()
+        path = self.dir / f"{seq:03d}-{_slug(name)}.json"
         _atomic_write(path, json.dumps(data, indent=2).encode("utf-8"))
-        return self._file_entry("perf", path, name=name, vitals=vitals, ratings=ratings,
+        return self._file_entry("perf", path, seq, name=name, vitals=vitals, ratings=ratings,
                                 network=network, cpu=cpu, url=data.get("url"))
 
     # ---- video ---------------------------------------------------------
@@ -467,7 +554,13 @@ class Run:
 
 
 class Recording:
-    """CDP screencast frames to MP4 (and optional GIF) through ffmpeg."""
+    """CDP screencast frames to MP4 (and optional GIF) through ffmpeg.
+
+    One recording per capture at a time. Frames and ffmpeg output stay in a 0700
+    scratch dir until they are 0600; the dir is removed on stop and on every error.
+    The payment guard is re-read for every frame: a slot marked mid-recording drops
+    all frames and ``stop()`` raises ``CaptureRefused``.
+    """
 
     def __init__(self, run: Run, name: str, *, max_seconds: float = 60, max_mb: float = 100,
                  gif: bool = False, gif_width: int = 720, max_width: int = 1280, max_height: int = 1280,
@@ -482,6 +575,7 @@ class Recording:
         self.frames: list[tuple[Path, float]] = []
         self.bytes = 0
         self.stopped_by: str | None = None
+        self.refused = False
         self.result: dict[str, Any] | None = None
         self._lock = threading.Lock()
         self._other: list[dict[str, Any]] = []
@@ -489,6 +583,7 @@ class Recording:
         self._thread: threading.Thread | None = None
         self._started = 0.0
         self._restore: Callable[[], None] | None = None
+        self._screencasting = False
 
     def __enter__(self) -> Recording:
         return self.start()
@@ -497,20 +592,35 @@ class Recording:
         self.stop()
 
     def start(self) -> Recording:
-        self.run.cap.check_guard()
+        cap = self.run.cap
+        cap.check_guard()
         if shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg is not on PATH; video capture is unavailable")
-        self.frames_dir.mkdir(parents=True, exist_ok=True)
-        self._restore = self.run.cap.patch_drain(self._drain_for_caller)
-        self._started = time.monotonic()
-        # A background tab paints nothing, so it sends no frames.
-        with contextlib.suppress(Exception):
-            self.run.cap.cdp("Page.bringToFront")
-        self.run.cap.cdp("Page.startScreencast", **self.params)
-        # health: allow HX012 -- harness subprocess: no Hermes profile scope exists here to carry
-        self._thread = threading.Thread(target=self._loop, name="ux-capture-screencast", daemon=True)
-        self._thread.start()
+        if cap.active_recording is not None:
+            raise RuntimeError(f"recording {cap.active_recording.name!r} is still running in this call; "
+                               "stop it before starting another")
+        cap.active_recording = self
+        try:
+            _private_dir(self.frames_dir)
+            self._restore = cap.patch_drain(self._drain_for_caller)
+            self._started = time.monotonic()
+            # A background tab paints nothing, so it sends no frames.
+            with contextlib.suppress(Exception):
+                cap.cdp("Page.bringToFront")
+            cap.cdp("Page.startScreencast", **self.params)
+            self._screencasting = True
+            # health: allow HX012 -- harness subprocess: no Hermes profile scope exists here to carry
+            self._thread = threading.Thread(target=self._loop, name="ux-capture-screencast", daemon=True)
+            self._thread.start()
+        except BaseException:
+            self._teardown()
+            raise
         return self
+
+    def _drop_frames(self) -> None:
+        for path, _ in self.frames:
+            path.unlink(missing_ok=True)
+        self.frames.clear()
 
     def _take(self, events: list[dict[str, Any]]) -> None:
         for event in events:
@@ -522,10 +632,14 @@ class Recording:
                 self.run.cap.cdp("Page.screencastFrameAck", sessionId=params.get("sessionId"))
             if self._stop.is_set() or self.stopped_by:
                 continue
+            if capture_blocked(self.run.cap.env):
+                self.refused, self.stopped_by = True, "payment_guard"
+                self._drop_frames()
+                continue
             data = base64.b64decode(params.get("data") or "")
             stamp = float((params.get("metadata") or {}).get("timestamp") or time.time())
             path = self.frames_dir / f"{len(self.frames):06d}.jpg"
-            path.write_bytes(data)
+            _private_write(path, data)
             self.frames.append((path, stamp))
             self.bytes += len(data)
             if self.bytes >= self.max_bytes:
@@ -548,23 +662,42 @@ class Recording:
                 self.stopped_by = "max_seconds"
             with contextlib.suppress(Exception):
                 self._pump()
+            if self.stopped_by in ("payment_guard", "max_seconds", "max_mb"):
+                self._stop_screencast()
             self._stop.wait(0.05)
+
+    def _stop_screencast(self) -> None:
+        if self._screencasting:
+            self._screencasting = False
+            with contextlib.suppress(Exception):
+                self.run.cap.cdp("Page.stopScreencast")
+
+    def _teardown(self) -> None:
+        """Stop the thread and screencast, restore drain_events, release the capture. Idempotent."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        self._stop_screencast()
+        if self._restore:
+            self._restore()
+            self._restore = None
+        if self.run.cap.active_recording is self:
+            self.run.cap.active_recording = None
+        if self.refused:
+            self._drop_frames()
 
     def stop(self) -> dict[str, Any]:
         if self.result is not None:
             return self.result
-        with contextlib.suppress(Exception):
-            self._pump()
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=5)
-        with contextlib.suppress(Exception):
-            self.run.cap.cdp("Page.stopScreencast")
-        with contextlib.suppress(Exception):
-            self._pump()
-        if self._restore:
-            self._restore()
         try:
+            with contextlib.suppress(Exception):
+                self._pump()
+            self._teardown()
+            if self.refused or capture_blocked(self.run.cap.env):
+                self.refused = True
+                self._drop_frames()
+                raise CaptureRefused("payment_screenshot_blocked: the slot was payment-marked during the "
+                                     "recording; all frames were discarded.")
             self.result = self._encode()
         finally:
             shutil.rmtree(self.frames_dir, ignore_errors=True)
@@ -580,21 +713,30 @@ class Recording:
             nxt = self.frames[i + 1][1] if i + 1 < len(self.frames) else stamp + 0.5
             lines.append(f"file '{path.name}'\nduration {max(0.02, min(nxt - stamp, 5.0)):.3f}")
         lines.append(f"file '{self.frames[-1][0].name}'")  # concat demuxer drops the last duration
-        listing.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        mp4 = self.run.dir / f"{seq:03d}-{_slug(self.name)}.mp4"
+        _private_write(listing, ("\n".join(lines) + "\n").encode("utf-8"))
+        # ffmpeg writes 0644 into the 0700 scratch dir; chmod, then move into the run dir.
+        tmp_mp4 = self.frames_dir / "out.mp4"
         _ffmpeg(["-f", "concat", "-safe", "0", "-i", str(listing),
                  "-vf", f"scale=trunc(iw/2)*2:trunc(ih/2)*2,fps={self.fps},format=yuv420p",
-                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-movflags", "+faststart", str(mp4)])
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-movflags", "+faststart", str(tmp_mp4)])
         extra: dict[str, Any] = {}
         if self.gif:
-            gif = self.run.dir / f"{seq:03d}-{_slug(self.name)}.gif"
-            _ffmpeg(["-i", str(mp4), "-vf", f"fps=8,scale={self.gif_width}:-1:flags=lanczos,split[a][b];"
-                     "[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer", str(gif)])
+            tmp_gif = self.frames_dir / "out.gif"
+            _ffmpeg(["-i", str(tmp_mp4), "-vf", f"fps=8,scale={self.gif_width}:-1:flags=lanczos,split[a][b];"
+                     "[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer", str(tmp_gif)])
+            gif = _publish(tmp_gif, self.run.dir / f"{seq:03d}-{_slug(self.name)}.gif")
             extra["gif"] = {"path": str(gif), "bytes": gif.stat().st_size, "sha256": _sha256(gif)}
+        mp4 = _publish(tmp_mp4, self.run.dir / f"{seq:03d}-{_slug(self.name)}.mp4")
         duration = self.frames[-1][1] - self.frames[0][1]
-        return self.run._file_entry("video", mp4, name=self.name, frames=len(self.frames),
+        return self.run._file_entry("video", mp4, seq, name=self.name, frames=len(self.frames),
                                     seconds=round(duration, 2), stopped_by=self.stopped_by or "stop",
                                     frame_bytes=self.bytes, **extra, **self.run.cap.page_state())
+
+
+def _publish(tmp: Path, dest: Path) -> Path:
+    tmp.chmod(0o600)
+    os.replace(tmp, dest)
+    return dest
 
 
 def _ffmpeg(args: list[str]) -> None:
@@ -628,8 +770,9 @@ def diff_images(before: Path, after: Path, out: Path, *, tolerance: int = 16) ->
     total = width * height
     overlay = Image.blend(canvas_b, Image.new("RGB", (width, height), (255, 255, 255)), 0.6)
     overlay.paste(Image.new("RGB", (width, height), (230, 0, 40)), (0, 0), mask)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    overlay.save(out, format="PNG")
+    buf = io.BytesIO()
+    overlay.save(buf, format="PNG")
+    _atomic_write(out, buf.getvalue())  # mkstemp: 0600
     return {"changed_px": changed, "total_px": total, "changed_ratio": round(changed / total, 6) if total else 0.0,
             "changed_bbox": mask.getbbox(), "size_changed": a.size != b.size,
             "before_size": list(a.size), "after_size": list(b.size), "tolerance": tolerance}
@@ -651,7 +794,8 @@ class UXCapture:
             raise RuntimeError(f"{ROOT_ENV} is unset: ux_capture runs only inside browser_exec")
         self.root = Path(root)
         self._emulated = False
-        self._world: tuple[str, int] | None = None
+        self._world: tuple[str, str, int] | None = None
+        self.active_recording: Recording | None = None
 
     # ---- plumbing ------------------------------------------------------
     def cdp(self, method: str, **params: Any) -> dict[str, Any]:
@@ -718,11 +862,6 @@ class UXCapture:
     def apply_emulation(self, *, viewport: Any = None, scheme: str | None = None,
                         reduced_motion: bool = False) -> dict[str, Any] | None:
         vp = parse_viewport(viewport) if viewport else None
-        if vp:
-            self.cdp("Emulation.setDeviceMetricsOverride", width=vp["width"], height=vp["height"],
-                     deviceScaleFactor=vp["dsf"], mobile=bool(vp["mobile"]),
-                     screenWidth=vp["width"], screenHeight=vp["height"])
-            self.cdp("Emulation.setTouchEmulationEnabled", enabled=bool(vp["mobile"]), maxTouchPoints=5)
         features = []
         if scheme:
             if scheme not in ("light", "dark"):
@@ -730,9 +869,15 @@ class UXCapture:
             features.append({"name": "prefers-color-scheme", "value": scheme})
         if reduced_motion:
             features.append({"name": "prefers-reduced-motion", "value": "reduce"})
+        # Set before the first call: a later failing call must still leave a restore to do.
+        self._emulated = self._emulated or bool(vp or features)
+        if vp:
+            self.cdp("Emulation.setDeviceMetricsOverride", width=vp["width"], height=vp["height"],
+                     deviceScaleFactor=vp["dsf"], mobile=bool(vp["mobile"]),
+                     screenWidth=vp["width"], screenHeight=vp["height"])
+            self.cdp("Emulation.setTouchEmulationEnabled", enabled=bool(vp["mobile"]), maxTouchPoints=5)
         if features:
             self.cdp("Emulation.setEmulatedMedia", features=features)
-        self._emulated = self._emulated or bool(vp or features)
         return vp
 
     def restore_emulation(self) -> None:
@@ -786,17 +931,28 @@ class UXCapture:
 
     # ---- isolated world + axe --------------------------------------------
     def _isolated_context(self) -> int:
-        frame_id = self.cdp("Page.getFrameTree")["frameTree"]["frame"]["id"]
-        if self._world and self._world[0] == frame_id:
-            return self._world[1]
-        ctx = self.cdp("Page.createIsolatedWorld", frameId=frame_id, worldName="hermes-ux-capture",
+        """Isolated world for the main frame's current document (keyed on frame id + loaderId)."""
+        frame = self.cdp("Page.getFrameTree")["frameTree"]["frame"]
+        key = (str(frame["id"]), str(frame.get("loaderId") or ""))
+        if self._world and self._world[:2] == key:
+            return self._world[2]
+        ctx = self.cdp("Page.createIsolatedWorld", frameId=key[0], worldName="hermes-ux-capture",
                        grantUniveralAccess=True)["executionContextId"]
-        self._world = (frame_id, ctx)
+        self._world = (*key, ctx)
         return ctx
 
     def evaluate_isolated(self, expression: str, *, timeout: float = 30.0) -> Any:
-        res = self.cdp("Runtime.evaluate", expression=expression, contextId=self._isolated_context(),
-                       returnByValue=True, awaitPromise=True, _response_timeout=timeout)
+        for attempt in (1, 2):
+            try:
+                res = self.cdp("Runtime.evaluate", expression=expression, contextId=self._isolated_context(),
+                               returnByValue=True, awaitPromise=True, _response_timeout=timeout)
+            except RuntimeError as exc:
+                # The page navigated and our cached world went with the old document.
+                if attempt == 1 and _STALE_CONTEXT_RE.search(str(exc)):
+                    self._world = None
+                    continue
+                raise
+            break
         if res.get("exceptionDetails"):
             detail = res["exceptionDetails"]
             text = (detail.get("exception") or {}).get("description") or detail.get("text") or "error"
@@ -819,6 +975,10 @@ class UXCapture:
         for chunk in js_chunks(text):
             self.evaluate_isolated("globalThis.__hermesAxe += " + chunk)
         self.evaluate_isolated("(0, eval)(globalThis.__hermesAxe); delete globalThis.__hermesAxe; typeof axe")
+
+
+_STALE_CONTEXT_RE = re.compile(r"Cannot find (?:default )?(?:execution )?context|context with specified id"
+                               r"|Execution context was destroyed", re.IGNORECASE)
 
 
 def js_chunks(text: str, limit: int = IPC_LINE_BUDGET) -> Iterator[str]:
