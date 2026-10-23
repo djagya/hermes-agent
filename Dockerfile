@@ -440,7 +440,10 @@ RUN npm install -g --prefix /usr/local --omit=dev \
         axe-core@4.14.0 && \
     test -x /usr/local/bin/markdownlint-cli2 && \
     test -f /usr/local/lib/node_modules/caldav-mcp/package.json && \
-    echo "20c09fe157a8a34a30e241aaa1fcdade657734f08ab379ecfbeb7d45cc46e878  /usr/local/lib/node_modules/axe-core/axe.min.js" | sha256sum -c -
+    printf '%s  %s\n' 20c09fe157a8a34a30e241aaa1fcdade657734f08ab379ecfbeb7d45cc46e878 \
+        /usr/local/lib/node_modules/axe-core/axe.min.js > /tmp/axe.sha256 && \
+    sha256sum -c /tmp/axe.sha256 && \
+    rm -f /tmp/axe.sha256
 
 # clickup-mcp 1.8.0 (and 1.9.0) pin @modelcontextprotocol/sdk 1.15.1
 # exactly (CVE-2026-104850 fixed in 1.31.0; CVE-2026-111767/111768 in
