@@ -399,6 +399,51 @@ def slot_status(slot_id: str) -> dict[str, Any]:
     return get_json("/v1/status?" + urlencode({"slot": slot_id}))
 
 
+# Rollout escape hatch: a control without the capture-guard route (404) lets
+# a card fill go ahead on the local mark alone. Off by default (fail closed).
+CAPTURE_GUARD_OPTIONAL_ENV = "HERMES_BROWSER_CAPTURE_GUARD_OPTIONAL"
+
+
+def set_capture_guard(lease_id: str, command_token: str) -> tuple[bool, str]:
+    """``POST /v1/capture-guard``: control refuses capture on the lease's slot from now on.
+
+    Returns ``(ok, reason)``. ``reason`` is ``""`` on success,
+    ``control_without_capture_guard`` on a 404 (control older than the
+    route), else a short cause. The flag is set-only: only a temporary-profile
+    wipe or a human clears it (contract: monolith ``services/browser/README.md``).
+    """
+    control = control_url()
+    if not control or control == CONFIG_UNREADABLE_URL or is_disabled_url(control):
+        return False, "managed control URL missing or disabled"
+    key = control_key()
+    if not key:
+        return False, f"{MANAGED_KEY_ENV} missing"
+    if not lease_id or not command_token:
+        return False, "no managed lease for this page"
+    req = Request(
+        control.rstrip("/") + "/v1/capture-guard",
+        data=json.dumps({"lease_id": lease_id, "command_token": command_token}).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urlopen(req, timeout=STATUS_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        if exc.code == 404:
+            return False, "control_without_capture_guard"
+        return False, f"control HTTP {exc.code}"
+    except (OSError, ValueError) as exc:
+        return False, f"control unreachable: {type(exc).__name__}"
+    if not isinstance(data, dict) or data.get("capture_blocked") is not True:
+        return False, "control did not confirm the guard"
+    return True, ""
+
+
+def capture_guard_optional() -> bool:
+    return (os.environ.get(CAPTURE_GUARD_OPTIONAL_ENV) or "").strip().lower() in {"1", "true", "yes"}
+
+
 def held_leases_for_task(task_id: Optional[str]) -> list[dict[str, str]]:
     """Copies of the lease snapshots this process holds for ``task_id``, each
     with its ``identity`` and ``mode`` from the hold key. Tokens included:

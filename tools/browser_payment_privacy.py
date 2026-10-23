@@ -29,7 +29,17 @@ clean. Restores and resets keep or drop both together; the operator reset is
 deleting both after confirming no payment tab survives.
 
 This prevents accidental capture through standard browser tools; arbitrary
-terminal/code execution is not a containment boundary (see SECURITY.md).
+terminal/code execution is not a containment boundary. In managed mode the
+enforcement lives in browser-control: card fill first sets control's
+set-only capture guard on the lease's slot (``browser_control_route.
+set_capture_guard``; the fill is refused when that fails), and control's CDP
+splice then refuses every capture method on that slot, whatever the code
+text or token. Control clears it only on a temporary-profile wipe or by a
+human. This file and :func:`_wants_capture` stay as defense in depth and
+cover the unmanaged paths. Not covered anywhere: reading the card text
+itself (``Runtime.evaluate`` on the provider iframe, the accessibility
+tree); only the registered-value redaction limits that. Contract: monolith
+``services/browser/README.md`` (Capture guard on the CDP splice).
 """
 
 from __future__ import annotations
