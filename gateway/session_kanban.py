@@ -11,6 +11,11 @@ import sqlite3
 from hermes_state_runtime import RuntimeStoreError
 
 
+def card_skills(task):
+    """The skills an owner-run card loads: its advisory skills, then (dlz) its mandatory ones."""
+    return list(dict.fromkeys([*(task.skills or ()), *(task.required_skills or ())]))
+
+
 def build_kanban_policy(connection, params, config):
     from hermes_cli import kanban_db as kb
     from hermes_cli.profiles import resolve_profile_env
@@ -42,8 +47,7 @@ def build_kanban_policy(connection, params, config):
             if bound and json.loads(bound[0])['request_id'] != 'kanban:' + json.dumps([board, task.id, task.current_run_id], separators=(',', ':')):
                 raise RuntimeStoreError('stale_kanban_claim')
             context = kb.build_worker_context(conn, task.id)
-            # dlz: a card's mandatory skills load with its advisory ones on the owner path.
-            skills = list(dict.fromkeys([*(task.skills or ()), *(task.required_skills or ())]))
+            skills = card_skills(task)
             if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
                 # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
                 skills = list(dict.fromkeys([*skills, 'sdlc-review']))
