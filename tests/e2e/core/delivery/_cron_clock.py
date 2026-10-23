@@ -246,6 +246,10 @@ def install(clock: VirtualClock, control: Control, setattr_fn=setattr) -> None:
     for module in (jobs, scheduler, executions):
         setattr_fn(module, "time", proxy)
     setattr_fn(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", HEARTBEAT_REAL_SECONDS)
+    # The ledger's 48 h terminal-row window (tests/cron/test_execution_ledger.py) follows the
+    # virtual clock, so a 30-virtual-day soak would prune the rows its final reconciliation
+    # checks. Widen it here (this runs in every ticker process) so every run stays auditable.
+    setattr_fn(executions, "TERMINAL_RETENTION_HOURS", 90 * 24)
     setattr_fn(scheduler, "run_job", FakeAgent(clock, control))
     setattr_fn(send_message_tool, "_send_to_platform", FakeSink(clock, control))
     # Durability is not under test (SIGKILL keeps the page cache); per-write fsync of
