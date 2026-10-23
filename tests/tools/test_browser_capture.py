@@ -391,3 +391,49 @@ def test_harness_guard_matches_gateway_guard(marks):
     for slot, gen in (("shopping", "g1"), ("research-1", "g2"), ("", "g1"), ("research-1", "")):
         env = {h.GUARD_ENV: str(path), h.SLOT_ENV: slot, h.GENERATION_ENV: gen}
         assert h.capture_blocked(env) == guard.capture_blocked_for_surface(slot, gen), (marks, slot, gen)
+
+
+def test_bind_clears_leftover_overrides_and_dead_recordings(cap, monkeypatch):
+    import os
+
+    fake, ux = cap
+    monkeypatch.setattr(h.os, "environ", ux.env)
+    dead = ux.root / "run" / ".frames-flow-999999"
+    alive = ux.root / "run" / f".frames-flow-{os.getppid()}"
+    dead.mkdir(parents=True)
+    alive.mkdir(parents=True)
+    monkeypatch.setattr(h, "_pid_alive", lambda pid: pid == os.getppid())
+    # A killed call left the tab throttled and emulated; the next bind resets it.
+    fake.calls = []
+    h.bind(fake.globals())
+    assert [m for m, _ in fake.calls] == [m for m, _ in h.RESET_CALLS]
+    assert not dead.exists() and alive.exists()
+    assert oct(ux.root.stat().st_mode & 0o777) == "0o700"
+    assert len(ux.run("r").matrix("bare", viewports="phone", schemes="dark")) == 1
+
+
+def test_failed_or_killed_ux_capture_exec_is_followed_by_a_reset(managed_exec, monkeypatch):
+    grants, _ = managed_exec
+    grants[:] = [_lease("research-1")]
+    calls = []
+
+    def run(cmd, code, env, timeout):
+        calls.append((code, env.get("BU_NAME"), timeout))
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(browser_use_cli, "_run_cli_killing_process_group", run)
+    out = json.loads(browser_use_cli.browser_exec("ux_capture.run('x').perf(network='offline')", task_id="t"))
+    assert "timed out" in out["error"]
+    reset_code, bu_name, timeout = calls[1]
+    assert reset_code.startswith("# hermes: ux capture helpers") and "ux_capture.reset_slot()" in reset_code
+    assert bu_name == calls[0][1] and timeout == 20
+
+    # Plain code that times out, and a ux_capture call that succeeds, get no extra call.
+    calls.clear()
+    browser_use_cli.browser_exec("print(page_info())", task_id="t")
+    assert len(calls) == 1
+    calls[:] = [("", "", 0)]
+    browser_use_cli.browser_exec("ux_capture.run('x')", task_id="t")
+    assert len(calls) == 2

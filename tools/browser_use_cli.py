@@ -1002,6 +1002,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             env.clear()
             env.update(rerouted)
             dispatched = dispatch()
+    # dlz: undo ux_capture overrides a killed/failed call left on the tab (tools/browser_capture.py).
+    from tools.browser_capture import reset_after_failed_exec as _ux_capture_reset
+    _ux_capture_reset(code, env, dispatched, cmd, _run_cli_killing_process_group, task_id,
+                      fenced=bot_desktop_browser)
     if "proc" not in dispatched:
         if "error_result" in dispatched:
             return dispatched["error_result"]

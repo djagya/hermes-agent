@@ -296,7 +296,7 @@ _AXE_RUN_SCRIPT = r"""
   const slim = r => ({id: r.id, impact: r.impact, help: r.help, helpUrl: r.helpUrl, nodes: r.nodes.length,
     targets: r.nodes.slice(0, 5).map(n => ({target: n.target, html: String(n.html || '').slice(0, 200),
       summary: String(n.failureSummary || '').slice(0, 300)}))});
-  return JSON.stringify({version: axe.version, url: location.href, violations: res.violations.map(slim),
+  return JSON.stringify({version: axe.version, url: location.origin + location.pathname, violations: res.violations.map(slim),
     incomplete: res.incomplete.map(slim), passes: (res.passes || []).length});
 })(%s, %s)
 """
@@ -309,7 +309,8 @@ _ELEMENT_RECT_SCRIPT = r"""
 """
 
 _SETTLE_SCRIPT = "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))"
-_PAGE_SCRIPT = "JSON.stringify({url: location.href, title: document.title, scroll_width: document.documentElement.scrollWidth, client_width: document.documentElement.clientWidth})"
+# origin + path only: query strings and fragments carry reset links, OAuth codes and session ids.
+_PAGE_SCRIPT = "JSON.stringify({url: location.origin + location.pathname, title: document.title, scroll_width: document.documentElement.scrollWidth, client_width: document.documentElement.clientWidth})"
 
 
 class Run:
@@ -318,8 +319,7 @@ class Run:
     def __init__(self, cap: UXCapture, name: str):
         self.cap = cap
         self.name = _slug(name, 80)
-        self.dir = cap.root / self.name
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self.dir = _private_dir(cap.root / self.name)
 
     # ---- index -------------------------------------------------------
     @property
@@ -394,6 +394,8 @@ class Run:
                settle: float = 0.8, note: str = "") -> list[dict[str, Any]]:
         """Capture every (viewport x scheme) pair; emulation is restored once at the end."""
         self.cap.check_guard()
+        viewports = (viewports,) if isinstance(viewports, (str, dict)) else viewports
+        schemes = (schemes,) if isinstance(schemes, str) else schemes
         out = []
         try:
             for spec in viewports:
@@ -463,6 +465,8 @@ class Run:
         base = self.cap.root / "baselines" / _slug(key, 80) / f"{variant}.png"
         src = Path(entry["path"])
         if update or not base.exists():
+            _private_dir(base.parent.parent)
+            _private_dir(base.parent)
             _atomic_write(base, src.read_bytes())  # mkstemp: 0600
             return self._add({"kind": "baseline", "name": key, "status": "stored", "baseline": str(base),
                               "sha256": _sha256(base), "source": str(src)})
@@ -835,6 +839,17 @@ class UXCapture:
         if fn:
             fn(timeout)
 
+    def reset_slot(self) -> list[str]:
+        """Clear emulation, throttling and screencast; drop dead recordings' frame dirs."""
+        for method, params in RESET_CALLS:
+            with contextlib.suppress(Exception):
+                self.cdp(method, **params)
+        self._emulated = False
+        with contextlib.suppress(OSError):
+            _private_dir(self.root)
+            return remove_stale_frames(self.root)
+        return []
+
     def check_guard(self) -> None:
         if capture_blocked(self.env):
             raise CaptureRefused("payment_screenshot_blocked: this slot held a card fill; capture refused. "
@@ -995,8 +1010,47 @@ def js_chunks(text: str, limit: int = IPC_LINE_BUDGET) -> Iterator[str]:
         i += size
 
 
+# Every override ux_capture can leave on the tab. They live in the harness daemon's CDP session,
+# which outlives a killed call, so they are cleared on every bind and after a failed call.
+RESET_CALLS: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("Page.stopScreencast", {}),
+    ("Emulation.clearDeviceMetricsOverride", {}),
+    ("Emulation.setTouchEmulationEnabled", {"enabled": False}),
+    ("Emulation.setEmulatedMedia", {"media": "", "features": []}),
+    ("Emulation.setCPUThrottlingRate", {"rate": 1}),
+    ("Network.emulateNetworkConditions", {"offline": False, "latency": 0,
+                                          "downloadThroughput": -1, "uploadThroughput": -1}),
+)
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid == os.getpid():
+        return False  # a dir named for this process predates it (pid reuse): nothing records yet
+    try:
+        os.kill(pid, 0)  # windows-footgun: ok — signal 0 is an existence probe, never delivered
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists, owned by someone else
+    return True
+
+
+def remove_stale_frames(root: Path) -> list[str]:
+    """Delete ``<root>/<run>/.frames-*-<pid>`` dirs whose recording process is gone."""
+    removed = []
+    for d in root.glob("*/.frames-*"):
+        tail = d.name.rsplit("-", 1)[-1]
+        if d.is_dir() and not (tail.isdigit() and _pid_alive(int(tail))):
+            shutil.rmtree(d, ignore_errors=True)
+            removed.append(str(d))
+    return removed
+
+
 def bind(g: dict[str, Any]) -> UXCapture:
-    return UXCapture(g)
+    """Bind ``ux_capture`` for this call; the tab starts with no ux_capture override left on it."""
+    cap = UXCapture(g)
+    cap.reset_slot()
+    return cap
 
 
 # ---- index / storyboard rendering ------------------------------------------
