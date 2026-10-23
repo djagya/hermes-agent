@@ -3,7 +3,8 @@
 Synthetic letter modelled on a German insurer's questionnaire letter (Versichertennummer +
 Einmal-Kennwort on a type=text field). The vision model is faked; the invariants are that the secret
 never reaches anything model-facing, that unclear reads and unverified sites write nothing, and that a
-second fill is never automatic.
+second fill is never automatic: a refill needs the page's failure signal, or a sign-in the backend
+itself confirmed, then saw expire, plus the user's yes.
 """
 
 from __future__ import annotations
@@ -71,12 +72,27 @@ def _login(handle, page=PAGE, form=FORM, **kw):
         writes.append(expression)
         return {"success": True, "result": json.dumps({"filled": expression.count('"token"')})}
 
+    action = kw.pop("action", bvt.browser_vault_letter_login)
     with patch.object(bvt, "_focus_bound_origin", lambda *a, **k: None), \
          patch.object(bvt, "_eval_js", side_effect=fake_eval), \
          patch.object(bvt, "_eval_js_secret", side_effect=fake_secret), \
-         patch.object(bvt, "_confirm_letter_origin", return_value=kw.pop("confirm", False)):
-        raw = bvt.browser_vault_letter_login(handle, task_id="t", **kw)
+         patch.object(bvt, "_confirm_letter_origin", return_value=kw.pop("confirm", False)), \
+         patch.object(bvt, "_confirm_letter_reuse", return_value=kw.pop("reuse", False)):
+        raw = action(handle, task_id=kw.pop("task_id", "t"), **kw)
     return json.loads(raw), raw, writes
+
+
+DRAFT = [{"index": 0, "type": "text", "name": "inc", "label": "Monatliches Einkommen", "autocomplete": ""}]
+
+
+def _signed_in(handle, page=PAGE, form=DRAFT, **kw):
+    from tools import browser_vault_tool as bvt
+    return _login(handle, page=page, form=form, action=bvt.browser_vault_letter_signed_in, **kw)[0]
+
+
+def _sealed_handle(tmp_path):
+    _, _, notes = _seal(tmp_path, [FIRST, VERIFY])
+    return notes[0].split("letter handle: ")[1].split()[0]
 
 
 def test_letter_photo_is_sealed_and_login_fills_both_fields_without_leaking(tmp_path):
@@ -172,3 +188,48 @@ def select_error(controls, cred, **kw):
 ])
 def test_summary_never_carries_the_secret(summary, kept):
     assert vl._scrub(summary, SECRET) == kept
+
+
+def test_expired_session_renews_only_a_confirmed_sign_in_with_the_users_yes(tmp_path):
+    from tools import browser_vault_tool as bvt
+
+    handle = _sealed_handle(tmp_path)
+    assert _login(handle)[0]["success"]
+    # An unclear submit stays blocked: no confirmation yet, and the login form alone confirms nothing.
+    out, _, writes = _login(handle, session_expired=True, reuse=True)
+    assert out["error_type"] == "reauth_unproven" and not writes
+    assert _signed_in(handle, form=FORM)["error_type"] == "still_on_login"
+    assert _signed_in(handle)["success"]
+
+    vl.get_letter(handle).last_fill_at -= 120
+    assert _login(handle, after_failed_login=True)[0]["error_type"] == "reauth_required"  # stays truthful
+    out, _, writes = _login(handle, session_expired=True)
+    assert out["error_type"] == "reuse_declined" and not writes
+    out, raw, writes = _login(handle, session_expired=True, reuse=True)
+    assert out["success"] and out["reauths_left"] == vl.MAX_REAUTHS - 1 and SECRET in writes[0] and SECRET not in raw
+    # One confirmation renews one sign-in: a repeated fill cannot reset the proof.
+    out, _, writes = _login(handle, session_expired=True, reuse=True)
+    assert out["error_type"] == "reauth_unproven" and not writes
+
+    assert json.loads(bvt.browser_vault_letter_done(handle))["success"]
+    assert vl.get_letter(handle).secret == "" and SECRET not in bvt.browser_vault_list()
+    assert _login(handle, session_expired=True, reuse=True)[0]["error_type"] == "letter_consumed"
+
+
+@pytest.mark.parametrize("change,kw,error", [
+    ({}, {"page": "https://www.beispiel-kk.de/login"}, "origin_mismatch"),  # printed site, other login origin
+    ({}, {"task_id": "other"}, "reauth_unproven"),
+    ({"signed_in_at": -vl.CHECKPOINT_MAX_AGE_S - 1}, {}, "reauth_stale"),
+    ({"reauths": vl.MAX_REAUTHS}, {}, "attempts_exhausted"),
+    ({"last_fill_at": 110}, {}, "rate_limited"),
+    ({"expires_at": -1e9}, {}, "letter_unknown"),
+])
+def test_renewal_fails_closed(tmp_path, change, kw, error):
+    handle = _sealed_handle(tmp_path)
+    assert _login(handle)[0]["success"] and _signed_in(handle)["success"]
+    cred = vl.get_letter(handle)
+    cred.last_fill_at -= 120
+    for name, delta in change.items():
+        setattr(cred, name, getattr(cred, name) + delta)
+    out, _, writes = _login(handle, session_expired=True, reuse=True, **kw)
+    assert out["error_type"] == error and not writes

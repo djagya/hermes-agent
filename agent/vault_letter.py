@@ -32,7 +32,11 @@ from agent.vault_login_classifier import LoginControl, _normalize_text
 logger = logging.getLogger(__name__)
 
 LETTER_HANDLE_PREFIX = "letter-"
-MAX_LETTER_FILLS = 2  # the first try, plus one retry after the page itself showed the login failed
+MAX_FAILED_RETRIES = 1  # one refill after the page itself showed the sign-in failed
+MAX_REAUTHS = 3  # sign-ins renewed after a confirmed session expired
+CONFIRM_WINDOW_S = 30 * 60  # a sign-in is confirmed within this long after its fill, or not at all
+CHECKPOINT_MAX_AGE_S = 12 * 3600  # an older confirmed sign-in no longer proves the letter works
+REAUTH_MIN_INTERVAL_S = 60.0
 _DEFAULT_TTL_HOURS = 24.0
 _MAX_PER_PROFILE = 16
 
@@ -54,13 +58,24 @@ class LetterCredential:
     expires_at: float
     summary: str = ""
     fills: int = 0
+    # Sign-in lifecycle, kept apart from the fill count: "new" → "filled" (submitted or not, unknown)
+    # → "signed_in" (the backend saw the login form gone on the letter's site) → "filled" again after a
+    # renewed sign-in; "done" once the form the letter is for was sent, which retires the secret.
+    state: str = "new"
+    failed_retries: int = 0
+    reauths: int = 0
+    last_fill_at: float = 0.0
+    fill_task: str = ""
+    login_origin: str = ""
+    signed_in_at: float = 0.0
 
     def public(self) -> dict[str, Any]:
         """Everything the model may see. Never the secret."""
         return {"handle": self.handle, "organization": self.organization, "purpose": self.purpose,
                 "portal_urls": list(self.portal_urls), "identifier_label": self.identifier_label,
                 "identifier": self.identifier, "secret_label": self.secret_label, "status": self.status,
-                "fills": self.fills, "expires_in_s": max(0, int(self.expires_at - time.time()))}
+                "fills": self.fills, "state": self.state, "reauths_left": MAX_REAUTHS - self.reauths,
+                "expires_in_s": max(0, int(self.expires_at - time.time()))}
 
 
 # ---------------------------------------------------------------------------
@@ -119,22 +134,113 @@ def list_letters() -> list[dict[str, Any]]:
         return [c.public() for c in _bucket().values()]
 
 
-def reserve_fill(handle: str, after_failed_login: bool) -> Optional[tuple[str, str]]:
+_CONSUMED = ("letter_consumed", "The form this letter was for was already sent, so its password is retired. "
+             "Nothing was written.")
+
+
+def fill_refusal(cred: LetterCredential, *, after_failed_login: bool = False, session_expired: bool = False,
+                 task: Optional[str] = None, origin: Optional[str] = None,
+                 now: Optional[float] = None) -> Optional[tuple[str, str]]:
+    """Why this fill may not run, as ``(error_type, message)``, else None. ``task``/``origin`` None
+    skips the checks that need them (the cheap pre-check before the page is read)."""
+    now = time.time() if now is None else now
+    if cred.state == "done":
+        return _CONSUMED
+    if after_failed_login and session_expired:
+        return ("invalid_reason", "Pass after_failed_login (the page showed the sign-in failed) or "
+                "session_expired (a confirmed sign-in expired), not both.")
+    if session_expired:
+        if cred.state != "signed_in":
+            return ("reauth_unproven", "No confirmed sign-in with this letter to renew: the last fill was never "
+                    "confirmed with action=letter_signed_in, or a renewed sign-in is still unconfirmed. Read the "
+                    "page; never refill after an unclear submit. Nothing was written.")
+        if task is not None and task != cred.fill_task:
+            return "reauth_unproven", "The sign-in was confirmed in another browser task. Nothing was written."
+        if origin is not None and origin != cred.login_origin:
+            return ("origin_mismatch", f"Renewing a sign-in works only on the login page it was confirmed for "
+                    f"({cred.login_origin}). Nothing was written.")
+        if now - cred.signed_in_at > CHECKPOINT_MAX_AGE_S:
+            return ("reauth_stale", "The confirmed sign-in is too old to prove this letter still works. Tell the "
+                    "user; they can sign in through a handoff. Nothing was written.")
+        if cred.reauths >= MAX_REAUTHS:
+            return ("attempts_exhausted", f"This letter's sign-in was already renewed {cred.reauths} times. Stop "
+                    "and tell the user what the page shows.")
+        if now - cred.last_fill_at < REAUTH_MIN_INTERVAL_S:
+            return "rate_limited", "The last fill was moments ago. Read the page before signing in again."
+        return None
+    if not cred.fills:
+        return None
+    if cred.state == "signed_in":
+        if after_failed_login:
+            return ("reauth_required", "The last sign-in with this letter was confirmed, so a login form now means "
+                    "the session expired, not that the password failed. Call again with session_expired=true.")
+        return ("attempt_unclear", "This letter's sign-in was confirmed earlier. If the page shows the login form "
+                "again because the session expired, call again with session_expired=true.")
+    if not after_failed_login:
+        return ("attempt_unclear", "This letter login was already filled. If the form was submitted, first "
+                "check the page: signed in → call action=letter_signed_in and continue; still on the login form "
+                "with an error → call again with after_failed_login=true. Never refill after a timeout without looking.")
+    if cred.failed_retries >= MAX_FAILED_RETRIES:
+        return ("attempts_exhausted", f"This letter login was already filled {cred.fills} times. Stop: more "
+                "tries can lock the one-time password. Tell the user what the page shows.")
+    return None
+
+
+def reserve_fill(handle: str, *, after_failed_login: bool = False, session_expired: bool = False,
+                 task: str, origin: str) -> Optional[tuple[str, str]]:
     """Count one fill attempt atomically, right before the secret is written. Every dispatched
-    fill counts, whatever its result. Returns ``(error_type, message)`` when no attempt is left."""
+    fill counts, whatever its result. Returns ``(error_type, message)`` when it may not run."""
     with _LOCK:
         cred = _bucket().get(handle)
+        if cred is not None and cred.state == "done":
+            return _CONSUMED
         if cred is None or not cred.secret:
             return "letter_unknown", "The letter login expired. Ask the user to send the photo again."
-        if cred.fills >= MAX_LETTER_FILLS:
-            return ("attempts_exhausted", f"This letter login was already filled {cred.fills} times. Stop: more "
-                    "tries can lock the one-time password. Tell the user what the page shows.")
-        if cred.fills and not after_failed_login:
-            return ("attempt_unclear", "This letter login was already filled. If the form was submitted, first "
-                    "check the page: signed in → continue; still on the login form with an error → call again "
-                    "with after_failed_login=true. Never refill after a timeout without looking.")
+        now = time.time()
+        refused = fill_refusal(cred, after_failed_login=after_failed_login, session_expired=session_expired,
+                               task=task, origin=origin, now=now)
+        if refused:
+            return refused
+        if session_expired:
+            cred.reauths += 1
+        else:
+            if cred.fills:
+                cred.failed_retries += 1
+            cred.fill_task, cred.login_origin = task, origin
         cred.fills += 1
+        cred.state, cred.last_fill_at = "filled", now
         return None
+
+
+def record_signed_in(handle: str, *, task: str) -> Optional[tuple[str, str]]:
+    """The backend saw this task's page on the letter's site with no login form after a fill: keep it
+    as the proof a later ``session_expired`` sign-in needs. Repeating it while signed in refreshes it."""
+    with _LOCK:
+        cred = _bucket().get(handle)
+        if cred is not None and cred.state == "done":
+            return _CONSUMED
+        if cred is None or not cred.secret:
+            return "letter_unknown", "The letter login expired. Ask the user to send the photo again."
+        now = time.time()
+        if cred.state not in ("filled", "signed_in"):
+            return "nothing_to_confirm", "This letter was never filled, so there is no sign-in to confirm."
+        if task != cred.fill_task:
+            return "nothing_to_confirm", "This letter was filled in another browser task."
+        if cred.state == "filled" and now - cred.last_fill_at > CONFIRM_WINDOW_S:
+            return ("confirm_too_late", "The fill was too long ago to tie this page to it. If the session later "
+                    "expires, the user signs in through a handoff.")
+        cred.state, cred.signed_in_at = "signed_in", now
+        return None
+
+
+def retire_letter(handle: str) -> bool:
+    """The form the letter was for was sent: zero the secret, keep the record so later calls say why."""
+    with _LOCK:
+        cred = _bucket().get(handle)
+        if cred is None:
+            return False
+        cred.secret, cred.state = "", "done"
+        return True
 
 
 def clear_letters() -> None:
@@ -502,6 +608,11 @@ def _best(controls: list[LoginControl], score) -> tuple[Optional[LoginControl], 
     if not scored:
         return None, False
     return scored[0][1], len(scored) > 1 and scored[1][0] == scored[0][0]
+
+
+def shows_login_form(controls: list[LoginControl], cred: LetterCredential) -> bool:
+    """A visible control could take the letter's secret: the page is (still, or again) a login form."""
+    return any(_score_secret(c, cred) for c in controls)
 
 
 def select_letter_fills(controls: list[LoginControl], cred: LetterCredential, *, secret_field: str = "",

@@ -172,7 +172,7 @@ def test_fill_payment_names_every_target_tags_fills_and_redacts_only_card_secret
 
     monkeypatch.setattr("tools.browser_vault_tool._ensure_supervisor", lambda task_id: Supervisor())
     monkeypatch.setattr("tools.browser_vault_tool._bot_desktop_browser_session", lambda task_id: False)
-    monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session", lambda task_id: None)
+    monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session", lambda task_id, surface=None: None)
     monkeypatch.setattr("agent.redact.register_vault_redaction_value", registered.append)
     monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent",
                         lambda *args, **k: consent_text.append(args[1]) or "accept")

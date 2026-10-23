@@ -95,7 +95,14 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             lease.assert_agent_may_act()
         from tools.browser_payment_privacy import mark_payment_session
 
-        mark_payment_session(task_id)
+        surface = None
+        if vault._is_managed():
+            from tools.browser_use_cli import vault_route
+
+            route = vault_route(task_id)
+            surface = {"slot_id": route.get("slot_id", ""),
+                       "browser_generation": route.get("browser_generation", "")}
+        mark_payment_session(task_id, surface)
         result = supervisor.commit_payment(inspected, fills)
         result.update(
             kind="payment",
