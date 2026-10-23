@@ -322,6 +322,9 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     except TimeoutError as exc:
         return tool_error(f"CDP call timed out after {safe_timeout}s: {exc}", method=method)
     except RuntimeError as exc:
+        if "payment_screenshot_blocked" in str(exc):
+            # browser-control's capture guard refused the method on a card-filled slot.
+            return json.dumps(screenshot_refusal())
         return tool_error(str(exc), method=method)
     except WebSocketException as exc:
         return tool_error(f"WebSocket error talking to CDP at {endpoint}: {exc}. The browser may have "

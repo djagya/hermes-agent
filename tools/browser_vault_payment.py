@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from agent.vault_backends import BackendError
 from agent.vault_login_classifier import select_checkout_fills
@@ -10,6 +11,8 @@ from agent.vault_payment_card import validate_card
 from agent.vault_payment_policy import PaymentPolicyError, effective_frame_origins
 from agent.vault_store import PAYMENT_FIELDS
 from tools.browser_supervisor_payment import OPTIONAL_CARD_TOKENS
+
+logger = logging.getLogger(__name__)
 
 
 def _register_card_redaction(secret: dict) -> None:
@@ -42,6 +45,29 @@ def _document_fills(inspected, secret: dict) -> list | None:
             return None
         fills += [dict(f, document=k) for f in document_fills]
     return fills
+
+
+def _set_control_capture_guard(route: dict) -> dict | None:
+    """Ask browser-control to refuse capture on this lease's slot; a refusal result when it did not.
+
+    Fail closed: any failure refuses the fill. Only a control without the route (404) may be let
+    through, and only when the operator set ``HERMES_BROWSER_CAPTURE_GUARD_OPTIONAL`` for a rollout.
+    """
+    from tools.browser_control_route import capture_guard_optional, set_capture_guard
+
+    ok, reason = set_capture_guard(str(route.get("lease") or ""), str(route.get("token") or ""))
+    if ok:
+        return None
+    if reason == "control_without_capture_guard" and capture_guard_optional():
+        logger.warning("card fill: browser-control has no capture guard route; local mark only (rollout)")
+        return None
+    logger.warning("card fill refused: browser-control capture guard not set (%s)", reason)
+    return {
+        "success": False,
+        "error_type": "payment_capture_guard_unavailable",
+        "error": "Browser control could not lock screen capture on this browser, so no card field was "
+        "written. Nothing was submitted. Report this to Danil; do not retry on another route.",
+    }
 
 
 def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
@@ -101,6 +127,10 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             from tools.browser_use_cli import vault_route
 
             route = vault_route(task_id)
+            # Control's CDP-level capture guard first; no card byte is written unless it holds.
+            refused = _set_control_capture_guard(route)
+            if refused:
+                return json.dumps(refused)
             surface = {"slot_id": route.get("slot_id", ""),
                        "browser_generation": route.get("browser_generation", ""),
                        "wipe_count": route.get("wipe_count", ""),

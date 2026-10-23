@@ -724,7 +724,9 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
              "slot_id": str(env.get("HERMES_BROWSER_SLOT_ID") or ""),
              "browser_generation": str(env.get("HERMES_BROWSER_GENERATION") or ""),
              "wipe_count": str(env.get("HERMES_BROWSER_WIPE_COUNT") or ""),
-             "profile_kind": str(env.get("HERMES_BROWSER_PROFILE_KIND") or "")}
+             "profile_kind": str(env.get("HERMES_BROWSER_PROFILE_KIND") or ""),
+             # Gateway memory only (never in a tool result): card fill sets control's capture guard.
+             "token": str(env.get("HERMES_BROWSER_COMMAND_TOKEN") or "")}
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
         from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
@@ -906,6 +908,18 @@ def _managed_dialogs(managed: bool, task_id: Optional[str], env: dict, started: 
     except Exception as e:  # health: allow BLE001 -- dialog reporting is advisory
         logger.debug("browser_exec dialog report failed: %s", e)
         return None
+
+
+# CDP error message prefix browser-control uses when its capture guard refuses a method.
+_CONTROL_CAPTURE_REFUSAL = "payment_screenshot_blocked"
+
+
+def _apply_control_capture_refusal(result: dict, managed: bool) -> None:
+    """browser-control answered a capture method with its guard error (card-filled slot)."""
+    if managed and _CONTROL_CAPTURE_REFUSAL in str(result.get("stderr") or ""):
+        from tools.browser_payment_privacy import screenshot_refusal
+
+        result.update(screenshot_refusal())
 
 
 def _with_dialogs(result_json: str, dialogs: Optional[dict]) -> str:
@@ -1092,6 +1106,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     stderr = _cap_stderr(stderr)
     if stderr:
         result["stderr"] = stderr
+    _apply_control_capture_refusal(result, managed)
     screenshot = _find_screenshot(proc.stdout, started)
     if screenshot:
         result["screenshot_path"] = screenshot
