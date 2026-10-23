@@ -123,19 +123,18 @@ def is_managed() -> bool:
 
 
 def control_key() -> str:
-    """Bearer key for control: ``HERMES_BROWSER_CONTROL_KEY``, else the file
-    named by ``HERMES_BROWSER_CONTROL_KEY_FILE``. Never returned to the model."""
-    key = (os.environ.get(MANAGED_KEY_ENV) or "").strip()
-    if key:
-        return key
+    """Bearer key for control. ``HERMES_BROWSER_CONTROL_KEY_FILE`` wins (an
+    unreadable file means no key, never a fallback to a retired env value),
+    else ``HERMES_BROWSER_CONTROL_KEY``; the same rule browser-control uses.
+    Never returned to the model."""
     path = (os.environ.get(MANAGED_KEY_FILE_ENV) or "").strip()
-    if not path:
-        return ""
-    try:
-        with open(path, encoding="utf-8-sig") as fh:
-            return fh.read().strip()
-    except OSError:
-        return ""
+    if path:
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+    return (os.environ.get(MANAGED_KEY_ENV) or "").strip()
 
 
 def clear_held_leases() -> None:

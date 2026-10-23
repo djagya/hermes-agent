@@ -73,9 +73,10 @@ def test_non_integer_wipe_count_leaves_env_unset(monkeypatch):
     assert route.MANAGED_WIPE_ENV not in env
 
 
-def test_control_key_from_file(monkeypatch, tmp_path):
-    monkeypatch.delenv("HERMES_BROWSER_CONTROL_KEY", raising=False)
+def test_control_key_file_wins_and_an_unreadable_file_means_no_key(monkeypatch, tmp_path):
     key = tmp_path / "key"
     key.write_text("from-file\n", encoding="utf-8")
     monkeypatch.setenv(route.MANAGED_KEY_FILE_ENV, str(key))
     assert route.control_key() == "from-file"
+    monkeypatch.setenv(route.MANAGED_KEY_FILE_ENV, str(tmp_path / "missing"))
+    assert route.control_key() == ""
