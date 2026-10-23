@@ -160,7 +160,8 @@ def clear_payment_surface(slot_id: str, *, confirmed_by: str) -> int:
         return len(removed)
 
 
-_CAPTURE_TOKENS = ("screenshot", "printtopdf", "screencast", "recording")
+# "ux_capture" is the browser_exec capture helper namespace (tools/browser_capture.py).
+_CAPTURE_TOKENS = ("screenshot", "printtopdf", "screencast", "recording", "ux_capture")
 
 
 def _wants_capture(code: str) -> bool:

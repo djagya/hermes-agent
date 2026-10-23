@@ -937,6 +937,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     if workspace:
         env["BH_AGENT_WORKSPACE"] = workspace
         code = _WORKSPACE_PREAMBLE + code
+    # dlz: ux_capture helpers (tools/browser_capture.py), loaded only when the code names them.
+    from tools.browser_capture import prepare_exec as _ux_capture_prepare
+    code = _ux_capture_prepare(code, env, task_id)
 
     # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no local
     # Chrome/CDP endpoint is reachable (their API key authenticates it)
