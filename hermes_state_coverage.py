@@ -18,6 +18,25 @@ from hermes_state_messages import _parse_tool_calls
 class SessionCoverageMixin:
     """Coverage helpers for SessionDB; relies on SessionMessagesMixin's codec/identity helpers."""
 
+    def _split_carried_tail(
+        self, conn, row_ids: list[int], compacted_messages: list[dict[str, Any]], tail_count: int,
+    ) -> tuple[list[int], int, int]:
+        """``(clone_ids, clone_tool_calls, tail_below)`` for the concurrent-tail rows *row_ids* (#137197).
+
+        A row the compacted set already carries (the compressor held it, and it was flushed above the
+        watermark or left unnamed) is superseded by that copy, not cloned beside it: the carried copy is
+        its one live row and the original takes rewind flags. Its carried dict has no original below the
+        watermark, so the positional tail rewind takes ``tail_below`` rows instead of *tail_count*."""
+        carried = self._carried_tail_ids(conn, row_ids, compacted_messages)
+        clone_ids = [row_id for row_id in row_ids if row_id not in carried]
+        clone_tool_calls = 0
+        if clone_ids:
+            _ids, clone_tool_calls = self._tail_rows_after_watermark(
+                conn, f"SELECT id, tool_calls FROM messages WHERE id IN ({_placeholders(clone_ids)}) ORDER BY id",
+                tuple(clone_ids))
+        return clone_ids, clone_tool_calls, tail_count - self._carried_tail_slots(
+            carried, len(compacted_messages), tail_count)
+
     def _carried_tail_ids(
         self, conn, tail_ids: list[int], compacted_messages: list[dict[str, Any]],
     ) -> dict[int, int]:

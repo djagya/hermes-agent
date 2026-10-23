@@ -948,10 +948,7 @@ class SessionMessagesMixin:
         covered_set.update(carried_ids)
         unseen = [row_id for row_id in active_ids if row_id not in covered_set]
         covered_active = [row_id for row_id in active_ids if row_id in covered_set]
-        # An unseen row the compacted set already carries is superseded by that copy, not cloned (#137197).
-        carried_unseen = self._carried_tail_ids(conn, unseen, compacted_messages)
-        clone_ids = [row_id for row_id in unseen if row_id not in carried_unseen]
-        tail_below = tail_count - self._carried_tail_slots(carried_unseen, len(compacted_messages), tail_count)
+        clone_ids, unseen_tool_calls, tail_below = self._split_carried_tail(conn, unseen, compacted_messages, tail_count)
         rewind_ids = list(carried_ids)
         if tail_below > 0:
             rewind_ids += self._tail_originals(covered_active, tail_below, merged_away)
@@ -970,10 +967,6 @@ class SessionMessagesMixin:
         self._carry_parent_timestamps(conn, session_id, compacted_messages)
         inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
         if clone_ids:
-            _ids, unseen_tool_calls = self._tail_rows_after_watermark(
-                conn,
-                f"SELECT id, tool_calls FROM messages WHERE id IN ({_placeholders(clone_ids)}) ORDER BY id",
-                tuple(clone_ids))
             self._clone_message_rows(conn, clone_ids)
             inserted += len(clone_ids)
             tool_calls_total += unseen_tool_calls
@@ -1015,9 +1008,6 @@ class SessionMessagesMixin:
         platform_message_id, token counts, reasoning sidecars all survive byte-exact, and the FTS triggers
         index the clones naturally), and the originals are archived. NOTE: re-sequencing assigns the tail
         rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
-        A tail row that *compacted_messages* already carries (the compressor held it, and it was flushed
-        above the watermark or left unnamed) is not cloned: the carried copy is its one live row and the
-        original takes rewind flags (#137197).
         """
         from hermes_state import SessionCompressionInProgressError
         def _do(conn):
@@ -1039,14 +1029,8 @@ class SessionMessagesMixin:
             tail_ids: list[int] = [] if watermark is None else [int(row["id"]) for row in conn.execute(
                 "SELECT id FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
                 (session_id, int(watermark))).fetchall()]
-            # A concurrent-tail row the compacted set already carries is superseded by that copy, not
-            # cloned beside it (#137197); its carried dict then has no original below the watermark.
-            carried_tail = self._carried_tail_ids(conn, tail_ids, compacted_messages)
-            clone_ids = [row_id for row_id in tail_ids if row_id not in carried_tail]
-            _ids, tail_tool_calls = ([], 0) if not clone_ids else self._tail_rows_after_watermark(
-                conn, f"SELECT id, tool_calls FROM messages WHERE id IN ({_placeholders(clone_ids)}) ORDER BY id",
-                tuple(clone_ids))
-            tail_below = tail_count - self._carried_tail_slots(carried_tail, len(compacted_messages), tail_count)
+            clone_ids, tail_tool_calls, tail_below = self._split_carried_tail(
+                conn, tail_ids, compacted_messages, tail_count)
             # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
             # concurrent append would steal a LIMIT slot.
             rewind_ids: list[int] = self._resolve_carried_row_ids(
