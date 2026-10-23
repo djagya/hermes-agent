@@ -97,7 +97,7 @@ def control(monkeypatch):
     seen, reply = [], {"status": 200, "body": {"capture_blocked": True, "slot_id": "shopping"}}
 
     class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):  # noqa: N802
+        def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
             seen.append((self.path, self.headers.get("Authorization"), json.loads(body)))
             data = json.dumps(reply["body"]).encode()

@@ -914,6 +914,14 @@ def _managed_dialogs(managed: bool, task_id: Optional[str], env: dict, started: 
 _CONTROL_CAPTURE_REFUSAL = "payment_screenshot_blocked"
 
 
+def _apply_control_capture_refusal(result: dict, managed: bool) -> None:
+    """browser-control answered a capture method with its guard error (card-filled slot)."""
+    if managed and _CONTROL_CAPTURE_REFUSAL in str(result.get("stderr") or ""):
+        from tools.browser_payment_privacy import screenshot_refusal
+
+        result.update(screenshot_refusal())
+
+
 def _with_dialogs(result_json: str, dialogs: Optional[dict]) -> str:
     if not dialogs:
         return result_json
@@ -1098,11 +1106,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     stderr = _cap_stderr(stderr)
     if stderr:
         result["stderr"] = stderr
-    if managed and _CONTROL_CAPTURE_REFUSAL in stderr:
-        # browser-control answered a capture method with its guard error (card-filled slot).
-        from tools.browser_payment_privacy import screenshot_refusal
-
-        result.update(screenshot_refusal())
+    _apply_control_capture_refusal(result, managed)
     screenshot = _find_screenshot(proc.stdout, started)
     if screenshot:
         result["screenshot_path"] = screenshot
