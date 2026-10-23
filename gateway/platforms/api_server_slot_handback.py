@@ -19,6 +19,7 @@ from __future__ import annotations
 import hmac
 import logging
 import re
+from functools import partial
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ def _expected_key() -> str:
         from tools.browser_control_route import control_key
 
         return control_key()
-    except Exception:  # health: allow BLE001 -- no control client: the route is disabled
+    except ImportError:
         return ""
 
 
@@ -89,3 +90,38 @@ async def inject(runner: Any, session_id: str, slot_id: str) -> str:
         return "unavailable"
     logger.info("browser handback wake scheduled: slot=%s session=%s", slot_id, session_id)
     return "injected"
+
+
+def _error(message: str, status: int, code: str):
+    from gateway.platforms.api_server import _error_response
+
+    return _error_response(message, status, code=code)
+
+
+async def handle_request(adapter: Any, request: Any):
+    """``POST /v1/browser-slots/handback``: 503 no key, 401 bad Bearer, 400 bad body, 404 unknown session."""
+    from aiohttp import web
+
+    status = check_bearer(request.headers.get("Authorization", ""))
+    if status == 503:
+        return _error("Browser slot handback is not configured.", 503, "handback_disabled")
+    if status is not None:
+        return _error("Invalid handback authorization.", 401, "handback_unauthorized")
+    try:
+        payload = await request.json()
+    except ValueError:
+        return _error("Request body must be valid JSON.", 400, "invalid_json")
+    fields, reason = parse(payload)
+    if fields is None:
+        return _error(reason, 400, "handback_invalid")
+    runner = adapter.gateway_runner or request.app.get("gateway_runner")
+    outcome = await inject(runner, fields["session_id"], fields["slot_id"])
+    if outcome == "session_not_found":
+        return _error("No live session with that id.", 404, "session_not_found")
+    if outcome != "injected":
+        return _error("Gateway cannot route the wake turn now.", 503, "handback_unavailable")
+    return web.json_response({"injected": True}, status=202)
+
+
+def _http_routes(adapter: Any) -> list[tuple]:
+    return [("POST", HANDBACK_PATH, partial(handle_request, adapter))]

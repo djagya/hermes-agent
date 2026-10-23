@@ -378,7 +378,7 @@ class DialogSupervisionMixin:
         try:
             attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=3.0)
             sid = attach["result"]["sessionId"]
-        except Exception as e:
+        except Exception as e:  # health: allow BLE001 -- a closed or hung tab is skipped; the others stay watched
             logger.debug("dialog tab attach failed for %s: %s", target_id[:12], e)
             return
         tabs[target_id] = sid
@@ -410,8 +410,12 @@ class DialogSupervisionMixin:
     async def _on_target_created(self, params: dict[str, Any], session_id: Optional[str]) -> None:
         info = params.get("targetInfo") or {}
         if getattr(self, "_watch_new_tabs", False) and info.get("type") == "page":
-            # Off the reader: _watch_tab awaits replies only the reader can deliver.
-            asyncio.create_task(self._watch_tab(str(info.get("targetId") or "")))
+            # Off the reader: _watch_tab awaits replies only the reader can deliver. _watch_tab
+            # swallows its own failures; the set keeps the task referenced until it finishes.
+            tasks = self.__dict__.setdefault("_dialog_tab_tasks", set())
+            task = asyncio.create_task(self._watch_tab(str(info.get("targetId") or "")))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
 
     # CDP event → handler(self, params, session_id); merged into CDPSupervisor._EVENT_HANDLERS.
     EVENT_HANDLERS: dict[str, Callable[..., Any]] = {

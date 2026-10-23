@@ -873,13 +873,23 @@ def _managed_busy_wait(timeout_s: Any) -> Optional[float]:
     """Fair-queue wait budget for a managed acquire: at most half this call's timeout."""
     try:
         from tools.browser_control_route import busy_wait_budget
-    except Exception:
+    except ImportError:
         return None
     return busy_wait_budget(_clamp_timeout(timeout_s))
 
 
-def _managed_dialogs(task_id: Optional[str], env: dict, started: float, identity: str) -> Optional[dict]:
+def _arm_dialogs(managed: bool, task_id: Optional[str], env: dict, on_dialog: str, identity: str) -> None:
+    """Managed slots: this call's page-dialog policy on the task's supervisor (``tools.browser_exec_dialogs``)."""
+    if managed:
+        from tools import browser_exec_dialogs
+        browser_exec_dialogs.arm(task_id, env, on_dialog=on_dialog, identity=identity)
+
+
+def _managed_dialogs(managed: bool, task_id: Optional[str], env: dict, started: float,
+                     identity: str) -> Optional[dict]:
     """Dialogs this call left pending or answered (``tools.browser_exec_dialogs``); never fails the exec."""
+    if not managed:
+        return None
     try:
         from tools import browser_exec_dialogs
         found = browser_exec_dialogs.collect(task_id, started)
@@ -1003,9 +1013,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         if refused:
             return {"error_result": refused}
         _attach_vault_supervisor(env, task_id)
-        if managed:
-            from tools import browser_exec_dialogs
-            browser_exec_dialogs.arm(task_id, env, on_dialog=on_dialog, identity=identity)
+        _arm_dialogs(managed, task_id, env, on_dialog, identity)
         with _driven_daemons_lock:
             _driven_daemons.add(env.get("BU_NAME", "default"))
         try:
@@ -1043,7 +1051,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             env.clear()
             env.update(rerouted)
             dispatched = dispatch()
-    dialogs = _managed_dialogs(task_id, env, started, identity) if managed else None
+    dialogs = _managed_dialogs(managed, task_id, env, started, identity)
     if "proc" not in dispatched:
         if "error_result" in dispatched:
             return _with_dialogs(dispatched["error_result"], dialogs)
@@ -1061,8 +1069,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         result["workspace"] = workspace
     if session:
         result["session"] = session
-    if dialogs:
-        result["dialogs"] = dialogs
+    result.update({"dialogs": dialogs} if dialogs else {})
     stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
     if managed and "permission-blocked" in stderr:
         stderr = _GATE_REFUSED_HINT + "\n" + stderr

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway import browser_handback as hb
+from gateway.platforms import api_server_slot_handback as hb
 
 
 @pytest.fixture(autouse=True)

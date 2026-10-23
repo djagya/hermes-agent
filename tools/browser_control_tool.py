@@ -45,7 +45,7 @@ def _route():
 def _available() -> bool:
     try:
         route = _route()
-    except Exception:
+    except ImportError:
         return False
     url = route.control_url()
     return bool(url) and not route.is_disabled_url(url) and url != route.CONFIG_UNREADABLE_URL
