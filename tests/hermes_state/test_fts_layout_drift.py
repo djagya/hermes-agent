@@ -172,6 +172,7 @@ def test_notice_for_a_legacy_inline_store_keeps_the_reclaim_estimate(tmp_path, m
     assert "60%" in _notice_for(db_path, monkeypatch)
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)")
 def test_a_base_index_the_next_open_realigns_is_not_offered_as_opt_in_work(tmp_path, monkeypatch):
     """A raw-``messages`` base index with a current trigram is realigned automatically on the next read-write
     open, so the update notice (read-only, before that open) must not send the user to optimize-storage."""
@@ -326,6 +327,7 @@ def test_optimize_settle_refuses_pending_backfill(tmp_path):
         db.close()
 
 
+@pytest.mark.skip(reason="fork FTS fence: live FTS rebuild disabled (contract owned by tests/hermes_state/test_fts_fork_fence.py)")
 def test_a_stale_base_source_view_is_replaced_before_the_store_is_stamped(tmp_path):
     from hermes_state_common import FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS
 
