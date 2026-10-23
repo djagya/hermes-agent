@@ -247,3 +247,19 @@ def test_recording_acks_frames_keeps_other_events_and_writes_mp4(cap):
     mp4 = open(out["path"], "rb").read()
     assert mp4[4:8] == b"ftyp" and out["frames"] == 6 and out["gif"]["bytes"] > 0
     assert not list(run.dir.glob(".frames-*"))
+
+
+def test_harness_auto_recording_is_always_forced_off(monkeypatch, managed_exec):
+    # BH_RECORD=0 outranks the harness's recording config file and refuses start_recording().
+    monkeypatch.setenv("BH_RECORD", "1")
+    assert browser_use_cli._base_subprocess_env()["BH_RECORD"] == "0"
+    grants, runs = managed_exec
+    grants[:] = [_lease("research-1")]
+    browser_use_cli.browser_exec("print(page_info())", task_id="t")
+    assert runs[0][1]["BH_RECORD"] == "0"
+    # On a payment slot, code reaching the harness recorder is refused like any capture.
+    guard.mark_payment_session("checkout", {"slot_id": "shopping", "browser_generation": "g1"})
+    grants[:] = [_lease("shopping")]
+    for code in ("import os; os.environ['BH_RECORD'] = '1'", "from browser_harness import recorder"):
+        assert json.loads(browser_use_cli.browser_exec(code, task_id="t"))["error_type"] == "payment_screenshot_blocked"
+    assert len(runs) == 1

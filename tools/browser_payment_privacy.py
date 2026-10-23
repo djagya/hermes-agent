@@ -160,8 +160,9 @@ def clear_payment_surface(slot_id: str, *, confirmed_by: str) -> int:
         return len(removed)
 
 
-# "ux_capture" is the browser_exec capture helper namespace (tools/browser_capture.py).
-_CAPTURE_TOKENS = ("screenshot", "printtopdf", "screencast", "recording", "ux_capture")
+# "ux_capture" is the browser_exec capture helper namespace (tools/browser_capture.py);
+# "recorder" / "bh_record" reach the harness's own per-action recorder and its env switch.
+_CAPTURE_TOKENS = ("screenshot", "printtopdf", "screencast", "recording", "ux_capture", "recorder", "bh_record")
 
 
 def _wants_capture(code: str) -> bool:
