@@ -101,7 +101,8 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
 
             route = vault_route(task_id)
             surface = {"slot_id": route.get("slot_id", ""),
-                       "browser_generation": route.get("browser_generation", "")}
+                       "browser_generation": route.get("browser_generation", ""),
+                       "wipe_count": route.get("wipe_count", "")}
         mark_payment_session(task_id, surface)
         result = supervisor.commit_payment(inspected, fills)
         result.update(

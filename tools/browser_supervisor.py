@@ -443,6 +443,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                 # are deliberately kept — they reconcile as fresh events arrive (worst case a
                 # stale dialog entry is rejected with "no dialog is showing", logged only).
                 self._page_session_id = None
+                self._reset_dialog_tabs()
                 await self._attach_initial_page()
                 self._set_active(True)
                 last_success_at = time.time()
@@ -487,6 +488,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
         that does not answer (crashed renderer, hung tab) is detached again and the error re-raised."""
         attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
         sid = attach["result"]["sessionId"]
+        self._main_page_target = target_id
         try:
             await self._enable_page_domains(sid, timeout=timeout)
         except BaseException:
@@ -549,6 +551,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                     else:
                         fut.set_result(msg)
                 elif handler := self._EVENT_HANDLERS.get(msg.get("method")):
+                    if self._dialog_tab_event_ignored(msg.get("method"), msg.get("params", {}), msg.get("sessionId")):
+                        continue
                     result = handler(self, msg.get("params", {}), msg.get("sessionId"))
                     if result is not None:
                         await result

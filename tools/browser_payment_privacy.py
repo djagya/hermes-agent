@@ -10,12 +10,16 @@ capture) still refuse while any mark exists (:func:`payment_session_sensitive`).
 
 Marks never clear on navigation, lease release, a new browser generation or a
 gateway restart: a persistent profile, and a temporary slot restarted without
-a wipe, can restore the payment tab, and control does not attest a wipe. They
-persist in ``$HERMES_HOME/browser/payment-capture-guard.json`` and are cleared
-only by an operator (``python -m tools.browser_payment_privacy clear``) after
-confirming the slot's payment tab is gone; each clear is appended to
-``payment-capture-guard.log`` beside it. An unreadable mark file refuses every
-capture.
+a wipe, can restore the payment tab. They persist in
+``$HERMES_HOME/browser/payment-capture-guard.json``. One mark clears by itself:
+a mark on a *temporary* slot that recorded control's wipe counter at fill time,
+once control reports that slot with a higher counter and a different browser
+generation (its profile was wiped after the fill; :func:`_prune_wiped`). Any
+missing, malformed or unreachable answer keeps the mark. Every other mark is
+cleared only by an operator (``python -m tools.browser_payment_privacy clear``)
+after confirming the slot's payment tab is gone. Each clear, automatic or
+operator, is appended to ``payment-capture-guard.log`` beside the file. An
+unreadable mark file refuses every capture.
 
 This prevents accidental capture through standard browser tools; arbitrary
 terminal/code execution is not a containment boundary (see SECURITY.md).
@@ -96,9 +100,14 @@ def mark_payment_session(task_id: str, surface: dict[str, str] | None = None) ->
     """
     slot_id = str((surface or {}).get("slot_id") or "").strip()
     generation = str((surface or {}).get("browser_generation") or "").strip()
+    wipe_count = str((surface or {}).get("wipe_count") or "").strip()
     mark: dict[str, Any] = {"task_id": str(task_id or ""), "marked_at": _now()}
     if slot_id and generation:
         mark.update(scope=SLOT_SCOPE, slot_id=slot_id, browser_generation=generation)
+        # Control's wipe counter for the slot when the card went in; only a
+        # plain decimal is recorded, so a mark without it never auto-clears.
+        if wipe_count.isdecimal() and wipe_count.isascii():
+            mark["wipe_count"] = int(wipe_count)
     else:
         mark["scope"] = PROFILE_SCOPE
     with _LOCK:
@@ -110,11 +119,91 @@ def mark_payment_session(task_id: str, surface: dict[str, str] | None = None) ->
         _write_marks(path, disk + [mark])
 
 
+def _int_field(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _wiped_since(mark: dict[str, Any], row: dict[str, Any]) -> bool:
+    """Control attests this slot's temporary profile was wiped after ``mark``. Fail closed."""
+    marked = _int_field(mark.get("wipe_count"))
+    current = _int_field(row.get("wipe_count"))
+    if marked is None or current is None or current <= marked:
+        return False
+    if row.get("error") or row.get("slot_id") != mark.get("slot_id") or row.get("kind") != "temporary":
+        return False
+    generation = str(row.get("browser_generation") or "")
+    return generation != str(mark.get("browser_generation") or "")
+
+
+def _prune_wiped(marks: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Drop slot marks whose temporary profile control reports wiped since the mark.
+
+    Asks control once per marked slot, outside the lock; any failure keeps the
+    mark. The file is re-read under the lock so a mark added meanwhile stays.
+    """
+    if not marks or not _managed():
+        return marks
+    candidates = {
+        str(m.get("slot_id")) for m in marks
+        if m.get("scope") == SLOT_SCOPE and m.get("slot_id") and _int_field(m.get("wipe_count")) is not None
+    }
+    if not candidates:
+        return marks
+    try:
+        from tools.browser_control_route import slot_status
+    except Exception:  # health: allow BLE001 -- no control client: keep every mark
+        return marks
+    rows: dict[str, dict[str, Any]] = {}
+    for slot_id in sorted(candidates):
+        try:
+            row = slot_status(slot_id)
+        except Exception:  # health: allow BLE001 -- control unreachable: keep the mark
+            continue
+        if isinstance(row, dict):
+            rows[slot_id] = row
+    if not rows:
+        return marks
+
+    def stale(mark: dict[str, Any]) -> bool:
+        row = rows.get(str(mark.get("slot_id") or ""))
+        return mark.get("scope") == SLOT_SCOPE and row is not None and _wiped_since(mark, row)
+
+    with _LOCK:
+        path = _state_path()
+        disk = _read_marks(path)
+        if disk is None:
+            return None
+        removed = [m for m in disk if stale(m)]
+        if not removed:
+            return disk
+        kept = [m for m in disk if not stale(m)]
+        _write_marks(path, kept)
+        with path.with_suffix(".log").open("a", encoding="utf-8") as log:
+            for slot_id in sorted({str(m.get("slot_id")) for m in removed}):
+                log.write(json.dumps({
+                    "cleared_at": _now(), "slot_id": slot_id, "confirmed_by": "auto:temporary-profile-wiped",
+                    "wipe_count": rows[slot_id].get("wipe_count"),
+                    "marks": [m for m in removed if str(m.get("slot_id")) == slot_id],
+                }, sort_keys=True) + "\n")
+        return kept
+
+
 def payment_session_sensitive(task_id: str | None) -> bool:
     """Profile-wide answer for tools that cannot name an authoritative slot."""
     with _LOCK:
         marks = _all_marks()
+    marks = _prune_wiped(marks)
     return marks is None or bool(marks)
+
+
+def slot_has_mark(slot_id: str) -> bool:
+    """Raw, local answer (no control lookup): any mark that covers ``slot_id``.
+    An unreadable file, a profile-wide mark or a missing slot id answer True."""
+    with _LOCK:
+        marks = _all_marks()
+    if marks is None or not str(slot_id or "").strip():
+        return True
+    return any(m.get("scope") != SLOT_SCOPE or m.get("slot_id") in (None, "", slot_id) for m in marks)
 
 
 def capture_blocked_for_surface(slot_id: str, browser_generation: str) -> bool:
@@ -128,6 +217,7 @@ def capture_blocked_for_surface(slot_id: str, browser_generation: str) -> bool:
         return payment_session_sensitive(None)
     with _LOCK:
         marks = _all_marks()
+    marks = _prune_wiped(marks)
     if marks is None:
         return True
     return any(m.get("scope") != SLOT_SCOPE or m.get("slot_id") in (None, "", slot_id) for m in marks)

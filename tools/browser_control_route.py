@@ -16,6 +16,7 @@ import atexit
 import json
 import os
 import threading
+import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -30,6 +31,13 @@ MANAGED_TOKEN_ENV = "HERMES_BROWSER_COMMAND_TOKEN"
 # guard keys on them (tools/browser_payment_privacy.py).
 MANAGED_SLOT_ENV = "HERMES_BROWSER_SLOT_ID"
 MANAGED_GENERATION_ENV = "HERMES_BROWSER_GENERATION"
+# Control's wipe counter for the slot at acquire time, and the slot's profile
+# kind. The capture guard records the counter with a card-fill mark and
+# clears the mark once control reports a later wipe of a temporary profile.
+MANAGED_WIPE_ENV = "HERMES_BROWSER_WIPE_COUNT"
+MANAGED_PROFILE_KIND_ENV = "HERMES_BROWSER_PROFILE_KIND"
+# The controller key may come from a file instead of the environment.
+MANAGED_KEY_FILE_ENV = "HERMES_BROWSER_CONTROL_KEY_FILE"
 # Sentinel returned by control_url() when config.yaml cannot be read: keeps
 # the install in managed mode (no local/cloud Chrome) with a clear error.
 CONFIG_UNREADABLE_URL = "managed://config-unreadable"
@@ -41,6 +49,14 @@ OPERATOR_DISABLED_ERROR = "unavailable: browsing disabled by operator"
 # time out a request the server then completed, orphaning the lease.
 CONTROL_TIMEOUT_S = 60.0
 STATUS_TIMEOUT_S = 10.0
+# A queued acquire waits in control's fair order this long by default
+# (callers pass a smaller budget from their own timeout). Each retry
+# honours control's ``retry_after_s``, clamped to this range.
+BUSY_WAIT_ENV = "HERMES_BROWSER_BUSY_WAIT_S"
+DEFAULT_BUSY_WAIT_S = 90.0
+RETRY_AFTER_MIN_S = 1.0
+RETRY_AFTER_MAX_S = 30.0
+DEFAULT_RETRY_AFTER_S = 5.0
 
 _held_lock = threading.Lock()
 _held_leases: dict[str, dict[str, str]] = {}
@@ -51,6 +67,27 @@ _key_locks: dict[str, list[Any]] = {}
 
 class ManagedBrowserError(Exception):
     """Structured managed-mode failure. ``str()`` is ``code: detail``."""
+
+
+class RouteError(str):
+    """An error string that also carries structured fields for the tool result.
+
+    ``resolve_managed_cdp`` has always returned a plain error string; a
+    ``busy`` result now also carries the control queue ticket, position and
+    retry hint as :attr:`fields`, which callers may merge into their JSON.
+    """
+
+    fields: dict[str, Any]
+
+    def __new__(cls, text: str, fields: Optional[dict[str, Any]] = None) -> "RouteError":
+        obj = super().__new__(cls, text)
+        obj.fields = dict(fields or {})
+        return obj
+
+
+# Seams for tests (a bounded wait must not really sleep in unit tests).
+_sleep = time.sleep
+_monotonic = time.monotonic
 
 
 def daemon_cache_key(slot_id: str, browser_generation: str, ownership_epoch: int) -> str:
@@ -86,7 +123,19 @@ def is_managed() -> bool:
 
 
 def control_key() -> str:
-    return (os.environ.get(MANAGED_KEY_ENV) or "").strip()
+    """Bearer key for control: ``HERMES_BROWSER_CONTROL_KEY``, else the file
+    named by ``HERMES_BROWSER_CONTROL_KEY_FILE``. Never returned to the model."""
+    key = (os.environ.get(MANAGED_KEY_ENV) or "").strip()
+    if key:
+        return key
+    path = (os.environ.get(MANAGED_KEY_FILE_ENV) or "").strip()
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
 
 
 def clear_held_leases() -> None:
@@ -163,9 +212,43 @@ def _apply_lease(env: dict[str, str], lease: dict[str, Any], control: str) -> Op
     env[MANAGED_TOKEN_ENV] = token
     env[MANAGED_SLOT_ENV] = slot_id
     env[MANAGED_GENERATION_ENV] = generation
+    # Only a counter control actually reported; anything else stays unset so
+    # the capture guard fails closed (never auto-clears) for this lease.
+    wipe_count = lease.get("wipe_count")
+    if isinstance(wipe_count, int) and not isinstance(wipe_count, bool) and wipe_count >= 0:
+        env[MANAGED_WIPE_ENV] = str(wipe_count)
+    else:
+        env.pop(MANAGED_WIPE_ENV, None)
+    kind = str(lease.get("profile_kind") or "")
+    if kind in {"temporary", "persistent"}:
+        env[MANAGED_PROFILE_KIND_ENV] = kind
+    else:
+        env.pop(MANAGED_PROFILE_KIND_ENV, None)
     env["BU_NAME"] = daemon_cache_key(slot_id, generation, epoch)
     env["_HERMES_BU_PRIVATE_BROWSER"] = "1"
     return None
+
+
+def _retry_after(reply: dict[str, Any]) -> Optional[float]:
+    raw = reply.get("retry_after_s")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return max(RETRY_AFTER_MIN_S, min(float(raw), RETRY_AFTER_MAX_S))
+
+
+def busy_fields(reply: dict[str, Any]) -> dict[str, Any]:
+    """The queue facts a ``busy`` reply carried, for the model-facing result."""
+    fields: dict[str, Any] = {}
+    ticket = str(reply.get("ticket") or reply.get("queued") or "").strip()
+    if ticket:
+        fields["queued_id"] = ticket
+    position = reply.get("position")
+    if isinstance(position, int) and not isinstance(position, bool) and position > 0:
+        fields["position"] = position
+    retry = _retry_after(reply)
+    if retry is not None:
+        fields["retry_after_s"] = retry
+    return fields
 
 
 def _format_error(lease: dict[str, Any]) -> str:
@@ -173,13 +256,37 @@ def _format_error(lease: dict[str, Any]) -> str:
     detail = str(lease.get("detail") or "").strip()
     if code == "busy":
         extra = detail or "browser slot queued"
-        return (
-            f"busy: {extra} — retry this call or cancel; "
-            "do not use a local, cloud, or CDP fallback"
+        fields = busy_fields(lease)
+        queue = []
+        if "queued_id" in fields:
+            queue.append(f"ticket {fields['queued_id']}")
+        if "position" in fields:
+            queue.append(f"position {fields['position']}")
+        if "retry_after_s" in fields:
+            queue.append(f"retry after {fields['retry_after_s']:g}s")
+        where = f" ({', '.join(queue)})" if queue else ""
+        return RouteError(
+            f"busy: {extra}{where} — retry this call later or cancel the ticket; "
+            "do not use a local, cloud, or CDP fallback",
+            fields,
         )
     if detail:
         return f"{code}: {detail}"
     return code
+
+
+def busy_wait_budget(timeout_s: Any = None) -> float:
+    """Seconds a queued acquire may wait: the env default, at most half the call's timeout."""
+    try:
+        budget = float(os.environ.get(BUSY_WAIT_ENV) or DEFAULT_BUSY_WAIT_S)
+    except ValueError:
+        budget = DEFAULT_BUSY_WAIT_S
+    if timeout_s is not None:
+        try:
+            budget = min(budget, float(timeout_s) / 2.0)
+        except (TypeError, ValueError):
+            pass
+    return max(budget, 0.0)
 
 
 def _post(control: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -252,6 +359,58 @@ def _lease_alive(control: str, lease_id: str) -> Optional[bool]:
     return data.get("owner") == "agent" and data.get("state") == "agent"
 
 
+def get_json(path: str, *, timeout: float = STATUS_TIMEOUT_S) -> dict[str, Any]:
+    """Authenticated ``GET`` on control; errors come back as ``{"error", "detail"}``."""
+    control = control_url()
+    if not control or control == CONFIG_UNREADABLE_URL or is_disabled_url(control):
+        return {"error": "unavailable", "detail": "managed control URL missing or disabled"}
+    key = control_key()
+    if not key:
+        return {"error": "unavailable", "detail": f"{MANAGED_KEY_ENV} missing"}
+    req = Request(control.rstrip("/") + path, method="GET", headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        try:
+            data = json.loads(exc.read().decode("utf-8") or "{}")
+        except (ValueError, OSError):
+            return {"error": "unavailable", "detail": f"control HTTP {exc.code}"}
+    except (OSError, ValueError) as exc:
+        return {"error": "unavailable", "detail": f"control unreachable: {type(exc).__name__}"}
+    return data if isinstance(data, dict) else {"error": "unavailable", "detail": "control returned a non-object"}
+
+
+def post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Authenticated ``POST`` on control (same error shape as :func:`get_json`)."""
+    control = control_url()
+    if not control or control == CONFIG_UNREADABLE_URL or is_disabled_url(control):
+        return {"error": "unavailable", "detail": "managed control URL missing or disabled"}
+    if not control_key():
+        return {"error": "unavailable", "detail": f"{MANAGED_KEY_ENV} missing"}
+    return _post(control, path, payload)
+
+
+def slot_status(slot_id: str) -> dict[str, Any]:
+    """``GET /v1/status?slot=<id>``: one slot's public row, or an error dict."""
+    return get_json("/v1/status?" + urlencode({"slot": slot_id}))
+
+
+def held_leases_for_task(task_id: Optional[str]) -> list[dict[str, str]]:
+    """Copies of the lease snapshots this process holds for ``task_id``, each
+    with its ``identity`` and ``mode`` from the hold key. Tokens included:
+    callers are trusted tool code and must never return them to the model."""
+    owner = str(task_id or "").strip() or "default"
+    out: list[dict[str, str]] = []
+    with _held_lock:
+        for key, snapshot in _held_leases.items():
+            task, _, rest = key.partition("|")
+            identity, _, mode = rest.partition("|")
+            if task == owner:
+                out.append({**snapshot, "identity": identity, "mode": mode})
+    return out
+
+
 def _forget_held(key: str) -> None:
     with _held_lock:
         _held_leases.pop(key, None)
@@ -291,6 +450,7 @@ def _acquire(
     mode: str,
     identity: str,
     qa_targets: list[str],
+    ticket: str = "",
 ) -> dict[str, Any]:
     if control == CONFIG_UNREADABLE_URL:
         return {
@@ -301,16 +461,53 @@ def _acquire(
         return {"error": "unavailable", "detail": "browsing disabled by operator"}
     if not control_key():
         return {"error": "unavailable", "detail": f"{MANAGED_KEY_ENV} missing"}
-    return _post(
-        control,
-        "/v1/acquire",
-        {
-            "task": task or "browser-exec",
-            "mode": mode,
-            "identity": identity,
-            "qa_targets": qa_targets,
-        },
-    )
+    payload: dict[str, Any] = {
+        "task": task or "browser-exec",
+        "mode": mode,
+        "identity": identity,
+        "qa_targets": qa_targets,
+    }
+    if ticket:
+        payload["ticket"] = ticket
+    return _post(control, "/v1/acquire", payload)
+
+
+def _acquire_waiting(
+    control: str,
+    *,
+    task: str,
+    mode: str,
+    identity: str,
+    qa_targets: list[str],
+    wait_s: float,
+) -> dict[str, Any]:
+    """Acquire, waiting in control's queue for at most ``wait_s`` seconds.
+
+    Control keeps the waiters' order (one entry per task/identity/mode,
+    refreshed by each retry) and answers ``busy`` with a ticket and
+    ``retry_after_s``. Only a queued reply is waited on: a slot held by a
+    human for this task, or a refusal without a ticket, returns at once.
+    A ``stale`` reply (reconnect with an old generation/epoch) is retried once.
+    """
+    deadline = _monotonic() + max(wait_s, 0.0)
+    ticket = ""
+    stale_retried = False
+    while True:
+        lease = _acquire(
+            control, task=task, mode=mode, identity=identity, qa_targets=qa_targets, ticket=ticket,
+        )
+        if lease.get("error") == "stale" and not stale_retried:
+            stale_retried = True
+            continue
+        if lease.get("error") != "busy":
+            return lease
+        ticket = str(lease.get("ticket") or lease.get("queued") or "")
+        if not ticket:
+            return lease
+        pause = _retry_after(lease) or DEFAULT_RETRY_AFTER_S
+        if _monotonic() + pause > deadline:
+            return lease
+        _sleep(pause)
 
 
 def resolve_managed_cdp(
@@ -322,6 +519,7 @@ def resolve_managed_cdp(
     qa_targets: Any = None,
     raw_cdp_override: Optional[str] = None,
     reconnect: bool = False,
+    wait_s: Optional[float] = None,
 ) -> Optional[str]:
     """Return an error string, or None after pointing ``env`` at the gate.
 
@@ -329,8 +527,9 @@ def resolve_managed_cdp(
     successful None does not fall through to local/cloud backends.
 
     A ``stale`` acquire (reconnect with an old generation/epoch) is retried
-    once. ``busy`` is a structured queued error: retry or cancel, never
-    fall back.
+    once. ``busy`` waits in control's fair queue for up to ``wait_s``
+    (default :func:`busy_wait_budget`), then returns a :class:`RouteError`
+    carrying the ticket; never fall back.
     """
     control = control_url()
     if not control:
@@ -357,6 +556,7 @@ def resolve_managed_cdp(
             identity=payload_identity,
             qa_targets=_coerce_targets(qa_targets),
             reconnect=reconnect,
+            wait_s=busy_wait_budget() if wait_s is None else max(float(wait_s), 0.0),
         )
 
 
@@ -370,6 +570,7 @@ def _resolve_held(
     identity: str,
     qa_targets: list[str],
     reconnect: bool,
+    wait_s: float = 0.0,
 ) -> Optional[str]:
     """Reuse the live held lease for ``key`` or acquire one. Caller holds the key lock."""
     with _held_lock:
@@ -385,21 +586,14 @@ def _resolve_held(
         # own resumed lease back, or a fresh slot).
         _forget_held(key)
 
-    lease = _acquire(
+    lease = _acquire_waiting(
         control,
         task=task,
         mode=mode,
         identity=identity,
         qa_targets=qa_targets,
+        wait_s=wait_s,
     )
-    if lease.get("error") == "stale":
-        lease = _acquire(
-            control,
-            task=task,
-            mode=mode,
-            identity=identity,
-            qa_targets=qa_targets,
-        )
     if lease.get("error"):
         return _format_error(lease)
 
@@ -412,6 +606,7 @@ def _resolve_held(
         MANAGED_TOKEN_ENV: env.get(MANAGED_TOKEN_ENV, ""),
         MANAGED_SLOT_ENV: env.get(MANAGED_SLOT_ENV, ""),
         MANAGED_GENERATION_ENV: env.get(MANAGED_GENERATION_ENV, ""),
+        **{k: env[k] for k in (MANAGED_WIPE_ENV, MANAGED_PROFILE_KIND_ENV) if k in env},
         "BU_NAME": env.get("BU_NAME", ""),
         "_HERMES_BU_PRIVATE_BROWSER": "1",
     }
@@ -430,6 +625,7 @@ def managed_cdp_or_error(
     qa_targets: Any = None,
     raw_cdp_override: Optional[str] = None,
     reconnect: bool = False,
+    wait_s: Optional[float] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Single choke-point helper for built-in and CLI paths.
 
@@ -448,6 +644,7 @@ def managed_cdp_or_error(
         qa_targets=qa_targets,
         raw_cdp_override=raw_cdp_override,
         reconnect=reconnect,
+        wait_s=wait_s,
     )
     if err:
         return None, err
@@ -475,7 +672,7 @@ def release_lease(env: dict[str, str]) -> Optional[str]:
     result = _post(
         control,
         "/v1/release",
-        {"lease_id": lease_id, "token": token},
+        {"lease_id": lease_id, "command_token": token, "token": token},
     )
     if result.get("error"):
         return _format_error(result)

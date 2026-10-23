@@ -576,6 +576,7 @@ def _resolve_backend_cdp(
     identity: str = "",
     qa_targets: Optional[list[str]] = None,
     force_local_sidecar: bool = False,
+    wait_s: Optional[float] = None,
 ) -> Optional[str]:
     """Point the harness at the configured backend's CDP endpoint; error string on failure.
 
@@ -611,6 +612,7 @@ def _resolve_backend_cdp(
             mode=mode,
             identity=identity,
             qa_targets=qa_targets,
+            wait_s=wait_s,
         )
     if _has_cdp_env(env):
         return None
@@ -720,7 +722,8 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
         return
     route = {"cdp": cdp, "lease": str(env.get("HERMES_BROWSER_LEASE_ID") or ""), "error": "",
              "slot_id": str(env.get("HERMES_BROWSER_SLOT_ID") or ""),
-             "browser_generation": str(env.get("HERMES_BROWSER_GENERATION") or "")}
+             "browser_generation": str(env.get("HERMES_BROWSER_GENERATION") or ""),
+             "wipe_count": str(env.get("HERMES_BROWSER_WIPE_COUNT") or "")}
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
         from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
@@ -747,6 +750,7 @@ def _route_backend(
     identity: str = "",
     qa_targets: Optional[list[str]] = None,
     force_local_sidecar: bool = False,
+    wait_s: Optional[float] = None,
 ) -> Optional[str]:
     """Resolve where the harness connects; returns an error string or None. Real-profile consent runs
     BEFORE provider resolution so a hit short-circuits the cloud path via the BU_CDP_* env contract. Named
@@ -765,6 +769,7 @@ def _route_backend(
             return "scope_denied: managed browser mode refuses local=true / real-profile"
         return _resolve_backend_cdp(
             env, task_id, session_name=session, mode=mode, identity=identity, qa_targets=qa_targets,
+            wait_s=wait_s,
         )
     rp_err = _resolve_real_profile_cdp(env, force_local=local)
     if rp_err:
@@ -864,9 +869,44 @@ def stop_harness_daemons() -> None:
             _run_cli_killing_process_group([*cmd, "--reload"], "", {**env, "BU_NAME": name}, 15)
 
 
+def _managed_busy_wait(timeout_s: Any) -> Optional[float]:
+    """Fair-queue wait budget for a managed acquire: at most half this call's timeout."""
+    try:
+        from tools.browser_control_route import busy_wait_budget
+    except Exception:
+        return None
+    return busy_wait_budget(_clamp_timeout(timeout_s))
+
+
+def _managed_dialogs(task_id: Optional[str], env: dict, started: float, identity: str) -> Optional[dict]:
+    """Dialogs this call left pending or answered (``tools.browser_exec_dialogs``); never fails the exec."""
+    try:
+        from tools import browser_exec_dialogs
+        found = browser_exec_dialogs.collect(task_id, started)
+        browser_exec_dialogs.disarm(task_id, env, identity=identity)
+        return found
+    except Exception as e:  # health: allow BLE001 -- dialog reporting is advisory
+        logger.debug("browser_exec dialog report failed: %s", e)
+        return None
+
+
+def _with_dialogs(result_json: str, dialogs: Optional[dict]) -> str:
+    if not dialogs:
+        return result_json
+    try:
+        data = json.loads(result_json)
+    except ValueError:
+        return result_json
+    if isinstance(data, dict):
+        data["dialogs"] = dialogs
+        return json.dumps(data, ensure_ascii=False)
+    return result_json
+
+
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False,
-                 mode: str = "", identity: str = "", qa_targets: Optional[list[str]] = None):
+                 mode: str = "", identity: str = "", qa_targets: Optional[list[str]] = None,
+                 on_dialog: str = "auto"):
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
@@ -911,10 +951,11 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         env["BU_NAME"] = session
     route_err = _route_backend(
         env, session, task_id, bool(local), mode=mode, identity=identity, qa_targets=qa_targets,
-        force_local_sidecar=local_sidecar,
+        force_local_sidecar=local_sidecar, wait_s=_managed_busy_wait(timeout_s),
     )
     if route_err:
-        return tool_error(route_err)
+        # A managed ``busy`` carries its queue ticket / position / retry hint.
+        return tool_error(route_err, **getattr(route_err, "fields", {}))
     if local_sidecar:
         env["BU_NAME"] = _sidecar_daemon_name(session)
     _exec_route_is_sidecar[route_key] = local_sidecar
@@ -932,6 +973,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     managed = _code_is_managed()
     if managed:
         code = _MANAGED_TIMEOUT_PREAMBLE + _MANAGED_FRONT_TAB_PREAMBLE + code
+        # The controller key stays in Hermes: browser_control does control calls for the model.
+        env.pop("HERMES_BROWSER_CONTROL_KEY", None)
+        env.pop("HERMES_BROWSER_CONTROL_KEY_FILE", None)
 
     workspace = _workspace_dir(task_id)
     if workspace:
@@ -959,6 +1003,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         if refused:
             return {"error_result": refused}
         _attach_vault_supervisor(env, task_id)
+        if managed:
+            from tools import browser_exec_dialogs
+            browser_exec_dialogs.arm(task_id, env, on_dialog=on_dialog, identity=identity)
         with _driven_daemons_lock:
             _driven_daemons.add(env.get("BU_NAME", "default"))
         try:
@@ -996,9 +1043,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             env.clear()
             env.update(rerouted)
             dispatched = dispatch()
+    dialogs = _managed_dialogs(task_id, env, started, identity) if managed else None
     if "proc" not in dispatched:
         if "error_result" in dispatched:
-            return dispatched["error_result"]
+            return _with_dialogs(dispatched["error_result"], dialogs)
         return tool_result(dispatched)
     proc = dispatched["proc"]
 
@@ -1013,6 +1061,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         result["workspace"] = workspace
     if session:
         result["session"] = session
+    if dialogs:
+        result["dialogs"] = dialogs
     stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
     if managed and "permission-blocked" in stderr:
         stderr = _GATE_REFUSED_HINT + "\n" + stderr
@@ -1135,6 +1185,17 @@ def _dynamic_schema_overrides() -> dict:
                 "work:<org>, shopping, or sensitive. Omit for research slots."
             ),
         }
+        props["on_dialog"] = {
+            "type": "string",
+            "enum": ["auto", "accept", "dismiss"],
+            "default": "auto",
+            "description": (
+                "Page dialogs (alert/confirm/prompt/leave-page) that open during this call. auto: alerts "
+                "close, confirm/prompt are dismissed, leave-page is accepted. accept/dismiss: answer them so. "
+                "On payment, order, deletion or sensitive pages dialogs are never auto-answered: they stay "
+                "pending in the result's `dialogs` until answered explicitly."
+            ),
+        }
         props["qa_targets"] = {
             "type": "array",
             "items": {"type": "string"},
@@ -1181,6 +1242,7 @@ registry.register(
         mode=args.get("mode", "") or "",
         identity=args.get("identity", "") or "",
         qa_targets=args.get("qa_targets"),
+        on_dialog=str(args.get("on_dialog") or "auto"),
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,
