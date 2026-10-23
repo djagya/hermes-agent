@@ -494,7 +494,8 @@ def _acquire_waiting(
     stale_retried = False
     while True:
         lease = _acquire(
-            control, task=task, mode=mode, identity=identity, qa_targets=qa_targets, ticket=ticket,
+            control, task=task, mode=mode, identity=identity, qa_targets=qa_targets,
+            **({"ticket": ticket} if ticket else {}),
         )
         if lease.get("error") == "stale" and not stale_retried:
             stale_retried = True
@@ -672,7 +673,7 @@ def release_lease(env: dict[str, str]) -> Optional[str]:
     result = _post(
         control,
         "/v1/release",
-        {"lease_id": lease_id, "command_token": token, "token": token},
+        {"lease_id": lease_id, "token": token},
     )
     if result.get("error"):
         return _format_error(result)
