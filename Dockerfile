@@ -431,11 +431,16 @@ RUN /opt/hermes/.venv/bin/python -m docker.build_agent
 # PM's npm shim lives in the sealed tool store, so npm's implicit global
 # prefix is that store, not /usr/local. Install the toolbox packages into the
 # runtime-copied /usr/local tree used by smoke.sh and start-baked-mcp.sh.
+# axe-core is data, not a command: browser_exec's ux_capture.audit_a11y()
+# injects axe.min.js into the page and refuses a file whose sha256 differs
+# from AXE_SHA256 in tools/browser_capture_harness.py (bump both together).
 RUN npm install -g --prefix /usr/local --omit=dev \
         markdownlint-cli2@0.23.3 \
-        caldav-mcp@0.10.0 && \
+        caldav-mcp@0.10.0 \
+        axe-core@4.14.0 && \
     test -x /usr/local/bin/markdownlint-cli2 && \
-    test -f /usr/local/lib/node_modules/caldav-mcp/package.json
+    test -f /usr/local/lib/node_modules/caldav-mcp/package.json && \
+    echo "20c09fe157a8a34a30e241aaa1fcdade657734f08ab379ecfbeb7d45cc46e878  /usr/local/lib/node_modules/axe-core/axe.min.js" | sha256sum -c -
 
 # clickup-mcp 1.8.0 (and 1.9.0) pin @modelcontextprotocol/sdk 1.15.1
 # exactly (CVE-2026-104850 fixed in 1.31.0; CVE-2026-111767/111768 in
@@ -700,7 +705,8 @@ RUN ldconfig && \
     test -x /usr/local/bin/markdownlint-cli2 && \
     test -x /usr/local/bin/uv && test -x /usr/local/bin/uvx && \
     test -f /usr/local/lib/node_modules/@hauptsache.net/clickup-mcp/package.json && \
-    test -f /usr/local/lib/node_modules/caldav-mcp/package.json
+    test -f /usr/local/lib/node_modules/caldav-mcp/package.json && \
+    test -f /usr/local/lib/node_modules/axe-core/axe.min.js
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/tools HERMES_RUNTIME_DIR=/opt/hermes/tools
 # TUI gateway children need the sealed runtime, not the build-helper system Python (upstream 48353b2b89).

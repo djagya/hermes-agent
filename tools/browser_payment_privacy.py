@@ -295,7 +295,9 @@ def reset_guard(*, confirmed_by: str) -> None:
                                   "marks": []}, sort_keys=True) + "\n")
 
 
-_CAPTURE_TOKENS = ("screenshot", "printtopdf", "screencast", "recording")
+# "ux_capture" is the browser_exec capture helper namespace (tools/browser_capture.py);
+# "recorder" / "bh_record" reach the harness's own per-action recorder and its env switch.
+_CAPTURE_TOKENS = ("screenshot", "printtopdf", "screencast", "recording", "ux_capture", "recorder", "bh_record")
 
 
 def _wants_capture(code: str) -> bool:
