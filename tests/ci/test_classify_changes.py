@@ -485,7 +485,7 @@ CASES = {
     ),
     "desktop queue panel (lost-turn card) → desktop core": (
         ["apps/desktop/src/app/chat/composer/queue-panel.tsx"],
-        _lanes(frontend=True, e2e_desktop_core=True),
+        _lanes(frontend=True, e2e_desktop_core=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"]),
     ),
     "desktop profile rail → desktop core": (
         ["apps/desktop/src/app/chat/sidebar/profile-switcher.tsx"],

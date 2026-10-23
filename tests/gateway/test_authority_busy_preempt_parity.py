@@ -104,7 +104,10 @@ async def test_busy_voice_note_interrupts_with_transcript_in_interrupt_mode(tmp_
         from tests.waiting import async_wait_until
         await async_wait_until(lambda: _admitted(authority), timeout=10, what='the voice note admitted')
         task.cancel()
-        assert agent.interrupts == [('TRANSCRIBED stop that',)], agent.interrupts
+        # dlz: interrupt mode interrupts at once with the caption (empty for a bare voice note) and
+        # transcribes in the background; the transcript reaches the queued follow-up turn
+        # (_start_pending_voice_stt), so a long clip never delays the interrupt or the ack.
+        assert agent.interrupts == [('',)], agent.interrupts
         assert sent, 'no busy ack'
     finally:
         authority.db.close()

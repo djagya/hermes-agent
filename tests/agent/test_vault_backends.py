@@ -277,7 +277,7 @@ def test_onepassword_backend_env_forwards_config_directory(monkeypatch):
 
 # A stand-in `op` holding the real CLI's service-account rule: `item get` without a vault query exits 1
 # with op's own message (op 2.32 checks this client-side, before it even decodes the token).
-_FAKE_OP = r'''#!/usr/bin/env python3
+_FAKE_OP_SA = r'''#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "op.log"), "a") as log:
@@ -300,7 +300,7 @@ def fake_op_service_account(tmp_path):
     from agent.vault_backends.onepassword import OnePasswordLoginBackend
 
     exe = tmp_path / "op"
-    exe.write_text(_FAKE_OP, encoding="utf-8")
+    exe.write_text(_FAKE_OP_SA, encoding="utf-8")
     exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
     token = lambda name, default="": "dummy-sa-token" if name == "OP_SERVICE_ACCOUNT_TOKEN" else default
     with patch("agent.secret_scope.get_secret", side_effect=token):

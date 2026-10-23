@@ -94,7 +94,7 @@ class GatewayInboundTranscriptionMixin:
                     break
                 clip = clips.setdefault(missing, PendingAudioClip())
                 results[missing] = await clip.transcribe(
-                    lambda: self._enrich_message_with_transcription("", [missing])
+                    lambda: self._enrich_message_with_transcription("", [missing], None)
                 )
                 # A merge can append media/text during STT. Re-read the event before publishing;
                 # keep completed clips so a caption merge cannot retranscribe or change an echo.
