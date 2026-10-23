@@ -589,7 +589,14 @@ def _locate_real_git() -> Optional[Path]:
         Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
         for base in (r"C:\Program Files", r"C:\Program Files (x86)")
         for arch in ("clangarm64", "mingw64", "mingw32")
-    ] + _portable_git_candidates()
+    ]
+    # Git for Windows runner images occasionally add or rename the architecture directory. Search
+    # exactly that bounded segment instead of treating the known names above as exhaustive; every
+    # discovered executable still has to pass the fork-bomb probe below.
+    for base in (r"C:\Program Files", r"C:\Program Files (x86)"):
+        with suppress(OSError):
+            candidates.extend(sorted((Path(base) / "Git").glob("*/libexec/git-core/git.exe")))
+    candidates += _portable_git_candidates()
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 
