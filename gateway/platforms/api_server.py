@@ -1728,6 +1728,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Browser-control (gated on browser.extension_control.enabled + API key): POST
             # mints a short-lived ticket, WS consumes it; artifacts are bounded + scope-bound.
             ("POST", "/v1/browser-control/register", self._handle_browser_control_register),
+            ("POST", "/v1/browser-slots/handback", self._handle_browser_slot_handback),
             ("GET", "/v1/browser-control/ws", self._handle_browser_control_ws),
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
@@ -2550,6 +2551,35 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         })
 
     # -- Browser-extension control (authenticated local/VPS API) ----------------------
+
+    async def _handle_browser_slot_handback(self, request: web.Request) -> web.Response:
+        """POST /v1/browser-slots/handback — monolith browser-control: a human returned a slot.
+
+        Bearer is the browser-control key, not the API key (``gateway/browser_handback.py``);
+        the injected text is composed here. 503 no key, 401 bad Bearer, 404 unknown session.
+        """
+        from gateway import browser_handback
+
+        status = browser_handback.check_bearer(request.headers.get("Authorization", ""))
+        if status == 503:
+            return _error_response("Browser slot handback is not configured.", 503, code="handback_disabled")
+        if status is not None:
+            return _error_response("Invalid handback authorization.", 401, err_type="gateway_auth_error",
+                                   code="handback_unauthorized")
+        try:
+            payload = await request.json()
+        except Exception:
+            return _error_response("Request body must be valid JSON.", 400)
+        fields, reason = browser_handback.parse(payload)
+        if fields is None:
+            return _error_response(reason, 400, code="handback_invalid")
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+        outcome = await browser_handback.inject(runner, fields["session_id"], fields["slot_id"])
+        if outcome == "session_not_found":
+            return _error_response("No live session with that id.", 404, code="session_not_found")
+        if outcome != "injected":
+            return _error_response("Gateway cannot route the wake turn now.", 503, code="handback_unavailable")
+        return web.json_response({"injected": True}, status=202)
 
     async def _handle_browser_control_register(self, request: web.Request) -> web.Response:
         """POST /v1/browser-control/register — mint a short-lived single-use controller ticket.
