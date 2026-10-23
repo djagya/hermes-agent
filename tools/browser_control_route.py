@@ -79,7 +79,7 @@ class RouteError(str):
 
     fields: dict[str, Any]
 
-    def __new__(cls, text: str, fields: Optional[dict[str, Any]] = None) -> "RouteError":
+    def __new__(cls, text: str, fields: Optional[dict[str, Any]] = None) -> RouteError:
         obj = super().__new__(cls, text)
         obj.fields = dict(fields or {})
         return obj
