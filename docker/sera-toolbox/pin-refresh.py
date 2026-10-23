@@ -103,11 +103,13 @@ def parse_dockerfile() -> dict[str, str]:
         m = re.search(rf"^ARG {re.escape(name)}=(.+)$", text, re.MULTILINE)
         return m.group(1).strip() if m else ""
 
-    debian = re.search(r"FROM debian:13\.4@(sha256:[0-9a-f]+)", text)
+    # Upstream names the base by a dated tag (debian:trixie-YYYYMMDD) since v0.22.5; follow whatever tag it uses.
+    debian = re.search(r"FROM debian:([^@\s]+)@(sha256:[0-9a-f]+)", text)
     node = re.search(r"FROM node:26-bookworm-slim@(sha256:[0-9a-f]+)", text)
     uv = re.search(r"FROM ghcr.io/astral-sh/uv:([^@\s]+)@(sha256:[0-9a-f]+)", text)
     return {
-        "debian_digest": debian.group(1) if debian else "",
+        "debian_tag": debian.group(1) if debian else "",
+        "debian_digest": debian.group(2) if debian else "",
         "node_digest": node.group(1) if node else "",
         "uv_tag": uv.group(1) if uv else "",
         "uv_digest": uv.group(2) if uv else "",
@@ -266,15 +268,17 @@ def main() -> int:
         rows.append((name, old, new or "(lookup failed)", link))
 
     try:
-        debian_new = dockerhub_digest("debian", "13.4")
-        row("debian:13.4", pins["debian_digest"], debian_new, "https://hub.docker.com/_/debian")
-        if args.apply and debian_new and debian_new != pins["debian_digest"]:
+        if not pins["debian_tag"]:
+            raise ValueError("no pinned debian base in the Dockerfile")
+        debian_new = dockerhub_digest("debian", pins["debian_tag"])
+        row(f"debian:{pins['debian_tag']}", pins["debian_digest"], debian_new, "https://hub.docker.com/_/debian")
+        if args.apply and debian_new and pins["debian_digest"] and debian_new != pins["debian_digest"]:
             n = replace_all(DOCKERFILE, pins["debian_digest"], debian_new)
             if n:
                 applied.append(f"debian digest x{n}")
     except Exception as exc:
         errors.append(f"debian: {exc}")
-        row("debian:13.4", pins["debian_digest"], "", "")
+        row(f"debian:{pins['debian_tag']}", pins["debian_digest"], "", "")
 
     try:
         node_new = dockerhub_digest("node", "26-bookworm-slim")
