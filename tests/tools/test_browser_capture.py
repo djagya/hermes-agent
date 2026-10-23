@@ -111,9 +111,9 @@ def test_matrix_writes_verified_pngs_and_restores_emulation_even_on_failure(cap)
                      "screenWidth": 390, "screenHeight": 844}
     assert _methods(fake)[-3:] == ["Emulation.clearDeviceMetricsOverride", "Emulation.setTouchEmulationEnabled",
                                    "Emulation.setEmulatedMedia"]
-    index = json.loads((run.dir / "index.json").read_text(encoding="utf-8"))
+    index = json.loads((run.dir / "index.json").read_text(encoding="utf-8-sig"))
     assert [e["seq"] for e in index["entries"]] == [1, 2, 3, 4, 5, 6] and "| 6 | screenshot |" in (
-        run.dir / "index.md").read_text(encoding="utf-8")
+        run.dir / "index.md").read_text(encoding="utf-8-sig")
 
     # Full page at 3x is clipped below Chromium's 16384 device-pixel limit.
     full = run.shot("long", full=True, viewport="phone")
@@ -127,7 +127,7 @@ def test_matrix_writes_verified_pngs_and_restores_emulation_even_on_failure(cap)
     assert "Emulation.clearDeviceMetricsOverride" in _methods(fake)
 
     board = run.storyboard("Home teardown", critique={"status": "Spinner never resolves on phone"})
-    text = open(board["html"], encoding="utf-8").read()
+    text = open(board["html"], encoding="utf-8-sig").read()
     assert "src='001-home-phone-light.png'" in text and "Spinner never resolves" in text
 
 

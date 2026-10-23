@@ -253,7 +253,7 @@ _PAGE_JS = "JSON.stringify({url: location.href, title: document.title, scroll_wi
 class Run:
     """One capture folder: ``<root>/<run>/`` with index.json, index.md and the files."""
 
-    def __init__(self, cap: "UXCapture", name: str):
+    def __init__(self, cap: UXCapture, name: str):
         self.cap = cap
         self.name = _slug(name, 80)
         self.dir = cap.root / self.name
@@ -286,6 +286,8 @@ class Run:
         return len(self.index()["entries"]) + 1
 
     def _file_entry(self, kind: str, path: Path, **extra: Any) -> dict[str, Any]:
+        with contextlib.suppress(OSError):
+            path.chmod(0o600)  # captures can show private pages; ffmpeg/Pillow default to 0644
         return self._add({"kind": kind, "file": path.name, "path": str(path),
                           "bytes": path.stat().st_size, "sha256": _sha256(path), **extra})
 
@@ -418,6 +420,8 @@ class Run:
         self.cap.check_guard()
         with self.cap.throttle(network=network, cpu=cpu):
             if reload:
+                with contextlib.suppress(Exception):
+                    self.cap.cdp("Page.bringToFront")  # hidden tabs never paint: no FCP/LCP
                 self.cap.cdp("Page.reload", ignoreCache=True)
                 self.cap.wait_for_load()
             self.cap.cdp("Performance.enable")
@@ -435,7 +439,7 @@ class Run:
                                 network=network, cpu=cpu, url=data.get("url"))
 
     # ---- video ---------------------------------------------------------
-    def record(self, name: str, **kw: Any) -> "Recording":
+    def record(self, name: str, **kw: Any) -> Recording:
         """Context manager: ``with run.record("signup", max_seconds=30, gif=True): ...``.
 
         Or call ``rec = run.record(...); rec.start(); ...; rec.stop()`` in the SAME
@@ -486,20 +490,24 @@ class Recording:
         self._started = 0.0
         self._restore: Callable[[], None] | None = None
 
-    def __enter__(self) -> "Recording":
+    def __enter__(self) -> Recording:
         return self.start()
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.stop()
 
-    def start(self) -> "Recording":
+    def start(self) -> Recording:
         self.run.cap.check_guard()
         if shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg is not on PATH; video capture is unavailable")
         self.frames_dir.mkdir(parents=True, exist_ok=True)
         self._restore = self.run.cap.patch_drain(self._drain_for_caller)
         self._started = time.monotonic()
+        # A background tab paints nothing, so it sends no frames.
+        with contextlib.suppress(Exception):
+            self.run.cap.cdp("Page.bringToFront")
         self.run.cap.cdp("Page.startScreencast", **self.params)
+        # health: allow HX012 -- harness subprocess: no Hermes profile scope exists here to carry
         self._thread = threading.Thread(target=self._loop, name="ux-capture-screencast", daemon=True)
         self._thread.start()
         return self
@@ -697,7 +705,7 @@ class UXCapture:
     def page_state(self) -> dict[str, Any]:
         try:
             return json.loads(self.js(_PAGE_JS))
-        except Exception:
+        except (RuntimeError, OSError, ValueError, TypeError):  # page state is decoration, never fatal
             return {}
 
     def run(self, name: str | None = None) -> Run:
@@ -845,34 +853,46 @@ def _entry_caption(e: dict[str, Any]) -> str:
     return " · ".join(str(b) for b in bits if b)
 
 
+def _pct(ratio: Any) -> str:
+    return f"{float(ratio or 0) * 100:.3f}%"
+
+
+def _facts_screenshot(e: dict[str, Any]) -> list[str]:
+    out = [f"{e.get('mode')} {e.get('width_px')}x{e.get('height_px')}px{' (truncated)' if e.get('truncated') else ''}"]
+    if e.get("scroll_width") and e.get("client_width") and e["scroll_width"] > e["client_width"]:
+        out.append(f"horizontal overflow: scrollWidth {e['scroll_width']} > clientWidth {e['client_width']}")
+    return out
+
+
+def _facts_a11y(e: dict[str, Any]) -> list[str]:
+    return [f"axe {e.get('axe_version')}: {e.get('violations')} violations {e.get('by_impact')}, "
+            f"{e.get('incomplete')} need review", *(e.get("top") or [])]
+
+
+def _facts_perf(e: dict[str, Any]) -> list[str]:
+    v, r = e.get("vitals") or {}, e.get("ratings") or {}
+    out = [", ".join(f"{k}={round(v[k], 3) if isinstance(v.get(k), float) else v.get(k)} ({r.get(k)})"
+                     for k in VITALS_THRESHOLDS if k in v)]
+    if e.get("network") or e.get("cpu"):
+        out.append(f"throttled: network={e.get('network')} cpu={e.get('cpu')}")
+    return out
+
+
+_FACTS: dict[str, Callable[[dict[str, Any]], list[str]]] = {
+    "screenshot": _facts_screenshot,
+    "a11y": _facts_a11y,
+    "perf": _facts_perf,
+    "diff": lambda e: [f"changed {_pct(e.get('changed_ratio'))} ({e.get('changed_px')} px)"
+                       f"{', size changed' if e.get('size_changed') else ''}"],
+    "baseline": lambda e: [f"baseline {e.get('status')}" + (f", changed {_pct(e.get('changed_ratio'))}"
+                                                           if e.get("changed_ratio") is not None else "")],
+    "video": lambda e: [f"{e.get('seconds')}s, {e.get('frames')} frames, stopped by {e.get('stopped_by')}"],
+}
+
+
 def _entry_facts(e: dict[str, Any]) -> list[str]:
-    kind = e.get("kind")
-    facts = []
-    if kind == "screenshot":
-        facts.append(f"{e.get('mode')} {e.get('width_px')}x{e.get('height_px')}px{' (truncated)' if e.get('truncated') else ''}")
-        if e.get("scroll_width") and e.get("client_width") and e["scroll_width"] > e["client_width"]:
-            facts.append(f"horizontal overflow: scrollWidth {e['scroll_width']} > clientWidth {e['client_width']}")
-    elif kind == "a11y":
-        facts.append(f"axe {e.get('axe_version')}: {e.get('violations')} violations {e.get('by_impact')}, "
-                     f"{e.get('incomplete')} need review")
-        facts.extend(e.get("top") or [])
-    elif kind == "perf":
-        v, r = e.get("vitals") or {}, e.get("ratings") or {}
-        facts.append(", ".join(f"{k}={round(v[k], 3) if isinstance(v.get(k), float) else v.get(k)} ({r.get(k)})"
-                               for k in VITALS_THRESHOLDS if k in v))
-        if e.get("network") or e.get("cpu"):
-            facts.append(f"throttled: network={e.get('network')} cpu={e.get('cpu')}")
-    elif kind == "diff":
-        facts.append(f"changed {e.get('changed_ratio', 0) * 100:.3f}% ({e.get('changed_px')} px)"
-                     f"{', size changed' if e.get('size_changed') else ''}")
-    elif kind == "baseline":
-        facts.append(f"baseline {e.get('status')}" + (f", changed {e.get('changed_ratio', 0) * 100:.3f}%"
-                                                      if e.get("changed_ratio") is not None else ""))
-    elif kind == "video":
-        facts.append(f"{e.get('seconds')}s, {e.get('frames')} frames, stopped by {e.get('stopped_by')}")
-    if e.get("url"):
-        facts.append(str(e["url"]))
-    return facts
+    facts = _FACTS.get(str(e.get("kind")), lambda _e: [])(e)
+    return facts + ([str(e["url"])] if e.get("url") else [])
 
 
 def _index_markdown(data: dict[str, Any]) -> str:
@@ -922,7 +942,7 @@ table{border-collapse:collapse;width:100%}td,th{border-top:1px solid var(--line)
 def _storyboard_html(run_dir: Path, data: dict[str, Any], title: str, critique: dict[str, str],
                      summary: str, embed: bool) -> str:
     esc = html.escape
-    parts = [f"<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>",
+    parts = ["<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>",
              f"<title>{esc(title)}</title><style>{_STORY_CSS}</style><main><h1>{esc(title)}</h1>",
              f"<p class=muted>Run {esc(str(data.get('run')))} · {len(data['entries'])} steps · generated {esc(_now())}</p>"]
     if summary:
