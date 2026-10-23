@@ -27,7 +27,7 @@ def test_attested_wipe_clears_the_mark_and_audits_it(control):
     _mark()
     control["research-1"] = _row()
     assert guard.capture_blocked_for_surface("research-1", "g2") is False
-    log = guard._state_path().with_suffix(".log").read_text(encoding="utf-8").splitlines()
+    log = guard._state_path().with_suffix(".log").read_text(encoding="utf-8-sig").splitlines()
     assert json.loads(log[-1])["confirmed_by"] == "auto:temporary-profile-wiped"
 
 

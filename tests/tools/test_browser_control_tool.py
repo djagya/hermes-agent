@@ -30,7 +30,7 @@ def test_handoff_uses_the_held_lease_saves_the_target_and_leaks_no_token(monkeyp
                                                                    {"url": "https://b.example/h#x", "expires_in": 1200})[1])
     out = _call(action="handoff", target_id="TAB1")
     assert posts == [("/v1/handoff", {"lease_id": "lease-1", "command_token": "tok-1", "target_id": "TAB1"})]
-    assert out["url"] == "https://b.example/h#x" and (held / "handoff-target").read_text() == "TAB1"
+    assert out["url"] == "https://b.example/h#x" and (held / "handoff-target").read_text(encoding="utf-8-sig") == "TAB1"
     assert "tok-1" not in json.dumps(out) and "secret-key" not in json.dumps(out)
 
 
