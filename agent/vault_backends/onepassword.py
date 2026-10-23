@@ -39,6 +39,7 @@ class OnePasswordLoginBackend(LoginBackend):
         from agent.secret_scope import get_secret
         env_name = str(self.cfg.get("service_account_token_env") or "OP_SERVICE_ACCOUNT_TOKEN")
         self._service_token = get_secret(env_name, "") or ""
+        self._item_vaults: dict[str, str] = {}  # item id -> vault id from the latest ``item list``
 
     # ── auth ────────────────────────────────────────────────────────────────
 
@@ -92,7 +93,9 @@ class OnePasswordLoginBackend(LoginBackend):
                        timeout_message="op timed out", stdin=subprocess.DEVNULL)
         if proc.returncode != 0:
             err = _scrub(proc.stderr or "")
-            if "session" in err.lower() or "sign in" in err.lower() or "not signed in" in err.lower():
+            # A service account never holds a session, so an auth failure there is not a lock to undo:
+            # surface op's own error instead of an unlock prompt that reports "already unlocked".
+            if not self._service_token and any(w in err.lower() for w in ("session", "sign in", "not signed in")):
                 _unlock.lock(self.name)
                 raise UnlockRequired(self)
             raise RuntimeError(f"op failed: {err[:200]}")
@@ -108,6 +111,7 @@ class OnePasswordLoginBackend(LoginBackend):
             args += ["--vault", configured_vault]
         raw = json.loads(self._run(*args) or "[]")
         out: list[VaultItemMeta] = []
+        self._item_vaults = {}
         for item in raw if isinstance(raw, list) else []:
             if item.get("category") == "CREDIT_CARD":
                 from agent.vault_payment_policy import onepassword_payment_metadata
@@ -131,6 +135,7 @@ class OnePasswordLoginBackend(LoginBackend):
             vault = item.get("vault") if isinstance(item.get("vault"), dict) else {}
             vault_id = str(vault.get("id") or configured_vault).strip()
             handle = f"{self.prefix}{vault_id}:{item_id}" if vault_id else f"{self.prefix}{item_id}"
+            self._item_vaults[item_id] = vault_id
             username = str(item.get("additional_information") or "").strip() or None
             out.append(VaultItemMeta(
                 id=handle, kind="login", label=str(item.get("title") or origins[0]),
@@ -148,14 +153,19 @@ class OnePasswordLoginBackend(LoginBackend):
         return None
 
     def _resolve_handle(self, handle: str) -> tuple[Optional[str], str]:
+        """``(vault, item)`` for an ``op item get``. A legacy (unqualified) handle takes the vault its
+        listing reported, listing at most once per backend; a handle no listing returned is refused
+        before any secret read, so a model-supplied id never reaches op's argv unproven."""
         vault_id, item_id = _split_handle(handle, self.prefix)
         if vault_id:
+            if vault_id.startswith("-") or not item_id or item_id.startswith("-"):
+                raise RuntimeError("1Password login not found; list logins again")
             return vault_id, item_id
-        meta = self.get_meta(handle)
-        if meta is not None:
-            return _split_handle(meta.id, self.prefix)
-        configured_vault = str(self.cfg.get("vault") or "").strip()
-        return configured_vault or None, item_id
+        if item_id not in self._item_vaults:
+            self.list_items()
+        if item_id not in self._item_vaults:
+            raise RuntimeError("1Password login not found; list logins again")
+        return self._item_vaults[item_id] or None, item_id
 
     def resolve_password(self, handle: str) -> str:
         vault_id, item_id = self._resolve_handle(handle)

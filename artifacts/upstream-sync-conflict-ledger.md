@@ -1,90 +1,85 @@
-# Upstream merge conflict ledger (sync/v0.22.2 candidate)
+# Upstream merge conflict ledger (sync/v0.22.5 candidate)
 
-Base HEAD: `6cdb34e7aced42e996749604a5c191b9806b2940` (release/v0.21.7-dlz, the pinned image)
-Upstream MERGE_HEAD: `d923a5eb487a17c0a68801bba9ef0f56c81040a8` (tag `v0.22.2`)
-Merge base: `71d34bad1045610252eda02ee79549436896e784` (tag `v0.21.7`, the previous sync)
+Base HEAD: `49ae702278d6b321f8d9cffb959fbfc2122a1732` (release/v0.22.2-dlz, the pinned image)
+Upstream MERGE_HEAD: `bf0203a794a07aac3ff764972ab9087baa4e4f4e` (tag `v0.22.5`)
+Merge base: `d923a5eb487a17c0a68801bba9ef0f56c81040a8` (tag `v0.22.2`, the previous sync)
 
-Same method as the v0.21.7 sync: one two-parent merge of the upstream release onto the fork
+Same method as the v0.22.2 sync: one two-parent merge of the upstream release onto the fork
 line, conflicts resolved hunk by hunk, everything outside a conflict taken from both histories.
-29 paths conflicted (27 content, 2 modify/delete). The previous ledger (sync onto `71d34bad10`)
-is in git history at release/v0.21.7-dlz.
+46 paths conflicted (all content). Sizing from the tree: v0.22.5 is a commit on upstream
+`main` (no wrong-commit tag this time), 3291 commits / 4690 files past v0.22.2; v0.22.3 and
+v0.22.4 are ancestors. The fork carries 472 changed paths over v0.22.2; 132 of them overlap.
 
-Unchanged by this release: config schema (`_config_version` 50,
-`hermes_cli/config_defaults.py`) and state schema (`SCHEMA_VERSION` 31,
-`hermes_state_common.py`).
+Schema moves in this release: config `_config_version` 50 -> 51 (drops
+`cron.bot_chat_delivery_timeout_seconds`), state `SCHEMA_VERSION` 31 -> 32 (no-op data step,
+#140315). The `tools.tool_search.defer` default list is unchanged since v0.22.2.
 
 ## Decisions that change behavior (operator review)
 
-- **The five vault tools are one tool** (upstream `3bf97898ac`): `browser_vault_list`,
-  `_fill`, `_unlock`, `_save_login` and `_enter_code` became `browser_vault` with an `action`
-  enum (`list`, `fill`, `save_login`, `enter_code`, `unlock`), deferred behind `tool_search`
-  (only its catalog line is paid per request; the model reaches it through `tool_call`). The
-  fork takes the folded tool and keeps its own parameters on it: `merchant_origin` for card
-  fill, and `code` + `expected_origin` for a code Hermes obtained through its own mail workflow.
-  The description carries the fork's card-fill rules (bound origins, the selected-merchant
-  1Password card, one card document incl. a Stripe hosted iframe, no seller-reputation claim,
-  never submits). Skills, docs or receipts that name the old tools must switch to
-  `browser_vault action=...`.
-- **Supplied one-time codes stay redacted on the folded tool.** The fork's early OTP
-  registration (`agent/tool_executor.py`) and preview mask (`agent/display.py`) were keyed on
-  the `browser_vault_enter_code` name. They now match `browser_vault` (a `code` on any action)
-  and keep the old name for older transcripts and staged replays.
-- **Memory `replace` is gone from the tool; `patch` edits one span** (upstream). The fork's
-  staged-write guard (`expected_sha256`, `before_write`) is threaded through `patch` /
-  `_patch` like the other store mutations, and `_batch` keeps the guard plus upstream's
-  top-level target check. `replace` stays in `_STORE_ACTIONS` for replaying older staged writes.
-- **Parked OAuth MCP servers**: upstream and the fork fixed the same replay of a dead refresh
-  token in two places. Both stay, armed by one `_arm_auth_park`: upstream's `_auth_park`
-  (token storage + credential stamp) stops discovery passes from nudging the server, and the
-  fork's `_auth_park_credentials` (credential stamp + endpoint/auth config) keeps the timed
-  self-probe asleep until a re-authorization or config edit.
-- **Kanban active-PR respawn guard** keeps the fork's rule (only the worker's own PR comment
-  counts; one explicit unblock after it allows one claim). Upstream's v0.22.2 change there was
-  value comparison of mixed integer/ISO timestamps; the fork guard now filters the window and
-  orders the legacy unblock fallback by parsed epoch, failing closed on an unreadable time.
-- **Home Assistant plugin pin moved** to hermes-official-plugins `a4e311e433` (still v2.0.1):
-  a `HASS_URL` without a scheme is a non-retryable fatal error, and the standalone (cron) send
-  calls `notify.<target>` first, falling back to the grouped `notify.notify` only on a 400 or an
-  empty target. Re-vendored; the fork's cold-boot grace patch on `adapter.py` is unchanged.
-- **uv quarantine**: upstream now sets `exclude-newer = "3 days"` without per-package
-  exceptions; the fork follows. `httpx2`/`httpcore2` stay at the fork's 2.13.0 (upstream
-  2.12.0); `uv.lock` was re-resolved with uv 0.12.3 (the PM pin).
-- **npm**: upstream's `undici` 6.29.0 / 7.30.0 and `yaml` 2.9.1 win; the fork's
-  `browserslist` 4.28.7 / `baseline-browser-mapping` 2.11.0 overrides stay (the lock already
-  resolves those versions).
-- **Version**: `pyproject.toml` and `uv.lock` say `0.22.2`
-  (`scripts/fork-release-version.sh --check` for `release/v0.22.2-dlz`).
-- **CI commit threading** (upstream): reusable workflows take a `commit` input that every
-  checkout follows (`tests/ci/test_stable_release_commit_threading.py`). The fork-only
-  `js-tests.yml:workspaces` and `tests.yml:plan` checkouts follow it too; the fork's
-  `tests.yml` N-1 job keeps its PR-head fallback after `inputs.commit`.
-- **Prompt surface** is re-rendered for the fork's schemas with
-  `scripts/fork-prompt-surface.sh` (monolith) after these commits.
+- **Kanban workers run inside the assignee's profile owner** (upstream). The dispatcher no
+  longer spawns `hermes -p <profile> --cli chat -q`; it spawns `hermes_cli.kanban_worker_client`,
+  which submits the claim to the assignee profile's running gateway (`kanban.run`), and the
+  turn runs as a managed worker there (`gateway/session_kanban.py`). Every assignee profile
+  needs a live owner: its own gateway or a multiplexer that serves it
+  (`gateway.multiplex_profiles`). Cron Bot Chat deliveries move the same way (config 51).
+- **Mandatory card skills** (fork `--required-skills`): on the owner path they are unioned
+  into the card's skill list, so they load. The fork's hard refusal (typed exit when a
+  mandatory skill is missing) is not ported to the owner path yet. Open item.
+- **Fork CI stays on GitHub-hosted runners.** Upstream moved CI to Blacksmith between v0.22.2
+  and v0.22.4. The fork has no Blacksmith app; labels and actions are mapped back (separate
+  commit), and the runner guard now refuses an unguarded `blacksmith-*` label.
+- **Debian base**: upstream pins `debian:trixie-20261020`; the fork's slim `runtime` stage
+  follows it (same libc as `sqlite_build`), with the fork's snapshot ARG unchanged.
+- **CPython 3.14.9** (PBS 20261021), kept on the fork's `install_only_stripped` flavor; the
+  eight artifacts were re-pinned from the release's `SHA256SUMS`.
+- **Pillow 13.0.0** arrives from upstream (override past browser-harness's 12.3.0 pin), so the
+  Pillow 12.3.0 Trivy ignores become stale after this image ships.
+- **Version**: `pyproject.toml` and `uv.lock` say `0.22.5`; `uv.lock` is upstream's v0.22.5
+  lock re-resolved with uv 0.13.5 (the PM pin); fork `httpx2`/`httpcore2` 2.13.0 kept with
+  upstream `mcp` 2.3.0.
 
 ## Per-path hunk decisions
 
-| Conflicted path | Resolution |
-|---|---|
-| `.github/workflows/ci.yaml` | both: fork selective inputs (`scope`, `roots`, `workspaces`) and upstream `commit` |
-| `.github/workflows/js-tests.yml`, `.github/workflows/tests.yml` (inputs) | both inputs (fork `workspaces` / `scope` / `roots`, upstream `commit`) |
-| `.github/workflows/tests.yml` (N-1 checkout) | `inputs.commit`, else the fork's PR head / `github.sha` |
-| `.github/workflows/lint.yml` | upstream `ref: inputs.commit` with the fork's `fetch-depth: 0` (health ratchet) |
-| `apps/desktop/package.json`, `ui-tui/package.json`, `package-lock.json` | upstream |
-| `package.json` | upstream overrides plus the fork's `browserslist` / `baseline-browser-mapping` |
-| `pyproject.toml` | fork `httpx2==2.13.0` (3 extras) |
-| `uv.lock` | upstream, then re-resolved (`uv lock`, uv 0.12.3) |
-| `hermes_cli/kanban_db.py` | upstream column lists (`last_heartbeat_at` is an epoch column now) plus fork `blocker_key` |
-| `hermes_cli/kanban_db_dispatch.py` | fork guard with epoch-safe time handling (see above) |
-| `hermes_cli/write_approval_commands.py` | fork `applied_result` plus upstream `patched` report line |
-| `model_tools.py` | upstream vault note (tool_call, action=list) plus the fork's enter_code mail-code sentence |
-| `tools/approval_smart.py` | fork guardian observation/parse helpers and `provenance` parameter plus upstream `_verdict_reasoning` |
-| `tools/browser_vault_tool.py` | upstream folded tool with the fork's parameters and card-fill text (see above) |
-| `tools/mcp_oauth.py`, `tools/mcp_tool.py` | both (`has_durable_tokens` + `credential_stamp`; both park slots) |
-| `tools/memory_tool.py`, `tools/memory_tool_store.py` | upstream `patch` with the fork's write guard (see above) |
-| `tests/ci/desktop_release_roles.py` | both expression helpers (`startsWith`, `fromJSON`) |
-| `tests/hermes_cli/test_left_core_migration.py` | both sides' cases |
-| `tests/fixtures/prompt_surface/**` | upstream, then re-rendered for the fork; `browser_vault_fill.json` / `browser_vault_enter_code.json` deleted with the folded tool |
+- .github/** runner hunks: fork side (GitHub-hosted / guarded labels). See CI section.
+- js-tests.yml: fork per-workspace matrix kept; added upstream's "Prepare locked Electron runtime" step (Electron 42 no longer downloads in postinstall) for the apps/desktop matrix rows only.
+- setup-pm/action.yml: fork restore/save split kept (already excludes __pycache__, saves only on trusted refs); upstream PR-default save inputs merged around it.
+- agent/context_compressor.py: both imports (fork skill-recency + upstream ProactivePruneMixin).
+- agent/session_persistence.py: upstream moved sanitize_context to agent.memory_context; fork vault redaction import kept.
+- hermes_cli/cli_commands_mixin.py: both (fork managed_connect_refusal + upstream _normalize_cdp_url import from cli_browser_gateway).
+- gateway/run_busy.py: upstream split the interrupt+ack tail into _busy_interrupt_and_ack (shared with the session authority's busy preempt in run_inbound). Fork's pre-queue supersession stamp stays before queueing; inside _busy_interrupt_and_ack the interrupt predicate is the (idempotent) _stamp_busy_interrupt_supersession, so the preempt path stamps too.
+- gateway/run_inbound.py + run_inbound_transcription.py: upstream moved the STT helpers into GatewayInboundTranscriptionMixin and independently added a per-clip memo (_gateway_pending_stt_clips) for voice notes merged during STT. Fork keeps its PendingAudioClip design (shared per-clip tasks, echo claimed by clip identity, background _start_pending_voice_stt): the fork's _transcribe_pending_audio_event_once / _echo_pending_stt_transcripts_once / _transcribe_and_echo_pending_voice / _start_pending_voice_stt replace upstream's in the new mixin; upstream's _enrich_message_with_transcription(clip_memo=None) kept (fork calls it without a memo).
+- gateway/run_turn.py: upstream moved the turn-persistence/delivery helpers (_hmwa_shape_agent_response … _hmwa_discard_stale_result) into gateway/run_turn_persistence.py and _hmwa_prepare_turn into run_turn_prepare.py. Each fork-modified method was 3-way merged into its new home (only _hmwa_deliver_turn_response differed; clean merge); fork-only _hmwa_final_assistant_row_id and _hmwa_stamp_delivery_target were added to the persistence mixin. The call site keeps the fork's _hmwa_stamp_delivery_target before upstream's new _deliver_turn_response_then_limit_offer.
+- gateway/run_turn_runner.py: both (fork interim_media_responses capture + upstream local-viewer message.interim publish; fork interim_media_responses result key + upstream _compressed/current_turn_user_idx keys).
+- hermes_state_messages.py: upstream moved set_latest_user_api_content/set_message_api_content to hermes_state_api_content.py; fork-only set_message_delivery stays in hermes_state_messages.py.
+- hermes_state_schema.py: upstream moved the open-time FTS stamp into _stamp_settled_fts_layout (fts_layout_current) and bumped SCHEMA_VERSION to 32 (no-op data step, #140315). The fork's guard (never stamp an older raw-content messages_fts aligned) is added to _stamp_settled_fts_layout.
+- hermes_cli/kanban_db_dispatch.py _worker_argv: BEHAVIOR CHANGE (upstream). Kanban workers no longer run `hermes -p <profile> --cli chat -q`; the dispatcher spawns hermes_cli.kanban_worker_client, which submits the claim to the assignee profile's running owner (gateway) via kanban.run and the owner runs the turn (gateway/session_kanban.py). Upstream wins. Fork --required-skills: required skills are now unioned into the owner-path skill list (gateway/session_kanban.py), so they load; the fork's hard refusal when a mandatory skill is missing (typed exit) is NOT ported yet -- open item. Fork _resolve_worker_cli_toolsets (explicit --toolsets pin) is no longer used by the launch path.
 
-Outside conflicts: `tools/mcp_tool_server_run.py` (single `_arm_auth_park`), `agent/tool_executor.py`
-and `agent/display.py` (OTP redaction), fork vault tests and the credential-vault doc moved to
-`browser_vault action=...`.
+- `agent/vault_backends/onepassword.py`: both sides fixed service-account item reads needing
+  `--vault`. Fork kept (vault-qualified handles, card listing and `resolve_secret`); upstream's
+  `_item_vaults` listing map is still populated by its non-conflicting lines but unused.
+- `tools/browser_tool_cdp.py`: both (fork `urlsplit` import, `_is_managed_browser` and its
+  managed short-circuit before upstream's per-profile `live_cdp_override() or env_cdp_url()`).
+- `tools/browser_camofox.py`: fork managed-mode refusal first, then upstream's per-profile CDP
+  override check.
+- `tools/browser_use_cli.py`: fork managed routing (`mode`/`identity`/`qa_targets`, leased slot,
+  `local=true` refusal, permission-blocked re-route) kept; upstream's real-profile fallback
+  (`real_profile`, `_route_exec_current`, `_reload_if_republished`) added, with the fork route
+  keywords threaded through `_route_exec`/`_route_exec_current`.
+- `tools/approval.py`: both (fork `_undefined_name_provenance`, upstream `_is_local_viewer_turn`).
+- `plugins/platforms/telegram/adapter.py`: both mixins (fork inline photos, upstream topic routing).
+- `Dockerfile`: upstream base digest + fork `DEBIAN_SNAPSHOT` ARG; fork runtime stage moved to the
+  same base.
+- `pyproject.toml`: upstream urllib3 2.8.0 / PyJWT 2.15.1 / mcp 2.3.0; fork httpx2 2.13.0;
+  fork aiohttp comments (same version); version 0.22.5.
+- `uv.lock`: upstream's v0.22.5 file, then `uv lock` (uv 0.13.5).
+- `pm/lock.json`: upstream CPython 3.14.9, restamped to `install_only_stripped`.
+- `package.json`, `apps/desktop/package.json`, `package-lock.json`: upstream versions (dompurify
+  3.4.17, ip-address 10.7.4, nanoid 3.3.20, katex override) plus the fork's `browserslist` 4.28.7 /
+  `baseline-browser-mapping` 2.11.0 overrides and their lock entries.
+- `plugins/platforms/photon/sidecar/package-lock.json`: upstream (grpc-js 1.14.6, undici).
+- Tests: `test_classify_changes.py` both kwargs (`installer`, `catalog`);
+  `test_api_server_active_work_drain.py` and `test_hosted_rooms.py` upstream (same fixes);
+  `test_mcp_oauth_manager.py` both; `test_fts_trigram_cron_exclusion.py` fork skip marker on
+  upstream's parametrized signature.
+- `tests/fixtures/prompt_surface/**`: upstream, then re-rendered for the fork with
+  `scripts/fork-prompt-surface.sh` (monolith) before the gate.

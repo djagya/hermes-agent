@@ -33,7 +33,8 @@ def test_current_repo_passes():
     assert "No unguarded larger runners." in result.stdout
 
 
-def test_unguarded_larger_runner_fails(tmp_path: Path):
+@pytest.mark.parametrize("label", ["ubuntu-latest-96-core", "blacksmith-4vcpu-ubuntu-2404"])
+def test_unguarded_larger_runner_fails(tmp_path: Path, label: str):
     workflows = tmp_path / ".github" / "workflows"
     workflows.mkdir(parents=True)
     (workflows / "tests.yml").write_text(
@@ -41,7 +42,7 @@ def test_unguarded_larger_runner_fails(tmp_path: Path):
         "on: workflow_call\n"
         "jobs:\n"
         "  test:\n"
-        "    runs-on: ubuntu-latest-96-core\n"
+        f"    runs-on: {label}\n"
         "    steps:\n"
         "      - run: echo hi\n",
         encoding="utf-8",
@@ -50,7 +51,7 @@ def test_unguarded_larger_runner_fails(tmp_path: Path):
     result = _run(tmp_path)
 
     assert result.returncode == 1
-    assert "ubuntu-latest-96-core" in result.stdout
+    assert label in result.stdout
     assert "tests.yml" in result.stdout
 
 

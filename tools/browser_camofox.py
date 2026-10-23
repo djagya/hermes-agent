@@ -108,7 +108,8 @@ def is_camofox_mode() -> bool:
             return False
     except Exception:
         pass
-    if os.getenv("BROWSER_CDP_URL", "").strip() or _config_cdp_url():
+    from tools.browser_tool_cdp import env_cdp_url, live_cdp_override
+    if live_cdp_override() or env_cdp_url() or _config_cdp_url():
         return False
     try:
         from tools.tool_backend_helpers import read_selection

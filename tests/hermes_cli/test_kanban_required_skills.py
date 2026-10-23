@@ -28,9 +28,10 @@ def test_required_skills_persist_and_spawn(kanban_home):
         task = kb.get_task(conn, tid)
         assert task.skills == ["advisory"]
         assert task.required_skills == ["needed"]
-        argv = kbd._worker_argv(task, "worker", None)
-        assert argv[argv.index("--required-skills") + 1] == "needed"
-        assert argv[argv.index("--skills") + 1] == "advisory"
+        # Since v0.22.4 the profile owner runs the card (gateway/session_kanban.py), not a
+        # `hermes chat --required-skills` child: the mandatory skill rides the owner's skill list.
+        from gateway.session_kanban import card_skills
+        assert card_skills(task) == ["advisory", "needed"]
         assert kb.get_task(conn, kb.create_task(conn, title="plain", assignee="worker")).required_skills is None
 
 
