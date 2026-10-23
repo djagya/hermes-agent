@@ -330,7 +330,11 @@ def browser_vault_list() -> str:
         try:
             metas = backend.list_items()
         except Exception as exc:
-            errors.append({"backend": backend.name, "error": str(exc)[:200]})
+            from agent.vault_backends import BackendError
+            if isinstance(exc, BackendError):
+                errors.append({"backend": backend.name, "error_type": exc.error_type, "error": exc.message()})
+            else:
+                errors.append({"backend": backend.name, "error": str(exc)[:200]})
             continue
         for meta in metas:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
@@ -563,8 +567,13 @@ def browser_vault_enter_code(
     source = "supplied" if explicit_code is not None else "user"
     backend = backend_for_handle(handle) if handle and explicit_code is None else None
     if backend is not None:
+        from agent.vault_backends import BackendError
         try:
             code_value = backend.resolve_otp(handle)
+        except BackendError as exc:
+            if type(exc) is not BackendError:  # a typed outage: say so, never "save an authenticator key"
+                return json.dumps(exc.result())
+            code_value = None
         except Exception:
             code_value = None
         if code_value:
@@ -1067,11 +1076,16 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     from tools.browser_tool_session import run_fenced
 
     def op() -> dict[str, Any]:
+        from agent.vault_backends import BackendError
         try:
             if _is_managed():
                 _managed_supervisor(task_id or "default", admit=True)
             return {"raw": fn()}
         except _PageUnavailable as exc:
+            return {"raw": json.dumps(exc.result())}
+        except BackendError as exc:
+            # Typed manager failures (rate budget, expired token, network, missing item) carry
+            # model-facing advice and no secret material.
             return {"raw": json.dumps(exc.result())}
 
     session = _active_sessions.get(_last_session_key(task_id or "default")) or {}

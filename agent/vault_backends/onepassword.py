@@ -10,22 +10,57 @@ service-account authentication works as well as interactive sessions.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from agent.secret_sources.base import run_cli
 from agent.secret_sources.onepassword import _OP_ENV_ALLOWLIST, _scrub, find_op
-from agent.vault_backends.base import LoginBackend, UnlockRequired, run_with_stdin_secret
+from agent.vault_backends.base import (
+    BackendAuthExpired,
+    BackendError,
+    BackendNetwork,
+    BackendRateLimited,
+    ItemNotFound,
+    LoginBackend,
+    UnlockRequired,
+    run_with_stdin_secret,
+)
 from agent.vault_backends import unlock as _unlock
 from agent.vault_store import VaultItemMeta, normalize_origin
 
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 30.0
+# ``op item list`` ran on every fill and every get_meta. 1Password rate-limits
+# and budgets service-account requests, so the item METADATA list (titles,
+# URLs, usernames, ids; never a password, card or TOTP value) is reused for
+# this long. A lock, a profile switch or a different account/vault misses.
+LIST_CACHE_TTL_S = 60.0
+_list_cache_lock = threading.Lock()
+_list_cache: dict[tuple, tuple[float, list]] = {}
+
+# Lower-cased ``op`` stderr fragments -> typed failure. Checked in this order.
+_RATE_MARKERS = ("rate limit", "too many requests", "daily limit", "request limit", "quota")
+_NOT_FOUND_MARKERS = ("isn't an item", "is not an item", "no item found", "item not found", "could not find item",
+                      "isn't a vault", "vault not found", "doesn't exist", "does not exist")
+_AUTH_MARKERS = ("unauthorized", "invalid token", "token expired", "expired token", "token has expired",
+                 "revoked", "invalid bearer", "authentication failed", "service account is not active")
+_SESSION_MARKERS = ("session", "sign in", "not signed in")
+_NETWORK_MARKERS = ("dial tcp", "no such host", "connection refused", "connection reset", "network is unreachable",
+                    "i/o timeout", "timed out", "timeout", "tls handshake", "could not connect", "eof",
+                    "temporary failure in name resolution")
+
+
+def clear_list_cache() -> None:
+    with _list_cache_lock:
+        _list_cache.clear()
 
 
 class OnePasswordLoginBackend(LoginBackend):
@@ -88,20 +123,58 @@ class OnePasswordLoginBackend(LoginBackend):
         token = None if self._service_token else _unlock.get_session_token(self.name)
         if not self._service_token and not token:
             raise UnlockRequired(self)
-        proc = run_cli([str(self._op()), *args], env=self._env(token), timeout=_TIMEOUT, label="op",
-                       timeout_message="op timed out", stdin=subprocess.DEVNULL)
+        try:
+            proc = run_cli([str(self._op()), *args], env=self._env(token), timeout=_TIMEOUT, label="op",
+                           timeout_message="op timed out", stdin=subprocess.DEVNULL)
+        except RuntimeError as exc:
+            if "timed out" in str(exc):
+                raise BackendNetwork(self.display_name, f"op timed out after {_TIMEOUT:.0f}s") from None
+            raise
         if proc.returncode != 0:
-            err = _scrub(proc.stderr or "")
-            if "session" in err.lower() or "sign in" in err.lower() or "not signed in" in err.lower():
-                _unlock.lock(self.name)
-                raise UnlockRequired(self)
-            raise RuntimeError(f"op failed: {err[:200]}")
+            raise self._classify(_scrub(proc.stderr or ""))
         return proc.stdout or ""
+
+    def _classify(self, err: str) -> Exception:
+        """The typed failure for an ``op`` error (``UnlockRequired`` locks the interactive session)."""
+        low = err.lower()
+        if any(m in low for m in _RATE_MARKERS):
+            return BackendRateLimited(self.display_name, err)
+        auth = any(m in low for m in _AUTH_MARKERS) or any(m in low for m in _SESSION_MARKERS)
+        if auth and self._service_token:
+            # A service-account / Connect token cannot be fixed by an interactive unlock.
+            return BackendAuthExpired(self.display_name, err)
+        if auth:
+            _unlock.lock(self.name)
+            return UnlockRequired(self)
+        if any(m in low for m in _NOT_FOUND_MARKERS):
+            return ItemNotFound(self.display_name, err)
+        if any(m in low for m in _NETWORK_MARKERS):
+            return BackendNetwork(self.display_name, err)
+        return BackendError(self.display_name, f"op failed: {err}")
+
+    def _list_cache_key(self) -> tuple:
+        home, generation = _unlock.generation(self.name)
+        token = hashlib.sha256(self._service_token.encode()).hexdigest()[:16] if self._service_token else ""
+        return (home, generation, str(self.cfg.get("account") or ""), str(self.cfg.get("vault") or "").strip(), token)
 
     # ── backend contract ───────────────────────────────────────────────────
     def list_items(self) -> list[VaultItemMeta]:
         if not self.is_unlocked():
             return []
+        key = self._list_cache_key()
+        now = time.monotonic()
+        with _list_cache_lock:
+            hit = _list_cache.get(key)
+        if hit is not None and now - hit[0] < LIST_CACHE_TTL_S:
+            return list(hit[1])
+        items = self._list_items_uncached()
+        with _list_cache_lock:
+            if len(_list_cache) > 32:
+                _list_cache.clear()
+            _list_cache[key] = (now, list(items))
+        return items
+
+    def _list_items_uncached(self) -> list[VaultItemMeta]:
         args = ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]
         configured_vault = str(self.cfg.get("vault") or "").strip()
         if configured_vault:
@@ -175,22 +248,34 @@ class OnePasswordLoginBackend(LoginBackend):
         try:
             raw = self._run("item", "get", item_id, "--vault", vault_id, "--format", "json", "--reveal")
             return parse_onepassword_card(json.loads(raw), item_id=item_id, vault_id=vault_id)
-        except UnlockRequired:
-            raise
+        except (UnlockRequired, ItemNotFound, BackendRateLimited, BackendAuthExpired, BackendNetwork):
+            raise  # typed causes carry no card data, only the scrubbed CLI error
         except Exception:
             raise ValueError("Payment card resolution failed") from None
 
     def resolve_otp(self, handle: str) -> Optional[str]:
         # `--otp` mints the current TOTP from the item's one-time-password field; items without one error out.
+        # A typed outage (rate budget, expired token, network, missing item) is raised so the caller does not
+        # tell the model to "save an authenticator key" for a login that already has one.
         try:
             vault_id, item_id = self._resolve_handle(handle)
             args = ["item", "get", item_id]
             if vault_id:
                 args += ["--vault", vault_id]
             code = self._run(*args, "--otp").strip()
+        except BackendError as exc:
+            if _no_otp_field(exc.detail) or type(exc) is BackendError:
+                return None  # the item has no TOTP seed: the user is asked instead
+            raise
         except Exception:
             return None
         return code if code.isdigit() else None
+
+
+def _no_otp_field(detail: str) -> bool:
+    """op's "this item has no one-time password" refusal (not an outage)."""
+    low = (detail or "").lower()
+    return "one-time password" in low and any(m in low for m in ("no ", "doesn't have", "does not have", "not have"))
 
 
 def _web_origins(origins: list[str]) -> tuple:

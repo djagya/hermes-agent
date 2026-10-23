@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from agent.vault_backends import BackendError
 from agent.vault_login_classifier import select_checkout_fills
 from agent.vault_payment_card import validate_card
 from agent.vault_payment_policy import PaymentPolicyError, effective_frame_origins
@@ -101,7 +102,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
 
             route = vault_route(task_id)
             surface = {"slot_id": route.get("slot_id", ""),
-                       "browser_generation": route.get("browser_generation", "")}
+                       "browser_generation": route.get("browser_generation", ""),
+                       "wipe_count": route.get("wipe_count", ""),
+                       "profile_kind": route.get("profile_kind", "")}
         mark_payment_session(task_id, surface)
         result = supervisor.commit_payment(inspected, fills)
         result.update(
@@ -117,6 +120,14 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             merchant_reputation="human_review_required",
         )
         return json.dumps(result)
+    except BackendError as exc:
+        if type(exc) is BackendError:  # unclassified op failure: keep the opaque refusal below
+            return json.dumps({
+                "success": False,
+                "error_type": "payment_fill_refused",
+                "error": "Card resolution or page checks failed; nothing was submitted. Inspect the page and request fresh consent.",
+            })
+        return json.dumps(exc.result())
     except PaymentPolicyError as exc:
         return json.dumps({
             "success": False,
