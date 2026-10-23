@@ -948,9 +948,10 @@ class SessionMessagesMixin:
         covered_set.update(carried_ids)
         unseen = [row_id for row_id in active_ids if row_id not in covered_set]
         covered_active = [row_id for row_id in active_ids if row_id in covered_set]
+        clone_ids, unseen_tool_calls, tail_below = self._split_carried_tail(conn, unseen, compacted_messages, tail_count)
         rewind_ids = list(carried_ids)
-        if tail_count > 0:
-            rewind_ids += self._tail_originals(covered_active, tail_count, merged_away)
+        if tail_below > 0:
+            rewind_ids += self._tail_originals(covered_active, tail_below, merged_away)
         rewind_ids += unseen
         rewind_ids = list(dict.fromkeys(rewind_ids))
         if rewind_ids:
@@ -965,13 +966,9 @@ class SessionMessagesMixin:
         # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
         self._carry_parent_timestamps(conn, session_id, compacted_messages)
         inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
-        if unseen:
-            _ids, unseen_tool_calls = self._tail_rows_after_watermark(
-                conn,
-                f"SELECT id, tool_calls FROM messages WHERE id IN ({_placeholders(unseen)}) ORDER BY id",
-                tuple(unseen))
-            self._clone_message_rows(conn, unseen)
-            inserted += len(unseen)
+        if clone_ids:
+            self._clone_message_rows(conn, clone_ids)
+            inserted += len(clone_ids)
             tool_calls_total += unseen_tool_calls
         # A carried copy whose stored identity was computed differently lands in its own
         # display_order group and would project twice; re-fold before publishing (#122167).
@@ -1029,20 +1026,22 @@ class SessionMessagesMixin:
                     conn, session_id, compacted_messages, proved[0], tail_count=tail_count,
                     carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch,
                     merged_away=proved[1])
-            tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
-                conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
-                (session_id, int(watermark)))
+            tail_ids: list[int] = [] if watermark is None else [int(row["id"]) for row in conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
+                (session_id, int(watermark))).fetchall()]
+            clone_ids, tail_tool_calls, tail_below = self._split_carried_tail(
+                conn, tail_ids, compacted_messages, tail_count)
             # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
             # concurrent append would steal a LIMIT slot.
             rewind_ids: list[int] = self._resolve_carried_row_ids(
                 conn, session_id, carried_messages or [])
-            if tail_count > 0:
+            if tail_below > 0:
                 bound = watermark is not None
                 rewind_ids += [int(row["id"]) for row in conn.execute(
                     f"SELECT id FROM messages WHERE session_id = ? AND active = 1{' AND id <= ?' if bound else ''} "
                     "ORDER BY id DESC LIMIT ?",
                     (session_id, *((int(watermark),) if bound else ()),
-                     int(tail_count) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
+                     int(tail_below) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
             rewind_ids += tail_ids
             rewind_ids = list(dict.fromkeys(rewind_ids))
             if rewind_ids:
@@ -1057,9 +1056,9 @@ class SessionMessagesMixin:
             # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
             self._carry_parent_timestamps(conn, session_id, compacted_messages)
             inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
-            if tail_ids:
-                self._clone_message_rows(conn, tail_ids)
-                inserted += len(tail_ids)
+            if clone_ids:
+                self._clone_message_rows(conn, clone_ids)
+                inserted += len(clone_ids)
                 tool_calls_total += tail_tool_calls
             # A carried copy whose stored identity was computed differently lands in its own
             # display_order group and would project twice; re-fold before publishing (#122167).
