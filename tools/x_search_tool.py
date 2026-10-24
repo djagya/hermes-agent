@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from tools.registry import registry, tool_error
-from tools.xai_http import DEFAULT_XAI_BASE_URL, hermes_xai_user_agent, resolve_xai_http_credentials
+from tools.xai_http import DEFAULT_XAI_BASE_URL, hermes_xai_default_headers, resolve_xai_http_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +227,7 @@ def x_search_tool(
     except RuntimeError as exc:
         return tool_error(str(exc))
     try:
-        tool_def, active_filters = _build_x_search_tool_def(
+        tool_def, _active_filters = _build_x_search_tool_def(
             allowed_x_handles, excluded_x_handles, from_date, to_date,
             enable_image_understanding, enable_video_understanding,
         )
@@ -246,22 +246,24 @@ def x_search_tool(
             payload["reasoning"] = {"effort": reasoning_effort}
         headers = {
             "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
-            "User-Agent": hermes_xai_user_agent(),
+            **hermes_xai_default_headers(base_url),
         }
         data = _post_with_retries(f"{base_url}/responses", headers, payload).json()
         citations = list(data.get("citations") or [])
         inline_citations = _extract_inline_citations(data)
-        # xAI returns 200 with a synthesized answer even when no posts match the narrowing
-        # filters; with both citation channels empty the answer came from training data.
-        degraded = bool(active_filters) and not citations and not inline_citations
+        # HTTP 200 alone does not prove native search ran. With no source
+        # evidence (filtered or broad query), return an explicit degraded failure.
+        degraded = not citations and not inline_citations
         result = {
-            "success": True, "provider": "xai", "credential_source": source, "tool": "x_search",
+            "success": not degraded, "provider": "xai", "credential_source": source, "tool": "x_search",
             "model": payload["model"], "query": query.strip(), "answer": _extract_response_text(data),
             "citations": citations, "inline_citations": inline_citations, "degraded": degraded,
             "degraded_reason": (
-                f"no citations returned despite filters: {', '.join(active_filters)}" if degraded else None
+                "No X search citations returned; native search execution is unconfirmed." if degraded else None
             ),
         }
+        if degraded:
+            result["error"] = result["degraded_reason"]
         return json.dumps(result, ensure_ascii=False)
     except requests.HTTPError as e:
         logger.error("x_search failed: %s", e, exc_info=True)

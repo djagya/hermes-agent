@@ -232,8 +232,19 @@ def _xai_validate_oauth_endpoint(url: str, *, field: str) -> str:
     raise _xai_err(message, "xai_discovery_invalid")
 
 
+def _xai_is_grok_proxy_url(value: str) -> bool:
+    """Match only the subscription HTTPS origin (not arbitrary grok.com hosts)."""
+    try:
+        parsed = urlparse(value)
+        return (parsed.scheme == "https" and parsed.hostname == "cli-chat-proxy.grok.com"
+                and parsed.port in (None, 443) and parsed.username is None
+                and parsed.password is None)
+    except ValueError:
+        return False
+
+
 def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
-    """Pin the OAuth inference base_url to ``*.x.ai``; warn and use *fallback* on rejection.
+    """Pin inference to xAI HTTPS origins or the exact subscription proxy origin.
 
     Warn-not-raise: a bad env var must not deadlock auth, but the bearer must never leak elsewhere.
     """
@@ -242,10 +253,14 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
         return fallback
     try:
         problem, host = _xai_url_problem(candidate)
+        parsed = urlparse(candidate)
+        port = parsed.port
     except Exception:
         logger.warning("Ignoring malformed xAI base_url override %r; using %s instead.", candidate, fallback)
         return fallback
-    if problem is None:
+    if _xai_is_grok_proxy_url(candidate):
+        return candidate
+    if problem is None and port in (None, 443) and parsed.username is None and parsed.password is None:
         return candidate
     if problem == "scheme":
         logger.warning(
@@ -258,7 +273,7 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
     else:
         logger.warning(
             "Refusing xAI base_url override %r — host %r is not on the xAI origin "
-            "(expected x.ai or a *.x.ai subdomain). The xai-oauth bearer is only "
+            "(expected HTTPS x.ai, *.x.ai, or cli-chat-proxy.grok.com on port 443, without userinfo). The xai-oauth bearer is only "
             "valid against xAI's inference API; sending it elsewhere would leak "
             "the credential. Falling back to %s.",
             candidate, host, fallback,
@@ -407,11 +422,24 @@ def _quarantine_xai_oauth_tokens(exc: AuthError) -> None:
         logger.debug("xAI OAuth: failed to persist quarantined state: %s", save_exc)
 
 
+def _xai_oauth_runtime_base_url(value: str = "", *, override: str = "") -> str:
+    """Migrate legacy OAuth defaults at read time, without rewriting auth rows.
+
+    The canonical API URL used to be persisted as the OAuth default, so it is
+    not evidence of customization. Noncanonical compatible routes survive;
+    explicit environment overrides (even the canonical API URL) win separately.
+    """
+    candidate = str(value or "").strip().rstrip("/")
+    if candidate == "https://api.x.ai/v1":
+        candidate = ""
+    base = _xai_validate_inference_base_url(candidate, fallback=DEFAULT_XAI_OAUTH_BASE_URL)
+    return _xai_validate_inference_base_url(override, fallback=base)
+
+
 def _xai_oauth_inference_base_url() -> str:
-    return _xai_validate_inference_base_url(
-        os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/") or os.getenv("XAI_BASE_URL", "").strip().rstrip("/"),
-        fallback=DEFAULT_XAI_OAUTH_BASE_URL,
-    )
+    return _xai_oauth_runtime_base_url(override=(
+        os.getenv("HERMES_XAI_BASE_URL", "").strip() or os.getenv("XAI_BASE_URL", "").strip()
+    ))
 
 
 def resolve_xai_oauth_runtime_credentials(

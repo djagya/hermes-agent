@@ -49,7 +49,8 @@ _ROUTE_DEFAULT_HEADERS = (
     ("chatgpt.com", lambda self, url: _lazy_attr("agent.codex_headers", "codex_cloudflare_headers")(
         self._client_kwargs.get("api_key", ""), base_url=url)),
     # Covers provider=xai and provider=xai-oauth (api.x.ai).
-    ("x.ai", lambda self, url: _lazy_attr("tools.xai_http", "hermes_xai_default_headers")()),
+    ("x.ai", lambda self, url: _lazy_attr("tools.xai_http", "hermes_xai_default_headers")(url)),
+    ("cli-chat-proxy.grok.com", lambda self, url: _lazy_attr("tools.xai_http", "hermes_xai_default_headers")(url)),
 )
 
 
@@ -610,6 +611,14 @@ class ClientLifecycleMixin:
         if old_key and api_key.strip() == old_key:
             logger.debug("%s credential refresh returned the same token; refresh likely failed silently", self.provider)
             return False
+        if self.provider == "xai-oauth":
+            # Preserve custom routes, but migrate the old persisted API default.
+            # Environment overrides remain deliberate, including the API URL.
+            from hermes_cli.config import get_env_value
+            base_url = _auth._xai_oauth_runtime_base_url(
+                self.base_url,
+                override=get_env_value("HERMES_XAI_BASE_URL") or get_env_value("XAI_BASE_URL") or "",
+            )
         return self._adopt_openai_credentials(api_key, base_url, reason=f"{self.provider}_credential_refresh")
 
     def _try_refresh_nous_client_credentials(self, *, force: bool = True, require_account: str | None = None) -> bool:

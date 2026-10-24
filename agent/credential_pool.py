@@ -315,6 +315,11 @@ class PooledCredential:
             # for every reader of the row — initial resolution AND a 401/429 rotation
             # (client_lifecycle._swap_credential), or a rotation silently leaves the proxy.
             return get_secret_str("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or self.base_url
+        if self.provider == "xai-oauth":
+            return auth_mod._xai_oauth_runtime_base_url(
+                self.base_url or "",
+                override=get_secret_str("HERMES_XAI_BASE_URL", "") or get_secret_str("XAI_BASE_URL", ""),
+            )
         return self.base_url
 
 

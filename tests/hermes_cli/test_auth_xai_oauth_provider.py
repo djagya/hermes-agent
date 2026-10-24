@@ -821,6 +821,8 @@ def test_auxiliary_client_routes_xai_oauth_through_responses_api(tmp_path, monke
     monkeypatch.delenv("HERMES_XAI_BASE_URL", raising=False)
     monkeypatch.delenv("XAI_BASE_URL", raising=False)
 
+    # Keep this routing test independent of process bootstrap / shared live transports.
+    monkeypatch.setattr("agent.auxiliary_client._openai_http_client_kwargs", lambda _base: {})
     client, model = resolve_provider_client("xai-oauth", model="grok-4")
     assert client is not None, (
         "xai-oauth must route to a Responses-API client; falling through to "

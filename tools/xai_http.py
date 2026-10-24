@@ -58,9 +58,41 @@ def hermes_xai_user_agent() -> str:
         return "Hermes-Agent/unknown"
 
 
-def hermes_xai_default_headers() -> dict[str, str]:
+# Inspected official Grok CLI 1.0.67 protocol headers. This is transport
+# compatibility, not a claim about the credential's subscription or quota.
+XAI_GROK_PROXY_REQUIRED_HEADERS = {
+    "X-XAI-Token-Auth": "xai-grok-cli",
+    "x-authenticateresponse": "authenticate-response",
+    "x-grok-client-mode": "headless",
+    "x-grok-client-version": "1.0.67",
+    "x-grok-client-identifier": "grok-shell",
+}
+
+
+def xai_grok_proxy_headers_for(base_url: str) -> dict[str, str]:
+    from hermes_cli.auth_xai import _xai_is_grok_proxy_url
+    return dict(XAI_GROK_PROXY_REQUIRED_HEADERS) if _xai_is_grok_proxy_url(base_url) else {}
+
+
+def apply_xai_route_headers(kwargs: dict, base_url: str) -> None:
+    """Merge case-insensitively, removing stale proxy headers after a route swap."""
+    required = xai_grok_proxy_headers_for(base_url)
+    headers = dict(kwargs.get("default_headers") or {})
+    names = {key.lower() for key in XAI_GROK_PROXY_REQUIRED_HEADERS}
+    if not required:
+        headers = {key: value for key, value in headers.items() if key.lower() not in names}
+    else:
+        present = {key.lower() for key in headers}
+        headers.update({key: value for key, value in required.items() if key.lower() not in present})
+    if headers:
+        kwargs["default_headers"] = headers
+    else:
+        kwargs.pop("default_headers", None)
+
+
+def hermes_xai_default_headers(base_url: str = "") -> dict[str, str]:
     """Default headers for OpenAI-SDK and raw HTTP clients talking to xAI (replaces the SDK User-Agent)."""
-    return {"User-Agent": hermes_xai_user_agent()}
+    return {"User-Agent": hermes_xai_user_agent(), **xai_grok_proxy_headers_for(base_url)}
 
 
 _TRUE_WORDS = {"1", "true", "yes", "on", "enabled"}
@@ -212,12 +244,10 @@ def resolve_xai_http_credentials(
             # the next healthy account rather than resurrecting the stale row.
             entry = pool.select()
         access_token = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
-        fallback_base_url = str(
-            getattr(entry, "runtime_base_url", None)
-            or getattr(entry, "base_url", "")
-            or auth_mod.DEFAULT_XAI_OAUTH_BASE_URL
-        ).strip().rstrip("/")
-        base_url = auth_mod._xai_validate_inference_base_url(_xai_base_url_override(), fallback=fallback_base_url)
+        base_url = auth_mod._xai_oauth_runtime_base_url(
+            getattr(entry, "base_url", "") or getattr(entry, "runtime_base_url", "") or "",
+            override=_xai_base_url_override(),
+        )
         if str(access_token).strip():
             return {"provider": "xai-oauth", "api_key": str(access_token).strip(), "base_url": base_url}
     except Exception:

@@ -196,6 +196,8 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
     # SDK-internal retries by default and let Hermes control the budget; explicit callers can still override
     # via kwargs.
     kwargs.setdefault("max_retries", 0)
+    from tools.xai_http import apply_xai_route_headers
+    apply_xai_route_headers(kwargs, base_url)
     return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
 
 
