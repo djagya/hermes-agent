@@ -51,6 +51,41 @@ def test_claim_unknown_job_returns_false(temp_home):
     assert claim_job_for_fire("nope-does-not-exist") is False
 
 
+def test_rejected_dispatch_releases_fire_claim(temp_home, monkeypatch):
+    """claim_dispatch rejects a spent one-shot and retires it as completed; the rejected fire
+    hands back its fire_claim so a re-arm is not refused as "over a live fire claim"."""
+    from cron import scheduler
+    from cron.jobs import (
+        _hermes_now, claim_job_for_fire, create_job, get_job, rearm_oneshot, update_job)
+
+    jid = create_job(prompt="x", schedule="in 30m", name="spent")["id"]
+    # Budget already spent by an earlier run, record active again (reschedule + resume).
+    update_job(jid, {"repeat": {"times": 1, "completed": 1},
+                     "last_run_at": _hermes_now().isoformat()})
+    claimed = claim_job_for_fire(jid, return_job=True)
+    assert claimed["fire_claim"]
+    ran = []
+    monkeypatch.setattr(scheduler, "run_job", lambda *a, **kw: ran.append(a))
+
+    assert scheduler.run_one_job(claimed) is True
+
+    after = get_job(jid)
+    assert (ran, after["state"], after.get("fire_claim")) == ([], "completed", None)
+    assert rearm_oneshot(jid, "in 10m")["state"] == "scheduled"
+
+
+def test_release_fire_claim_only_for_owner(temp_home):
+    from cron.jobs import claim_job_for_fire, create_job, get_job, release_fire_claim
+
+    jid = create_job(prompt="x", schedule="every 5m", name="t")["id"]
+    owner = claim_job_for_fire(jid, return_job=True)["fire_claim"]["by"]
+
+    assert release_fire_claim(jid, expected_owner="someone-else") is False
+    assert get_job(jid)["fire_claim"] is not None
+    assert release_fire_claim(jid, expected_owner=owner) is True
+    assert get_job(jid)["fire_claim"] is None
+
+
 def test_claim_paused_job_returns_false(temp_home):
     """A paused job can't be claimed."""
     from cron.jobs import create_job, claim_job_for_fire, pause_job
