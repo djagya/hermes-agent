@@ -271,23 +271,69 @@ class TestHealthyJobUnaffected:
                 assert error.startswith("[blocked_config] ")
 
     def test_recovery_clears_alert_marker(self, tmp_path):
-        """After a blocked tick, a healthy tick clears the alert-dedup marker
+        """After a blocked tick, a tick that really runs clears the alert-dedup marker
         so a FUTURE config break re-alerts."""
         job = _job()
+        deliveries = []
         with cron_jobs.use_cron_store(tmp_path):
             cron_jobs.save_jobs([job])
-            # Tick 1: blocked.
-            _run_job_patched(job, tmp_path, resolve=_AuthErrorFactory())
+            _tick_one(job["id"], tmp_path, deliveries, resolve=_AuthErrorFactory())
             stored = next(j for j in cron_jobs.load_jobs() if j["id"] == job["id"])
             assert stored.get("preflight_alerted")
-            # Tick 2: key restored → healthy run clears the marker.
-            fresh = next(j for j in cron_jobs.load_jobs() if j["id"] == job["id"])
-            success, *_rest, agent_constructed = _run_job_patched(fresh, tmp_path)
-            assert success is True
-            assert agent_constructed is True
+            # Key restored → a healthy run clears the marker.
+            built = _tick_one(job["id"], tmp_path, deliveries)
+            assert built is True
             stored = next(j for j in cron_jobs.load_jobs() if j["id"] == job["id"])
             assert not stored.get("preflight_alerted")
             assert not stored.get("preflight_alerted_at")
+
+    def test_mcp_block_after_passing_preflight_alerts_once_per_interval(self, tmp_path):
+        """Review F3: the config check passes, then the empty-MCP-toolset gate blocks. The
+        passing check must not clear the marker, or every tick re-alerts."""
+        job = _job()
+        deliveries = []
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            for _tick in range(3):
+                built = _tick_one(job["id"], tmp_path, deliveries,
+                                  mcp_reason="MCP toolset 'todoist' resolved to zero tools")
+                assert built is False
+            stored = next(j for j in cron_jobs.load_jobs() if j["id"] == job["id"])
+        assert stored["last_status"] == "blocked_config"
+        assert len(deliveries) == 1, deliveries
+
+
+def _tick_one(job_id, tmp_path, deliveries, *, resolve=None, mcp_reason=None):
+    """One run_one_job tick with the cron seams patched; returns whether AIAgent was built."""
+    from contextlib import ExitStack
+
+    def fake_deliver(job, content, adapters=None, loop=None, **kwargs):
+        if content:
+            deliveries.append(content)
+
+    fresh = next(j for j in cron_jobs.load_jobs() if j["id"] == job_id)
+    patches = [
+        patch("cron.scheduler._hermes_home", tmp_path),
+        patch("cron.scheduler_delivery._resolve_origin", return_value=None),
+        patch("hermes_cli.env_loader.load_hermes_dotenv"),
+        patch("hermes_cli.env_loader.reset_secret_source_cache"),
+        patch("hermes_state_registry.acquire", return_value=MagicMock()),
+        patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]),
+        patch.object(sched, "_deliver_result", side_effect=fake_deliver),
+        patch.object(sched, "_empty_requested_mcp_toolsets", return_value=mcp_reason),
+    ]
+    if resolve is None:
+        patches.append(patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                             return_value=dict(_RUNTIME)))
+    else:
+        patches.append(patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                             side_effect=resolve))
+    with patch("run_agent.AIAgent") as mock_agent_cls, ExitStack() as stack:
+        mock_agent_cls.return_value.run_conversation.return_value = {"final_response": "ok"}
+        for p in patches:
+            stack.enter_context(p)
+        sched.run_one_job(fresh)
+        return mock_agent_cls.called
 
 
 class TestOptOut:

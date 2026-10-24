@@ -1719,12 +1719,10 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
     _pf_reason = None
     try:
         if _cron_preflight_enabled(cfg):
+            # A passing check does NOT clear the alert marker: a later gate (the MCP empty-toolset
+            # check) can still block this tick. The marker clears once the job really runs
+            # (cron.jobs._record_run_outcome).
             _pf_reason = _preflight_job_config(job, cfg)
-            if not _pf_reason and job.get("preflight_alerted"):
-                # Config healthy again: clear alert-once marker so a future break re-alerts.
-                with contextlib.suppress(Exception):
-                    from cron.jobs import clear_preflight_alerted
-                    clear_preflight_alerted(job_id)
     except Exception:
         # Fail open: the validator must never take down a runnable job.
         logger.debug("Job '%s': preflight validation errored — failing open", job_id, exc_info=True)
