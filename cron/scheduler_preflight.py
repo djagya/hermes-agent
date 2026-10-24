@@ -20,7 +20,7 @@ from cron.env_settings import cron_env_setting
 logger = logging.getLogger("cron.scheduler")
 
 # Error-string prefixes from ``run_job``; ``run_one_job`` keys off them for last_status and the
-# alert-once dedup. ``:silent`` = already alerted on a previous tick — do not deliver again.
+# alert dedup. ``:silent`` = already alerted inside the reminder interval — do not deliver again.
 BLOCKED_CONFIG_MARKER = "[blocked_config]"
 BLOCKED_CONFIG_SILENT_MARKER = "[blocked_config:silent]"
 

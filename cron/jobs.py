@@ -2340,9 +2340,43 @@ def mark_preflight_alerted(job_id: str) -> bool:
     return _set_alert_flag(job_id, "preflight_alerted", True)
 
 
+def claim_preflight_alert(job_id: str, repeat_hours: float) -> bool:
+    """Stamp a blocked-config alert for *job_id*; return True when this tick should deliver it.
+
+    A blocked job never runs, so alert-once would leave a job that silently stopped working with
+    no further signal. The first blocked tick alerts; later ones stay silent until *repeat_hours*
+    have passed since the last alert, then alert again (``<= 0``: every tick). A bare legacy
+    ``preflight_alerted`` marker without ``preflight_alerted_at`` alerts again once and is stamped.
+    """
+    now = _hermes_now()
+
+    def apply(jobs, _i, job):
+        due = True
+        last = job.get("preflight_alerted_at")
+        if job.get("preflight_alerted") and last and repeat_hours > 0:
+            try:
+                last_dt = _ensure_aware(datetime.fromisoformat(str(last)))
+                due = _elapsed_seconds(now, last_dt) >= repeat_hours * 3600
+            except (TypeError, ValueError):
+                due = True
+        if due:
+            job["preflight_alerted"] = True
+            job["preflight_alerted_at"] = now.isoformat()
+            save_jobs(jobs)
+        return due
+
+    return _with_job(job_id, apply, True)
+
+
 def clear_preflight_alerted(job_id: str) -> None:
     """Clear the preflight alert-dedup marker (config validates again)."""
-    _set_alert_flag(job_id, "preflight_alerted", False)
+    def apply(jobs, _i, job):
+        if "preflight_alerted" in job or "preflight_alerted_at" in job:
+            job.pop("preflight_alerted", None)
+            job.pop("preflight_alerted_at", None)
+            save_jobs(jobs)
+
+    _with_job(job_id, apply, None)
 
 
 def note_fire_forward_failure(job_id: str, detail: str) -> bool:
@@ -2376,6 +2410,7 @@ def _record_run_outcome(
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
         # the forward-failure stamp so it only describes CURRENT auto-fire health.
         job.pop("preflight_alerted", None)
+        job.pop("preflight_alerted_at", None)
         job.pop("last_fire_error", None)
         job["failure_streak"] = 0
     else:

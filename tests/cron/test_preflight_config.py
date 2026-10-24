@@ -5,8 +5,9 @@ provider API key, unready attached skill (missing required env), unknown
 delivery platform — must be blocked BEFORE any agent machinery is constructed:
 
   - ``last_status`` becomes ``blocked_config`` (not a generic ``error``),
-  - exactly ONE alert is delivered (no re-alert every tick — same
-    alert-once spirit as the dead-pin auto-pause in #73506),
+  - ONE alert per reminder interval (``cron.failure_repeat_alert_hours``,
+    default 6 h) — not every tick, but never silent for good: a blocked job
+    does no work, so it keeps reminding until fixed,
   - the agent is NEVER constructed, so no LLM call is burned.
 
 ``cron.preflight: false`` in config.yaml restores the old behavior (the run
@@ -232,6 +233,43 @@ class TestHealthyJobUnaffected:
         assert final_response == "ok"
         assert agent_constructed is True
 
+    def test_blocked_job_realerts_after_reminder_interval(self, tmp_path):
+        """2026-10-24 (nightly-learnings): a daily blocked job alerted once, then went
+        silent while it never ran. Past the reminder interval it must alert again."""
+        from datetime import timedelta
+
+        job = _job()
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            *_rest, error, _built = _run_job_patched(job, tmp_path, resolve=_AuthErrorFactory())
+            assert error.startswith("[blocked_config] ")
+            *_rest, error, _built = _run_job_patched(job, tmp_path, resolve=_AuthErrorFactory())
+            assert error.startswith("[blocked_config:silent] "), "inside the interval stays quiet"
+
+            jobs = cron_jobs.load_jobs()
+            old = cron_jobs._hermes_now() - timedelta(hours=7)
+            jobs[0]["preflight_alerted_at"] = old.isoformat()
+            cron_jobs.save_jobs(jobs)
+            *_rest, error, _built = _run_job_patched(job, tmp_path, resolve=_AuthErrorFactory())
+            assert error.startswith("[blocked_config] "), "past the interval it re-alerts"
+
+            # Legacy marker without a timestamp (written before this change) re-alerts once.
+            jobs = cron_jobs.load_jobs()
+            jobs[0].pop("preflight_alerted_at")
+            cron_jobs.save_jobs(jobs)
+            *_rest, error, _built = _run_job_patched(job, tmp_path, resolve=_AuthErrorFactory())
+            assert error.startswith("[blocked_config] ")
+            assert cron_jobs.load_jobs()[0].get("preflight_alerted_at")
+
+    def test_zero_repeat_hours_alerts_every_blocked_tick(self, tmp_path):
+        job = _job()
+        with cron_jobs.use_cron_store(tmp_path), \
+             patch.object(sched, "_failure_repeat_alert_hours", return_value=0.0):
+            cron_jobs.save_jobs([job])
+            for _tick in range(2):
+                *_rest, error, _built = _run_job_patched(job, tmp_path, resolve=_AuthErrorFactory())
+                assert error.startswith("[blocked_config] ")
+
     def test_recovery_clears_alert_marker(self, tmp_path):
         """After a blocked tick, a healthy tick clears the alert-dedup marker
         so a FUTURE config break re-alerts."""
@@ -249,6 +287,7 @@ class TestHealthyJobUnaffected:
             assert agent_constructed is True
             stored = next(j for j in cron_jobs.load_jobs() if j["id"] == job["id"])
             assert not stored.get("preflight_alerted")
+            assert not stored.get("preflight_alerted_at")
 
 
 class TestOptOut:

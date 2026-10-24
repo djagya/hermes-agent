@@ -1705,7 +1705,8 @@ def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
 def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Optional[tuple]:
     """Pre-dispatch config validation: refuse unrunnable jobs (missing key, unready skill,
     unconfigured delivery) BEFORE AIAgent is built. run_one_job keys off BLOCKED_CONFIG_MARKER to
-    record blocked_config and alert once (`preflight_alerted` bit). Must run after the wake gate so
+    record blocked_config and alert (`preflight_alerted` bit, repeated on the incident reminder
+    cadence). Must run after the wake gate so
     silent ticks stay silent. Opt-out: `cron.preflight: false`. Returns failure tuple or None.
     """
     # --------------------------------------------------------------- Pre-dispatch configuration validation
@@ -1713,8 +1714,8 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
     # (no fallback chain), unready attached skill, unconfigured delivery platform — is refused HERE, before
     # AIAgent is constructed and before the resolution below can feed a doomed runtime into it, so a
     # misconfigured job never burns an LLM call. run_one_job keys off the BLOCKED_CONFIG_MARKER in the
-    # returned error to record last_status='blocked_config' and alert exactly once (dedup persisted via the
-    # job's `preflight_alerted` bit — the #73506 alert-once shape).
+    # returned error to record last_status='blocked_config' and alert (dedup persisted via the job's
+    # `preflight_alerted` bit + `preflight_alerted_at`; re-alerts every failure_repeat_alert_hours).
     _pf_reason = None
     try:
         if _cron_preflight_enabled(cfg):
@@ -1734,17 +1735,26 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
 
 
 def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple:
-    """The ``blocked_config`` failure tuple for *_pf_reason*, alerting once per job."""
+    """The ``blocked_config`` failure tuple for *_pf_reason*; alerts on the first blocked tick and
+    again each reminder interval while blocked."""
     logger.warning(
         "Job '%s' (ID: %s): BLOCKED by pre-dispatch config validation — %s (no LLM call was made)",
         job_name, job_id, _pf_reason)
-    already_alerted = False
+    # A blocked job does no work, so it is never silent for long: re-alert on the same reminder
+    # cadence as failure incidents (cron.failure_repeat_alert_hours, default 6 h; 0 = every tick).
+    repeat_hours = DEFAULT_FAILURE_REPEAT_ALERT_HOURS
+    with contextlib.suppress(Exception):
+        repeat_hours = _failure_repeat_alert_hours()
+    alert_due = True
     try:
-        from cron.jobs import mark_preflight_alerted
-        already_alerted = mark_preflight_alerted(job_id)
+        from cron.jobs import claim_preflight_alert
+        alert_due = claim_preflight_alert(job_id, repeat_hours)
     except Exception:
         logger.debug("Job '%s': could not persist preflight alert marker", job_id, exc_info=True)
-    marker = BLOCKED_CONFIG_SILENT_MARKER if already_alerted else BLOCKED_CONFIG_MARKER
+    marker = BLOCKED_CONFIG_MARKER if alert_due else BLOCKED_CONFIG_SILENT_MARKER
+    repeat_line = (
+        f"this alert repeats every {repeat_hours:g} h while the job stays blocked"
+        if repeat_hours > 0 else "this alert repeats on every blocked run")
     blocked_doc = (
         f"# Cron Job: {job_name}\n\n"
         f"**Job ID:** {job_id}\n"
@@ -1754,7 +1764,7 @@ def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple
         "(nothing was charged).\n\n"
         f"**Reason:** {_pf_reason}\n\n"
         "Hermes tries again at the next scheduled time and clears this state on the first healthy "
-        "run; this alert is not repeated. Check with `hermes cron doctor`. Set `cron.preflight: "
+        f"run; {repeat_line}. Check with `hermes cron doctor`. Set `cron.preflight: "
         "false` in config.yaml to disable this check."
     )
     return False, blocked_doc, "", f"{marker} {_pf_reason}"
@@ -2978,7 +2988,7 @@ def _compose_run_delivery(
     says the operator was already told, deliver nothing. ``agent_declared``: *error* is the
     agent's own ``[CRON_FAILURE]`` evidence, delivered verbatim."""
     err = str(error) if error else ""
-    # Failed jobs always deliver, except blocked-config runs, which alert exactly ONCE.
+    # Failed jobs always deliver, except blocked-config runs, which alert on the reminder cadence.
     blocked_config_silent = BLOCKED_CONFIG_SILENT_MARKER in err
     blocked_config = blocked_config_silent or BLOCKED_CONFIG_MARKER in err
     incident_acked = False
