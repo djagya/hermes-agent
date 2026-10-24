@@ -10,6 +10,8 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 
 def _point_ledger(monkeypatch, tmp_path):
     from cron import executions
@@ -588,3 +590,16 @@ def test_retention_window_follows_config_but_never_drops_below_two_days(monkeypa
     executions.finish_execution(recent["id"], success=True)
     assert executions.get_execution(old["id"]) is None
     assert executions.get_execution(recent["id"]) is not None
+
+
+@pytest.mark.parametrize("value", [1e8, float("inf"), float("nan"), "inf"])
+def test_absurd_retention_config_is_clamped_and_ledger_writes_still_work(monkeypatch, tmp_path, value):
+    """A config typo must not overflow timedelta inside every ledger write."""
+    import hermes_cli.config as hermes_config
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(hermes_config, "load_config_readonly",
+                        lambda: {"cron": {"executions_retention_hours": value}})
+    assert executions._terminal_retention_hours() <= executions.MAX_TERMINAL_RETENTION_HOURS
+    run = executions.create_execution("job", source="builtin")
+    assert executions.finish_execution(run["id"], success=True)["status"] == "completed"

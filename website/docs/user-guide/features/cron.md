@@ -552,6 +552,11 @@ job is green again after an alert, one "recovered" message goes to the failure
 lane. Jobs without a threshold behave as described above: the first failure of
 a signature alerts and there is no recovery message.
 
+Both thresholds are checked when a run finishes. A job that stops running
+altogether (paused, wedged, or the scheduler itself is down) never reaches
+them; watch the scheduler from outside for that (for example a no-agent job
+that pushes a heartbeat to an off-host dead-man check).
+
 ### Fleet health check: `hermes cron doctor`
 
 `hermes cron doctor` is a read-only health check over every active job. It prints grouped, per-job issues and exits `1` while any finding stands, including historical late or catch-up dispatches (`0` when no findings remain).

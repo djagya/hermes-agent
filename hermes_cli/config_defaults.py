@@ -1885,7 +1885,8 @@ DEFAULT_CONFIG = {
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
         # How long finished runs stay in cron/executions.db (`hermes cron runs`). Values below 48
-        # are ignored; the 100k-row cap still applies. Keep in sync with
+        # (and non-finite
+        # values) are ignored, values above ten years are capped; the 100k-row cap still applies. Keep in sync with
         # cron.executions.TERMINAL_RETENTION_HOURS.
         "executions_retention_hours": 48,
     },
