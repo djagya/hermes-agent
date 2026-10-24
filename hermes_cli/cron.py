@@ -780,7 +780,9 @@ _JOB_DETAIL_LINES = (
     ("no_agent", "  Mode: no-agent (script stdout delivered directly)"),
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
     ("workdir", "  Workdir: {}"),
-    ("interpreter", "  Python: {}"))
+    ("interpreter", "  Python: {}"),
+    ("alert_after_consecutive_failures", "  Alerts: after {} failed runs in a row"),
+    ("alert_when_stale_minutes", "  Alerts: once failing for {} min"))
 
 
 def _print_job_details(job_data: dict[str, Any]) -> None:
@@ -845,7 +847,10 @@ def cron_edit(args):
     result = _cron_api(action="update", job_id=args.job_id,
                        schedule=getattr(args, "schedule", None),
                        prompt=getattr(args, "prompt", None), skills=final_skills,
-                       no_agent=getattr(args, "no_agent", None), **_job_api_kwargs(args))
+                       no_agent=getattr(args, "no_agent", None),
+                       alert_after_consecutive_failures=getattr(args, "alert_after_failures", None),
+                       alert_when_stale_minutes=getattr(args, "alert_when_stale_minutes", None),
+                       **_job_api_kwargs(args))
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1

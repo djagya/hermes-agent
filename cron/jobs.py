@@ -1721,6 +1721,20 @@ def _normalize_failure_deliver(value: Any) -> Optional[str]:
     return _normalize_job_optional_text(value)
 
 
+def _normalize_alert_threshold(value: Any) -> Optional[int]:
+    """``alert_after_consecutive_failures`` / ``alert_when_stale_minutes``: a positive whole
+    number, or None (unset: every first failure alerts, the default). 0 / "" clear the setting."""
+    if value is None or value == "" or value is False:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Alert threshold must be a whole number, got {value!r}.") from None
+    if number < 0 or number != float(value):
+        raise ValueError(f"Alert threshold must be a whole number >= 0, got {value!r}.")
+    return number or None
+
+
 def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     """Spelling-only validation via the shared parser (cron knob never stricter/looser than
     config.yaml); model capability is deliberately NOT checked (model unknowable at create time,
@@ -1801,6 +1815,8 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "reasoning_effort": _normalize_reasoning_effort,
     "script_timeout_seconds": _normalize_script_timeout,
     "catch_up_missed": _normalize_catch_up_missed,
+    "alert_after_consecutive_failures": _normalize_alert_threshold,
+    "alert_when_stale_minutes": _normalize_alert_threshold,
 }
 
 
@@ -2429,9 +2445,13 @@ def _record_run_outcome(
         # health.
         job.pop("last_fire_error", None)
         job["failure_streak"] = 0
+        job.pop("failing_since", None)
     else:
         # Consecutive agent-failure streak; delivery failures do NOT count
         # (scheduler._failure_streak_nudge).
+        if not int(job.get("failure_streak") or 0):
+            # First failure of a streak: the clock alert_when_stale_minutes measures against.
+            job["failing_since"] = now
         job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
         # Sticky last-failure stamp (#118354): the next success resets last_status and
         # failure_streak, which erases the only job-level trace that a run ever failed —
