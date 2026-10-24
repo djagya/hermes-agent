@@ -410,6 +410,15 @@ Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
 ledger is included in quick backups.
 
+Finished attempts are kept for 48 hours by default (and at most 100,000 rows).
+Raise `cron.executions_retention_hours` to keep a longer history; values below
+48 or non-finite values are ignored, and values above ten years are capped:
+
+```yaml
+cron:
+  executions_retention_hours: 168   # keep a week of finished runs
+```
+
 Scheduled attempts also record their exact scheduled instant, separately from
 the time they were claimed. If an old `jobs.json` snapshot re-arms an occurrence
 that the retained ledger records as completed, Hermes skips that replay and
@@ -529,6 +538,33 @@ failure ping reached delivery; `alerted_at` is the latest one and starts the
 reminder cooldown) → `resolved` (the job ran OK afterwards; re-opens on a
 repeat) or `closed` (acknowledged; terminal for that signature). Stored error
 text is secret-redacted and truncated before it is written.
+
+
+### Alert after a streak or a stale window (per job)
+
+A job that refreshes data and keeps its last good copy does not need a ping for
+one failed run. Give it a threshold and single blips stay in the run history
+only:
+
+```bash
+hermes cron edit <job> --alert-after-failures 3        # alert on the 3rd failure in a row
+hermes cron edit <job> --alert-when-stale-minutes 45   # alert once failing for 45 minutes
+hermes cron edit <job> --alert-after-failures 0        # clear: alert on the first failure again
+```
+
+With both set, whichever is reached first alerts. Below the threshold the run
+is still recorded (`hermes cron runs`, the incident ledger, `failure_streak`);
+only the ping waits. Once it alerts, the alert says how many runs failed in a
+row, for how long, and quotes the failing step's error line from the script's
+stderr. The `failure_repeat_alert_hours` reminder applies as before. When the
+job is green again after an alert, one "recovered" message goes to the failure
+lane. Jobs without a threshold behave as described above: the first failure of
+a signature alerts and there is no recovery message.
+
+Both thresholds are checked when a run finishes. A job that stops running
+altogether (paused, wedged, or the scheduler itself is down) never reaches
+them; watch the scheduler from outside for that (for example a no-agent job
+that pushes a heartbeat to an off-host dead-man check).
 
 ### Fleet health check: `hermes cron doctor`
 
