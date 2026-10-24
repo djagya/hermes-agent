@@ -311,8 +311,7 @@ def _build_job_prompt(
             prerun_script if prerun_script is not None
             else _script._run_job_script(
                 script_path, workdir=_sched._resolve_job_workdir(job, str(job.get("id") or "")),
-                interpreter=job.get("interpreter"),
-                timeout_seconds=job.get("script_timeout_seconds")))
+                interpreter=job.get("interpreter"), **_script.job_timeout_kwargs(job)))
         if success and not script_output:
             return None  # no output → nothing to report, skip the AI call
         heading, intro = (

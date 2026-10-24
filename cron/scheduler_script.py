@@ -429,6 +429,13 @@ def _script_argv(
     return [python_exe, str(path)], env_overlay, None
 
 
+def job_timeout_kwargs(job: dict) -> dict[str, Any]:
+    """``{"timeout_seconds": N}`` when the job sets its own ``script_timeout_seconds``, else ``{}``
+    (callers then keep the plain ``_run_job_script`` call shape)."""
+    value = job.get("script_timeout_seconds")
+    return {"timeout_seconds": value} if value is not None else {}
+
+
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
@@ -569,8 +576,7 @@ def _run_job_script_with_claim_heartbeat(
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     def run() -> tuple[bool, str]:
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"),
-                               timeout_seconds=job.get("script_timeout_seconds"))
+                               interpreter=job.get("interpreter"), **job_timeout_kwargs(job))
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")
