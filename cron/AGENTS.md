@@ -19,13 +19,15 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   `HERMES_CRON_TIMEOUT` overrides, `0` = unlimited. It is idle time, not wall-clock — a stalled
   session is hard-interrupted so it cannot monopolise the scheduler, while a long-but-active job
   is never cut off. Attached scripts (pre-run or `no_agent`) are bounded separately by the script
-  timeout (`_DEFAULT_SCRIPT_TIMEOUT`, 3600s).
+  timeout (`_DEFAULT_SCRIPT_TIMEOUT`, 3600s); a job's own `script_timeout_seconds` overrides
+  `cron.script_timeout_seconds`.
 - Catch-up window = half the period, clamped to 120s–2h; 120s grace for missed one-shots.
 - Every recurring occurrence is accounted for: `tick()` advances `next_run_at` BEFORE dispatch
   (at-most-once across a mid-run crash) and stamps `pending_slot` in the same save; a scan that
   finds the stamp with a dead owner restores the instant ONCE (`cron/occurrences.py`), the
   executions ledger's `scheduled_instant` blocks a second fire, `cron.catch_up_missed: false`
-  skips past-grace misses with a logged reason. Never drop a slot silently (#107485).
+  skips past-grace misses with a logged reason (a job's own boolean `catch_up_missed` wins, so
+  an idempotent refresh can run its one missed slot after a restart). Never drop a slot silently (#107485).
 - Per-home tick lock `<home>/cron/.tick.lock` prevents duplicate ticks across processes for
   that profile's store; never a `~/.hermes/...` literal.
 - **The ticker binds each served profile's scope for the whole tick, including pre-loop code.**

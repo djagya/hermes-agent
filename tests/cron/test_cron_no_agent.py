@@ -422,3 +422,23 @@ def test_a_routed_profile_script_keeps_administrator_managed_values_over_its_own
     assert ok, output
     assert output.strip() == "managed-value"
     assert os.environ["ORG_POLICY_FLAG"] == "managed-value"  # parent untouched
+
+
+def test_run_job_no_agent_honours_per_job_script_timeout(hermes_env):
+    """A job's own ``script_timeout_seconds`` beats the global 4 h default; 0 clears it."""
+    from cron.jobs import create_job, load_jobs, update_job
+    from cron.scheduler import run_job
+
+    (hermes_env / "scripts" / "slow.sh").write_text("sleep 30\n")
+    job = create_job(prompt=None, schedule="every 5m", script="slow.sh", no_agent=True,
+                     deliver="local", script_timeout_seconds=1)
+    assert job["script_timeout_seconds"] == 1
+
+    success, _doc, _final, error = run_job(job)
+    assert success is False
+    assert "timed out after 1s" in error
+
+    update_job(job["id"], {"script_timeout_seconds": 0})
+    assert "script_timeout_seconds" not in load_jobs()[0]
+    with pytest.raises(ValueError):
+        update_job(job["id"], {"script_timeout_seconds": -5})

@@ -111,10 +111,10 @@ def _run_monitor_source(job: dict) -> tuple[bool, str]:
     monitor_script = _field(job, "monitor_script")
     if monitor_script:
         # Same containment + interpreter rules as the existing `script` field.
-        from cron.scheduler_script import _run_job_script
+        from cron.scheduler_script import _run_job_script, job_timeout_kwargs
 
         return _run_job_script(monitor_script, workdir=_field(job, "workdir") or None,
-                               interpreter=job.get("interpreter"))
+                               interpreter=job.get("interpreter"), **job_timeout_kwargs(job))
     monitor_url = _field(job, "monitor_url")
     if monitor_url:
         return _fetch_monitor_url(monitor_url)
