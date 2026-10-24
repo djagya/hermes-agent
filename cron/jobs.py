@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
 import logging
+import math
 import shutil
 import sys
 import threading
@@ -1741,6 +1742,37 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_script_timeout(value: Any) -> Optional[int]:
+    """Per-job ``script_timeout_seconds``: a positive whole number of seconds, or None/""/0 to clear
+    (back to ``cron.script_timeout_seconds``). Bools are rejected: ``True`` is not a duration."""
+    if value is None or value == "" or value == 0:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("script_timeout_seconds must be a positive number of seconds.")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid script_timeout_seconds {value!r}.") from None
+    if not math.isfinite(seconds) or seconds <= 0 or seconds != int(seconds):
+        raise ValueError(f"Invalid script_timeout_seconds {value!r}: use whole seconds > 0.")
+    return int(seconds)
+
+
+def _normalize_catch_up_missed(value: Any) -> Optional[bool]:
+    """Per-job ``catch_up_missed``: True/False overrides ``cron.catch_up_missed``; None/"" clears.
+    Text from the CLI ("true"/"false") is accepted; anything else raises."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "yes", "on", "1"}:
+        return True
+    if text in {"false", "no", "off", "0"}:
+        return False
+    raise ValueError(f"Invalid catch_up_missed {value!r}: use true, false or '' to clear.")
+
+
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
@@ -1756,6 +1788,8 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
     "interpreter": _normalize_job_optional_text,
+    "script_timeout_seconds": _normalize_script_timeout,
+    "catch_up_missed": _normalize_catch_up_missed,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1765,6 +1799,8 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "script_timeout_seconds": _normalize_script_timeout,
+    "catch_up_missed": _normalize_catch_up_missed,
 }
 
 
@@ -1836,6 +1872,8 @@ def create_job(
     paused_reason: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
+    script_timeout_seconds: Optional[int] = None,
+    catch_up_missed: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1934,6 +1972,8 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
+        ("script_timeout_seconds", f["script_timeout_seconds"]),
+        ("catch_up_missed", f["catch_up_missed"]),
     ):
         if value is not None:
             job[key] = value
@@ -2120,6 +2160,9 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        for _optional in ("script_timeout_seconds", "catch_up_missed"):
+            if _optional in updates and updated.get(_optional) is None:
+                updated.pop(_optional, None)  # cleared: absent key = global config
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
@@ -3150,6 +3193,15 @@ def _reanchor_stale_cron(d: _DueJob) -> bool:
     return False
 
 
+def _job_catches_up(job: dict[str, Any]) -> bool:
+    """A job's own ``catch_up_missed`` (bool) beats ``cron.catch_up_missed``: an idempotent refresh
+    can run its one missed slot after a restart while the global default stays off."""
+    own = job.get("catch_up_missed")
+    if isinstance(own, bool):
+        return own
+    return bool(_cron_config_number("catch_up_missed", True, lambda value: value is not False))
+
+
 def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
     """Re-anchor accumulated misses; return whether catch-up was explicitly disabled.
 
@@ -3165,7 +3217,7 @@ def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
         return False
     d.scan.persist(d.job["id"], next_run_at=new_next)
     if (_instant_after(_ensure_aware(datetime.fromisoformat(new_next)), d.scan.now)
-            and not _cron_config_number("catch_up_missed", True, lambda value: value is not False)):
+            and not _job_catches_up(d.job)):
         logger.info(
             "Job '%s' missed its scheduled time (%s, grace=%ds). "
             "Skipping missed occurrence because cron.catch_up_missed is false; next run: %s",
