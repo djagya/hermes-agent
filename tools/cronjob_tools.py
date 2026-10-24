@@ -870,6 +870,10 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
         # CLI-only lane; update_job validates, 0 / empty string clears.
         if a[_key] is not None:
             updates[_key] = a[_key]
+    for _alert_key in ("alert_after_consecutive_failures", "alert_when_stale_minutes"):
+        # CLI-only lane; update_job validates, 0 clears (back to alerting on the first failure).
+        if a[_alert_key] is not None:
+            updates[_alert_key] = a[_alert_key]
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
@@ -1028,7 +1032,9 @@ def cronjob(
     pinned: Optional[bool] = None,
     interpreter: Optional[str] = None,
     script_timeout_seconds: Optional[int] = None,
-    catch_up_missed: Optional[bool | str] = None) -> str:
+    catch_up_missed: Optional[bool | str] = None,
+    alert_after_consecutive_failures: Optional[int] = None,
+    alert_when_stale_minutes: Optional[int] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility

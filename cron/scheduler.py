@@ -406,6 +406,130 @@ def _mark_incident_alerted(incident_id: Optional[str]) -> None:
         logger.debug("Failed marking incident %s alerted: %s", incident_id, exc)
 
 
+def _positive_int(value: Any) -> Optional[int]:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _job_alert_policy(job: dict) -> tuple[Optional[int], Optional[int]]:
+    """Per-job alert policy ``(alert_after_consecutive_failures, alert_when_stale_minutes)``.
+    Both unset (the default) keeps the plain behaviour: the first failure of a signature alerts."""
+    return (_positive_int(job.get("alert_after_consecutive_failures")),
+            _positive_int(job.get("alert_when_stale_minutes")))
+
+
+def _failing_minutes(job: dict, streak: int) -> Optional[float]:
+    """Minutes since the first failed run of the current streak (``failing_since``, stamped by
+    mark_job_run). 0 for a streak of one; None when a longer streak has no stamp (a streak that
+    began before the stamp existed), which the policy treats as "alert"."""
+    if streak <= 1:
+        return 0.0
+    since = job.get("failing_since")
+    if not since:
+        return None
+    try:
+        from cron.jobs import _elapsed_seconds, _ensure_aware
+
+        start = _ensure_aware(datetime.fromisoformat(str(since)))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, _elapsed_seconds(_hermes_now(), start) / 60.0)
+
+
+def _alert_withheld_by_policy(job: dict) -> bool:
+    """True while a job with an alert policy is still below it: the failure is recorded (run
+    ledger, incident, streak) but not pinged. Either threshold reached alerts. Unreadable state
+    alerts rather than swallowing. The streak counts this run (mark_job_run has not run yet)."""
+    after, stale = _job_alert_policy(job)
+    if after is None and stale is None:
+        return False
+    streak = int(job.get("failure_streak") or 0) + 1
+    if after is not None and streak >= after:
+        return False
+    if stale is not None:
+        minutes = _failing_minutes(job, streak)
+        if minutes is None or minutes >= stale:
+            return False
+    return True
+
+
+_ERROR_LINE_RE = re.compile(
+    r"error|fail|exception|traceback|denied|refused|unreachable|timed? ?out|fatal|exit", re.IGNORECASE)
+
+
+def _last_error_line(error: Optional[str]) -> str:
+    """The line that names the failing step: the last error-looking stderr line of a script
+    failure (``Script exited with code N`` then ``stderr:``), else of the whole text. Bounded."""
+    text = str(error or "")[-8000:]
+    match = re.search(r"(?:^|\n)stderr:\n(.*?)(?:\nstdout:\n|\Z)", text, re.DOTALL)
+    lines = [ln.strip() for ln in (match.group(1) if match else text).splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    line = next((ln for ln in reversed(lines) if _ERROR_LINE_RE.search(ln)), lines[-1])
+    return line if len(line) <= 200 else line[:197].rstrip() + "..."
+
+
+def _failure_alert_tail(job: dict, error: Optional[str], notice: str) -> str:
+    """What follows the one-line failure notice. Jobs with an alert policy get the streak, how
+    long it has been failing and the failing step's error line; other jobs keep the review nudge."""
+    after, stale = _job_alert_policy(job)
+    if after is None and stale is None:
+        return _failure_streak_nudge(job)
+    streak = int(job.get("failure_streak") or 0) + 1
+    tail = f"\nFailed {streak} run{'s' if streak != 1 else ''} in a row"
+    minutes = _failing_minutes(job, streak)
+    if minutes:
+        tail += f", failing for {int(minutes)} min"
+    tail += "."
+    line = _last_error_line(error)
+    if line and line not in notice:
+        tail += f"\nError line: {line}"
+    return tail
+
+
+def _stash_recovery_notice(job: dict) -> None:
+    """On a green run after an alerted failure streak, stash a one-line recovery notice for the
+    failure lane (``job['_recovery_notice']``). Only for jobs with an alert policy, and only when a
+    failure ping actually went out; must run before the incidents are resolved."""
+    after, stale = _job_alert_policy(job)
+    streak = int(job.get("failure_streak") or 0)
+    if (after is None and stale is None) or streak <= 0:
+        return
+    try:
+        from cron.incidents import count_alerted_incidents
+
+        if not count_alerted_incidents(job["id"]):
+            return
+    except Exception as exc:
+        logger.debug("Incident store unavailable for job %s (no recovery notice): %s", job["id"], exc, exc_info=True)
+        return
+    minutes = _failing_minutes(job, streak + 1)
+    span = f", failed for {int(minutes)} min" if minutes else ""
+    job["_recovery_notice"] = (
+        f"✅ Cron '{job.get('name') or job['id']}' recovered after {streak} failed "
+        f"run{'s' if streak != 1 else ''}{span}.")
+
+
+def _deliver_recovery_notice(job: dict, fence: "_FireOwnership", *, adapters, loop) -> None:
+    """Send a stashed recovery notice through the failure lane. Best-effort: it never changes the
+    run's own outcome or delivery bookkeeping."""
+    notice = job.pop("_recovery_notice", None)
+    if not notice or fence.lost():
+        return
+    try:
+        with fence.side_effect_fence() as owns:
+            if not owns:
+                return
+            error = _deliver_result(job, notice, adapters=adapters, loop=loop, for_failure=True)
+        if error:
+            logger.warning("Recovery notice for job %s not delivered: %s", job["id"], error)
+    except Exception as exc:
+        logger.warning("Recovery notice for job %s not delivered: %s", job["id"], exc, exc_info=True)
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the assembled prompt (incl. runtime-loaded skill content,
     unseen by create-time scanning) trips the injection scanner; run_job turns it into a clean
@@ -2998,6 +3122,7 @@ def _compose_run_delivery(
         deliver_content = blocked_config_notice(job.get("name") or job["id"], _pf_text)
     elif success:
         deliver_content = final_response
+        _stash_recovery_notice(job)
         _resolve_incidents_for_recovered_job(job)
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
@@ -3008,18 +3133,24 @@ def _compose_run_delivery(
         )
         if incident_acked:
             deliver_content = ""
+        elif _alert_withheld_by_policy(job):
+            # Below the job's alert_after_consecutive_failures / alert_when_stale_minutes: the
+            # failure is in the ledger and the streak, the ping waits for the threshold.
+            deliver_content = ""
         elif agent_declared:
             # The agent already diagnosed the failure in prose; the summarizer's substring
             # heuristics would re-diagnose it ("timed out" -> blame the model service, "401" ->
             # "sign in again") and attach the wrong remediation. Deliver the evidence as-is.
             from cron.scheduler_failure_copy import generic_failure_notice
-            deliver_content = generic_failure_notice(
+            _notice = generic_failure_notice(
                 job.get("name") or job["id"], job["id"], err.strip().rstrip("."),
-            ) + _failure_streak_nudge(job)
+            )
+            deliver_content = _notice + _failure_alert_tail(job, error, _notice)
         else:
             from cron.quota_hold import hold_notice
+            _notice = _summarize_cron_failure_for_delivery(job, error)
             deliver_content = (
-                _summarize_cron_failure_for_delivery(job, error) + _failure_streak_nudge(job)
+                _notice + _failure_alert_tail(job, error, _notice)
                 # The one alert on entering a provider-window hold says so (#89376).
                 + hold_notice(job, job.get("_quota_hold_seconds"))
             )
@@ -3134,6 +3265,7 @@ def _save_compose_deliver(
     ) = _compose_run_delivery(
         job, success=d.success, error=d.error, final_response=final_response,
         output_file=output_file, agent_declared=d.agent_declared)
+    _deliver_recovery_notice(job, fence, adapters=adapters, loop=loop)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
     if d.should_deliver and not d.success and job.get("_model_unreachable"):
@@ -3269,13 +3401,16 @@ def _deliver_crash_failure(
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
         return None, "suppressed_acked"
+    if _alert_withheld_by_policy(job):
+        return None, "suppressed"
     delivery_error = None
+    _notice = _summarize_cron_failure_for_delivery(job, err_text)
     try:
         delivery_error = _deliver_result(
             job,
             # Same text as the normal failure delivery: this run also counts toward
             # failure_streak, so the nudge must leave through here too.
-            _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
+            _notice + _failure_alert_tail(job, err_text, _notice),
             adapters=adapters,
             loop=loop,
             for_failure=True,
