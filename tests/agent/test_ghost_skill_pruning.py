@@ -22,6 +22,8 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.context_compressor import (
     SKILL_PRUNED_MARKER_PREFIX,
     SUMMARY_PREFIX,
@@ -170,6 +172,30 @@ class TestProtectedSkillPrune:
         skill_row = result[3]
         assert pruned >= 1
         assert _skill_pruned_marker("fresh-skill") in skill_row["content"]
+
+    @pytest.mark.parametrize(
+        ("compressor_kwargs", "bulky_turn", "kept"),
+        [
+            ({}, False, True),  # 18 short turns since the load: still just loaded
+            ({}, True, False),  # same age, one large turn in between: aged out
+            ({"config_context_length": 16000, "max_tokens": 4000}, False, False),  # small window caps the look-back
+        ],
+    )
+    def test_skill_recency_follows_token_volume_not_only_message_count(self, compressor_kwargs, bulky_turn, kept):
+        c = _make_compressor(**compressor_kwargs)
+        msgs = (
+            self._filler(2)
+            + _skill_view_pair("call_old", "older-skill", size=18000)
+            + _skill_view_pair("call_new", "working-skill", size=18000)
+            + self._filler(18, start=2)
+        )
+        if bulky_turn:
+            msgs[6]["content"] = "new work " * 6000
+        # Both loads are more than ten messages back and outside the count tail.
+        result, _ = c._prune_old_tool_results(msgs, protect_tail_count=4)
+        assert (result[5]["content"] == msgs[5]["content"]) is kept
+        assert _skill_pruned_marker("older-skill") in result[3]["content"]
+        assert result[4]["tool_calls"] == msgs[4]["tool_calls"]
 
 class TestMarkerSurvivesRealCompress:
     """P2 layer: markers survive a real compress() with a mocked aux LLM."""

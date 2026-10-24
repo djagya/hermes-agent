@@ -22,8 +22,33 @@ def _cc():
     return context_compressor
 
 
+def volume_recent_start(messages: list[dict[str, Any]], start: int, token_budget: int) -> int:
+    """Lower ``start`` to the oldest message whose newest-first running token total still fits
+    ``token_budget``, so a run of short turns does not age a just-loaded skill out of the
+    message-count window. Never raises ``start``; bulky messages exhaust the budget early."""
+    estimate = _cc()._estimate_msg_budget_tokens
+    used = 0
+    for i in range(len(messages) - 1, -1, -1):
+        used += estimate(messages[i])
+        if used > token_budget:
+            break
+        start = min(start, i)
+    return start
+
+
 class ProactivePruneMixin:
     """``ContextCompressor`` mixin: the deterministic, no-LLM tool-result prune and its commit."""
+
+    def _skill_recency_tokens(self) -> int:
+        """Token look-back for just-loaded skills: the fixed cap, lowered to the tail's share of a
+        small model's input window. An unresolved window keeps the cap rather than forcing a probe."""
+        cc = _cc()
+        budget = cc._SKILL_PRUNE_RECENT_TOKENS
+        context_length = getattr(self, "_resolved_context_length", None)
+        if context_length is not None:
+            window = self._effective_input_window(context_length, getattr(self, "max_tokens", None))
+            budget = min(budget, int(window * cc.TAIL_MAX_CONTEXT_FRACTION))
+        return budget
 
     def prune_tool_results_only(
         self, messages: list[dict[str, Any]], current_tokens: int | None = None,
