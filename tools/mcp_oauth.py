@@ -421,6 +421,9 @@ class HermesTokenStorage:
         # ``set_tokens`` write. See ``tools.mcp_oauth_provider.enforce_refresh_token_issuer``.
         self.loaded_issuer: str | None = None
         self._bound_issuer: str | None = None
+        # ``expires_in`` the stored access token was issued with; a reload rewrites ``expires_in`` to the
+        # time remaining, and the provider's expiry margin is capped by the issued lifetime.
+        self.issued_lifetime: int | None = None
 
     def _path(self, suffix: str) -> Path:
         return _get_token_dir(self._hermes_home) / f"{self._server_name}{suffix}"
@@ -471,6 +474,10 @@ class HermesTokenStorage:
         True for tokens that expired while down. Legacy files without it use the file mtime, clamped
         to zero (self-heals on the next ``set_tokens``)."""
         absolute_expiry = data.pop("expires_at", None)
+        self.issued_lifetime = None
+        with contextlib.suppress(TypeError, ValueError):
+            if data.get("expires_in") is not None:
+                self.issued_lifetime = int(data["expires_in"])
         if absolute_expiry is not None:
             data["expires_in"] = int(max(absolute_expiry - time.time(), 0))
         elif data.get("expires_in") is not None:
@@ -493,6 +500,7 @@ class HermesTokenStorage:
         if payload.get("expires_in") is not None:
             with contextlib.suppress(TypeError, ValueError):  # mock tokens / odd shapes: skip, don't fail persistence
                 payload["expires_at"] = time.time() + int(payload["expires_in"])
+                self.issued_lifetime = int(payload["expires_in"])
         if self._bound_issuer:  # which authorization server granted these tokens (never sent on the wire)
             payload["hermes_issuer"] = self._bound_issuer
             self.loaded_issuer = self._bound_issuer
