@@ -522,7 +522,8 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 from cron.jobs import (
     _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
-    save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
+    release_fire_claim, save_job_output, self_removal_delivery_allowed,
+    self_removal_delivery_scope, use_cron_store)
 from cron import store_health
 from cron.execution_identity import enter_cron_execution, exit_cron_execution
 from cron.executions import (
@@ -3270,6 +3271,24 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
     return success, error, False
 
 
+def _skip_rejected_dispatch(job: dict, execution_id: str, fire_owner: Optional[str]) -> None:
+    """Close out a fire that ``claim_dispatch`` rejected (one-shot dispatch limit reached)."""
+    logger.info(
+        "Job '%s': one-shot dispatch limit reached — skipping",
+        job.get("name", job["id"]))
+    finish_execution(
+        execution_id, success=False,
+        error="Dispatch claim rejected; execution was not started.")
+    # No run follows, so mark_job_run will not clear this fire's claim on a retained
+    # (completed) record; without this it blocks a re-arm until the claim TTL expires.
+    if fire_owner:
+        try:
+            release_fire_claim(job["id"], expected_owner=fire_owner)
+        except Exception:  # a cleanup step must not turn a skipped fire into a crash; the claim expires at its TTL
+            logger.warning("Job '%s': could not release the fire claim after a rejected dispatch",
+                           job.get("name", job["id"]), exc_info=True)
+
+
 def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
@@ -3305,12 +3324,7 @@ def _run_one_job_body(
         # This lives here in the shared body so BOTH the built-in ticker and the external provider (Chronos
         # fire_due) get at-most-times semantics. See #38758.
         if not claim_dispatch(job["id"]):
-            logger.info(
-                "Job '%s': one-shot dispatch limit reached — skipping",
-                job.get("name", job["id"]))
-            finish_execution(
-                execution_id, success=False,
-                error="Dispatch claim rejected; execution was not started.")
+            _skip_rejected_dispatch(job, execution_id, fire_owner)
             return True  # not an error — already handled/removed
 
         # Claimed durably before dispatch; becomes running only right before the actual run.
