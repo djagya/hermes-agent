@@ -2314,35 +2314,39 @@ def remove_job(job_id: str) -> bool:
         return True
 
 
-def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
-    """Set/clear a persisted alert-dedup marker (alert exactly once until the condition heals;
-    survives restarts) and return the PRIOR value. Field: ``preflight_alerted`` (blocked config).
+def claim_preflight_alert(job_id: str, repeat_hours: float) -> bool:
+    """Stamp a blocked-config alert for *job_id*; return True when this tick should deliver it.
 
-    The marker records that the operator was already alerted about this job's condition, so the scheduler
-    alerts exactly once and stays silent on subsequent ticks until the condition heals (same alert-once
-    shape as the dead-pin auto-pause in #73506).
+    A blocked job never runs, so alert-once would leave a job that silently stopped working with
+    no further signal. The first blocked tick alerts; later ones stay silent until *repeat_hours*
+    have passed since the last alert, then alert again (``<= 0``: every tick). A bare legacy
+    ``preflight_alerted`` marker without ``preflight_alerted_at`` alerts again once and is stamped.
     """
+    now = _hermes_now()
+
     def apply(jobs, _i, job):
-        prior = bool(job.get(field))
-        if value:
-            job[field] = True
-        else:
-            job.pop(field, None)
-        if prior != value:
+        if repeat_hours <= 0:
+            # Every tick alerts; stamp once instead of rewriting jobs.json per blocked tick.
+            if not job.get("preflight_alerted"):
+                job["preflight_alerted"] = True
+                job["preflight_alerted_at"] = now.isoformat()
+                save_jobs(jobs)
+            return True
+        due = True
+        last = job.get("preflight_alerted_at")
+        if job.get("preflight_alerted") and last:
+            try:
+                last_dt = _ensure_aware(datetime.fromisoformat(str(last)))
+                due = _elapsed_seconds(now, last_dt) >= repeat_hours * 3600
+            except (TypeError, ValueError):
+                due = True
+        if due:
+            job["preflight_alerted"] = True
+            job["preflight_alerted_at"] = now.isoformat()
             save_jobs(jobs)
-        return prior
+        return due
 
-    return _with_job(job_id, apply, False)
-
-
-def mark_preflight_alerted(job_id: str) -> bool:
-    """Mark the job as preflight-alerted; return True if it already was."""
-    return _set_alert_flag(job_id, "preflight_alerted", True)
-
-
-def clear_preflight_alerted(job_id: str) -> None:
-    """Clear the preflight alert-dedup marker (config validates again)."""
-    _set_alert_flag(job_id, "preflight_alerted", False)
+    return _with_job(job_id, apply, True)
 
 
 def note_fire_forward_failure(job_id: str, detail: str) -> bool:
@@ -2372,10 +2376,14 @@ def _record_run_outcome(
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
     job["last_error"] = None if success else error
-    if success:
-        # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
-        # the forward-failure stamp so it only describes CURRENT auto-fire health.
+    if status != "blocked_config":
+        # The job got past every pre-run gate and really ran (ok or not): drop the blocked-config
+        # alert markers so a FUTURE block alerts at once.
         job.pop("preflight_alerted", None)
+        job.pop("preflight_alerted_at", None)
+    if success:
+        # Healthy run: clear the forward-failure stamp so it only describes CURRENT auto-fire
+        # health.
         job.pop("last_fire_error", None)
         job["failure_streak"] = 0
     else:
