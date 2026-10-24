@@ -73,6 +73,17 @@ _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE sessi
 _SHADOWED_CHECKPOINT_ROWS_SQL = ("SELECT id, codex_reasoning_items FROM messages WHERE session_id = ? AND active = 1 "
     "AND role = 'assistant' AND id < ? AND codex_reasoning_items LIKE '%\"compaction\"%'")
 _SET_CODEX_REASONING_SQL = "UPDATE messages SET codex_reasoning_items = ? WHERE id = ?"
+# Provider replay blobs on a row compaction just superseded (``active=0, compacted=0``), cleared only when a
+# live copy of the same message (same ``message_uid``) holds byte-identical values: replay reads active rows
+# only, and display and search never read these columns, so the copy just stored the same bytes twice.
+_SUPERSEDED_BLOB_COLUMNS = ("reasoning_details", "codex_reasoning_items", "codex_message_items")
+_DROP_SUPERSEDED_BLOBS_SQL = (
+    f"UPDATE messages SET {', '.join(f'{c} = NULL' for c in _SUPERSEDED_BLOB_COLUMNS)} "
+    "WHERE session_id = ? AND active = 0 AND compacted = 0 AND id IN ({ids}) "
+    f"AND ({' OR '.join(f'{c} IS NOT NULL' for c in _SUPERSEDED_BLOB_COLUMNS)}) "
+    "AND EXISTS (SELECT 1 FROM messages AS live WHERE live.session_id = messages.session_id "
+    "AND live.active = 1 AND live.id > messages.id AND live.message_uid = messages.message_uid"
+    f"{''.join(f' AND live.{c} IS messages.{c}' for c in _SUPERSEDED_BLOB_COLUMNS)})")
 _INVALID = object()  # _json_or sentinel where the fallback must be distinguishable from JSON null
 
 
@@ -848,6 +859,13 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             f"WHERE id IN ({_placeholders(tail_ids)}) ORDER BY id",
             [session_id, *tail_ids] if retarget else tail_ids)
 
+    def _drop_superseded_blobs(self, conn, session_id: str, superseded_ids: list[int]) -> None:
+        """Clear the provider replay blobs of the rows this compaction superseded whose live copy holds the
+        same bytes (``_DROP_SUPERSEDED_BLOBS_SQL``). A copy whose blobs differ keeps its own."""
+        if superseded_ids:
+            conn.execute(_DROP_SUPERSEDED_BLOBS_SQL.format(ids=_placeholders(superseded_ids)),
+                         [session_id, *superseded_ids])
+
     def _archive_named_rows(
         self, conn, session_id: str, compacted_messages: list[dict[str, Any]], covered: list[int], *,
         tail_count: int, carried_messages: Optional[list[dict[str, Any]]], patched_model_config: Any,
@@ -890,6 +908,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             self._clone_message_rows(conn, unseen)
             inserted += len(unseen)
             tool_calls_total += unseen_tool_calls
+        self._drop_superseded_blobs(conn, session_id, rewind_ids)
         # A carried copy whose stored identity was computed differently lands in its own
         # display_order group and would project twice; re-fold before publishing (#122167).
         self._reconcile_display_orders(conn, session_id)
@@ -932,8 +951,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         slow provider summary call (``id > watermark``) are NOT summarized away. They are re-sequenced after
         the compacted set by a pure-SQL column clone (every column except ``id`` — content, api_content,
         platform_message_id, token counts, reasoning sidecars all survive byte-exact, and the FTS triggers
-        index the clones naturally), and the originals are archived. NOTE: re-sequencing assigns the tail
-        rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
+        index the clones naturally), and the originals are archived. A superseded original whose live copy
+        holds the same provider blobs (``reasoning_details``, ``codex_*_items``) drops its own copy of them.
+        NOTE: re-sequencing assigns the tail rows fresh ids; consumers that reference durable row ids
+        re-resolve by content (see 3e8ab0610).
         """
         return self._execute_transcript_write(lambda conn: self._archive_and_compact_on_conn(
             conn, session_id, compacted_messages, model_config_patch=model_config_patch,
@@ -1009,6 +1030,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             self._clone_message_rows(conn, tail_ids)
             inserted += len(tail_ids)
             tool_calls_total += tail_tool_calls
+        self._drop_superseded_blobs(conn, session_id, rewind_ids)
         # A carried copy whose stored identity was computed differently lands in its own
         # display_order group and would project twice; re-fold before publishing (#122167).
         self._reconcile_display_orders(conn, session_id)
