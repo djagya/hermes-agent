@@ -81,7 +81,11 @@ context as `active=1` rows. A protected message can therefore legitimately appea
 in both generations with identical content and timestamp. Do not delete these
 archive rows as duplicates. Diagnose duplicate *live* writes using `active=1`,
 and check the database's profile as well as the session ID when investigating
-history that appears to revert.
+history that appears to revert. The archive row keeps its content and identity,
+but when a compaction supersedes it (`active=0, compacted=0`) and its live copy
+holds byte-identical `reasoning_details`, `codex_reasoning_items` and
+`codex_message_items`, those three columns are cleared on the archive row; the
+live copy keeps them.
 
 
 
