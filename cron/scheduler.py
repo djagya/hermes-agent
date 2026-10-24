@@ -457,14 +457,14 @@ def _alert_withheld_by_policy(job: dict) -> bool:
 
 
 _ERROR_LINE_RE = re.compile(
-    r"error|fail|exception|traceback|denied|refused|unreachable|timed? ?out|fatal|exit", re.I)
+    r"error|fail|exception|traceback|denied|refused|unreachable|timed? ?out|fatal|exit", re.IGNORECASE)
 
 
 def _last_error_line(error: Optional[str]) -> str:
     """The line that names the failing step: the last error-looking stderr line of a script
     failure (``Script exited with code N`` then ``stderr:``), else of the whole text. Bounded."""
     text = str(error or "")[-8000:]
-    match = re.search(r"(?:^|\n)stderr:\n(.*?)(?:\nstdout:\n|\Z)", text, re.S)
+    match = re.search(r"(?:^|\n)stderr:\n(.*?)(?:\nstdout:\n|\Z)", text, re.DOTALL)
     lines = [ln.strip() for ln in (match.group(1) if match else text).splitlines() if ln.strip()]
     if not lines:
         return ""
