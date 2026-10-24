@@ -38,6 +38,10 @@ _REFRESH_TRANSIENT_ERRORS = frozenset({"server_error", "temporarily_unavailable"
 _REFRESH_SAFE_OAUTH_ERRORS = _REFRESH_TERMINAL_ERRORS | _REFRESH_TRANSIENT_ERRORS
 _REFRESH_MAX_ATTEMPTS = 3
 _REFRESH_RETRY_DEADLINE_SECONDS = 15.0
+# Treat an access token as expired this long before its recorded expiry (capped at a tenth of its
+# issued lifetime). The SDK keeps sending it until ``time.time() <= expiry``, with no margin, and
+# answers the resulting 401 with a full authorization-code login instead of a refresh.
+_TOKEN_EXPIRY_SKEW_SECONDS = 60
 _REFRESH_BACKOFF_SECONDS = (1.0, 2.0)
 
 
@@ -154,10 +158,37 @@ class HermesProviderMixin:
 
     def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser", **kwargs: Any):
         super().__init__(*args, **kwargs)
+        self._hermes_install_expiry_skew()
         self._hermes_oauth_flow = oauth_flow
         # oauth.user_agent — stamped onto token-endpoint requests only; some authorization servers/WAFs
         # reject httpx's default (#75576).
         self._hermes_token_user_agent = token_user_agent
+
+    def _hermes_install_expiry_skew(self) -> None:
+        """Make the SDK refresh shortly BEFORE the access token expires, not at the exact second.
+
+        ``OAuthContext.is_token_valid`` accepts a token until ``time.time() <= expiry``. A request sent
+        in the last moments reaches the server after its expiry (the local stamp is also later than the
+        server's by the refresh round trip) and gets 401, and the SDK's 401 branch skips the refresh token
+        and starts a browser login, which non-interactive callers cannot complete. Every expiry write goes
+        through ``context.update_token_expiry`` (SDK token/refresh handlers, ``_store_tokens``, disk
+        adoption, cold load), so the margin is applied there once. It is capped at a tenth of the token's
+        issued lifetime so short-lived tokens stay usable, and skipped for a token without a refresh token; for a pair reloaded from disk ``expires_in`` is
+        only the remaining time, so the cap uses the lifetime the storage recorded at issue."""
+        ctx = self.context
+        sdk_update = ctx.update_token_expiry
+
+        def _update_with_skew(token) -> None:
+            sdk_update(token)
+            remaining = getattr(token, "expires_in", None)
+            # No refresh token: nothing to refresh early with, so keep sending it until it expires.
+            if ctx.token_expiry_time is None or not remaining or not getattr(token, "refresh_token", None):
+                return
+            issued = getattr(ctx.storage, "issued_lifetime", None)
+            lifetime = max(int(remaining), issued if isinstance(issued, int) else 0)
+            ctx.token_expiry_time -= min(_TOKEN_EXPIRY_SKEW_SECONDS, lifetime // 10)
+
+        ctx.update_token_expiry = _update_with_skew
 
     async def _perform_authorization(self):
         info = self.context.client_info

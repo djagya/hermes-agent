@@ -485,3 +485,69 @@ async def test_initialize_prefetches_oauth_metadata_when_missing(
     # so they must carry the stamped User-Agent or WAF-fronted providers 403 them (#113771).
     from tools.mcp_oauth_provider import DEFAULT_AUTH_REQUEST_USER_AGENT
     assert seen_user_agents and set(seen_user_agents) == {DEFAULT_AUTH_REQUEST_USER_AGENT}
+
+
+# ---------------------------------------------------------------------------
+# Expiry margin: refresh shortly before expiry, not at the exact second
+# ---------------------------------------------------------------------------
+
+def _provider_for(storage):
+    from mcp.shared.auth import OAuthClientMetadata
+    from pydantic import AnyUrl
+
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    return _HERMES_PROVIDER_CLS(
+        server_name="srv",
+        server_url="https://example.com/mcp",
+        client_metadata=OAuthClientMetadata(
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            client_name="Hermes Agent",
+        ),
+        storage=storage,
+        redirect_handler=_noop_redirect,
+        callback_handler=_noop_callback,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "issued, remaining, refresh, expect_valid",
+    [
+        (3600, 2, "r", False),   # reloaded seconds before expiry: refresh first, never send it
+        (3600, 300, "r", True),  # outside the margin: keep using it
+        (30, 20, "r", True),     # short-lived token: margin capped at a tenth of its lifetime
+        (3600, 2, None, True),   # no refresh token: nothing to refresh with, use it until expiry
+    ],
+)
+async def test_token_near_expiry_counts_as_expired(tmp_path, monkeypatch, issued, remaining, refresh, expect_valid):
+    """A token in its last seconds must be refreshed before the request, not sent.
+
+    The SDK accepts a token until ``time.time() <= expiry`` and answers the
+    resulting 401 with a full browser login instead of a refresh, so a request
+    racing the expiry boundary ends in ``OAuthNonInteractiveError`` for
+    background callers. Covers both the cold-load path (``expires_in`` is the
+    remaining time) and a fresh token response (``expires_in`` is the lifetime).
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from mcp.shared.auth import OAuthToken
+
+    from tools.mcp_oauth import HermesTokenStorage, _get_token_dir
+
+    storage = HermesTokenStorage("srv")
+    await storage.set_tokens(OAuthToken(access_token="a", expires_in=issued, refresh_token=refresh))
+    token_path = _get_token_dir() / "srv.json"
+    persisted = json.loads(token_path.read_text())
+    persisted["expires_at"] = time.time() + remaining
+    token_path.write_text(json.dumps(persisted))
+
+    cold = _provider_for(storage)
+    await cold._initialize()
+    assert cold.context.is_token_valid() is expect_valid
+
+    fresh = _provider_for(HermesTokenStorage("srv"))
+    fresh.context.current_tokens = OAuthToken(access_token="b", expires_in=issued, refresh_token=refresh)
+    fresh.context.update_token_expiry(fresh.context.current_tokens)
+    margin = min(60, issued // 10) if refresh else 0
+    assert fresh.context.token_expiry_time == pytest.approx(time.time() + issued - margin, abs=1)
