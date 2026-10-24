@@ -26,6 +26,7 @@ from hermes_state_compaction_display import later_tool_copy_ids, not_a_later_too
 from hermes_state_detached_results import SessionDetachedResultsMixin
 from hermes_state_todo import SessionTodoResultMixin
 from hermes_state_stored_reads import SessionStoredReadsMixin
+from hermes_state_superseded_blobs import drop_superseded_blobs
 from hermes_state_identity import (
     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json, _uid_list)
 
@@ -897,6 +898,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             self._clone_message_rows(conn, clone_ids)
             inserted += len(clone_ids)
             tool_calls_total += unseen_tool_calls
+        drop_superseded_blobs(conn, session_id, rewind_ids)
         # A carried copy whose stored identity was computed differently lands in its own
         # display_order group and would project twice; re-fold before publishing (#122167).
         self._reconcile_display_orders(conn, session_id)
@@ -939,8 +941,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         slow provider summary call (``id > watermark``) are NOT summarized away. They are re-sequenced after
         the compacted set by a pure-SQL column clone (every column except ``id`` — content, api_content,
         platform_message_id, token counts, reasoning sidecars all survive byte-exact, and the FTS triggers
-        index the clones naturally), and the originals are archived. NOTE: re-sequencing assigns the tail
-        rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
+        index the clones naturally), and the originals are archived. A superseded original whose live copy
+        holds the same provider blobs (``reasoning_details``, ``codex_*_items``) drops its own copy of them.
+        NOTE: re-sequencing assigns the tail rows fresh ids; consumers that reference durable row ids
+        re-resolve by content (see 3e8ab0610).
         A tail row that *compacted_messages* already carries (the compressor held it, and it was flushed
         above the watermark or left unnamed) is not cloned: the carried copy is its one live row and the
         original takes rewind flags (#137197).
@@ -1028,6 +1032,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             self._clone_message_rows(conn, clone_ids)
             inserted += len(clone_ids)
             tool_calls_total += tail_tool_calls
+        drop_superseded_blobs(conn, session_id, rewind_ids)
         # A carried copy whose stored identity was computed differently lands in its own
         # display_order group and would project twice; re-fold before publishing (#122167).
         self._reconcile_display_orders(conn, session_id)
