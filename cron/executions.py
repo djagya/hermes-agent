@@ -202,8 +202,24 @@ def touch_execution_progress(execution_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def _terminal_retention_hours() -> float:
+    """``cron.executions_retention_hours`` (default ``TERMINAL_RETENTION_HOURS``). Values below the
+    default are ignored: the two-day window is what the stale-claim and audit paths assume.
+    ``MAX_TERMINAL_EXECUTIONS`` still caps the row count."""
+    default = float(TERMINAL_RETENTION_HOURS)
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+        value = float((cron_cfg or {}).get("executions_retention_hours", default))
+    except Exception:
+        return default
+    return value if value > default else default
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    cutoff = (_hermes_now() - timedelta(hours=TERMINAL_RETENTION_HOURS)).isoformat()
+    cutoff = (_hermes_now() - timedelta(hours=_terminal_retention_hours())).isoformat()
     conn.execute(
         """DELETE FROM executions
            WHERE status IN ('completed','failed','unknown')

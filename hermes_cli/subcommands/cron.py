@@ -151,6 +151,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--interpreter",
         help="Absolute or ~ path to a Python for a .py script / monitor script. "
             "Pass empty string to clear (back to Hermes' Python).")
+    cron_edit.add_argument("--alert-after-failures", dest="alert_after_failures", type=int,
+        metavar="N",
+        help="Send the failure alert only once N runs in a row have failed (single blips stay "
+            "in `hermes cron runs`). A recovery message follows once alerted. 0 clears.")
+    cron_edit.add_argument("--alert-when-stale-minutes", dest="alert_when_stale_minutes",
+        type=int, metavar="M",
+        help="Send the failure alert once the job has been failing for M minutes. With "
+            "--alert-after-failures, whichever comes first alerts. 0 clears.")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

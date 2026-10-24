@@ -530,6 +530,28 @@ reminder cooldown) → `resolved` (the job ran OK afterwards; re-opens on a
 repeat) or `closed` (acknowledged; terminal for that signature). Stored error
 text is secret-redacted and truncated before it is written.
 
+
+### Alert after a streak or a stale window (per job)
+
+A job that refreshes data and keeps its last good copy does not need a ping for
+one failed run. Give it a threshold and single blips stay in the run history
+only:
+
+```bash
+hermes cron edit <job> --alert-after-failures 3        # alert on the 3rd failure in a row
+hermes cron edit <job> --alert-when-stale-minutes 45   # alert once failing for 45 minutes
+hermes cron edit <job> --alert-after-failures 0        # clear: alert on the first failure again
+```
+
+With both set, whichever is reached first alerts. Below the threshold the run
+is still recorded (`hermes cron runs`, the incident ledger, `failure_streak`);
+only the ping waits. Once it alerts, the alert says how many runs failed in a
+row, for how long, and quotes the failing step's error line from the script's
+stderr. The `failure_repeat_alert_hours` reminder applies as before. When the
+job is green again after an alert, one "recovered" message goes to the failure
+lane. Jobs without a threshold behave as described above: the first failure of
+a signature alerts and there is no recovery message.
+
 ### Fleet health check: `hermes cron doctor`
 
 `hermes cron doctor` is a read-only health check over every active job. It prints grouped, per-job issues and exits `1` while any finding stands, including historical late or catch-up dispatches (`0` when no findings remain).

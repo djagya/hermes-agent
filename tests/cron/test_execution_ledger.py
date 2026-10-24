@@ -564,3 +564,27 @@ def test_history_orders_by_instant_across_dst_fall_back(monkeypatch, tmp_path):
     ]
     page = executions.list_executions(job_id="dst-job", before_claimed_at=later["claimed_at"])
     assert [r["id"] for r in page] == [earlier["id"]]
+
+
+def test_retention_window_follows_config_but_never_drops_below_two_days(monkeypatch, tmp_path):
+    """``cron.executions_retention_hours`` lengthens the audit window; a smaller value is ignored."""
+    import hermes_cli.config as hermes_config
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    clock = {"now": datetime(2026, 10, 10, tzinfo=UTC)}
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock["now"])
+    cfg = {"cron": {"executions_retention_hours": 14 * 24}}
+    monkeypatch.setattr(hermes_config, "load_config_readonly", lambda: cfg)
+
+    old = executions.create_execution("old", source="builtin")
+    executions.finish_execution(old["id"], success=False, error="kept for the audit")
+    clock["now"] += timedelta(days=3)
+    executions.finish_execution(executions.create_execution("new", source="builtin")["id"], success=True)
+    assert executions.get_execution(old["id"]) is not None
+
+    cfg["cron"]["executions_retention_hours"] = 24  # below the floor: the 48 h default holds
+    clock["now"] += timedelta(hours=1)
+    recent = executions.create_execution("recent", source="builtin")
+    executions.finish_execution(recent["id"], success=True)
+    assert executions.get_execution(old["id"]) is None
+    assert executions.get_execution(recent["id"]) is not None
