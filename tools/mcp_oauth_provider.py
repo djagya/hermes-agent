@@ -173,8 +173,9 @@ class HermesProviderMixin:
         and starts a browser login, which non-interactive callers cannot complete. Every expiry write goes
         through ``context.update_token_expiry`` (SDK token/refresh handlers, ``_store_tokens``, disk
         adoption, cold load), so the margin is applied there once. It is capped at a tenth of the token's
-        issued lifetime so short-lived tokens stay usable, and skipped for a token without a refresh token; for a pair reloaded from disk ``expires_in`` is
-        only the remaining time, so the cap uses the lifetime the storage recorded at issue."""
+        issued lifetime so short-lived tokens stay usable, and skipped for a token without a refresh token.
+        For a pair reloaded from disk ``expires_in`` is only the remaining time, so the cap uses the
+        lifetime the storage recorded at issue."""
         ctx = self.context
         sdk_update = ctx.update_token_expiry
 
@@ -371,7 +372,8 @@ class HermesProviderMixin:
         """
         from tools.mcp_oauth import RefreshFenceTimeout
         while True:
-            self._hermes_early_refresh = None
+            # No reset of ``_hermes_early_refresh`` here: a flow starting now (outside context.lock) would
+            # wipe the snapshot of the flow that is refreshing. ``_refresh_token`` resets it under the lock.
             inner = super().async_auth_flow(request)
             discovery_failures: list[str] = []
             try:
@@ -435,9 +437,14 @@ class HermesProviderMixin:
             except (MCPRefreshError, RefreshFenceTimeout) as exc:
                 if not self._hermes_restore_after_early_refresh_failure(exc):
                     raise
-                await inner.aclose()  # release the SDK's context.lock before the restarted flow takes it
             finally:
-                await self._hermes_release_refresh_fence()
+                # A failure raised here (not by the SDK) leaves the SDK generator suspended inside
+                # ``async with context.lock``; close it now so the lock is free for the next flow, not at
+                # GC. A no-op once the generator has finished.
+                try:
+                    await inner.aclose()
+                finally:
+                    await self._hermes_release_refresh_fence()
 
     @staticmethod
     def _hermes_refresh_was_not_sent(request, exc: BaseException) -> bool:
@@ -620,6 +627,8 @@ class HermesProviderMixin:
             ok = await self._hermes_handle_refresh_response(response)
         finally:
             await self._hermes_release_refresh_fence()
+        if ok:
+            self._hermes_early_refresh = None
         # Only a 4xx refusal says the grant is dead. A 5xx, a throttle (408/425/429) or an
         # unreadable 2xx says nothing about it: the refresh token on disk may still be good.
         status = response.status_code

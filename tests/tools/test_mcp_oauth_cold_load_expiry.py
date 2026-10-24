@@ -553,52 +553,103 @@ async def test_token_near_expiry_counts_as_expired(tmp_path, monkeypatch, issued
     assert fresh.context.token_expiry_time == pytest.approx(time.time() + issued - margin, abs=1)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "status, body, keeps_refresh_token",
-    [
-        (503, b"<html>down</html>", True),            # endpoint outage: grant kept for the refresh at expiry
-        (400, b'{"error":"invalid_grant"}', False),  # rejected grant: only the access token is kept
-    ],
-)
-async def test_failed_early_refresh_still_sends_live_access_token(tmp_path, monkeypatch, status, body, keeps_refresh_token):
-    """A refresh started inside the margin that fails must not cost the token's last seconds.
-
-    The SDK adds the Bearer header only when ``is_token_valid()``; without a
-    fallback the request would go out bare, get 401 and start a browser login,
-    where the same request without the margin succeeds with the live token.
-    """
+async def _refreshing_provider(tmp_path, monkeypatch, *, expires_in):
+    """Manager provider holding access token ``live`` (issued for 3600 s) with ``expires_in`` left."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
     from pydantic import AnyUrl
 
     import tools.mcp_oauth_provider as provider_mod
     from tools.mcp_oauth import HermesTokenStorage
-    from tools.mcp_tool import sdk_httpx
 
     async def _no_wait(_delay):
         return None
 
     monkeypatch.setattr(provider_mod, "_sleep", _no_wait)
-    httpx = sdk_httpx()
     storage = HermesTokenStorage("srv")
     await storage.set_tokens(OAuthToken(access_token="live", expires_in=3600, refresh_token="r"))
     provider = _provider_for(storage)
     provider._initialized = True
     provider.context.client_info = OAuthClientInformationFull(
         client_id="cid", redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")])
-    provider.context.current_tokens = OAuthToken(access_token="live", expires_in=40, refresh_token="r")
+    provider.context.current_tokens = OAuthToken(access_token="live", expires_in=expires_in, refresh_token="r")
     provider.context.update_token_expiry(provider.context.current_tokens)
+    return provider
 
+
+async def _answer_refreshes(flow, request, httpx, status, body, first):
+    """Answer every refresh POST the flow yields with ``status``; return the resource request it then sends."""
+    out = first
+    while out is not request:
+        out = await flow.asend(httpx.Response(status, content=body, request=out))
+    return out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status, body, keeps_refresh_token, concurrent",
+    [
+        (503, b"<html>down</html>", True, False),            # endpoint outage: grant kept for the refresh at expiry
+        (400, b'{"error":"invalid_grant"}', False, False),  # rejected grant: only the access token is kept
+        (503, b"<html>down</html>", True, True),             # a second request starting mid-refresh changes nothing
+    ],
+)
+async def test_failed_early_refresh_still_sends_live_access_token(
+        tmp_path, monkeypatch, status, body, keeps_refresh_token, concurrent):
+    """A refresh started inside the margin that fails must not cost the token's last seconds.
+
+    The SDK adds the Bearer header only when ``is_token_valid()``; without a
+    fallback the request would go out bare, get 401 and start a browser login,
+    where the same request without the margin succeeds with the live token.
+    """
+    from tools.mcp_tool import sdk_httpx
+
+    httpx = sdk_httpx()
+    provider = await _refreshing_provider(tmp_path, monkeypatch, expires_in=40)
     request = httpx.Request("POST", "https://example.com/mcp")
     flow = provider.async_auth_flow(request)
-    out = await flow.asend(None)
-    refresh_posts = 0
-    while out is not request:
-        refresh_posts += 1
-        out = await flow.asend(httpx.Response(status, content=body, request=out))
-    assert refresh_posts >= 1
+    first = await flow.asend(None)
+    assert first is not request  # the early refresh POST
+
+    other_task = other_flow = other_request = None
+    if concurrent:
+        other_request = httpx.Request("POST", "https://example.com/mcp")
+        other_flow = provider.async_auth_flow(other_request)
+        other_task = asyncio.ensure_future(other_flow.asend(None))
+        await asyncio.sleep(0)  # let it start and wait for context.lock
+
+    out = await _answer_refreshes(flow, request, httpx, status, body, first)
     assert out.headers.get("Authorization") == "Bearer live"
     assert bool(provider.context.current_tokens.refresh_token) is keeps_refresh_token
     with pytest.raises(StopAsyncIteration):
         await flow.asend(httpx.Response(200, request=request))
+
+    if concurrent:
+        other_out = await asyncio.wait_for(other_task, 5)
+        assert other_out is other_request  # live token restored: no second early refresh
+        assert other_out.headers.get("Authorization") == "Bearer live"
+        await other_flow.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_releases_context_lock(tmp_path, monkeypatch):
+    """A refresh failure raised by Hermes' retry wrapper must free ``context.lock`` at once, not at GC."""
+    import gc
+
+    from tools.mcp_oauth_provider import MCPRefreshError
+    from tools.mcp_tool import sdk_httpx
+
+    httpx = sdk_httpx()
+    provider = await _refreshing_provider(tmp_path, monkeypatch, expires_in=0)
+    provider.context.token_expiry_time = time.time() - 1  # already expired: no early-refresh fallback
+    request = httpx.Request("POST", "https://example.com/mcp")
+    gc.disable()
+    try:
+        flow = provider.async_auth_flow(request)
+        out = await flow.asend(None)
+        with pytest.raises(MCPRefreshError):
+            await _answer_refreshes(flow, request, httpx, 503, b"down", out)
+        await asyncio.wait_for(provider.context.lock.acquire(), 1)
+        provider.context.lock.release()
+    finally:
+        gc.enable()
