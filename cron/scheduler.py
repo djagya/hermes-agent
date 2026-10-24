@@ -504,7 +504,7 @@ def _stash_recovery_notice(job: dict) -> None:
         if not count_alerted_incidents(job["id"]):
             return
     except Exception as exc:
-        logger.debug("Incident store unavailable for job %s (no recovery notice): %s", job["id"], exc)
+        logger.debug("Incident store unavailable for job %s (no recovery notice): %s", job["id"], exc, exc_info=True)
         return
     minutes = _failing_minutes(job, streak + 1)
     span = f", failed for {int(minutes)} min" if minutes else ""
@@ -527,7 +527,7 @@ def _deliver_recovery_notice(job: dict, fence: "_FireOwnership", *, adapters, lo
         if error:
             logger.warning("Recovery notice for job %s not delivered: %s", job["id"], error)
     except Exception as exc:
-        logger.warning("Recovery notice for job %s not delivered: %s", job["id"], exc)
+        logger.warning("Recovery notice for job %s not delivered: %s", job["id"], exc, exc_info=True)
 
 
 class CronPromptInjectionBlocked(Exception):

@@ -410,6 +410,15 @@ Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
 ledger is included in quick backups.
 
+Finished attempts are kept for 48 hours by default (and at most 100,000 rows).
+Raise `cron.executions_retention_hours` to keep a longer history; values below
+48 or non-finite values are ignored, and values above ten years are capped:
+
+```yaml
+cron:
+  executions_retention_hours: 168   # keep a week of finished runs
+```
+
 Scheduled attempts also record their exact scheduled instant, separately from
 the time they were claimed. If an old `jobs.json` snapshot re-arms an occurrence
 that the retained ledger records as completed, Hermes skips that replay and

@@ -215,6 +215,7 @@ def _terminal_retention_hours() -> float:
         cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
         value = float((cron_cfg or {}).get("executions_retention_hours", default))
     except Exception:
+        logger.debug("cron.executions_retention_hours unreadable; keeping %sh", default, exc_info=True)
         return default
     if not math.isfinite(value) or value <= default:
         return default
