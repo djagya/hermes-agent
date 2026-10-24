@@ -34,6 +34,7 @@ EXECUTIONS_FILE: Optional[Path] = None
 # global bound for a runaway/manual-fire loop. At one fire per minute, 100k rows covers more than
 # 34 continuously firing jobs for the full window.
 TERMINAL_RETENTION_HOURS = 48
+MAX_TERMINAL_RETENTION_HOURS = 10 * 365 * 24
 MAX_TERMINAL_EXECUTIONS = 100_000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
@@ -202,8 +203,27 @@ def touch_execution_progress(execution_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def _terminal_retention_hours() -> float:
+    """``cron.executions_retention_hours`` (default ``TERMINAL_RETENTION_HOURS``). Values below the
+    default are ignored: the two-day window is what the stale-claim and audit paths assume.
+    ``MAX_TERMINAL_EXECUTIONS`` still caps the row count."""
+    default = float(TERMINAL_RETENTION_HOURS)
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+        value = float((cron_cfg or {}).get("executions_retention_hours", default))
+    except Exception:
+        return default
+    if not math.isfinite(value) or value <= default:
+        return default
+    # A typo like 1e8 would overflow timedelta inside every ledger write; cap at ten years.
+    return min(value, MAX_TERMINAL_RETENTION_HOURS)
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    cutoff = (_hermes_now() - timedelta(hours=TERMINAL_RETENTION_HOURS)).isoformat()
+    cutoff = (_hermes_now() - timedelta(hours=_terminal_retention_hours())).isoformat()
     conn.execute(
         """DELETE FROM executions
            WHERE status IN ('completed','failed','unknown')
