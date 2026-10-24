@@ -180,6 +180,8 @@ class HermesProviderMixin:
 
         def _update_with_skew(token) -> None:
             sdk_update(token)
+            # The server's own expiry, kept so a failed early refresh can fall back to it.
+            self._hermes_hard_expiry = (token, ctx.token_expiry_time)
             remaining = getattr(token, "expires_in", None)
             # No refresh token: nothing to refresh early with, so keep sending it until it expires.
             if ctx.token_expiry_time is None or not remaining or not getattr(token, "refresh_token", None):
@@ -189,6 +191,38 @@ class HermesProviderMixin:
             ctx.token_expiry_time -= min(_TOKEN_EXPIRY_SKEW_SECONDS, lifetime // 10)
 
         ctx.update_token_expiry = _update_with_skew
+
+    # (token, unskewed expiry) of the last expiry write, and the snapshot taken when a refresh
+    # starts inside the margin; see _hermes_restore_after_early_refresh_failure.
+    _hermes_hard_expiry: tuple[Any, float | None] | None = None
+    _hermes_early_refresh: tuple[Any, float] | None = None
+
+    def _hermes_snapshot_early_refresh(self) -> None:
+        """Remember the access token when a refresh starts before its real expiry (inside the margin)."""
+        self._hermes_early_refresh = None
+        tokens, hard = self._hermes_hard_expiry or (None, None)
+        if tokens is not None and tokens is self.context.current_tokens and hard is not None and time.time() < hard:
+            self._hermes_early_refresh = (tokens, hard)
+
+    def _hermes_restore_after_early_refresh_failure(self, exc: BaseException) -> bool:
+        """After an early refresh fails, keep sending the still-live access token until it expires.
+
+        Without this the margin would cost the token's last seconds: the SDK adds the Bearer header only
+        when ``is_token_valid()``, so the request would go out bare, get 401 and start a browser login.
+        The real expiry is restored (no margin), so the next refresh comes at expiry, as without the
+        margin. A grant the server rejected is not kept: only its access token is."""
+        early, self._hermes_early_refresh = self._hermes_early_refresh, None
+        if early is None or time.time() >= early[1]:
+            return False
+        tokens, hard = early
+        if isinstance(exc, MCPRefreshError) and exc.kind == "oauth_rejected":
+            tokens = tokens.model_copy(update={"refresh_token": None})
+        self.context.current_tokens = tokens
+        self.context.token_expiry_time = hard
+        self._hermes_logger.warning(
+            "MCP OAuth: early token refresh failed (%s); using the current access token until it expires",
+            getattr(exc, "kind", type(exc).__name__))
+        return True
 
     async def _perform_authorization(self):
         info = self.context.client_info
@@ -335,7 +369,9 @@ class HermesProviderMixin:
         the original request with the winner's access token, never POSTing
         the burned refresh token.
         """
+        from tools.mcp_oauth import RefreshFenceTimeout
         while True:
+            self._hermes_early_refresh = None
             inner = super().async_auth_flow(request)
             discovery_failures: list[str] = []
             try:
@@ -396,6 +432,10 @@ class HermesProviderMixin:
                             discovery_failures.append(failure)
                         elif getattr(sent, "status_code", None) == 200:
                             sent = await self._hermes_accept_origin_issued_metadata(sent)
+            except (MCPRefreshError, RefreshFenceTimeout) as exc:
+                if not self._hermes_restore_after_early_refresh_failure(exc):
+                    raise
+                await inner.aclose()  # release the SDK's context.lock before the restarted flow takes it
             finally:
                 await self._hermes_release_refresh_fence()
 
@@ -433,6 +473,7 @@ class HermesProviderMixin:
         refreshes inside one process.
         """
         self._coerce_client_secret_post()
+        self._hermes_snapshot_early_refresh()
         await self._hermes_acquire_refresh_fence()
         try:
             # Re-read under the fence: a peer may have rotated while we waited
