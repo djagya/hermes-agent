@@ -432,6 +432,7 @@ def _script_argv(
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    timeout_seconds: Optional[int] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -447,7 +448,15 @@ def _run_job_script(
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
-    script_timeout = _get_script_timeout()
+    # The job's own ``script_timeout_seconds`` beats ``cron.script_timeout_seconds``: a 2-minute
+    # refresh must not hold its slot for the global 4 h. Normalized on write; re-checked here
+    # because jobs.json is also hand-edited.
+    try:
+        script_timeout = _positive_int(timeout_seconds) if timeout_seconds is not None else None
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid per-job script_timeout_seconds %r", timeout_seconds)
+        script_timeout = None
+    script_timeout = script_timeout or _get_script_timeout()
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
@@ -560,7 +569,8 @@ def _run_job_script_with_claim_heartbeat(
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     def run() -> tuple[bool, str]:
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+                               interpreter=job.get("interpreter"),
+                               timeout_seconds=job.get("script_timeout_seconds"))
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")
