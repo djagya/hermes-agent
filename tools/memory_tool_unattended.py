@@ -33,6 +33,15 @@ def background_add_ceiling(config: Optional[dict[str, Any]] = None) -> float:
     return min(max(ratio, 0.0), 1.0)
 
 
+_NO_DELETE_ADVICE = (
+    " The background review cannot remove or shorten entries, so do not retry with a batch or a removal. "
+    "Save nothing more to memory in this review; put a procedure or task lesson in the relevant skill instead.")
+
+
+def _refusal(reason: str, usage: str) -> dict[str, Any]:
+    return _error(reason + _NO_DELETE_ADVICE, "over_budget", done=True, usage=usage)
+
+
 def unattended_add_refusal(store: Any, target: str, contents: list[Any]) -> Optional[str]:
     """JSON refusal when an unattended review add would take ``target`` past the ceiling, else
     None. Reads the live file under the store lock, so writes from other sessions count."""
@@ -50,12 +59,24 @@ def unattended_add_refusal(store: Any, target: str, contents: list[Any]) -> Opti
         cap = int(limit * ratio)
         if not new or total <= cap:
             return {"success": True}
-        return _error(
-            f"Not saved: {label} is at {current:,}/{limit:,} chars and this would take it to {total:,}, past "
-            f"the {cap:,}-char limit for unattended background-review adds (memory.background_add_ceiling = "
-            f"{ratio:g}). The background review cannot remove or shorten entries, so do not retry with a "
-            "batch or a removal. Save nothing more to memory in this review; put a procedure or task lesson "
-            "in the relevant skill instead.", "over_budget", done=True, usage=f"{current:,}/{limit:,}")
+        return _refusal(f"Not saved: {label} is at {current:,}/{limit:,} chars and this would take it to "
+                        f"{total:,}, past the {cap:,}-char limit for unattended background-review adds "
+                        f"(memory.background_add_ceiling = {ratio:g}).", f"{current:,}/{limit:,}")
 
     result = store._mutate(target, _check, skip_drift=True)
     return None if result.get("success") else json.dumps(result, ensure_ascii=False)
+
+
+def unattended_overflow_refusal(store: Any, target: str, result_json: str) -> str:
+    """The ceiling check and the store's write take the lock separately, so a concurrent writer can
+    still fill the store in between. The store's own over-limit refusal then asks for an
+    add-plus-removal batch, which an unattended review cannot run (it would only be staged): give
+    the review the no-removal refusal instead. Other callers get ``result_json`` unchanged."""
+    from tools.skill_provenance import is_unattended_review
+
+    if not is_unattended_review():
+        return result_json
+    label = "USER.md" if target == "user" else "MEMORY.md"
+    usage = store._usage(target)
+    return json.dumps(_refusal(f"Not saved: {label} is full for unattended background-review adds ({usage} chars).",
+                               usage), ensure_ascii=False)

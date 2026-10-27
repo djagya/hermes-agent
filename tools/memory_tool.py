@@ -14,7 +14,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from utils import is_truthy_value
 from tools.registry import no_cache_check_fn
-from tools.memory_tool_unattended import unattended_add_refusal
+from tools.memory_tool_unattended import unattended_add_refusal, unattended_overflow_refusal
 
 # fcntl is Unix-only; Windows uses msvcrt. MemoryStore reads both lazily from
 # this module (tests patch ``memory_tool.fcntl``).
@@ -232,6 +232,8 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
     try:
         outcome, result = _memory_tool(action, target, content, old_text, new_text, operations, store)
         failure_class = "none" if outcome == "success" else FAILURE_CLASS.get()
+        if outcome == "failed" and failure_class == "over_budget":  # the store's refusal, not a gate's
+            result = unattended_overflow_refusal(store, target, result)
     finally:
         FAILURE_CLASS.reset(token)
     from hermes_cli.observability.shared_metrics_loop import record_builtin_memory_call
@@ -262,7 +264,7 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
         if any(isinstance(op, dict) and op.get("action") == "replace" for op in operations):
             return _invalid(_REPLACE_REMOVED)
         denied = (_background_delete_gate(store, action, operations, target)
-                  or unattended_add_refusal(store, target, [op.get("content") for op in operations
+                  or unattended_add_refusal(store, target, [op.get("content") or op.get("new_text") for op in operations
                                                             if isinstance(op, dict) and op.get("action") == "add"]))
         if denied is not None:
             return "rejected", denied
