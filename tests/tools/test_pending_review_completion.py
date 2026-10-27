@@ -65,14 +65,12 @@ def _apply_memory(record, store):
 
 def _stage_memory_add(store, content, target="user"):
     from tools import write_approval as wa
-    from tools.memory_tool import _build_memory_write_guard
     return wa.stage_write(
         "memory",
         {
             "action": "add",
             "target": target,
             "content": content,
-            "_write_guard": _build_memory_write_guard(store, target),
         },
         summary=content,
         origin="foreground",
@@ -280,7 +278,7 @@ def test_same_id_substitution_is_never_claimed_under_reviewed_digest(hermes_home
     """Audit regression: a schema-valid record swapped in under the same id
     must survive an earlier reviewed decision (apply and reject)."""
     from tools import write_approval as wa
-    from tools.memory_tool import MemoryStore, _build_memory_write_guard
+    from tools.memory_tool import MemoryStore
 
     store = MemoryStore()
     store.load_from_disk()
@@ -295,7 +293,6 @@ def test_same_id_substitution_is_never_claimed_under_reviewed_digest(hermes_home
         "action": "add",
         "target": "user",
         "content": "attacker entry",
-        "_write_guard": _build_memory_write_guard(store, "user"),
     }
     path = os.path.join(hermes_home, "pending", "memory", f"{pending_id}.json")
     with open(path, encoding="utf-8") as handle:
