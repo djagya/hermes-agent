@@ -164,7 +164,6 @@ def test_handle_approve_all(hermes_home):
     from tools.memory_tool import MemoryStore
     from tools import write_approval as wa
     store = MemoryStore(); store.load_from_disk()
-    from tools.memory_tool import _build_memory_write_guard
 
     wa.stage_write(
         "memory",
@@ -172,7 +171,6 @@ def test_handle_approve_all(hermes_home):
             "action": "add",
             "target": "user",
             "content": "a",
-            "_write_guard": _build_memory_write_guard(store, "user"),
         },
         summary="a",
         origin="foreground",
@@ -183,7 +181,6 @@ def test_handle_approve_all(hermes_home):
             "action": "add",
             "target": "memory",
             "content": "b",
-            "_write_guard": _build_memory_write_guard(store, "memory"),
         },
         summary="b",
         origin="foreground",
@@ -199,14 +196,14 @@ def test_handle_approve_surfaces_overwritten_entry(hermes_home):
     approver the FULL entry it overwrote — the store's replaced_entries field used to be
     dropped by _apply_one, so the incident path stayed silent."""
     from hermes_cli.write_approval_commands import handle_pending_subcommand
-    from tools.memory_tool import MemoryStore, _build_memory_write_guard
+    from tools.memory_tool import MemoryStore
     from tools import write_approval as wa
     store = MemoryStore(); store.load_from_disk()
     entry = "RULE A: gate merges. RULE B: ci per HEAD. RULE C: never squash."
     store.add("memory", entry)
     wa.stage_write("memory", {"action": "batch", "target": "memory", "operations": [
         {"action": "replace", "old_text": "RULE B: ci per HEAD.", "content": "RULE B: CI is per-head.",
-         "matched_entry": entry}], "_write_guard": _build_memory_write_guard(store, "memory")},
+         "matched_entry": entry}]},
         summary="batch", origin="background_review")
     out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
     assert "Approved 1" in out and entry in out
@@ -217,14 +214,13 @@ def test_handle_approve_lists_a_patch_as_the_entry_before_the_edit(hermes_home):
     """An approved patch keeps the rest of its entry; the approve output called it an
     overwrite and told the user to re-add text they had deliberately changed."""
     from hermes_cli.write_approval_commands import handle_pending_subcommand
-    from tools.memory_tool import MemoryStore, _build_memory_write_guard
+    from tools.memory_tool import MemoryStore
     from tools import write_approval as wa
     store = MemoryStore(); store.load_from_disk()
     entry = "RULE A: gate merges. RULE B: ci per HEAD. RULE C: never squash."
     store.add("memory", entry)
     wa.stage_write("memory", {"action": "batch", "target": "memory", "operations": [
-        {"action": "patch", "old_text": "ci per HEAD", "content": "CI is per-head", "matched_entry": entry}],
-        "_write_guard": _build_memory_write_guard(store, "memory")},  # dlz: staged base-state guard
+        {"action": "patch", "old_text": "ci per HEAD", "content": "CI is per-head", "matched_entry": entry}]},
         summary="batch", origin="background_review")
     out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
     assert "Patched entry (as it was before the edit):" in out and entry in out
@@ -832,22 +828,16 @@ def test_pending_apply_capability_cannot_be_forged_outside_record_apply(hermes_h
 
 
 def test_direct_memory_pending_apply_without_live_record_is_rejected(hermes_home):
-    from tools.memory_tool import apply_memory_pending
+    from tools.memory_tool import MemoryStore, apply_memory_pending
 
-    class EnabledStore:
-        def target_enabled(self, _target):
-            return True
-
-        def add(self, *_args):
-            raise AssertionError("direct replay reached the memory store")
-
-    result = apply_memory_pending(
-        {"action": "add", "target": "memory", "content": "claim"},
-        EnabledStore(),  # type: ignore[arg-type]
-    )
+    store = MemoryStore()
+    store.load_from_disk()
+    assert store.add("memory", "existing fact")["success"]
+    before = store._path_for("memory").read_bytes()
+    result = apply_memory_pending({"action": "add", "target": "memory", "content": "claim"}, store)
     assert result["success"] is False
-    assert "target" not in result  # replay guard refuses before any store-target operation
-    assert "restage" in result["error"]
+    assert "capability is not live" in result["error"]
+    assert store._path_for("memory").read_bytes() == before
 
 
 def test_dedupe_into_applying_record_surfaces_recovery_required(hermes_home):
@@ -995,9 +985,9 @@ def test_manual_quarantine_resolution_preserves_evidence(hermes_home):
     assert restored is not None and restored["state"] == "pending"
 
 
-def test_memory_pending_guard_rejects_stale_target_without_consuming(
-    hermes_home,
-):
+def test_memory_pending_add_applies_after_unrelated_target_change(hermes_home):
+    """An add is append-only, so a change to other entries since staging does not stale it
+    (the fork's former whole-file guard refused it)."""
     from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools import write_approval as wa
     from tools.memory_tool import MemoryStore, memory_tool
@@ -1005,26 +995,17 @@ def test_memory_pending_guard_rejects_stale_target_without_consuming(
     _set_approval("memory", True)
     staging = MemoryStore()
     staging.load_from_disk()
-    staged = json.loads(
-        memory_tool("add", "memory", "approved fact", store=staging)
-    )
+    staged = json.loads(memory_tool("add", "memory", "approved fact", store=staging))
     target = Path(hermes_home) / "memories" / "MEMORY.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("foreign fact", encoding="utf-8")
 
     current = MemoryStore()
     current.load_from_disk()
-    output = handle_pending_subcommand(
-        wa.MEMORY,
-        ["approve", staged["pending_id"]],
-        memory_store=current,
-    )
-    record = wa.get_pending(wa.MEMORY, staged["pending_id"])
-    assert output is not None
-    assert "Approved 0" in output
-    assert "stale" in output.lower()
-    assert target.read_text(encoding="utf-8") == "foreign fact"
-    assert record is not None and record["state"] == "pending"
+    output = handle_pending_subcommand(wa.MEMORY, ["approve", staged["pending_id"]], memory_store=current)
+    assert "Approved 1" in output, output
+    assert current.memory_entries == ["foreign fact", "approved fact"]
+    assert wa.get_pending(wa.MEMORY, staged["pending_id"]) is None
 
 
 def test_memory_pending_guard_allows_exact_unchanged_apply(hermes_home):
