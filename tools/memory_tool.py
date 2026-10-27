@@ -5,7 +5,6 @@ mid-session writes hit disk but never change the prompt (prefix cache intact).
 Single `memory` tool: add/patch/remove or a batch `operations` list."""
 
 import copy
-import hashlib
 import json
 import logging
 from contextvars import ContextVar
@@ -61,17 +60,6 @@ def load_on_disk_store() -> MemoryStore:
     store.load_from_disk()
     return store
 
-def _build_memory_write_guard(store: "MemoryStore", target: str) -> dict[str, Any]:
-    """Snapshot exact target bytes under the store's mutation lock."""
-    path = store._path_for(target)
-    with store._file_lock(path):
-        try:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "ABSENT"
-        except OSError as exc:
-            raise RuntimeError(f"Cannot stage memory write from unreadable target: {path}") from exc
-    return {"target": target, "expected_sha256": digest}
-
-
 def _pin_matched_entries(store: MemoryStore, payload: dict[str, Any]) -> Optional[str]:
     """Record on each staged replace/remove the FULL entry its old_text selects now. Approval
     then applies to exactly the entry the approver reviewed and refuses if it changed:
@@ -107,8 +95,6 @@ def _gate_or_stage(store: MemoryStore, summary: str, detail: str, payload: dict[
         return tool_error(decision.message, success=False)
     if (unmatched := _pin_matched_entries(store, payload)) is not None:
         return unmatched
-    payload = dict(payload)
-    payload["_write_guard"] = _build_memory_write_guard(store, payload.get("target", "memory"))
     FAILURE_CLASS.set("staged")
     record = wa.stage_write(wa.MEMORY, payload, summary=f"{summary}: {detail[:120]}", origin=wa.current_origin())
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"], "message": decision.message},
@@ -214,8 +200,6 @@ def _background_delete_gate(store, action, operations, target="memory", content=
         if (unmatched := _pin_matched_entries(store, payload)) is not None:
             return unmatched
         from tools import write_approval as wa
-        if store is not None:
-            payload["_write_guard"] = _build_memory_write_guard(store, target)
         FAILURE_CLASS.set("staged")
         record = wa.stage_write(
             wa.MEMORY, payload,
@@ -379,29 +363,22 @@ def apply_memory_pending(payload: dict[str, Any], store: MemoryStore) -> dict[st
     if any(not op.get("matched_entry") for op in destructive_ops(payload)):
         return {"success": False, "error": "This destructive pending write predates entry pinning and cannot be "
                                            "verified; nothing was applied. Reject it and recreate the change."}
-    guard = payload.get("_write_guard")
-    if not isinstance(guard, dict) or guard.get("target") != target:
-        return {"success": False, "error": "Pending memory write has no valid base-state guard; inspect and restage it."}
-    digest = guard.get("expected_sha256")
-    if not (digest == "ABSENT" or isinstance(digest, str) and len(digest) == 64
-            and all(char in "0123456789abcdef" for char in digest)):
-        return {"success": False, "error": "Pending memory write has a malformed base-state guard; inspect and restage it."}
     from tools import write_approval as wa
 
-    # Consume only at the store's locked commit boundary. Stale target guards,
-    # missing pinned entries and validation failures must remain retryable;
-    # a failure after this point is quarantined rather than blindly replayed.
+    # Consume only at the store's locked commit boundary. Missing pinned entries and
+    # validation failures must remain retryable; a failure after this point is
+    # quarantined rather than blindly replayed. The pins are the staleness guard: a
+    # change to any OTHER entry since staging leaves this record applicable (a legacy
+    # whole-file ``_write_guard`` key is ignored).
     def before_write():
         return wa.consume_pending_apply_capability(wa.MEMORY, payload)
 
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [],
-                                 expected_sha256=digest, before_write=before_write)
+        return store.apply_batch(target, payload.get("operations") or [], before_write=before_write)
     if action not in _STORE_ACTIONS:
         return {"success": False, "error": f"Unknown staged action '{action}'."}
     return _STORE_ACTIONS[action][0](store, target, payload.get("content") or "", payload.get("old_text") or "",
-                                     payload.get("matched_entry"), expected_sha256=digest,
-                                     before_write=before_write)
+                                     payload.get("matched_entry"), before_write=before_write)
 
 
 MEMORY_SCHEMA = {
