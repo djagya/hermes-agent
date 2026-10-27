@@ -18,7 +18,6 @@ import gateway.run as gateway_run
 from gateway.config import GatewayConfig
 from gateway.run import GatewayRunner, _profile_runtime_scope
 from tools import write_approval as wa
-from tools.memory_tool import load_on_disk_store, _build_memory_write_guard
 from tools.skill_manager_tool import stage_skill_write
 
 
@@ -96,10 +95,8 @@ async def test_memory_and_skills_review_commands_use_routed_profile_from_dispatc
     runner.routed_home = routed_home
 
     with _profile_runtime_scope(routed_home):
-        store = load_on_disk_store()
         memory_approve = wa.stage_write(
-            wa.MEMORY, {"action": "add", "target": "memory", "content": "routed approved",
-                        "_write_guard": _build_memory_write_guard(store, "memory")},
+            wa.MEMORY, {"action": "add", "target": "memory", "content": "routed approved"},
             summary="routed-memory-approve", origin="foreground")
         skill_reject = stage_skill_write(
             {"action": "create", "name": "routed-skill", "content": "---\nname: routed-skill\n---\n"},
@@ -115,8 +112,7 @@ async def test_memory_and_skills_review_commands_use_routed_profile_from_dispatc
         assert "routed approved" in (routed_home / "memories" / "MEMORY.md").read_text()
         with _profile_runtime_scope(routed_home):
             memory_reject = wa.stage_write(
-                wa.MEMORY, {"action": "add", "target": "memory", "content": "routed rejected",
-                            "_write_guard": _build_memory_write_guard(load_on_disk_store(), "memory")},
+                wa.MEMORY, {"action": "add", "target": "memory", "content": "routed rejected"},
                 summary="routed-memory-reject", origin="foreground")
         assert "Rejected pending memory write" in await runner.slash("memory", f"reject {memory_reject['id']}")
         assert "routed-skill-reject" in await runner.slash("skills", "pending")
