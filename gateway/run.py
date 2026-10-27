@@ -1069,19 +1069,54 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
+# Cap on the original request quoted into the resume note (the full row stays in the history).
+_RESUME_REQUEST_QUOTE_MAX_CHARS = 4000
+_RESUME_NOTE_PREFIX = "[System note: The previous turn was interrupted by "
+
+
+def _message_text(content: Any) -> str:
+    """Plain text of a transcript ``content`` (str, or an OpenAI-style parts list)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text") or "") for part in content
+            if isinstance(part, dict) and part.get("type") == "text").strip()
+    return ""
+
+
+def interrupted_request_text(history: Any) -> str:
+    """Text of the user request the interrupted turn was working on (latest real user row), or "".
+
+    Skips earlier resume notes (a turn interrupted twice) and blank rows, so the resumed turn quotes what
+    the user actually asked rather than a scaffold or an empty attribution prefix."""
+    for msg in reversed(history or []):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        text = _message_text(msg.get("content")).strip()
+        if not text or text.startswith(_RESUME_NOTE_PREFIX):
+            continue
+        if len(text) > _RESUME_REQUEST_QUOTE_MAX_CHARS:
+            text = text[:_RESUME_REQUEST_QUOTE_MAX_CHARS] + " […]"
+        return text
+    return ""
+
+
 def build_resume_recovery_note(
-    reason: Optional[str], message: str = "", *, interactive: bool = True) -> str:
+    reason: Optional[str], message: str = "", *, interactive: bool = True, original_request: str = "") -> str:
     """Build the resume-pending recovery system note for an interrupted turn (empty ``message`` = auto-resume).
 
-    Interactive platforms report the restore and ask what next; non-interactive ones finish the work.
-
-    On non-interactive event platforms (webhook, API server — adapters with ``interactive_resume = False``)
-    nobody can answer; the resumed turn must instead complete the interrupted work, or the task is silently
-    abandoned behind a "restored" acknowledgement that goes nowhere (#57056).
+    ``interactive=True`` (``gateway.resume_interrupted: ask`` on a platform with a human): report the restore
+    and ask what next. ``interactive=False``: CONTINUE the interrupted work — the fork default for every
+    platform, and the only option on event platforms (webhook, API server) where nobody can answer and a
+    "restored" acknowledgement would silently abandon the task (#57056). ``original_request`` is the
+    interrupted user request, quoted so the model resumes THAT task (a restart mid-turn otherwise left an
+    empty user turn and the model asked what the user wanted).
     """
     reason_phrase = (
         "a gateway restart" if reason == "restart_timeout"
         else "a gateway shutdown" if reason == "shutdown_timeout" else "a gateway interruption")
+    request_block = ""
     if message:
         resume_guidance = (
             "Address the user's NEW message below FIRST and focus on what the user is asking now.")
@@ -1097,23 +1132,26 @@ def build_resume_recovery_note(
         )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
+            "This is an automatic resume, not a new user message: do NOT emit a 'session restored' "
+            "acknowledgement or ask what to do next. Review the conversation history and "
             "CONTINUE the interrupted task to completion.")
         tail_guidance = (
             "Do NOT re-run tool calls whose results already "
             "appear in the history — resume from the first step that has no recorded result.")
+        if original_request:
+            request_block = f"\n\nThe interrupted request was:\n<interrupted_request>\n{original_request}\n</interrupted_request>"
     return (
-        f"[System note: The previous turn was interrupted by "
+        f"{_RESUME_NOTE_PREFIX}"
         f"{reason_phrase}; the gateway is now back online. "
         f"Any restart/shutdown command in the history has already "
         f"run — do NOT re-execute or verify it. {resume_guidance} {tail_guidance}]"
+        + request_block
         + (f"\n\n{message}" if message else ""))
 
 
 def _prepare_resume_pending_message(
-    reason: Optional[str], message: Optional[str], *, interactive: bool = True) -> tuple[str, str]:
+    reason: Optional[str], message: Optional[str], *, interactive: bool = True,
+    original_request: str = "") -> tuple[str, str]:
     """Return the recovery message and the user text to persist.
 
     Empty original: persist the note (a "" user row trips the pre-call sanitizer). Real text: persist clean.
@@ -1125,7 +1163,8 @@ def _prepare_resume_pending_message(
     words: the transcript stays scaffold-free (the model still receives the wrapped note), and a non-empty
     row never trips the sanitizer.
     """
-    recovery_message = build_resume_recovery_note(reason, message or "", interactive=interactive)
+    recovery_message = build_resume_recovery_note(
+        reason, message or "", interactive=interactive, original_request=original_request)
     persist_message = message if isinstance(message, str) and message.strip() else recovery_message
     return recovery_message, persist_message
 

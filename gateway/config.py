@@ -66,6 +66,9 @@ def _env_multiplex_profiles_override() -> bool | None:
 
 # What the runner does when the last messaging adapter goes down (GatewayConfig.on_all_adapters_down).
 ON_ALL_ADAPTERS_DOWN_POLICIES = ("exit", "stay_alive")
+# What the startup auto-resume turn does on an interactive platform (GatewayConfig.resume_interrupted):
+# ``continue`` finishes the interrupted request; ``ask`` reports the restore and asks what next.
+RESUME_INTERRUPTED_POLICIES = ("continue", "ask")
 
 
 def _env_on_all_adapters_down_override() -> str | None:
@@ -635,6 +638,10 @@ class GatewayConfig:
     # failure exit only severs the UI's websockets and drops in-flight assistant messages (#118080).
     # Retryable failures are recoverable in both modes; non-retryable adapter loss always exits.
     on_all_adapters_down: str = "exit"  # "exit" | "stay_alive"; GATEWAY_ON_ALL_ADAPTERS_DOWN overrides
+    # Startup auto-resume of a turn cut off by a restart/shutdown drain timeout, on interactive platforms
+    # (non-interactive ones always continue). ``continue`` (fork default): resume the interrupted request
+    # from its original text. ``ask``: upstream behaviour — report the restore and ask what next.
+    resume_interrupted: str = "continue"
     unauthorized_dm_behavior: str = "pair"  # UNAUTHORIZED_DM_BEHAVIORS
     unauthorized_dm_decline_message: str = ""  # "decline" reply text; empty → DEFAULT_UNAUTHORIZED_DM_DECLINE_MESSAGE
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
@@ -647,7 +654,7 @@ class GatewayConfig:
         "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
         "max_concurrent_sessions", "multiplex_profiles",
-        "on_all_adapters_down",
+        "on_all_adapters_down", "resume_interrupted",
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
         "loop_watchdog_max_strikes", "unauthorized_dm_behavior", "unauthorized_dm_decline_message",
@@ -807,6 +814,8 @@ class GatewayConfig:
             loop_watchdog_probe_timeout_s=bounded_float("loop_watchdog_probe_timeout_s", DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, 1.0, 600.0),
             loop_watchdog_max_strikes=max_strikes,
             on_all_adapters_down=on_all_adapters_down,
+            resume_interrupted=_normalize_choice(
+                pick("resume_interrupted"), RESUME_INTERRUPTED_POLICIES, "continue"),
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), UNAUTHORIZED_DM_BEHAVIORS, "pair"),
             unauthorized_dm_decline_message=str(data.get("unauthorized_dm_decline_message") or "").strip(),
