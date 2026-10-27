@@ -110,8 +110,10 @@ def _gate_or_stage(store: MemoryStore, summary: str, detail: str, payload: dict[
     payload = dict(payload)
     payload["_write_guard"] = _build_memory_write_guard(store, payload.get("target", "memory"))
     FAILURE_CLASS.set("staged")
-    record = wa.stage_write(wa.MEMORY, payload, summary=f"{summary}: {detail[:120]}", origin=wa.current_origin())
-    from tools.memory_tool_pending import after_review_stage
+    from tools.memory_tool_pending import after_review_stage, mark_attended
+    origin = wa.current_origin()
+    record = wa.stage_write(wa.MEMORY, mark_attended(payload, origin), summary=f"{summary}: {detail[:120]}",
+                            origin=origin)
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"], "message": decision.message,
                        **after_review_stage(record)}, ensure_ascii=False)
 
