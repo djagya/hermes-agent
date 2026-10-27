@@ -97,8 +97,10 @@ def _gate_or_stage(store: MemoryStore, summary: str, detail: str, payload: dict[
     if (unmatched := _pin_matched_entries(store, payload)) is not None:
         return unmatched
     FAILURE_CLASS.set("staged")
-    record = wa.stage_write(wa.MEMORY, payload, summary=f"{summary}: {detail[:120]}", origin=wa.current_origin())
-    from tools.memory_tool_pending import after_review_stage
+    from tools.memory_tool_pending import after_review_stage, mark_attended
+    origin = wa.current_origin()
+    record = wa.stage_write(wa.MEMORY, mark_attended(payload, origin), summary=f"{summary}: {detail[:120]}",
+                            origin=origin)
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"], "message": decision.message,
                        **after_review_stage(record)}, ensure_ascii=False)
 
