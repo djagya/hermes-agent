@@ -94,6 +94,22 @@ def daemon_cache_key(slot_id: str, browser_generation: str, ownership_epoch: int
     return f"bu-ctrl-{slot_id}-{browser_generation}-{ownership_epoch}"
 
 
+def _retire_daemon(name: str) -> None:
+    """Stop the harness daemon of a lease this process let go (released, or found dead).
+
+    The daemon is named per lease and never exits when control fences its CDP
+    socket, so every recycled lease left one behind (21 in the gateway on
+    2026-10-26). Off-thread: ``--reload`` can take seconds.
+    """
+    if not str(name or "").startswith("bu-ctrl-"):
+        return
+    try:
+        from tools.browser_use_cli import stop_harness_daemon
+    except ImportError:
+        return
+    threading.Thread(target=stop_harness_daemon, args=(name,), name="bu-daemon-retire", daemon=True).start()
+
+
 def control_url() -> str:
     """Env wins over ``browser.control_url`` in config.yaml."""
     env_url = (os.environ.get(MANAGED_CONTROL_ENV) or "").strip()
@@ -731,6 +747,7 @@ def _resolve_held(
         # Dead lease: forget it and acquire again (control hands a task its
         # own resumed lease back, or a fresh slot).
         _forget_held(key)
+        _retire_daemon(cached.get("BU_NAME", ""))
 
     lease = _acquire_waiting(
         control,
@@ -807,12 +824,16 @@ def release_lease(env: dict[str, str]) -> Optional[str]:
     if is_disabled_url(control):
         return OPERATOR_DISABLED_ERROR
     cache_name = str(env.get("BU_NAME") or "").strip()
+    retired = {cache_name}
     with _held_lock:
         for key, held in list(_held_leases.items()):
             if held.get(MANAGED_LEASE_ENV) == lease_id or (
                 cache_name and held.get("BU_NAME") == cache_name
             ):
+                retired.add(str(held.get("BU_NAME") or ""))
                 _held_leases.pop(key, None)
+    for name in retired:
+        _retire_daemon(name)
     if not control_key():
         return f"unavailable: {MANAGED_KEY_ENV} missing"
     result = _post(

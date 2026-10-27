@@ -675,6 +675,8 @@ def test_gate_403_is_explained_and_retried_on_a_fresh_lease(tmp_path, monkeypatc
         calls = tmp_path / "calls"
         script = _fake_cli(
             tmp_path,
+            # The dead lease's daemon is retired with --reload off-thread; count execs only.
+            'case "$1" in --reload) exit 0;; esac\n'
             f"echo x >> '{calls}'\n"
             'case "$BU_CDP_URL" in *tok-1*) echo "browser-harness: permission-blocked: Chrome '
             'is reachable, but the per-session Allow remote debugging popup" >&2; exit 1;; esac\n'
@@ -817,3 +819,38 @@ def test_parallel_same_key_waiter_reacquires_after_a_failed_acquire(monkeypatch)
     assert any(err and err.startswith("busy:") for err in errors)
     assert (env_a or env_b)[MANAGED_LEASE_ENV] == "lease-2"
     assert route._key_locks == {}
+
+
+def test_dropped_lease_retires_its_harness_daemon(monkeypatch):
+    """2026-10-26: each recycled lease left its per-lease harness daemon running (21 in the gateway)."""
+    import tools.browser_control_route as route
+
+    retired = []
+    monkeypatch.setattr(route, "_retire_daemon", lambda name: retired.append(name))
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        assert _resolve(port, monkeypatch, task_id="t1")[0] is None
+        first = route.held_leases_for_task("t1")[0]["BU_NAME"]
+        state.status_replies["lease-1"] = {"error": "stale", "detail": "unknown lease"}
+        state.acquire_replies.append(dict(DEFAULT_LEASE, lease_id="lease-2", command_token="tok-2"))
+        assert _resolve(port, monkeypatch, task_id="t1")[0] is None
+        assert retired == [first]
+        second = route.held_leases_for_task("t1")[0]["BU_NAME"]
+        assert release_task_leases({"t1"}) == 1
+        assert retired == [first, second]
+    finally:
+        httpd.shutdown()
+
+
+def test_stop_harness_daemon_only_stops_a_driven_name(monkeypatch):
+    import tools.browser_use_cli as cli
+
+    stopped = []
+    monkeypatch.setattr(cli, "_reload_daemons", lambda names: stopped.extend(names))
+    monkeypatch.setattr(cli, "_driven_daemons", {"bu-ctrl-research-1-g-7"})
+    cli.stop_harness_daemon("bu-ctrl-shopping-g-9")
+    cli.stop_harness_daemon("bu-ctrl-research-1-g-7")
+    cli.stop_harness_daemon("bu-ctrl-research-1-g-7")
+    assert stopped == ["bu-ctrl-research-1-g-7"]

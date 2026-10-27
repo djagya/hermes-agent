@@ -860,12 +860,7 @@ _driven_daemons_lock = threading.Lock()
 _exec_route_is_sidecar: dict[str, bool] = {}
 
 
-def stop_harness_daemons() -> None:
-    """Stop every harness daemon this process drove, through the harness's own identity-checked
-    ``--reload``; the next browser_exec respawns one on the endpoint it resolves then."""
-    with _driven_daemons_lock:
-        names = sorted(_driven_daemons)
-        _driven_daemons.clear()
+def _reload_daemons(names: list) -> None:
     cmd = _find_cli() if names else None
     if not cmd:
         return
@@ -873,6 +868,24 @@ def stop_harness_daemons() -> None:
     for name in names:
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             _run_cli_killing_process_group([*cmd, "--reload"], "", {**env, "BU_NAME": name}, 15)
+
+
+def stop_harness_daemons() -> None:
+    """Stop every harness daemon this process drove, through the harness's own identity-checked
+    ``--reload``; the next browser_exec respawns one on the endpoint it resolves then."""
+    with _driven_daemons_lock:
+        names = sorted(_driven_daemons)
+        _driven_daemons.clear()
+    _reload_daemons(names)
+
+
+def stop_harness_daemon(name: str) -> None:
+    """Stop one daemon this process drove; a no-op for any other name."""
+    with _driven_daemons_lock:
+        if name not in _driven_daemons:
+            return
+        _driven_daemons.discard(name)
+    _reload_daemons([name])
 
 
 def _managed_busy_wait(timeout_s: Any) -> Optional[float]:
