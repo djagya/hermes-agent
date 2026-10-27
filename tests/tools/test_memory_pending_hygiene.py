@@ -140,7 +140,8 @@ def test_supersede_never_drops_a_later_record(store):
     """Two reviews staging concurrently must not delete each other: only EARLIER records go."""
     from tools.memory_tool_pending import supersede_review_proposals
     first = wa.get_pending(wa.MEMORY, _review(store, action="remove", old_text="Staging DB")["pending_id"])
-    second = _review(store, action="remove", old_text="Staging DB")
+    second = _review(store, operations=[{"action": "remove", "old_text": "Staging DB"},
+                                        {"action": "add", "content": "Staging DB: pg-staging-4"}])
     assert second["superseded"] == [first["id"]]
 
     # A review that staged `first` and runs its hygiene late must not drop the later record.
