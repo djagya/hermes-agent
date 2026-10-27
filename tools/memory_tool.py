@@ -14,6 +14,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from utils import is_truthy_value
 from tools.registry import no_cache_check_fn
+from tools.memory_tool_unattended import unattended_add_refusal
 
 # fcntl is Unix-only; Windows uses msvcrt. MemoryStore reads both lazily from
 # this module (tests patch ``memory_tool.fcntl``).
@@ -260,7 +261,9 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
             return _invalid("operations must be a list of {action, content?, old_text?} objects.")
         if any(isinstance(op, dict) and op.get("action") == "replace" for op in operations):
             return _invalid(_REPLACE_REMOVED)
-        denied = _background_delete_gate(store, action, operations, target)
+        denied = (_background_delete_gate(store, action, operations, target)
+                  or unattended_add_refusal(store, target, [op.get("content") for op in operations
+                                                            if isinstance(op, dict) and op.get("action") == "add"]))
         if denied is not None:
             return "rejected", denied
         # Approval gate: stages (background/gateway) or prompts inline (CLI); off by default.
@@ -283,6 +286,7 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
         return _invalid(f"Unknown action '{action}'. Use: add, patch, remove")
     invalid = (_validate_single_op(store, action, target, content, old_text)
                or _background_delete_gate(store, action, None, target, content, old_text)
+               or (unattended_add_refusal(store, target, [content]) if action == "add" else None)
                or _apply_write_gate(store, action, target, content, old_text))
     if invalid is not None:
         return "rejected", invalid

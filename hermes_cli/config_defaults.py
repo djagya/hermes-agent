@@ -1317,8 +1317,8 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
-        # Periodic built-in memory review; 0 when an external provider auto-extracts.
-        "nudge_interval": 10,
+        "nudge_interval": 10,  # Periodic built-in memory review; 0 when an external provider auto-extracts.
+        "background_add_ceiling": 1.0,  # Unattended review adds stop at this fraction of a char limit.
         # One external provider: bundled (retaindb, byterover) or catalog-installed (honcho,
         # hindsight, supermemory, mem0, openviking, holographic). Empty = built-in only.
         "provider": "",
