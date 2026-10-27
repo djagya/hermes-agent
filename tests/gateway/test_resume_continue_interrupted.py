@@ -95,3 +95,11 @@ def test_config_parses_resume_interrupted():
     assert GatewayConfig.from_dict({}).resume_interrupted == "continue"
     assert GatewayConfig.from_dict({"gateway": {"resume_interrupted": "ASK"}}).resume_interrupted == "ask"
     assert GatewayConfig.from_dict({"resume_interrupted": "bogus"}).resume_interrupted == "continue"
+
+
+def test_config_yaml_gateway_section_is_bridged():
+    from gateway.config_loader import bridge_toplevel_keys
+
+    gw_data: dict = {}
+    bridge_toplevel_keys({"gateway": {"resume_interrupted": "ask"}}, {"resume_interrupted": "ask"}, gw_data)
+    assert GatewayConfig.from_dict(gw_data).resume_interrupted == "ask"
