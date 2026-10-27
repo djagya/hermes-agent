@@ -19,17 +19,18 @@ CVE-2026-14257
 CVE-2026-69152
 CVE-2026-69192
 # brace-expansion 5.0.7 bundled inside npm itself (tools/npm-12.0.2 and
-# node-26.7.0's lib/node_modules/npm); fixed in 5.0.10. The npm fixes are
-# merged (npm/cli #10088, #10089) but npm 12.2.1 / 11.21.1 are not released
-# yet. The repo lockfiles already override brace-expansion. Expires so the
-# next build re-checks once npm ships the fix.
-CVE-2026-102276 exp:2026-10-29
-CVE-2026-102278 exp:2026-10-29
+# node-26.7.0's lib/node_modules/npm); fixed in 5.0.10. The repo lockfiles
+# already override brace-expansion. Re-checked 2026-10-27: npm 12.2.1
+# (2026-10-15 17:40Z, bundles brace-expansion 5.0.12) is inside the 14-day
+# npm release-age window until 2026-10-29 17:40Z; bump pm/lock.json's npm
+# then. No node 26.x release bundles a fixed npm yet (26.12.1 of 2026-10-21
+# ships npm 11.20.0), so node's own npm tree has no installable fix.
+CVE-2026-102276 exp:2026-11-12
+CVE-2026-102278 exp:2026-11-12
 # undici 6.27.0 bundled inside npm itself (same two npm trees); fixed in
-# 6.28.1, pending the same npm 12.2.1 / 11.21.1 releases. The photon
-# sidecar's own undici is locked to a fixed release. Expires with the
-# entries above.
-CVE-2026-19534 exp:2026-10-29
+# 6.28.1. npm 12.2.1 bundles undici 6.29.0; same window and node gap as
+# the entries above.
+CVE-2026-19534 exp:2026-11-12
 # markdown-it 15.0.1 inside the baked markdownlint-cli2 0.23.3, which pins it
 # exactly. Denial of service when parsing a crafted document; the CLI only
 # lints local files Sera chooses, never inbound messages. The fix needs
@@ -38,24 +39,15 @@ CVE-2026-19534 exp:2026-10-29
 # Expires when 0.24.0 clears it: bump the Dockerfile pin then.
 CVE-2026-111758 exp:2026-11-04
 CVE-2026-111759 exp:2026-11-04
-# brotli 1.2.0 / brotlicffi 1.2.0.2 in the sealed venv (GHSA-9v8h-qqgm-4m35,
-# out-of-bounds write in the decoder). The fixes, brotli 1.2.1 and
-# brotlicffi 1.2.1.0, were published 2026-10-22 13:57Z / 16:19Z, inside
-# uv.lock's 3-day exclude-newer window until 2026-10-25 16:20Z. The window
-# exempts only CA trust stores. Expires the next day: relock then
-# (`uv lock --upgrade-package brotli --upgrade-package brotlicffi`, and the
-# brotlicffi pin in [messaging]).
-GHSA-9v8h-qqgm-4m35 exp:2026-10-26
 # undici: 6.27.0 bundled inside npm itself (tools/npm-12.0.2 and node-26.7.0's
-# lib/node_modules/npm), fixed in 6.29.1, pending an npm release; and the
-# photon sidecar's 7.29.1, fixed in 7.30.1 (published 2026-10-15, inside the
-# 14-day npm release-age window until 2026-10-29). Bump the sidecar lock then.
-# Same expiry as the other npm-bundled undici row.
-CVE-2026-109869 exp:2026-10-29
+# lib/node_modules/npm), fixed in 6.29.1; no npm release has it yet (12.2.1
+# bundles 6.29.0). The photon sidecar's 7.29.1 is fixed in 7.30.1
+# (2026-10-15 14:18Z), inside the 14-day npm release-age window until
+# 2026-10-29 14:18Z: bump the sidecar lock then. The npm-bundled copy keeps
+# this row until npm and node ship undici >= 6.29.1; re-check on expiry.
+CVE-2026-109869 exp:2026-11-12
 # zod (CVE-2023-54404, denial of service on unbounded array validation).
-# Photon sidecar zod 4.5.4: fixed in 4.6.6 (2026-10-11), inside the 14-day
-# npm window until 2026-10-25; bump the sidecar lock on 2026-10-26.
-# clickup-mcp zod 3.25.76: clickup-mcp 1.8.0 and the latest 1.9.0 require
+# The photon sidecar is on zod 4.6.7 (fixed). clickup-mcp zod 3.25.76: clickup-mcp 1.8.0 and the latest 1.9.0 require
 # zod ^3.24.2 and the fix exists only in zod 4, a major the server is not
 # written for, so an override would break it. It validates tool arguments
 # from Sera's own model over stdio, not inbound messages. Re-check then.
