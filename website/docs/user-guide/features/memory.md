@@ -353,6 +353,14 @@ This is the answer to "the agent saved a wrong assumption about me": set
 `write_approval: true`, and every save — especially the unprompted background
 ones — waits for your yes/no before it ever enters your profile.
 
+Because the background review can add but never remove, its adds can fill memory
+to the limit and leave no room for things you ask it to remember. Set
+`memory.background_add_ceiling` (a fraction of each store's char limit, default
+`1.0`) to keep headroom: an unattended review add that would cross it is not
+saved, and the review is told to save nothing more and put procedures in a skill
+instead. Foreground saves and `/refine` are not affected. For example, `0.8`
+keeps the last 20% of `MEMORY.md` and `USER.md` for foreground turns.
+
 A staged `patch` or `remove` (the background review stages these even with the
 gate off) records the full entry it targets, and `/memory pending` shows it.
 Approval applies to exactly that entry: if it changed after the write was staged,
