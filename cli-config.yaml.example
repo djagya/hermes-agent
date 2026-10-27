@@ -1010,6 +1010,11 @@ memory:
   # every N user turns. Set to 0 to disable. Only active when memory is enabled.
   nudge_interval: 10        # Nudge every 10 user turns (0 = disabled)
 
+  # Unapproved unattended background-review memory proposals (/memory pending) are
+  # moved to pending/memory/expired/ after this many days. Foreground and /refine
+  # writes never expire. 0 = keep forever.
+  pending_ttl_days: 14
+
 # =============================================================================
 # Session Continuity (Messaging Platforms)
 # =============================================================================

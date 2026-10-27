@@ -361,6 +361,19 @@ staged before this pinning existed has no verifiable target and is refused too:
 reject it and recreate the change. `/memory approve` lists the full text of
 every entry it overwrote or removed.
 
+The unattended background review's own proposals are kept tidy so the queue
+cannot rot (foreground writes and proposals from an explicit `/refine` are never
+touched):
+
+- **Expiry:** a proposal nobody approved within `memory.pending_ttl_days`
+  (default `14`; `0` = never) is moved to `pending/memory/expired/` with a log
+  line. Nothing is deleted; move a file back to `pending/memory/` to restore it.
+- **Latest wins:** when the review stages a proposal that covers every operation
+  of an earlier one (the same entries, the same added text), the earlier one is
+  dropped. An earlier proposal with any other operation is kept.
+- **The review sees its queue:** each memory review is shown its own pending
+  proposals, quoted as data, so it does not stage the same consolidation again.
+
 ## Background review notifications (`display.memory_notifications`)
 
 After a turn, the background self-improvement review may quietly save a memory

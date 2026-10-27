@@ -1169,6 +1169,9 @@ def _run_review_fork(
     # tell the model that memory is available, or it will burn iterations on denied calls.
     memory_phrase_deny = " and memory for notes (add only)" if "memory" in review_whitelist else ""
     memory_phrase_prompt = "memory and skill " if "memory" in review_whitelist else "skill "
+    if "memory" in review_whitelist:
+        from tools.memory_tool_pending import review_pending_digest
+        prompt += review_pending_digest()
     set_thread_tool_whitelist(
         review_whitelist,
         deny_msg_fmt=(
