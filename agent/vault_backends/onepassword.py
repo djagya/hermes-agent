@@ -235,8 +235,14 @@ class OnePasswordLoginBackend(LoginBackend):
         args = ["item", "get", item_id]
         if vault_id:
             args += ["--vault", vault_id]
-        args += ["--fields", "label=password", "--reveal"]
-        return self._run(*args).rstrip("\r\n")
+        # The whole item as JSON, not ``--fields label=password``: that plain output is CSV-quoted, so a
+        # password holding a quote or comma came back wrapped in literal quotes and the fill was refused.
+        raw = self._run(*args, "--format", "json", "--reveal")
+        try:
+            item = json.loads(raw)
+        except ValueError:
+            raise BackendError(self.display_name, "op item get returned no JSON item") from None
+        return _login_password(item, self.display_name)
 
     def resolve_secret(self, handle: str) -> dict[str, str]:
         """Reveal a single card only inside the trusted native filler, never in tool output."""
@@ -270,6 +276,29 @@ class OnePasswordLoginBackend(LoginBackend):
         except Exception:
             return None
         return code if code.isdigit() else None
+
+
+def _login_password(item: object, backend: str) -> str:
+    """The Login item's password value, byte-exact (no trim, no CSV decoding).
+
+    Picks the field 1Password marks ``purpose: PASSWORD``, then the built-in ``id: password``,
+    then a field labelled ``password``. Several matching fields in the first tier that has any
+    are fine when they agree; different values are refused rather than guessed.
+    """
+    fields = item.get("fields") if isinstance(item, dict) else None
+    fields = [f for f in fields if isinstance(f, dict)] if isinstance(fields, list) else []
+    tiers = (
+        [f for f in fields if f.get("purpose") == "PASSWORD"],
+        [f for f in fields if f.get("id") == "password"],
+        [f for f in fields if str(f.get("label") or "").strip().lower() == "password"],
+    )
+    for tier in tiers:
+        values = {f.get("value") for f in tier if isinstance(f.get("value"), str) and f.get("value") != ""}
+        if len(values) == 1:
+            return values.pop()
+        if len(values) > 1:
+            raise BackendError(backend, "the item has several different password fields; keep one")
+    raise BackendError(backend, "the item has no password field")
 
 
 def _no_otp_field(detail: str) -> bool:
