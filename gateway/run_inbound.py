@@ -1430,7 +1430,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
-        if _is_shared_multi_user and source.user_name:
+        if _is_shared_multi_user and source.user_name and (message_text.strip() or not event.internal):  # blank internal = auto-resume, no sender (run_resume)
             # Display names are attacker-influenceable: neutralize newlines/control chars or a
             # hostile name masquerades as a fake markdown section (mirrors build_session_context_prompt).
             _safe_user_name = neutralize_untrusted_inline_text(source.user_name)

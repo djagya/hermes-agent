@@ -1607,9 +1607,9 @@ class TurnRunner:
             ctx.message = note + "\n\n" + ctx.message
 
     def _resume_note_interactive(self) -> bool:
-        """Interactive platforms report the restore and ask what next; event platforms (webhook,
-        API server) continue the work — nobody is present to answer."""
-        return bool(getattr(self._runner._delivery_adapter_for(self._ctx.source), "interactive_resume", True))
+        """See ``gateway.run_resume.resume_note_interactive`` (``gateway.resume_interrupted``)."""
+        from gateway.run_resume import resume_note_interactive
+        return resume_note_interactive(self._runner, self._ctx.source)
 
     def _prepare_turn_message(self, agent_history):
         """Prepend recovery/notice guidance to ``ctx.message``.
@@ -1619,8 +1619,7 @@ class TurnRunner:
         """
         from gateway.run import (
             _auto_continue_freshness_window, _is_fresh_gateway_interruption,
-            _last_transcript_timestamp, _prepare_resume_pending_message, build_resume_recovery_note,
-        )
+            _last_transcript_timestamp, _prepare_resume_pending_message, build_resume_recovery_note, interrupted_request_text)
         ctx = self._ctx
         persist_override: Optional[Any] = ctx.persist_user_message
         self._prepend_pending_note("_pending_model_notes")
@@ -1646,7 +1645,7 @@ class TurnRunner:
             # Empty message = the startup auto-resume turn; there is no NEW user message.
             ctx.message, persist_override = _prepare_resume_pending_message(
                 resume_reason, ctx.message, interactive=self._resume_note_interactive(),
-            )
+                original_request=interrupted_request_text(ctx.history))
         elif agent_history and agent_history[-1].get("role") == "tool" and interruption_is_fresh:
             persist_override = ctx.message
             ctx.message = (
@@ -1661,7 +1660,8 @@ class TurnRunner:
         # did not fire (freshness signals disagreed, marker cleared) we must NOT hand the model a blank
         # user turn. Restricted to resume_pending sessions so caption-less image turns are untouched.
         if isinstance(ctx.message, str) and not ctx.message.strip() and resume_pending:
-            ctx.message = build_resume_recovery_note(resume_reason, "", interactive=self._resume_note_interactive())
+            ctx.message = build_resume_recovery_note(resume_reason, "", interactive=self._resume_note_interactive(),
+                                                     original_request=interrupted_request_text(ctx.history))
         return persist_override, ctx.persist_user_timestamp
 
     def _native_image_run_message(self):
