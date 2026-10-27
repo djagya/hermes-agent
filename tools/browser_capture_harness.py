@@ -751,7 +751,7 @@ def _publish(tmp: Path, dest: Path) -> Path:
 
 def _ffmpeg(args: list[str]) -> None:
     proc = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args],
-                          capture_output=True, timeout=300, check=False)
+                          stdin=subprocess.DEVNULL, capture_output=True, timeout=300, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode('utf-8', 'replace')[-600:]}")
 
