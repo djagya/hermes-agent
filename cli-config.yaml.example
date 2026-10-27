@@ -1010,6 +1010,11 @@ memory:
   # every N user turns. Set to 0 to disable. Only active when memory is enabled.
   nudge_interval: 10        # Nudge every 10 user turns (0 = disabled)
 
+  # The background review may add memory entries unattended but never remove them.
+  # Its adds stop at this fraction of memory_char_limit / user_char_limit, leaving the
+  # rest for foreground turns. 1.0 = up to the hard limit (default); e.g. 0.8 keeps 20%.
+  background_add_ceiling: 1.0
+
 # =============================================================================
 # Session Continuity (Messaging Platforms)
 # =============================================================================

@@ -361,6 +361,14 @@ staged before this pinning existed has no verifiable target and is refused too:
 reject it and recreate the change. `/memory approve` lists the full text of
 every entry it overwrote or removed.
 
+Because the background review can add but never remove, its adds can fill memory
+to the limit and leave no room for things you ask it to remember. Set
+`memory.background_add_ceiling` (a fraction of each store's char limit, default
+`1.0`) to keep headroom: an unattended review add that would cross it is not
+saved, and the review is told to save nothing more and put procedures in a skill
+instead. Foreground saves and `/refine` are not affected. For example, `0.8`
+keeps the last 20% of `MEMORY.md` and `USER.md` for foreground turns.
+
 ## Background review notifications (`display.memory_notifications`)
 
 After a turn, the background self-improvement review may quietly save a memory
