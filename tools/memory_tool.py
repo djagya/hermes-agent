@@ -98,8 +98,9 @@ def _gate_or_stage(store: MemoryStore, summary: str, detail: str, payload: dict[
         return unmatched
     FAILURE_CLASS.set("staged")
     record = wa.stage_write(wa.MEMORY, payload, summary=f"{summary}: {detail[:120]}", origin=wa.current_origin())
-    return json.dumps({"success": True, "staged": True, "pending_id": record["id"], "message": decision.message},
-                      ensure_ascii=False)
+    from tools.memory_tool_pending import after_review_stage
+    return json.dumps({"success": True, "staged": True, "pending_id": record["id"], "message": decision.message,
+                       **after_review_stage(record)}, ensure_ascii=False)
 
 
 # action -> (store call, gate (summary, detail) text) for the live tool path and staged replay
@@ -205,11 +206,13 @@ def _background_delete_gate(store, action, operations, target="memory", content=
             summary=(f"background review consolidation ({'batch' if operations is not None else action} "
                      f"on {target}): {detail}")[:200],
             origin=wa.current_origin())
+        from tools.memory_tool_pending import after_review_stage
         return json.dumps({
             "success": True, "staged": True, "proposal_staged": True, "pending_id": record["id"],
             "message": ("Background review may not delete memory entries unattended. The proposed "
                         f"{'batch' if operations is not None else action} was staged for your approval — "
                         "review it with /memory pending (approve to apply, discard to drop)."),
+            **after_review_stage(record),
         }, ensure_ascii=False)
     except Exception:
         logger.warning("Failed to stage background-review consolidation; denying", exc_info=True)

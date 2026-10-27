@@ -361,6 +361,17 @@ staged before this pinning existed has no verifiable target and is refused too:
 reject it and recreate the change. `/memory approve` lists the full text of
 every entry it overwrote or removed.
 
+The background review's own proposals are kept tidy so the queue cannot rot:
+
+- **Expiry:** a proposal staged by the background review that nobody approved
+  within `memory.pending_ttl_days` (default `14`; `0` = never) is discarded, with
+  a log line. Writes staged from a foreground turn never expire.
+- **Latest wins:** when the review stages a new `patch`/`remove` for entries that
+  an older review proposal also targets, the older one is dropped. An older
+  proposal that also touches other entries is kept.
+- **The review sees its queue:** each memory review is shown its own pending
+  proposals, so it does not stage the same consolidation again.
+
 ## Background review notifications (`display.memory_notifications`)
 
 After a turn, the background self-improvement review may quietly save a memory

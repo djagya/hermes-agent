@@ -15,6 +15,9 @@ def _fmt_state(subsystem: str) -> str:
 
 
 def _fmt_pending_list(subsystem: str) -> str:
+    if subsystem == wa.MEMORY:
+        from tools.memory_tool_pending import expire_review_proposals
+        expire_review_proposals()
     records = wa.list_pending(subsystem)
     if not records:
         return f"No pending {subsystem} writes."
