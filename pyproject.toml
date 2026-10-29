@@ -245,6 +245,7 @@ sera-toolbox = [
   "hermes-agent[ddgs]",
   "hermes-agent[fal]",
   "hermes-agent[stt-whisper]",
+  "beautifulsoup4==4.15.0",
   "PyMuPDF==1.28.2",
   "weasyprint==70.0",
   "python-docx==1.2.0",
