@@ -791,7 +791,8 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
         navigate(sup, origins["merchant"] + f"/pp-{variant}")
         with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
             raw = browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"])
-        time.sleep(1.0)  # let every scripted reset finish before reading the frames
+        # No extra wait: the fill itself settles 1.0 s after the last write, past every scripted
+        # reset (the delayed one fires at 300 ms), so the frames are final when it returns.
         outcomes[variant] = (json.loads(raw), frame_values(variant), raw)
         print("OUTCOME", variant, {k: v for k, v in outcomes[variant][0].items()
                                    if k in ("success", "error_type", "filled_fields", "field_retention")},

@@ -320,8 +320,8 @@ def _elicit(message: str, description: str, *, timeout_seconds: int | None,
     from tools import approval as _a
     try:
         session_key = _ctx.get_current_session_key()
-    except Exception as exc:  # pragma: no cover -- defensive
-        logger.warning("Elicitation consent: session lookup failed: %s", exc)
+    except Exception:  # pragma: no cover -- defensive
+        logger.warning("Elicitation consent: session lookup failed", exc_info=True)
         return "decline", "unavailable"
 
     # api_server is an unattended *platform* for the dangerous-command gate, but a live ``/v1/runs`` run
