@@ -107,9 +107,17 @@ def test_fills_are_grouped_per_document_and_every_document_needs_fields():
     assert sp._fills_by_document(holder, [{"index": 0, "value": "4242", "document": 1}])[0] == []
 
 
+@pytest.fixture(autouse=True)
+def _no_settle_wait(monkeypatch):
+    monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
+
+
 class _FakeSupervisor(sp.PaymentSupervisionMixin):
-    def __init__(self, results):
+    """Commit results per document; ``retained`` maps a token to its state after settling (default held)."""
+
+    def __init__(self, results, retained=None):
         self.results, self.writes, self.released = list(results), [], False
+        self.retained = retained or {}
 
     async def _payment_is_current(self, i):
         return True
@@ -117,6 +125,13 @@ class _FakeSupervisor(sp.PaymentSupervisionMixin):
     async def _commit_payment_document(self, d, fills):
         self.writes.append((d.origin, fills))
         return self.results.pop(0)
+
+    async def _payment_retention(self, d):
+        fills = next(f for origin, f in self.writes if origin == d.origin)
+        if self.retained.get(d.origin) == "gone":
+            return None
+        return [{"token": f.get("token", ""), "state": self.retained.get(f.get("token"), "held"),
+                 "length": 0 if self.retained.get(f.get("token")) == "empty" else len(f["value"])} for f in fills]
 
     async def _release_payment_documents(self, i):
         self.released = True
@@ -130,7 +145,8 @@ def test_split_commit_writes_each_document_once_and_sums_fields():
     sup, i = _FakeSupervisor([{"success": True, "filled_fields": 1}, {"success": True, "filled_fields": 2}]), _split_inspection()
     fills = [{"index": 0, "value": "07/35", "document": 0}, {"index": 0, "value": "n", "document": 1},
              {"index": 1, "value": "c", "document": 1}]
-    assert asyncio.run(sup._commit_payment(i, fills)) == {"success": True, "filled_fields": 3}
+    assert asyncio.run(sup._commit_payment(i, fills)) == {"success": True, "filled_fields": 3,
+                                                           "retention_verified": True}
     assert [origin for origin, _ in sup.writes] == [MERCHANT, DATATRANS] and sup.released
     assert asyncio.run(sup._commit_payment(i, fills))["error_type"] == "payment_consent_consumed"
 
@@ -224,3 +240,170 @@ def test_expiry_fits_the_field_length():
     card = {**CARD, "exp_month": "7"}
     assert [f["value"] for f in select_checkout_fills(two, card, PAYMENT_FIELDS)] == ["07", "35"]
     assert [f["value"] for f in select_checkout_fills(four, card, PAYMENT_FIELDS)] == ["07", "2035"]
+
+
+_PAYPAL = "https://www.paypal.com"
+
+
+def _four_hosted_documents():
+    return _inspection(*(PaymentDocument(f"f{n}", f"s{n}", f"o{n}", f"{_PAYPAL}#{n}", _controls(t))
+                         for n, t in enumerate(("cc-name", "cc-exp", "cc-csc", "cc-number"))))
+
+
+def _four_fills():
+    return [{"index": 0, "token": t, "value": v, "document": n} for n, (t, v) in enumerate(
+        (("cc-name", "Ada Lovelace"), ("cc-exp", "07/35"), ("cc-csc", "837"), ("cc-number", "4242424242424242")))]
+
+
+def test_success_needs_every_document_to_hold_after_settling():
+    """The reported shape: four hosted documents each pass their own check, then the number and CVC
+    are empty. Before the settled check this returned success with filled_fields 4."""
+    sup = _FakeSupervisor([{"success": True, "filled_fields": 1}] * 4, retained={"cc-number": "empty", "cc-csc": "empty"})
+    out = asyncio.run(sup._commit_payment(_four_hosted_documents(), _four_fills()))
+    assert out == {"success": False, "error_type": "payment_fields_not_retained", "filled_fields": 2,
+                   "partially_filled": True,
+                   "field_retention": {"cc-csc": "empty", "cc-exp": "held", "cc-name": "held", "cc-number": "empty"},
+                   "field_lengths": {"cc-csc": 0, "cc-number": 0}}
+    assert sup.released and len(sup.writes) == 4  # written once each, never retried
+
+
+def test_an_unreadable_document_after_settling_counts_as_replaced():
+    sup = _FakeSupervisor([{"success": True, "filled_fields": 1}] * 4, retained={f"{_PAYPAL}#3": "gone"})
+    out = asyncio.run(sup._commit_payment(_four_hosted_documents(), _four_fills()))
+    assert out["error_type"] == "payment_fields_not_retained" and out["field_retention"]["cc-number"] == "replaced"
+
+
+def test_retention_result_keeps_only_tokens_states_and_bounded_lengths():
+    fills = [{"token": "cc-number", "value": "4242424242424242"}, {"token": "cc-csc", "value": "837"}]
+    answer = [{"token": "cc-number", "state": "changed", "length": 19, "value": "4242424242424242"},
+              {"token": "cc-csc", "state": "4242", "length": "837"}]
+    out = sp._retention_result([(fills, answer)])
+    assert out["field_retention"] == {"cc-csc": "replaced", "cc-number": "changed"}
+    assert out["field_lengths"] == {"cc-csc": 0, "cc-number": 19}
+    assert "4242" not in json.dumps(out) and "837" not in json.dumps(out)
+    # Missing, extra or mismatched answers are never read as held.
+    for bad in (None, [], answer + [{"token": "cc-name", "state": "held"}], "junk",
+                [{"token": "cc-csc", "state": "held"}, {"token": "cc-number", "state": "held"}]):
+        assert sp._retention_result([(fills, bad)])["field_retention"] == {"cc-csc": "replaced", "cc-number": "replaced"}
+
+
+def _fill_with_consent(monkeypatch, verdict, reason):
+    from tools import browser_vault_payment as bvp
+
+    inspection = _four_hosted_documents()
+    calls = []
+
+    class Supervisor:
+        def inspect_payment(self, *a, **k):
+            return inspection
+
+        def payment_is_current(self, i):
+            calls.append("payment_is_current")
+            return True
+
+        def commit_payment(self, i, fills):
+            calls.append("commit_payment")
+            return {"success": True}
+
+        def discard_payment(self, i):
+            calls.append("discard_payment")
+
+    def consent(*args, outcome=None, **kwargs):
+        if outcome is not None and reason:
+            outcome["reason"] = reason
+        return verdict
+
+    def resolve(handle):
+        calls.append("resolve_secret")
+        return dict(CARD)
+
+    monkeypatch.setattr("tools.browser_vault_tool._ensure_supervisor", lambda task_id: Supervisor())
+    monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session",
+                        lambda task_id, surface=None: calls.append("mark_payment_session"))
+    monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", consent)
+    meta = SimpleNamespace(id="h", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
+                           payment_frame_origins=PAYMENT_PSP_ORIGINS)
+    raw = bvp.fill_payment(SimpleNamespace(name="local", resolve_secret=resolve), meta, "task")
+    return json.loads(raw), calls
+
+
+@pytest.mark.parametrize("verdict, reason, expected", [
+    ("decline", "refused", "refused"), ("cancel", "timeout", "timeout"), ("decline", "unavailable", "unavailable"),
+    ("decline", None, "refused"), ("cancel", None, "timeout"),  # a consent stub without a reason
+])
+def test_consent_not_given_stops_before_any_secret_or_write(monkeypatch, verdict, reason, expected):
+    out, calls = _fill_with_consent(monkeypatch, verdict, reason)
+    # Same error_type as before (callers stop and never retry on it), now with the typed reason.
+    assert out["success"] is False and out["error_type"] == "payment_declined"
+    assert out["consent_outcome"] == expected and out["issuer_response"] is False
+    assert "not a bank or issuer decline" in out["error"]
+    assert calls == ["discard_payment"]  # no freshness pass, no secret, no capture mark, no write
+
+
+def test_not_retained_fill_carries_a_stop_message(monkeypatch):
+    from tools import browser_vault_payment as bvp
+
+    inspection = _four_hosted_documents()
+
+    class Supervisor:
+        def inspect_payment(self, *a, **k):
+            return inspection
+
+        def payment_is_current(self, i):
+            return True
+
+        def commit_payment(self, i, fills):
+            i.consumed = True
+            return {"success": False, "error_type": "payment_fields_not_retained", "filled_fields": 2,
+                    "partially_filled": True, "field_retention": {"cc-number": "empty"}, "field_lengths": {"cc-number": 0}}
+
+        def discard_payment(self, i):
+            pass
+
+    monkeypatch.setattr("tools.browser_vault_tool._ensure_supervisor", lambda task_id: Supervisor())
+    monkeypatch.setattr("tools.browser_vault_tool._bot_desktop_browser_session", lambda task_id: False)
+    monkeypatch.setattr("tools.browser_vault_tool._is_managed", lambda: False)
+    monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session", lambda task_id, surface=None: None)
+    monkeypatch.setattr("agent.redact.register_vault_redaction_value", lambda value: None)
+    monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", lambda *a, **k: "accept")
+    meta = SimpleNamespace(id="h", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
+                           payment_frame_origins=PAYMENT_PSP_ORIGINS)
+    backend = SimpleNamespace(name="local", resolve_secret=lambda handle: dict(CARD))
+    out = json.loads(bvp.fill_payment(backend, meta, "task"))
+    assert out["success"] is False and out["submitted"] is False
+    assert "do not retry" in out["error"] and "not a bank or issuer response" in out["error"]
+
+
+@pytest.mark.parametrize("setup, verdict, reason", [
+    ("gateway_no_callback", "decline", "unavailable"),
+    ("gateway_notify_failed", "decline", "unavailable"),
+    ("gateway_unanswered", "cancel", "timeout"),
+    ("gateway_deny", "decline", "refused"),
+    ("gateway_once", "accept", "accepted"),
+    ("cli_no_user", "decline", "unavailable"),
+    ("cli_timeout", "cancel", "timeout"),
+    ("cli_never_shown", "cancel", "unavailable"),
+    ("cli_deny", "decline", "refused"),
+])
+def test_elicitation_reports_why_consent_ended(monkeypatch, setup, verdict, reason):
+    from tools import approval_prompt as ap
+
+    gateway = setup.startswith("gateway")
+    monkeypatch.setattr(ap._ctx, "get_current_session_key", lambda: "s")
+    monkeypatch.setattr(ap._ctx, "_get_session_platform", lambda: "telegram" if gateway else "cli")
+    monkeypatch.setattr(ap._ctx, "_is_gateway_approval_context", lambda: gateway)
+    monkeypatch.setattr(ap._ctx, "_no_user_can_answer", lambda: setup == "cli_no_user")
+    monkeypatch.setattr(ap._ctx, "_fire_approval_hook", lambda *a, **k: None)
+    monkeypatch.setattr("tools.approval._gateway_notify_cb",
+                        lambda key: None if setup == "gateway_no_callback" else (lambda *a: None))
+    decisions = {"gateway_notify_failed": {"resolved": False, "notify_failed": True},
+                 "gateway_unanswered": {"resolved": False}, "gateway_deny": {"resolved": True, "choice": "deny"},
+                 "gateway_once": {"resolved": True, "choice": "once"}}
+    monkeypatch.setattr(ap._gw, "_await_gateway_decision", lambda *a, **k: decisions[setup])
+    choices = {"cli_timeout": "timeout", "cli_never_shown": ap.Unanswered("no_callback"), "cli_deny": "deny"}
+    monkeypatch.setattr(ap, "prompt_dangerous_approval", lambda *a, **k: choices[setup])
+    monkeypatch.setattr("tools.terminal_tool._get_approval_callback", lambda: None)
+    detail = {}
+    assert ap.request_elicitation_consent("m", "d", outcome=detail) == verdict
+    assert detail == {"reason": reason}
+    assert ap.request_elicitation_consent("m", "d") == verdict  # the verdict alone is unchanged

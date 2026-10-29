@@ -106,6 +106,48 @@ _PROVIDER_PAGES = {
 }
 
 
+# PayPal card fields shape (www.paypal.com/smart/card-field): name, number, expiry and CVV each in its
+# own out-of-process frame. Each variant adds one way a provider can drop a value AFTER the native
+# fill's immediate per-document check; ``el`` is the frame's only input. Synthetic: no PayPal code runs.
+_PP_FIELDS = {"name": "cc-name", "number": "cc-number", "expiry": "cc-exp", "cvv": "cc-csc"}
+_PP_CLEAR_LATER = "el.addEventListener('input',()=>setTimeout(()=>{el.value=''},300))"
+_PP_VARIANTS = {
+    "stable": {},
+    # Controlled input that rejects the write inside its own input handler.
+    "sync": {"number": "el.addEventListener('input',()=>{el.value=''})"},
+    # Controlled inputs that reset from their own state a moment later (the reported symptom).
+    "delayed": {"number": _PP_CLEAR_LATER, "cvv": _PP_CLEAR_LATER},
+    # Brand detection on the number clears the CVC in another frame, after the CVC frame was checked.
+    "brand": {"number": "el.addEventListener('input',()=>parent.postMessage('brand','*'))",
+              "cvv": "addEventListener('message',e=>{if(e.data==='brand')el.value=''})"},
+    # A field that clears itself shortly after it loses focus.
+    "blur": {"cvv": "el.addEventListener('blur',()=>setTimeout(()=>{el.value=''},50))"},
+    # A re-render that swaps the number input for a fresh, empty node.
+    "replace": {"number": "el.addEventListener('input',()=>setTimeout(()=>{const n=document.createElement('input');"
+                "n.autocomplete='cc-number';el.replaceWith(n)},200))"},
+    # The provider re-formats the expiry ("07/35" -> "07 / 35"), which is the same value.
+    "expiry": {"expiry": "el.addEventListener('input',()=>setTimeout(()=>{const d=el.value.replace(/\\D/g,'');"
+               "el.value=d.slice(0,2)+' / '+d.slice(2)},100))"},
+    # ... or drops the separator altogether ("07/35" -> "0735").
+    "expiry_digits": {"expiry": "el.addEventListener('input',()=>{el.value=el.value.replace(/\\D/g,'')})"},
+}
+
+
+def _paypal_page(path, origins):
+    parts = path.split("/")
+    if path.startswith("/smart/card-field/") and len(parts) == 5 and parts[3] in _PP_VARIANTS:
+        variant, field = parts[3], parts[4]
+        script = _PP_VARIANTS[variant].get(field, "")
+        return (f'<input autocomplete="{_PP_FIELDS[field]}" id="{field}">'
+                f'<script>const el=document.getElementById("{field}");{script}</script>')
+    if path.startswith("/pp-") and path[4:] in _PP_VARIANTS:
+        relay = ("<script>addEventListener('message',e=>{if(e.data==='brand')"
+                 "for(let i=0;i<frames.length;i++)frames[i].postMessage('brand','*')})</script>")
+        return relay + "".join(
+            f'<iframe src="{origins["psp"]}/smart/card-field/{path[4:]}/{f}"></iframe>' for f in _PP_FIELDS)
+    return None
+
+
 def _provider_page(path, origins):
     psp = origins.get("psp", "")
     merchants = {
@@ -175,7 +217,8 @@ def payment_browser(tmp_path, record_property):
                 f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
                 "/dt-duplicate": '<input autocomplete="cc-number"><input autocomplete="cc-exp">'
                 f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
-            }.get(self.path) or _shopify_page(self.path, origins) or _provider_page(self.path, origins) or FIELDS
+            }.get(self.path) or _shopify_page(self.path, origins) or _paypal_page(self.path, origins) \
+                or _provider_page(self.path, origins) or FIELDS
             body = (
                 '<!doctype html><form onsubmit="window.submitted=true;return false">'
                 + body
@@ -540,7 +583,7 @@ def test_hosted_oopif_identity_races_and_single_use(payment_browser):
                 sup._page_session_id = "not-the-approved-session"
         out = sup.commit_payment(i, fills)
         if mutation == "normal":
-            assert out == {"success": True, "filled_fields": 3}
+            assert out == {"success": True, "filled_fields": 3, "retention_verified": True}
         else:
             assert not out["success"], mutation
         assert not sup.commit_payment(i, fills)["success"]
@@ -703,3 +746,93 @@ def test_provider_shapes_fill_once_without_submit(payment_browser, tmp_path, mon
     assert out["filled_fields"] == 5 and out["fields"] == ["cc-csc", "cc-exp-month", "cc-exp-year", "cc-name", "cc-number"]
     # The wallet page on the same origin holds a full card form and is never a target.
     assert fill("/wallet")["target_origins"] == [origins["psp"]] and len(frame_values("/smart/")) == 2
+
+
+def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browser, tmp_path, monkeypatch, caplog):
+    """Four hosted card-field frames on one provider origin. A value the provider drops after the
+    per-document check (delayed reset, brand detection in another frame, reset on blur, a replaced
+    node) must not come back as success; a stable fill and a re-formatted expiry must."""
+    from dataclasses import replace
+
+    from agent import vault_payment_policy as policy
+    from agent.vault_store import VaultStore
+    from tools.browser_cdp_tool import browser_cdp
+    from tools.browser_supervisor import _schedule
+    from tools.browser_vault_tool import browser_vault_fill
+
+    sup, origins = payment_browser
+    card_data = {**CARD, "cardholder_name": "Ada Lovelace"}
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item("payment", "Synthetic card", card_data, origin=origins["merchant"])
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    monkeypatch.setattr(policy, "PAYMENT_PSP_ORIGINS", (origins["psp"],))
+    monkeypatch.setattr(policy, "PAYMENT_PROVIDERS", policy.PAYMENT_PROVIDERS + (
+        replace(policy.OPT_IN_PROVIDERS[0], name="synthetic-paypal", origins=(origins["psp"],), max_documents=4,
+                paths=("/smart/card-field",)),))
+
+    def frame_values(variant):
+        out = {}
+        targets = _schedule(sup._cdp("Target.getTargets"), sup._loop, timeout=10)["result"]["targetInfos"]
+        for t in targets:
+            if t["type"] == "iframe" and f"/smart/card-field/{variant}/" in t["url"]:
+                fsid = _schedule(sup._cdp("Target.attachToTarget", {"targetId": t["targetId"], "flatten": True}),
+                                 sup._loop, timeout=10)["result"]["sessionId"]
+                try:
+                    reply = _schedule(sup._cdp("Runtime.evaluate", {
+                        "expression": "document.querySelector('input').value", "returnByValue": True},
+                        session_id=fsid), sup._loop, timeout=10)
+                finally:
+                    _schedule(sup._cdp("Target.detachFromTarget", {"sessionId": fsid}), sup._loop, timeout=10)
+                out[t["url"].rsplit("/", 1)[-1]] = reply["result"]["result"]["value"]
+        return out
+
+    outcomes = {}
+    for variant in _PP_VARIANTS:
+        navigate(sup, origins["merchant"] + f"/pp-{variant}")
+        with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
+            raw = browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"])
+        # No extra wait: the fill itself settles 1.0 s after the last write, past every scripted
+        # reset (the delayed one fires at 300 ms), so the frames are final when it returns.
+        outcomes[variant] = (json.loads(raw), frame_values(variant), raw)
+        print("OUTCOME", variant, {k: v for k, v in outcomes[variant][0].items()
+                                   if k in ("success", "error_type", "filled_fields", "field_retention")},
+              {k: len(v) for k, v in outcomes[variant][1].items()})
+
+    for variant, (out, values, raw) in outcomes.items():
+        assert out["submitted"] is False, variant
+        assert sup.evaluate_runtime("!!window.submitted")["result"] is False
+        # Diagnostics carry states and lengths only, never a field value.
+        for secret in (CARD["card_number"], "4242 4242", CARD["cvc"], "Ada Lovelace", "07/35"):
+            assert secret not in raw, (variant, secret)
+        empty = {f for f, v in values.items() if not v}
+        if out["success"]:
+            # Success is only reported when every written field still holds its value.
+            assert not empty and out["filled_fields"] == 4 and out["retention_verified"] is True, (variant, out)
+        else:
+            assert empty or variant == "replace", (variant, out, values)
+    assert outcomes["stable"][0]["success"] and outcomes["expiry"][0]["success"]
+    assert outcomes["expiry_digits"][0]["success"] and outcomes["expiry_digits"][1]["expiry"] == "0735"
+    assert outcomes["stable"][1] == {"name": "Ada Lovelace", "number": CARD["card_number"], "expiry": "07/35",
+                                     "cvv": CARD["cvc"]}
+    assert outcomes["expiry"][1]["expiry"] == "07 / 35"
+    assert outcomes["sync"][0]["error_type"] == "payment_validation_failed"
+    assert outcomes["sync"][0]["partially_filled"] is True
+    expected = {
+        "delayed": {"cc-number": "empty", "cc-csc": "empty"},
+        "brand": {"cc-csc": "empty"},
+        "blur": {"cc-csc": "empty"},
+        "replace": {"cc-number": "replaced"},
+    }
+    for variant, dropped in expected.items():
+        out = outcomes[variant][0]
+        assert out["error_type"] == "payment_fields_not_retained" and out["partially_filled"] is True, (variant, out)
+        assert out["field_retention"] == {**dict.fromkeys(_PP_FIELDS.values(), "held"), **dropped}, (variant, out)
+        assert out["filled_fields"] == 4 - len(dropped), (variant, out)
+        assert set(out["field_lengths"]) == set(dropped) and all(type(n) is int for n in out["field_lengths"].values())
+    # The capture guard set before the secret write still holds after a fill that did not settle.
+    assert json.loads(browser_cdp("Page.captureScreenshot", task_id="payment-live"))["error_type"] \
+        == "payment_screenshot_blocked"
+    for value in (CARD["card_number"], CARD["cvc"]):
+        assert value not in caplog.text
+    print("RECEIPT paypal_shape stable=PASS expiry_format=PASS expiry_digits=PASS sync_reset=REFUSED delayed_reset=REFUSED "
+          "brand_reset=REFUSED blur_reset=REFUSED replaced_node=REFUSED no_submit=PASS capture_blocked=PASS")

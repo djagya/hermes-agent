@@ -8,6 +8,7 @@ eval or a model tool argument.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -23,6 +24,11 @@ from agent.vault_payment_policy import (
 
 
 _MAX_CARD_DOCUMENTS = 4
+# Bounded wait between the last document's write and the all-documents retention check: long enough
+# for a provider's deferred re-render, validation or brand detection to land, short enough to stay
+# well inside commit_payment's 20 s budget. Never a retry window.
+_SETTLE_SECONDS = 1.0
+_RETENTION_STATES = frozenset({"held", "empty", "changed", "replaced"})
 # Card fields a saved card may lack: left empty for the user instead of refusing the whole fill.
 OPTIONAL_CARD_TOKENS = frozenset({"cc-name", "postal-code"})
 
@@ -500,12 +506,18 @@ class PaymentSupervisionMixin:
             # Every document was re-validated just above. A split checkout is written one
             # document at a time: no cross-document transaction exists, so a later failure
             # reports what an earlier document already received instead of retrying.
+            written = []
             for document, document_fills in _commit_order(i, _fills_by_document(i, fills)):
                 result = await self._commit_payment_document(document, document_fills)
                 if not result.get("success"):
                     return _partial(result, filled)
                 filled += result.get("filled_fields", 0)
-            return {"success": True, "filled_fields": filled}
+                written.append((document, document_fills))
+            # A document's own check runs right after its writes. Providers reset controlled inputs
+            # later, and a later document (brand detection on the number, a blur) can clear an
+            # earlier one, so success is only reported once EVERY document still holds its values.
+            await asyncio.sleep(_SETTLE_SECONDS)
+            return _retention_result([(f, await self._payment_retention(d)) for d, f in written])
         except PaymentPolicyError:
             return _partial({"success": False, "error_type": "payment_fields_invalid"}, filled)
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
@@ -535,6 +547,22 @@ class PaymentSupervisionMixin:
             return {"success": False, "error_type": "payment_result_invalid"}
         return result
 
+    async def _payment_retention(self, d: PaymentDocument) -> list | None:
+        """Per written field ``{token, state, length}`` from the document's commit closure, or None when
+        the document cannot answer (navigated, replaced, transport failure): its fields are then
+        unknown and reported as replaced. Never retried, never a value."""
+        try:
+            states = _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": d.object_id,
+                "functionDeclaration": "function(){return this.retained()}",
+                "returnByValue": True,
+            }, session_id=d.frame_session))
+        except Exception:  # health: allow BLE001 -- a gone document is a failed retention check, never a value
+            return None
+        if not isinstance(states, list):
+            return None
+        return states
+
     async def _release_payment_documents(self, i: PaymentInspection) -> None:
         for d in i.documents:
             await self._release_payment_object(d.frame_session, d.object_id)
@@ -553,6 +581,37 @@ def _commit_order(i: PaymentInspection, groups: list) -> list:
     later write would correctly see as a changed document."""
     pairs = [(d, g) for d, g in zip(i.documents, groups) if g]
     return sorted(pairs, key=lambda p: any(c.token == "cc-number" for c in p[0].controls))
+
+
+def _retention_result(documents: list) -> dict:
+    """Success only when every written field of every document still holds its value after settling.
+    ``documents`` pairs each document's fills with its ``retained()`` answer (None: unreadable). The
+    result names tokens, states and lengths only."""
+    states: dict = {}
+    lengths: dict = {}
+    held = total = 0
+    for fills, answer in documents:
+        answer = answer if isinstance(answer, list) and len(answer) == len(fills) else [None] * len(fills)
+        for f, entry in zip(fills, answer):  # the closure answers in fill order
+            token = str(f.get("token") or "")
+            entry = entry if isinstance(entry, dict) and entry.get("token") == token else {}
+            state = entry.get("state") if entry.get("state") in _RETENTION_STATES else "replaced"
+            total += 1
+            held += state == "held"
+            states[token] = state
+            if state != "held":
+                length = entry.get("length")
+                lengths[token] = length if type(length) is int and 0 <= length <= 256 else 0
+    if total and held == total:
+        return {"success": True, "filled_fields": held, "retention_verified": True}
+    return {
+        "success": False,
+        "error_type": "payment_fields_not_retained",
+        "filled_fields": held,
+        "partially_filled": True,
+        "field_retention": dict(sorted(states.items())),
+        "field_lengths": dict(sorted(lengths.items())),
+    }
 
 
 def _partial(result: dict, filled_before: int) -> dict:
@@ -605,9 +664,26 @@ _INSPECT = r"""(() => {
     (now => now.length === elements.length && now.every((e,n)=>e === elements[n]))(allInputs()) &&
     entries.every(x=>visible(x.e));
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
-  let used = false;
+  // One value in two spellings: providers re-format as they mask ("07/35" -> "07 / 35" or "0735",
+  // grouped card numbers, upper-cased names). Anything else is a different value.
+  const same = (a,b) => a.replace(/[\s\/.-]/g,'').toUpperCase() === b.replace(/[\s\/.-]/g,'').toUpperCase();
+  const live = el => el.isConnected && el.ownerDocument === doc && allInputs().includes(el);
+  let used = false, written = null;
   return {
     describe:()=>describe().filter(x=>selected.has(x.index)), valid,
+    // After every document was written and the page had time to settle: does each written field still
+    // hold its value? States and lengths only; a value never leaves this world. Answers once.
+    retained: () => {
+      const w = written;
+      written = null;
+      if (!w) return null;
+      const page = document === doc && location.href === href;
+      return w.map(f => {
+        const el = elements[f.index];
+        if (!page || !live(el)) return {token:f.token,state:'replaced',length:0};
+        return {token:f.token,state:same(el.value,f.value)?'held':el.value?'changed':'empty',length:el.value.length};
+      });
+    },
     commit: fills => {
       if (used || !valid()) return {success:false,error_type:'payment_fields_changed'};
       used = true;
@@ -624,7 +700,7 @@ _INSPECT = r"""(() => {
       // Page handlers run between these writes, so each target is re-checked first, and success is
       // judged on the inputs still in the document: a re-render that replaced a node must not let
       // its detached copy report a value the live form does not hold.
-      const live = el => el.isConnected && el.ownerDocument === doc && allInputs().includes(el);
+      written = fills.map(f=>({index:f.index,token:String(f.token||''),value:f.value}));
       let attempted = 0;
       for (const f of ordered) {
         const el = elements[f.index];
@@ -638,8 +714,7 @@ _INSPECT = r"""(() => {
         el.dispatchEvent(new FocusEvent('blur'));
         el.blur();
       }
-      const held = fills.filter(f=>live(elements[f.index]) &&
-        elements[f.index].value.replace(/[ -]/g,'') === f.value.replace(/[ -]/g,'')).length;
+      const held = fills.filter(f=>live(elements[f.index]) && same(elements[f.index].value,f.value)).length;
       return held === fills.length && location.href === href ? {success:true,filled_fields:held} :
         {success:false,error_type:'payment_validation_failed',filled_fields:held,partially_filled:true};
     }

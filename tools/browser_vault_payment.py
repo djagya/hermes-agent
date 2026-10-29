@@ -70,6 +70,36 @@ def _set_control_capture_guard(route: dict) -> dict | None:
     }
 
 
+_CONSENT_OUTCOMES = frozenset({"refused", "timeout", "unavailable"})
+_CONSENT_MESSAGES = {
+    "refused": "The user did not approve the card fill.",
+    "timeout": "Nobody answered the card-fill approval in time.",
+    "unavailable": "The card-fill approval could not be shown to the user.",
+}
+_NOT_RETAINED = (
+    "Card fields were written, but after the page settled at least one no longer held its value "
+    "(field_retention names which; states and lengths only). This is not a bank or issuer response and "
+    "nothing was submitted. Do not submit the checkout and do not retry the fill; report it to the user. "
+    "Another fill needs fresh consent."
+)
+
+
+def _consent_not_given(verdict: str, reason: str | None) -> dict:
+    """The stop result when card-fill consent was not given. ``error_type`` stays ``payment_declined``
+    (callers stop on it and never retry); ``consent_outcome`` says whether the user refused, nobody
+    answered in time, or the prompt could not be shown. None of these is an issuer or bank decline."""
+    if reason not in _CONSENT_OUTCOMES:  # a stubbed consent without a reason: infer from the verdict
+        reason = "timeout" if verdict == "cancel" else "refused"
+    return {
+        "success": False,
+        "error_type": "payment_declined",
+        "consent_outcome": reason,
+        "issuer_response": False,
+        "error": _CONSENT_MESSAGES[reason] + " This is not a bank or issuer decline. No card value was read "
+        "and no field was written. Stop; do not retry the fill.",
+    }
+
+
 def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
     from tools import browser_vault_tool as vault
     from tools.approval_prompt import request_elicitation_consent
@@ -93,6 +123,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             frame_origins=effective_frame_origins(meta.payment_frame_origins),
         )
         prompt = inspected.prompt()
+        consent_detail: dict = {}
         consent = request_elicitation_consent(
             f"Fill '{meta.label}' on {prompt['merchant_origin']}",
             f"Card fields will be sent to {prompt['target_origin']}. HTTPS and the selected document/fields "
@@ -101,9 +132,12 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             "tool only fills and never submits payment.",
             surface="vault-payment",
             title="Approve card fill on this merchant?",
+            outcome=consent_detail,
         )
         if consent != "accept":
-            return json.dumps({"success": False, "error_type": "payment_declined"})
+            # Stop here: no secret resolved, no field written. Same error_type as before, so every caller
+            # that stops on payment_declined still stops; consent_outcome says why.
+            return json.dumps(_consent_not_given(consent, consent_detail.get("reason")))
         if not supervisor.payment_is_current(inspected):
             return json.dumps({"success": False, "error_type": "payment_page_changed"})
         # Never resolve at inspection/list time, on decline or on stale consent.
@@ -137,6 +171,8 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
                        "profile_kind": route.get("profile_kind", "")}
         mark_payment_session(task_id, surface)
         result = supervisor.commit_payment(inspected, fills)
+        if result.get("error_type") == "payment_fields_not_retained":
+            result["error"] = _NOT_RETAINED
         result.update(
             kind="payment",
             backend=backend.name,
