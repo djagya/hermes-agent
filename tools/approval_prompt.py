@@ -284,21 +284,45 @@ def _consent(choice, unresolved: str) -> str:
     return unresolved if choice in ("timeout", "cancelled") else "decline"
 
 
+def _consent_reason(choice) -> str:
+    """Why an elicitation ended: ``accepted``, ``refused`` (the user said no), ``timeout`` (asked, nobody
+    answered in time or the prompt was withdrawn) or ``unavailable`` (it never reached a person)."""
+    if choice in ("once", "session", "always"):
+        return "accepted"
+    if isinstance(choice, Unanswered):
+        return "unavailable"
+    return "timeout" if choice in ("timeout", "cancelled") else "refused"
+
+
 def request_elicitation_consent(message: str, description: str, *,
                                 timeout_seconds: int | None = None,
-                                surface: str = "mcp-elicitation", title: str = "Confirm this action?") -> str:
+                                surface: str = "mcp-elicitation", title: str = "Confirm this action?",
+                                outcome: dict | None = None) -> str:
     """Route an MCP elicitation request to the surface owning the active session:
     gateway sessions through ``_await_gateway_decision``, CLI/TUI through
     ``prompt_dangerous_approval``. Always fails closed: a missing notify_cb in a
     gateway session, timeouts, and exceptions map to ``"decline"`` so a server
     treats them as "user did not approve" rather than retrying or hanging.
-    Returns ``"accept" | "decline" | "cancel"``."""
+    Returns ``"accept" | "decline" | "cancel"``.
+
+    ``outcome``, when given, receives ``outcome["reason"]``: one of ``accepted``, ``refused``,
+    ``timeout`` or ``unavailable`` (see ``_consent_reason``). The verdict itself is unchanged, so
+    callers that only read the return value behave exactly as before."""
+    verdict, reason = _elicit(message, description, timeout_seconds=timeout_seconds, surface=surface, title=title)
+    if outcome is not None:
+        outcome["reason"] = reason
+    return verdict
+
+
+def _elicit(message: str, description: str, *, timeout_seconds: int | None,
+            surface: str, title: str) -> tuple[str, str]:
+    """``request_elicitation_consent`` with the reason: ``(verdict, reason)``."""
     from tools import approval as _a
     try:
         session_key = _ctx.get_current_session_key()
     except Exception as exc:  # pragma: no cover -- defensive
         logger.warning("Elicitation consent: session lookup failed: %s", exc)
-        return "decline"
+        return "decline", "unavailable"
 
     # api_server is an unattended *platform* for the dangerous-command gate, but a live ``/v1/runs`` run
     # registers an approval notify callback and answers via ``POST /v1/runs/{id}/approval``
@@ -314,7 +338,7 @@ def request_elicitation_consent(message: str, description: str, *,
         if notify_cb is None:
             logger.warning("Elicitation requested in gateway session %s but no "
                            "notify_cb is registered — failing closed", session_key)
-            return "decline"
+            return "decline", "unavailable"
         try:
             decision = _gw._await_gateway_decision(
                 session_key, notify_cb, {"command": message, "description": description,
@@ -322,18 +346,19 @@ def request_elicitation_consent(message: str, description: str, *,
                                          "pattern_keys": ["mcp_elicitation"]}, surface=surface)
         except Exception as exc:
             logger.error("Elicitation gateway dispatch failed: %s", exc, exc_info=True)
-            return "decline"
+            return "decline", "unavailable"
         if decision.get("notify_failed"):
-            return "decline"
+            return "decline", "unavailable"
         if not decision.get("resolved") or decision.get("cancelled"):
-            return "cancel"  # nobody answered (timeout / prompt withdrawn) — not a user refusal
-        return _consent(decision.get("choice"), "decline")
+            return "cancel", "timeout"  # nobody answered (timeout / prompt withdrawn) — not a user refusal
+        choice = decision.get("choice")
+        return _consent(choice, "decline"), _consent_reason(choice)
 
     # Nobody can answer a -q, cron or unattended-platform worker. A `hermes chat -q` turn still has the CLI's
     # panel callback registered, which would wait the full approval timeout before failing closed.
     if _ctx._no_user_can_answer():
         logger.info("Elicitation consent (%s) declined: no user can answer in this session", surface)
-        return "decline"
+        return "decline", "unavailable"
 
     # Same observer payload as the gateway branch (#131876); post fires in a finally so the
     # wait settles for observers on the early fail-closed return too.
@@ -351,7 +376,7 @@ def request_elicitation_consent(message: str, description: str, *,
         hook_choice = choice
     except Exception as exc:
         logger.error("Elicitation CLI prompt failed: %s", exc, exc_info=True)
-        return "decline"
+        return "decline", "unavailable"
     finally:
         _ctx._fire_approval_hook("post_approval_response", **hook_kwargs, choice=hook_choice)
-    return _consent(choice, "cancel")  # timeout mirrors the gateway's unresolved outcome
+    return _consent(choice, "cancel"), _consent_reason(choice)  # timeout mirrors the gateway's unresolved outcome
