@@ -41,11 +41,21 @@ CVE-2026-111758 exp:2026-11-04
 CVE-2026-111759 exp:2026-11-04
 # undici: 6.27.0 bundled inside npm itself (tools/npm-12.0.2 and node-26.7.0's
 # lib/node_modules/npm), fixed in 6.29.1; no npm release has it yet (12.2.1
-# bundles 6.29.0). The photon sidecar's 7.29.1 is fixed in 7.30.1
-# (2026-10-15 14:18Z), inside the 14-day npm release-age window until
-# 2026-10-29 14:18Z: bump the sidecar lock then. The npm-bundled copy keeps
-# this row until npm and node ship undici >= 6.29.1; re-check on expiry.
+# bundles 6.29.0). The photon sidecar is on 7.30.1 (fixed) since
+# 2026-10-29. The npm-bundled copy keeps this row until npm and node ship
+# undici >= 6.29.1; re-check on expiry.
 CVE-2026-109869 exp:2026-11-12
+# undici 6.27.0 bundled inside npm itself (same two npm trees), flagged
+# 2026-10-29: CVE-2026-109383 (TLS options dropped in Agent, certificate
+# validation bypass) and CVE-2026-87018 (DoS via TLS renegotiation), both
+# fixed in 6.29.1 (2026-10-15). No npm release bundles it yet: the newest,
+# 12.2.1, bundles 6.29.0, and no node 26.x ships a newer npm. npm's undici
+# runs only inside npm (image build, PM installs) against the public registry
+# with default trust; Hermes never loads it. The photon sidecar's copies of
+# both are fixed by its undici 7.30.1 lock bump. Re-check npm and node on
+# expiry; bump pm/lock.json's npm once a release bundles undici >= 6.29.1.
+CVE-2026-109383 exp:2026-11-12
+CVE-2026-87018 exp:2026-11-12
 # zod (CVE-2023-54404, denial of service on unbounded array validation).
 # The photon sidecar is on zod 4.6.7 (fixed). clickup-mcp zod 3.25.76: clickup-mcp 1.8.0 and the latest 1.9.0 require
 # zod ^3.24.2 and the fix exists only in zod 4, a major the server is not
