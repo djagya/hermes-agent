@@ -16,7 +16,12 @@ import pytest
 from agent.vault_login_classifier import LoginControl, classify_checkout_control
 from agent.vault_payment_policy import PAYMENT_PSP_ORIGINS, PaymentPolicyError, https_origin
 from tools import browser_supervisor_payment as sp
-from tools.browser_supervisor_payment import PaymentDocument, PaymentInspection, _card_documents
+from tools.browser_supervisor_payment import (
+    PaymentDocument,
+    PaymentInspection,
+    _card_documents,
+    _explained_card_documents,
+)
 
 MERCHANT = "https://shop.example"
 DATATRANS = "https://pay.datatrans.com"
@@ -407,3 +412,14 @@ def test_elicitation_reports_why_consent_ended(monkeypatch, setup, verdict, reas
     assert ap.request_elicitation_consent("m", "d", outcome=detail) == verdict
     assert detail == {"reason": reason}
     assert ap.request_elicitation_consent("m", "d") == verdict  # the verdict alone is unchanged
+
+
+def test_coverage_refusal_names_an_unsupported_provider_but_other_refusals_stay_fixed():
+    tree = (("page", "", MERCHANT + "/checkout", MERCHANT, ""),
+            ("f1", "", "https://secure.pay1.de/client-api/frame", "https://secure.pay1.de", "page"))
+    with pytest.raises(PaymentPolicyError,
+                       match=r"^Incomplete or ambiguous card fields \(card frames on https://secure\.pay1\.de: PAYONE"):
+        _explained_card_documents([_candidate(MERCHANT, "cc-name", frame="page")], MERCHANT, tree, ())
+    with pytest.raises(PaymentPolicyError, match=r"^Card fields split across payment providers$"):
+        _explained_card_documents(
+            [_candidate(STRIPE, "cc-number"), _candidate("https://pay.datatrans.com", "cc-csc")], MERCHANT, tree, ())
