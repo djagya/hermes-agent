@@ -18,12 +18,19 @@ from agent.vault_login_classifier import LoginControl, classify_checkout_control
 from agent.vault_payment_policy import (
     PAYMENT_PSP_ORIGINS,
     PaymentPolicyError,
+    coverage_hint,
     https_origin,
     provider_for_origin,
 )
 
 
 _MAX_CARD_DOCUMENTS = 4
+# Refusals that mean "no complete reviewed card document": these get coverage_hint's reason.
+_COVERAGE_REFUSALS = frozenset({
+    "Missing, ambiguous or split payment documents",
+    "Incomplete or ambiguous card fields",
+    "Missing card expiry fields",
+})
 # Bounded wait between the last document's write and the all-documents retention check: long enough
 # for a provider's deferred re-render, validation or brand detection to land, short enough to stay
 # well inside commit_payment's 20 s budget. Never a retry window.
@@ -113,6 +120,18 @@ def _card_documents(candidates: list, merchant: str) -> tuple:
     if "cc-exp" in tokens and ("cc-exp-month" in tokens or "cc-exp-year" in tokens):
         raise PaymentPolicyError("Ambiguous card expiry fields")
     return tuple(PaymentDocument(*c) for c in candidates)
+
+
+def _explained_card_documents(candidates: list, merchant: str, tree: tuple, allowed: tuple) -> tuple:
+    """``_card_documents``, with a coverage refusal naming the provider-level cause it can see in the
+    frame tree (an unsupported PSP, a reviewed one not enabled, a non-card-field page)."""
+    try:
+        return _card_documents(candidates, merchant)
+    except PaymentPolicyError as exc:
+        hint = coverage_hint(tree, merchant, allowed) if str(exc) in _COVERAGE_REFUSALS else ""
+        if hint:
+            raise PaymentPolicyError(f"{exc} ({hint})") from None
+        raise
 
 
 def _frame_admitted(record: tuple, by_id: dict, merchant: str, allowed: tuple) -> bool:
@@ -391,7 +410,7 @@ class PaymentSupervisionMixin:
                     await self._cdp(
                         "Runtime.releaseObject", {"objectId": obj}, session_id=fsid
                     )
-            documents = _card_documents(candidates, merchant)
+            documents = _explained_card_documents(candidates, merchant, tree, allowed_frames)
             if await self._payment_tree(sid, child_sessions) != tree:
                 raise PaymentPolicyError("Payment page changed during inspection")
             return PaymentInspection(

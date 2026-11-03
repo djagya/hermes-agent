@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Mapping
 from urllib.parse import urlsplit
@@ -51,6 +52,13 @@ OPT_IN_PROVIDERS = (
     PaymentProvider("saferpay-fields", ("https://www.saferpay.com",), 4, ("/Fields/",)),
 )
 PAYMENT_PROVIDERS = DEFAULT_PROVIDERS + OPT_IN_PROVIDERS
+# Hosted card-field products reviewed and found unsupported (payment-providers.md). Never admitted;
+# named in a refusal so the cause reads as the payment provider, not the shop.
+UNSUPPORTED_PROVIDERS = {
+    "https://secure.pay1.de": "PAYONE Client API hosted iFrames (select-based expiry), not supported",
+    "https://payment.direct.worldline-solutions.com": "Worldline Direct Hosted Tokenization Page, not supported",
+    "https://www.computop-paygate.com": "Computop Paygate, not supported",
+}
 PAYMENT_PSP_ORIGINS = tuple(o for p in DEFAULT_PROVIDERS for o in p.origins)
 
 
@@ -73,6 +81,27 @@ def reviewed_origins() -> tuple:
 
 def provider_for_origin(origin: str) -> PaymentProvider | None:
     return next((p for p in PAYMENT_PROVIDERS if origin in p.origins), None)
+
+
+def coverage_hint(tree: tuple, merchant: str, allowed: tuple) -> str:
+    """Why a checkout yielded no complete reviewed card document, from frame origins and paths only
+    (nothing is read from an unreviewed frame). ``tree`` rows are ``(id, loader, url, origin,
+    parent)`` with the browser's security origin. Only constant provider text and a sanitized path
+    of a reviewed origin appear; '' when nothing specific applies."""
+    notes = []
+    for _fid, _loader, url, origin, parent in tree:
+        if not parent or origin == merchant:
+            continue
+        provider = provider_for_origin(origin)
+        if origin in UNSUPPORTED_PROVIDERS:
+            notes.append(f"card frames on {origin}: {UNSUPPORTED_PROVIDERS[origin]}")
+        elif provider is not None and origin not in allowed:
+            notes.append(f"{origin} is reviewed provider {provider.name}, not enabled in vault.payment_providers")
+        elif provider is not None and not provider.admits(url):
+            path = re.sub(r"[^A-Za-z0-9/_.-]", "", urlsplit(url).path)[:40]
+            notes.append(f"{origin}{path} is not a {provider.name} card-field document "
+                         "(wallet, buttons and guest-checkout pages are out of scope)")
+    return "; ".join(dict.fromkeys(notes))[:400]
 
 
 def effective_frame_origins(override: tuple = ()) -> tuple:
