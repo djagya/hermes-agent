@@ -9,9 +9,13 @@ Bindings are data, not code: one JSON object at
 ``$HERMES_HOME/browser/managed-bridges.json`` mapping a bridge id to its binding.
 The operator installs it owned by root and not group/other-writable, for example
 ``install -o root -g root -m 0644 bindings.json <HERMES_HOME>/browser/managed-bridges.json``.
-The gateway runs unprivileged and owns ``HERMES_HOME``, so it can delete or replace
-that file but cannot make one owned by root; any other owner, a symlink, or a
-writable mode loads no bindings, and every bridge call then fails closed.
+The gateway runs unprivileged and owns ``HERMES_HOME``, so it can delete or move
+that file but cannot create or edit one owned by root. The loader refuses any
+other owner, a writable mode, a hard-linked file, and a path that resolves through
+a symlink; then no bindings load and every bridge call fails closed. Residual: the
+gateway could move a root-owned bindings file the operator left elsewhere in a
+directory it can write (an old copy, another profile's) into place, so keep exactly
+one installed copy per profile home.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -43,9 +48,11 @@ _CHALLENGE_SELECTOR = (
     '[class*="captcha" i], [id*="captcha" i], '
     'input[name*="otp" i], input[name*="one-time" i]'
 )
+# Compared after lowercasing and dropping "_" / "-", so accessToken == access_token.
 _SENSITIVE_KEYS = {
-    "authorization", "cookie", "cookies", "password", "secret", "session_token",
-    "token", "access_token", "refresh_token", "id_token",
+    "authorization", "cookie", "cookies", "setcookie", "password", "secret", "clientsecret",
+    "sessiontoken", "sessionid", "token", "accesstoken", "refreshtoken", "idtoken", "apikey",
+    "bearer", "csrftoken", "xsrftoken",
 }
 
 
@@ -78,13 +85,17 @@ def _load_bindings() -> dict[str, Any]:
     """
     if _gateway_is_root():
         return {}  # a root gateway could write the file itself, so ownership proves nothing
+    path = _bindings_path()
     try:
-        fd = os.open(_bindings_path(), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        # A symlinked browser/ (or file) would let the gateway point at any root-owned file.
+        if os.path.realpath(path) != os.path.join(os.path.realpath(path.parent.parent), path.parent.name, path.name):
+            return {}
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
         return {}
     try:
         info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != _OPERATOR_UID
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != _OPERATOR_UID or info.st_nlink != 1
                 or info.st_mode & 0o022 or info.st_size > _BINDINGS_CAP):
             return {}
         with os.fdopen(fd, "rb") as handle:
@@ -334,7 +345,7 @@ def _assert_public(value: Any, depth: int = 0) -> None:
         raise _BridgeError("response_refused")
     if isinstance(value, dict):
         for key, item in value.items():
-            if str(key).lower() in _SENSITIVE_KEYS:
+            if re.sub(r"[_\-]", "", str(key).lower()) in _SENSITIVE_KEYS:
                 raise _BridgeError("response_refused")
             _assert_public(item, depth + 1)
     elif isinstance(value, list):
@@ -357,15 +368,24 @@ def _public_result(value: Any) -> dict[str, Any]:
     return {"success": True, **result}
 
 
-def _write_archive(value: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any]:
-    encoded = value.pop("archive_base64", None)
+def _archive_destination(binding: dict[str, Any]) -> Path:
+    """Today's pinned archive path, checked before the page export runs."""
     root = binding.get("archive_root")
     name = binding.get("archive_name")
-    if not isinstance(encoded, str) or not isinstance(root, str) or not isinstance(name, str):
-        raise _BridgeError("archive_validation_failed")
-    if len(encoded) > ((_ARCHIVE_CAP + 2) // 3) * 4:
+    if not isinstance(root, str) or not os.path.isabs(root) or not isinstance(name, str):
         raise _BridgeError("archive_validation_failed")
     if not re.fullmatch(r"[a-z0-9-]{1,64}", name):
+        raise _BridgeError("archive_validation_failed")
+    date = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d")
+    destination = Path(root).resolve() / date / "downloads" / f"{name}-{date}.zip"
+    if os.path.lexists(destination):
+        raise _BridgeError("archive_exists")
+    return destination
+
+
+def _write_archive(value: dict[str, Any], destination: Path) -> dict[str, Any]:
+    encoded = value.pop("archive_base64", None)
+    if not isinstance(encoded, str) or len(encoded) > ((_ARCHIVE_CAP + 2) // 3) * 4:
         raise _BridgeError("archive_validation_failed")
     try:
         raw = base64.b64decode(encoded, validate=True)
@@ -384,21 +404,20 @@ def _write_archive(value: dict[str, Any], binding: dict[str, Any]) -> dict[str, 
     except Exception as exc:
         raise _BridgeError("archive_validation_failed") from exc
 
-    date = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d")
-    directory = Path(root).resolve() / date / "downloads"
+    directory = destination.parent
     directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-    destination = directory / f"{name}-{date}.zip"
-    temporary = directory / f".{name}-{os.getpid()}.tmp"
+    if directory.resolve() != directory:  # a symlinked date/downloads dir would escape the root
+        raise _BridgeError("archive_validation_failed")
+    descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=f".{destination.stem}-", suffix=".tmp")
     try:
-        with temporary.open("xb") as output:
-            os.chmod(temporary, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
             output.write(raw)
         try:
             os.link(temporary, destination)
         except FileExistsError as exc:
             raise _BridgeError("archive_exists") from exc
     finally:
-        temporary.unlink(missing_ok=True)
+        os.unlink(temporary)
     return {
         "success": True,
         "archive_file": str(destination),
@@ -451,6 +470,8 @@ def run_managed_bridge(binding_id: str, action: str, *, task_id: Optional[str],
             return {"success": True, "credential_resolved": True}
         if action == "fill":
             expression = _login_expression(credentials or {}, binding)
+            # Recheck after the vault call: a handoff minted meanwhile refuses before the fill.
+            endpoint, target = _held_target(binding, task_id)
             value = _evaluate_expression(endpoint, target, expression,
                                          await_promise=False, timeout_s=10.0)
             _public_result(value)
@@ -459,17 +480,18 @@ def run_managed_bridge(binding_id: str, action: str, *, task_id: Optional[str],
         expression = expressions.get(action) if isinstance(expressions, dict) else None
         if not isinstance(expression, str) or not expression:
             raise _BridgeError("unknown_binding")
+        destination = _archive_destination(binding) if action == "archive" else None
         expression = _guard_read_expression(expression, binding)
         value = _evaluate_expression(endpoint, target, expression, await_promise=True,
                                      timeout_s=180.0 if action == "archive" else 60.0)
-        if action == "archive":
+        if destination is not None:
             if not isinstance(value, dict) or not value.get("ok"):
                 _public_result(value)
-            return _write_archive(value, binding)
+            return _write_archive(value, destination)
         return _public_result(value)
     except _BridgeError as exc:
         return {"success": False, "error": exc.code}
-    except (OSError, TypeError, ValueError, OverflowError):
+    except Exception:  # health: allow BLE001 -- tool boundary; transport errors can carry the lease URL and token, so neither str(exc) nor a traceback may reach the model or logs
         return {"success": False, "error": "bridge_failed"}
 
 

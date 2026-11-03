@@ -324,21 +324,28 @@ def test_browser_exec_without_code_or_bridge_keeps_the_usage_error():
     assert "No code provided" in raw
 
 
-@pytest.mark.parametrize("case", ["ok", "writable", "other_owner", "symlink", "root_gateway", "not_object"])
+@pytest.mark.parametrize("case", [
+    "ok", "writable", "other_owner", "symlink", "parent_symlink", "hardlink", "root_gateway", "not_object",
+])
 def test_bindings_load_only_from_an_operator_owned_file(monkeypatch, tmp_path, case):
-    path = tmp_path / "managed-bridges.json"
-    path.write_text(json.dumps([] if case == "not_object" else {"synthetic": _binding()}))
-    path.chmod(0o666 if case == "writable" else 0o644)
-    if case == "symlink":
-        target, path = path, tmp_path / "link.json"
-        path.symlink_to(target)
+    home = tmp_path / "home"
+    real_dir = tmp_path / "elsewhere" if case == "parent_symlink" else home / "browser"
+    real_dir.mkdir(parents=True)
+    source = real_dir / ("other.json" if case in {"symlink", "hardlink"} else "managed-bridges.json")
+    source.write_text(json.dumps([] if case == "not_object" else {"synthetic": _binding()}))
+    source.chmod(0o666 if case == "writable" else 0o644)
+    path = home / "browser" / "managed-bridges.json"
+    if case == "parent_symlink":
+        home.mkdir()
+        (home / "browser").symlink_to(real_dir)
+    elif case == "symlink":
+        path.symlink_to(source)
+    elif case == "hardlink":
+        os.link(source, path)
     monkeypatch.setattr(bridge, "_bindings_path", lambda: path)
     monkeypatch.setattr(bridge, "_OPERATOR_UID", os.getuid() + (1 if case == "other_owner" else 0))
     monkeypatch.setattr(bridge, "_gateway_is_root", lambda: case == "root_gateway")
-    loaded = _REAL_LOAD_BINDINGS()
-    assert (loaded == {"synthetic": _binding()}) is (case == "ok")
-    if case != "ok":
-        assert loaded == {}
+    assert _REAL_LOAD_BINDINGS() == ({"synthetic": _binding()} if case == "ok" else {})
 
 
 def test_bindings_path_is_fixed_under_hermes_home(monkeypatch, tmp_path):
@@ -405,3 +412,106 @@ def test_read_guard_runs_before_the_pinned_body(origin, challenge, expected):
     observed = _run_js(expression, origin=origin, challenge=challenge)
     assert observed["readStarted"] is (expected is None)
     assert observed["result"].get("error") == expected
+
+
+def test_vault_item_for_another_origin_is_never_resolved(monkeypatch):
+    backend = _credential_owner(monkeypatch)
+    backend.get_meta = lambda handle: SimpleNamespace(kind="login", identifier="synthetic-user",
+                                                      allowed_origins=("https://other.example",), origin=None)
+    backend.resolve_password = lambda handle: pytest.fail("password resolved for a foreign origin")
+    _transport(monkeypatch)
+    assert bridge.run_managed_bridge("synthetic", "fill", task_id="task-1")["error"] == "credential_resolution_failed"
+
+
+def test_missing_task_refuses_before_any_lease_lookup(monkeypatch):
+    monkeypatch.setattr(bridge, "held_managed_cdp", lambda *a, **k: pytest.fail("lease lookup without a task"))
+    monkeypatch.setattr(bridge, "_resolve_credentials", lambda *a: pytest.fail("vault access without a task"))
+    assert bridge.run_managed_bridge("synthetic", "fill", task_id=None) == {"success": False, "error": "lease_not_held"}
+
+
+def test_handoff_minted_during_vault_call_refuses_the_fill(monkeypatch):
+    _credential_owner(monkeypatch)
+    calls = _transport(monkeypatch)
+    answers = iter([None, "lease_handed_off"])
+
+    def held(env, **kwargs):
+        env["BU_CDP_URL"] = LEASE_URL
+        return next(answers)
+
+    monkeypatch.setattr(bridge, "held_managed_cdp", held)
+    assert bridge.run_managed_bridge("synthetic", "fill", task_id="task-1")["error"] == "lease_handed_off"
+    assert calls == []
+
+
+@pytest.mark.parametrize("override", [
+    {"code": "print(1)"}, {"session": "s"}, {"local": True}, {"mode": "qa"}, {"identity": "other"},
+    {"qa_targets": ["https://x.example"]}, {"on_dialog": "accept"}, {"timeout_s": 5},
+])
+def test_bridge_refuses_every_route_override(override):
+    args = dict(binding_id="synthetic", action="route", code="", session="", timeout_s=60, default_timeout_s=60,
+                local=False, mode="", identity="", qa_targets=None, on_dialog="auto", task_id="task-1")
+    args.update(override)
+    assert bridge.dispatch_browser_exec(**args) == {"error": "bridge_override_refused"}
+
+
+@pytest.mark.parametrize("key", ["accessToken", "refresh-token", "Set-Cookie", "sessionId", "apiKey"])
+def test_read_refuses_secret_keys_in_any_spelling(monkeypatch, key):
+    _transport(monkeypatch)
+    monkeypatch.setattr(bridge, "_cdp_call", lambda *a: {"result": {"value": {"ok": True, "nested": [{key: "x"}]}}})
+    assert bridge.run_managed_bridge("synthetic", "route", task_id="task-1")["error"] == "response_refused"
+
+
+def test_transport_exception_never_reaches_the_caller(monkeypatch):
+    _transport(monkeypatch)
+
+    def broken(*args):
+        raise RuntimeError(f"CDP error at {LEASE_URL}")
+
+    monkeypatch.setattr(bridge, "_cdp_call", broken)
+    monkeypatch.setattr(bridge, "_evaluate_expression", lambda *a, **k: broken())
+    assert bridge.run_managed_bridge("synthetic", "route", task_id="task-1") == {"success": False, "error": "bridge_failed"}
+
+
+def _zip(names):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name in names:
+            archive.writestr(name, b"%PDF synthetic")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+@pytest.mark.parametrize("value,error", [
+    ({"ok": True, "archive_base64": _zip(["a.pdf", "b.pdf"]), "document_count": 1}, "archive_validation_failed"),
+    ({"ok": True, "archive_base64": base64.b64encode(b"not a zip").decode(), "document_count": 0},
+     "archive_validation_failed"),
+    ({"ok": True, "archive_base64": "%%%", "document_count": 1}, "archive_validation_failed"),
+    ({"ok": True, "archive_base64": _zip(["a.pdf"])}, "archive_validation_failed"),
+])
+def test_archive_rejects_bad_exports_and_writes_nothing(monkeypatch, tmp_path, value, error):
+    _transport(monkeypatch)
+    monkeypatch.setattr(bridge, "_cdp_call", lambda *a: {"result": {"value": value}})
+    binding = _binding(archive_root=str(tmp_path), archive_name="synthetic-documents")
+    assert bridge.run_managed_bridge("s", "archive", task_id="task-1", bindings={"s": binding})["error"] == error
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+
+
+def test_archive_refuses_a_symlinked_date_directory(monkeypatch, tmp_path):
+    calls = _transport(monkeypatch)
+    root, outside = tmp_path / "root", tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    date = bridge.datetime.now(bridge.ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d")
+    (root / date).symlink_to(outside)
+    binding = _binding(archive_root=str(root), archive_name="synthetic-documents")
+    result = bridge.run_managed_bridge("s", "archive", task_id="task-1", bindings={"s": binding})
+    assert result["error"] == "archive_validation_failed" and calls
+    assert list(outside.rglob("*.zip")) == []
+
+
+def test_existing_archive_refuses_before_the_page_export_runs(monkeypatch, tmp_path):
+    calls = _transport(monkeypatch)
+    binding = _binding(archive_root=str(tmp_path), archive_name="synthetic-documents")
+    bridge._archive_destination(binding).parent.mkdir(parents=True)
+    bridge._archive_destination(binding).write_bytes(b"PK")
+    assert bridge.run_managed_bridge("s", "archive", task_id="task-1", bindings={"s": binding})["error"] == "archive_exists"
+    assert calls == []

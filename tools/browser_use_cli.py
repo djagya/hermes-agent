@@ -953,12 +953,13 @@ def _with_dialogs(result_json: str, dialogs: Optional[dict]) -> str:
 
 def _bridge_or_usage_error(code: str, **bridge_args) -> Optional[str]:
     """A pinned bridge call's result, the usage error for a call with no code, or None for code."""
+    from agent.redact import redact_sensitive_text
     from tools.browser_managed_bridge import dispatch_browser_exec
     from tools.registry import tool_error, tool_result
 
     bridge_result = dispatch_browser_exec(code=code, default_timeout_s=_DEFAULT_TIMEOUT_S, **bridge_args)
     if bridge_result is not None:
-        return tool_result(bridge_result)
+        return redact_sensitive_text(tool_result(bridge_result), force=True)
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
     return None
