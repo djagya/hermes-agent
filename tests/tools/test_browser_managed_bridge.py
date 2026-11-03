@@ -132,7 +132,7 @@ def test_held_lease_refuses_task_and_identity_mismatch(monkeypatch, task_id, ide
 
 
 @pytest.mark.parametrize("alive,error", [(False, "lease_stale"), (None, "lease_unavailable")])
-def test_held_lease_refuses_stale_handed_off_or_unknown_state(monkeypatch, alive, error):
+def test_held_lease_refuses_stale_or_unknown_state(monkeypatch, alive, error):
     key = route._hold_key("task-1", "", "sensitive", "research")
     held = {"BU_CDP_URL": LEASE_URL, route.MANAGED_LEASE_ENV: "lease-1"}
     monkeypatch.setattr(route, "_held_leases", {key: held})
@@ -140,6 +140,23 @@ def test_held_lease_refuses_stale_handed_off_or_unknown_state(monkeypatch, alive
     monkeypatch.setattr(route, "_lease_alive", lambda control, lease: alive)
     monkeypatch.setattr(route, "_acquire_waiting", lambda **kwargs: pytest.fail("must not acquire"))
     assert route.held_managed_cdp({}, task_id="task-1", identity="sensitive", mode="research") == error
+
+
+def test_held_lease_refuses_handoff_until_handback(monkeypatch):
+    key = route._hold_key("task-1", "", "sensitive", "research")
+    held = {
+        "BU_CDP_URL": LEASE_URL,
+        route.MANAGED_SLOT_ENV: "slot-1",
+        route.MANAGED_LEASE_ENV: "lease-1",
+    }
+    monkeypatch.setattr(route, "_held_leases", {key: held})
+    monkeypatch.setattr(route, "_minted_handoffs", {})
+    monkeypatch.setattr(route, "control_url", lambda: "http://control.invalid")
+    monkeypatch.setattr(route, "_lease_alive", lambda control, lease: True)
+    route.note_handoff("task-1", "slot-1", "lease-1", 60)
+    assert route.held_managed_cdp({}, task_id="task-1", identity="sensitive") == "lease_handed_off"
+    assert route.claim_handback("task-1", "slot-1", "lease-1") is True
+    assert route.held_managed_cdp({}, task_id="task-1", identity="sensitive") is None
 
 
 def test_held_lease_refuses_ambient_cdp_override(monkeypatch):

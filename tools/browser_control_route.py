@@ -802,6 +802,19 @@ def held_managed_cdp(
         cached = _held_leases.get(key)
     if not cached:
         return "lease_not_held"
+    owner = str(task_id or "").strip() or "default"
+    handoff_key = (
+        owner,
+        str(cached.get(MANAGED_SLOT_ENV, "")),
+        str(cached.get(MANAGED_LEASE_ENV, "")),
+    )
+    now = _monotonic()
+    with _handoffs_lock:
+        handoff_until = _minted_handoffs.get(handoff_key, 0.0)
+        if handoff_until <= now:
+            _minted_handoffs.pop(handoff_key, None)
+    if handoff_until > now:
+        return "lease_handed_off"
     alive = _lease_alive(control, cached.get(MANAGED_LEASE_ENV, ""))
     if alive is None:
         return "lease_unavailable"
