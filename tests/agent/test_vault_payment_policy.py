@@ -87,8 +87,10 @@ def _tree(*frames):
 
 
 @pytest.mark.parametrize("frame,allowed,expected", [
-    (("https://secure.pay1.de/client-api/iframe?x=1", "https://secure.pay1.de"), (),
-     "card frames on https://secure.pay1.de: PAYONE"),
+    (("https://www.computop-paygate.com/paySSL.aspx?x=1", "https://www.computop-paygate.com"), (),
+     "card frames on https://www.computop-paygate.com: Computop"),
+    (("https://secure.pay1.de/client-api/js/v1/payone_iframe.html", "https://secure.pay1.de"), (),
+     "https://secure.pay1.de is reviewed provider payone-hosted-iframes, not enabled"),
     (("https://js.mollie.com/v1/component/card", "https://js.mollie.com"), (),
      "https://js.mollie.com is reviewed provider mollie-components, not enabled in vault.payment_providers"),
     (("https://www.paypal.com/smart/buttons<b>?q=1", "https://www.paypal.com"), ("https://www.paypal.com",),

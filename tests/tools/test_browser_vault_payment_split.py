@@ -416,9 +416,9 @@ def test_elicitation_reports_why_consent_ended(monkeypatch, setup, verdict, reas
 
 def test_coverage_refusal_names_an_unsupported_provider_but_other_refusals_stay_fixed():
     tree = (("page", "", MERCHANT + "/checkout", MERCHANT, ""),
-            ("f1", "", "https://secure.pay1.de/client-api/frame", "https://secure.pay1.de", "page"))
+            ("f1", "", "https://www.computop-paygate.com/paySSL.aspx", "https://www.computop-paygate.com", "page"))
     with pytest.raises(PaymentPolicyError,
-                       match=r"^Incomplete or ambiguous card fields \(card frames on https://secure\.pay1\.de: PAYONE"):
+                       match=r"^Incomplete or ambiguous card fields \(card frames on https://www\.computop-paygate\.com: Computop"):
         _explained_card_documents([_candidate(MERCHANT, "cc-name", frame="page")], MERCHANT, tree, ())
     with pytest.raises(PaymentPolicyError, match=r"^Card fields split across payment providers$"):
         _explained_card_documents(
@@ -526,3 +526,44 @@ def test_select_expiry_fill_maps_to_the_option_or_refuses_before_any_write(monke
     else:
         assert out["success"] and {f["token"]: f["value"] for f in committed}["cc-exp-year"] == outcome
         assert {f["token"]: f["value"] for f in committed}["cc-exp-month"] == "07"
+
+
+_PP = "https://www.paypal.com"
+_PAYONE = "https://secure.pay1.de"
+
+
+def _rows(*frames):
+    """(id, loader, url, origin, parent) rows under a merchant page "m"."""
+    return {r[0]: r for r in (("m", "", MERCHANT + "/checkout", MERCHANT, ""), *frames)}
+
+
+@pytest.mark.parametrize("frames,target,expected", [
+    # Captured 2026-11-03: PayPal's Buttons guest card form nests inside /smart/buttons.
+    ((("b", "", _PP + "/smart/buttons?x=1", _PP, "m"), ("c", "", _PP + "/smart/card-fields?y", _PP, "b")), "c", True),
+    ((("b", "", _PP + "/smart/buttons", _PP, "m"), ("a", "", "about:blank", _PP, "b"),
+      ("c", "", _PP + "/smart/card-fields", _PP, "a")), "c", True),
+    # The buttons page and PayPal's login/identity pages are never fill targets.
+    ((("b", "", _PP + "/smart/buttons", _PP, "m"),), "b", False),
+    ((("x", "", _PP + "/idapps/xauth/portal", _PP, "m"),), "x", False),
+    # A card form under a PayPal login or identity page is refused, not filled.
+    ((("x", "", _PP + "/idapps/xauth/portal", _PP, "m"), ("c", "", _PP + "/smart/card-fields", _PP, "x")), "c", "raise"),
+    # PAYONE: only its hosted field document, directly under the merchant page.
+    ((("p", "", _PAYONE + "/client-api/js/v1/payone_iframe.html", _PAYONE, "m"),), "p", True),
+    ((("p", "", _PAYONE + "/frontend/other.html", _PAYONE, "m"),), "p", False),
+])
+def test_frame_admission_for_paypal_guest_form_and_payone(frames, target, expected):
+    rows = _rows(*frames)
+    if expected == "raise":
+        with pytest.raises(PaymentPolicyError, match="Unapproved payment frame ancestry"):
+            sp._frame_admitted(rows[target], rows, MERCHANT, (_PP, _PAYONE))
+    else:
+        assert sp._frame_admitted(rows[target], rows, MERCHANT, (_PP, _PAYONE)) is expected
+
+
+def test_payone_checkout_shape_is_five_documents_with_merchant_holder():
+    docs = _card_documents([
+        _candidate(MERCHANT, "cc-name", frame="page"),
+        _candidate(_PAYONE, "cc-number", frame="pan"), _candidate(_PAYONE, "cc-csc", frame="cvc"),
+        _candidate(_PAYONE, "cc-exp-month", frame="mm"), _candidate(_PAYONE, "cc-exp-year", frame="yy"),
+    ], MERCHANT)
+    assert len(docs) == 5

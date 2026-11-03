@@ -143,6 +143,10 @@ def _frame_admitted(record: tuple, by_id: dict, merchant: str, allowed: tuple) -
         provider = provider_for_origin(r[3]) if r[3] != merchant else None
         return provider is None or provider.admits(r[2])
 
+    def may_contain(r: tuple) -> bool:
+        provider = provider_for_origin(r[3]) if r[3] != merchant else None
+        return provider is None or provider.admits_ancestor(r[2])
+
     # Ignore unrelated ads, but never inspect/inject into an arbitrary PSP.
     if record[3] not in (merchant, *allowed) or not on_card_path(record):
         return False
@@ -150,7 +154,7 @@ def _frame_admitted(record: tuple, by_id: dict, merchant: str, allowed: tuple) -
     ancestor = record[4]
     while ancestor:
         above = by_id.get(ancestor)
-        if above is None or above[3] not in (merchant, *allowed) or not on_card_path(above):
+        if above is None or above[3] not in (merchant, *allowed) or not may_contain(above):
             raise PaymentPolicyError("Unapproved payment frame ancestry")  # e.g. inside a wallet page
         ancestor = above[4]
     return True
@@ -295,7 +299,13 @@ class PaymentSupervisionMixin:
                 ]["frameTree"]
                 # Replace the parent's placeholder with the child's authoritative loader/origin.
                 frames[:] = [f for f in frames if f[0] != fid]
+                known = {f[0] for f in frames}
                 walk(child, parent)
+                # Same-origin frames inside this OOPIF (PayPal's guest card form inside /smart/buttons)
+                # are in its process: they are reached through its session, never the page's.
+                for f in frames:
+                    if f[0] not in known:
+                        child_sessions.setdefault(f[0], fsid)
                 pending.remove(target)
                 progress = True
             if not progress:
@@ -456,7 +466,8 @@ class PaymentSupervisionMixin:
                 await self._release_payment_object(parent_sid, obj)
 
     async def _release_payment_sessions(self, sessions: dict) -> None:
-        for sid in sessions.values():
+        # In-process child frames share their OOPIF's session: detach each session once.
+        for sid in dict.fromkeys(sessions.values()):
             try:
                 await self._cdp("Target.detachFromTarget", {"sessionId": sid})
             except Exception:
