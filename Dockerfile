@@ -447,7 +447,7 @@ RUN npm install -g --prefix /usr/local --omit=dev \
 
 # clickup-mcp 1.8.0 (and 1.9.0) pin @modelcontextprotocol/sdk 1.15.1
 # exactly (CVE-2026-104850 fixed in 1.31.0; CVE-2026-111767/111768 in
-# 1.32.0). `npm install -g` ignores
+# 1.32.0); body-parser 2.4.0 is overridden for CVE-2026-111181. `npm install -g` ignores
 # `overrides`, so install it from its lock project (SDK override,
 # integrity-hashed) with the shallow global layout, then move the package
 # dir into the global tree and link its bin the way `npm install -g` does.
@@ -461,7 +461,8 @@ RUN cp -r docker/sera-toolbox/clickup-mcp /tmp/clickup-mcp && \
     cd / && rm -rf /tmp/clickup-mcp && npm cache clean --force && \
     m=/usr/local/lib/node_modules/@hauptsache.net/clickup-mcp && \
     test "$(node -p "require('$m/package.json').version")" = 1.8.0 && \
-    test "$(node -p "require('$m/node_modules/@modelcontextprotocol/sdk/package.json').version")" = 1.32.1
+    test "$(node -p "require('$m/node_modules/@modelcontextprotocol/sdk/package.json').version")" = 1.32.1 && \
+    test "$(node -p "require('$m/node_modules/body-parser/package.json').version")" = 2.4.0
 
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, dep assembly, npm install all run as root) and

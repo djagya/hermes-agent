@@ -62,9 +62,3 @@ CVE-2026-87018 exp:2026-11-12
 # written for, so an override would break it. It validates tool arguments
 # from Sera's own model over stdio, not inbound messages. Re-check then.
 CVE-2023-54404 exp:2026-11-07
-# body-parser 2.3.0 in clickup-mcp (via express 5.2.1 from the MCP SDK).
-# Fixed in 2.4.0 (2026-10-22), inside the 14-day npm window until
-# 2026-11-05. Sera launches clickup-mcp over stdio, so its HTTP transport
-# (the only body-parser user) never listens. Add a body-parser override to
-# clickup-mcp/package.json then.
-CVE-2026-111181 exp:2026-11-06
