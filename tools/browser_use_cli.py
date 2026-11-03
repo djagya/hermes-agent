@@ -954,19 +954,27 @@ def _with_dialogs(result_json: str, dialogs: Optional[dict]) -> str:
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False,
                  mode: str = "", identity: str = "", qa_targets: Optional[list[str]] = None,
-                 on_dialog: str = "auto"):
+                 on_dialog: str = "auto", bridge: str = "", action: str = ""):
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
     from tools.browser_payment_privacy import exec_capture_refusal, exec_slot_capture_refusal
+
+    from tools.browser_managed_bridge import dispatch_browser_exec
+    bridge_result = dispatch_browser_exec(
+        binding_id=bridge, action=action, code=code, session=session,
+        timeout_s=timeout_s, default_timeout_s=_DEFAULT_TIMEOUT_S, local=local,
+        mode=mode, identity=identity, qa_targets=qa_targets, on_dialog=on_dialog,
+        task_id=task_id,
+    )
+    if bridge_result is not None:
+        return tool_result(bridge_result)
 
     # Unmanaged: a card fill blocks capture for the whole profile. Managed: the slot control
     # grants this call is checked in dispatch(), so a re-route is checked too.
     refused = exec_capture_refusal(code, task_id)
     if refused:
         return refused
-    if not code or not code.strip():
-        return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 
     # The verdict is carried into the route, never re-derived: the predicate resolves DNS, so a second
     # evaluation could relax the floor and still pick the cloud for a rebinding host.
@@ -1261,7 +1269,18 @@ def _dynamic_schema_overrides() -> dict:
                 "Shared proxies are refused."
             ),
         }
-        overrides["parameters"] = {**BROWSER_EXEC_SCHEMA["parameters"], "properties": props}
+        props["bridge"] = {
+            "type": "string",
+            "description": "Operator-installed pinned bridge id. Supply only bridge and action; no code or route overrides.",
+        }
+        props["action"] = {
+            "type": "string",
+            "enum": ["verify", "fill", "route", "capture", "archive"],
+            "description": "Action exposed by the pinned bridge binding.",
+        }
+        overrides["parameters"] = {
+            **BROWSER_EXEC_SCHEMA["parameters"], "properties": props, "required": [],
+        }
     return overrides
 
 
@@ -1300,6 +1319,8 @@ registry.register(
         identity=args.get("identity", "") or "",
         qa_targets=args.get("qa_targets"),
         on_dialog=str(args.get("on_dialog") or "auto"),
+        bridge=str(args.get("bridge", "") or ""),
+        action=str(args.get("action", "") or ""),
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,

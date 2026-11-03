@@ -778,6 +778,40 @@ def _resolve_held(
     return None
 
 
+def held_managed_cdp(
+    env: dict[str, str],
+    *,
+    task_id: Optional[str],
+    identity: str,
+    mode: str = "research",
+) -> Optional[str]:
+    """Reuse only this task/identity's live held lease; never acquire a browser.
+
+    Pinned native bridges run after another browser call established the lease.
+    A missing, stale, handed-off or differently-owned lease is a refusal, not a
+    reason to create a fresh browser that would not contain the commissioned tab.
+    """
+    control = control_url()
+    if not control or is_disabled_url(control):
+        return "lease_unavailable"
+    refused = _refuse_overrides(env, _ambient_cdp_override())
+    if refused:
+        return refused
+    key = _hold_key(task_id, "", identity, _coerce_mode(mode))
+    with _held_lock:
+        cached = _held_leases.get(key)
+    if not cached:
+        return "lease_not_held"
+    alive = _lease_alive(control, cached.get(MANAGED_LEASE_ENV, ""))
+    if alive is None:
+        return "lease_unavailable"
+    if not alive:
+        _forget_held(key)
+        return "lease_stale"
+    env.update(cached)
+    return None
+
+
 def managed_cdp_or_error(
     env: Optional[dict[str, str]] = None,
     *,
