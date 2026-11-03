@@ -133,8 +133,21 @@ _PP_VARIANTS = {
 }
 
 
+_PP_GUEST_FORM = ('<label for="email">E-Mail</label><input id="email" name="email" autocomplete="email" value="a@b.example">'
+                  '<label for="n">Kreditkartennummer</label><input id="n" name="cardnumber" type="tel" autocomplete="cc-number">'
+                  '<label for="e">G\u00fcltig bis</label><input id="e" name="expiry-date" type="tel" autocomplete="cc-exp">'
+                  '<label for="c">Pr\u00fcfnr.</label><input id="c" name="credit-card-security" type="tel" autocomplete="cc-csc">'
+                  '<label for="p">Handy</label><input id="p" name="phone" type="tel" autocomplete="tel">')
+
+
 def _paypal_page(path, origins):
     parts = path.split("/")
+    if path == "/pp-guest":
+        return f'<iframe src="{origins["psp"]}/smart/buttons/g"></iframe>'
+    if path == "/smart/buttons/g":
+        return f'<button>PayPal</button><iframe src="{origins["psp"]}/smart/card-fields/g"></iframe>'
+    if path == "/smart/card-fields/g":
+        return _PP_GUEST_FORM
     if path.startswith("/smart/card-field/") and len(parts) == 5 and parts[3] in _PP_VARIANTS:
         variant, field = parts[3], parts[4]
         script = _PP_VARIANTS[variant].get(field, "")
@@ -145,6 +158,34 @@ def _paypal_page(path, origins):
                  "for(let i=0;i<frames.length;i++)frames[i].postMessage('brand','*')})</script>")
         return relay + "".join(
             f'<iframe src="{origins["psp"]}/smart/card-field/{path[4:]}/{f}"></iframe>' for f in _PP_FIELDS)
+    return None
+
+
+# PAYONE Client API hosted-iFrame shape (secure.pay1.de, field names from the Client API docs): one
+# frame per field, expiry month and year as <select>; the brand select and the holder input stay on the
+# merchant page. Synthetic: no PAYONE code runs. ``noyear`` lacks the card's expiry year.
+_PAYONE_YEARS = {"ok": range(2026, 2041), "noyear": range(2026, 2035)}
+
+
+def _payone_page(path, origins):
+    parts = path.split("/")
+    record = "<script>window.seen=[];el.addEventListener('input',()=>seen.push('input'));" \
+             "el.addEventListener('change',()=>seen.push('change'))</script>"
+    if path.startswith("/payone-field/") and len(parts) == 4 and parts[2] in _PAYONE_YEARS:
+        field = parts[3]
+        if field in ("cardpan", "cardcvc2"):
+            return f'<input type="text" id="{field}" name="{field}"><script>const el=document.querySelector("input")</script>' + record
+        options = {"cardexpiremonth": ["0"] + [str(m) for m in range(1, 13)],
+                   "cardexpireyear": ["0"] + [str(y) for y in _PAYONE_YEARS[parts[2]]]}.get(field)
+        if options is None:
+            return None
+        return (f'<select id="{field}" name="{field}">' + "".join(f"<option value='{o}'>{o}</option>" for o in options)
+                + '</select><script>const el=document.querySelector("select")</script>' + record)
+    if path.startswith("/payone-") and path[8:] in _PAYONE_YEARS:
+        return ('<select id="cardtype" name="cardtype"><option value=""></option><option value="V">Visa</option><option value="M">Mastercard</option>'
+                '</select><label for="cardholder">Cardholder</label><input id="cardholder" name="cardholder">'
+                + "".join(f'<iframe src="{origins["psp"]}/payone-field/{path[8:]}/{f}"></iframe>'
+                          for f in ("cardpan", "cardcvc2", "cardexpiremonth", "cardexpireyear")))
     return None
 
 
@@ -218,6 +259,7 @@ def payment_browser(tmp_path, record_property):
                 "/dt-duplicate": '<input autocomplete="cc-number"><input autocomplete="cc-exp">'
                 f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
             }.get(self.path) or _shopify_page(self.path, origins) or _paypal_page(self.path, origins) \
+                or _payone_page(self.path, origins) \
                 or _provider_page(self.path, origins) or FIELDS
             body = (
                 '<!doctype html><form onsubmit="window.submitted=true;return false">'
@@ -836,3 +878,126 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
         assert value not in caplog.text
     print("RECEIPT paypal_shape stable=PASS expiry_format=PASS expiry_digits=PASS sync_reset=REFUSED delayed_reset=REFUSED "
           "brand_reset=REFUSED blur_reset=REFUSED replaced_node=REFUSED no_submit=PASS capture_blocked=PASS")
+
+
+def test_payone_shaped_select_expiry_fills_once_or_refuses_without_writes(payment_browser, tmp_path, monkeypatch, caplog):
+    """PAYONE-shaped hosted fields: number, CVC, expiry month and year each in their own provider frame,
+    month and year as <select>. A matching year fills once without submit and passes the settled retention
+    check; a year list without the card's year refuses before any document is written."""
+    from dataclasses import replace
+
+    from agent import vault_payment_policy as policy
+    from agent.vault_store import VaultStore
+    from tools.browser_supervisor import _schedule
+    from tools.browser_vault_tool import browser_vault_fill
+
+    sup, origins = payment_browser
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item("payment", "Synthetic card", {**CARD, "cardholder_name": "Ada Lovelace"},
+                          origin=origins["merchant"])
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    monkeypatch.setattr(policy, "PAYMENT_PSP_ORIGINS", (origins["psp"],))
+    # Four provider frames plus the merchant's holder input: five documents.
+    monkeypatch.setattr(policy, "PAYMENT_PROVIDERS", policy.PAYMENT_PROVIDERS + (
+        replace(policy.OPT_IN_PROVIDERS[0], name="synthetic-payone", origins=(origins["psp"],), max_documents=5,
+                paths=("/payone-field",)),))
+
+    def frame_state(variant):
+        out = {}
+        targets = _schedule(sup._cdp("Target.getTargets"), sup._loop, timeout=10)["result"]["targetInfos"]
+        for t in targets:
+            if t["type"] == "iframe" and f"/payone-field/{variant}/" in t["url"]:
+                fsid = _schedule(sup._cdp("Target.attachToTarget", {"targetId": t["targetId"], "flatten": True}),
+                                 sup._loop, timeout=10)["result"]["sessionId"]
+                try:
+                    reply = _schedule(sup._cdp("Runtime.evaluate", {
+                        "expression": "[el.value, seen]", "returnByValue": True}, session_id=fsid), sup._loop, timeout=10)
+                finally:
+                    _schedule(sup._cdp("Target.detachFromTarget", {"sessionId": fsid}), sup._loop, timeout=10)
+                out[t["url"].rsplit("/", 1)[-1]] = reply["result"]["result"]["value"]
+        return out
+
+    def merchant_values():
+        return sup.evaluate_runtime("[cardtype.value, cardholder.value]")["result"]
+
+    navigate(sup, origins["merchant"] + "/payone-ok")
+    with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
+        raw = browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"])
+    out = json.loads(raw)
+    assert out["success"] and out["retention_verified"] is True and out["filled_fields"] == 5, out
+    assert out["submitted"] is False and sup.evaluate_runtime("!!window.submitted")["result"] is False
+    assert out["fields"] == ["cc-csc", "cc-exp-month", "cc-exp-year", "cc-name", "cc-number"]
+    state = frame_state("ok")
+    assert {f: v[0] for f, v in state.items()} == {"cardpan": CARD["card_number"], "cardcvc2": CARD["cvc"],
+                                                   "cardexpiremonth": "7", "cardexpireyear": "2035"}, state
+    assert state["cardexpiremonth"][1] == state["cardexpireyear"][1] == ["input", "change"]
+    assert merchant_values() == ["", "Ada Lovelace"]  # the brand select is never a card field
+    for secret in (CARD["card_number"], CARD["cvc"]):
+        assert secret not in raw and secret not in caplog.text
+    print("RECEIPT payone_shape select_expiry=PASS retention=PASS no_submit=PASS")
+
+    navigate(sup, origins["merchant"] + "/payone-noyear")
+    with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
+        raw = browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"])
+    out = json.loads(raw)
+    assert out["success"] is False and out["error_type"] == "payment_expiry_option_unmatched", out
+    assert CARD["card_number"] not in raw and CARD["cvc"] not in raw
+    state = frame_state("noyear")
+    assert len(state) == 4 and all(v[1] == [] for v in state.values()), state  # no event reached any frame
+    assert state["cardpan"][0] == state["cardcvc2"][0] == "" and merchant_values() == ["", ""]
+    assert state["cardexpiremonth"][0] == "0" and state["cardexpireyear"][0] == "0"  # untouched defaults
+    assert sup.evaluate_runtime("!!window.submitted")["result"] is False
+    print("RECEIPT payone_shape missing_year=REFUSED zero_writes=PASS")
+
+
+def test_paypal_guest_card_form_inside_buttons_fills_once(payment_browser, tmp_path, monkeypatch):
+    """The Buttons guest form nests /smart/card-fields inside /smart/buttons on the provider origin.
+    Admitted only because the reviewed row lists /smart/buttons as an ancestor path; the email and
+    phone inputs beside the card fields are never written."""
+    from dataclasses import replace
+
+    from agent import vault_payment_policy as policy
+    from agent.vault_store import VaultStore
+    from tools.browser_supervisor import _schedule
+    from tools.browser_vault_tool import browser_vault_fill
+
+    sup, origins = payment_browser
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item("payment", "Synthetic card", dict(CARD), origin=origins["merchant"])
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    monkeypatch.setattr(policy, "PAYMENT_PSP_ORIGINS", (origins["psp"],))
+    row = replace(policy.OPT_IN_PROVIDERS[0], name="synthetic-paypal-guest", origins=(origins["psp"],),
+                  max_documents=4, paths=("/smart/card-field", "/smart/card-fields"), ancestor_paths=())
+
+    def fill(provider):
+        monkeypatch.setattr(policy, "PAYMENT_PROVIDERS", policy.DEFAULT_PROVIDERS + (provider,))
+        navigate(sup, origins["merchant"] + "/pp-guest")
+        with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
+            return json.loads(browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"]))
+
+    def form_values():
+        targets = _schedule(sup._cdp("Target.getTargets"), sup._loop, timeout=10)["result"]["targetInfos"]
+        # /smart/card-fields is same-origin with /smart/buttons, so it lives in the buttons frame's process.
+        frame = next(t for t in targets if t["type"] == "iframe" and t["url"].endswith("/smart/buttons/g"))
+        fsid = _schedule(sup._cdp("Target.attachToTarget", {"targetId": frame["targetId"], "flatten": True}),
+                         sup._loop, timeout=10)["result"]["sessionId"]
+        try:
+            reply = _schedule(sup._cdp("Runtime.evaluate", {
+                "expression": "Object.fromEntries([...document.querySelector('iframe').contentDocument"
+                              ".querySelectorAll('input')].map(i=>[i.id,i.value]))",
+                "returnByValue": True}, session_id=fsid), sup._loop, timeout=10)
+        finally:
+            _schedule(sup._cdp("Target.detachFromTarget", {"sessionId": fsid}), sup._loop, timeout=10)
+        return reply["result"]["result"]["value"]
+
+    refused = fill(row)
+    assert refused["success"] is False and "ancestry" in refused["error"].lower(), refused
+    assert form_values()["n"] == ""
+
+    out = fill(replace(row, ancestor_paths=("/smart/buttons",)))
+    assert out["success"] is True and out["submitted"] is False and out["filled_fields"] == 3, out
+    assert CARD["card_number"] not in json.dumps(out) and CARD["cvc"] not in json.dumps(out)
+    values = form_values()
+    assert values["n"] == CARD["card_number"] and values["c"] == CARD["cvc"] and values["e"]
+    assert values["email"] == "a@b.example" and values["p"] == ""
+    assert sup.evaluate_runtime("!!window.submitted")["result"] is False

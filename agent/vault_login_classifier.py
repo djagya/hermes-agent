@@ -35,18 +35,19 @@ ADDRESS_AUTOFILL_TOKENS = ("address-line1", "address-line2", "address-level2", "
                            "postal-code", "country-name", "country")
 # Labels are matched after _normalize_text (lower-case ASCII, umlauts/accents folded: "Prüfnummer" ->
 # "prufnummer"). Besides English: German, French, Dutch, Spanish and Italian checkout labels; the CVC row
-# comes before the number row because "Kartenprüfnummer" also names a number.
+# comes before the number row because "Kartenprüfnummer" also names a number. ``cardpan``, ``cardcvc2``,
+# ``cardexpiremonth`` and ``cardexpireyear`` are the PAYONE Client API hosted-iFrame field names.
 _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:cvc|cvv|csc|cvn|ccv|security\s*code|card\s*code|(?:karten)?prufnummer|prufziffer|"
                 r"sicherheitscode|cryptogramme|code\s*de\s*securite|beveiligingscode|codigo\s*de\s*seguridad|"
-                r"codice\s*di\s*sicurezza)\b"), "cc-csc"),
+                r"codice\s*di\s*sicurezza|cardcvc2?)\b"), "cc-csc"),
     (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num|pan|kartennummer|numero\s*de\s*(?:la\s*)?carte|"
-                r"kaartnummer|numero\s*de\s*(?:la\s*)?tarjeta|numero\s*(?:della\s*)?carta)\b"), "cc-number"),
+                r"kaartnummer|numero\s*de\s*(?:la\s*)?tarjeta|numero\s*(?:della\s*)?carta|cardpan)\b"), "cc-number"),
     (re.compile(r"\b(?:name\s*on\s*card|cardholder|cc\s*name|ccname|karteninhaber(?:in|s)?|name\s*auf\s*der\s*karte|"
                 r"titulaire(?:\s*de\s*la\s*carte)?|kaarthouder|titular(?:\s*de\s*la\s*tarjeta)?|"
                 r"intestatario(?:\s*della\s*carta)?)\b"), "cc-name"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?\s*month|exp\s*mm|ccmonth|ablaufmonat)\b"), "cc-exp-month"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?\s*year|exp\s*yy(?:yy)?|ccyear|ablaufjahr)\b"), "cc-exp-year"),
+    (re.compile(r"\b(?:exp(?:iry|iration)?\s*month|exp\s*mm|ccmonth|ablaufmonat|cardexpiremonth)\b"), "cc-exp-month"),
+    (re.compile(r"\b(?:exp(?:iry|iration)?\s*year|exp\s*yy(?:yy)?|ccyear|ablaufjahr|cardexpireyear)\b"), "cc-exp-year"),
     (re.compile(r"\b(?:exp(?:iry|iration)?(?:\s*date)?|mm\s*yy|valid\s*thru|ablaufdatum|gultig\s*bis|"
                 r"verfallsdatum|date\s*d\s*expiration|vervaldatum|fecha\s*de\s*(?:caducidad|vencimiento)|"
                 r"data\s*di\s*scadenza|scadenza)\b"), "cc-exp"),
@@ -91,6 +92,9 @@ class LoginControl:
     name: str
     type: str
     max_length: Optional[int] = None
+    # ``<select>`` only: ``(value, visible text, disabled)`` per option, in DOM order. Months and years
+    # are not secrets; the native card fill matches the expiry against them (match_expiry_option).
+    options: tuple = ()
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
@@ -104,7 +108,15 @@ class LoginControl:
             name=str(raw.get("name") or ""),
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
+            options=_options(raw.get("options")),
         )
+
+
+def _options(raw: Any) -> tuple:
+    if not isinstance(raw, list):
+        return ()
+    return tuple((str(o[0]), str(o[1]), o[2] is True) for o in raw[:400]
+                 if isinstance(o, (list, tuple)) and len(o) == 3)
 
 
 @dataclass(frozen=True)
@@ -195,9 +207,22 @@ def select_password_fill(
     ]
 
 
+_SELECT_CARD_TOKENS = frozenset({"cc-exp-month", "cc-exp-year"})
+
+
 def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
     """Classify one control as a payment/address fill target (autocomplete token exact match 100,
-    label/name heuristic 70), or None. Password/email inputs are never checkout targets."""
+    label/name heuristic 70), or None. Password/email inputs are never checkout targets. A ``<select>``
+    is only ever an expiry month or year among the card tokens (PAYONE, Worldline HTP, Computop), never
+    the number, CVC, holder or a combined expiry."""
+    result = _classify_checkout_control(control)
+    if (result is not None and control.type == "select" and result.token.startswith("cc-")
+            and result.token not in _SELECT_CARD_TOKENS):
+        return None
+    return result
+
+
+def _classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
     tokens = [t for t in control.autocomplete.lower().split() if t]
     for token in PAYMENT_AUTOFILL_TOKENS + ADDRESS_AUTOFILL_TOKENS:
         if token in tokens:
@@ -232,6 +257,25 @@ def _fit_expiry(token: str, value: str, max_length: Optional[int]) -> str:
     if token == "cc-exp-year" and value.isdigit() and max_length == 2:
         return value[-2:]
     return value
+
+
+def match_expiry_option(token: str, value: str, options: tuple) -> Optional[str]:
+    """The value of the ONE enabled option of an expiry ``<select>`` whose value or visible text is the
+    month ("07" or "7") or the year (four-digit "2035" or two-digit "35"), or None when no option or
+    several options match: the caller then refuses the fill. Only numbers match, never a month name, so
+    a zero-based month list ("6" shown as "07") reads as ambiguous instead of picking June."""
+    if not value.isdigit():
+        return None
+    if token == "cc-exp-month":
+        wanted = {str(int(value)), str(int(value)).zfill(2)}
+    elif token == "cc-exp-year" and len(value) == 4:
+        wanted = {value, value[-2:]}
+    else:
+        return None
+    matches = [o for o in options if not o[2] and o[0] and (o[0].strip() in wanted or o[1].strip() in wanted)]
+    if len(matches) != 1 or sum(o[0] == matches[0][0] for o in options) != 1:
+        return None
+    return matches[0][0]
 
 
 def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict[str, str],

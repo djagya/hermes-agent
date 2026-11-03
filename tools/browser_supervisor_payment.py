@@ -143,6 +143,10 @@ def _frame_admitted(record: tuple, by_id: dict, merchant: str, allowed: tuple) -
         provider = provider_for_origin(r[3]) if r[3] != merchant else None
         return provider is None or provider.admits(r[2])
 
+    def may_contain(r: tuple) -> bool:
+        provider = provider_for_origin(r[3]) if r[3] != merchant else None
+        return provider is None or provider.admits_ancestor(r[2])
+
     # Ignore unrelated ads, but never inspect/inject into an arbitrary PSP.
     if record[3] not in (merchant, *allowed) or not on_card_path(record):
         return False
@@ -150,7 +154,7 @@ def _frame_admitted(record: tuple, by_id: dict, merchant: str, allowed: tuple) -
     ancestor = record[4]
     while ancestor:
         above = by_id.get(ancestor)
-        if above is None or above[3] not in (merchant, *allowed) or not on_card_path(above):
+        if above is None or above[3] not in (merchant, *allowed) or not may_contain(above):
             raise PaymentPolicyError("Unapproved payment frame ancestry")  # e.g. inside a wallet page
         ancestor = above[4]
     return True
@@ -295,7 +299,13 @@ class PaymentSupervisionMixin:
                 ]["frameTree"]
                 # Replace the parent's placeholder with the child's authoritative loader/origin.
                 frames[:] = [f for f in frames if f[0] != fid]
+                known = {f[0] for f in frames}
                 walk(child, parent)
+                # Same-origin frames inside this OOPIF (PayPal's guest card form inside /smart/buttons)
+                # are in its process: they are reached through its session, never the page's.
+                for f in frames:
+                    if f[0] not in known:
+                        child_sessions.setdefault(f[0], fsid)
                 pending.remove(target)
                 progress = True
             if not progress:
@@ -456,7 +466,8 @@ class PaymentSupervisionMixin:
                 await self._release_payment_object(parent_sid, obj)
 
     async def _release_payment_sessions(self, sessions: dict) -> None:
-        for sid in sessions.values():
+        # In-process child frames share their OOPIF's session: detach each session once.
+        for sid in dict.fromkeys(sessions.values()):
             try:
                 await self._cdp("Target.detachFromTarget", {"sessionId": sid})
             except Exception:
@@ -641,13 +652,14 @@ def _partial(result: dict, filled_before: int) -> dict:
 
 _INSPECT = r"""(() => {
   const doc = document, href = location.href;
-  // Inputs in document order, including those inside open shadow roots (Unzer UI v2 renders every
-  // card input in one); closed roots stay out of reach and therefore out of scope.
+  // Inputs and selects in document order, including those inside open shadow roots (Unzer UI v2
+  // renders every card input in one); closed roots stay out of reach and therefore out of scope. A
+  // select is only ever an expiry month or year (PAYONE, Worldline HTP, Computop).
   const allInputs = () => {
     const out = [];
     const walk = root => {
       for (const n of root.querySelectorAll('*')) {
-        if (n.tagName === 'INPUT') out.push(n);
+        if (n.tagName === 'INPUT' || n.tagName === 'SELECT') out.push(n);
         if (n.shadowRoot) walk(n.shadowRoot);
       }
     };
@@ -655,11 +667,16 @@ _INSPECT = r"""(() => {
     return out;
   };
   const elements = allInputs();
+  const isSelect = e => e.tagName === 'SELECT';
+  // A select's options (months, years: never a secret) are part of the description, so a list that
+  // is re-populated after consent fails valid() like any other changed field.
   const describe = () => elements.map((e,index) => ({index, autocomplete:e.autocomplete,
     name:e.name+' '+e.id, label:(e.labels?Array.from(e.labels,l=>l.textContent).join(' '):'')+' '+
       (e.getAttribute('aria-label')||'')+' '+(e.placeholder||''),
-    type:e.type, formIndex:e.form?Array.from(doc.forms).indexOf(e.form):null,
-    maxLength:e.maxLength>0?e.maxLength:null}));
+    type:isSelect(e)?(e.multiple?'select-multiple':'select'):e.type,
+    formIndex:e.form?Array.from(doc.forms).indexOf(e.form):null,
+    maxLength:e.maxLength>0?e.maxLength:null,
+    ...(isSelect(e)?{options:Array.from(e.options,o=>[o.value,o.text.slice(0,64),o.disabled]).slice(0,400)}:{})}));
   // Honeypots and visually-hidden inputs are never fill targets: Shopify's PCI frames carry one
   // aria-hidden, tabindex=-1, 1px input per card token around the real field, and filling one
   // is a fraud signal.
@@ -675,7 +692,7 @@ _INSPECT = r"""(() => {
        e.checkVisibility({opacityProperty: true, visibilityProperty: true}));  // a transparent ancestor too
   };
   const entries = elements.map((e,index)=>({e,index})).filter(x=>visible(x.e) &&
-    !['hidden','submit','button','reset','file','image','checkbox','radio'].includes(x.e.type));
+    !['hidden','submit','button','reset','file','image','checkbox','radio','select-multiple'].includes(x.e.type));
   const selected = new Set(entries.map(x=>x.index));
   const signature = JSON.stringify(describe());
   const valid = () => document === doc && location.href === href &&
@@ -683,6 +700,10 @@ _INSPECT = r"""(() => {
     (now => now.length === elements.length && now.every((e,n)=>e === elements[n]))(allInputs()) &&
     entries.every(x=>visible(x.e));
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+  const selectSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;
+  // A select fill names the value of exactly one enabled option, chosen on the inspected options.
+  const oneOption = (el,v) => Array.from(el.options).filter(o=>o.value === v && !o.disabled).length === 1 &&
+    Array.from(el.options).filter(o=>o.value === v).length === 1;
   // One value in two spellings: providers re-format as they mask ("07/35" -> "07 / 35" or "0735",
   // grouped card numbers, upper-cased names). Anything else is a different value.
   const same = (a,b) => a.replace(/[\s\/.-]/g,'').toUpperCase() === b.replace(/[\s\/.-]/g,'').toUpperCase();
@@ -710,6 +731,13 @@ _INSPECT = r"""(() => {
           fills.some(f=>!selected.has(f.index) || typeof f.value !== 'string' || !f.value) ||
           new Set(fills.map(f=>f.index)).size !== fills.length)
         return {success:false,error_type:'payment_fields_invalid'};
+      // Every select target is checked before ANY write in this document: zero or several matching
+      // options leave the whole document untouched.
+      const selects = fills.filter(f=>isSelect(elements[f.index]));
+      if (selects.some(f=>!['cc-exp-month','cc-exp-year'].includes(f.token)))
+        return {success:false,error_type:'payment_fields_invalid'};
+      if (selects.some(f=>!oneOption(elements[f.index],f.value)))
+        return {success:false,error_type:'payment_expiry_option_unmatched'};
       // Native setters in an isolated world, one field at a time with its own events, the card number
       // last: a controlled form (Stripe Card/Payment Element) re-renders on each input event and would
       // reset sibling fields written before the event they never saw; brand detection on the number
@@ -727,8 +755,13 @@ _INSPECT = r"""(() => {
           return {success:false,error_type:'payment_fields_changed',filled_fields:attempted,partially_filled:attempted>0};
         attempted += 1;
         el.focus();
-        setter.call(el,f.value);
-        el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
+        if (isSelect(el)) {
+          selectSetter.call(el,f.value);
+          el.dispatchEvent(new Event('input',{bubbles:true}));
+        } else {
+          setter.call(el,f.value);
+          el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
+        }
         el.dispatchEvent(new Event('change',{bubbles:true}));
         el.dispatchEvent(new FocusEvent('blur'));
         el.blur();

@@ -416,10 +416,154 @@ def test_elicitation_reports_why_consent_ended(monkeypatch, setup, verdict, reas
 
 def test_coverage_refusal_names_an_unsupported_provider_but_other_refusals_stay_fixed():
     tree = (("page", "", MERCHANT + "/checkout", MERCHANT, ""),
-            ("f1", "", "https://secure.pay1.de/client-api/frame", "https://secure.pay1.de", "page"))
+            ("f1", "", "https://www.computop-paygate.com/paySSL.aspx", "https://www.computop-paygate.com", "page"))
     with pytest.raises(PaymentPolicyError,
-                       match=r"^Incomplete or ambiguous card fields \(card frames on https://secure\.pay1\.de: PAYONE"):
+                       match=r"^Incomplete or ambiguous card fields \(card frames on https://www\.computop-paygate\.com: Computop"):
         _explained_card_documents([_candidate(MERCHANT, "cc-name", frame="page")], MERCHANT, tree, ())
     with pytest.raises(PaymentPolicyError, match=r"^Card fields split across payment providers$"):
         _explained_card_documents(
             [_candidate(STRIPE, "cc-number"), _candidate("https://pay.datatrans.com", "cc-csc")], MERCHANT, tree, ())
+
+
+def _select(index=0, **raw):
+    return classify_checkout_control(LoginControl.from_dict({"index": index, "type": "select", **raw}))
+
+
+@pytest.mark.parametrize("raw, token", [
+    ({"autocomplete": "cc-exp-month"}, "cc-exp-month"), ({"autocomplete": "cc-exp-year"}, "cc-exp-year"),
+    ({"name": "cardexpiremonth cardexpiremonth"}, "cc-exp-month"),  # PAYONE hosted iFrame
+    ({"name": "cardexpireyear cardexpireyear"}, "cc-exp-year"),
+    # A select is never the number, CVC, holder or a combined expiry, by token or by name.
+    ({"autocomplete": "cc-number"}, None), ({"name": "cardpan"}, None), ({"autocomplete": "cc-csc"}, None),
+    ({"label": "Cardholder"}, None), ({"label": "Expiry date"}, None),
+    ({"name": "cardtype", "label": "Card type"}, None),  # PAYONE's merchant brand select
+    ({"autocomplete": "country"}, "country-name"),  # address selects keep working
+])
+def test_a_select_is_only_ever_an_expiry_month_or_year(raw, token):
+    c = _select(**raw)
+    assert (c.token if c else None) == token
+
+
+@pytest.mark.parametrize("name, token", [
+    ("cardpan cardpan", "cc-number"), ("cardcvc2 cardcvc2", "cc-csc"), ("cardholder", "cc-name"),
+    ("cardexpiremonth", "cc-exp-month"), ("cardexpireyear", "cc-exp-year"),
+    ("pseudocardpan", None), ("truncatedcardpan", None),  # PAYONE's response fields are not inputs to fill
+])
+def test_payone_hosted_field_names(name, token):
+    c = classify_checkout_control(LoginControl.from_dict({"index": 0, "type": "text", "name": name}))
+    assert (c.token if c else None) == token
+
+
+_MONTHS = [["", "MM", False]] + [[f"{m:02d}", f"{m:02d}", False] for m in range(1, 13)]
+
+
+@pytest.mark.parametrize("token, value, options, want", [
+    ("cc-exp-month", "07", _MONTHS, "07"),
+    ("cc-exp-month", "07", [[str(m), name, False] for m, name in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                                                          "Jul"), 1)], "7"),
+    ("cc-exp-month", "07", [["July", "07 - July", False]], None),  # text is not exactly the number
+    ("cc-exp-month", "07", [[m, m, False] for m in ("January", "July")], None),  # names only
+    ("cc-exp-month", "07", [[str(m), f"{m + 1:02d}", False] for m in range(12)], None),  # zero-based: 2 matches
+    ("cc-exp-year", "2035", [["", "YYYY", False]] + [[str(y), str(y), False] for y in range(2026, 2041)], "2035"),
+    ("cc-exp-year", "2035", [[f"{y}", f"{y}", False] for y in range(26, 41)], "35"),
+    ("cc-exp-year", "2035", [[str(y), str(y), False] for y in range(2026, 2035)], None),  # year missing
+    ("cc-exp-year", "2035", [["2035", "2035", False], ["35", "35", False]], None),  # ambiguous
+    ("cc-exp-year", "2035", [["2035", "2035", True]], None),  # disabled
+    ("cc-exp-year", "2035", [["2035", "2035", False], ["2035", "35", False]], None),  # duplicate value
+    ("cc-number", "4242424242424242", [["4242424242424242", "", False]], None),
+])
+def test_expiry_option_matching(token, value, options, want):
+    from agent.vault_login_classifier import match_expiry_option
+
+    control = LoginControl.from_dict({"index": 0, "type": "select", "options": options})
+    assert match_expiry_option(token, value, control.options) == want
+
+
+def _payone_inspection(years):
+    def doc(n, raw):
+        return PaymentDocument(f"f{n}", f"s{n}", f"o{n}", "https://secure.pay1.de",
+                               (classify_checkout_control(LoginControl.from_dict({"index": 0, **raw})),))
+    return _inspection(
+        doc(0, {"type": "text", "name": "cardpan"}), doc(1, {"type": "text", "name": "cardcvc2"}),
+        doc(2, {"type": "select", "name": "cardexpiremonth", "options": _MONTHS}),
+        doc(3, {"type": "select", "name": "cardexpireyear", "options": [[y, y, False] for y in years]}))
+
+
+@pytest.mark.parametrize("years, outcome", [(["34", "35", "36"], "35"), (["2034", "2036"], None)])
+def test_select_expiry_fill_maps_to_the_option_or_refuses_before_any_write(monkeypatch, years, outcome):
+    from tools import browser_vault_payment as bvp
+
+    inspection, committed = _payone_inspection(years), []
+
+    class Supervisor:
+        def inspect_payment(self, *a, **k):
+            return inspection
+
+        def payment_is_current(self, i):
+            return True
+
+        def commit_payment(self, i, fills):
+            committed.extend(fills)
+            i.consumed = True
+            return {"success": True, "filled_fields": len(fills)}
+
+        def discard_payment(self, i):
+            i.consumed = True
+
+    monkeypatch.setattr("tools.browser_vault_tool._ensure_supervisor", lambda task_id: Supervisor())
+    monkeypatch.setattr("tools.browser_vault_tool._bot_desktop_browser_session", lambda task_id: False)
+    monkeypatch.setattr("tools.browser_vault_tool._is_managed", lambda: False)
+    monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session", lambda task_id, surface=None: None)
+    monkeypatch.setattr("agent.redact.register_vault_redaction_value", lambda value: None)
+    monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", lambda *a, **k: "accept")
+    meta = SimpleNamespace(id="h", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
+                           payment_frame_origins=PAYMENT_PSP_ORIGINS)
+    raw = bvp.fill_payment(SimpleNamespace(name="local", resolve_secret=lambda handle: dict(CARD)), meta, "task")
+    out = json.loads(raw)
+    assert CARD["card_number"] not in raw and CARD["cvc"] not in raw
+    if outcome is None:
+        assert out["error_type"] == "payment_expiry_option_unmatched" and not committed and inspection.consumed
+    else:
+        assert out["success"] and {f["token"]: f["value"] for f in committed}["cc-exp-year"] == outcome
+        assert {f["token"]: f["value"] for f in committed}["cc-exp-month"] == "07"
+
+
+_PP = "https://www.paypal.com"
+_PAYONE = "https://secure.pay1.de"
+
+
+def _rows(*frames):
+    """(id, loader, url, origin, parent) rows under a merchant page "m"."""
+    return {r[0]: r for r in (("m", "", MERCHANT + "/checkout", MERCHANT, ""), *frames)}
+
+
+@pytest.mark.parametrize("frames,target,expected", [
+    # Captured 2026-11-03: PayPal's Buttons guest card form nests inside /smart/buttons.
+    ((("b", "", _PP + "/smart/buttons?x=1", _PP, "m"), ("c", "", _PP + "/smart/card-fields?y", _PP, "b")), "c", True),
+    ((("b", "", _PP + "/smart/buttons", _PP, "m"), ("a", "", "about:blank", _PP, "b"),
+      ("c", "", _PP + "/smart/card-fields", _PP, "a")), "c", True),
+    # The buttons page and PayPal's login/identity pages are never fill targets.
+    ((("b", "", _PP + "/smart/buttons", _PP, "m"),), "b", False),
+    ((("x", "", _PP + "/idapps/xauth/portal", _PP, "m"),), "x", False),
+    # A card form under a PayPal login or identity page is refused, not filled.
+    ((("x", "", _PP + "/idapps/xauth/portal", _PP, "m"), ("c", "", _PP + "/smart/card-fields", _PP, "x")), "c", "raise"),
+    # PAYONE: only its hosted field document, directly under the merchant page.
+    ((("p", "", _PAYONE + "/client-api/js/v1/payone_iframe.html", _PAYONE, "m"),), "p", True),
+    ((("p", "", _PAYONE + "/frontend/other.html", _PAYONE, "m"),), "p", False),
+])
+def test_frame_admission_for_paypal_guest_form_and_payone(frames, target, expected):
+    rows = _rows(*frames)
+    if expected == "raise":
+        with pytest.raises(PaymentPolicyError, match="Unapproved payment frame ancestry"):
+            sp._frame_admitted(rows[target], rows, MERCHANT, (_PP, _PAYONE))
+    else:
+        assert sp._frame_admitted(rows[target], rows, MERCHANT, (_PP, _PAYONE)) is expected
+
+
+def test_payone_checkout_shape_is_five_documents_with_merchant_holder():
+    docs = _card_documents([
+        _candidate(MERCHANT, "cc-name", frame="page"),
+        _candidate(_PAYONE, "cc-number", frame="pan"), _candidate(_PAYONE, "cc-csc", frame="cvc"),
+        _candidate(_PAYONE, "cc-exp-month", frame="mm"), _candidate(_PAYONE, "cc-exp-year", frame="yy"),
+    ], MERCHANT)
+    assert len(docs) == 5

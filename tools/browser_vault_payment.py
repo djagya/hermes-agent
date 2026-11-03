@@ -6,7 +6,7 @@ import json
 import logging
 
 from agent.vault_backends import BackendError
-from agent.vault_login_classifier import select_checkout_fills
+from agent.vault_login_classifier import match_expiry_option, select_checkout_fills
 from agent.vault_payment_card import validate_card
 from agent.vault_payment_policy import PaymentPolicyError, effective_frame_origins
 from agent.vault_store import PAYMENT_FIELDS
@@ -34,15 +34,29 @@ def _register_card_redaction(secret: dict) -> None:
             register_vault_redaction_value(value)
 
 
+class ExpiryOptionUnmatched(Exception):
+    """An expiry ``<select>`` has no single option for the card's month or year. Carries no value."""
+
+
 def _document_fills(inspected, secret: dict) -> list | None:
     """Fills tagged with their card document, or None when a required field cannot be filled. An
-    optional field (holder name, billing postcode) the saved card has no value for is skipped."""
+    optional field (holder name, billing postcode) the saved card has no value for is skipped. An
+    expiry ``<select>`` takes the value of its one matching option; zero or several matching options
+    in ANY document raise ExpiryOptionUnmatched before anything is written anywhere."""
     fills = []
     for k, document in enumerate(inspected.documents):
         document_fills = select_checkout_fills(list(document.controls), secret, PAYMENT_FIELDS)
         filled = {f["index"] for f in document_fills}
         if any(c.control.index not in filled and c.token not in OPTIONAL_CARD_TOKENS for c in document.controls):
             return None
+        controls = {c.control.index: c.control for c in document.controls}
+        for f in document_fills:
+            control = controls[f["index"]]
+            if control.type == "select":
+                option = match_expiry_option(f["token"], f["value"], control.options)
+                if option is None:
+                    raise ExpiryOptionUnmatched()
+                f["value"] = option
         fills += [dict(f, document=k) for f in document_fills]
     return fills
 
@@ -70,6 +84,11 @@ def _set_control_capture_guard(route: dict) -> dict | None:
     }
 
 
+_EXPIRY_UNMATCHED = (
+    "The expiry month or year list on this checkout has no single option matching the saved card, so no "
+    "card field was written and nothing was submitted. Do not retry; ask the user to fill the card by hand "
+    "or check the saved expiry."
+)
 _CONSENT_OUTCOMES = frozenset({"refused", "timeout", "unavailable"})
 _CONSENT_MESSAGES = {
     "refused": "The user did not approve the card fill.",
@@ -142,8 +161,15 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             return json.dumps({"success": False, "error_type": "payment_page_changed"})
         # Never resolve at inspection/list time, on decline or on stale consent.
         secret = validate_card(backend.resolve_secret(meta.id))
-        fills = _document_fills(inspected, secret)
         _register_card_redaction(secret)
+        try:
+            fills = _document_fills(inspected, secret)
+        except ExpiryOptionUnmatched:
+            return json.dumps({
+                "success": False,
+                "error_type": "payment_expiry_option_unmatched",
+                "error": _EXPIRY_UNMATCHED,
+            })
         if fills is None:
             return json.dumps({
                 "success": False,
