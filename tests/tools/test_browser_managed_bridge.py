@@ -84,11 +84,11 @@ def _transport(monkeypatch, targets=None):
     def evaluate(url, method, params, target_id, timeout):
         calls.append({"url": url, "method": method, "params": params, "timeout": timeout})
         expression = params.get("expression", "")
-        if expression == "route-expression":
+        if "return (route-expression);" in expression:
             value = {"ok": True, "detail_route": "/insurance/synthetic/detail"}
-        elif expression == "capture-expression":
+        elif "return (capture-expression);" in expression:
             value = {"ok": True, "inventory": [{"amount": "1.00"}], "total": "1.00"}
-        elif expression == "archive-expression":
+        elif "return (archive-expression);" in expression:
             buffer = io.BytesIO()
             with zipfile.ZipFile(buffer, "w") as archive:
                 archive.writestr("synthetic.pdf", b"%PDF synthetic")
@@ -205,7 +205,10 @@ def test_read_actions_use_only_pinned_expressions(monkeypatch, action, tmp_path)
         ),
     })
     assert result["success"] is True, result
-    assert calls[0]["params"]["expression"] == f"{action}-expression"
+    expression = calls[0]["params"]["expression"]
+    assert f"return ({action}-expression);" in expression
+    assert expression.index("window.location.origin") < expression.index(f"{action}-expression")
+    assert expression.index("challenge_refused") < expression.index(f"{action}-expression")
     assert calls[0]["params"]["awaitPromise"] is True
     assert "archive_base64" not in result
     assert "lease-secret" not in json.dumps(result)
@@ -280,3 +283,20 @@ def test_archive_never_overwrites_and_sensitive_read_fields_fail_closed(monkeypa
     refused = bridge.run_managed_bridge("synthetic", "route", task_id="task-1")
     assert refused == {"success": False, "error": "response_refused"}
     assert calls
+
+
+@pytest.mark.parametrize("action", ["verify", "fill"])
+@pytest.mark.parametrize("task_id", [None, "unowned-task"])
+def test_no_credential_resolution_before_owned_lease(monkeypatch, action, task_id):
+    monkeypatch.setattr(bridge, "held_managed_cdp", lambda *args, **kwargs: "lease_not_held")
+    monkeypatch.setattr(bridge, "_resolve_credentials", lambda *args: pytest.fail("unowned vault access"))
+    result = bridge.run_managed_bridge("synthetic", action, task_id=task_id)
+    assert result == {"success": False, "error": "lease_not_held"}
+
+
+def test_login_expression_checks_current_origin_before_fields():
+    expression = bridge._login_expression(
+        {"username": "synthetic-user", "password": "synthetic-password"}, _binding(),
+    )
+    assert 'window.location.origin !== "https://portal.example"' in expression
+    assert expression.index("origin_mismatch") < expression.index("const user=")

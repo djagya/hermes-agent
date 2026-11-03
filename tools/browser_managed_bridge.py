@@ -131,6 +131,8 @@ def _login_expression(credentials: dict[str, str], binding: dict[str, Any]) -> s
 
     parts = [
         "(() => {",
+        f"if (window.location.origin !== {json.dumps(_origin(binding['origin']))}) "
+        "return {ok:false,error:'origin_mismatch'};",
         f"if (document.querySelector({json.dumps(_CHALLENGE_SELECTOR)})) "
         "return {ok:false,error:'challenge_refused'};",
         f"const user=document.querySelector({json.dumps(username_selector)});",
@@ -378,6 +380,19 @@ def _held_target(binding: dict[str, Any], task_id: Optional[str]) -> tuple[str, 
     return endpoint, target
 
 
+def _guard_read_expression(expression: str, binding: dict[str, Any]) -> str:
+    """Recheck the document at use, before any pinned async read starts."""
+    return (
+        "(() => {"
+        f"if (window.location.origin !== {json.dumps(_origin(binding['origin']))}) "
+        "return {ok:false,error:'origin_mismatch'};"
+        f"if (document.querySelector({json.dumps(_CHALLENGE_SELECTOR)})) "
+        "return {ok:false,error:'challenge_refused'};"
+        f"return ({expression});"
+        "})()"
+    )
+
+
 def run_managed_bridge(binding_id: str, action: str, *, task_id: Optional[str],
                        bindings: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Run one pinned operation inside the native browser/vault/lease owner."""
@@ -385,10 +400,10 @@ def run_managed_bridge(binding_id: str, action: str, *, task_id: Optional[str],
         binding = _validated_binding(_load_bindings() if bindings is None else bindings, binding_id)
         if action not in {"verify", "fill", "route", "capture", "archive"}:
             raise _BridgeError("usage_error")
+        endpoint, target = _held_target(binding, task_id)
         credentials = _resolve_credentials(binding) if action in {"verify", "fill"} else None
         if action == "verify":
             return {"success": True, "credential_resolved": True}
-        endpoint, target = _held_target(binding, task_id)
         if action == "fill":
             expression = _login_expression(credentials or {}, binding)
             value = _evaluate_expression(endpoint, target, expression,
@@ -399,6 +414,7 @@ def run_managed_bridge(binding_id: str, action: str, *, task_id: Optional[str],
         expression = expressions.get(action) if isinstance(expressions, dict) else None
         if not isinstance(expression, str) or not expression:
             raise _BridgeError("unknown_binding")
+        expression = _guard_read_expression(expression, binding)
         value = _evaluate_expression(endpoint, target, expression, await_promise=True,
                                      timeout_s=180.0 if action == "archive" else 60.0)
         if action == "archive":
