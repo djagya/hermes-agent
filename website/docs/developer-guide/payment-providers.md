@@ -55,9 +55,9 @@ pages, official example repositories) and the provider's published test cards.
 | — | Checkout.com Flow | `checkout-web-components.checkout.com` (SDK source) | split frames incl. holder | discovered | Blocked: payment session needs an account secret key. |
 | — | Mollie hosted checkout, Adyen HPP/pay-by-link, Worldline Direct Hosted Checkout | full-page redirect | — | out of scope | Not an embedded target. |
 | — | Nexi XPay Global / NPG Build v3 | `xpay.nexigroup.com` (SDK) / `xpaysandbox.nexigroup.com` | 5 frames incl. holder email | sandbox-native-tested: refused | Over the document bound and a write race; email no longer reads as holder. Needs its own scoped change. |
-| — | PAYONE Client API hosted iFrames (legacy) | `secure.pay1.de` | 1 frame per field, expiry as `<select>` by default | sandbox-native-tested: refused | Blocked: `<select>` fill and PAYONE field ids not supported. |
-| — | Worldline Direct Hosted Tokenization Page | `payment.direct.worldline-solutions.com` (docs) / `payment.preprod…` | 1 document, expiry `<select>` | fixture-tested: refused | Blocked: `<select>` fill; a live session needs a merchant API key. |
-| — | Computop Paygate PaySSL | `www.computop-paygate.com` | 1 document, expiry `<select>` | fixture-tested: refused | Blocked: `<select>` fill, unlabelled CVC/holder; merchant keys needed. |
+| — | PAYONE Client API hosted iFrames (legacy) | `secure.pay1.de` | 1 frame per field, expiry as `<select>` by default | sandbox-native-tested: refused (before select support) | Engine supports `<select>` expiry and the `cardpan`/`cardcvc2`/`cardexpiremonth`/`cardexpireyear` names (fixture-tested). Still blocked: no reviewed provider row; origins, paths and document count need a real topology capture. |
+| — | Worldline Direct Hosted Tokenization Page | `payment.direct.worldline-solutions.com` (docs) / `payment.preprod…` | 1 document, expiry `<select>` | fixture-tested: refused (before select support) | Engine supports `<select>` expiry. Still blocked: no reviewed provider row from a real topology; a live session needs a merchant API key. |
+| — | Computop Paygate PaySSL | `www.computop-paygate.com` | 1 document, expiry `<select>` | fixture-tested: refused (before select support) | Engine supports `<select>` expiry. Still blocked: unlabelled CVC/holder, no reviewed provider row from a real topology; merchant keys needed. |
 | — | Nexi Checkout (Nets Easy) embedded, Nexi XPay Italy legacy Build, PAYONE Commerce Platform HTP, Worldline Direct Hosted Fields, Ingenico Connect, Worldline Sips | see docs | — | discovered | Blocked: merchant credentials; no public render. |
 
 Wallets (Apple Pay, Google Pay, PayPal buttons), BNPL, bank transfers, Click to Pay, stored-card
@@ -77,6 +77,12 @@ paths, and frames without card inputs are never targets. 3DS and device challeng
   all (accents used to split words: `Prüfnummer` read as `pru fnummer`). `ccv`, a masked CVC input and
   holder-email exclusion were added.
 - A two-character year field gets a two-digit year.
+- Expiry month and year `<select>` controls are inspected with the same honeypot and visibility rules
+  as inputs (PAYONE, Worldline HTP, Computop). A select is only ever `cc-exp-month` or `cc-exp-year`.
+  The fill picks the ONE enabled option whose value or visible text is the month (`07` or `7`) or the
+  year (`2035` or `35`); no match or several matches (a zero-based month list) refuses the fill with
+  `payment_expiry_option_unmatched` before any document is written. The options are part of the
+  document signature, so a list that changes after consent fails the freshness check.
 - A holder-name field is filled when the card has a holder name and left to the user otherwise,
   instead of refusing the whole fill.
 
