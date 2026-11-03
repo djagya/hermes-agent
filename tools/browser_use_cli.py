@@ -951,6 +951,19 @@ def _with_dialogs(result_json: str, dialogs: Optional[dict]) -> str:
     return result_json
 
 
+def _bridge_or_usage_error(code: str, **bridge_args) -> Optional[str]:
+    """A pinned bridge call's result, the usage error for a call with no code, or None for code."""
+    from tools.browser_managed_bridge import dispatch_browser_exec
+    from tools.registry import tool_error, tool_result
+
+    bridge_result = dispatch_browser_exec(code=code, default_timeout_s=_DEFAULT_TIMEOUT_S, **bridge_args)
+    if bridge_result is not None:
+        return tool_result(bridge_result)
+    if not code or not code.strip():
+        return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
+    return None
+
+
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False,
                  mode: str = "", identity: str = "", qa_targets: Optional[list[str]] = None,
@@ -960,15 +973,13 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     from tools.registry import tool_error, tool_result
     from tools.browser_payment_privacy import exec_capture_refusal, exec_slot_capture_refusal
 
-    from tools.browser_managed_bridge import dispatch_browser_exec
-    bridge_result = dispatch_browser_exec(
-        binding_id=bridge, action=action, code=code, session=session,
-        timeout_s=timeout_s, default_timeout_s=_DEFAULT_TIMEOUT_S, local=local,
-        mode=mode, identity=identity, qa_targets=qa_targets, on_dialog=on_dialog,
+    early = _bridge_or_usage_error(
+        code, binding_id=bridge, action=action, session=session, timeout_s=timeout_s,
+        local=local, mode=mode, identity=identity, qa_targets=qa_targets, on_dialog=on_dialog,
         task_id=task_id,
     )
-    if bridge_result is not None:
-        return tool_result(bridge_result)
+    if early is not None:
+        return early
 
     # Unmanaged: a card fill blocks capture for the whole profile. Managed: the slot control
     # grants this call is checked in dispatch(), so a re-route is checked too.

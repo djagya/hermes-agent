@@ -820,6 +820,7 @@ def held_managed_cdp(
         return "lease_unavailable"
     if not alive:
         _forget_held(key)
+        _retire_daemon(cached.get("BU_NAME", ""))
         return "lease_stale"
     env.update(cached)
     return None

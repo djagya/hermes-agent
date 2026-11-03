@@ -4,6 +4,14 @@ The model selects only a binding and action. The private binding pins the origin
 slot identity, vault item, selectors and read expressions. Every browser call
 reuses the current task's already-held managed lease; this module never acquires
 a replacement browser and never exports its endpoint or command token.
+
+Bindings are data, not code: one JSON object at
+``$HERMES_HOME/browser/managed-bridges.json`` mapping a bridge id to its binding.
+The operator installs it owned by root and not group/other-writable, for example
+``install -o root -g root -m 0644 bindings.json <HERMES_HOME>/browser/managed-bridges.json``.
+The gateway runs unprivileged and owns ``HERMES_HOME``, so it can delete or replace
+that file but cannot make one owned by root; any other owner, a symlink, or a
+writable mode loads no bindings, and every bridge call then fails closed.
 """
 
 from __future__ import annotations
@@ -11,11 +19,11 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
-import importlib
 import io
 import json
 import os
 import re
+import stat
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -47,14 +55,51 @@ class _BridgeError(Exception):
         self.code = code
 
 
+_BINDINGS_CAP = 1_000_000
+# The owner a bindings file must have; tests point this at their own uid.
+_OPERATOR_UID = 0
+
+
+def _bindings_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home()) / "browser" / "managed-bridges.json"
+
+
+def _gateway_is_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
 def _load_bindings() -> dict[str, Any]:
-    """Load the operator-private source module, never a caller-selected path."""
+    """Load the operator-installed bindings file, never a caller-selected path.
+
+    Refused (no bindings) unless it is a regular, root-owned file without
+    group/other write access, read without following a final symlink.
+    """
+    if _gateway_is_root():
+        return {}  # a root gateway could write the file itself, so ownership proves nothing
     try:
-        module = importlib.import_module("tools.browser_managed_bridge_bindings")
-        bindings = module.BINDINGS
-        return bindings if isinstance(bindings, dict) else {}
-    except (ImportError, AttributeError):
+        fd = os.open(_bindings_path(), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
         return {}
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != _OPERATOR_UID
+                or info.st_mode & 0o022 or info.st_size > _BINDINGS_CAP):
+            return {}
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read(_BINDINGS_CAP + 1)
+    except OSError:
+        return {}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        bindings = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return bindings if isinstance(bindings, dict) and len(raw) <= _BINDINGS_CAP else {}
 
 
 def _origin(value: Any) -> str:
@@ -434,7 +479,7 @@ def dispatch_browser_exec(*, binding_id: str, action: str, code: str, session: s
                           on_dialog: str, task_id: Optional[str]) -> Optional[dict[str, Any]]:
     """Dispatch the narrow browser_exec bridge surface, or decline ordinary code."""
     if not binding_id and not action:
-        return None if (code or "").strip() else {"error": "code_required"}
+        return None
     overrides = (
         not binding_id or not action or bool(code and code.strip()) or bool(session) or local
         or bool(mode) or bool(identity) or bool(qa_targets) or on_dialog != "auto"

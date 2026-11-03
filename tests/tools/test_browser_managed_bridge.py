@@ -3,6 +3,9 @@
 import base64
 import io
 import json
+import os
+import shutil
+import subprocess
 import zipfile
 from types import SimpleNamespace
 
@@ -14,6 +17,7 @@ from tools import browser_use_cli
 from tools.registry import registry
 
 
+_REAL_LOAD_BINDINGS = bridge._load_bindings
 ORIGIN = "https://portal.example/"
 LEASE_URL = "http://control.invalid/slot/research-1/json/version?tok=lease-secret"
 
@@ -300,3 +304,104 @@ def test_login_expression_checks_current_origin_before_fields():
     )
     assert 'window.location.origin !== "https://portal.example"' in expression
     assert expression.index("origin_mismatch") < expression.index("const user=")
+
+
+def test_stale_lease_retires_its_harness_daemon(monkeypatch):
+    key = route._hold_key("task-1", "", "sensitive", "research")
+    held = {"BU_CDP_URL": LEASE_URL, route.MANAGED_LEASE_ENV: "lease-1", "BU_NAME": "bu-ctrl-slot-1-g-1"}
+    retired = []
+    monkeypatch.setattr(route, "_held_leases", {key: held})
+    monkeypatch.setattr(route, "control_url", lambda: "http://control.invalid")
+    monkeypatch.setattr(route, "_lease_alive", lambda control, lease: False)
+    monkeypatch.setattr(route, "_retire_daemon", retired.append)
+    assert route.held_managed_cdp({}, task_id="task-1", identity="sensitive") == "lease_stale"
+    assert retired == ["bu-ctrl-slot-1-g-1"]
+    assert key not in route._held_leases
+
+
+def test_browser_exec_without_code_or_bridge_keeps_the_usage_error():
+    raw = registry.dispatch("browser_exec", {}, task_id="task-1")
+    assert "No code provided" in raw
+
+
+@pytest.mark.parametrize("case", ["ok", "writable", "other_owner", "symlink", "root_gateway", "not_object"])
+def test_bindings_load_only_from_an_operator_owned_file(monkeypatch, tmp_path, case):
+    path = tmp_path / "managed-bridges.json"
+    path.write_text(json.dumps([] if case == "not_object" else {"synthetic": _binding()}))
+    path.chmod(0o666 if case == "writable" else 0o644)
+    if case == "symlink":
+        target, path = path, tmp_path / "link.json"
+        path.symlink_to(target)
+    monkeypatch.setattr(bridge, "_bindings_path", lambda: path)
+    monkeypatch.setattr(bridge, "_OPERATOR_UID", os.getuid() + (1 if case == "other_owner" else 0))
+    monkeypatch.setattr(bridge, "_gateway_is_root", lambda: case == "root_gateway")
+    loaded = _REAL_LOAD_BINDINGS()
+    assert (loaded == {"synthetic": _binding()}) is (case == "ok")
+    if case != "ok":
+        assert loaded == {}
+
+
+def test_bindings_path_is_fixed_under_hermes_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert bridge._bindings_path() == tmp_path / "browser" / "managed-bridges.json"
+
+
+_NODE = shutil.which("node")
+
+
+def _run_js(expression, *, origin, challenge=False, ionic=False):
+    """Execute a generated expression against a fake DOM in Node; report writes, events, clicks."""
+    harness = """
+const state={writes:{},events:[],clicked:false,readStarted:false};
+const field=(name)=>({set value(v){state.writes[name]=v;},get value(){return state.writes[name]||'';},
+  dispatchEvent(e){state.events.push(e.type);}});
+const nodes={'#email':field('user'),'#password':field('pass'),
+  'form':{classList:{contains:(c)=>c==='ng-valid'}},'button[type=submit]':{click(){state.clicked=true;}}};
+globalThis.window={location:{origin:ORIGIN}};
+globalThis.document={querySelector:(s)=>s.includes('captcha')?(CHALLENGE?{}:null):(nodes[s]||null)};
+globalThis.Event=class{constructor(t){this.type=t;}};
+globalThis.CustomEvent=globalThis.Event;
+globalThis.state=state;
+const result=eval(EXPRESSION);
+process.stdout.write(JSON.stringify({result,...state}));
+""".replace("ORIGIN", json.dumps(origin)).replace("CHALLENGE", json.dumps(challenge)).replace(
+        "EXPRESSION", json.dumps(expression))
+    done = subprocess.run([_NODE, "-e", harness], capture_output=True, text=True, timeout=30, check=True)
+    return json.loads(done.stdout)
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not installed")
+@pytest.mark.parametrize("ionic", [False, True])
+@pytest.mark.parametrize("origin,challenge,expected", [
+    ("https://wrong.example", False, "origin_mismatch"),
+    ("https://portal.example", True, "challenge_refused"),
+    ("https://portal.example", False, None),
+])
+def test_fill_expression_checks_page_at_use_and_never_submits(origin, challenge, expected, ionic):
+    expression = bridge._login_expression(
+        {"username": "synthetic-user", "password": "synthetic-password"}, _binding(ionic=ionic),
+    )
+    observed = _run_js(expression, origin=origin, challenge=challenge)
+    assert observed["clicked"] is False
+    if expected:
+        assert observed["result"] == {"ok": False, "error": expected}
+        assert observed["writes"] == {}
+    else:
+        assert observed["result"]["ok"] is True
+        assert observed["writes"] == {"user": "synthetic-user", "pass": "synthetic-password"}
+        per_field = ["ionInput", "ionChange", "ionBlur"] if ionic else ["input", "change"]
+        assert observed["events"] == per_field * 2
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not installed")
+@pytest.mark.parametrize("origin,challenge,expected", [
+    ("https://wrong.example", False, "origin_mismatch"),
+    ("https://portal.example", True, "challenge_refused"),
+    ("https://portal.example", False, None),
+])
+def test_read_guard_runs_before_the_pinned_body(origin, challenge, expected):
+    expression = bridge._guard_read_expression("(() => { state.readStarted = true; return {ok: true}; })()",
+                                               _binding())
+    observed = _run_js(expression, origin=origin, challenge=challenge)
+    assert observed["readStarted"] is (expected is None)
+    assert observed["result"].get("error") == expected
