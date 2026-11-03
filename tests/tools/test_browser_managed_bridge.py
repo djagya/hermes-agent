@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import zipfile
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -373,6 +374,7 @@ const result=eval(EXPRESSION);
 process.stdout.write(JSON.stringify({result,...state}));
 """.replace("ORIGIN", json.dumps(origin)).replace("CHALLENGE", json.dumps(challenge)).replace(
         "EXPRESSION", json.dumps(expression))
+    assert _NODE is not None
     done = subprocess.run([_NODE, "-e", harness], capture_output=True, text=True, timeout=30, check=True)
     return json.loads(done.stdout)
 
@@ -448,8 +450,9 @@ def test_handoff_minted_during_vault_call_refuses_the_fill(monkeypatch):
     {"qa_targets": ["https://x.example"]}, {"on_dialog": "accept"}, {"timeout_s": 5},
 ])
 def test_bridge_refuses_every_route_override(override):
-    args = dict(binding_id="synthetic", action="route", code="", session="", timeout_s=60, default_timeout_s=60,
-                local=False, mode="", identity="", qa_targets=None, on_dialog="auto", task_id="task-1")
+    args: dict[str, Any] = dict(binding_id="synthetic", action="route", code="", session="", timeout_s=60,
+                                default_timeout_s=60, local=False, mode="", identity="", qa_targets=None,
+                                on_dialog="auto", task_id="task-1")
     args.update(override)
     assert bridge.dispatch_browser_exec(**args) == {"error": "bridge_override_refused"}
 

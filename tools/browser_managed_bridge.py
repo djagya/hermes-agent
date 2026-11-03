@@ -152,9 +152,11 @@ def _resolve_credentials(binding: dict[str, Any]) -> dict[str, str]:
     try:
         backend = backend_for_handle(handle)
         meta = backend.get_meta(handle) if backend is not None else None
+        if backend is None or meta is None:
+            raise _BridgeError("credential_resolution_failed")
         expected = _origin(binding["origin"])
         allowed = {_origin(item) for item in (getattr(meta, "allowed_origins", None) or ())}
-        if not allowed and getattr(meta, "origin", None):
+        if not allowed and meta.origin:
             allowed = {_origin(meta.origin)}
         username = str(getattr(meta, "identifier", "") or "")
         if getattr(meta, "kind", "") != "login" or not username or expected not in allowed:
@@ -397,7 +399,7 @@ def _write_archive(value: dict[str, Any], destination: Path) -> dict[str, Any]:
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             pdf_count = sum(not item.is_dir() and item.filename.lower().endswith(".pdf")
                             for item in archive.infolist())
-        if pdf_count != int(value.get("document_count")):
+        if pdf_count != int(value.get("document_count", -1)):
             raise _BridgeError("archive_validation_failed")
     except _BridgeError:
         raise
