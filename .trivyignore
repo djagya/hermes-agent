@@ -54,3 +54,9 @@ CVE-2026-87018 exp:2026-11-12
 # written for, so an override would break it. It validates tool arguments
 # from Sera's own model over stdio, not inbound messages. Re-check then.
 CVE-2023-54404 exp:2026-11-07
+# re2js 2.8.6 (CVE-2026-116795, ReDoS with repeated lookbehind matching),
+# fixed in 2.8.7. Flagged 2026-11-04: markdownlint 0.42.0 (inside
+# markdownlint-cli2 0.24.0, the newest of both) pins re2js to exactly 2.8.6,
+# so a global install cannot pick up the fix. The CLI lints markdown in Sera's
+# own workspace. Re-check markdownlint on expiry.
+CVE-2026-116795 exp:2026-11-11
