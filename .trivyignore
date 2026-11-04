@@ -31,14 +31,6 @@ CVE-2026-102278 exp:2026-11-12
 # 6.28.1. npm 12.2.1 bundles undici 6.29.0; same window and node gap as
 # the entries above.
 CVE-2026-19534 exp:2026-11-12
-# markdown-it 15.0.1 inside the baked markdownlint-cli2 0.23.3, which pins it
-# exactly. Denial of service when parsing a crafted document; the CLI only
-# lints local files Sera chooses, never inbound messages. The fix needs
-# markdownlint-cli2 0.24.0 (2026-10-21) with markdown-it 15.0.3, markdownlint
-# 0.42.0 and smol-toml 1.9.1, all inside the 14-day npm release-age window.
-# Expires when 0.24.0 clears it: bump the Dockerfile pin then.
-CVE-2026-111758 exp:2026-11-04
-CVE-2026-111759 exp:2026-11-04
 # undici: 6.27.0 bundled inside npm itself (tools/npm-12.0.2 and node-26.7.0's
 # lib/node_modules/npm), fixed in 6.29.1; no npm release has it yet (12.2.1
 # bundles 6.29.0). The photon sidecar is on 7.30.1 (fixed) since

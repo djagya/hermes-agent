@@ -435,7 +435,7 @@ RUN /opt/hermes/.venv/bin/python -m docker.build_agent
 # injects axe.min.js into the page and refuses a file whose sha256 differs
 # from AXE_SHA256 in tools/browser_capture_harness.py (bump both together).
 RUN npm install -g --prefix /usr/local --omit=dev \
-        markdownlint-cli2@0.23.3 \
+        markdownlint-cli2@0.24.0 \
         caldav-mcp@0.10.0 \
         axe-core@4.14.0 && \
     test -x /usr/local/bin/markdownlint-cli2 && \
