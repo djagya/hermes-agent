@@ -253,7 +253,7 @@ process.stdout.write(JSON.stringify({result, writes}));
     import re
     values = {"MUTATION": json.dumps(mutation), "ORIGIN": json.dumps(ORIGIN), "SCRIPT": script}
     harness = re.sub(r"MUTATION|ORIGIN|SCRIPT", lambda m: values[m.group(0)], harness)
-    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10)
+    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
     assert run.returncode == 0, run.stderr.replace(SECRET, "[redacted]")
     observed = json.loads(run.stdout)
     assert observed["writes"] == (1 if mutation == "none" else 0)

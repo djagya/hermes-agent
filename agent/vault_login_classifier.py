@@ -392,7 +392,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     return [{
       autocomplete: element.autocomplete || "",
       formIndex: resolvedFormIndex >= 0 ? resolvedFormIndex : null,
-      pageUrl: window.location.href,
+      pageUrl: document.URL,
       formAction: element.form ? element.form.action : "",
       index,
       maxLength: element.maxLength > 0 ? element.maxLength : null,
