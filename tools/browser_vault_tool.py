@@ -607,7 +607,8 @@ def browser_vault_enter_code(
                        "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
 
-def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_origin: str = "") -> str:
+def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_origin: str = "",
+                       purpose: str = "login") -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -625,11 +626,16 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
         classify_login_control,
         select_checkout_fills,
         select_password_fill,
+        build_signup_fill_js,
+        select_signup_control,
     )
     from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
 
     effective_task_id = task_id or "default"
+    if purpose not in ("login", "signup"):
+        return json.dumps({"success": False, "error_type": "invalid_purpose",
+                           "error": "Use purpose=login (default) or signup. Nothing was written."})
     backend = backend_for_handle(handle)
     if backend is not None and backend.needs_unlock and not backend.is_unlocked():
         unlocked = json.loads(browser_vault_unlock(backend.name))
@@ -652,6 +658,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
                 ),
             }
         )
+    if purpose == "signup" and meta.kind != "login":
+        return json.dumps({"success": False, "error_type": "signup_login_required",
+                           "error": "Signup requires a saved login item. Nothing was written."})
     if meta.kind == "payment":
         from tools.browser_vault_payment import fill_payment
 
@@ -705,20 +714,41 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
         result = classify(LoginControl.from_dict(raw))
         if result is not None:
             classified.append(result)
-    if not classified:
+    signup_target = None
+    if purpose == "signup":
+        signup_target = select_signup_control([LoginControl.from_dict(raw) for raw in raw_controls
+                                               if isinstance(raw, dict)])
+        if signup_target is None:
+            return json.dumps({"success": False, "error_type": "signup_target_unsupported",
+                               "error": "Signup requires exactly one explicit new-password input on a registration "
+                                        "form; confirmation, mixed login, OTP and recovery forms are unsupported. "
+                                        "Nothing was written."})
+        if not _confirm_signup_fill(handle, meta.label, page_origin):
+            return json.dumps({"success": False, "error_type": "signup_declined",
+                               "error": "Signup password fill was not approved. Nothing was written. Do not retry."})
+        if _current_page_origin(effective_task_id) != page_origin:
+            return json.dumps({"success": False, "error_type": "origin_changed",
+                               "error": "The page origin changed during approval. Nothing was written."})
+    if not classified and signup_target is None:
         return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
 
     # ── Resolve secret and fill (secret never enters any logged string) ─────
     try:
         if meta.kind == "login":
             secret = {"password": backend.resolve_password(handle)}
-            fills = select_password_fill(classified, secret["password"])
+            fills = ([{"index": signup_target.control.index, "token": "new-password", "value": secret["password"]}]
+                     if signup_target is not None and secret["password"] else
+                     select_password_fill(classified, secret["password"]))
         else:
             secret = backend.resolve_secret(handle)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault action=unlock."})
+    except Exception:
+        # Backend errors can contain secret bytes not yet returned to this caller.
+        return json.dumps({"success": False, "error_type": "secret_resolution_failed",
+                           "error": "Could not resolve the saved item. Nothing was written."})
     if not fills:
         return json.dumps(
             {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
@@ -728,12 +758,18 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
     # BEFORE they touch the page: any later browser_* result (including
     # browser_cdp Runtime.evaluate reads) that echoes them is scrubbed.
     # Address values are not secrets but the card fields are: register every payment value.
-    for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
-        register_vault_redaction_value(value)
+    try:
+        for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
+            register_vault_redaction_value(value)
+    except Exception:
+        return json.dumps({"success": False, "error_type": "redaction_unavailable",
+                           "error": "Secret redaction could not be registered. Nothing was written."})
 
     try:
         fill_result = _eval_js_secret(
-            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
+            effective_task_id, (build_signup_fill_js(fills, page_origin, nonce, signup_target.control)
+                                if signup_target is not None else
+                                build_fill_js(fills, expected_origin=page_origin, nonce=nonce))
         )
     except Exception as exc:
         # Strip any secret material from exception text before surfacing.
@@ -758,16 +794,23 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
                 "error": (
                     "Refused: the page navigated away from the bound origin "
                     f"({page_origin}) before the fill could run "
-                    f"(now on {parsed.get('found') or 'unknown'}). "
+                    f"(now on {scrub_secret_from_text(str(parsed.get('found') or 'unknown'), secret)}). "
                     "Nothing was written."
                 ),
             }
         )
     filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
 
+    if isinstance(parsed, dict) and parsed.get("refused") == "signup_target_changed":
+        return json.dumps({"success": False, "error_type": "signup_target_changed",
+                           "error": "The approved signup target changed. Nothing was written."})
+
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
-    if meta.kind == "login":
+    if purpose == "signup":
+        out["purpose"] = "signup"
+        out["next"] = "Password filled only; nothing submitted. Review the account-creation form before submitting."
+    elif meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"
                        + (" (a code will be generated automatically)." if meta.has_otp else "."))
     if meta.kind != "login":
@@ -986,6 +1029,21 @@ def browser_vault_letter_done(handle: str) -> str:
     return json.dumps({"success": True, "state": "done", "next": "The letter's password is retired; nothing will fill it again."})
 
 
+def _confirm_signup_fill(handle: str, label: str, origin: str) -> bool:
+    """Fresh native human decision, never inherited from ordinary login permission."""
+    from tools.approval_prompt import request_elicitation_consent
+
+    try:
+        return request_elicitation_consent(
+            f"Create account on {origin} using saved login '{label}' (handle: {handle})?",
+            "Approve entering this saved password into exactly one new-password field to create an account "
+            "on this exact origin. This is not an ordinary login or password reset. The password never enters "
+            "the conversation. Nothing will be submitted; confirmation-password fields are unsupported.",
+            surface="vault-signup", title="Confirm signup password fill?") == "accept"
+    except Exception:
+        return False
+
+
 def _confirm_payment_fill(label: str, origin: str) -> bool:
     """Human confirmation before a card is written into a page: a prompt injection that reaches a checkout
     must not be able to spend. Routes through the approval surface of the active session (gateway button
@@ -1016,7 +1074,10 @@ BROWSER_VAULT_SCHEMA = {
         "payment provider from the card's hosted_origins, each field exactly once; fields across two providers, "
         "duplicate or ambiguous fields, a missing number/CVC/expiry and unlisted origins are refused; HTTPS is not a "
         "seller reputation check: verify the merchant and checkout terms before requesting consent; it never "
-        "submits); save_login (nothing saved for this site: the user "
+        "submits; purpose=signup separately asks the user to approve account creation with this exact login item "
+        "on its exact origin, then fills one unambiguous new-password field on a registration form only; "
+        "confirmation-password, mixed login, OTP and recovery forms are refused; stop on signup_declined); "
+        "save_login (nothing saved for this site: the user "
         "enters it in a masked prompt, Hermes saves and fills it); enter_code (a one-time/2FA code after the "
         "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
         "their device; a code Hermes itself obtained through its own authorized mail workflow goes in code with "
@@ -1040,6 +1101,10 @@ BROWSER_VAULT_SCHEMA = {
             "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock", "letter_login",
                                                   "letter_signed_in", "letter_done"]},
             "handle": {"type": "string", "description": "fill / enter_code / letter_*: a handle from list or a letter note."},
+            "purpose": {"type": "string", "enum": ["login", "signup"], "default": "login",
+                        "description": "fill only: login preserves current-password behavior; signup requires fresh "
+                                       "native approval to create an account with this exact login item and origin. "
+                                       "Only one explicit new-password input is supported; never submits."},
             "secret_field": {"type": "string", "description":
                 "letter_login only: the field for the letter's password/code (name, id or visible label) when not recognised."},
             "identifier_field": {"type": "string", "description":
@@ -1107,7 +1172,8 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
         return browser_vault_letter_done(handle)
     page_ops = {
         "fill": lambda: browser_vault_fill(handle=handle, task_id=tid,
-                                           merchant_origin=str(args.get("merchant_origin") or "")),
+                                           merchant_origin=str(args.get("merchant_origin") or ""),
+                                           purpose=args.get("purpose", "login")),
         "save_login": lambda: browser_vault_save_login(label=label, task_id=tid),
         "enter_code": lambda: browser_vault_enter_code(handle=handle, task_id=tid, code=str(args.get("code") or ""),
                                                        expected_origin=str(args.get("expected_origin") or "")),
