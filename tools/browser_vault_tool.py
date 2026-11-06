@@ -682,7 +682,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
     """
     from agent.vault_login_classifier import select_checkout_fills
     from tools import browser_vault_signup as signup
-    from agent.vault_backends import UnlockRequired, backend_for_handle
+    from agent.vault_backends import BackendError, UnlockRequired, backend_for_handle
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
 
     effective_task_id = task_id or "default"
@@ -769,7 +769,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault action=unlock."})
-    except Exception:  # health: allow BLE001 -- backend errors can carry secret bytes: refuse without echoing them
+    except BackendError:
+        raise  # typed manager failures carry advice and no secret; _fenced_page_op turns them into results
+    except Exception:  # health: allow BLE001 -- untyped backend errors can carry secret bytes: refuse without echoing them
         return json.dumps({"success": False, "error_type": "secret_resolution_failed",
                            "error": "Could not resolve the saved item. Nothing was written."})
     if not fills:
@@ -1158,7 +1160,7 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     page_ops = {
         "fill": lambda: browser_vault_fill(handle=handle, task_id=tid,
                                            merchant_origin=str(args.get("merchant_origin") or ""),
-                                           purpose=args.get("purpose", "login")),
+                                           purpose=str(args.get("purpose") or "login")),
         "save_login": lambda: browser_vault_save_login(label=label, task_id=tid),
         "enter_code": lambda: browser_vault_enter_code(handle=handle, task_id=tid, code=str(args.get("code") or ""),
                                                        expected_origin=str(args.get("expected_origin") or "")),

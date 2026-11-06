@@ -205,16 +205,17 @@ def select_signup_control(controls: list[LoginControl]) -> Optional[ClassifiedLo
             target.autocomplete.lower().split() != ["new-password"]):
         return None
     text = _normalize_text(target.name + " " + target.label)
-    if re.search(r"\b(?:confirm|repeat|again|reset|recover|change|current|old)\b", text):
+    if re.search(r"\b(?:confirm\w*|repeat\w*|retype\w*|re ?enter\w*|again|reset|recover\w*|change|current|old)\b", text):
         return None
     page, action = urlsplit(target.page_url), urlsplit(target.form_action)
-    if (page.scheme not in ("http", "https") or not page.netloc or
+    if (page.scheme != "https" or not page.netloc or
             (page.scheme, page.netloc) != (action.scheme, action.netloc)):
         return None
     routes = " ".join(unquote(urlsplit(u).path + "?" + urlsplit(u).query + "#" + urlsplit(u).fragment)
                       for u in (target.page_url, target.form_action))
     route_words = _normalize_text(routes)
-    if re.search(r"\b(?:reset|recover\w*|forgot\w*|change|update|security|settings)\b", route_words):
+    if (re.search(r"reset|recover|forgot|changepassword|passwordchange", route_words.replace(" ", "")) or
+            re.search(r"\b(?:change|update|security|settings|login|log in|signin|sign in)\b", route_words)):
         return None
     page_path = _normalize_text(unquote(page.path))
     if not re.search(r"\b(?:register|registration|signup|sign up|create account)\b", page_path):
@@ -427,6 +428,7 @@ def build_signup_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonc
       const el = targets.length === 1 ? targets[0] : null;
       if (window.location.href !== bound.url || !el || !visible(el) || !el.form ||
           el.form.action !== bound.action || el.type !== 'password' ||
+          Array.from(el.form.elements || []).some(e => e.hasAttribute && e.hasAttribute('formaction')) ||
           el.autocomplete.trim().toLowerCase() !== 'new-password' ||
           inputs.filter(e => e.type === 'password' || /(?:current|new)-password/.test(e.autocomplete)).length !== 1 ||
           inputs.some(e => /one-time-code/.test(e.autocomplete)))

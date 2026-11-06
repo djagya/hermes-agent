@@ -11,6 +11,7 @@ from agent.vault_login_classifier import (
     LoginControl, build_signup_fill_js, classify_login_control, select_signup_control,
 )
 from tools import browser_vault_tool as vault
+from tools.approval_prompt import request_elicitation_consent as REAL_CONSENT
 
 ORIGIN = "https://app.dataforseo.com"
 SECRET = "synthetic-signup-password-__FILL__-__BOUND__"
@@ -80,6 +81,32 @@ def test_unavailable_confirmation_fails_closed(core):
     core.write.assert_not_called()
 
 
+@pytest.mark.parametrize("gateway", [True, False])
+def test_real_consent_with_nobody_to_answer_refuses_before_resolution(core, monkeypatch, gateway):
+    # The real routing: a gateway session with no approval callback, or a cron/-q/unattended worker.
+    monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", REAL_CONSENT)
+    monkeypatch.setattr("tools.approval_context._is_gateway_approval_context", lambda: gateway)
+    monkeypatch.setattr("tools.approval_context._get_session_platform", lambda: "cron")
+    monkeypatch.setattr("tools.approval_context._no_user_can_answer", lambda: True)
+    monkeypatch.setattr("tools.approval._gateway_notify_cb", lambda key: None)
+    assert fill()["error_type"] == "signup_declined"
+    core.backend.resolve_password.assert_not_called()
+    core.write.assert_not_called()
+
+
+@pytest.mark.parametrize("purpose", ["login", "signup"])
+def test_typed_backend_errors_keep_their_advice(core, purpose):
+    from agent.vault_backends.base import BackendRateLimited
+
+    core.backend.resolve_password.side_effect = BackendRateLimited("synthetic")
+    if purpose == "login":
+        core.inspect.return_value["result"] = json.dumps([field(autocomplete="current-password")])
+    # Raised, not swallowed: _fenced_page_op turns a typed failure into its own result and advice.
+    with pytest.raises(BackendRateLimited):
+        vault.browser_vault_fill(HANDLE, purpose=purpose)
+    core.write.assert_not_called()
+
+
 def test_wrong_origin_before_consent_or_resolution(core):
     core.origin.return_value = "https://wrong.test"
     assert fill()["error_type"] == "origin_mismatch"
@@ -111,6 +138,11 @@ BAD_CONTROLS = [
     [field(formAction="https://other.test/register")],
     [field(pageUrl=ORIGIN + "/login", formAction=ORIGIN + "/login")],
     [field(pageUrl=ORIGIN + "/login?next=/signup")],
+    [field(pageUrl=ORIGIN + "/login/after-signup", formAction=ORIGIN + "/login")],
+    [field(pageUrl=ORIGIN + "/signup/resetpassword", formAction=ORIGIN + "/signup/resetpassword")],
+    [field(pageUrl=ORIGIN + "/register/changepassword", formAction=ORIGIN + "/register/changepassword")],
+    [field(name="password_confirmation")], [field(label="Retype password")],
+    [field(pageUrl="http://app.dataforseo.com/register", formAction="http://app.dataforseo.com/register")],
 ]
 
 
@@ -205,7 +237,7 @@ def test_signup_handler_cannot_bypass_human_ownership_fence(monkeypatch):
     target.assert_not_called()
 
 
-@pytest.mark.parametrize("mutation", ["none", "origin", "url", "type", "autocomplete", "action", "duplicate", "mixed", "otp", "hidden", "stamp"])
+@pytest.mark.parametrize("mutation", ["none", "origin", "url", "type", "autocomplete", "action", "duplicate", "mixed", "otp", "hidden", "stamp", "formaction"])
 def test_signup_script_against_synthetic_dom(mutation):
     """Exercise actual generated JS, not a fabricated browser response. No browser/vault."""
     node = shutil.which("node")
@@ -221,7 +253,7 @@ const origin = ORIGIN;
 const window = { location: { origin, href: origin + '/register' } };
 class HTMLInputElement {
   constructor() { this.type = 'password'; this.autocomplete = 'new-password';
-    this.form = { action: origin + '/register' }; this.tagName = 'INPUT'; this.held = ''; }
+    this.form = { action: origin + '/register', elements: [] }; this.tagName = 'INPUT'; this.held = ''; }
   get value() { return this.held; }
   set value(v) { writes++; this.held = v; }
   getClientRects() { return mutation === 'hidden' ? [] : [1]; }
@@ -237,6 +269,7 @@ if (mutation === 'autocomplete') el.autocomplete = 'current-password';
 if (mutation === 'action') el.form.action += '/reset';
 if (mutation === 'duplicate') targets.push(new HTMLInputElement());
 if (mutation === 'stamp') targets = [];
+if (mutation === 'formaction') el.form.elements.push({hasAttribute: a => a === 'formaction'});
 if (mutation === 'mixed') inputs.push(new HTMLInputElement());
 if (mutation === 'otp') inputs.push({type: 'text', autocomplete: 'one-time-code', getClientRects: () => [1]});
 const getComputedStyle = () => ({display: 'block', visibility: 'visible'});
