@@ -14,6 +14,7 @@ Scoring:
 - label/name regex heuristics .................. 70-75
 Hard exclusions: autocomplete ``new-password`` / ``one-time-code``, and
 label/name text matching ``(new|confirm|create|repeat)\\s*password``.
+Explicit signup selection is separate and never weakens these login exclusions.
 """
 
 from __future__ import annotations
@@ -95,6 +96,8 @@ class LoginControl:
     # ``<select>`` only: ``(value, visible text, disabled)`` per option, in DOM order. Months and years
     # are not secrets; the native card fill matches the expiry against them (match_expiry_option).
     options: tuple = ()
+    page_url: str = ""
+    form_action: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
@@ -109,6 +112,8 @@ class LoginControl:
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
             options=_options(raw.get("options")),
+            page_url=str(raw.get("pageUrl") or ""),
+            form_action=str(raw.get("formAction") or ""),
         )
 
 
@@ -180,6 +185,46 @@ def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginC
         if _RE_OTP.search(_normalize_text(" ".join(p for p in (c.name, c.label) if p))):
             out.append(ClassifiedLoginControl(c, 70, "one-time-code"))
     return out
+
+
+def select_signup_control(controls: list[LoginControl]) -> Optional[ClassifiedLoginControl]:
+    """Conservative, separate signup intent: one explicit new password, no confirmation.
+
+    Require a registration route and a real form; refuse recovery/change routes,
+    OTP, mixed login forms and unrelated credential forms anywhere on the page.
+    This never relaxes the ordinary login classifier's exclusions.
+    """
+    from urllib.parse import unquote, urlsplit
+
+    passwords = [c for c in controls if c.type == "password" or
+                 {"current-password", "new-password"}.intersection(c.autocomplete.lower().split())]
+    if len(passwords) != 1 or classify_otp_controls(controls):
+        return None
+    target = passwords[0]
+    if (target.type != "password" or target.form_index is None or
+            target.autocomplete.lower().split() != ["new-password"]):
+        return None
+    text = _normalize_text(target.name + " " + target.label)
+    if re.search(r"\b(?:confirm\w*|repeat\w*|retype\w*|re ?enter\w*|again|reset|recover\w*|change|current|old)\b", text):
+        return None
+    page, action = urlsplit(target.page_url), urlsplit(target.form_action)
+    if (page.scheme != "https" or not page.netloc or
+            (page.scheme, page.netloc) != (action.scheme, action.netloc)):
+        return None
+    routes = " ".join(unquote(urlsplit(u).path + "?" + urlsplit(u).query + "#" + urlsplit(u).fragment)
+                      for u in (target.page_url, target.form_action))
+    route_words = _normalize_text(routes)
+    if (re.search(r"reset|recover|forgot|changepassword|passwordchange", route_words.replace(" ", "")) or
+            re.search(r"\b(?:change|update|security|settings|login|log in|signin|sign in)\b", route_words)):
+        return None
+    page_path = _normalize_text(unquote(page.path))
+    if not re.search(r"\b(?:register|registration|signup|sign up|create account)\b", page_path):
+        return None
+    # Other visible login/identifier controls must belong to the target's form.
+    for control in controls:
+        if classify_login_control(control) is not None and control.form_index != target.form_index:
+            return None
+    return ClassifiedLoginControl(target, 100, "new-password")
 
 
 def select_password_fill(
@@ -348,6 +393,8 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     return [{
       autocomplete: element.autocomplete || "",
       formIndex: resolvedFormIndex >= 0 ? resolvedFormIndex : null,
+      pageUrl: document.URL,
+      formAction: element.form ? element.form.action : "",
       index,
       maxLength: element.maxLength > 0 ? element.maxLength : null,
       label: [
@@ -363,6 +410,36 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   });
   return JSON.stringify(out);
 })()"""
+
+
+def build_signup_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str,
+                         control: LoginControl) -> str:
+    """Revalidate approved field intent synchronously before the native secret write.
+
+    Exact URL/action binding also rejects same-origin navigation during approval.
+    Only the existing secret transport may evaluate this expression.
+    """
+    guard = """(() => {
+      const bound = __BOUND__;
+      const visible = e => !e.disabled && !e.readOnly && e.getClientRects().length > 0 &&
+        getComputedStyle(e).display !== 'none' && getComputedStyle(e).visibility !== 'hidden';
+      const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
+      const targets = document.querySelectorAll('[data-hermes-vault-slot="' + bound.stamp + '"]');
+      const el = targets.length === 1 ? targets[0] : null;
+      if (window.location.href !== bound.url || !el || !visible(el) || !el.form ||
+          el.form.action !== bound.action || el.type !== 'password' ||
+          Array.from(el.form.elements || []).some(e => e.hasAttribute && e.hasAttribute('formaction')) ||
+          el.autocomplete.trim().toLowerCase() !== 'new-password' ||
+          inputs.filter(e => e.type === 'password' || /(?:current|new)-password/.test(e.autocomplete)).length !== 1 ||
+          inputs.some(e => /one-time-code/.test(e.autocomplete)))
+        return JSON.stringify({refused: 'signup_target_changed', filled: 0});
+      return __FILL__;
+    })()"""
+    bound = json.dumps({"stamp": f"{nonce}:{control.index}", "url": control.page_url,
+                        "action": control.form_action})
+    # Splice once: never rescan secret bytes as template placeholders.
+    values = {"__BOUND__": bound, "__FILL__": build_fill_js(fills, expected_origin, nonce)}
+    return re.sub(r"__BOUND__|__FILL__", lambda m: values[m.group(0)], guard)
 
 
 def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
