@@ -59,6 +59,14 @@
       "code": "unavailable",
       "status": 409
     },
+    "slot_not_idle": {
+      "code": "busy",
+      "status": 409
+    },
+    "slot_maintenance": {
+      "code": "unavailable",
+      "status": 409
+    },
     "slot_transient": {
       "code": "busy",
       "status": 409
@@ -117,6 +125,10 @@
     },
     "handoff_unavailable": {
       "code": "scope_denied",
+      "status": 403
+    },
+    "handoff_link_expired": {
+      "code": "stale",
       "status": 403
     },
     "handoff_lease_changed": {
@@ -189,11 +201,25 @@
         "?slot=",
         "?task="
       ],
-      "reply": "pool view (slots, queue_length, park_history, capture_guard_history, idle_recycles, decisions, timeouts, capabilities) | ?slot= slot row | ?lease= slot row + lease_state=live + handoff_pending",
+      "reply": "pool view (slots, queue_length, park_history, capture_guard_history, idle_recycles, decisions, timeouts, capabilities, handback_delivery {pending, failed, store_ok}) | ?slot= slot row | ?lease= slot row + lease_state=live + handoff_pending",
       "errors": [
         "lease_ended (lease_state ended|unknown, ended_by, ended_at)",
         "unknown_slot"
       ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/handback/pending",
+      "auth": "controller",
+      "body": [
+        "?event_id="
+      ],
+      "reply": "pending=true + the event body (event, session_id, slot_id, lease_id, resumed_lease_id|reason_code, event_id) while control still holds it undelivered | pending=false",
+      "errors": [],
       "lanes": [
         "private"
       ],
@@ -378,6 +404,25 @@
     },
     {
       "method": "POST",
+      "path": "/v1/maintenance",
+      "auth": "controller",
+      "body": [
+        "slot_id",
+        "action (begin|end)"
+      ],
+      "reply": "slot_id, state, busy_reason (begin) | browser_generation (end)",
+      "errors": [
+        "fence_down",
+        "slot_not_idle",
+        "slot_maintenance"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
       "path": "/v1/take",
       "auth": "human",
       "body": [
@@ -526,11 +571,13 @@
       "path": "/handoff/consume",
       "auth": "human+handoff_origin",
       "body": [
-        "token"
+        "token",
+        "ask (new_link, on an expired link)"
       ],
-      "reply": "303 /handoff/control + session cookie; a re-tap of a used link while its session lives: 303 /handoff/control (this browser) or 409 page (another device), never a second session",
+      "reply": "303 /handoff/control + session cookie; a re-tap of a used link while its session lives: 303 /handoff/control (this browser) or 409 page (another device), never a second session; ask=new_link on an expired unused link: 200 page, and handoff_ended reason_code=expired_unused is sent to the minting session once",
       "errors": [
         "handoff_unavailable",
+        "handoff_link_expired",
         "handoff_lease_changed",
         "handoff_origin_denied",
         "handoff_held",
@@ -833,7 +880,8 @@
         "session_id",
         "slot_id",
         "lease_id",
-        "resumed_lease_id"
+        "resumed_lease_id",
+        "event_id"
       ]
     },
     "handoff_ended": {
@@ -843,7 +891,19 @@
         "session_id",
         "slot_id",
         "lease_id",
-        "reason_code"
+        "reason_code",
+        "event_id"
+      ],
+      "reason_codes": [
+        "human_ended",
+        "link_expired",
+        "expired_unused",
+        "human_idle",
+        "human_disconnected",
+        "take_failed",
+        "resume_failed",
+        "recycled",
+        "other"
       ]
     }
   }

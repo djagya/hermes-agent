@@ -14,6 +14,17 @@ key alone must not be enough — and each lease wakes it at most once per
 composes itself: nothing from the request body reaches the model except a
 validated slot id.
 
+dlz: durable delivery (Codex qol #10). Control keeps each event in an outbox and retries
+transient failures with the same ``event_id``. The replay marker is recorded and the claim
+consumed only after the wake turn is scheduled, so a 503 ("not admitted, retry") never burns
+the real wake. After a gateway restart the in-memory claim is gone; the route then asks
+control (``GET /v1/handback/pending?event_id=``) whether it really sent this exact event and
+still holds it undelivered. Persisting claims in the gateway's own state was rejected: that
+state is writable by the same uid that can read the key, so a forged claim plus the key
+would wake Sera; control's outbox lives in another container. Answers: 202 admitted, 409
+already handled, 503 not admitted now (retry), 403 refused (no claim, control does not
+confirm), 404 no such session.
+
 Not the API key: the API key dispatches arbitrary agent work, and control only
 ever needs this one notice. A key-less gateway answers 503.
 """
@@ -48,6 +59,7 @@ HANDBACK_TEXT = (
 HANDOFF_ENDED_REASONS = {
     "human_ended": "Danil pressed End on the slot",
     "link_expired": "the handoff link expired unused",
+    "expired_unused": "Danil opened the handoff link after it expired and asked for a new one",
     "human_idle": "the human session went idle and the slot parked",
     "human_disconnected": "the human viewer disconnected and the slot parked",
     "take_failed": "the takeover failed and the slot parked",
@@ -61,10 +73,23 @@ HANDOFF_ENDED_TEXT = (
     "was finished: your next browser_exec gets a fresh lease; check the page's real state there, and "
     "tell Danil what you found and what still needs him."
 )
+# dlz: Danil pressed "Ask Sera for a new link" on an expired, never-used link. The slot never
+# left this task; he is waiting for a fresh link.
+EXPIRED_UNUSED_TEXT = (
+    "[browser-control] Danil opened the handoff link for browser slot {slot} after it had expired "
+    "(nothing was handed over) and asked for a new one. If the step still needs him, go back to the "
+    "saved handoff target (workspace file handoff-target; switch_tab() first, and if that tab is gone "
+    "reopen the page), mint a fresh link with browser_control action=handoff and send it to him. If it "
+    "is no longer needed, tell him. This is not approval for any purchase, deletion or other step."
+)
 EVENTS = ("handback", "handoff_ended")
+_EVENT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 REPLAY_WINDOW_S = 600.0
+# dlz: how long an admitted event id is remembered: longer than control's 30 min retry horizon.
+EVENT_RECEIPT_S = 3600.0
 _replay_lock = threading.Lock()
 _handled: dict[str, float] = {}
+_inflight: set[str] = set()
 
 
 def _expected_key() -> str:
@@ -88,9 +113,9 @@ def check_bearer(header: str) -> Optional[int]:
 
 
 def parse(payload: Any) -> tuple[Optional[dict[str, str]], str]:
-    """``({"event", "session_id", "slot_id", "lease_id", "resumed_lease_id", "reason_code"}, "")`` or
-    ``(None, reason)``. ``resumed_lease_id`` is "" unless well formed; ``reason_code`` is a key of
-    :data:`HANDOFF_ENDED_REASONS` ("" for a handback)."""
+    """``({"event", "session_id", "slot_id", "lease_id", "resumed_lease_id", "reason_code",
+    "event_id"}, "")`` or ``(None, reason)``. ``resumed_lease_id`` and ``event_id`` are "" unless
+    well formed; ``reason_code`` is a key of :data:`HANDOFF_ENDED_REASONS` ("" for a handback)."""
     event = payload.get("event") if isinstance(payload, dict) else None
     if event not in EVENTS:
         return None, "event must be 'handback' or 'handoff_ended'"
@@ -108,43 +133,136 @@ def parse(payload: Any) -> tuple[Optional[dict[str, str]], str]:
     if event == "handoff_ended":
         reason = str(payload.get("reason_code") or "").strip()
         reason = reason if reason in HANDOFF_ENDED_REASONS else "other"
+    event_id = str(payload.get("event_id") or "").strip()
     return {"event": str(event), "session_id": session_id, "slot_id": slot_id, "lease_id": lease_id,
-            "resumed_lease_id": resumed if _SLOT_RE.match(resumed) else "", "reason_code": reason}, ""
+            "resumed_lease_id": resumed if _SLOT_RE.match(resumed) else "", "reason_code": reason,
+            "event_id": event_id if _EVENT_ID_RE.match(event_id) else ""}, ""
 
 
-def _seen(lease_id: str) -> bool:
-    """True when this lease's handback was already handled within the replay window; records it otherwise."""
+def _replay_key(event: str, lease_id: str) -> str:
+    # dlz: recheck P2 — a handoff_ended (an unused link expired) must not eat the Return of a newer
+    # link on the same lease, so each event has its own key. One key for every end reason: a second
+    # end notice for the lease inside the window needs control's word (below), never the key alone.
+    return lease_id if event == "handback" else f"{event}:{lease_id}"
+
+
+def _seen(key: str, window: float = REPLAY_WINDOW_S) -> bool:
+    """True when ``key`` was handled within ``window`` (check only; :func:`_record` records)."""
     now = time.monotonic()
     with _replay_lock:
-        for old in [k for k, at in _handled.items() if now - at > REPLAY_WINDOW_S]:
+        for old in [k for k, at in _handled.items() if now - at > max(window, EVENT_RECEIPT_S)]:
             _handled.pop(old, None)
-        if lease_id in _handled:
-            return True
-        _handled[lease_id] = now
+        at = _handled.get(key)
+        return at is not None and now - at <= window
+
+
+def _record(*keys: str) -> None:
+    now = time.monotonic()
+    with _replay_lock:
+        for key in keys:
+            if key:
+                _handled[key] = now
+
+
+async def _confirmed_by_control(event_id: str, fields: dict[str, str]) -> Optional[bool]:
+    """Control's word on this exact event (no local claim, e.g. after a gateway restart)."""
+    if not event_id:
         return False
+    import asyncio
+
+    from tools.browser_control_route import confirm_handback_event
+
+    try:
+        return await asyncio.to_thread(confirm_handback_event, event_id, fields)
+    except Exception:  # dlz: an unreachable control is "retry later", never a wake
+        logger.debug("handback confirmation failed", exc_info=True)
+        return None
 
 
 async def inject(runner: Any, session_id: str, slot_id: str, lease_id: str, *, event: str = "handback",
-                 reason_code: str = "") -> str:
-    """Schedule the wake turn. Returns ``"injected"``, ``"replay"``, ``"session_not_found"`` or ``"unavailable"``.
+                 reason_code: str = "", event_id: str = "", resumed_lease_id: str = "") -> str:
+    """Admit the wake turn. Returns ``"injected"``, ``"replay"``, ``"refused"``, ``"session_not_found"``
+    or ``"unavailable"`` (not admitted now: retry).
 
     The control key is readable by same-uid model code, so the key alone never wakes a session: the
-    session must have minted a handoff for this slot + agent lease (or still hold that lease), and
-    each lease wakes at most once per replay window."""
+    session must have minted a handoff for this slot + agent lease (or still hold that lease), or
+    control must confirm it sent this exact event. Each lease and event wakes at most once per replay
+    window on the claim alone; a further notice inside the window needs control's confirmation of a
+    new event id. Nothing is recorded or consumed until the turn is admitted."""
     if runner is None:
         return "unavailable"
     from tools.browser_control_route import claim_handback
 
-    if not claim_handback(session_id, slot_id, lease_id):
-        # dlz: D10-B, fail closed. After a gateway restart the in-memory claim is gone, and control-v1's
-        # /v1/status?lease= does not attest which agent lease a Return resumed, so a live lease for this
-        # task/slot proves nothing about Return. Refuse (the caller logs it loudly); never wake on it.
-        return "session_not_found"
-    # Once per original lease and event, only after the claim (a forged id cannot burn the real one).
-    # dlz: recheck P2 — a handoff_ended (an unused link expired) must not eat the Return of a newer link
-    # on the same lease, so each event has its own key.
-    if _seen(lease_id if event == "handback" else f"{event}:{lease_id}"):
-        return "replay"
+    # dlz: one admission at a time per claim (session, slot, lease), across events and reasons, so two
+    # concurrent requests cannot both spend one minted claim; the loser retries (503).
+    claim_key = f"{session_id}|{slot_id}|{lease_id}"
+    with _replay_lock:
+        if claim_key in _inflight:
+            return "unavailable"
+        _inflight.add(claim_key)
+    try:
+        fields = {"event": event, "session_id": session_id, "slot_id": slot_id, "lease_id": lease_id}
+        if event == "handoff_ended":
+            fields["reason_code"] = reason_code
+        else:
+            fields["resumed_lease_id"] = resumed_lease_id
+        confirmed: Optional[bool] = None
+        claimed = claim_handback(session_id, slot_id, lease_id, consume=False)
+        if not claimed:
+            # dlz: D10-B, fail closed. After a gateway restart the in-memory claim is gone, and a live
+            # lease for this task/slot proves nothing about Return. Only control's own outbox, asked
+            # for this exact event id, stands in for the claim; never wake on the key alone.
+            confirmed = await _confirmed_by_control(event_id, fields)
+            if confirmed is None:
+                return "unavailable"
+            if not confirmed:
+                return "refused"
+        # Only after the claim (a forged id cannot burn the real one), recorded only once admitted
+        # (a failed attempt does not refuse its retry). The event id is control's idempotency key.
+        receipt = f"event:{event_id}" if event_id else ""
+        if receipt and _seen(receipt, EVENT_RECEIPT_S):
+            return "replay"
+        key = _replay_key(event, lease_id)
+        if _seen(key):
+            if confirmed is None and event_id:
+                confirmed = await _confirmed_by_control(event_id, fields)
+            if confirmed is None and event_id:
+                return "unavailable"
+            if not confirmed:
+                return "replay"
+        return await _admit(runner, session_id, slot_id, lease_id, event=event, reason_code=reason_code,
+                            keys=(key, receipt))
+    finally:
+        with _replay_lock:
+            _inflight.discard(claim_key)
+
+
+async def _deliver(runner: Any, session_key: str, content: str) -> bool:
+    """dlz: the turn is admitted only when the dispatcher says so (the session FIFO took it, or the
+    adapter accepted it). ``_schedule_plugin_message_injection`` answers True before dispatch, and its
+    dispatch then refuses a draining gateway, so a 202 there could still mean "never woken"."""
+    import asyncio
+
+    dispatch = getattr(runner, "_dispatch_plugin_message_injection", None)
+    if dispatch is None:
+        schedule = getattr(runner, "_schedule_plugin_message_injection", None)
+        return bool(schedule and schedule(content=content, plugin_id=PLUGIN_ID, session_key=session_key))
+    accepting = getattr(runner, "_plugin_injection_accepting", None)
+    if accepting is not None and not accepting():
+        return False
+    # Shielded: a cancelled request (gateway shutdown) does not cancel a half-done admission.
+    task = asyncio.ensure_future(dispatch(session_key=session_key, content=content, plugin_id=PLUGIN_ID))
+    try:
+        return bool(await asyncio.shield(task))
+    except Exception:  # dlz: a dispatcher fault is "not admitted", logged; control retries
+        logger.warning("browser handback dispatch failed", exc_info=True)
+        return False
+
+
+async def _admit(runner: Any, session_id: str, slot_id: str, lease_id: str, *, event: str,
+                 reason_code: str, keys: tuple[str, ...]) -> str:
+    from tools.browser_control_route import claim_handback
+
     store = getattr(runner, "async_session_store", None)
     entry = None
     if store is not None and hasattr(store, "lookup_by_session_id"):
@@ -153,22 +271,22 @@ async def inject(runner: Any, session_id: str, slot_id: str, lease_id: str, *, e
         entry = runner.session_store.lookup_by_session_id(session_id)
     if entry is None or not getattr(entry, "session_key", ""):
         return "session_not_found"
-    schedule = getattr(runner, "_schedule_plugin_message_injection", None)
-    if schedule is None:
-        return "unavailable"
-    if event == "handoff_ended":
+    if event == "handoff_ended" and reason_code == "expired_unused":
+        content = EXPIRED_UNUSED_TEXT.format(slot=slot_id)
+    elif event == "handoff_ended":
         why = HANDOFF_ENDED_REASONS.get(reason_code) or HANDOFF_ENDED_REASONS["other"]
         content = HANDOFF_ENDED_TEXT.format(slot=slot_id, why=why)
     else:
         content = HANDBACK_TEXT.format(slot=slot_id)
-    ok = schedule(content=content, plugin_id=PLUGIN_ID, session_key=entry.session_key)
-    if not ok:
-        return "unavailable"
+    if not await _deliver(runner, entry.session_key, content):
+        return "unavailable"  # dlz: not admitted; the claim and the markers stay untouched for the retry
+    _record(*keys)
+    claim_handback(session_id, slot_id, lease_id)  # consume a minted handoff now it is delivered
     if event == "handback":
         from tools.browser_exec_dialogs import note_handoff
 
         note_handoff(session_id)  # the next exec holds beforeunload: the page may hold Danil's unsaved input
-    logger.info("browser %s wake scheduled: slot=%s session=%s reason=%s", event, slot_id, session_id,
+    logger.info("browser %s wake admitted: slot=%s session=%s reason=%s", event, slot_id, session_id,
                 reason_code or "-")
     return "injected"
 
@@ -197,17 +315,22 @@ async def handle_request(adapter: Any, request: Any):
         return _error(reason, 400, "handback_invalid")
     runner = adapter.gateway_runner or request.app.get("gateway_runner")
     outcome = await inject(runner, fields["session_id"], fields["slot_id"], fields["lease_id"],
-                           event=fields["event"], reason_code=fields["reason_code"])
+                           event=fields["event"], reason_code=fields["reason_code"],
+                           event_id=fields["event_id"], resumed_lease_id=fields["resumed_lease_id"])
     if outcome == "replay":
         return _error("This handback was already delivered.", 409, "handback_replay")
+    if outcome == "refused":
+        # dlz: D10-B — loud, not silent: Sera is never woken; control shows it on the slot board.
+        logger.warning("browser %s NOT delivered: no local handoff claim and control did not confirm "
+                       "the event slot=%s session=%s",
+                       fields["event"], fields["slot_id"], fields["session_id"])
+        return _error("No handoff claim for that session, slot and lease.", 403, "handback_refused")
     if outcome == "session_not_found":
-        # dlz: D10-B — loud, not silent: a 404 here means Sera is never woken and the slot recycles later.
-        logger.warning("browser %s NOT delivered: no local handoff claim (lost on a gateway restart?) "
-                       "slot=%s session=%s",
+        logger.warning("browser %s NOT delivered: no such session slot=%s session=%s",
                        fields["event"], fields["slot_id"], fields["session_id"])
         return _error("No live session with that id.", 404, "session_not_found")
     if outcome != "injected":
-        return _error("Gateway cannot route the wake turn now.", 503, "handback_unavailable")
+        return _error("Gateway cannot route the wake turn now; retry.", 503, "handback_unavailable")
     return web.json_response({"injected": True}, status=202)
 
 
