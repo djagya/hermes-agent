@@ -3886,7 +3886,16 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramHeldInboundMixin, Teleg
         if finalize and self._rich_eligible(content):
             rich_result = await self._try_edit_rich(chat_id, message_id, content, metadata=metadata)
             if rich_result is not None:
+                if self._inline_photos(content):
+                    # dlz: same contract as the fresh send — consumed even when uncertain.
+                    rich_result.raw_response = {
+                        **(rich_result.raw_response if isinstance(rich_result.raw_response, dict) else {}),
+                        "inline_images_consumed": True,
+                    }
                 return rich_result
+        if self._inline_photos(content) and (metadata or {}).get("inline_images_fallback"):
+            # dlz: the gateway still owns attachment fallback; do not echo image links.
+            _, content = self.extract_images(content)
         # Pre-flight: over-limit content is split-and-delivered on finalize; mid-stream we truncate instead
         # (splitting moves the edit target to a continuation → infinite duplication loop).
         # Pre-flight: if content already exceeds the limit, split-and-deliver without round-tripping a

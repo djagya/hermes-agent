@@ -621,21 +621,32 @@ def test_cap_is_pinned_and_missed_rows_age_out(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("prune", ["age", "count"])
-def test_retention_keeps_runs_whose_delivery_is_still_queued(monkeypatch, tmp_path, prune):
-    """CRON-2: the drain settles a job through its queued run; pruning that row strands the job."""
+def test_retention_keeps_only_in_flight_queued_deliveries(monkeypatch, tmp_path, prune):
+    """CRON-2: a run whose queued delivery is still in flight survives both prunes (the drain settles
+    the job through it). One whose queue entry is already terminal (write-back crashed) is settled
+    from the queue without a resend and ages out; one the queue never saw gets no exemption."""
+    from cron import delivery_queue
+
     executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "cron" / "deliveries.db")
     clock = {"now": datetime(2026, 10, 10, tzinfo=UTC)}
     monkeypatch.setattr(executions, "_hermes_now", lambda: clock["now"])
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 1 if prune == "count" else 100)
-    queued = executions.create_execution("queued", source="builtin")
-    executions.finish_execution(queued["id"], success=True, delivery_outcome="queued")
-    settled = executions.create_execution("settled", source="builtin")
-    executions.finish_execution(settled["id"], success=True, delivery_outcome="delivered")
-    if prune == "age":
-        clock["now"] += timedelta(hours=executions.TERMINAL_RETENTION_HOURS, seconds=1)
+    rows = {}
+    for name in ("pending", "terminal", "unseen", "settled"):
+        clock["now"] += timedelta(seconds=1)  # distinct finish times: the cap keeps the newest
+        rows[name] = executions.create_execution(name, source="builtin")["id"]
+        if name in ("pending", "terminal"):  # the run queues its send before booking the outcome
+            delivery_queue.enqueue(rows[name], {"id": name}, "text")
+        executions.finish_execution(rows[name], success=True,
+                                    delivery_outcome="delivered" if name == "settled" else "queued")
+    with delivery_queue._transaction() as conn:  # drained; the ledger write-back never ran
+        conn.execute("UPDATE deliveries SET status='delivered' WHERE execution_id=?", (rows["terminal"],))
+    clock["now"] += timedelta(hours=executions.TERMINAL_RETENTION_HOURS if prune == "age" else 0, seconds=1)
     newer = executions.create_execution("newer", source="builtin")
     executions.finish_execution(newer["id"], success=True)
 
-    assert executions.get_execution(settled["id"]) is None
-    assert executions.settle_delivery_outcome(queued["id"], "delivered")
-    assert executions.get_execution(queued["id"])["delivery_outcome"] == "delivered"
+    assert executions.get_execution(newer["id"]) is not None
+    assert [n for n, i in rows.items() if executions.get_execution(i)] == ["pending"]
+    assert executions.settle_delivery_outcome(rows["pending"], "delivered")
+    assert delivery_queue.get_status(rows["terminal"])["status"] == "delivered"  # never resent

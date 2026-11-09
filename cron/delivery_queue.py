@@ -225,6 +225,30 @@ def get_status(execution_id: str) -> Optional[dict]:
     }
 
 
+def statuses(execution_ids: list[str]) -> Optional[dict[str, str]]:
+    """dlz: queue status per execution id (live row, else tombstone); ids the queue never saw are
+    absent. ``{}`` without a queue file (never created here); ``None`` when the queue is unreadable.
+    One connection for the ledger's retention reconcile."""
+    ids = [str(i) for i in execution_ids]
+    if not ids or not _path().exists():
+        return {}
+    try:
+        with _transaction() as conn:
+            found = {}
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                marks = ",".join("?" * len(chunk))
+                found.update({r[0]: r[1] for r in conn.execute(
+                    f"SELECT execution_id, terminal_status FROM delivery_tombstones "
+                    f"WHERE execution_id IN ({marks})", chunk)})
+                found.update({r[0]: r[1] for r in conn.execute(
+                    f"SELECT execution_id, status FROM deliveries WHERE execution_id IN ({marks})", chunk)})
+            return found
+    except Exception:
+        logger.warning("Cron delivery queue unreadable during ledger retention", exc_info=True)
+        return None
+
+
 def claim_next() -> Optional[dict]:
     """Atomically claim one pending send before touching the transport."""
     pid = os.getpid()

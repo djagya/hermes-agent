@@ -115,8 +115,27 @@ async def test_background_voice_row_keeps_provenance_without_reply_anchor(tmp_pa
          patch("gateway.run._load_gateway_config", return_value={}), \
          patch("run_agent.AIAgent", return_value=agent):
         await tasks[0]
-    assert agent.run_conversation.call_args.kwargs["persist_user_display_metadata"] == {"inbound_voice": {
-        "schema": 1, "platform_message_id": "fixture-message", "audio_paths": [path]}}
+    # The real persisted row must satisfy the Morning Pages binding rule (hermes/identity
+    # morning_pages_ingest/session_source.py:_voice_metadata): the binding names the row's own id.
+    from agent.turn_context import build_turn_context
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+    from tests.gateway.test_restart_drain_recovery_dedup import _MinimalAgent, _build_turn_context_for_test
+
+    kwargs = agent.run_conversation.call_args.kwargs
+    ctx = _build_turn_context_for_test(
+        build_turn_context, None, user_message=kwargs["user_message"],
+        persist_user_display_metadata=kwargs.get("persist_user_display_metadata"),
+        persist_user_platform_id=kwargs.get("persist_user_platform_id"))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = db.create_session("bg-voice", "gateway")
+    AIAgent._flush_messages_to_session_db_unlocked(
+        _MinimalAgent(db, session_id), [m for m in ctx.messages if m.get("role") == "user"],
+        conversation_history=None)
+    (row,) = [m for m in db.get_messages(session_id) if m.get("role") == "user"]
+    voice = row["display_metadata"]["inbound_voice"]
+    assert voice == {"schema": 1, "platform_message_id": "fixture-message", "audio_paths": [path]}
+    assert str(row["platform_message_id"]) == voice["platform_message_id"]
 
 
 def test_voice_binding_survives_carrier_folds_and_restatement():

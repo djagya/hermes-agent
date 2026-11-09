@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from telegram.error import BadRequest, TimedOut
+from telegram.error import BadRequest, NetworkError, TimedOut
 
 from gateway.platforms.base import SendResult
 from gateway.platforms.base_response import final_text_metadata
@@ -133,3 +133,38 @@ def test_text_transport_metadata_does_not_mutate_attachment_metadata():
     assert final_text_metadata(adapter, extracted, metadata) == {
         **metadata, 'inline_images_fallback': True}
     assert metadata == {'thread_id': 'topic', 'notify': True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure, replayable', [(TimedOut('timed out'), False),
+                                                 (NetworkError('connection reset'), True)])
+async def test_queued_rich_send_uncertain_is_not_replayed(monkeypatch, failure, replayable):
+    """An ambiguous rich timeout may have landed: no replay and no photo batch. A failure that
+    provably never left keeps the completion-send fallback."""
+    adapter = prepared_adapter(monkeypatch)
+    adapter._bot.do_api_request.side_effect = failure
+    runner = object.__new__(GatewayRunner)
+    delivered = await runner._deliver_queued_first_response(
+        response(PRODUCT_URLS), source=event().source, adapter=adapter, metadata={}, event_message_id='2')
+    adapter._bot.do_api_request.assert_awaited_once()
+    assert delivered is (not replayable)
+    adapter.send_multiple_images.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_queued_edit_reconcile_keeps_inline_photos(monkeypatch):
+    """The reconcile edit carries the same native photo layout; no follow-up attachment batch."""
+    adapter = prepared_adapter(monkeypatch)
+    content = response(PRODUCT_URLS)
+    runner = object.__new__(GatewayRunner)
+    delivered = await runner._deliver_queued_first_response(
+        content, source=event().source, adapter=adapter, metadata={}, event_message_id='2',
+        stream_consumer=SimpleNamespace(message_id='41'))
+    assert delivered
+    adapter._bot.do_api_request.assert_awaited_once()
+    method = adapter._bot.do_api_request.call_args.args[0]
+    rich = adapter._bot.do_api_request.call_args.kwargs['api_kwargs']['rich_message']
+    assert method == 'editMessageText'
+    assert all(f'![image {i}]({url})' in rich['markdown'] for i, url in enumerate(PRODUCT_URLS))
+    adapter.send_multiple_images.assert_not_called()
+    adapter._bot.send_message.assert_not_called()

@@ -258,28 +258,57 @@ def _terminal_retention_hours() -> float:
     return min(value, MAX_TERMINAL_RETENTION_HOURS)
 
 
+_PRUNABLE_STATUSES = "('completed','failed','unknown','cancelled','missed')"
+
+
+def _unsettled_queued_ids(conn: sqlite3.Connection) -> list[str]:
+    """dlz: CRON-2 — terminal runs whose queued delivery is still in flight; retention keeps them.
+
+    A run whose delivery is queued is not history yet: the drain settles the job through this row
+    (``delivery_outcome._settle_job_record``). A queued row whose queue entry is already terminal
+    (the drain's write-back crashed) is settled here from the queue's outcome, never resent, so it
+    ages out normally; one the queue never saw (Bot Chat deferral, lost queue) gets no exemption,
+    or retention would grow without bound. An unreadable queue keeps every queued row this pass."""
+    queued = [r[0] for r in conn.execute(
+        f"SELECT id FROM executions WHERE delivery_outcome='queued' AND status IN {_PRUNABLE_STATUSES}")]
+    if not queued:
+        return []
+    from cron.delivery_queue import statuses
+    from cron.delivery_outcome import _LEDGER_OUTCOME
+
+    found = statuses(queued)
+    if found is None:
+        return queued
+    for execution_id, status in found.items():
+        if status in _LEDGER_OUTCOME:
+            conn.execute(
+                "UPDATE executions SET delivery_outcome=? WHERE id=? AND delivery_outcome='queued'",
+                (_LEDGER_OUTCOME[status], execution_id))
+    return [i for i in queued if found.get(i) in ("pending", "delivering")]
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    # dlz: CRON-2 — a run whose delivery is still queued is not history yet: the drain settles
-    # the job through this row (``delivery_outcome._settle_job_record``), so neither prune may
-    # drop it, or the job stays ``delivery_queued`` forever after a long outage.
+    import json
+
+    keep = json.dumps(_unsettled_queued_ids(conn))
     cutoff = (_hermes_now() - timedelta(hours=_terminal_retention_hours())).isoformat()
     conn.execute(
         # dlz: cancelled/missed rows age out too, or the time prune never drops them (only the cap).
-        """DELETE FROM executions
-           WHERE status IN ('completed','failed','unknown','cancelled','missed')
-             AND COALESCE(delivery_outcome, '') <> 'queued'
+        f"""DELETE FROM executions
+           WHERE status IN {_PRUNABLE_STATUSES}
+             AND id NOT IN (SELECT value FROM json_each(?))
              AND julianday(COALESCE(finished_at, claimed_at)) < julianday(?)""",
-        (cutoff,),
+        (keep, cutoff),
     )
     conn.execute(
-        """DELETE FROM executions WHERE id IN (
+        f"""DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown','cancelled','missed')
-               AND COALESCE(delivery_outcome, '') <> 'queued'
+             WHERE status IN {_PRUNABLE_STATUSES}
+               AND id NOT IN (SELECT value FROM json_each(?))
              ORDER BY julianday(finished_at) DESC, finished_at DESC,
                       julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
-        (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
+        (keep, max(0, int(MAX_TERMINAL_EXECUTIONS))),
     )
 
 

@@ -24,24 +24,26 @@ class GatewayBackgroundMixin:
         self, prompt: str, source: SessionSource, task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[list[str]] = None,
         media_types: Optional[list[str]] = None, persist_user_display_metadata: Optional[dict] = None,
+        inbound_message_id: Optional[str] = None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task (mirrors ``_run_agent``)."""
         with self._profile_scope_for_source(source):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
-                persist_user_display_metadata,
+                persist_user_display_metadata, inbound_message_id,
             )
 
     async def _run_background_task_inner(
         self, prompt: str, source: SessionSource, task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[list[str]] = None,
         media_types: Optional[list[str]] = None, persist_user_display_metadata: Optional[dict] = None,
+        inbound_message_id: Optional[str] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat.
 
-        dlz: ``persist_user_display_metadata`` is captured at dispatch (the native voice binding,
-        keyed on the raw inbound id, not the ``event_message_id`` reply anchor) so a /bg voice row
-        keeps its provenance like a main-session row."""
+        dlz: ``persist_user_display_metadata`` (the native voice binding) and ``inbound_message_id``
+        (the RAW inbound id, not the ``event_message_id`` reply anchor) are captured at dispatch and
+        persisted on the /bg user row like a main-session row; the binding names that id."""
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _load_gateway_config,
             _platform_config_key,
@@ -123,7 +125,9 @@ class GatewayBackgroundMixin:
                     return agent.run_conversation(
                         user_message=enriched_prompt, task_id=task_id,
                         **({"persist_user_display_metadata": dict(persist_user_display_metadata)}
-                           if persist_user_display_metadata else {}))
+                           if persist_user_display_metadata else {}),
+                        **({"persist_user_platform_id": str(inbound_message_id)}
+                           if inbound_message_id is not None else {}))
                 finally:
                     self._cleanup_agent_resources(agent)
 

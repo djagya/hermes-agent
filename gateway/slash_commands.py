@@ -874,7 +874,8 @@ class GatewaySlashCommandsMixin(
             # Forward image/audio attachments so the background agent can see them.
             media_urls=list(event.media_urls or []), media_types=list(event.media_types or []),
             # dlz: native voice provenance (1180cfa066) from the raw inbound id, not the reply anchor.
-            persist_user_display_metadata=inbound_voice_metadata(event) or None))
+            persist_user_display_metadata=inbound_voice_metadata(event) or None,
+            inbound_message_id=str(event.message_id) if event.message_id else None))
         return t("gateway.background.started", preview=_preview(prompt), task_id=task_id)
 
     async def _handle_btw_command(self, event: MessageEvent) -> str:

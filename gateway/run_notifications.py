@@ -330,11 +330,30 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         already delivered it, the reconcile edit landed, the send succeeded, or there was nothing
         textual to send. False: the send was REFUSED (flood control, dead transport) — the caller
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
-        DECLINE returns True: that destination is not approved and must not be re-sent."""
+        DECLINE returns True: that destination is not approved and must not be re-sent. So does an
+        UNCERTAIN send or edit that consumed inline photos (a rich timeout may have landed)."""
         from gateway.run import _strip_response_attachments_for_direct_send
         inline_images_consumed = False
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
+            # dlz: B11 — mirror the ordinary final (extract_response_content + final_text_metadata):
+            # keep the image tags when the adapter renders them inline, mark the attachment fallback,
+            # and skip the URL photos below once the text send or edit consumed them.
+            _inline_text, _inline_metadata = text_content, None
+            _preserves = getattr(adapter, "preserves_inline_images", None)
+            if callable(_preserves) and _preserves(response):
+                _inline_text = adapter.extract_media(response)[1].replace("[[audio_as_voice]]", "").strip()
+                _inline_metadata = {"inline_images_fallback": True}
+
+            def _consumed_uncertain(result) -> tuple[bool, bool]:
+                """(consumed, uncertain): a consumed send that failed without proof it never landed
+                must not be replayed — the photos may already be in the chat."""
+                raw = getattr(result, "raw_response", None)
+                consumed = isinstance(raw, dict) and bool(raw.get("inline_images_consumed"))
+                uncertain = (consumed and not getattr(result, "success", False)
+                             and not getattr(result, "retryable", False))
+                return consumed, uncertain
+
             if text_content:
                 # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
                 # a plain send here would duplicate it.
@@ -347,15 +366,18 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 ):
                     try:
                         _edit_res = await adapter.edit_message(
-                            chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
+                            chat_id=source.chat_id, message_id=_sc_msg_id, content=_inline_text, finalize=True,
+                            **({"metadata": _inline_metadata} if _inline_metadata else {}),
                         )
-                        if getattr(_edit_res, "success", False):
+                        inline_images_consumed, _uncertain = _consumed_uncertain(_edit_res)
+                        if getattr(_edit_res, "success", False) or _uncertain:
                             _reconciled = True
                             logger.info(
-                                "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
-                                _sc_msg_id,
+                                "Queued-lane final reconciled by editing message %s in place (no duplicate send%s).",
+                                _sc_msg_id, "; outcome uncertain, not replayed" if _uncertain else "",
                             )
                         else:
+                            inline_images_consumed = False
                             # P5(b): a DECLINE is not "editing unavailable". The
                             # send below re-delivers the whole response to the
                             # chat the connector just refused.
@@ -371,21 +393,20 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     except Exception as _qe:
                         logger.debug("Queued-lane reconcile edit failed (%s); falling back to send.", _qe)
                 if not _reconciled:
-                    # dlz: B11 — a fresh send mirrors the ordinary final (extract_response_content +
-                    # final_text_metadata): keep the image tags when the adapter renders them inline,
-                    # mark the attachment fallback, and skip the URL photos below once consumed.
-                    _send_text, _send_metadata = text_content, metadata
-                    _preserves = getattr(adapter, "preserves_inline_images", None)
-                    if callable(_preserves) and _preserves(response):
-                        _send_text = adapter.extract_media(response)[1].replace(
-                            "[[audio_as_voice]]", "").strip()
-                        _send_metadata = {**(metadata or {}), "inline_images_fallback": True}
+                    _send_metadata = ({**(metadata or {}), **_inline_metadata} if _inline_metadata
+                                      else metadata)
                     _sent = await self._send_queued_final_text(
-                        adapter, source, _send_text, _send_metadata, event_message_id, session_key,
+                        adapter, source, _inline_text, _send_metadata, event_message_id, session_key,
                         inbound_message_id)
-                    _raw = getattr(_sent, "raw_response", None)
-                    inline_images_consumed = isinstance(_raw, dict) and bool(_raw.get("inline_images_consumed"))
-                    if not getattr(_sent, "success", False):
+                    inline_images_consumed, _uncertain = _consumed_uncertain(_sent)
+                    if _uncertain:
+                        # dlz: an ambiguous rich send (timeout) may have landed: report it delivered so
+                        # the completion send does not replay text and photos; definite refusals
+                        # (retryable / not consumed) keep the fallback below.
+                        logger.warning(
+                            "Queued-lane final send to %s uncertain after consuming inline photos; "
+                            "not replaying it.", getattr(source, "chat_id", "?"))
+                    elif not getattr(_sent, "success", False):
                         # The text never landed. Report it undelivered and skip the attachments too:
                         # the caller's normal completion send replays the whole response (text and
                         # its MEDIA: tags), so uploading here would duplicate every file.
