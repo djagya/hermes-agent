@@ -138,6 +138,9 @@ class _FakeSupervisor(sp.PaymentSupervisionMixin):
         return [{"token": f.get("token", ""), "state": self.retained.get(f.get("token"), "held"),
                  "length": 0 if self.retained.get(f.get("token")) == "empty" else len(f["value"])} for f in fills]
 
+    async def _frames_shown(self, i, d):
+        return True
+
     async def _release_payment_documents(self, i):
         self.released = True
 
@@ -311,7 +314,7 @@ def test_a_written_frame_hidden_after_settling_counts_as_replaced():
     asked = []
 
     class Supervisor(sp.PaymentSupervisionMixin):
-        async def _frame_rendered(self, fid, parent, parent_sid):
+        async def _frame_rendered(self, fid, parent, parent_sid, strict=False):
             return fid != "n"
 
         async def _cdp(self, method, params=None, session_id=None):
@@ -340,7 +343,7 @@ def test_retention_result_keeps_only_tokens_states_and_bounded_lengths():
         assert sp._retention_result([(fills, bad)])["field_retention"] == {"cc-csc": "replaced", "cc-number": "replaced"}
 
 
-def _fill_with_consent(monkeypatch, verdict, reason, on_consent=None, expires_in=None):
+def _fill_with_consent(monkeypatch, verdict, reason, on_consent=None, expires_in=None, on_current=None):
     import time as _time
 
     from tools import browser_vault_payment as bvp
@@ -356,6 +359,8 @@ def _fill_with_consent(monkeypatch, verdict, reason, on_consent=None, expires_in
 
         def payment_is_current(self, i):
             calls.append("payment_is_current")
+            if on_current:
+                on_current(i)
             return True
 
         def commit_payment(self, i, fills):
@@ -416,6 +421,76 @@ def test_consent_is_bounded_by_the_inspection_window_and_a_late_accept_writes_no
     assert 30 <= asked["timeout"] <= 40  # the prompt closes with the inspection window
     assert out["error_type"] == "payment_consent_expired" and "120 s inspection window" in out["error"]
     assert calls == ["discard_payment"]  # no freshness pass, no secret, no write
+
+
+def test_a_window_that_closes_during_the_freshness_pass_resolves_no_secret(monkeypatch):
+    """119 s at the post-consent check, 121 s once the slow freshness pass returns: no secret, no write."""
+    import time as _time
+
+    def lapse(i):
+        i.expires_at = _time.monotonic() - 1
+
+    monkeypatch.setattr("tools.browser_vault_tool._bot_desktop_browser_session", lambda task_id: False)
+    out, calls = _fill_with_consent(monkeypatch, "accept", "accepted", on_current=lapse, expires_in=60)
+    assert out["error_type"] == "payment_consent_expired"
+    assert "resolve_secret" not in calls and "commit_payment" not in calls
+
+
+@pytest.mark.parametrize("lapse_at", ["freshness", "second_document"])
+def test_commit_never_writes_after_the_window_closes(lapse_at):
+    import time as _time
+
+    i = _split_inspection()
+    i.expires_at = _time.monotonic() + 60
+
+    class Supervisor(_FakeSupervisor):
+        async def _payment_is_current(self, inspection):
+            if lapse_at == "freshness":
+                inspection.expires_at = 0
+            return True
+
+        async def _commit_payment_document(self, d, fills):
+            out = await super()._commit_payment_document(d, fills)
+            i.expires_at = 0  # the first document's write ends after the window
+            return out
+
+    sup = Supervisor([{"success": True, "filled_fields": 1}] * 2)
+    out = asyncio.run(sup._commit_payment(i, [{"index": 0, "token": "cc-number", "value": "4242", "document": 0},
+                                              {"index": 0, "token": "cc-csc", "value": "837", "document": 1}]))
+    if lapse_at == "freshness":
+        assert out == {"success": False, "error_type": "payment_consent_expired"} and not sup.writes
+    else:  # a truthful partial stop, never success
+        assert out == {"success": False, "error_type": "payment_consent_expired", "filled_fields": 1,
+                       "partially_filled": True} and len(sup.writes) == 1
+
+
+@pytest.mark.parametrize("hidden", ["ancestor", "during_collection"])
+def test_retention_needs_every_frame_shown_before_and_after_the_reads(hidden):
+    """A guest card form inside /smart/buttons: hiding the buttons frame hides the card frame too, and a
+    frame hidden between its own read and the end of collection is not verified either."""
+    import time as _time
+
+    tree = (("top", "", "", MERCHANT, ""), ("btn", "", "", _PAYPAL, "top"), ("card", "", "", _PAYPAL, "btn"))
+    doc = PaymentDocument("card", "sc", "oc", _PAYPAL, _controls("cc-number"))
+    i = PaymentInspection("op", "page", "target", MERCHANT, (doc,), tree, _time.monotonic() + 60)
+    checks = []
+
+    class Supervisor(_FakeSupervisor):
+        async def _frame_rendered(self, fid, parent, parent_sid, strict=False):
+            checks.append((fid, strict))
+            if hidden == "ancestor":
+                return fid != "btn"
+            return len(checks) <= 2  # shown for the pre-read pass, hidden by the post-read pass
+
+        async def _cdp(self, method, params=None, session_id=None):
+            return {"result": {"result": {"value": [{"token": "cc-number", "state": "held", "length": 4}]}}}
+
+    sup = Supervisor([{"success": True, "filled_fields": 1}])
+    sup._payment_retention = sp.PaymentSupervisionMixin._payment_retention.__get__(sup)
+    sup._frames_shown = sp.PaymentSupervisionMixin._frames_shown.__get__(sup)
+    out = asyncio.run(sup._commit_payment(i, [{"index": 0, "token": "cc-number", "value": "4242", "document": 0}]))
+    assert out["error_type"] == "payment_fields_not_retained" and out["field_retention"] == {"cc-number": "replaced"}
+    assert all(strict for _, strict in checks) and ("btn", True) in checks
 
 
 def test_commit_after_the_inspection_window_is_expired_not_a_changed_page():

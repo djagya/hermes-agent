@@ -441,8 +441,10 @@ class PaymentSupervisionMixin:
             await self._release_payment_sessions(child_sessions)
             raise
 
-    async def _frame_rendered(self, fid: str, parent: str, parent_sid: str) -> bool:
-        """Whether the iframe element hosting ``fid`` is laid out and visible in its parent document."""
+    async def _frame_rendered(self, fid: str, parent: str, parent_sid: str, *, strict: bool = False) -> bool:
+        """Whether the iframe element hosting ``fid`` is laid out and visible in its parent document.
+        ``strict`` (dlz, retention only) also refuses a transparent iframe or one under a transparent or
+        hidden ancestor element."""
         obj = None
         try:
             owner = (await self._cdp("DOM.getFrameOwner", {"frameId": fid}, session_id=parent_sid))["result"]
@@ -454,9 +456,12 @@ class PaymentSupervisionMixin:
                 session_id=parent_sid))["result"]["object"]["objectId"]
             return _value(await self._cdp("Runtime.callFunctionOn", {
                 "objectId": obj,
-                "functionDeclaration": "function(){const r=this.getBoundingClientRect();return this.isConnected&&"
+                "functionDeclaration": "function(strict){const r=this.getBoundingClientRect();return this.isConnected&&"
                                        "this.getClientRects().length>0&&r.width>2&&r.height>2&&"
-                                       "getComputedStyle(this).visibility!=='hidden'}",
+                                       "getComputedStyle(this).visibility!=='hidden'&&(!strict||"
+                                       "(Number(getComputedStyle(this).opacity)>0&&(typeof this.checkVisibility!=="
+                                       "'function'||this.checkVisibility({opacityProperty:true,visibilityProperty:true}))))}",
+                "arguments": [{"value": strict}],
                 "returnByValue": True,
             }, session_id=parent_sid)) is True
         except (KeyError, TypeError, PaymentPolicyError):
@@ -536,6 +541,10 @@ class PaymentSupervisionMixin:
             i.consumed = True
             await self._release_payment_documents(i)
             return {"success": False, "error_type": "payment_page_changed"}
+        if time.monotonic() >= i.expires_at:  # dlz: the freshness pass itself can outlast the window
+            i.consumed = True
+            await self._release_payment_documents(i)
+            return {"success": False, "error_type": "payment_consent_expired"}
         # Consume before ingress; transport uncertainty is never a retry authorization.
         i.consumed = True
         filled = 0
@@ -545,6 +554,10 @@ class PaymentSupervisionMixin:
             # reports what an earlier document already received instead of retrying.
             written = []
             for document, document_fills in _commit_order(i, _fills_by_document(i, fills)):
+                if time.monotonic() >= i.expires_at:
+                    # dlz: no write after the window closes; earlier documents' values are reported, not
+                    # completed.
+                    return _partial({"success": False, "error_type": "payment_consent_expired"}, filled)
                 result = await self._commit_payment_document(document, document_fills)
                 if not result.get("success"):
                     return _partial(result, filled)
@@ -554,7 +567,11 @@ class PaymentSupervisionMixin:
             # later, and a later document (brand detection on the number, a blur) can clear an
             # earlier one, so success is only reported once EVERY document still holds its values.
             await asyncio.sleep(_SETTLE_SECONDS)
-            return _retention_result([(f, await self._payment_retention(i, d)) for d, f in written])
+            answers = [(d, f, await self._payment_retention(i, d)) for d, f in written]
+            # dlz: and once more after every read: a frame hidden while the answers were collected is not
+            # the one the user sees, so its fields count as replaced.
+            return _retention_result([(f, a if a is not None and await self._frames_shown(i, d) else None)
+                                      for d, f, a in answers])
         except PaymentPolicyError:
             return _partial({"success": False, "error_type": "payment_fields_invalid"}, filled)
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
@@ -591,10 +608,8 @@ class PaymentSupervisionMixin:
         a value."""
         # dlz: a provider that re-renders by hiding the written frame and showing a fresh, empty one
         # leaves the old document holding every value; from inside, that document still looks visible.
-        parent = next((f[4] for f in i.tree if f[0] == d.frame_id), None)
         try:
-            if parent is None or (parent and not await self._frame_rendered(
-                    d.frame_id, parent, i.child_sessions.get(parent, i.page_session))):
+            if not await self._frames_shown(i, d):
                 return None
             states = _value(await self._cdp("Runtime.callFunctionOn", {
                 "objectId": d.object_id,
@@ -606,6 +621,27 @@ class PaymentSupervisionMixin:
         if not isinstance(states, list):
             return None
         return states
+
+    async def _frames_shown(self, i: PaymentInspection, d: PaymentDocument) -> bool:
+        """dlz: whether the document's frame AND every frame above it is still shown to the user: laid out,
+        visible and not transparent in its parent (strict check, retention only). Any failure: False."""
+        by_id = {f[0]: f for f in i.tree}
+        fid = d.frame_id
+        try:
+            for _ in range(len(by_id)):
+                record = by_id.get(fid)
+                if record is None:
+                    return False
+                parent = record[4]
+                if not parent:
+                    return True
+                if not await self._frame_rendered(fid, parent, i.child_sessions.get(parent, i.page_session),
+                                                  strict=True):
+                    return False
+                fid = parent
+        except Exception:  # health: allow BLE001 -- an unreadable frame is not a frame the user sees
+            return False
+        return False
 
     async def _release_payment_documents(self, i: PaymentInspection) -> None:
         for d in i.documents:
