@@ -103,6 +103,46 @@ def test_start_byte_cannot_be_revoked_and_recording_failure_runs_no_code(tmp_pat
     assert proc.returncode != 0 and not ran.exists()  # no fd to record into: user code never ran
 
 
+@pytest.mark.skipif(not __import__("sys").platform.startswith("linux"), reason="/proc/self/fd is Linux-only")
+def test_child_cannot_drain_the_start_byte_through_proc_self_fd():
+    """Recheck2 P1: the child's write end is closed before user code, so /proc/self/fd cannot reopen the pipe."""
+    import os
+    import sys
+
+    drain = ("import os\nfor f in range(3, 256):\n    try:\n        fd = os.open(f'/proc/self/fd/{f}', os.O_RDONLY | os.O_NONBLOCK)\n"
+             "    except OSError:\n        continue\n    try:\n        os.read(fd, 1)\n    except OSError:\n        pass\n"
+             "raise SystemExit(1)\n")
+    env = dict(os.environ)
+    pipe = bu_cli._arm_exec_start(env)
+    proc = bu_cli._run_cli_killing_process_group([sys.executable, "-c", "import sys; exec(sys.stdin.read())"],
+                                                 bu_cli._EXEC_STARTED_PREAMBLE + drain, env, 30)
+    assert proc.returncode == 1 and bu_cli._exec_start_seen(env, pipe) is True
+
+
+def test_no_start_pipe_sends_no_preamble_and_never_retries(tmp_path, monkeypatch):
+    """Recheck2 P2: without a pipe (Windows, pipe failure) the code runs unchanged and a connect-looking
+    failure is never replayed (fail closed: treated as started)."""
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id: None)
+        monkeypatch.setattr(bu_cli, "_arm_exec_start", lambda env: None)
+        calls, sent = tmp_path / "calls", tmp_path / "sent"
+        script = _fake_cli(
+            tmp_path,
+            'case "$1" in --reload) exit 0;; esac\n'
+            f"echo x >> '{calls}'\ncat > '{sent}'\n"
+            'echo "CDP WS handshake failed: timed out during opening handshake" >&2; exit 1\n',
+        )
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [str(script)])
+        json.loads(bu_cli.browser_exec("print(1)", task_id="t1"))
+        assert len(calls.read_text().split()) == 1
+        assert bu_cli._EXEC_STARTED_FD_ENV not in sent.read_text()
+    finally:
+        httpd.shutdown()
+
+
 def test_qa_targets_schema_names_the_registry_not_hostnames(monkeypatch):
     """B23: control admits registered app names only (grant.py admit)."""
     monkeypatch.setattr(route, "is_managed", lambda: True)

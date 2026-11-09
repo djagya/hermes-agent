@@ -155,7 +155,12 @@ def _slot_oom_hint(env: dict, started: float) -> str:
 # failure to record raises before any user code runs. "No byte" is therefore the structured proof that
 # execution never started; stderr text alone is not (user code can print the same phrase).
 _EXEC_STARTED_FD_ENV = "HERMES_BU_EXEC_STARTED_FD"
-_EXEC_STARTED_PREAMBLE = f'__import__("os").write(int(__import__("os").environ.pop("{_EXEC_STARTED_FD_ENV}")), b"1")\n'
+# The child's write end is closed right after the byte (recheck2 P1: user code could otherwise reopen
+# /proc/self/fd/<n> read-only and drain it). The preamble is sent only when a pipe was armed.
+_EXEC_STARTED_PREAMBLE = (
+    f'(lambda _o, _f: (_o.write(_f, b"1"), _o.close(_f)))'
+    f'(__import__("os"), int(__import__("os").environ.pop("{_EXEC_STARTED_FD_ENV}")))\n'
+)
 
 
 def _arm_exec_start(env: dict) -> Optional[tuple[int, int]]:
@@ -1306,8 +1311,6 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     # The time spent waiting in control's queue comes out of this call's budget.
     timeout = max(_MIN_TIMEOUT_S, _clamp_timeout(timeout_s) - int(_managed_waited_s(managed)))
     started = time.time()
-    if managed:
-        code = _EXEC_STARTED_PREAMBLE + code
     exec_start = {"never_started": False}
 
     def dispatch() -> dict[str, Any]:
@@ -1325,11 +1328,14 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         owning = schedule(lambda: _own_harness_daemon_until_owned(env), _OWN_DURING_CALL_S)
         start_pipe = _arm_exec_start(env) if managed else None
         exec_start["never_started"] = False
+        # dlz: recheck2 P2 — no pipe (Windows, pipe failure): no preamble, and never a retry (fail closed).
+        armed = start_pipe is not None
         try:
-            proc = _run_cli_killing_process_group(cmd, code, env, timeout)
+            proc = _run_cli_killing_process_group(cmd, (_EXEC_STARTED_PREAMBLE + code) if armed else code,
+                                                  env, timeout)
             seen = _exec_start_seen(env, start_pipe)
             start_pipe = None
-            exec_start["never_started"] = managed and not seen and getattr(proc, "returncode", 0) != 0
+            exec_start["never_started"] = armed and not seen and getattr(proc, "returncode", 0) != 0
             return {"proc": proc}
         except subprocess.TimeoutExpired:
             oom = _slot_oom_hint(env, started) if managed else ""
