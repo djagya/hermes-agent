@@ -22,8 +22,17 @@ const evaluate = (expression, context) => Boolean(value(expression, context))
 it('pull requests restore the caches main saves and never write their own', () => {
   const step = id => setup.runs.steps.find(candidate => candidate.id === id)
   const base = { toolchain: 'all', cache: 'true', 'cache-python': 'true', 'cache-node': 'true', 'test-environment': 'false', extras: 'voice' }
+  // dlz: the PM tools cache always restores and saves only on a push to main or a release line
+  // (tools-cache-restore / tools-cache-save), so it is checked on its own below.
+  for (const [event_name, ref, saves] of [
+    ['pull_request', 'refs/pull/1/merge', false], ['workflow_dispatch', 'refs/heads/main', false],
+    ['push', 'refs/heads/main', true]]) {
+    const inputs = { ...base, 'save-tools-cache': value(setup.inputs['save-tools-cache'].default, { github: { event_name } }) }
+    const github = { event_name, ref }
+    expect(evaluate(step('tools-cache-restore').if, { inputs, github }), `tools restore on ${event_name}`).toBe(true)
+    expect(evaluate(step('tools-cache-save').if, { inputs, github }), `tools save on ${event_name}`).toBe(saves)
+  }
   for (const [kind, saving, restoring] of [
-    ['tools', 'tools-cache', 'tools-cache-restore'],
     ['python', 'python-cache', 'python-cache-restore'],
     ['node', 'node-cache', 'node-cache-restore'],
   ]) {
