@@ -125,6 +125,13 @@ _PP_VARIANTS = {
     # A re-render that swaps the number input for a fresh, empty node.
     "replace": {"number": "el.addEventListener('input',()=>setTimeout(()=>{const n=document.createElement('input');"
                 "n.autocomplete='cc-number';el.replaceWith(n)},200))"},
+    # A re-render that hides the written number input and shows a fresh, empty one beside it.
+    "hidden": {"number": "el.addEventListener('input',()=>setTimeout(()=>{el.style.display='none';"
+               "const n=document.createElement('input');n.autocomplete='cc-number';el.after(n)},200))"},
+    # The page hides the written number FRAME and shows a fresh, empty one (the old one keeps its value).
+    "frameswap": {"number": "el.addEventListener('input',()=>setTimeout(()=>parent.postMessage('swap','*'),200))"},
+    # A reset that lands later than one second after the last write.
+    "late": {"number": "el.addEventListener('input',()=>setTimeout(()=>{el.value=''},1500))"},
     # The provider re-formats the expiry ("07/35" -> "07 / 35"), which is the same value.
     "expiry": {"expiry": "el.addEventListener('input',()=>setTimeout(()=>{const d=el.value.replace(/\\D/g,'');"
                "el.value=d.slice(0,2)+' / '+d.slice(2)},100))"},
@@ -155,7 +162,10 @@ def _paypal_page(path, origins):
                 f'<script>const el=document.getElementById("{field}");{script}</script>')
     if path.startswith("/pp-") and path[4:] in _PP_VARIANTS:
         relay = ("<script>addEventListener('message',e=>{if(e.data==='brand')"
-                 "for(let i=0;i<frames.length;i++)frames[i].postMessage('brand','*')})</script>")
+                 "for(let i=0;i<frames.length;i++)frames[i].postMessage('brand','*');"
+                 "if(e.data==='swap')for(const f of document.querySelectorAll('iframe'))if(f.contentWindow===e.source)"
+                 "{f.style.display='none';const n=document.createElement('iframe');"
+                 "n.src=f.src.replace('/frameswap/','/stable/');f.after(n)}})</script>")
         return relay + "".join(
             f'<iframe src="{origins["psp"]}/smart/card-field/{path[4:]}/{f}"></iframe>' for f in _PP_FIELDS)
     return None
@@ -833,8 +843,8 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
         navigate(sup, origins["merchant"] + f"/pp-{variant}")
         with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
             raw = browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"])
-        # No extra wait: the fill itself settles 1.0 s after the last write, past every scripted
-        # reset (the delayed one fires at 300 ms), so the frames are final when it returns.
+        # No extra wait: the fill itself settles 2.0 s after the last write, past every scripted
+        # reset (the latest fires at 1.5 s), so the frames are final when it returns.
         outcomes[variant] = (json.loads(raw), frame_values(variant), raw)
         print("OUTCOME", variant, {k: v for k, v in outcomes[variant][0].items()
                                    if k in ("success", "error_type", "filled_fields", "field_retention")},
@@ -851,7 +861,8 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
             # Success is only reported when every written field still holds its value.
             assert not empty and out["filled_fields"] == 4 and out["retention_verified"] is True, (variant, out)
         else:
-            assert empty or variant == "replace", (variant, out, values)
+            # ``frame_values`` reads the written frames only: a swapped-out one still holds its values.
+            assert empty or variant in ("replace", "hidden", "frameswap"), (variant, out, values)
     assert outcomes["stable"][0]["success"] and outcomes["expiry"][0]["success"]
     assert outcomes["expiry_digits"][0]["success"] and outcomes["expiry_digits"][1]["expiry"] == "0735"
     assert outcomes["stable"][1] == {"name": "Ada Lovelace", "number": CARD["card_number"], "expiry": "07/35",
@@ -864,6 +875,9 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
         "brand": {"cc-csc": "empty"},
         "blur": {"cc-csc": "empty"},
         "replace": {"cc-number": "replaced"},
+        "hidden": {"cc-number": "replaced"},
+        "frameswap": {"cc-number": "replaced"},
+        "late": {"cc-number": "empty"},
     }
     for variant, dropped in expected.items():
         out = outcomes[variant][0]
@@ -877,7 +891,8 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
     for value in (CARD["card_number"], CARD["cvc"]):
         assert value not in caplog.text
     print("RECEIPT paypal_shape stable=PASS expiry_format=PASS expiry_digits=PASS sync_reset=REFUSED delayed_reset=REFUSED "
-          "brand_reset=REFUSED blur_reset=REFUSED replaced_node=REFUSED no_submit=PASS capture_blocked=PASS")
+          "brand_reset=REFUSED blur_reset=REFUSED replaced_node=REFUSED hidden_node=REFUSED frame_swap=REFUSED "
+          "late_reset=REFUSED no_submit=PASS capture_blocked=PASS")
 
 
 def test_payone_shaped_select_expiry_fills_once_or_refuses_without_writes(payment_browser, tmp_path, monkeypatch, caplog):

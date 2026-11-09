@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from agent.vault_backends import BackendError
 from agent.vault_login_classifier import match_expiry_option, select_checkout_fills
@@ -104,19 +105,58 @@ _NOT_RETAINED = (
 
 
 def _consent_not_given(verdict: str, reason: str | None) -> dict:
-    """The stop result when card-fill consent was not given. ``error_type`` stays ``payment_declined``
-    (callers stop on it and never retry); ``consent_outcome`` says whether the user refused, nobody
-    answered in time, or the prompt could not be shown. None of these is an issuer or bank decline."""
+    """The stop result when card-fill consent was not given; ``consent_outcome`` says whether the user
+    refused, nobody answered in time, or the prompt could not be shown. None of these is an issuer or
+    bank decline. dlz: only an explicit refusal is ``payment_declined`` (stop, never retry); a missing
+    answer is ``payment_consent_missing``, which also stops, but a new fill (with its own new prompt)
+    may follow once the user is asked."""
     if reason not in _CONSENT_OUTCOMES:  # a stubbed consent without a reason: infer from the verdict
         reason = "timeout" if verdict == "cancel" else "refused"
+    if reason == "refused":
+        return {
+            "success": False,
+            "error_type": "payment_declined",
+            "consent_outcome": reason,
+            "issuer_response": False,
+            "error": _CONSENT_MESSAGES[reason] + " This is not a bank or issuer decline. No card value was read "
+            "and no field was written. Stop; do not retry the fill.",
+        }
     return {
         "success": False,
-        "error_type": "payment_declined",
+        "error_type": "payment_consent_missing",
         "consent_outcome": reason,
         "issuer_response": False,
-        "error": _CONSENT_MESSAGES[reason] + " This is not a bank or issuer decline. No card value was read "
-        "and no field was written. Stop; do not retry the fill.",
+        "error": _CONSENT_MESSAGES[reason] + " No card-fill approval was received; this is not a bank or issuer "
+        "decline. No card value was read and no field was written. Stop here. A new fill needs a new consent "
+        "prompt; ask the user once whether to try again.",
     }
+
+
+# dlz: a next step for every typed refusal the model can get from fill_payment (B19).
+_SUPERVISOR_REQUIRED = (
+    "The card fill needs the supervised browser for this task, and it is not attached. Nothing was read or "
+    "written. Open the checkout in the browser tools first, then call fill once more; if this repeats, report "
+    "it to the user instead of filling by hand."
+)
+_NO_ORIGIN = (
+    "This saved card is not bound to any merchant site, so it cannot be filled anywhere. Nothing was read or "
+    "written. Ask the user to save the card with this merchant's site; never type card values yourself."
+)
+_PAGE_CHANGED = (
+    "The checkout changed after it was inspected (navigation, re-render or a different frame), so no card "
+    "field was written and nothing was submitted. Check the page, then call fill once more; it shows a new "
+    "approval prompt."
+)
+_CONSENT_EXPIRED = (
+    "The approval arrived (or the fill reached the page) after the 120 s inspection window closed, so no "
+    "card field was written and nothing was submitted. Ask the user again: call fill once more for a new "
+    "prompt and approve it in time."
+)
+
+
+def _remaining_seconds(inspected) -> int:
+    """Whole seconds left in the inspection window: the consent prompt's own deadline (at least 1)."""
+    return max(1, int(inspected.expires_at - time.monotonic()))
 
 
 def _payment_item_unchanged(backend, meta) -> bool:
@@ -141,14 +181,14 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
     except vault._PageUnavailable as exc:
         return json.dumps(exc.result())
     except Exception:  # health: allow BLE001 -- CDP attach errors can carry endpoint credentials; fixed type only
-        return json.dumps({"success": False, "error_type": "supervisor_required"})
+        return json.dumps({"success": False, "error_type": "supervisor_required", "error": _SUPERVISOR_REQUIRED})
     if supervisor is None:
-        return json.dumps({"success": False, "error_type": "supervisor_required"})
+        return json.dumps({"success": False, "error_type": "supervisor_required", "error": _SUPERVISOR_REQUIRED})
     inspected = None
     try:
         bound = tuple(meta.allowed_origins) or ((meta.origin,) if meta.origin else ())
         if not bound and meta.payment_scope != "confirmed_page":
-            return json.dumps({"success": False, "error_type": "no_origin"})
+            return json.dumps({"success": False, "error_type": "no_origin", "error": _NO_ORIGIN})
         inspected = supervisor.inspect_payment(
             merchant_origin,
             bound_origins=bound,
@@ -165,13 +205,17 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             surface="vault-payment",
             title="Approve card fill on this merchant?",
             outcome=consent_detail,
+            # dlz: the prompt closes with the inspection window, not the global approval timeout.
+            timeout_seconds=_remaining_seconds(inspected),
         )
         if consent != "accept":
-            # Stop here: no secret resolved, no field written. Same error_type as before, so every caller
-            # that stops on payment_declined still stops; consent_outcome says why.
+            # Stop here: no secret resolved, no field written. A refusal is payment_declined, a missing
+            # answer payment_consent_missing; both stop, and consent_outcome says why.
             return json.dumps(_consent_not_given(consent, consent_detail.get("reason")))
+        if time.monotonic() >= inspected.expires_at:
+            return json.dumps({"success": False, "error_type": "payment_consent_expired", "error": _CONSENT_EXPIRED})
         if not supervisor.payment_is_current(inspected):
-            return json.dumps({"success": False, "error_type": "payment_page_changed"})
+            return json.dumps({"success": False, "error_type": "payment_page_changed", "error": _PAGE_CHANGED})
         # The card is resolved and written inside the backend's fill_context (a plugin backend's lock /
         # snapshot / manager session), entered only after consent; a plugin item that changed meanwhile
         # is refused before any value is resolved.
@@ -222,6 +266,10 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             result = supervisor.commit_payment(inspected, fills)
             if result.get("error_type") == "payment_fields_not_retained":
                 result["error"] = _NOT_RETAINED
+            elif result.get("error_type") == "payment_page_changed":  # the commit's own freshness check
+                result["error"] = _PAGE_CHANGED
+            elif result.get("error_type") == "payment_consent_expired":
+                result["error"] = _CONSENT_EXPIRED
             result.update(
                 kind="payment",
                 backend=backend.name,

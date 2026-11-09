@@ -33,8 +33,9 @@ _COVERAGE_REFUSALS = frozenset({
 })
 # Bounded wait between the last document's write and the all-documents retention check: long enough
 # for a provider's deferred re-render, validation or brand detection to land, short enough to stay
-# well inside commit_payment's 20 s budget. Never a retry window.
-_SETTLE_SECONDS = 1.0
+# well inside commit_payment's 20 s budget. Never a retry window. dlz: 2 s, not 1 s: a reset that
+# lands between 1 and 2 s after the last write was still reported as success.
+_SETTLE_SECONDS = 2.0
 _RETENTION_STATES = frozenset({"held", "empty", "changed", "replaced"})
 # Card fields a saved card may lack: left empty for the user instead of refusing the whole fill.
 OPTIONAL_CARD_TOKENS = frozenset({"cc-name", "postal-code"})
@@ -525,6 +526,12 @@ class PaymentSupervisionMixin:
     async def _commit_payment(self, i: PaymentInspection, fills: list[dict]) -> dict:
         if i.consumed:
             return {"success": False, "error_type": "payment_consent_consumed"}
+        if time.monotonic() >= i.expires_at:
+            # dlz: the inspection window closed (late approval, slow card lookup): nothing is written, and
+            # the result says so instead of reading as a changed page.
+            i.consumed = True
+            await self._release_payment_documents(i)
+            return {"success": False, "error_type": "payment_consent_expired"}
         if not await self._payment_is_current(i):
             i.consumed = True
             await self._release_payment_documents(i)
@@ -547,7 +554,7 @@ class PaymentSupervisionMixin:
             # later, and a later document (brand detection on the number, a blur) can clear an
             # earlier one, so success is only reported once EVERY document still holds its values.
             await asyncio.sleep(_SETTLE_SECONDS)
-            return _retention_result([(f, await self._payment_retention(d)) for d, f in written])
+            return _retention_result([(f, await self._payment_retention(i, d)) for d, f in written])
         except PaymentPolicyError:
             return _partial({"success": False, "error_type": "payment_fields_invalid"}, filled)
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
@@ -577,11 +584,18 @@ class PaymentSupervisionMixin:
             return {"success": False, "error_type": "payment_result_invalid"}
         return result
 
-    async def _payment_retention(self, d: PaymentDocument) -> list | None:
+    async def _payment_retention(self, i: PaymentInspection, d: PaymentDocument) -> list | None:
         """Per written field ``{token, state, length}`` from the document's commit closure, or None when
-        the document cannot answer (navigated, replaced, transport failure): its fields are then
-        unknown and reported as replaced. Never retried, never a value."""
+        the document cannot answer (navigated, replaced, transport failure) or its frame is no longer
+        shown in its parent: its fields are then unknown and reported as replaced. Never retried, never
+        a value."""
+        # dlz: a provider that re-renders by hiding the written frame and showing a fresh, empty one
+        # leaves the old document holding every value; from inside, that document still looks visible.
+        parent = next((f[4] for f in i.tree if f[0] == d.frame_id), None)
         try:
+            if parent is None or (parent and not await self._frame_rendered(
+                    d.frame_id, parent, i.child_sessions.get(parent, i.page_session))):
+                return None
             states = _value(await self._cdp("Runtime.callFunctionOn", {
                 "objectId": d.object_id,
                 "functionDeclaration": "function(){return this.retained()}",
@@ -680,10 +694,11 @@ _INSPECT = r"""(() => {
   // Honeypots and visually-hidden inputs are never fill targets: Shopify's PCI frames carry one
   // aria-hidden, tabindex=-1, 1px input per card token around the real field, and filling one
   // is a fraud signal.
-  const visible = e => {
-    if (e.disabled || e.readOnly || !e.isConnected || e.ownerDocument !== doc ||
-        e.getAttribute('aria-hidden') === 'true' || e.tabIndex < 0 || e.hasAttribute('data-honeypot-field'))
-      return false;
+  const visible = e => !(e.disabled || e.readOnly || !e.isConnected || e.ownerDocument !== doc ||
+      e.getAttribute('aria-hidden') === 'true' || e.tabIndex < 0 || e.hasAttribute('data-honeypot-field')) &&
+    shown(e);
+  // Laid out and visible to the user; also what the settled retention check requires of a written field.
+  const shown = e => {
     const r = e.getBoundingClientRect(), s = getComputedStyle(e);
     // Mollie keeps a transparent, click-through focus-trap input beside each real field.
     return e.getClientRects().length>0 && r.width > 2 && r.height > 2 && s.visibility !== 'hidden' &&
@@ -720,7 +735,8 @@ _INSPECT = r"""(() => {
       const page = document === doc && location.href === href;
       return w.map(f => {
         const el = elements[f.index];
-        if (!page || !live(el)) return {token:f.token,state:'replaced',length:0};
+        // dlz: a field the provider hid in favour of a fresh input is not the one the user sees.
+        if (!page || !live(el) || !shown(el)) return {token:f.token,state:'replaced',length:0};
         return {token:f.token,state:same(el.value,f.value)?'held':el.value?'changed':'empty',length:el.value.length};
       });
     },

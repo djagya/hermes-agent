@@ -364,7 +364,8 @@ def _elicit(message: str, description: str, *, timeout_seconds: int | None,
                 session_key, notify_cb, {"command": message, "description": description,
                                          "pattern_key": "mcp_elicitation",
                                          "pattern_keys": ["mcp_elicitation"],
-                                         "allow_session": scoped, "allow_permanent": scoped}, surface=surface)
+                                         "allow_session": scoped, "allow_permanent": scoped}, surface=surface,
+                timeout_s=timeout_seconds)  # dlz: a caller's per-call deadline holds on the gateway too
         except Exception as exc:
             logger.error("Elicitation gateway dispatch failed: %s", exc, exc_info=True)
             return "decline", "unavailable"
