@@ -1414,7 +1414,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
-        if _is_shared_multi_user and source.user_name and (message_text.strip() or not event.internal):  # blank internal = auto-resume, no sender (run_resume)
+        # dlz: an internal event (notification, wake, injection, auto-resume) was not written by the
+        # source's user, so it gets no "[name]" sender prefix, with or without text.
+        if _is_shared_multi_user and source.user_name and not event.internal:
             # Display names are attacker-influenceable: neutralize newlines/control chars or a
             # hostile name masquerades as a fake markdown section (mirrors build_session_context_prompt).
             _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
