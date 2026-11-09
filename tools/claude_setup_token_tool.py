@@ -114,8 +114,8 @@ def claude_setup_token(args: dict[str, Any], **kwargs) -> str:
 CLAUDE_SETUP_TOKEN_SCHEMA = {
     "name": "claude_setup_token",
     "description": (
-        "Create a new long-lived Claude subscription token (`claude setup-token`) when Danil explicitly "
-        "asks for it. start runs the native CLI and returns authorize_url (send it to Danil in chat; "
+        "Create a long-lived Claude subscription token via `claude setup-token`. Use only when Danil "
+        "explicitly asks. start runs the native CLI and returns authorize_url (send it to Danil in chat; "
         "status repeats it while the callback is awaited) and a handoff_url (the same step on his "
         "signed-in dashboard). After approving at Claude he pastes the final http://localhost address "
         "back to you in chat (or on the dashboard page). For a pasted address call submit with the "
@@ -130,7 +130,7 @@ CLAUDE_SETUP_TOKEN_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["start", "submit", "status", "cancel"]},
             "flow": {"type": "string", "description": "Flow handle from start (submit/status/cancel)."},
-            "callback": {"type": "string", "maxLength": 4096,
+            "callback": {"type": "string", "maxLength": 1900,
                          "description": "submit only: the final http://localhost callback address Danil pasted "
                                         "in chat, exactly as sent."},
         },

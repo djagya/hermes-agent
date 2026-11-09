@@ -10,6 +10,11 @@
     "kind": "bare_which"
   },
   {
+    "path": "agent/claude_setup_token.py",
+    "symbol": "Broker._claude_binary",
+    "kind": "bare_which"
+  },
+  {
     "path": "agent/lsp/cli.py",
     "symbol": "_backend_warnings",
     "kind": "bare_which"
