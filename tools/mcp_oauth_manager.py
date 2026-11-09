@@ -257,6 +257,7 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
         inner = super().async_auth_flow(request)
         resource_lock_released = retry_after_concurrent_auth = False
         sent_access_token = None
+        resource_401_refresh_attempted = refresh_seen = False
         try:
             outgoing = await inner.__anext__()
             while True:
@@ -268,6 +269,8 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                     self.context.lock.release()
                     resource_lock_released = True
                 else:
+                    if self._hermes_fence is not None:
+                        refresh_seen = True
                     try:  # refuse the SDK's guessed DCR POST before it hits the network
                         await self._maybe_reject_fabricated_registration(outgoing)
                     except Exception:
@@ -306,6 +309,35 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                     await inner.aclose()
                     retry_after_concurrent_auth = True
                     break
+                # An explicit rejection of this access token is not proof that its
+                # refresh grant is dead. Re-enter the SDK's own proactive refresh
+                # path once, under its normal lock and Hermes' rotating-grant fence.
+                if outgoing is request and getattr(incoming, "status_code", None) == 401:
+                    if resource_401_refresh_attempted:
+                        await inner.aclose()
+                        break  # expose the second 401; no reauthorization loop
+                    from tools.mcp_tool import sdk_httpx
+                    transport_httpx = sdk_httpx()
+                    assert transport_httpx is not None  # this flow requires the SDK transport
+                    try:
+                        request.content  # never consume/replay an unbuffered stream
+                        buffered = True
+                    except transport_httpx.RequestNotRead:
+                        buffered = False
+                    from tools.mcp_oauth_provider import enforce_refresh_token_issuer
+                    enforce_refresh_token_issuer(self.context)
+                    if (not refresh_seen and buffered and self.context.is_token_valid()
+                            and self.context.can_refresh_token()
+                            and self.context.oauth_metadata is not None
+                            and incoming.headers.get("www-authenticate", "").strip().lower()
+                                == 'bearer error="invalid_token"'):
+                        await inner.aclose()  # release the SDK lock before restarting
+                        # In-memory invalidation only; never edit persisted expiry.
+                        self.context.token_expiry_time = time.time() - 1
+                        resource_401_refresh_attempted = True
+                        inner = super().async_auth_flow(request)
+                        outgoing = await inner.__anext__()
+                        continue
                 # Sniff the response for a dead-client-registration signal before handing it back to the SDK
                 # (best-effort, GH#36767).
                 await self._maybe_flag_poisoned_client(incoming)
