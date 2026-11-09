@@ -87,3 +87,26 @@ def test_manager_card_metadata_and_native_resolution_are_separate(
         json.loads(line) for line in script.with_suffix(".log").read_text().splitlines()
     ]
     assert all(f["value"] not in json.dumps(calls) for f in CARD["fields"])
+
+
+@pytest.mark.platforms("posix")
+def test_card_revision_is_the_op_version_from_the_listing_and_from_the_revealed_item(tmp_path, monkeypatch):
+    """Design v2 A8: the prompt binds the listing's ``version``; the reveal reports the version it read, so an
+    item edited between the two (version 3 -> 4) is told apart. Synthetic op, synthetic card."""
+    script = tmp_path / "op"
+    listed = {**{k: v for k, v in CARD.items() if k != "fields"}, "version": 3}
+    script.write_text(
+        "#!/usr/bin/env python3\nimport json,sys\na=sys.argv[1:]\n"
+        f"listed={listed!r}\ncard={dict(CARD, version=4)!r}\n"
+        "if a[:2]==['item','list']:print(json.dumps([listed]))\n"
+        "elif a[:2]==['item','get'] and '--reveal' in a:print(json.dumps(card))\nelse:sys.exit(2)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home-rev"))
+    backend = OnePasswordLoginBackend({"binary_path": str(script)})
+    backend._service_token = "synthetic-service-token"
+    meta = backend.get_meta("op:vault:card")
+    assert meta.revision == "op:3" and "revision" not in meta.to_dict()
+    card, revision = backend.resolve_payment_secret("op:vault:card")
+    assert revision == "op:4" and card["card_number"] == CARD["fields"][0]["value"]

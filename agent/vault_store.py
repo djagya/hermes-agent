@@ -19,10 +19,13 @@ Design notes:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import uuid
 from contextlib import contextmanager, suppress
@@ -188,6 +191,10 @@ class VaultItemMeta:
     allowed_origins: tuple = ()
     payment_scope: str = "origin_bound"
     payment_frame_origins: tuple = ()
+    # dlz: a non-secret snapshot id of the stored item (1Password ``version``; for the local store a keyed
+    # digest of the record). Bound when a card-fill prompt is shown and re-checked when the card is read;
+    # "" = the backend cannot tell one revision from another. Never in to_dict / model output.
+    revision: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         out = {
@@ -648,10 +655,14 @@ class VaultStore:
         Callers must never place the returned values into tool results,
         logs, exceptions, or any string that reaches the session DB.
         """
+        return self.resolve_secret_with_revision(item_id)[0]
+
+    def resolve_secret_with_revision(self, item_id: str) -> tuple[dict[str, Any], str]:
+        """``resolve_secret`` plus the record's revision, both from the same read."""
         with self._locked():
             for rec in self._read_all():
                 if rec.get("id") == item_id:
-                    return dict(rec.get("secret") or {})
+                    return dict(rec.get("secret") or {}), _record_revision(rec)
         raise VaultError(f"no vault item with id {item_id!r}")
 
     @staticmethod
@@ -666,7 +677,20 @@ class VaultStore:
             identifier_type=rec.get("identifier_type") if identifier else None,
             identifier=identifier or None,
             has_otp=bool((rec.get("secret") or {}).get("otp_secret")),
+            revision=_record_revision(rec),
         )
+
+
+# dlz: per-process key for record revisions. A plain hash of a record would be a hash of card digits
+# (brute-forceable); a keyed digest only says "same record or not" inside this process, which is all a
+# fill compares (prompt time vs. read time).
+_REVISION_KEY = secrets.token_bytes(32)
+
+
+def _record_revision(rec: dict[str, Any]) -> str:
+    """A non-secret id of the stored record: changes whenever any field or secret value changes."""
+    canonical = json.dumps(rec, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return "local:" + hmac.new(_REVISION_KEY, canonical, hashlib.sha256).hexdigest()[:32]
 
 
 def get_vault_store() -> VaultStore:

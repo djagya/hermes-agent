@@ -200,7 +200,8 @@ class OnePasswordLoginBackend(LoginBackend):
                     out.append(VaultItemMeta(
                         id=payment.handle, kind="payment", label=str(item.get("title") or "Payment card"),
                         origin=None, created_at=str(item.get("created_at") or ""),
-                        payment_scope="confirmed_page"))  # hosted origins: the reviewed set at fill time
+                        payment_scope="confirmed_page",  # hosted origins: the reviewed set at fill time
+                        revision=_item_revision(item)))
                 continue
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origins = _all_origins(urls)
@@ -260,6 +261,11 @@ class OnePasswordLoginBackend(LoginBackend):
 
     def resolve_secret(self, handle: str) -> dict[str, str]:
         """Reveal a single card only inside the trusted native filler, never in tool output."""
+        return self.resolve_payment_secret(handle)[0]
+
+    def resolve_payment_secret(self, handle: str) -> tuple[dict[str, str], Optional[str]]:
+        """The card and the ``version`` of the item op revealed (same JSON). The fill compares it with the
+        version the prompt was shown for, so an item edited meanwhile is never written."""
         from agent.vault_payment_card import parse_onepassword_card
 
         vault_id, item_id = _split_handle(handle, self.prefix)
@@ -267,7 +273,8 @@ class OnePasswordLoginBackend(LoginBackend):
             raise ValueError("A vault-qualified card handle is required")
         try:
             raw = self._run("item", "get", item_id, "--vault", vault_id, "--format", "json", "--reveal")
-            return parse_onepassword_card(json.loads(raw), item_id=item_id, vault_id=vault_id)
+            item = json.loads(raw)
+            return parse_onepassword_card(item, item_id=item_id, vault_id=vault_id), _item_revision(item)
         except (UnlockRequired, ItemNotFound, BackendRateLimited, BackendAuthExpired, BackendNetwork):
             raise  # typed causes carry no card data, only the scrubbed CLI error
         except Exception:
@@ -313,6 +320,17 @@ def _login_password(item: object, backend: str) -> str:
         if len(values) > 1:
             raise BackendError(backend, "the item has several different password fields; keep one")
     raise BackendError(backend, "the item has no password field")
+
+
+def _item_revision(item: object) -> str:
+    """The item's ``version`` (op JSON, list and get alike; 1Password bumps it on every edit) as text, or ""
+    when op did not report one. Non-secret."""
+    version = item.get("version") if isinstance(item, dict) else None
+    if type(version) is int and version >= 0:
+        return f"op:{version}"
+    if isinstance(version, str) and version.isascii() and version.isdecimal():
+        return f"op:{int(version)}"
+    return ""
 
 
 def _no_otp_field(detail: str) -> bool:

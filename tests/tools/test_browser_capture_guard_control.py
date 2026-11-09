@@ -1,4 +1,5 @@
-"""browser-control's CDP capture guard, runtime side: set before card fill, fail closed.
+"""browser-control's CDP capture guard, runtime side: set before card fill, fail closed. Also the managed
+fill's live-ownership fences and item-revision binding (design v2 A6-A8), asserted by call order.
 
 Synthetic leases and a fake control only; no Chrome, no card data.
 """
@@ -33,9 +34,10 @@ def fill(monkeypatch):
             return inspected
 
         def payment_is_current(self, i):
+            events.append("current")
             return True
 
-        def commit_payment(self, i, fills):
+        def commit_payment(self, i, fills, strict=False):
             events.append("commit")
             i.consumed = True
             return {"success": True, "filled_fields": len(fills)}
@@ -43,7 +45,11 @@ def fill(monkeypatch):
         def discard_payment(self, i):
             pass
 
-    monkeypatch.setattr("tools.browser_vault_tool._ensure_supervisor", lambda task_id: Supervisor())
+    supervisor = Supervisor()
+    inspected.owner = supervisor
+    monkeypatch.setattr("tools.browser_vault_tool._ensure_supervisor", lambda task_id: supervisor)
+    monkeypatch.setattr("tools.browser_vault_tool._managed_supervisor",
+                        lambda task_id, admit=False: events.append("admit") or supervisor)
     monkeypatch.setattr("tools.browser_vault_tool._is_managed", lambda: True)
     monkeypatch.setattr("tools.browser_vault_tool._bot_desktop_browser_session", lambda task_id: False)
     monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", lambda *a, **k: "accept")
@@ -56,25 +62,31 @@ def fill(monkeypatch):
     monkeypatch.setattr(bvp, "_document_fills", lambda i, s: [{"index": 0, "token": "cc-number", "document": 0}])
     monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session",
                         lambda task_id, surface=None: events.append("local-mark"))
-    backend = SimpleNamespace(name="local", resolve_secret=lambda handle: {"card_number": "synthetic"})
-    meta = SimpleNamespace(id="h", label="Card", allowed_origins=("https://shop.test",), origin=None,
+    meta = SimpleNamespace(id="h", kind="payment", label="Card", allowed_origins=("https://shop.test",), origin=None,
                            payment_scope="bound", payment_frame_origins=())
+    backend = SimpleNamespace(name="local", get_meta=lambda handle: events.append("meta") or meta,
+                              resolve_secret=lambda handle: events.append("resolve") or {"card_number": "synthetic"})
 
-    def run(answer):
+    def run(answer, strict=False):
         def fake_set(lease_id, token):
             events.append(("set", lease_id, token))
             return answer
 
         monkeypatch.setattr(route, "set_capture_guard", fake_set)
-        return json.loads(bvp.fill_payment(backend, meta, "task"))
+        return json.loads(bvp.fill_payment(backend, meta, "task", strict=strict))
 
+    run.backend, run.meta, run.supervisor = backend, meta, supervisor
     return run, events, monkeypatch
 
 
 def test_card_fill_sets_the_control_guard_before_any_write(fill):
     run, events, _ = fill
     assert run((True, ""))["success"] is True
-    assert events == [("set", "lease-shop", "tok-shop"), "local-mark", "commit"]
+    # dlz: design v2 A6 order: item re-read, live lease admission, page freshness, then the guard and the local
+    # mark BEFORE the card is read, and a second admission (commit fence) before the write.
+    assert [e for e in events if e != "admit"] == ["meta", "current", ("set", "lease-shop", "tok-shop"), "local-mark",
+                                                   "resolve", "commit"]
+    assert events.index("admit") < events.index("current") and events[-2:] == ["admit", "commit"]
 
 
 @pytest.mark.parametrize("answer, optional, filled", [
@@ -90,7 +102,21 @@ def test_card_fill_fails_closed_when_the_guard_is_not_set(fill, answer, optional
     assert ("commit" in events) is filled
     if not filled:
         assert out == {"success": False, "error_type": "payment_capture_guard_unavailable",
-                       "error": out["error"]} and "local-mark" not in events
+                       "error": out["error"]} and "local-mark" not in events and "resolve" not in events
+
+
+def test_strict_fill_ignores_the_rollout_exception_and_needs_a_managed_browser(fill):
+    """Unreviewed destinations: a control without the guard route refuses even with the OPTIONAL opt-in,
+    and an unmanaged browser is refused before anything is inspected."""
+    run, events, monkeypatch = fill
+    monkeypatch.setenv(route.CAPTURE_GUARD_OPTIONAL_ENV, "1")
+    out = run((False, "control_without_capture_guard"), strict=True)
+    assert out["error_type"] == "payment_capture_guard_unavailable"
+    assert "resolve" not in events and "commit" not in events
+    monkeypatch.setattr("tools.browser_vault_tool._is_managed", lambda: False)
+    events.clear()
+    assert run((True, ""), strict=True)["error_type"] == "payment_destination_requires_managed_browser"
+    assert events == []
 
 
 @pytest.fixture
@@ -146,3 +172,57 @@ def test_control_capture_refusal_reaches_the_model_as_payment_screenshot_blocked
     # Split literal: the local text guard cannot see it; control's answer still maps.
     out = json.loads(browser_use_cli.browser_exec('cdp("Page.capture" + "Screen" + "shot")', task_id="t"))
     assert out["success"] is False and out["error_type"] == "payment_screenshot_blocked"
+
+
+@pytest.mark.parametrize("at, error_type", [
+    ("lease_ended", "payment_browser_changed"),        # control: the agent no longer holds the slot
+    ("supervisor_replaced", "payment_browser_changed"),  # a re-attach is a different browser connection
+    ("route_lease_changed", "payment_browser_changed"),  # takeover + Return to Sera minted a new lease
+    ("human_took_desktop", "human_has_control"),
+    ("lease_ended_at_commit", "payment_browser_changed"),
+])
+def test_a_takeover_between_prompt_and_write_never_writes_the_card(fill, at, error_type):
+    from tools import browser_vault_tool as vault
+    from tools.bot_desktop import lease as desktop
+
+    run, events, monkeypatch = fill
+    admits = []
+
+    def admit(task_id, admit=False):
+        admits.append(admit)
+        events.append("admit")
+        if at == "lease_ended" or (at == "lease_ended_at_commit" and len(admits) == 2):
+            raise vault._PageUnavailable("lease_unavailable", "lease ended")
+        return SimpleNamespace() if at == "supervisor_replaced" else run.supervisor
+
+    routes = iter([{"lease": "lease-shop"}] + [{"lease": "lease-new" if at == "route_lease_changed" else "lease-shop",
+                                                "token": "tok-shop", "slot_id": "shopping"}] * 4)
+    monkeypatch.setattr(vault, "_managed_supervisor", admit)
+    monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: next(routes))
+    if at == "human_took_desktop":
+        monkeypatch.setattr(vault, "_bot_desktop_browser_session", lambda task_id: True)
+        monkeypatch.setattr(desktop, "assert_agent_may_act",
+                            lambda: (_ for _ in ()).throw(desktop.HumanHasControl("human")))
+    out = run((True, ""))
+    assert out["success"] is False and out["error_type"] == error_type and "commit" not in events
+    # Every check asked control (never the cached socket state); a changed route stops before any attach.
+    assert all(admits) and bool(admits) is (at != "route_lease_changed")
+    if at == "lease_ended_at_commit":  # read inside Hermes, dropped, never written
+        assert "resolve" in events and "dropped; no field received it" in out["error"]
+    else:  # stopped before the card was read and before the guard was set
+        assert "resolve" not in events and "local-mark" not in events
+
+
+@pytest.mark.parametrize("edit", ["during_consent", "at_read"])
+def test_an_edited_card_is_never_written(fill, edit):
+    """Design v2 A8: the prompt binds the item's revision; a different revision on the in-context re-read,
+    or in the revealed item itself, refuses with payment_item_changed and writes nothing."""
+    run, events, _ = fill
+    meta = run.meta
+    meta.revision = "op:3"
+    fresh = SimpleNamespace(**{**vars(meta), "revision": "op:4" if edit == "during_consent" else "op:3"})
+    run.backend.get_meta = lambda handle: events.append("meta") or fresh
+    run.backend.resolve_payment_secret = lambda handle: (events.append("resolve") or {"card_number": "x"}, "op:4")
+    out = run((True, ""))
+    assert out["error_type"] == "payment_item_changed" and "commit" not in events
+    assert ("resolve" in events) is (edit == "at_read")

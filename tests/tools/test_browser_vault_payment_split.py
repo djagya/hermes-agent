@@ -127,7 +127,10 @@ class _FakeSupervisor(sp.PaymentSupervisionMixin):
     async def _payment_is_current(self, i):
         return True
 
-    async def _commit_payment_document(self, d, fills, deadline_ms=None):
+    async def _payment_tree(self, sid, child_sessions=None):
+        return ()  # the synthetic inspections' tree
+
+    async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False):
         self.deadlines = getattr(self, "deadlines", []) + [deadline_ms]
         self.writes.append((d.origin, fills))
         return self.results.pop(0)
@@ -187,7 +190,7 @@ def test_fill_payment_names_every_target_tags_fills_and_redacts_only_card_secret
         def payment_is_current(self, i):
             return True
 
-        def commit_payment(self, i, fills):
+        def commit_payment(self, i, fills, strict=False):
             committed.extend(fills)
             i.consumed = True
             return {"success": True, "filled_fields": len(fills)}
@@ -201,9 +204,9 @@ def test_fill_payment_names_every_target_tags_fills_and_redacts_only_card_secret
     monkeypatch.setattr("agent.redact.register_vault_redaction_value", registered.append)
     monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent",
                         lambda *args, **k: consent_text.append(args[1]) or "accept")
-    backend = SimpleNamespace(name="local", resolve_secret=lambda handle: dict(CARD))
-    meta = SimpleNamespace(id="h", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
+    meta = SimpleNamespace(id="h", kind="payment", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
                            payment_frame_origins=PAYMENT_PSP_ORIGINS)
+    backend = SimpleNamespace(name="local", resolve_secret=lambda handle: dict(CARD), get_meta=lambda handle: meta)
 
     out = json.loads(bvp.fill_payment(backend, meta, "task"))
     assert out["success"] and out["target_origin"] == DATATRANS and out["target_origins"] == [MERCHANT, DATATRANS]
@@ -244,9 +247,9 @@ def test_early_refusals_carry_a_next_step(monkeypatch, case):
     monkeypatch.setattr("tools.browser_vault_tool._ensure_supervisor",
                         lambda task_id: None if case == "supervisor_none" else Supervisor())
     monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", lambda *a, **k: "accept")
-    meta = SimpleNamespace(id="h", label="Card", allowed_origins=(), origin=None, payment_frame_origins=PAYMENT_PSP_ORIGINS,
+    meta = SimpleNamespace(id="h", kind="payment", label="Card", allowed_origins=(), origin=None, payment_frame_origins=PAYMENT_PSP_ORIGINS,
                            payment_scope="" if case == "no_origin" else "confirmed_page")
-    out = json.loads(bvp.fill_payment(SimpleNamespace(name="local"), meta, "task"))
+    out = json.loads(bvp.fill_payment(SimpleNamespace(name="local", get_meta=lambda handle: meta), meta, "task"))
     expected = {"supervisor_none": "supervisor_required", "no_origin": "no_origin", "page_changed": "payment_page_changed"}
     assert out["success"] is False and out["error_type"] == expected[case]
     assert len(out.get("error", "")) > 40, out
@@ -343,7 +346,7 @@ def _fill_with_consent(monkeypatch, verdict, reason, on_consent=None, expires_in
                 on_current(i)
             return True
 
-        def commit_payment(self, i, fills):
+        def commit_payment(self, i, fills, strict=False):
             calls.append("commit_payment")
             return {"success": True}
 
@@ -365,9 +368,10 @@ def _fill_with_consent(monkeypatch, verdict, reason, on_consent=None, expires_in
     monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session",
                         lambda task_id, surface=None: calls.append("mark_payment_session"))
     monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", consent)
-    meta = SimpleNamespace(id="h", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
+    meta = SimpleNamespace(id="h", kind="payment", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
                            payment_frame_origins=PAYMENT_PSP_ORIGINS)
-    raw = bvp.fill_payment(SimpleNamespace(name="local", resolve_secret=resolve), meta, "task")
+    raw = bvp.fill_payment(SimpleNamespace(name="local", resolve_secret=resolve, get_meta=lambda handle: meta),
+                           meta, "task")
     return json.loads(raw), calls
 
 
@@ -429,7 +433,7 @@ def test_commit_never_writes_after_the_window_closes(lapse_at):
                 inspection.expires_at = 0
             return True
 
-        async def _commit_payment_document(self, d, fills, deadline_ms=None):
+        async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False):
             out = await super()._commit_payment_document(d, fills, deadline_ms)
             i.expires_at = 0  # the first document's write ends after the window
             return out
@@ -451,7 +455,11 @@ class _OwnerSupervisor(sp.PaymentSupervisionMixin):
         self.shown, self.passes, self.calls = shown, 0, []
 
     async def _payment_is_current(self, i):
+        self.tree = i.tree
         return True
+
+    async def _payment_tree(self, sid, child_sessions=None):
+        return self.tree
 
     async def _cdp(self, method, params=None, session_id=None, timeout=None):
         self.calls.append(method)
@@ -506,8 +514,9 @@ def test_four_hosted_frames_cost_one_visibility_call_per_parent_per_pass():
     i = _owned_inspection(tree, docs)
     # Each fake document answers for cc-number; only the call budget is under test here.
     asyncio.run(sup._commit_payment(i, fills))
-    assert sup.passes == 2
-    assert sup.calls.count("Runtime.callFunctionOn") == 2 + 4 + 4  # owner checks + commits + retention reads
+    # dlz: settle before/after (2) plus one visibility pass before each later document (3, design v2 A5).
+    assert sup.passes == 2 + 3
+    assert sup.calls.count("Runtime.callFunctionOn") == 5 + 4 + 4  # owner checks + commits + retention reads
 
 
 @pytest.mark.parametrize("consent_s, expected_ms", [(30, 20_000), (5, 5_000)])
@@ -584,6 +593,101 @@ def test_renderer_writes_only_while_both_its_monotonic_and_wall_clocks_are_insid
     assert out["result"]["success"] is bool(writes)
     if not writes:
         assert out["result"]["error_type"] == "payment_consent_expired"
+
+
+_SETTER_HARNESS = r"""
+let writes = [], els, cover = null;
+const performance = {now: () => 1000};
+class HTMLInputElement { get value() { return this.held || ''; } set value(v) { writes.push(this.id); this.held = v; } }
+class HTMLSelectElement { get value() { return ''; } set value(v) {} }
+class Event {} class InputEvent extends Event {} class FocusEvent extends Event {}
+const document = {forms: []};
+const location = {href: 'https://psp.example/card'};
+const mk = (id, token, top) => Object.assign(new HTMLInputElement(), {tagName: 'INPUT', autocomplete: token, name: id,
+  id, labels: null, placeholder: '', type: 'text', form: null, maxLength: 0, disabled: false, readOnly: false,
+  isConnected: true, tabIndex: 0, shadowRoot: null, ownerDocument: document, hidden: false, top,
+  style: {setProperty() {}}, hasAttribute: () => false, dispatchEvent: () => true, blur() {},
+  getAttribute(n) { return n === 'aria-label' ? (this.aria || null) : null; },
+  getBoundingClientRect() { return this.hidden ? {width: 0, height: 0, left: 0, top: 0} : {width: 100, height: 20, left: 0, top: this.top}; },
+  getClientRects() { return this.hidden ? [] : [1]; }, getRootNode: () => document,
+  focus() { if (this.onfocus) this.onfocus(); }});
+els = [mk('c', 'cc-csc', 0), mk('n', 'cc-number', 40)];
+document.querySelectorAll = () => els;
+document.elementFromPoint = (x, y) => cover || els.find(e => !e.hidden && y >= e.top && y < e.top + 20) || null;
+const getComputedStyle = e => ({visibility: e.hidden ? 'hidden' : 'visible', opacity: '1', pointerEvents: 'auto'});
+const api = INSPECT;
+const n = els[1];
+n.onfocus = {none: () => {}, hide: () => { n.hidden = true; }, hide_other: () => { els[0].hidden = true; },
+  relabel: () => { n.aria = 'Gift card'; }, swap: () => { els = [els[0], mk('n2', 'cc-number', 40)]; },
+  navigate: () => { location.href = 'https://psp.example/elsewhere'; }, cover: () => { cover = {}; }}[CASE.focus];
+const result = api.commit([{index: 0, token: 'cc-csc', value: '837'}, {index: 1, token: 'cc-number', value: '4242'}],
+                          60000, CASE.strict);
+process.stdout.write(JSON.stringify({result, writes}));
+"""
+
+
+@pytest.mark.parametrize("focus, strict, writes", [
+    ("none", True, ["c", "n"]), ("cover", False, ["c", "n"]),  # reviewed shapes keep today's behaviour
+    ("hide", False, ["c"]), ("hide_other", False, ["c"]), ("relabel", False, ["c"]), ("swap", False, ["c"]),
+    ("navigate", False, ["c"]), ("cover", True, ["c"]),
+])
+def test_a_focus_handler_that_changes_the_pinned_set_stops_the_next_setter(focus, strict, writes):
+    """Design v2 A5: page code runs on focus; the field is written only if the whole pinned set still holds
+    right before its setter (and, strict, the field is what a click at its centre would hit)."""
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for the synthetic commit closure")
+    values = {"CASE": json.dumps({"focus": focus, "strict": strict}), "INSPECT": sp._INSPECT}
+    harness = re.sub(r"\bCASE\b|\bINSPECT\b", lambda m: values[m.group(0)], _SETTER_HARNESS)
+    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
+    assert run.returncode == 0, run.stderr
+    out = json.loads(run.stdout)
+    assert out["writes"] == writes
+    if len(writes) == 1:
+        assert out["result"] == {"success": False, "error_type": "payment_fields_changed", "filled_fields": 1,
+                                 "partially_filled": True}
+    else:
+        assert out["result"]["success"] is True
+
+
+@pytest.mark.parametrize("change", ["hidden", "tree", "unreadable"])
+def test_a_later_document_is_not_written_once_the_page_changed_after_the_first(change):
+    """Split checkout: the first document's handlers hide the next card frame or change the frame tree;
+    the next document gets no write and the earlier one is reported."""
+    class Supervisor(_FakeSupervisor):
+        async def _payment_tree(self, sid, child_sessions=None):
+            if self.writes and change == "unreadable":
+                raise RuntimeError("frame gone")
+            return (("x",),) if self.writes and change == "tree" else ()
+
+        async def _shown_documents(self, i):
+            return {"a"} if self.writes and change == "hidden" else {d.frame_id for d in i.documents}
+
+    sup = Supervisor([{"success": True, "filled_fields": 1}] * 2)
+    out = asyncio.run(sup._commit_payment(_split_inspection(), [
+        {"index": 0, "token": "cc-csc", "value": "837", "document": 0},
+        {"index": 0, "token": "cc-number", "value": "4242", "document": 1}]))
+    assert out == {"success": False, "error_type": "payment_page_changed", "filled_fields": 1, "partially_filled": True}
+    assert len(sup.writes) == 1
+
+
+def test_a_top_document_that_navigated_after_the_fill_is_reported():
+    tree = (("top", "", "https://shop.example/checkout", MERCHANT, ""), ("card", "", "", _PAYPAL, "top"))
+
+    class Supervisor(_OwnerSupervisor):
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if method == "Page.getFrameTree":
+                return {"result": {"frameTree": {"frame": {"url": "https://shop.example/thanks"}}}}
+            return await super()._cdp(method, params, session_id, timeout)
+
+    doc = PaymentDocument("card", "sc", "oc", _PAYPAL, _controls("cc-number"))
+    out = asyncio.run(Supervisor(lambda n, f: True)._commit_payment(
+        _owned_inspection(tree, [doc]), [{"index": 0, "token": "cc-number", "value": "4242", "document": 0}]))
+    assert out["success"] is True and out["navigated_after_fill"] is True
 
 
 class _CancelSupervisor(sp.PaymentSupervisionMixin):
@@ -674,7 +778,7 @@ def test_not_retained_fill_carries_a_stop_message(monkeypatch):
         def payment_is_current(self, i):
             return True
 
-        def commit_payment(self, i, fills):
+        def commit_payment(self, i, fills, strict=False):
             i.consumed = True
             return {"success": False, "error_type": "payment_fields_not_retained", "filled_fields": 2,
                     "partially_filled": True, "field_retention": {"cc-number": "empty"}, "field_lengths": {"cc-number": 0}}
@@ -688,9 +792,9 @@ def test_not_retained_fill_carries_a_stop_message(monkeypatch):
     monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session", lambda task_id, surface=None: None)
     monkeypatch.setattr("agent.redact.register_vault_redaction_value", lambda value: None)
     monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", lambda *a, **k: "accept")
-    meta = SimpleNamespace(id="h", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
+    meta = SimpleNamespace(id="h", kind="payment", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
                            payment_frame_origins=PAYMENT_PSP_ORIGINS)
-    backend = SimpleNamespace(name="local", resolve_secret=lambda handle: dict(CARD))
+    backend = SimpleNamespace(name="local", resolve_secret=lambda handle: dict(CARD), get_meta=lambda handle: meta)
     out = json.loads(bvp.fill_payment(backend, meta, "task"))
     assert out["success"] is False and out["submitted"] is False
     assert "do not retry" in out["error"] and "not a bank or issuer response" in out["error"]
@@ -819,7 +923,7 @@ def test_select_expiry_fill_maps_to_the_option_or_refuses_before_any_write(monke
         def payment_is_current(self, i):
             return True
 
-        def commit_payment(self, i, fills):
+        def commit_payment(self, i, fills, strict=False):
             committed.extend(fills)
             i.consumed = True
             return {"success": True, "filled_fields": len(fills)}
@@ -833,9 +937,10 @@ def test_select_expiry_fill_maps_to_the_option_or_refuses_before_any_write(monke
     monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session", lambda task_id, surface=None: None)
     monkeypatch.setattr("agent.redact.register_vault_redaction_value", lambda value: None)
     monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", lambda *a, **k: "accept")
-    meta = SimpleNamespace(id="h", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
+    meta = SimpleNamespace(id="h", kind="payment", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
                            payment_frame_origins=PAYMENT_PSP_ORIGINS)
-    raw = bvp.fill_payment(SimpleNamespace(name="local", resolve_secret=lambda handle: dict(CARD)), meta, "task")
+    backend = SimpleNamespace(name="local", resolve_secret=lambda handle: dict(CARD), get_meta=lambda handle: meta)
+    raw = bvp.fill_payment(backend, meta, "task")
     out = json.loads(raw)
     assert CARD["card_number"] not in raw and CARD["cvc"] not in raw
     if outcome is None:

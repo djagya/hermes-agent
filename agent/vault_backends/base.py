@@ -112,6 +112,12 @@ class LoginBackend(ABC):
         logins, so the base returns the password-only shape."""
         return {"password": self.resolve_password(handle)}
 
+    def resolve_payment_secret(self, handle: str) -> tuple[dict[str, str], Optional[str]]:
+        """A card payload plus the revision of the item it was read from (``VaultItemMeta.revision``), both
+        from one read. ``None``: this backend cannot say which revision it returned (plugins today); the
+        card fill then relies on its in-context metadata re-read alone."""
+        return self.resolve_secret(handle), None
+
 
 def run_with_stdin_secret(argv: Sequence[str], *, env: dict[str, str], secret: str, timeout: float,
                           label: str) -> subprocess.CompletedProcess:

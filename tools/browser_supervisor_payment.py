@@ -595,14 +595,16 @@ class PaymentSupervisionMixin:
         except Exception:  # health: allow BLE001 -- any CDP failure means the approved page is not current; fail closed
             return False
 
-    def commit_payment(self, inspected: PaymentInspection, fills: list[dict]) -> dict:
+    def commit_payment(self, inspected: PaymentInspection, fills: list[dict], strict: bool = False) -> dict:
+        """Write the fills. ``strict`` (unreviewed destinations) adds a hit test at each field's centre
+        before its setter; reviewed provider shapes keep ``False`` so they cannot regress."""
         import concurrent.futures
 
         from agent.async_utils import safe_schedule_threadsafe
         from tools.browser_supervisor import _LoopUnavailable
 
         until = time.monotonic() + _COMMIT_BUDGET_SECONDS
-        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills, until), self._loop)
+        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills, until, strict), self._loop)
         if future is None:
             raise _LoopUnavailable("Browser supervisor loop unavailable")
         try:
@@ -619,16 +621,18 @@ class PaymentSupervisionMixin:
                 pass
             return {"success": False, "error_type": "payment_transport_uncertain", "partially_filled": True}
 
-    async def _commit_payment(self, i: PaymentInspection, fills: list[dict], until: float | None = None) -> dict:
+    async def _commit_payment(self, i: PaymentInspection, fills: list[dict], until: float | None = None,
+                              strict: bool = False) -> dict:
         if i.consumed:
             return {"success": False, "error_type": "payment_consent_consumed"}
         try:
-            return await self._commit_payment_once(i, fills, until)
+            return await self._commit_payment_once(i, fills, until, strict)
         finally:
             # dlz: one cleanup for the whole lifecycle (freshness included) that a cancellation cannot cut short.
             await self._release_once(i)
 
-    async def _commit_payment_once(self, i: PaymentInspection, fills: list[dict], until: float | None) -> dict:
+    async def _commit_payment_once(self, i: PaymentInspection, fills: list[dict], until: float | None,
+                                   strict: bool = False) -> dict:
         if time.monotonic() >= i.expires_at:
             # dlz: the inspection window closed (late approval, slow card lookup): nothing is written, and
             # the result says so instead of reading as a changed page.
@@ -650,13 +654,18 @@ class PaymentSupervisionMixin:
             # document at a time: no cross-document transaction exists, so a later failure
             # reports what an earlier document already received instead of retrying.
             written = []
-            for document, document_fills in _commit_order(i, _fills_by_document(i, fills)):
+            order = _commit_order(i, _fills_by_document(i, fills))
+            for document, document_fills in order:
                 if time.monotonic() >= i.expires_at:
                     # dlz: no write after the window closes; earlier documents' values are reported, not
                     # completed.
                     return _partial({"success": False, "error_type": "payment_consent_expired"}, filled)
+                # dlz: an earlier document's page handlers ran after its writes: before the next document,
+                # the frame topology and every card frame's visibility are checked again.
+                if written and not await self._payment_scope_current(i, [d for d, _f in order]):
+                    return _partial({"success": False, "error_type": "payment_page_changed"}, filled)
                 result = await self._commit_payment_document(
-                    document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop))
+                    document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop), strict=strict)
                 if not result.get("success"):
                     return _partial(result, filled)
                 filled += result.get("filled_fields", 0)
@@ -670,21 +679,45 @@ class PaymentSupervisionMixin:
             before = await self._shown_documents(i)
             answers = [(d, f, await self._payment_retention(i, d)) for d, f in written]
             after = await self._shown_documents(i)
-            return _retention_result([(f, a if d.frame_id in before and d.frame_id in after else None)
-                                      for d, f, a in answers])
+            result = _retention_result([(f, a if d.frame_id in before and d.frame_id in after else None)
+                                        for d, f, a in answers])
+            if await self._top_navigated(i):
+                result["navigated_after_fill"] = True
+            return result
         except PaymentPolicyError:
             return _partial({"success": False, "error_type": "payment_fields_invalid"}, filled)
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
             return _partial({"success": False, "error_type": "payment_transport_uncertain"}, filled)
 
-    async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None) -> dict:
+    async def _payment_scope_current(self, i: PaymentInspection, documents: list) -> bool:
+        """dlz: between the documents of a split fill: the frame tree is still the inspected one and every
+        card frame being filled is still shown. Any failure to answer counts as changed."""
+        try:
+            if await self._payment_tree(i.page_session, i.child_sessions) != i.tree:
+                return False
+            return {d.frame_id for d in documents} <= await self._shown_documents(i)
+        except Exception:  # health: allow BLE001 -- an unreadable page is not the approved page; fail closed
+            return False
+
+    async def _top_navigated(self, i: PaymentInspection) -> bool:
+        """dlz: whether the top document's URL differs from the inspected one after the fill (True only when
+        read and different; an unreadable page is reported through retention instead)."""
+        try:
+            tree = await self._cdp("Page.getFrameTree", session_id=i.page_session)
+            url = tree["result"]["frameTree"]["frame"]["url"]
+        except Exception:  # health: allow BLE001 -- retention already reports a page that cannot answer
+            return False
+        return bool(i.tree) and isinstance(url, str) and url != i.tree[0][2]
+
+    async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None,
+                                       strict: bool = False) -> dict:
         result = _value(
             await self._cdp(
                 "Runtime.callFunctionOn",
                 {
                     "objectId": d.object_id,
-                    "functionDeclaration": "function(fills,deadline){return this.commit(fills,deadline)}",
-                    "arguments": [{"value": fills}, {"value": deadline_ms}],
+                    "functionDeclaration": "function(fills,deadline,strict){return this.commit(fills,deadline,strict)}",
+                    "arguments": [{"value": fills}, {"value": deadline_ms}, {"value": strict is True}],
                     "returnByValue": True,
                 },
                 session_id=d.frame_session,
@@ -865,6 +898,13 @@ _INSPECT = r"""(() => {
   // grouped card numbers, upper-cased names). Anything else is a different value.
   const same = (a,b) => a.replace(/[\s\/.-]/g,'').toUpperCase() === b.replace(/[\s\/.-]/g,'').toUpperCase();
   const live = el => el.isConnected && el.ownerDocument === doc && allInputs().includes(el);
+  // dlz: strict mode (unreviewed destinations): the focused field is what the user would hit at its centre.
+  const hits = el => {
+    const r = el.getBoundingClientRect(), root = el.getRootNode ? el.getRootNode() : doc;
+    const at = (root && typeof root.elementFromPoint === 'function' ? root : doc)
+      .elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return at === el;
+  };
   let used = false, written = null;
   return {
     describe:()=>describe().filter(x=>selected.has(x.index)), valid,
@@ -882,7 +922,7 @@ _INSPECT = r"""(() => {
         return {token:f.token,state:same(el.value,f.value)?'held':el.value?'changed':'empty',length:el.value.length};
       });
     },
-    commit: (fills, deadline) => {
+    commit: (fills, deadline, strict) => {
       if (used || !valid()) return {success:false,error_type:'payment_fields_changed'};
       used = true;
       // dlz: `deadline` is ms after `born` on this document's monotonic clock (never Date.now(): a wall-clock
@@ -912,13 +952,19 @@ _INSPECT = r"""(() => {
       // its detached copy report a value the live form does not hold.
       written = fills.map(f=>({index:f.index,token:String(f.token||''),value:f.value}));
       let attempted = 0;
+      const changed = () => ({success:false,error_type:'payment_fields_changed',filled_fields:attempted,
+                              partially_filled:attempted>0});
       for (const f of ordered) {
         const el = elements[f.index];
-        if (!live(el) || location.href !== href)
-          return {success:false,error_type:'payment_fields_changed',filled_fields:attempted,partially_filled:attempted>0};
+        if (!valid() || !live(el))
+          return changed();
         el.focus();
         if (late())  // focus handlers run page code; never write past the window
           return {success:false,error_type:'payment_consent_expired',filled_fields:attempted,partially_filled:attempted>0};
+        // dlz: focus handlers can hide, swap, relabel or navigate: the whole pinned set is re-checked
+        // right before this setter, not only before the loop.
+        if (!valid() || !live(el) || !shown(el) || (strict === true && !hits(el)))
+          return changed();
         attempted += 1;
         if (isSelect(el)) {
           selectSetter.call(el,f.value);

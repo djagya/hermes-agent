@@ -62,21 +62,23 @@ def _document_fills(inspected, secret: dict) -> list | None:
     return fills
 
 
-def _set_control_capture_guard(route: dict) -> dict | None:
+def _set_control_capture_guard(route: dict, strict: bool = False) -> dict | None:
     """Ask browser-control to refuse capture on this lease's slot; a refusal result when it did not.
 
     Fail closed: any failure refuses the fill. Only a control without the route (404) may be let
     through, and only when the operator set ``HERMES_BROWSER_CAPTURE_GUARD_OPTIONAL`` for a rollout.
+    dlz: ``strict`` (unreviewed destinations) ignores that rollout exception: the guard holds or no fill.
     """
     from tools.browser_control_route import capture_guard_optional, set_capture_guard
 
     ok, reason = set_capture_guard(str(route.get("lease") or ""), str(route.get("token") or ""))
     if ok:
         return None
-    if reason == "control_without_capture_guard" and capture_guard_optional():
+    if reason == "control_without_capture_guard" and not strict and capture_guard_optional():
         logger.warning("card fill: browser-control has no capture guard route; local mark only (rollout)")
         return None
-    logger.warning("card fill refused: browser-control capture guard not set (%s)", reason)
+    logger.warning("card fill refused: browser-control capture guard not set (%s%s)", reason,
+                   ", strict" if strict else "")
     return {
         "success": False,
         "error_type": "payment_capture_guard_unavailable",
@@ -96,10 +98,13 @@ _CONSENT_MESSAGES = {
     "timeout": "Nobody answered the card-fill approval in time.",
     "unavailable": "The card-fill approval could not be shown to the user.",
 }
+# dlz: once a field was written, "nothing was submitted" is not something Hermes can promise for the page.
+_SUBMITTED_NOTHING = ("Hermes submitted nothing; page scripts may have acted on the filled fields. Check the page "
+                      "before anything else.")
 _NOT_RETAINED = (
     "Card fields were written, but after the page settled at least one no longer held its value "
-    "(field_retention names which; states and lengths only). This is not a bank or issuer response and "
-    "nothing was submitted. Do not submit the checkout and do not retry the fill; report it to the user. "
+    "(field_retention names which; states and lengths only). This is not a bank or issuer response. "
+    + _SUBMITTED_NOTHING + " Do not submit the checkout and do not retry the fill; report it to the user. "
     "Another fill needs fresh consent."
 )
 
@@ -156,16 +161,61 @@ _CONSENT_EXPIRED = (
 
 _CONSENT_EXPIRED_PARTIAL = (
     "The 120 s inspection window closed part-way through the fill: some card fields were written, the rest "
-    "were not. Nothing was submitted. Do not submit the checkout and do not retry; tell the user. Another "
+    "were not. " + _SUBMITTED_NOTHING + " Do not submit the checkout and do not retry; tell the user. Another "
     "fill needs a new approval."
 )
 
 
 _TRANSPORT_UNCERTAIN = (
     "The card fill did not finish cleanly (browser transport failed or the fill ran out of time), so some card "
-    "fields may hold values and others not. Nothing was submitted. Do not submit the checkout and do not retry; "
-    "tell the user. Another fill needs a new approval."
+    "fields may hold values and others not. " + _SUBMITTED_NOTHING + " Do not submit the checkout and do not "
+    "retry; tell the user. Another fill needs a new approval."
 )
+
+
+_PAGE_CHANGED_PARTIAL = (
+    "The checkout changed part-way through the fill (a field was hidden, replaced, relabelled or covered, a frame "
+    "changed, or the page navigated), so the fill stopped: some card fields were written, the rest were not. "
+    + _SUBMITTED_NOTHING + " Do not submit the checkout and do not retry; tell the user. Another fill needs a "
+    "new approval."
+)
+
+
+_PARTIAL_STOPPED = (
+    "The card fill stopped part-way: some card fields were written, the rest were not. " + _SUBMITTED_NOTHING
+    + " Do not submit the checkout and do not retry; tell the user. Another fill needs a new approval."
+)
+
+
+_BROWSER_CHANGED = (
+    "The browser this approval was for is no longer the one Hermes controls for this task (the lease ended, a "
+    "human took over, or the browser connection was replaced), so no card field was written and nothing was "
+    "submitted. Do not retry on your own; tell the user. Another fill needs a new approval."
+)
+
+
+_ITEM_CHANGED = (
+    "The saved card changed before the fill. Nothing was resolved or written; list the vault and request "
+    "fresh consent."
+)
+
+
+_ITEM_CHANGED_ON_READ = (
+    "The saved card read for this fill is not the revision the approval was shown for (it was edited "
+    "meanwhile), so it was dropped and no card field was written. Nothing was submitted. List the vault and "
+    "request fresh consent."
+)
+
+
+_REQUIRES_MANAGED = (
+    "A card fill on an unreviewed payment destination needs the managed browser, where browser-control locks "
+    "capture; this browser is not managed. Nothing was read or written. Tell the user; do not retry on another "
+    "browser."
+)
+
+
+# Appended when a check after the card was read stops the fill: the value never reached the page.
+_READ_NOT_WRITTEN = " The card was read inside Hermes for this fill and dropped; no field received it."
 
 
 def _remaining_seconds(inspected) -> int:
@@ -173,23 +223,84 @@ def _remaining_seconds(inspected) -> int:
     return max(1, int(inspected.expires_at - time.monotonic()))
 
 
-def _payment_item_unchanged(backend, meta) -> bool:
-    """Inside ``fill_context``: the card still binds what consent was given for. Only a backend with its own
-    context is re-read (``tools.browser_vault_context.snapshot_refusal`` rule); built-in managers freeze nothing."""
-    from tools.browser_vault_context import _has_own_context, saved_origins
+def _payment_item_current(backend, meta) -> bool:
+    """Inside ``fill_context``: the card still binds what consent was given for. dlz: every backend is
+    re-read (metadata only, never a value), and the item's revision must be the one the prompt was shown
+    for. A 1Password listing may come from its 60 s metadata cache; the version op reports with the revealed
+    card is checked again in ``_resolve_card``."""
+    from tools.browser_vault_context import saved_origins
 
-    if not _has_own_context(backend):
-        return True
     fresh = backend.get_meta(meta.id)
-    return (fresh is not None and fresh.kind == "payment" and saved_origins(fresh) == saved_origins(meta)
+    return (fresh is not None and fresh.kind == "payment" and fresh.label == meta.label
+            and saved_origins(fresh) == saved_origins(meta)
             and tuple(fresh.payment_frame_origins) == tuple(meta.payment_frame_origins)
-            and fresh.payment_scope == meta.payment_scope)
+            and fresh.payment_scope == meta.payment_scope
+            and getattr(fresh, "revision", "") == getattr(meta, "revision", ""))
 
 
-def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
+def _resolve_card(backend, meta) -> dict | None:
+    """The card's raw payload, or None when the backend says it read a different revision than the one the
+    prompt was shown for (the value is dropped here, unwritten). A backend that cannot name the revision it
+    read (``None``) relies on the in-context metadata re-read."""
+    resolve = getattr(backend, "resolve_payment_secret", None)
+    if callable(resolve):
+        secret, revision = resolve(meta.id)
+    else:  # duck-typed backends (tests, old plugins) without the revision-aware call
+        secret, revision = backend.resolve_secret(meta.id), None
+    if revision is not None and revision != getattr(meta, "revision", ""):
+        return None
+    return secret
+
+
+def _route_lease(task_id: str) -> str:
+    from tools.browser_use_cli import vault_route
+
+    return str((vault_route(task_id) or {}).get("lease") or "")
+
+
+def _ownership_refusal(vault, task_id: str, supervisor, inspected, lease: str) -> dict | None:
+    """dlz: live ownership, asked of control (not the cached route copy): the lease snapshotted before the
+    prompt is still this task's lease, control confirms the agent holds it, and the supervisor that inspected
+    the page is the live one. A Bot Desktop human takeover refuses too. None = may proceed."""
+    if vault._is_managed():
+        changed = {"success": False, "error_type": "payment_browser_changed", "error": _BROWSER_CHANGED}
+        # The route first: a new lease must not even get a supervisor attached on this path.
+        if not lease or _route_lease(task_id) != lease or inspected.owner is not supervisor:
+            return changed
+        try:
+            live = vault._managed_supervisor(task_id, admit=True)
+        except vault._PageUnavailable:
+            return changed
+        if live is not supervisor:
+            return changed
+    if vault._bot_desktop_browser_session(task_id):
+        from tools.bot_desktop import lease as desktop
+
+        try:
+            desktop.assert_agent_may_act()
+        except desktop.HumanHasControl:
+            return {"success": False, "error_type": "human_has_control", "error": _BROWSER_CHANGED}
+    return None
+
+
+def _expired() -> dict:
+    return {"success": False, "error_type": "payment_consent_expired", "error": _CONSENT_EXPIRED}
+
+
+def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, strict: bool = False) -> str:
+    """Native card fill after the owner's approval. ``strict`` (the unreviewed-destination feature): a managed
+    browser is required, the capture guard's rollout exception does not apply, and each field is hit-tested
+    before its setter. Reviewed fills keep ``strict=False``.
+
+    Order after consent (design v2 A6): backend context -> item revision -> live ownership -> page freshness
+    -> capture guard and local mark -> expiry -> read the card -> its revision -> fills -> commit fence
+    (ownership again, expiry) -> commit with its own per-document and per-setter checks."""
     from tools import browser_vault_tool as vault
     from tools.approval_prompt import request_elicitation_consent
 
+    if strict and not vault._is_managed():
+        return json.dumps({"success": False, "error_type": "payment_destination_requires_managed_browser",
+                           "error": _REQUIRES_MANAGED})
     try:
         supervisor = vault._ensure_supervisor(task_id)
     except vault._PageUnavailable as exc:
@@ -203,6 +314,8 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
         bound = tuple(meta.allowed_origins) or ((meta.origin,) if meta.origin else ())
         if not bound and meta.payment_scope != "confirmed_page":
             return json.dumps({"success": False, "error_type": "no_origin", "error": _NO_ORIGIN})
+        # dlz: the lease this approval is for, snapshotted before the prompt (managed mode).
+        lease = _route_lease(task_id) if vault._is_managed() else ""
         inspected = supervisor.inspect_payment(
             merchant_origin,
             bound_origins=bound,
@@ -227,26 +340,48 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             # answer payment_consent_missing; both stop, and consent_outcome says why.
             return json.dumps(_consent_not_given(consent, consent_detail.get("reason")))
         if time.monotonic() >= inspected.expires_at:
-            return json.dumps({"success": False, "error_type": "payment_consent_expired", "error": _CONSENT_EXPIRED})
-        if not supervisor.payment_is_current(inspected):
-            return json.dumps({"success": False, "error_type": "payment_page_changed", "error": _PAGE_CHANGED})
+            return json.dumps(_expired())
         # The card is resolved and written inside the backend's fill_context (a plugin backend's lock /
-        # snapshot / manager session), entered only after consent; a plugin item that changed meanwhile
-        # is refused before any value is resolved.
+        # snapshot / manager session), entered only after consent; an item that changed meanwhile is
+        # refused before any value is resolved.
         from tools.browser_vault_context import fill_context
 
         with fill_context(backend):
-            if not _payment_item_unchanged(backend, meta):
-                return json.dumps({"success": False, "error_type": "payment_item_changed",
-                                   "error": "The saved card changed before the fill. Nothing was resolved "
-                                            "or written; list the vault and request fresh consent."})
-            # dlz: the freshness pass and the backend context can outlast the window: last check before
-            # any secret is read.
+            if not _payment_item_current(backend, meta):
+                return json.dumps({"success": False, "error_type": "payment_item_changed", "error": _ITEM_CHANGED})
+            # dlz: live ownership and page freshness inside the context, right before the card is read.
+            refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
+            if refused:
+                return json.dumps(refused)
+            if not supervisor.payment_is_current(inspected):
+                return json.dumps({"success": False, "error_type": "payment_page_changed", "error": _PAGE_CHANGED})
+            # Capture lock (control's CDP guard, then the local mark) BEFORE the card is read: both are
+            # set-only and harmless if the fill stops later, and no card byte is read unless they hold.
+            from tools.browser_payment_privacy import mark_payment_session
+
+            surface = None
+            if vault._is_managed():
+                from tools.browser_use_cli import vault_route
+
+                route = vault_route(task_id)
+                refused = _set_control_capture_guard(route, strict=strict)
+                if refused:
+                    return json.dumps(refused)
+                surface = {"slot_id": route.get("slot_id", ""),
+                           "browser_generation": route.get("browser_generation", ""),
+                           "wipe_count": route.get("wipe_count", ""),
+                           "profile_kind": route.get("profile_kind", "")}
+            mark_payment_session(task_id, surface)
+            # dlz: the freshness pass, the guard and the backend context can outlast the window: last check
+            # before any secret is read.
             if time.monotonic() >= inspected.expires_at:
-                return json.dumps({"success": False, "error_type": "payment_consent_expired",
-                                   "error": _CONSENT_EXPIRED})
+                return json.dumps(_expired())
             # Never resolve at inspection/list time, on decline or on stale consent.
-            secret = validate_card(backend.resolve_secret(meta.id))
+            raw = _resolve_card(backend, meta)
+            if raw is None:
+                return json.dumps({"success": False, "error_type": "payment_item_changed",
+                                   "error": _ITEM_CHANGED_ON_READ})
+            secret = validate_card(raw)
             _register_card_redaction(secret)
             try:
                 fills = _document_fills(inspected, secret)
@@ -261,36 +396,27 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
                     "success": False,
                     "error_type": "payment_fields_incomplete",
                 })
-            # Re-admit at the write if a desktop user took control during consent.
-            if vault._bot_desktop_browser_session(task_id):
-                from tools.bot_desktop import lease
-
-                lease.assert_agent_may_act()
-            from tools.browser_payment_privacy import mark_payment_session
-
-            surface = None
-            if vault._is_managed():
-                from tools.browser_use_cli import vault_route
-
-                route = vault_route(task_id)
-                # Control's CDP-level capture guard first; no card byte is written unless it holds.
-                refused = _set_control_capture_guard(route)
-                if refused:
-                    return json.dumps(refused)
-                surface = {"slot_id": route.get("slot_id", ""),
-                           "browser_generation": route.get("browser_generation", ""),
-                           "wipe_count": route.get("wipe_count", ""),
-                           "profile_kind": route.get("profile_kind", "")}
-            mark_payment_session(task_id, surface)
-            result = supervisor.commit_payment(inspected, fills)
+            # Commit fence: a takeover or lease loss while the card was read stops here, before any write.
+            refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
+            if refused:
+                refused["error"] += _READ_NOT_WRITTEN
+                return json.dumps(refused)
+            if time.monotonic() >= inspected.expires_at:
+                out = _expired()
+                out["error"] += _READ_NOT_WRITTEN
+                return json.dumps(out)
+            result = supervisor.commit_payment(inspected, fills, strict=strict)
             if result.get("error_type") == "payment_fields_not_retained":
                 result["error"] = _NOT_RETAINED
-            elif result.get("error_type") == "payment_page_changed":  # the commit's own freshness check
-                result["error"] = _PAGE_CHANGED
+            elif result.get("error_type") in ("payment_page_changed", "payment_fields_changed"):
+                # the commit's own freshness, per-document and per-setter checks
+                result["error"] = _PAGE_CHANGED_PARTIAL if result.get("partially_filled") else _PAGE_CHANGED
             elif result.get("error_type") == "payment_consent_expired":
                 result["error"] = _CONSENT_EXPIRED_PARTIAL if result.get("partially_filled") else _CONSENT_EXPIRED
             elif result.get("error_type") == "payment_transport_uncertain":
                 result["error"] = _TRANSPORT_UNCERTAIN
+            elif not result.get("success") and result.get("partially_filled"):
+                result["error"] = _PARTIAL_STOPPED
             result.update(
                 kind="payment",
                 backend=backend.name,
