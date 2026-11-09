@@ -486,7 +486,7 @@ class Broker:
             # Wide enough that neither the URL nor the token wraps.
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 4000, 0, 0))
             proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, close_fds=True,
-                                    start_new_session=True, env=self._child_env())
+                                    start_new_session=True, env=self._child_env())  # detached-spawn: ok — the broker owns this flow's group; cancel, expiry and the post-token linger killpg it
         except Exception:
             os.close(master)
             raise
