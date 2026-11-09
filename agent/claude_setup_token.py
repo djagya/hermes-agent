@@ -265,7 +265,7 @@ def _linux_listener_in_group(port: int, pgid: int) -> Optional[bool]:
     inodes = set()
     for table in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
-            lines = Path(table).read_text().splitlines()[1:]
+            lines = Path(table).read_text(encoding="utf-8-sig").splitlines()[1:]
         except OSError:
             continue
         for line in lines:
@@ -641,7 +641,7 @@ class Broker:
         if proc is None or flow.pgid is None or proc.poll() is not None:
             return
         try:
-            os.killpg(flow.pgid, signal.SIGTERM)
+            os.killpg(flow.pgid, signal.SIGTERM)  # windows-footgun: ok (POSIX PTY broker only)
         except OSError:
             pass
 

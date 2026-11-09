@@ -16,14 +16,14 @@ SNAPSHOT = re.compile(r"\b(20\d{6}T\d{6}Z)\b")
 
 
 def test_every_debian_stage_uses_one_pinned_digest():
-    bases = re.findall(r"^FROM (debian:\S+)", DOCKERFILE, re.M)
+    bases = re.findall(r"^FROM (debian:\S+)", DOCKERFILE, re.MULTILINE)
     assert len(bases) >= 3, bases
     assert all(re.fullmatch(r"debian:[\w.-]+@sha256:[0-9a-f]{64}", b) for b in bases), bases
     assert len(set(bases)) == 1, sorted(set(bases))
 
 
 def test_debian_snapshot_agrees_across_build_and_smoke():
-    args = re.findall(r"^ARG DEBIAN_SNAPSHOT=(\S+)$", DOCKERFILE, re.M)
+    args = re.findall(r"^ARG DEBIAN_SNAPSHOT=(\S+)$", DOCKERFILE, re.MULTILINE)
     assert len(args) >= 2 and len(set(args)) == 1, args
     for rel in (
         ".github/workflows/fork-release-image.yml",
