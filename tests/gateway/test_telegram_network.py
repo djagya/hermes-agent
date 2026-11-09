@@ -16,6 +16,8 @@ initialize — #87015), then fall through to the dual-stack hostname last,
 and "stick" to whichever path works.
 """
 
+import errno
+
 import httpx
 import pytest
 import socket
@@ -479,3 +481,18 @@ class TestDiscoverFallbackIps:
 
         assert ips == ["149.154.167.220"]
         assert elapsed < 1.4, f"discovery gated on hung system DNS ({elapsed:.2f}s)"
+
+
+def test_transport_error_names_its_cause_chain_and_errno():
+    # dlz: ~1,000 "ConnectError('')" lines a day hid whether DNS, TCP or TLS failed.
+    try:
+        try:
+            raise ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+        except ConnectionResetError as inner:
+            raise httpx.ConnectError("") from inner
+    except httpx.ConnectError as exc:
+        text = tnet._describe_transport_error(exc)
+    assert text.startswith("ConnectError('')") and "ConnectionResetError" in text and "errno ECONNRESET" in text
+    loop = httpx.ConnectError("x")
+    loop.__context__ = loop  # a cycle must not hang
+    assert tnet._describe_transport_error(loop).count("ConnectError") == 1

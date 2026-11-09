@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import time
 import socket
 from typing import Iterable, Optional
 
@@ -18,12 +19,29 @@ logger = logging.getLogger(__name__)
 _TELEGRAM_API_HOST = "api.telegram.org"
 
 
+def _error_chain(error: BaseException, limit: int = 4) -> str:
+    """dlz: ``repr`` of the error and its causes. httpx's ConnectError('') hid the real failure
+    (DNS gaierror, TLS SSLError, ECONNRESET...) behind an empty message; errno is named when set."""
+    parts, seen, cur = [], set(), error
+    while cur is not None and id(cur) not in seen and len(parts) < limit:
+        seen.add(id(cur))
+        text = repr(cur)
+        errno = getattr(cur, "errno", None)
+        if isinstance(errno, int):
+            import errno as _errno
+
+            text += f" [errno {_errno.errorcode.get(errno, errno)}]"
+        parts.append(text)
+        cur = cur.__cause__ or cur.__context__
+    return " <- ".join(parts)
+
+
 def _describe_transport_error(error: Exception) -> str:
     """Return a non-empty, secret-safe exception representation for diagnostics."""
     try:
         from agent.redact import redact_sensitive_text
 
-        return redact_sensitive_text(repr(error), force=True)
+        return redact_sensitive_text(_error_chain(error), force=True)
     except Exception:
         return type(error).__name__
 
@@ -147,6 +165,7 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         for ip in self._attempt_order():
             candidate = request if ip is None else _rewrite_request_for_ip(request, ip)
             transport = self._primary if ip is None else await self._get_fallback(ip)
+            started = time.monotonic()
             try:
                 response = await transport.handle_async_request(candidate)
                 if self._last_failure is not None:
@@ -171,7 +190,8 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 if not _is_retryable_connect_error(exc):
                     raise
                 path = ip or _TELEGRAM_API_HOST
-                failure = _describe_transport_error(exc)
+                # dlz: elapsed time separates an instant refusal/reset from a connect timeout.
+                failure = f"{_describe_transport_error(exc)} after {int((time.monotonic() - started) * 1000)} ms"
                 self._last_failure = (path, failure)
                 if self._sticky_ip is not _UNSET and ip == self._sticky_ip:
                     async with self._sticky_lock:
