@@ -347,11 +347,14 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
 
             def _consumed_uncertain(result) -> tuple[bool, bool]:
                 """(consumed, uncertain): a consumed send that failed without proof it never landed
-                must not be replayed — the photos may already be in the chat."""
+                must not be replayed — the photos may already be in the chat. Delivery certainty is
+                the adapter's ``delivery_uncertain`` mark; without one, only a retryable failure
+                (proven non-delivery, e.g. a pool timeout) may be replayed."""
                 raw = getattr(result, "raw_response", None)
-                consumed = isinstance(raw, dict) and bool(raw.get("inline_images_consumed"))
-                uncertain = (consumed and not getattr(result, "success", False)
-                             and not getattr(result, "retryable", False))
+                raw = raw if isinstance(raw, dict) else {}
+                consumed = bool(raw.get("inline_images_consumed"))
+                uncertain = consumed and not getattr(result, "success", False) and (
+                    bool(raw.get("delivery_uncertain")) or not getattr(result, "retryable", False))
                 return consumed, uncertain
 
             if text_content:

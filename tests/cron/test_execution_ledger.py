@@ -621,32 +621,46 @@ def test_cap_is_pinned_and_missed_rows_age_out(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("prune", ["age", "count"])
-def test_retention_keeps_only_in_flight_queued_deliveries(monkeypatch, tmp_path, prune):
-    """CRON-2: a run whose queued delivery is still in flight survives both prunes (the drain settles
-    the job through it). One whose queue entry is already terminal (write-back crashed) is settled
-    from the queue without a resend and ages out; one the queue never saw gets no exemption."""
-    from cron import delivery_queue
+def test_retention_keeps_unsettled_queued_runs_until_job_and_ledger_settle(monkeypatch, tmp_path, prune):
+    """CRON-2: a queued run survives both prunes until settled, including one whose queue entry is
+    terminal but whose write-back never ran; the drain tick then settles the job record and the
+    ledger from the queue (no resend) and the row ages out. A run the queue never saw is pruned."""
+    from cron import delivery_queue, jobs, scheduler
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     executions = _point_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "cron" / "deliveries.db")
     clock = {"now": datetime(2026, 10, 10, tzinfo=UTC)}
     monkeypatch.setattr(executions, "_hermes_now", lambda: clock["now"])
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 1 if prune == "count" else 100)
-    rows = {}
+    rows, job_ids = {}, {}
     for name in ("pending", "terminal", "unseen", "settled"):
         clock["now"] += timedelta(seconds=1)  # distinct finish times: the cap keeps the newest
-        rows[name] = executions.create_execution(name, source="builtin")["id"]
+        job_ids[name] = jobs.create_job(prompt=name, schedule="every 1h", deliver="telegram:fixture")["id"]
+        rows[name] = executions.create_execution(job_ids[name], source="builtin")["id"]
         if name in ("pending", "terminal"):  # the run queues its send before booking the outcome
-            delivery_queue.enqueue(rows[name], {"id": name}, "text")
+            delivery_queue.enqueue(rows[name], {"id": job_ids[name]}, "text")
         executions.finish_execution(rows[name], success=True,
                                     delivery_outcome="delivered" if name == "settled" else "queued")
-    with delivery_queue._transaction() as conn:  # drained; the ledger write-back never ran
+        jobs.update_job(job_ids[name], {"last_status": "delivery_queued", "canonical_completions": [rows[name]]})
+    with delivery_queue._transaction() as conn:  # drained; the write-back never ran
         conn.execute("UPDATE deliveries SET status='delivered' WHERE execution_id=?", (rows["terminal"],))
-    clock["now"] += timedelta(hours=executions.TERMINAL_RETENTION_HOURS if prune == "age" else 0, seconds=1)
-    newer = executions.create_execution("newer", source="builtin")
-    executions.finish_execution(newer["id"], success=True)
 
-    assert executions.get_execution(newer["id"]) is not None
-    assert [n for n, i in rows.items() if executions.get_execution(i)] == ["pending"]
-    assert executions.settle_delivery_outcome(rows["pending"], "delivered")
+    def unrelated_prune():
+        clock["now"] += timedelta(hours=executions.TERMINAL_RETENTION_HOURS if prune == "age" else 0, seconds=1)
+        newer = executions.create_execution("newer", source="builtin")
+        executions.finish_execution(newer["id"], success=True)
+        assert executions.get_execution(newer["id"]) is not None
+
+    def kept():
+        return [n for n, i in rows.items() if executions.get_execution(i)]
+
+    unrelated_prune()
+    assert kept() == ["pending", "terminal"]
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **kw: "fixture: no transport")
+    scheduler.drain_delivery_queue({}, None)
+    assert jobs.get_job(job_ids["terminal"])["last_status"] == "ok"
+    assert executions.get_execution(rows["terminal"])["delivery_outcome"] == "delivered"
     assert delivery_queue.get_status(rows["terminal"])["status"] == "delivered"  # never resent
+    unrelated_prune()
+    assert "terminal" not in kept()

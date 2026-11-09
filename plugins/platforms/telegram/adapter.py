@@ -1467,14 +1467,40 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramHeldInboundMixin, Teleg
             _TimedOut = None
         return bool((_TimedOut and isinstance(exc, _TimedOut)) or "timed out" in str(exc).lower())
 
+    def _rich_request_not_sent(self, exc: Exception) -> bool:
+        """dlz: proof the rich request never reached Telegram, so a replay cannot duplicate it: a
+        connect-phase failure, an httpx pool timeout (PTB: "Request was *not* sent"), or an answer
+        from Telegram itself (flood RetryAfter, an API refusal). A reset, read failure or plain
+        timeout after the request was written is NOT proof: Telegram may have accepted it."""
+        if self._looks_like_connect_timeout(exc) or self._looks_like_pool_timeout(exc):
+            return True
+        if self._exception_graph_matches(exc, "connecterror", "connection refused", "all connection attempts failed"):
+            return True
+        try:
+            from telegram.error import BadRequest, NetworkError, TelegramError
+        except (ImportError, AttributeError):
+            return False
+        # PTB's BadRequest subclasses NetworkError but is Telegram's answer; other NetworkErrors
+        # (TimedOut included) are transport failures with unknown delivery.
+        return isinstance(exc, BadRequest) or (isinstance(exc, TelegramError) and not isinstance(exc, NetworkError))
+
     def _rich_transient_result(self, exc: Exception, what: str, *, retry_after: Any = None) -> SendResult:
-        """SendResult for a transient/unknown rich-API failure (request may have reached Telegram, so the
-        caller must NOT legacy-resend); retry semantics mirror legacy send()."""
+        """SendResult for a transient/unknown rich-API failure (the caller must NOT legacy-resend).
+        dlz: ``retryable`` only with proof of non-delivery; otherwise ``raw_response.delivery_uncertain``
+        marks the outcome unknown, and no retry, fallback or ledger redelivery may replay it."""
         safe_error = _redact_telegram_error_text(exc)
         logger.warning("[%s] %s transient failure (no legacy resend): %s", self.name, what, safe_error)
+        not_sent = self._rich_request_not_sent(exc)
         return SendResult(
-            success=False, error=safe_error,
-            retryable=(self._looks_like_connect_timeout(exc) or not self._is_timed_out(exc)), retry_after=retry_after)
+            success=False, error=safe_error, retryable=not_sent, retry_after=retry_after,
+            raw_response=None if not_sent else {"delivery_uncertain": True})
+
+    def _send_retry_is_final(self, result: SendResult) -> bool:
+        """dlz: an uncertain rich send may have landed: never retry it or fall back to plain text."""
+        raw = getattr(result, "raw_response", None)
+        if isinstance(raw, dict) and raw.get("delivery_uncertain"):
+            return True
+        return super()._send_retry_is_final(result)
 
     @staticmethod
     async def _record_rich_sent(chat_id: Any, message_id: Any, content: str) -> None:

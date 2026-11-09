@@ -1508,7 +1508,13 @@ def drain_delivery_queue(adapters, loop) -> int:
             _mark_incident_alerted(queued_job.get("_failure_incident_id"))
         return error
 
-    return drain(send)
+    processed = drain(send)
+    # dlz: CRON-2 — a terminal queue entry whose outcome never reached the job/ledger is settled
+    # here (no resend), so its run leaves the retention exemption.
+    from cron.delivery_outcome import reconcile_queued_deliveries
+    with contextlib.suppress(Exception):
+        reconcile_queued_deliveries()
+    return processed
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)

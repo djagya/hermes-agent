@@ -4248,6 +4248,14 @@ class BasePlatformAdapter(ABC):
             if getattr(result, "success", False):
                 await asyncio.to_thread(mark_delivered, obligation_id)
                 return
+            _raw = getattr(result, "raw_response", None)
+            if isinstance(_raw, dict) and _raw.get("delivery_uncertain"):
+                # dlz: the platform may already have this message (e.g. a reset reading Telegram's
+                # ack): no runtime redelivery may replay it. Close the obligation.
+                logger.warning("[%s] final send outcome uncertain; ledger obligation closed without "
+                               "redelivery: %s", delivery_adapter.name, getattr(result, "error", ""))
+                await asyncio.to_thread(mark_delivered, obligation_id)
+                return
             error = str(getattr(result, "error", "") or "")
             await asyncio.to_thread(mark_failed, obligation_id, error)
             if is_reconnect_only(error):

@@ -92,3 +92,20 @@ def settle_quietly(job_id: Optional[str], execution_id: Optional[str]) -> None:
         settle_queued_delivery(job_id, execution_id)
     except Exception:
         logger.warning("Cron delivery %s: outcome write-back failed", execution_id, exc_info=True)
+
+
+def reconcile_queued_deliveries() -> int:
+    """dlz: CRON-2 — settle queued runs whose queue entry is already terminal (the drain's
+    write-back crashed or failed): job record and ledger row, from the queue's own outcome, never
+    resent. Runs on the gateway's drain tick, outside every lock; returns the runs settled."""
+    from cron.delivery_queue import _TERMINAL, statuses
+    from cron.executions import queued_execution_ids
+
+    queued = queued_execution_ids()
+    found = statuses([i for i, _ in queued]) if queued else {}
+    settled = 0
+    for execution_id, job_id in queued:
+        if (found or {}).get(execution_id) in _TERMINAL:
+            settle_quietly(job_id, execution_id)
+            settled += 1
+    return settled

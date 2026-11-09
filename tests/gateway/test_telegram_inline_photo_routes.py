@@ -135,12 +135,23 @@ def test_text_transport_metadata_does_not_mutate_attachment_metadata():
     assert metadata == {'thread_id': 'topic', 'notify': True}
 
 
+def _pool_timeout():
+    import httpx
+
+    error = TimedOut('Pool timeout: All connections in the connection pool are occupied.')
+    error.__cause__ = httpx.PoolTimeout('pool')
+    return error
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure, replayable', [(TimedOut('timed out'), False),
-                                                 (NetworkError('connection reset'), True)])
+@pytest.mark.parametrize('failure, replayable', [
+    (TimedOut('timed out'), False),
+    (NetworkError('Connection reset by peer'), False),  # reading the ack: Telegram may have it
+    (_pool_timeout(), True),  # PTB: the request was not sent
+])
 async def test_queued_rich_send_uncertain_is_not_replayed(monkeypatch, failure, replayable):
-    """An ambiguous rich timeout may have landed: no replay and no photo batch. A failure that
-    provably never left keeps the completion-send fallback."""
+    """Only proven non-delivery may be replayed by the completion send; an ambiguous rich failure
+    may have landed, so no replay and no photo batch."""
     adapter = prepared_adapter(monkeypatch)
     adapter._bot.do_api_request.side_effect = failure
     runner = object.__new__(GatewayRunner)
@@ -168,3 +179,27 @@ async def test_queued_edit_reconcile_keeps_inline_photos(monkeypatch):
     assert all(f'![image {i}]({url})' in rich['markdown'] for i, url in enumerate(PRODUCT_URLS))
     adapter.send_multiple_images.assert_not_called()
     adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure, sends', [(NetworkError('Connection reset by peer'), 1), (_pool_timeout(), 2)])
+async def test_rich_retry_and_ledger_replay_only_proven_non_delivery(monkeypatch, failure, sends):
+    """The base retry loop and the delivery ledger see the same certainty: an uncertain rich send
+    is neither retried, nor re-sent as plain text, nor left for ledger redelivery."""
+    import asyncio
+
+    from gateway import delivery_ledger
+    from gateway.platforms.base import BasePlatformAdapter
+
+    adapter = prepared_adapter(monkeypatch)
+    monkeypatch.setattr(asyncio, 'sleep', AsyncMock())
+    adapter._bot.do_api_request.side_effect = [failure, {'message_id': 9}]
+    result = await adapter._send_with_retry(chat_id='111', content=response(PRODUCT_URLS), metadata={})
+    assert adapter._bot.do_api_request.await_count == sends
+    adapter._bot.send_message.assert_not_called()
+    marks = []
+    monkeypatch.setattr(delivery_ledger, 'mark_delivered', lambda oid: marks.append('delivered'))
+    monkeypatch.setattr(delivery_ledger, 'mark_failed', lambda oid, error='': marks.append('failed'))
+    adapter.gateway_runner = None
+    await BasePlatformAdapter._finalize_delivery_obligation(adapter, 'obligation', result, event(), adapter)
+    assert marks == ['delivered']

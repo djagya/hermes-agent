@@ -262,29 +262,34 @@ _PRUNABLE_STATUSES = "('completed','failed','unknown','cancelled','missed')"
 
 
 def _unsettled_queued_ids(conn: sqlite3.Connection) -> list[str]:
-    """dlz: CRON-2 — terminal runs whose queued delivery is still in flight; retention keeps them.
+    """dlz: CRON-2 — terminal runs whose queued delivery is not settled yet; retention keeps them.
 
-    A run whose delivery is queued is not history yet: the drain settles the job through this row
-    (``delivery_outcome._settle_job_record``). A queued row whose queue entry is already terminal
-    (the drain's write-back crashed) is settled here from the queue's outcome, never resent, so it
-    ages out normally; one the queue never saw (Bot Chat deferral, lost queue) gets no exemption,
-    or retention would grow without bound. An unreadable queue keeps every queued row this pass."""
-    queued = [r[0] for r in conn.execute(
-        f"SELECT id FROM executions WHERE delivery_outcome='queued' AND status IN {_PRUNABLE_STATUSES}")]
+    A run whose delivery is queued is not history yet: settlement (``delivery_outcome``) writes the
+    job record AND this row, fenced on this row being the job's latest attempt, so pruning it first
+    strands the job ``delivery_queued``. A queue entry that is already terminal (the drain's
+    write-back crashed) stays exempt until ``reconcile_queued_deliveries`` settles both — never
+    resent; that settles the ledger row unconditionally, so it then ages out. A run the queue never
+    saw (Bot Chat deferral, lost queue) can never settle and gets no exemption, or retention would
+    grow without bound. An unreadable queue keeps every queued row this pass. Lock order stays
+    ledger -> queue (the queue never takes the ledger lock)."""
+    queued = queued_execution_ids(conn)
     if not queued:
         return []
     from cron.delivery_queue import statuses
-    from cron.delivery_outcome import _LEDGER_OUTCOME
 
-    found = statuses(queued)
+    found = statuses([i for i, _ in queued])
     if found is None:
-        return queued
-    for execution_id, status in found.items():
-        if status in _LEDGER_OUTCOME:
-            conn.execute(
-                "UPDATE executions SET delivery_outcome=? WHERE id=? AND delivery_outcome='queued'",
-                (_LEDGER_OUTCOME[status], execution_id))
-    return [i for i in queued if found.get(i) in ("pending", "delivering")]
+        return [i for i, _ in queued]
+    return [i for i, _ in queued if i in found]
+
+
+def queued_execution_ids(conn: Optional[sqlite3.Connection] = None) -> list[tuple[str, str]]:
+    """``(execution_id, job_id)`` of terminal runs whose delivery outcome is still ``queued``."""
+    query = f"SELECT id, job_id FROM executions WHERE delivery_outcome='queued' AND status IN {_PRUNABLE_STATUSES}"
+    if conn is not None:
+        return [(r[0], r[1]) for r in conn.execute(query)]
+    with _transaction() as own:
+        return [(r[0], r[1]) for r in own.execute(query)]
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
