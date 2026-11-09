@@ -656,7 +656,8 @@ class PaymentSupervisionMixin:
                     # completed.
                     return _partial({"success": False, "error_type": "payment_consent_expired"}, filled)
                 result = await self._commit_payment_document(
-                    document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop))
+                    document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop),
+                    wall_deadline_ms=_wall_deadline_ms(stop))
                 if not result.get("success"):
                     return _partial(result, filled)
                 filled += result.get("filled_fields", 0)
@@ -677,14 +678,15 @@ class PaymentSupervisionMixin:
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
             return _partial({"success": False, "error_type": "payment_transport_uncertain"}, filled)
 
-    async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None) -> dict:
+    async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None,
+                                       wall_deadline_ms: float | None = None) -> dict:
         result = _value(
             await self._cdp(
                 "Runtime.callFunctionOn",
                 {
                     "objectId": d.object_id,
-                    "functionDeclaration": "function(fills,deadline){return this.commit(fills,deadline)}",
-                    "arguments": [{"value": fills}, {"value": deadline_ms}],
+                    "functionDeclaration": "function(fills,deadline,wall){return this.commit(fills,deadline,wall)}",
+                    "arguments": [{"value": fills}, {"value": deadline_ms}, {"value": wall_deadline_ms}],
                     "returnByValue": True,
                 },
                 session_id=d.frame_session,
@@ -745,6 +747,13 @@ def _renderer_deadline_ms(d: PaymentDocument, stop: float) -> float:
     if d.clock_anchor is None:
         return 0.0
     return max(0.0, (stop - d.clock_anchor) * 1000)
+
+
+def _wall_deadline_ms(stop: float) -> float:
+    """dlz: the same ``stop`` as an epoch-ms instant. The renderer requires BOTH clocks to be inside: its
+    monotonic clock can pause while a remote browser's machine sleeps (macOS ticks exclude sleep), and
+    the wall clock keeps running through sleep; a wall-clock step alone cannot reopen the window either."""
+    return time.time() * 1000 + (stop - time.monotonic()) * 1000
 
 
 # dlz: each pinned owner <iframe> is still shown to the user (strict: transparent or hidden ancestors too).
@@ -878,12 +887,14 @@ _INSPECT = r"""(() => {
         return {token:f.token,state:same(el.value,f.value)?'held':el.value?'changed':'empty',length:el.value.length};
       });
     },
-    commit: (fills, deadline) => {
+    commit: (fills, deadline, wall) => {
       if (used || !valid()) return {success:false,error_type:'payment_fields_changed'};
       used = true;
       // dlz: `deadline` is ms after `born` on this document's monotonic clock (never Date.now(): a wall-clock
       // step must not reopen the window); checked here and again before every setter. Not a number: late.
-      const late = () => !(typeof deadline === 'number' && performance.now() - born < deadline);
+      // Also `wall` (epoch ms): a sleeping remote browser's monotonic clock pauses, its wall clock does not.
+      const late = () => !(typeof deadline === 'number' && performance.now() - born < deadline &&
+                           typeof wall === 'number' && Date.now() < wall);
       if (late()) return {success:false,error_type:'payment_consent_expired'};
       if (!Array.isArray(fills) || !fills.length ||
           fills.some(f=>!selected.has(f.index) || typeof f.value !== 'string' || !f.value) ||
