@@ -14,14 +14,15 @@ from pathlib import Path
 import pytest
 
 from gateway.platforms import api_server_slot_handback as hb
-from tools import browser_control_route as route, browser_payment_privacy as privacy
+from tools import browser_payment_privacy as privacy
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_PATH = ROOT / "tests/fixtures/browser_control/control-v1.json"
 # monolith 0a4e658c9e (origin/main, 2026-11-07)
 CONTRACT_SHA256 = "d0d49bbf9f3cc4adfad6ae8e7bccb21e4686bb0569970435c9d7cb0484657111"
-# Events the fork accepts before control declares them (monolith follow-up: B10 control half).
-FORK_AHEAD_EVENTS = {"handoff_ended": ["event", "session_id", "slot_id", "lease_id", "reason_code"]}
+# The body the fork's handback route reads for B10. Pending: monolith control-v1 must declare it
+# (control half of B10); until then the test below is a strict xfail and turns red when it lands.
+HANDOFF_ENDED_BODY = ["event", "session_id", "slot_id", "lease_id", "reason_code"]
 
 
 @pytest.fixture(scope="module")
@@ -72,22 +73,28 @@ def test_release_handoff_pending_is_declared_deferred(contract):
 def test_d10b_lease_status_reports_lease_state(contract):
     row = _route(contract, "GET", "/v1/status")
     assert "?lease=|?lease_id=" in row["body"] and "lease_state=live" in row["reply"]
-    assert route.lease_status("") == {"error": "stale", "detail": "no lease id"}
 
 
-def test_b10_every_event_control_sends_is_accepted_by_the_handback_route(contract):
-    events = dict(contract["events"])
-    for name, spec in FORK_AHEAD_EVENTS.items():
-        if name in events:  # control now declares it: its body must be the one the fork reads
-            assert set(events[name]["body"]) == set(spec), f"{name} body drifted from the fork's reader"
-        else:
-            events[name] = {"body": spec}
-    assert set(events) == set(hb.EVENTS)
-    for name, spec in events.items():
-        body = {field: "x-1" for field in spec["body"]}
-        body.update(event=name, session_id="s-1", slot_id="shopping")
-        if "reason_code" in body:
-            body["reason_code"] = "human_ended"
-        fields, reason = hb.parse(body)
-        assert fields is not None, f"{name}: {reason}"
-        assert fields["event"] == name
+def _accepts(name, fields_list):
+    body = {field: "x-1" for field in fields_list}
+    body.update(event=name, session_id="s-1", slot_id="shopping")
+    if "reason_code" in body:
+        body["reason_code"] = "human_ended"
+    fields, reason = hb.parse(body)
+    assert fields is not None, f"{name}: {reason}"
+    assert fields["event"] == name
+
+
+def test_every_event_control_declares_is_accepted_by_the_handback_route(contract):
+    assert contract["events"], "control-v1 declares no events"
+    for name, spec in contract["events"].items():
+        assert name in hb.EVENTS, f"control sends {name}; the handback route refuses it"
+        _accepts(name, spec["body"])
+
+
+@pytest.mark.xfail(strict=True, reason="pending-control: monolith control-v1 does not declare handoff_ended yet "
+                   "(B10 control half); re-vendor the contract when it lands")
+def test_b10_control_declares_handoff_ended_with_the_body_the_fork_reads(contract):
+    spec = contract["events"]["handoff_ended"]
+    assert set(spec["body"]) == set(HANDOFF_ENDED_BODY)
+    _accepts("handoff_ended", spec["body"])

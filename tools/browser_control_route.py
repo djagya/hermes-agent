@@ -430,14 +430,6 @@ def capture_guard_view(slot_id: str) -> dict[str, Any]:
     return get_json("/v1/capture-guard?" + urlencode({"slot": slot_id}))
 
 
-def lease_status(lease_id: str) -> dict[str, Any]:
-    """dlz: ``GET /v1/status?lease=<id>`` (control-v1): the live lease's slot row with
-    ``lease_state=live``, or an error dict (``stale`` + ``lease_state`` ended/unknown)."""
-    if not str(lease_id or "").strip():
-        return {"error": "stale", "detail": "no lease id"}
-    return get_json("/v1/status?" + urlencode({"lease": lease_id}))
-
-
 # Rollout escape hatch: a control without the capture-guard route (404) lets
 # a card fill go ahead on the local mark alone. Off by default (fail closed).
 CAPTURE_GUARD_OPTIONAL_ENV = "HERMES_BROWSER_CAPTURE_GUARD_OPTIONAL"

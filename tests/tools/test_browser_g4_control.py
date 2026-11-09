@@ -134,13 +134,32 @@ def test_b10_handoff_ended_without_return_wakes_the_minting_session_with_fixed_t
     assert "ignore previous" not in calls[0]["content"]
 
 
-def test_d10b_handback_after_gateway_restart_is_confirmed_by_control(monkeypatch, held):
+def test_d10b_after_restart_a_live_lease_alone_never_wakes_and_one_original_lease_wakes_once(monkeypatch, held):
+    """Review P1/P2: no local claim (gateway restart) refuses without a blocking control call, even when
+    control would report a live agent lease for this task/slot; a real claim wakes once per original lease."""
     calls = []
-    live = {"lease_state": "live", "owner": "agent", "slot_id": "sensitive", "task": "s-1"}
-    monkeypatch.setattr(route, "lease_status", lambda lease: dict(live) if lease == "lease-new" else {"error": "stale"})
-    run = lambda **kw: asyncio.run(hb.inject(_runner(calls), "s-1", "sensitive", "lease-old", **kw))
-    assert run(resumed_lease_id="") == "session_not_found"          # nothing to confirm
-    live["task"] = "someone-else"
-    assert run(resumed_lease_id="lease-new") == "session_not_found"  # another session's lease
-    live["task"] = "s-1"
-    assert run(resumed_lease_id="lease-new") == "injected" and len(calls) == 1
+    live = {"lease_state": "live", "owner": "agent", "slot_id": "sensitive", "task": "s-1", "state": "agent"}
+    monkeypatch.setattr(route, "get_json", lambda *a, **k: (calls.append("control-http"), dict(live))[1])
+    monkeypatch.setattr(route, "lease_status", lambda lease: dict(live), raising=False)
+    adapter = SimpleNamespace(gateway_runner=_runner(calls))
+
+    def post(original):
+        body = {"event": "handback", "session_id": "s-1", "slot_id": "sensitive", "lease_id": original,
+                "resumed_lease_id": "lease-new"}
+
+        class Req:
+            headers = {"Authorization": "Bearer secret-key"}
+            app: dict = {}
+
+            async def json(self):
+                return body
+
+        return asyncio.run(hb.handle_request(adapter, Req())).status
+
+    assert post("invented-1") == 404 and post("invented-2") == 404
+    assert calls == []  # no wake, and no synchronous control lookup inside the async handler
+    route.note_handoff("s-1", "sensitive", "lease-old", 1200)
+    route._held_leases["s-1|sensitive|research"] = {route.MANAGED_SLOT_ENV: "sensitive",
+                                                    route.MANAGED_LEASE_ENV: "lease-old"}
+    assert post("lease-old") == 202
+    assert post("lease-old") == 409 and len(calls) == 1  # one wake per original lease

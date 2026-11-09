@@ -112,23 +112,6 @@ def parse(payload: Any) -> tuple[Optional[dict[str, str]], str]:
             "resumed_lease_id": resumed if _SLOT_RE.match(resumed) else "", "reason_code": reason}, ""
 
 
-def _control_confirms(session_id: str, slot_id: str, resumed_lease_id: str) -> bool:
-    """dlz: D10-B. After a gateway restart the in-memory handoff claims are gone; control's
-    ``/v1/status?lease=`` vouches instead, and only for a handback: the lease Return to Sera
-    minted must be live, agent-owned, on this slot and for this session. Anything else refuses."""
-    if not resumed_lease_id:
-        return False
-    try:
-        from tools.browser_control_route import lease_status
-
-        row = lease_status(resumed_lease_id)
-    except Exception as exc:  # health: allow BLE001 -- control unreachable: refuse (no wake)
-        logger.warning("browser handback: control lease check failed: %s", type(exc).__name__)
-        return False
-    return (isinstance(row, dict) and not row.get("error") and row.get("lease_state") == "live"
-            and row.get("owner") == "agent" and row.get("slot_id") == slot_id and row.get("task") == session_id)
-
-
 def _seen(lease_id: str) -> bool:
     """True when this lease's handback was already handled within the replay window; records it otherwise."""
     now = time.monotonic()
@@ -142,7 +125,7 @@ def _seen(lease_id: str) -> bool:
 
 
 async def inject(runner: Any, session_id: str, slot_id: str, lease_id: str, *, event: str = "handback",
-                 resumed_lease_id: str = "", reason_code: str = "") -> str:
+                 reason_code: str = "") -> str:
     """Schedule the wake turn. Returns ``"injected"``, ``"replay"``, ``"session_not_found"`` or ``"unavailable"``.
 
     The control key is readable by same-uid model code, so the key alone never wakes a session: the
@@ -153,11 +136,11 @@ async def inject(runner: Any, session_id: str, slot_id: str, lease_id: str, *, e
     from tools.browser_control_route import claim_handback
 
     if not claim_handback(session_id, slot_id, lease_id):
-        if event != "handback" or not _control_confirms(session_id, slot_id, resumed_lease_id):
-            return "session_not_found"
-        logger.warning("browser handback: no local claim (gateway restarted?); control confirmed lease "
-                       "slot=%s session=%s", slot_id, session_id)
-    if _seen(f"{event}:{lease_id}"):  # only after the claim: a forged id cannot burn the real handback
+        # dlz: D10-B, fail closed. After a gateway restart the in-memory claim is gone, and control-v1's
+        # /v1/status?lease= does not attest which agent lease a Return resumed, so a live lease for this
+        # task/slot proves nothing about Return. Refuse (the caller logs it loudly); never wake on it.
+        return "session_not_found"
+    if _seen(lease_id):  # per original lease, only after the claim: a forged id cannot burn the real one
         return "replay"
     store = getattr(runner, "async_session_store", None)
     entry = None
@@ -211,13 +194,13 @@ async def handle_request(adapter: Any, request: Any):
         return _error(reason, 400, "handback_invalid")
     runner = adapter.gateway_runner or request.app.get("gateway_runner")
     outcome = await inject(runner, fields["session_id"], fields["slot_id"], fields["lease_id"],
-                           event=fields["event"], resumed_lease_id=fields["resumed_lease_id"],
-                           reason_code=fields["reason_code"])
+                           event=fields["event"], reason_code=fields["reason_code"])
     if outcome == "replay":
         return _error("This handback was already delivered.", 409, "handback_replay")
     if outcome == "session_not_found":
         # dlz: D10-B — loud, not silent: a 404 here means Sera is never woken and the slot recycles later.
-        logger.warning("browser %s NOT delivered: no claim and no control confirmation slot=%s session=%s",
+        logger.warning("browser %s NOT delivered: no local handoff claim (lost on a gateway restart?) "
+                       "slot=%s session=%s",
                        fields["event"], fields["slot_id"], fields["session_id"])
         return _error("No live session with that id.", 404, "session_not_found")
     if outcome != "injected":

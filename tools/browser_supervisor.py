@@ -534,7 +534,16 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             with contextlib.suppress(Exception):
                 await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=min(2.0, left()))
             raise
-        await self._install_dialog_bridge(sid)
+        if deadline is None:
+            await self._install_dialog_bridge(sid)
+            return sid
+        # dlz: G4 review (codex P2): the bridge's 3 best-effort calls (up to 13 s) count against the same
+        # deadline. Past it the page stays attached without the bridge, as when a bridge step fails.
+        try:
+            await asyncio.wait_for(self._install_dialog_bridge(sid), timeout=left())
+        except TimeoutError:
+            logger.info("CDP supervisor %s: dialog bridge install ran past the attach budget; attached without it",
+                        self.task_id)
         return sid
 
     async def _attach_initial_page(self) -> None:

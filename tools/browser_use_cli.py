@@ -15,9 +15,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -146,6 +148,22 @@ def _slot_oom_hint(env: dict, started: float) -> str:
     except Exception:  # health: allow BLE001 -- advisory only; the exec result stands without it
         return ""
     return _RENDERER_OOM_HINT if last >= started - 1.0 else ""
+
+
+# dlz: G4 review (codex P1). harness 0.1.13 run.py runs ensure_daemon() (the CDP connect) before
+# exec(code): a connect failure exits 1 before any of the code ran. The first line of the piped code
+# touches this marker, so "marker absent" is the structured proof that execution never started; stderr
+# text alone is not (user code can print the same phrase after it clicked something).
+_EXEC_STARTED_ENV = "HERMES_BU_EXEC_STARTED"
+_EXEC_STARTED_PREAMBLE = (
+    'with __import__("contextlib").suppress(OSError): '
+    f'open(__import__("os").environ.pop("{_EXEC_STARTED_ENV}", "") or __import__("os").devnull, "a").close()\n'
+)
+
+
+def _exec_never_started(proc: Any, marker: str) -> bool:
+    """True only when the CLI exited non-zero and the code's first line never ran."""
+    return bool(marker) and getattr(proc, "returncode", 0) != 0 and not os.path.exists(marker)
 
 
 def _managed_connect_failure(stderr: str) -> str:
@@ -1261,6 +1279,12 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     # The time spent waiting in control's queue comes out of this call's budget.
     timeout = max(_MIN_TIMEOUT_S, _clamp_timeout(timeout_s) - int(_managed_waited_s(managed)))
     started = time.time()
+    start_marker = ""
+    if managed:
+        marker_dir = tempfile.mkdtemp(prefix="hermes-bu-exec-")
+        start_marker = os.path.join(marker_dir, "started")
+        env[_EXEC_STARTED_ENV] = start_marker
+        code = _EXEC_STARTED_PREAMBLE + code
 
     def dispatch() -> dict[str, Any]:
         refused = exec_slot_capture_refusal(code, env)
@@ -1296,7 +1320,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     else:
         dispatched = dispatch()
     connect_failure = (
-        _managed_connect_failure(dispatched["proc"].stderr or "") if managed and "proc" in dispatched else ""
+        _managed_connect_failure(dispatched["proc"].stderr or "")
+        if managed and "proc" in dispatched and _exec_never_started(dispatched["proc"], start_marker) else ""
     )
     if connect_failure:
         # The harness fails at daemon connect, before running any of the code, so one retry is
@@ -1315,7 +1340,12 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             rerouted.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
             env.clear()
             env.update(rerouted)
+            env[_EXEC_STARTED_ENV] = start_marker
             dispatched = dispatch()
+    never_started = "proc" in dispatched and _exec_never_started(dispatched["proc"], start_marker)
+    if start_marker:
+        shutil.rmtree(os.path.dirname(start_marker), ignore_errors=True)
+        env.pop(_EXEC_STARTED_ENV, None)
     # dlz: undo ux_capture overrides a killed/failed call left on the tab (tools/browser_capture.py).
     from tools.browser_capture import reset_after_failed_exec as _ux_capture_reset
     _ux_capture_reset(code, env, dispatched, cmd, _run_cli_killing_process_group, task_id,
@@ -1343,7 +1373,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     result.update(_take_real_profile_note(route_key))
     result.update({"dialogs": dialogs} if dialogs else {})
     stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
-    failure = _managed_connect_failure(stderr) if managed else ""
+    failure = _managed_connect_failure(stderr) if managed and never_started else ""
     if failure == "gate":
         stderr = _GATE_REFUSED_HINT + "\n" + stderr
     elif failure == "handshake":

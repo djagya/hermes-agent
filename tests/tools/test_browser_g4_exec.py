@@ -56,6 +56,32 @@ def test_handshake_timeout_is_explained_and_retried_once(tmp_path, monkeypatch):
         httpd.shutdown()
 
 
+def test_handshake_text_after_the_code_started_never_replays_it(tmp_path, monkeypatch):
+    """Review P1: user code that ran (and clicked) then printed the phrase and failed is not re-run."""
+    import sys
+
+    state = _State()
+    httpd, port = _start(state)
+    try:
+        _managed_env(monkeypatch, port)
+        monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id: None)
+        calls = tmp_path / "calls"
+        # Runs the first line of the piped code (the start marker), like run.py's exec(code) after connect.
+        script = _fake_cli(
+            tmp_path,
+            'case "$1" in --reload) exit 0;; esac\n'
+            f"echo x >> '{calls}'\n"
+            f"head -n 1 | '{sys.executable}' -c 'import sys; exec(sys.stdin.read())'\n"
+            'echo "CDP WS handshake failed: timed out during opening handshake" >&2; exit 1\n',
+        )
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [str(script)])
+        result = json.loads(bu_cli.browser_exec("click(1, 2)", task_id="t1"))
+        assert len(calls.read_text().split()) == 1
+        assert not result["stderr"].startswith("the browser slot did not answer")
+    finally:
+        httpd.shutdown()
+
+
 def test_qa_targets_schema_names_the_registry_not_hostnames(monkeypatch):
     """B23: control admits registered app names only (grant.py admit)."""
     monkeypatch.setattr(route, "is_managed", lambda: True)
@@ -81,7 +107,7 @@ class _HungTabs(sup_mod.CDPSupervisor):
         if session_id in {"s-A", "s-B"}:
             if method == "Target.setAutoAttach":
                 await asyncio.sleep(timeout)
-                raise asyncio.TimeoutError()
+                raise TimeoutError()
             await asyncio.sleep(timeout * 0.9)
         return {"result": {}}
 
@@ -99,6 +125,32 @@ def test_initial_attach_fits_the_start_budget_with_hung_tabs(monkeypatch):
     asyncio.run(sup._attach_initial_page())
     assert time.monotonic() - started < 1.5
     assert sup._page_session_id == "s-NEW"
+
+
+class _SlowBridge(sup_mod.CDPSupervisor):
+    """Attach and enables answer; the real dialog-bridge install's CDP calls hang for their full timeout."""
+
+    def __init__(self):
+        super().__init__("t-bridge", "ws://127.0.0.1:1/devtools/browser/x")
+        self.calls = []
+
+    async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
+        self.calls.append(method)
+        if method == "Target.attachToTarget":
+            return {"result": {"sessionId": "s-A"}}
+        if method in {"Page.addScriptToEvaluateOnNewDocument", "Fetch.enable"}:
+            await asyncio.sleep(timeout)
+            raise TimeoutError()
+        return {"result": {}}
+
+
+def test_dialog_bridge_install_stays_inside_the_attach_deadline():
+    """Review P2: the bridge phase (real _install_dialog_bridge) used to add up to 13 s after the deadline."""
+    sup = _SlowBridge()
+    started = time.monotonic()
+    sid = asyncio.run(sup._attach_page("A", timeout=5.0, deadline=time.monotonic() + 0.8))
+    assert sid == "s-A" and "Page.addScriptToEvaluateOnNewDocument" in sup.calls
+    assert time.monotonic() - started < 1.5
 
 
 def test_failed_attach_is_cached_typed_and_reported(tmp_path, monkeypatch):
