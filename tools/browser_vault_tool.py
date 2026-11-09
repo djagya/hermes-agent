@@ -912,10 +912,14 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
             effective_task_id, signup.fill_expression(fills, page_origin, nonce, signup_target)
         )
     except Exception as exc:  # health: allow BLE001 -- any CDP failure becomes a typed result; its text is scrubbed of the secret
-        return json.dumps(
+        return signup.uncertain(signup_target, backend.name, meta.kind, page_origin) or json.dumps(
             {"success": False, "error": scrub_secret_from_text(str(exc), secret)}
         )
     if not fill_result.get("success"):
+        # dlz: a paired signup write may have landed before the transport failed: never "nothing written".
+        paired = signup.uncertain(signup_target, backend.name, meta.kind, page_origin)
+        if paired:
+            return paired
         err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
         out = {"success": False, "error": err}
         if fill_result.get("error_type"):
@@ -926,7 +930,7 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     if refusal:
         return refusal
     if signup_target is not None:
-        return signup.finish(parsed, backend.name, meta.kind, page_origin)
+        return signup.finish(parsed, backend.name, meta.kind, page_origin, signup_target)
     filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
@@ -1189,9 +1193,13 @@ BROWSER_VAULT_SCHEMA = {
         "duplicate or ambiguous fields, a missing number/CVC/expiry and unlisted origins are refused; HTTPS is not a "
         "seller reputation check: verify the merchant and checkout terms before requesting consent; it never "
         "submits; purpose=signup separately asks the user to approve account creation with this exact login item "
-        "on its exact origin, then fills one unambiguous new-password field on a registration form only; "
-        "confirmation-password, mixed login, OTP and recovery forms are refused; stop on signup_declined when its "
-        "consent_outcome is refused; timeout or unavailable is not a refusal: ask the user to approve once more); "
+        "on its exact origin, then fills one unambiguous new-password field on a registration form, plus its ONE "
+        "explicitly labelled confirm-password field in the same form when there is one (same password in both); "
+        "ambiguous password pairs, a third password, mixed login, OTP and recovery forms are refused; stop on "
+        "signup_declined when its consent_outcome is refused; timeout or unavailable is not a refusal: ask the user "
+        "to approve once more; a paired fill succeeds only when both fields hold the password: signup_fill_partial, "
+        "signup_fields_not_retained or signup_fill_uncertain mean a field may hold it, so do not submit or retry, "
+        "tell the user); "
         "save_login (nothing saved for this site: the user "
         "enters it in a masked prompt, Hermes saves and fills it); enter_code (a one-time/2FA code after the "
         "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
@@ -1226,7 +1234,8 @@ BROWSER_VAULT_SCHEMA = {
             "purpose": {"type": "string", "enum": ["login", "signup"], "default": "login",
                         "description": "fill only: login preserves current-password behavior; signup requires fresh "
                                        "native approval to create an account with this exact login item and origin. "
-                                       "Only one explicit new-password input is supported; never submits."},
+                                       "Fills one explicit new-password input, or that input plus one explicitly "
+                                       "labelled confirm-password input in the same form; never submits."},
             "secret_field": {"type": "string", "description":
                 "letter_login only: the field for the letter's password/code (name, id or visible label) when not recognised."},
             "identifier_field": {"type": "string", "description":

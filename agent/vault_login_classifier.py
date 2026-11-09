@@ -187,10 +187,36 @@ def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginC
     return out
 
 
-def select_signup_control(controls: list[LoginControl]) -> Optional[ClassifiedLoginControl]:
-    """Conservative, separate signup intent: one explicit new password, no confirmation.
+@dataclass(frozen=True)
+class SignupTargets:
+    """The approved signup write set: the new-password field and, optionally, its ONE explicitly
+    labelled confirmation field in the same form. Both receive the same saved password."""
 
-    Require a registration route and a real form; refuse recovery/change routes,
+    primary: LoginControl
+    confirm: Optional[LoginControl] = None
+
+    @property
+    def controls(self) -> tuple[LoginControl, ...]:
+        return (self.primary,) if self.confirm is None else (self.primary, self.confirm)
+
+
+# Shared with the page-JS gate in build_signup_fill_js (same patterns, same normalisation), so the role
+# decided here is re-decided in the page right before the write. Confirmation intent must be explicit.
+_SIGNUP_CONFIRM_RE = r"\b(?:confirm\w*|repeat\w*|retype\w*|re ?type\w*|re ?enter\w*|verify|again)\b"
+_SIGNUP_FORBIDDEN_RE = r"\b(?:reset|recover\w*|change|current|old)\b"
+
+
+def _signup_intent_text(control: LoginControl) -> str:
+    # camelCase split first: "passwordConfirm" must read as "password confirm", not one opaque word.
+    return _normalize_text(re.sub(r"([a-z])([A-Z])", r"\1 \2", control.name + " " + control.label))
+
+
+def select_signup_targets(controls: list[LoginControl]) -> Optional[SignupTargets]:
+    """Conservative, separate signup intent: one explicit new password, optionally paired with ONE
+    explicitly labelled confirmation field (confirm/repeat/retype/re-enter/verify/again in its name,
+    id, label, aria text or placeholder). Two indistinguishable password inputs are never a pair.
+
+    Require a registration route and a real form; refuse recovery/change routes, a third password,
     OTP, mixed login forms and unrelated credential forms anywhere on the page.
     This never relaxes the ordinary login classifier's exclusions.
     """
@@ -198,14 +224,19 @@ def select_signup_control(controls: list[LoginControl]) -> Optional[ClassifiedLo
 
     passwords = [c for c in controls if c.type == "password" or
                  {"current-password", "new-password"}.intersection(c.autocomplete.lower().split())]
-    if len(passwords) != 1 or classify_otp_controls(controls):
+    if len(passwords) not in (1, 2) or classify_otp_controls(controls):
         return None
-    target = passwords[0]
-    if (target.type != "password" or target.form_index is None or
-            target.autocomplete.lower().split() != ["new-password"]):
+    for c in passwords:
+        if (c.type != "password" or c.form_index is None or c.autocomplete.lower().split() != ["new-password"]
+                or re.search(_SIGNUP_FORBIDDEN_RE, _signup_intent_text(c))):
+            return None
+    confirms = [c for c in passwords if re.search(_SIGNUP_CONFIRM_RE, _signup_intent_text(c))]
+    primaries = [c for c in passwords if c not in confirms]
+    if len(primaries) != 1 or len(confirms) != len(passwords) - 1:
         return None
-    text = _normalize_text(target.name + " " + target.label)
-    if re.search(r"\b(?:confirm\w*|repeat\w*|retype\w*|re ?enter\w*|again|reset|recover\w*|change|current|old)\b", text):
+    target, confirm = primaries[0], (confirms[0] if confirms else None)
+    if confirm is not None and (confirm.form_index != target.form_index or confirm.index <= target.index or
+                                (confirm.page_url, confirm.form_action) != (target.page_url, target.form_action)):
         return None
     page, action = urlsplit(target.page_url), urlsplit(target.form_action)
     if (page.scheme != "https" or not page.netloc or
@@ -224,7 +255,7 @@ def select_signup_control(controls: list[LoginControl]) -> Optional[ClassifiedLo
     for control in controls:
         if classify_login_control(control) is not None and control.form_index != target.form_index:
             return None
-    return ClassifiedLoginControl(target, 100, "new-password")
+    return SignupTargets(target, confirm)
 
 
 def select_password_fill(
@@ -425,12 +456,16 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
 
 
 def build_signup_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str,
-                         control: LoginControl) -> str:
+                         target: SignupTargets) -> str:
     """Revalidate approved field intent synchronously before the native secret write.
 
     Exact URL/action binding also rejects same-origin navigation during approval.
-    Only the existing secret transport may evaluate this expression.
+    Only the existing secret transport may evaluate this expression. A paired target gets
+    :func:`_build_signup_pair_js` instead; the one-field script is unchanged.
     """
+    if target.confirm is not None:
+        return _build_signup_pair_js(fills, expected_origin, nonce, target)
+    control = target.primary
     guard = """(() => {
       const bound = __BOUND__;
       const visible = e => !e.disabled && !e.readOnly && e.getClientRects().length > 0 &&
@@ -452,6 +487,117 @@ def build_signup_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonc
     # Splice once: never rescan secret bytes as template placeholders.
     values = {"__BOUND__": bound, "__FILL__": build_fill_js(fills, expected_origin, nonce)}
     return re.sub(r"__BOUND__|__FILL__", lambda m: values[m.group(0)], guard)
+
+
+# How long the paired signup fill waits after both writes before reading back that each field still holds
+# the value (frameworks reset controlled inputs on a later tick). The supervisor awaits the promise.
+SIGNUP_SETTLE_MS = 1000
+
+
+def _build_signup_pair_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str,
+                          target: SignupTargets) -> str:
+    """The paired signup write: new-password then its confirmation field, same value.
+
+    Before the first write the WHOLE approved set is revalidated (URL, origin, stamps, uniqueness, form
+    identity/action, no formaction override, exactly these two visible passwords, no OTP, both roles
+    re-derived from the live attributes). The first write's input/change events can rewrite the page, so
+    the set is revalidated again before the second write; a changed set stops there and reports
+    ``partial`` (one field possibly written), never a retry. After both writes and a settle, each field
+    reports only whether it still holds the value. No value is ever returned.
+    """
+    controls = target.controls
+    if [f.get("index") for f in fills] != [c.index for c in controls] or len({f.get("value") for f in fills}) != 1:
+        raise ValueError("signup pair fills do not match the approved targets")
+    values = {
+        "__ORIGIN__": json.dumps(expected_origin),
+        "__BOUND__": json.dumps({"url": target.primary.page_url, "action": target.primary.form_action,
+                                 "stamps": [f"{nonce}:{c.index}" for c in controls]}),
+        "__CONFIRM_RE__": json.dumps(_SIGNUP_CONFIRM_RE),
+        "__FORBIDDEN_RE__": json.dumps(_SIGNUP_FORBIDDEN_RE),
+        "__SETTLE_MS__": str(int(SIGNUP_SETTLE_MS)),
+        "__VALUE__": json.dumps(fills[0]["value"]),
+    }
+    # One pass: the spliced secret is never rescanned for placeholders.
+    return re.sub("|".join(values), lambda m: values[m.group(0)], _SIGNUP_PAIR_JS_TEMPLATE)
+
+
+_SIGNUP_PAIR_JS_TEMPLATE = """(async () => {
+  const expectedOrigin = __ORIGIN__;
+  if (window.location.origin !== expectedOrigin) {
+    return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
+  }
+  const bound = __BOUND__;
+  const confirmRe = new RegExp(__CONFIRM_RE__);
+  const forbiddenRe = new RegExp(__FORBIDDEN_RE__);
+  const visible = (e) => !e.disabled && !e.readOnly && e.getClientRects().length > 0 &&
+    getComputedStyle(e).display !== "none" && getComputedStyle(e).visibility !== "hidden";
+  // Same text and normalisation as the Python classifier (_signup_intent_text over the inspected
+  // name/id, labels, aria text, placeholder and title).
+  const intent = (e) => {
+    const labels = e.labels ? Array.from(e.labels, (l) => l.textContent || "") : [];
+    const root = e.getRootNode ? e.getRootNode() : document;
+    const aria = (e.getAttribute("aria-labelledby") || "").split(/\\s+/).filter(Boolean)
+      .map((id) => { const n = (root.getElementById ? root.getElementById(id) : null) || document.getElementById(id); return n ? (n.textContent || "") : ""; })
+      .join(" ");
+    const raw = [e.name, e.id, ...labels, e.getAttribute("aria-label") || "", aria,
+                 e.getAttribute("placeholder") || "", e.getAttribute("title") || ""].join(" ");
+    return raw.replace(/([a-z])([A-Z])/g, "$1 $2").normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "")
+      .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  };
+  const approved = () => {
+    if (window.location.origin !== expectedOrigin || window.location.href !== bound.url) return null;
+    const found = bound.stamps.map((s) => document.querySelectorAll('[data-hermes-vault-slot="' + s + '"]'));
+    if (found.some((list) => list.length !== 1)) return null;
+    const [p, c] = found.map((list) => list[0]);
+    const inputs = Array.from(document.querySelectorAll("input")).filter(visible);
+    const passwords = inputs.filter((e) => e.type === "password" || /(?:current|new)-password/.test(e.autocomplete));
+    if (p === c || passwords.length !== 2 || !passwords.includes(p) || !passwords.includes(c) ||
+        inputs.some((e) => /one-time-code/.test(e.autocomplete))) return null;
+    for (const e of [p, c]) {
+      if (!visible(e) || e.type !== "password" || String(e.autocomplete).trim().toLowerCase() !== "new-password" ||
+          !e.form || e.form.action !== bound.action || forbiddenRe.test(intent(e))) return null;
+    }
+    if (p.form !== c.form || Array.from(p.form.elements || []).some((e) => e.hasAttribute && e.hasAttribute("formaction"))) return null;
+    if (confirmRe.test(intent(p)) || !confirmRe.test(intent(c))) return null;
+    return [p, c];
+  };
+  let set = null;
+  try { set = approved(); } catch (_) { set = null; }
+  if (!set) return JSON.stringify({ refused: "signup_target_changed", filled: 0 });
+  const value = __VALUE__;
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+  const write = (e) => {
+    e.focus();
+    if (setter && setter.set) { setter.set.call(e, value); } else { e.value = value; }
+    e.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
+    e.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  };
+  const unstamp = () => { try { document.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot")); } catch (_) { /* best effort */ } };
+  let attempted = 0;
+  try {
+    attempted = 1;
+    write(set[0]);
+    // The first write's events may have replaced, relabelled or moved the confirmation field.
+    const again = approved();
+    if (!again || again[0] !== set[0] || again[1] !== set[1]) {
+      unstamp();
+      return JSON.stringify({ partial: "signup_target_changed", attempted });
+    }
+    attempted = 2;
+    write(set[1]);
+  } catch (_) {
+    unstamp();
+    return JSON.stringify({ partial: "signup_write_failed", attempted });
+  }
+  unstamp();
+  await new Promise((resolve) => setTimeout(resolve, __SETTLE_MS__));
+  let retained = [false, false];
+  try {
+    const here = window.location.href === bound.url;
+    retained = set.map((e) => here && e.isConnected && visible(e) && e.value === value);
+  } catch (_) { /* unreadable: not retained */ }
+  return JSON.stringify({ filled: 2, retained });
+})()"""
 
 
 def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
