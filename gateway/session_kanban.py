@@ -398,17 +398,25 @@ KANBAN_TURN_AUTHOR = {'id': 'kanban:dispatcher', 'name': 'Kanban dispatcher', 'i
 
 def _run_task_turns(agent, frame, history, context):
     from agent.skill_commands import build_preloaded_skills_prompt
-    # dlz: a mandatory skill that did not load stops the card before any model turn (D03-A). Resolved
-    # on its own: ``missing`` holds display labels ("Ambiguous skill name x: ..."), not identifiers,
-    # and an ambiguous, unknown or disabled mandatory skill is missing alike (fail closed).
-    # ``.get``: a claim saved before this key existed carries no mandatory list.
-    if required := [s for s in context.get('required_skills') or () if s and s.strip()]:
+    # dlz: a mandatory skill that did not load stops the card before any model turn (D03-A). Its
+    # coverage is checked on the very load that renders it into the prompt (each skill is resolved and
+    # rendered once: inline shell snippets must not run twice). ``missing`` holds display labels
+    # ("Ambiguous skill name x: ..."), so any entry there fails closed. ``.get``: a claim saved before
+    # this key existed carries no mandatory list.
+    required = list(dict.fromkeys(s.strip() for s in context.get('required_skills') or () if s and s.strip()))
+    if required:
         from agent.skill_commands import format_missing_skills
-        _, _, required_missing = build_preloaded_skills_prompt(required, task_id=agent.session_id)
+        required_prompt, loaded, required_missing = build_preloaded_skills_prompt(required, task_id=agent.session_id)
         if required_missing:
             raise MissingRequiredSkill(f"required skill(s) missing or disabled in this profile: "
                                        f"{format_missing_skills(required_missing)}")
-    skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
+        advisory = [s for s in context['skills'] if (s or '').strip() not in required]
+        advisory_prompt, advisory_loaded, missing = build_preloaded_skills_prompt(
+            advisory, task_id=agent.session_id, excluded_loaded_names=set(loaded))
+        skills = '\n\n'.join(p for p in (advisory_prompt, required_prompt) if p)
+        loaded = [*loaded, *advisory_loaded]
+    else:
+        skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
     if missing and not loaded:
         raise ValueError('kanban_skills_unavailable')
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)

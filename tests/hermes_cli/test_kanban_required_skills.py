@@ -116,3 +116,34 @@ def test_owner_run_card_missing_required_skill_books_typed_exit(kanban_home, mon
         session_kanban.run_worker_turns(agent, {"policy": {"kanban_json": json.dumps(context)}, "text": "go"}, [])
     agent.run_conversation.assert_not_called()
     assert session_kanban.worker_exit_code(kb.kanban_db_path(), context) == kb.KANBAN_MISSING_SKILL_EXIT_CODE
+
+
+def test_owner_run_card_renders_each_mandatory_skill_once_into_the_prompt(monkeypatch):
+    """dlz D03-A: the mandatory check reads the very load that renders the prompt. A second load
+    could miss a skill that vanished meanwhile (the model then ran without it) and ran its inline
+    shell snippets twice."""
+    from types import SimpleNamespace
+    from agent import kanban_turn_recovery, skill_commands
+    from gateway import session_kanban
+
+    rendered = []
+
+    def load(ids, **_kwargs):
+        loaded, missing = [], []
+        for name in ids:
+            # "needed" resolves on its first load only (deleted or disabled right after).
+            (loaded if name != "needed" or "needed" not in rendered else missing).append(name)
+            if name in loaded:
+                rendered.append(name)
+        return "\n\n".join(f"BLOCK:{n}" for n in loaded), loaded, missing
+
+    monkeypatch.setattr(skill_commands, "build_preloaded_skills_prompt", load)
+    monkeypatch.setattr(kanban_turn_recovery, "recover_failed_kanban_turns", lambda *_a, **_k: None)
+    prompts = []
+    agent = SimpleNamespace(session_id="s1", run_conversation=lambda prompt, **_k: prompts.append(prompt) or {
+        "final_response": "ok", "completed": True})
+    context = {"task_id": "t", "skills": ["advisory", "needed"], "required_skills": ["needed"],
+               "context": "", "goal_mode": False}
+    session_kanban._run_task_turns(agent, {"text": "go"}, [], context)
+    assert rendered.count("needed") == 1
+    assert "BLOCK:needed" in prompts[0] and "BLOCK:advisory" in prompts[0]

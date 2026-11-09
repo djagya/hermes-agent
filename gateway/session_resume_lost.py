@@ -65,7 +65,7 @@ def resume_lost_turn(db, *, epoch: int, session_ids, reason: str) -> str | None:
     pause/settlement then stands). Synchronous: callers on the owner loop run it off-loop."""
     from hermes_state_keys import admission_fingerprint
     from hermes_state_runtime import (
-        ADMISSION_QUEUE_MAX, RuntimeStoreError, _epoch, _json, _retire_admission_workers, _row)
+        RuntimeStoreError, _epoch, _json, _retire_admission_workers, _row)
     from hermes_state_runtime_workers import worker_states
     ids = tuple(dict.fromkeys(sid for sid in session_ids if sid))
     if not ids:
@@ -92,13 +92,17 @@ def resume_lost_turn(db, *, epoch: int, session_ids, reason: str) -> str | None:
                          "WHERE admission_id=? AND status='unknown'", (epoch, raw['admission_id']))
             resumed = raw
             admission_id = raw['admission_id']
-        else:  # the drain interrupted it: the settled turn before the inputs saved behind it
+        else:  # the drain interrupted it: the last turn that EXECUTED before the inputs saved behind it
+            # (a follower cancelled while still queued never ran: ``generation`` stays NULL, skipped).
             before = pending[0]['seq'] if pending else None
             raw = conn.execute(f"SELECT * FROM session_admissions WHERE target_session_id IN ({marks}) "
-                               "AND status='terminal'" + (" AND seq<?" if before is not None else "")
-                               + " ORDER BY seq DESC LIMIT 1", (*ids, *([before] if before is not None else []))).fetchone()
+                               "AND status='terminal' AND intent='queue' AND generation IS NOT NULL"
+                               + (" AND seq<?" if before is not None else "") + " ORDER BY seq DESC LIMIT 1",
+                               (*ids, *([before] if before is not None else []))).fetchone()
+            # No queue cap here: the head was accepted before its followers; putting it back takes no
+            # new capacity (a full queue behind it must not abandon it).
             if (raw is None or raw['outcome'] != 'interrupted' or not _resumable(conn, _row(raw), epoch)
-                    or not _owner_stopped(conn, raw['admission_id']) or len(pending) >= ADMISSION_QUEUE_MAX):
+                    or not _owner_stopped(conn, raw['admission_id'])):
                 return None
             payload = _row(raw)['payload']
             payload['native_text_v1']['media'] = []  # released at settlement; the transcript keeps their hints

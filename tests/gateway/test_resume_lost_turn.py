@@ -174,6 +174,35 @@ async def test_drain_interrupted_person_turn_is_readmitted_ahead_of_its_follower
         store.close_all_db_handles()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('followers', ['full_queue', 'cancelled_first'])
+async def test_drain_interrupted_head_is_recovered_behind_a_full_or_cancelled_queue(tmp_path, monkeypatch, followers):
+    """The head was accepted before its followers: a full queue (32) behind it, or a follower
+    cancelled before it ever ran, must not abandon it."""
+    from hermes_state_runtime import ADMISSION_QUEUE_MAX, cancel_session_input
+    store, owner = await _owners(tmp_path, monkeypatch)
+    try:
+        first = await owner(1)
+        head = admit_session_input(first.db, epoch=first.epoch, principal_id=PERSON, session_id='s',
+                                   request_id='m0', payload=_native('HEAD'))
+        claimed = claim_session_input(first.db, epoch=first.epoch, session_id='s')
+        count = ADMISSION_QUEUE_MAX if followers == 'full_queue' else 2
+        queued = [admit_session_input(first.db, epoch=first.epoch, principal_id=PERSON, session_id='s',
+                                      request_id=f'm{i}', payload=_native(f'F{i}'))['admission_id']
+                  for i in range(1, count + 1)]
+        if followers == 'cancelled_first':
+            cancel_session_input(first.db, epoch=first.epoch, admission_id=queued.pop(0))
+        settle_session_input(first.db, epoch=first.epoch, admission_id=head['admission_id'],
+                             generation=claimed['generation'], outcome='interrupted',
+                             result=_interrupted('drain_interrupted'))
+        second = await owner(2)
+        resumed = resume_lost_turn(second.db, epoch=second.epoch, session_ids=['s'], reason='restart_timeout')
+        assert resumed is not None
+        assert [r['admission_id'] for r in list_session_admissions(second.db, session_id='s')] == [resumed, *queued]
+    finally:
+        store.close_all_db_handles()
+
+
 def test_turn_runner_runs_the_resumed_turn_with_the_note_not_as_a_new_message():
     from gateway.run_turn_runner import TurnRunner
     from gateway.session_resume_lost import resumed_turn
