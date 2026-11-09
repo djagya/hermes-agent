@@ -154,6 +154,13 @@ _CONSENT_EXPIRED = (
 )
 
 
+_CONSENT_EXPIRED_PARTIAL = (
+    "The 120 s inspection window closed part-way through the fill: some card fields were written, the rest "
+    "were not. Nothing was submitted. Do not submit the checkout and do not retry; tell the user. Another "
+    "fill needs a new approval."
+)
+
+
 def _remaining_seconds(inspected) -> int:
     """Whole seconds left in the inspection window: the consent prompt's own deadline (at least 1)."""
     return max(1, int(inspected.expires_at - time.monotonic()))
@@ -226,6 +233,11 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
                 return json.dumps({"success": False, "error_type": "payment_item_changed",
                                    "error": "The saved card changed before the fill. Nothing was resolved "
                                             "or written; list the vault and request fresh consent."})
+            # dlz: the freshness pass and the backend context can outlast the window: last check before
+            # any secret is read.
+            if time.monotonic() >= inspected.expires_at:
+                return json.dumps({"success": False, "error_type": "payment_consent_expired",
+                                   "error": _CONSENT_EXPIRED})
             # Never resolve at inspection/list time, on decline or on stale consent.
             secret = validate_card(backend.resolve_secret(meta.id))
             _register_card_redaction(secret)
@@ -269,7 +281,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             elif result.get("error_type") == "payment_page_changed":  # the commit's own freshness check
                 result["error"] = _PAGE_CHANGED
             elif result.get("error_type") == "payment_consent_expired":
-                result["error"] = _CONSENT_EXPIRED
+                result["error"] = _CONSENT_EXPIRED_PARTIAL if result.get("partially_filled") else _CONSENT_EXPIRED
             result.update(
                 kind="payment",
                 backend=backend.name,
