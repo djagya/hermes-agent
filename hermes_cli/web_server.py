@@ -834,6 +834,9 @@ app.include_router(_models_routes.router)
 app.include_router(_config_env_routes.router)
 app.include_router(_messaging_routes.router)
 app.include_router(_messaging_relay_routes.router)
+# dlz: owner handoff for the gateway-owned `claude setup-token` intake.
+from hermes_cli.web_routers import claude_setup_token as _claude_setup_token_routes
+app.include_router(_claude_setup_token_routes.router)
 app.include_router(_oauth_routes.router)
 app.include_router(_sessions_routes.manage_router)
 app.include_router(_status_routes.logs_router)

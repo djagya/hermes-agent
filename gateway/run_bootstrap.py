@@ -373,6 +373,9 @@ async def _start_gateway_start_control_socket(runner):
         from gateway.webapp_listener import register_control_verbs
         from hermes_constants import get_hermes_home
         register_control_verbs(runner, get_hermes_home(), server=_control_server)
+        # dlz: owner-authenticated `claude setup-token` intake; the dashboard forwards here only.
+        from agent.claude_setup_token import register_control_verbs as _register_claude_setup_token
+        _register_claude_setup_token(_control_server)
         if not await _control_server.start():
             _control_server = None
         else:
