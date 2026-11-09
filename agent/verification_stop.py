@@ -59,7 +59,7 @@ def _session_is_messaging_surface() -> bool:
         return False
 
 
-def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
+def verify_on_stop_enabled(config: dict[str, Any] | None = None, *, platform: str | None = None) -> bool:
     """Return whether edit -> verify-before-finish behavior is enabled.
 
     Precedence: ``HERMES_VERIFY_ON_STOP`` env var, then ``agent.verify_on_stop``
@@ -67,6 +67,8 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
     legacy surface-aware mode: ON for interactive coding surfaces and
     programmatic callers, OFF for messaging surfaces where the verification
     narrative is chat noise. Missing/unrecognized values fall back to OFF.
+    dlz: ``"auto"`` is also OFF for a cron run (``platform="cron"``): its final reply is the job's
+    report, and a verification nudge replaced it (R-op-20261109-B3).
     """
     env = os.environ.get("HERMES_VERIFY_ON_STOP")
     if env is not None:
@@ -84,6 +86,8 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
         return cfg_val
     token = cfg_val.strip().lower() if isinstance(cfg_val, str) else ""
     if token == "auto":
+        if str(platform or "").strip().lower() == "cron":
+            return False
         return not _session_is_messaging_surface()
     return token in _TRUTHY_TOKENS
 

@@ -60,6 +60,26 @@ def test_verify_on_stop_auto_on_for_interactive_surfaces(clear_verify_env, sourc
     clear_verify_env.setenv("HERMES_SESSION_SOURCE", source)
     assert verify_on_stop_enabled({"agent": {"verify_on_stop": "auto"}}) is True
 
+def test_verify_on_stop_auto_is_off_for_a_cron_run(clear_verify_env):
+    # dlz (R-op-20261109-B3): a cron run's final reply is the job's report; under "auto" a
+    # verification nudge replaced a [CRON_FAILURE] report. An explicit true still forces it.
+    cfg = {"agent": {"verify_on_stop": "auto"}}
+    assert verify_on_stop_enabled(cfg, platform="cron") is False
+    assert verify_on_stop_enabled(cfg, platform="cli") is True
+    assert verify_on_stop_enabled({"agent": {"verify_on_stop": True}}, platform="cron") is True
+
+
+def test_the_stop_gate_passes_the_agents_platform(clear_verify_env, monkeypatch):
+    from types import SimpleNamespace
+
+    from agent import turn_stop_gates
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"agent": {"verify_on_stop": "auto"}})
+    agent = SimpleNamespace(platform="cron", session_id="s", _turn_file_mutation_paths={"/w/x.py"},
+                            _verification_stop_nudges=0)
+    assert turn_stop_gates._verify_on_stop_nudge(agent) is None
+
+
 def test_verify_on_stop_missing_value_defaults_off(clear_verify_env):
     # A missing/unrecognized config value falls back OFF on every surface,
     # matching the opt-in DEFAULT_CONFIG default — only an explicit "auto"
