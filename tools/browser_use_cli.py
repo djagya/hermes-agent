@@ -15,11 +15,9 @@ import json
 import logging
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -152,18 +150,44 @@ def _slot_oom_hint(env: dict, started: float) -> str:
 
 # dlz: G4 review (codex P1). harness 0.1.13 run.py runs ensure_daemon() (the CDP connect) before
 # exec(code): a connect failure exits 1 before any of the code ran. The first line of the piped code
-# touches this marker, so "marker absent" is the structured proof that execution never started; stderr
-# text alone is not (user code can print the same phrase after it clicked something).
-_EXEC_STARTED_ENV = "HERMES_BU_EXEC_STARTED"
-_EXEC_STARTED_PREAMBLE = (
-    'with __import__("contextlib").suppress(OSError): '
-    f'open(__import__("os").environ.pop("{_EXEC_STARTED_ENV}", "") or __import__("os").devnull, "a").close()\n'
-)
+# writes one byte to an inherited pipe whose read end only this process holds: once written, user code
+# cannot take it back (recheck P1: a marker file could be unlinked). The write is not guarded, so a
+# failure to record raises before any user code runs. "No byte" is therefore the structured proof that
+# execution never started; stderr text alone is not (user code can print the same phrase).
+_EXEC_STARTED_FD_ENV = "HERMES_BU_EXEC_STARTED_FD"
+_EXEC_STARTED_PREAMBLE = f'__import__("os").write(int(__import__("os").environ.pop("{_EXEC_STARTED_FD_ENV}")), b"1")\n'
 
 
-def _exec_never_started(proc: Any, marker: str) -> bool:
-    """True only when the CLI exited non-zero and the code's first line never ran."""
-    return bool(marker) and getattr(proc, "returncode", 0) != 0 and not os.path.exists(marker)
+def _arm_exec_start(env: dict) -> Optional[tuple[int, int]]:
+    """A non-blocking pipe for the start byte; None (no retry ever: fail closed) when one cannot be made."""
+    if os.name == "nt":
+        return None
+    try:
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(read_fd, False)
+    except OSError:
+        return None
+    env[_EXEC_STARTED_FD_ENV] = str(write_fd)
+    return read_fd, write_fd
+
+
+def _exec_start_seen(env: dict, pipe: Optional[tuple[int, int]]) -> bool:
+    """Close the pipe; True when the code's first line ran (or the pipe could not be read: fail closed)."""
+    env.pop(_EXEC_STARTED_FD_ENV, None)
+    if pipe is None:
+        return True
+    read_fd, write_fd = pipe
+    with contextlib.suppress(OSError):
+        os.close(write_fd)
+    try:
+        return bool(os.read(read_fd, 1))
+    except BlockingIOError:
+        return False
+    except OSError:
+        return True
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(read_fd)
 
 
 def _managed_connect_failure(stderr: str) -> str:
@@ -874,9 +898,12 @@ def _run_cli_killing_process_group(cmd, code, env, timeout):
     still holding them, and on Windows ``run()``'s unbounded post-kill ``communicate()`` then
     blocks on pipe EOF forever — so the tool call, plus its activity heartbeat, wedges (#106244).
     """
+    start_fd = str((env or {}).get(_EXEC_STARTED_FD_ENV) or "")
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", env=env, **_group_popen_kwargs(),
+        # dlz: only the exec-start pipe's write end is inherited (see _EXEC_STARTED_PREAMBLE).
+        **({"pass_fds": (int(start_fd),)} if start_fd.isdecimal() else {}),
     )
     try:
         stdout, stderr = proc.communicate(input=code, timeout=timeout)
@@ -1279,12 +1306,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     # The time spent waiting in control's queue comes out of this call's budget.
     timeout = max(_MIN_TIMEOUT_S, _clamp_timeout(timeout_s) - int(_managed_waited_s(managed)))
     started = time.time()
-    start_marker = ""
     if managed:
-        marker_dir = tempfile.mkdtemp(prefix="hermes-bu-exec-")
-        start_marker = os.path.join(marker_dir, "started")
-        env[_EXEC_STARTED_ENV] = start_marker
         code = _EXEC_STARTED_PREAMBLE + code
+    exec_start = {"never_started": False}
 
     def dispatch() -> dict[str, Any]:
         refused = exec_slot_capture_refusal(code, env)
@@ -1299,8 +1323,14 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         # it publishes its pid, so a Hermes killed mid-call takes it along (the call's end owns it too).
         from agent.periodic_scheduler import schedule
         owning = schedule(lambda: _own_harness_daemon_until_owned(env), _OWN_DURING_CALL_S)
+        start_pipe = _arm_exec_start(env) if managed else None
+        exec_start["never_started"] = False
         try:
-            return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
+            proc = _run_cli_killing_process_group(cmd, code, env, timeout)
+            seen = _exec_start_seen(env, start_pipe)
+            start_pipe = None
+            exec_start["never_started"] = managed and not seen and getattr(proc, "returncode", 0) != 0
+            return {"proc": proc}
         except subprocess.TimeoutExpired:
             oom = _slot_oom_hint(env, started) if managed else ""
             return {"error_result": tool_error(
@@ -1312,6 +1342,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         except OSError as e:
             return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
         finally:
+            if start_pipe is not None:
+                _exec_start_seen(env, start_pipe)
             owning.cancel(wait=5)  # an in-flight check finishes before the post-call one runs
 
     if bot_desktop_browser:
@@ -1321,7 +1353,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         dispatched = dispatch()
     connect_failure = (
         _managed_connect_failure(dispatched["proc"].stderr or "")
-        if managed and "proc" in dispatched and _exec_never_started(dispatched["proc"], start_marker) else ""
+        if managed and "proc" in dispatched and exec_start["never_started"] else ""
     )
     if connect_failure:
         # The harness fails at daemon connect, before running any of the code, so one retry is
@@ -1340,12 +1372,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             rerouted.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
             env.clear()
             env.update(rerouted)
-            env[_EXEC_STARTED_ENV] = start_marker
             dispatched = dispatch()
-    never_started = "proc" in dispatched and _exec_never_started(dispatched["proc"], start_marker)
-    if start_marker:
-        shutil.rmtree(os.path.dirname(start_marker), ignore_errors=True)
-        env.pop(_EXEC_STARTED_ENV, None)
+    never_started = "proc" in dispatched and exec_start["never_started"]
     # dlz: undo ux_capture overrides a killed/failed call left on the tab (tools/browser_capture.py).
     from tools.browser_capture import reset_after_failed_exec as _ux_capture_reset
     _ux_capture_reset(code, env, dispatched, cmd, _run_cli_killing_process_group, task_id,

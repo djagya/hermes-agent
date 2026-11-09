@@ -140,7 +140,10 @@ async def inject(runner: Any, session_id: str, slot_id: str, lease_id: str, *, e
         # /v1/status?lease= does not attest which agent lease a Return resumed, so a live lease for this
         # task/slot proves nothing about Return. Refuse (the caller logs it loudly); never wake on it.
         return "session_not_found"
-    if _seen(lease_id):  # per original lease, only after the claim: a forged id cannot burn the real one
+    # Once per original lease and event, only after the claim (a forged id cannot burn the real one).
+    # dlz: recheck P2 — a handoff_ended (an unused link expired) must not eat the Return of a newer link
+    # on the same lease, so each event has its own key.
+    if _seen(lease_id if event == "handback" else f"{event}:{lease_id}"):
         return "replay"
     store = getattr(runner, "async_session_store", None)
     entry = None

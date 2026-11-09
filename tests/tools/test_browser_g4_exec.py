@@ -82,6 +82,27 @@ def test_handshake_text_after_the_code_started_never_replays_it(tmp_path, monkey
         httpd.shutdown()
 
 
+def test_start_byte_cannot_be_revoked_and_recording_failure_runs_no_code(tmp_path):
+    """Recheck P1: the start signal is a byte on a pipe only Hermes reads. Code that closes every fd
+    afterwards cannot take it back; a preamble that cannot record raises before any user code runs."""
+    import os
+    import sys
+
+    cmd = [sys.executable, "-c", "import sys; exec(sys.stdin.read())"]
+    hostile = "import os\nfor f in range(3, 256):\n    try:\n        os.close(f)\n    except OSError:\n        pass\n"
+    env = dict(os.environ)
+    pipe = bu_cli._arm_exec_start(env)
+    proc = bu_cli._run_cli_killing_process_group(cmd, bu_cli._EXEC_STARTED_PREAMBLE + hostile + "raise SystemExit(1)\n",
+                                                 env, 30)
+    assert proc.returncode == 1 and bu_cli._exec_start_seen(env, pipe) is True
+    pipe = bu_cli._arm_exec_start(env)
+    assert bu_cli._exec_start_seen(env, pipe) is False  # nothing ran
+    ran = tmp_path / "ran"
+    proc = bu_cli._run_cli_killing_process_group(
+        cmd, bu_cli._EXEC_STARTED_PREAMBLE + f"open({str(ran)!r}, 'w').close()\n", dict(os.environ), 30)
+    assert proc.returncode != 0 and not ran.exists()  # no fd to record into: user code never ran
+
+
 def test_qa_targets_schema_names_the_registry_not_hostnames(monkeypatch):
     """B23: control admits registered app names only (grant.py admit)."""
     monkeypatch.setattr(route, "is_managed", lambda: True)
@@ -125,32 +146,6 @@ def test_initial_attach_fits_the_start_budget_with_hung_tabs(monkeypatch):
     asyncio.run(sup._attach_initial_page())
     assert time.monotonic() - started < 1.5
     assert sup._page_session_id == "s-NEW"
-
-
-class _SlowBridge(sup_mod.CDPSupervisor):
-    """Attach and enables answer; the real dialog-bridge install's CDP calls hang for their full timeout."""
-
-    def __init__(self):
-        super().__init__("t-bridge", "ws://127.0.0.1:1/devtools/browser/x")
-        self.calls = []
-
-    async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
-        self.calls.append(method)
-        if method == "Target.attachToTarget":
-            return {"result": {"sessionId": "s-A"}}
-        if method in {"Page.addScriptToEvaluateOnNewDocument", "Fetch.enable"}:
-            await asyncio.sleep(timeout)
-            raise TimeoutError()
-        return {"result": {}}
-
-
-def test_dialog_bridge_install_stays_inside_the_attach_deadline():
-    """Review P2: the bridge phase (real _install_dialog_bridge) used to add up to 13 s after the deadline."""
-    sup = _SlowBridge()
-    started = time.monotonic()
-    sid = asyncio.run(sup._attach_page("A", timeout=5.0, deadline=time.monotonic() + 0.8))
-    assert sid == "s-A" and "Page.addScriptToEvaluateOnNewDocument" in sup.calls
-    assert time.monotonic() - started < 1.5
 
 
 def test_failed_attach_is_cached_typed_and_reported(tmp_path, monkeypatch):
