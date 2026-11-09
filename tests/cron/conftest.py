@@ -138,3 +138,41 @@ def cron_owner(monkeypatch):
     run = owner_execution_runner()
     monkeypatch.setattr("cron.scheduler_authority.run_canonical_job", run)
     return run
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gateway_spawn(monkeypatch):
+    """dlz: a cron test must never start a real gateway. On darwin ``spawn_unmanaged_gateway``
+    goes through ``launchctl bootstrap`` of a plist, so the gateway argv never reaches the global
+    live-system guard's subprocess check, and the ``--idle-exit`` daemon outlives pytest (orphans
+    from ``test_cron_alert_policy`` / ``test_cron_script`` on 2026-11-09). Every start seam
+    ``ensure_gateway_runtime`` uses refuses here, and a test that reached one fails at teardown
+    even when production code swallowed the refusal. A test that patches a seam itself wins
+    (its monkeypatch is applied after this one)."""
+    import hermes_cli.gateway_launchd_runtime as launchd_runtime
+    import hermes_cli.gateway_runtime_service as runtime_service
+    import hermes_cli.gateway_runtime_start as runtime_start
+
+    import traceback
+
+    attempts: list[str] = []
+
+    def _refuse(seam):
+        def refuse(*_args, **_kwargs):
+            frames = traceback.extract_stack()[-8:-1]
+            attempts.append(seam + " from " + " <- ".join(
+                f"{f.filename.rsplit('/', 2)[-2:][-1]}:{f.lineno}:{f.name}" for f in reversed(frames)))
+            raise runtime_service.RuntimeStartError("spawn_failed")
+        return refuse
+
+    for module, name in ((runtime_start, "spawn_unmanaged_gateway"),
+                         (runtime_start, "start_gateway_job"),
+                         (runtime_start, "start_detached_replacement"),
+                         (launchd_runtime, "start_gateway_job"),
+                         (runtime_service, "start_existing_gateway_service")):
+        monkeypatch.setattr(module, name, _refuse(f"{module.__name__}.{name}"))
+    yield
+    if attempts:
+        pytest.fail(f"cron test tried to start a real gateway via {attempts[0]}; stub "
+                    "cron.scheduler_authority.run_canonical_job (see the cron_owner fixture) "
+                    "or the gateway client instead", pytrace=False)

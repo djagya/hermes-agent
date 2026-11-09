@@ -4,8 +4,10 @@
 # See #70480 and https://sqlite.org/wal.html#walresetbug.
 # Pinned by the multi-arch index digest: uv and node already come from pm's
 # sha-verified lock, and a tag alone would let the base drift under them.
-FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS sqlite_build
-ARG DEBIAN_SNAPSHOT=20261104T214428Z
+# dlz: every `FROM debian:` stage uses this one digest (the built libsqlite is
+# linked against its libc); tests/ci/test_dockerfile_debian_pin.py enforces it.
+FROM debian:trixie-20261020@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308 AS sqlite_build
+ARG DEBIAN_SNAPSHOT=20261108T082754Z
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
@@ -92,9 +94,11 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/tools
 # must be declared here. The list is the `ldd ... | grep "not found"` set of
 # the pinned chrome binary in this base image, mapped to trixie package
 # names (see .hermes/plans/termux-removal-commit-spec.md).
+# tmux backs the hermes-agent skill's interactive spawning recipe; the runtime
+# user cannot apt-get it later (no root, and the root fs resets on restart).
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils \
+    ca-certificates curl iputils-ping python3 python-is-python3 gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils tmux \
     libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 && \
     rm -rf /var/lib/apt/lists/*
 
@@ -236,10 +240,11 @@ WORKDIR /opt/hermes
 # here rather than by `npx playwright install`,
 # which fetched whatever revision the npm-resolved playwright wanted,
 # unverified, and recorded no fact. The resolved browser binary path is
-# baked to /etc/hermes/agent-browser-executable-path for stage2-hook.sh:
-# the layout differs per arch (chrome-linux64/chrome on amd64,
-# chromium-linux-arm64/chromium on arm64), so it is resolved at build time
-# and never hunted at boot.
+# baked to /etc/hermes/chromium-executable-path: the layout differs per
+# arch (chrome-linux64/chrome on amd64, chromium-linux-arm64/chromium on
+# arm64), so it is resolved at build time and never hunted at boot.
+# hermes_cli/browser_runtime.py reads it when a volume over the runtime dir
+# hides pm's facts; stage2-hook.sh checks it still names a binary.
 ENV HERMES_RUNTIME_DIR=/opt/hermes/tools
 COPY pm/ pm/
 # pm's lazy imports resolve get_default_hermes_root()/project_venv_dir()
@@ -262,7 +267,8 @@ RUN set -eu; \
     test -n "$browser_bin"; \
     "$browser_bin" --version; \
     mkdir -p /etc/hermes; \
-    printf '%s' "$browser_bin" > /etc/hermes/agent-browser-executable-path
+    printf '%s' "$browser_bin" > /etc/hermes/chromium-executable-path; \
+    test -s /etc/hermes/chromium-executable-path
 
 # PM is resident too: never borrow application libraries or create its worker
 # environment under /root (unreachable to the runtime UID).
@@ -315,12 +321,21 @@ FROM runtime_base AS python_deps
 # [sera-toolbox] supplies smoke-required parsers and ruff in the production
 # venv; dependency groups are intentionally excluded.
 #
+# [fal] is baked because the image tool's availability check imports
+# fal_client whenever a FAL backend resolves, which the Nous-managed gateway
+# always does on hosted agents. Lazy-installing it at the gateway's first boot
+# builds a whole new venv generation on the volume (about 90s).
+#
 # --record-selection writes these extras to the store's facts.json as the venv
 # selection, as a bundle build does. Without it, the first opt-in extra a
 # container installs on use (FAL, a plugin's deps) records a selection of
 # just that extra, and every later boot runs a generation without the extras
 # baked here (aiohttp, so no API server). stage2's dependency refresh
 # restores this baseline into volumes that already lost it.
+#
+# The [documents] extra (python-docx, openpyxl, python-pptx, reportlab, pypdf;
+# ~25 MB) is baked so the microsoft-office and pdf skills work out of the box:
+# this venv is sealed and has no pip, so the agent could not add them itself.
 #
 # Source binding is created after the source copy below.
 COPY pyproject.toml uv.lock ./
@@ -344,7 +359,7 @@ RUN python3 -m pm.build_env --source /opt/hermes --python /usr/local/bin/python3
     --cache /opt/hermes/uv-cache \
     --out /opt/hermes/.venv --no-install-project --sealed --record-selection \
     --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock \
-    --extra azure-identity --extra matrix --extra google-chat --extra sera-toolbox
+    --extra azure-identity --extra matrix --extra google-chat --extra fal --extra documents --extra sera-toolbox
 RUN python3 -m pm.build_env --prune-cache --ci --cache /opt/hermes/uv-cache
 
 # Icons render on the runtime environment: Pillow and resvg-py are core
@@ -376,6 +391,24 @@ COPY --from=icons /tmp/hermes-icons /tmp/hermes-icons
 RUN node scripts/build/tui.mjs --source /opt/hermes --out /opt/products/tui && \
     node scripts/build/web.mjs --source /opt/hermes --icons /tmp/hermes-icons --out /opt/products/web
 
+# The Webapp (the browser-hosted Desktop) builds through its source recipe,
+# which installs Desktop's dependencies in a private workspace. A stage of its
+# own so Desktop changes leave the TUI and dashboard layers cached.
+FROM runtime_base AS webapp_build
+COPY package.json package-lock.json .npmrc ./
+COPY apps/desktop/package.json apps/desktop/
+COPY apps/desktop/scripts/build-webapp.mjs apps/desktop/scripts/
+COPY apps/shared/package.json apps/shared/
+COPY scripts/build/*.mjs scripts/build/
+ENV npm_config_install_links=false
+# Dependencies first, keyed only by the manifests and the recipe, so a source
+# change reuses this layer and the build below reuses its install.
+RUN node apps/desktop/scripts/build-webapp.mjs --deps-only
+COPY apps/ apps/
+RUN node apps/desktop/scripts/build-webapp.mjs
+
+# dlz: upstream's `runtime` stage is the fork's assembler; the published
+# `runtime` stage below copies its trees onto a clean Debian base.
 FROM python_deps AS assembled_build
 ARG HERMES_GIT_SHA=
 ARG HERMES_IMAGE_NAME=nousresearch/hermes-agent
@@ -406,6 +439,7 @@ RUN cd plugins/platforms/photon/sidecar && \
 # Shared product outputs are independent of application dependency assembly.
 COPY --from=frontend_build /opt/products/tui /opt/hermes/ui-tui
 COPY --from=frontend_build /opt/products/web /opt/hermes/hermes_cli/web_dist
+COPY --from=webapp_build /opt/hermes/apps/desktop/dist-webapp /opt/hermes/apps/desktop/dist-webapp
 # ---------- Bot Screen X socket directory ----------
 # Xvnc would create this itself (/tmp is 1777); pre-creating it keeps ownership
 # deterministic when HERMES_UID is remapped between boots.
@@ -525,10 +559,12 @@ RUN set -eu; \
 COPY --chmod=0444 docker/sera-toolbox/managed-config.yaml /etc/hermes/config.yaml
 
 # ---------- s6-overlay service wiring ----------
-# Static services declared at build time: main-hermes + dashboard.
-# Per-profile gateway services are registered dynamically at runtime by
-# the profile create/delete hooks (Phase 4); they live under
-# /run/service/ (tmpfs) and are reconciled on container restart by
+# Static services declared at build time: main-hermes, dashboard and
+# profile-gateways. Per-profile gateway services are registered
+# dynamically at runtime by the profile create/delete hooks (Phase 4);
+# they live under /run/hermes-service/ (tmpfs), supervised by the
+# hermes-owned s6-svscan of the profile-gateways service, never in the
+# root /run/service scandir, and are reconciled on container restart by
 # /etc/cont-init.d/02-reconcile-profiles (Phase 4 Task 4.0).
 COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 
@@ -539,7 +575,7 @@ COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 #
 # 02-reconcile-profiles re-creates per-profile gateway s6 service
 # slots from $HERMES_HOME/profiles/<name>/ after a container restart
-# (the /run/service/ scandir is tmpfs and wiped on restart). Phase 4.
+# (the /run/hermes-service/ scandir is tmpfs and wiped on restart). Phase 4.
 RUN mkdir -p /etc/cont-init.d && \
     printf '#!/command/with-contenv sh\nexec /opt/hermes/docker/stage2-hook.sh\n' \
         > /etc/cont-init.d/01-hermes-setup && \
@@ -629,6 +665,8 @@ RUN /opt/hermes/docker/sera-toolbox/write-toolchain-manifest.sh
 # binary by absolute path, so this PATH ordering is transparent to
 # every other consumer.
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
+# Login shells re-read /etc/profile, which resets PATH; this re-adds the dirs above.
+COPY --chmod=0644 docker/profile-hermes-path.sh /etc/profile.d/hermes.sh
 # PM's atomic writer creates private facts for source installs. In the
 # image these are shared, non-secret package metadata, read by UID 10000.
 # uv's environment locks are build-only and may be world-writable. Remove
@@ -654,17 +692,17 @@ ARG HERMES_GIT_SHA=
 LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
       org.opencontainers.image.revision="${HERMES_GIT_SHA}"
 ARG HERMES_BOT_DESKTOP=0
-ARG DEBIAN_SNAPSHOT=20261104T214428Z
+ARG DEBIAN_SNAPSHOT=20261108T082754Z
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
 RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     apt-get -o Acquire::Retries=3 update && \
     DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --only-upgrade --no-install-recommends \
       bsdutils gzip libblkid1 liblastlog2-2 libmount1 libpcre2-8-0 libsmartcols1 \
       libsqlite3-0 libuuid1 login mount util-linux \
-      libssl3t64 openssl openssl-provider-legacy apt libapt-pkg7.0 && \
+      libssl3t64 openssl openssl-provider-legacy apt libapt-pkg7.0 zlib1g && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 python3-venv \
-    libffi8 libolm3 libatomic1 procps git openssh-client xz-utils \
+    libffi8 libolm3 libatomic1 procps git openssh-client xz-utils tmux \
     libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
     bubblewrap file jq zip unzip p7zip-full zstd libarchive-tools \
     poppler-utils qpdf ghostscript tesseract-ocr tesseract-ocr-eng ocrmypdf \
@@ -690,6 +728,7 @@ COPY --from=assembled_build /usr/libexec/sera-toolbox /usr/libexec/sera-toolbox
 COPY --from=assembled_build /etc/hermes /etc/hermes
 COPY --from=assembled_build /etc/sera-toolbox /etc/sera-toolbox
 COPY --from=assembled_build /etc/profile.d/hermes-path.sh /etc/profile.d/hermes-path.sh
+COPY --from=assembled_build /etc/profile.d/hermes.sh /etc/profile.d/hermes.sh
 COPY --from=assembled_build /etc/cont-init.d /etc/cont-init.d
 COPY --from=assembled_build /etc/s6-overlay /etc/s6-overlay
 COPY --from=assembled_build /etc/ld.so.conf.d/000-sqlite-fixed.conf /etc/ld.so.conf.d/000-sqlite-fixed.conf
@@ -705,6 +744,7 @@ RUN ldconfig && \
     esac && \
     test ! -x /usr/bin/gcc && test ! -x /usr/bin/g++ && test ! -x /usr/bin/docker && \
     test -r /etc/hermes/config.yaml && test -x /init && \
+    test -s /etc/hermes/chromium-executable-path && tmux -V >/dev/null && \
     test -x /opt/hermes/.venv/bin/hermes && \
     test -x /usr/local/bin/markdownlint-cli2 && \
     test -x /usr/local/bin/uv && test -x /usr/local/bin/uvx && \

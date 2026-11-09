@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import cron.jobs as cron_jobs
 from cron.scheduler import run_job
 import cron.scheduler as sched
+from tests.cron.conftest import owner_execution_runner
 
 pytestmark = pytest.mark.usefixtures("cron_owner")
 
@@ -318,7 +319,9 @@ def _tick_one(job_id, tmp_path, deliveries, *, resolve=None, mcp_reason=None):
         patch("cron.scheduler_delivery._resolve_origin", return_value=None),
         patch("hermes_cli.env_loader.load_hermes_dotenv"),
         patch("hermes_cli.env_loader.reset_secret_source_cache"),
-        patch("hermes_state_registry.acquire", return_value=MagicMock()),
+        # dlz: a run that passes preflight reaches the owner seam; run it in-process (as the
+        # cron_owner fixture does) instead of dialling a real gateway with a stub store.
+        patch("cron.scheduler_authority.run_canonical_job", owner_execution_runner()),
         patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]),
         patch.object(sched, "_deliver_result", side_effect=fake_deliver),
         patch.object(sched, "_empty_requested_mcp_toolsets", return_value=mcp_reason),

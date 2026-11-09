@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import os
 import threading
 import time
@@ -22,6 +23,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+logger = logging.getLogger(__name__)
 
 MANAGED_CONTROL_ENV = "HERMES_BROWSER_CONTROL_URL"
 MANAGED_KEY_ENV = "HERMES_BROWSER_CONTROL_KEY"
@@ -104,10 +107,16 @@ def _retire_daemon(name: str) -> None:
     if not str(name or "").startswith("bu-ctrl-"):
         return
     try:
+        from hermes_constants import hermes_home_key
         from tools.browser_use_cli import stop_harness_daemon
-    except ImportError:
+    except ImportError as exc:
+        # Visible, not silent: a retire that cannot run leaves the lease's daemon behind (10-26 leak).
+        logger.warning("browser control: cannot retire harness daemon %s: %s", name, exc)
         return
-    threading.Thread(target=stop_harness_daemon, args=(name,), name="bu-daemon-retire", daemon=True).start()
+    # The owning profile is read here, on the caller's thread: lease names are per controller, so two
+    # served profiles can share one, and the retire thread has no profile scope of its own.
+    threading.Thread(target=stop_harness_daemon, args=(name, hermes_home_key()), name="bu-daemon-retire",
+                     daemon=True).start()
 
 
 def control_url() -> str:

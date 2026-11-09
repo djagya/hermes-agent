@@ -8,9 +8,12 @@ import re
 from pathlib import Path
 
 # Blacksmith labels (upstream since v0.22.4) never start on the fork: it has no
-# Blacksmith app, so a job on one queues until it times out.
+# Blacksmith app, so a job on one queues until it times out. Blacksmith actions
+# (useblacksmith/checkout, ...) are matched too: the fork trusts no new
+# third-party action, and they only make sense on a Blacksmith runner.
 LARGE_RUNNER = re.compile(
     r"(?:ubuntu|windows|macos)-latest-\d+(?:-arm)?-core|blacksmith-\d+vcpu-[a-z0-9.-]+"
+    r"|useblacksmith/[A-Za-z0-9_.-]+"
 )
 NOUS_GUARD = "NousResearch/hermes-agent"
 FORK_FALLBACK = re.compile(

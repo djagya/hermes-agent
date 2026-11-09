@@ -43,7 +43,6 @@ def _tick(job_id, tmp_path, deliveries, *, error=None):
          patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
          patch("hermes_cli.env_loader.load_hermes_dotenv"), \
          patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-         patch("hermes_state_registry.acquire", return_value=MagicMock()), \
          patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
              "api_key": "k", "base_url": "https://example.invalid/v1",
@@ -60,7 +59,7 @@ def _tick(job_id, tmp_path, deliveries, *, error=None):
 
 
 @pytest.fixture
-def store(monkeypatch, tmp_path):
+def store(monkeypatch, tmp_path, cron_owner):
     monkeypatch.setattr(incidents, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     (tmp_path / "config.yaml").write_text("cron:\n  preflight: false\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

@@ -105,7 +105,7 @@ gw="$(docker run -d --network none \
   -v "$shut_home:/opt/data" \
   "$IMAGE" gateway run)"
 for _ in $(seq 1 90); do
-  if docker exec "$gw" /command/s6-svstat /run/service/gateway-default 2>/dev/null | grep -q up; then
+  if docker exec "$gw" /command/s6-svstat /run/hermes-service/gateway-default 2>/dev/null | grep -q up; then
     break
   fi
   sleep 1

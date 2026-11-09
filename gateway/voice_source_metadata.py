@@ -21,10 +21,3 @@ def inbound_voice_metadata(event):
                              'platform_message_id': str(message_id),
                              'audio_paths': list(dict.fromkeys(paths))}}
 
-
-def user_row_display_metadata(event, owner=None):
-    """Failed-turn user row metadata: the voice binding plus the input owner, if any."""
-    metadata = inbound_voice_metadata(event)
-    if owner:
-        metadata['gateway_input_owner'] = owner
-    return metadata

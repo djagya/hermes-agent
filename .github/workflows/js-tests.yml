@@ -121,6 +121,15 @@ jobs:
             web/node_modules
           key: node-modules-scripts-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-npm${{ steps.node.outputs.npm-version }}-${{ hashFiles('package-lock.json') }}
 
+      # Vitest records each file's duration and result under
+      # node_modules/.vite/vitest and orders the next run from it, longest first.
+      # The run that misses the cache writes it before the post step saves the
+      # tree, so every hit until the next lockfile change replays that one run's
+      # order: the slowest jsdom suites all start cold together and starve the
+      # rest past their 15s timeout. Drop it so each run orders from scratch.
+      - name: Drop vitest run history from the restored tree
+        run: rm -rf node_modules/.vite/vitest apps/*/node_modules/.vite/vitest ui-tui/node_modules/.vite/vitest ui-tui/packages/*/node_modules/.vite/vitest tests-js/node_modules/.vite/vitest web/node_modules/.vite/vitest
+
       - uses: ./.github/actions/retry
         if: steps.node-modules-cache.outputs.cache-hit != 'true'
         with:
@@ -129,7 +138,42 @@ jobs:
       - name: Prepare locked Electron runtime
         if: matrix.package == 'apps/desktop'
         run: node scripts/build/electron-runtime.mjs --source .
-      - run: npm run --prefix ${{ matrix.package }} ${{ matrix.script }}
+      # dlz: one check per matrix leg (the fork has no 32-core runner, so it keeps
+      # the matrix); the step keeps upstream's name, which
+      # tests/ci/test_js_tests_vitest_history.py orders the history drop against.
+      # The WhatsApp bridge suites run in the whatsapp-bridge job below.
+      - name: Run all workspace checks
+        run: npm run --prefix ${{ matrix.package }} ${{ matrix.script }}
+      - name: Check the checkout is clean
+        # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
+        # leaves an untracked or modified file in the checkout is reported here. Runs only when
+        # every earlier step passed: a step that failed midway can leave its own temp files
+        # (a half-extracted download, a worktree its later cleanup never removed).
+        uses: ./.github/actions/check-clean-worktree
+
+  # dlz: upstream runs these inside its single JS job; the fork's matrix legs are
+  # one workspace check each, so the bridge gets one small leg of its own.
+  whatsapp-bridge:
+    name: scripts/whatsapp-bridge / node --test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+      - uses: ./.github/actions/setup-pm
+        with:
+          toolchain: node
+      # The WhatsApp bridge is a standalone npm package, outside the root
+      # workspaces. Two of its suites import @whiskeysockets/baileys, so install
+      # its own lockfile first; --ignore-scripts because the tests need no
+      # native build.
+      - name: Install WhatsApp bridge dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/whatsapp-bridge
+      - name: Run WhatsApp bridge node tests
+        run: node --test scripts/whatsapp-bridge/*.test.mjs
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
         # leaves an untracked or modified file in the checkout is reported here. Runs only when

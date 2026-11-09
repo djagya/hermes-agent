@@ -125,9 +125,30 @@ CASES = {
     # through the same compilers (tests/ci/test_update_ci_routing.py).
     "shared JS builder → frontend + both update suites": (
         ["scripts/build/web.mjs"],
-        _lanes(python=True, frontend=True, e2e_upgrade=True, e2e_desktop_update=True, os_tests=True),
+        _lanes(python=True, frontend=True, e2e_upgrade=True, e2e_desktop_update=True, docker=True, os_tests=True),
+    ),
+    # The image builds the Webapp through this recipe; Desktop sources do not route to docker.
+    "webapp build recipe → docker": (
+        ["apps/desktop/scripts/build-webapp.mjs"],
+        _lanes(
+            frontend=True, e2e_upgrade=True, e2e_desktop_core=True, e2e_desktop_update=True, docker=True,
+            workspaces=["apps/desktop", "apps/shared"], os_tests=True,
+        ),
     ),
     "root JS tests → frontend": (["tests-js/product-builders.test.mjs"], _lanes(python=True, frontend=True)),
+    # The bridge's node --test suites run in the JS & TS job (js-tests.yml).
+    # dlz: the fork classifier arms the OS lanes for a full-scope Python run and
+    # resolves a plugin source to selective roots (scripts/ci/classify_changes.py);
+    # the WhatsApp adapter's roots also carry its tests/gateway/test_whatsapp*.py.
+    "whatsapp bridge → frontend": (
+        ["scripts/whatsapp-bridge/bridge_helpers.js"], _lanes(python=True, frontend=True, os_tests=True),
+    ),
+    "whatsapp adapter → frontend": (
+        ["plugins/platforms/whatsapp/adapter.py"],
+        _lanes(python=True, frontend=True, scan=True, py_full=False,
+               py_roots=[["tests/plugins/test_adapter*.py", "tests/test_adapter*.py", "tests/plugins/",
+                          "tests/gateway/test_whatsapp*.py"]]),
+    ),
     "docs-only → nothing heavy": (["README.md", "docs/guide.md"], _lanes()),
     "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
     # pyproject.toml declares the pytest markers the OS lanes select on, so it
@@ -316,6 +337,14 @@ CASES = {
     # .py/.pth payloads are what it scans for).
     "test runner script → python_prod stays on": (
         ["scripts/run_tests_parallel.py"],
+        _lanes(python=True, scan=True, e2e=True, e2e_upgrade=True, os_tests=True),
+    ),
+    "runner launch module → same lanes as the runner": (
+        ["scripts/run_tests_launch.py"],
+        _lanes(python=True, scan=True, e2e=True, e2e_upgrade=True, os_tests=True),
+    ),
+    "fork-server child → same lanes as the runner": (
+        ["scripts/run_tests_fork_child.py"],
         _lanes(python=True, scan=True, e2e=True, e2e_upgrade=True, os_tests=True),
     ),
     # Supply-chain lanes
@@ -861,3 +890,14 @@ def test_catalog_lane_runs_every_test_that_reads_the_shipped_catalog():
     assert not any(f.startswith("tests/e2e/") for f in files)
     text = (_REPO / ".github/workflows/catalog-tests.yml").read_text(encoding="utf-8-sig")
     assert "scripts/ci/catalog_test_files.py" in text and "scripts/run_tests.sh" in text
+
+
+def test_whatsapp_adapter_change_selects_its_gateway_tests():
+    """dlz: the adapter's suites live in tests/gateway/, outside the plugins/ subtree."""
+    spec = importlib.util.spec_from_file_location("select_test_roots", _REPO / "scripts/ci/select_test_roots.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    groups = json.loads(classify(["plugins/platforms/whatsapp/adapter.py"])["py_roots"])
+    roots = mod.resolve_roots(groups, str(_REPO))
+    expected = sorted(p.relative_to(_REPO).as_posix() for p in (_REPO / "tests/gateway").glob("test_whatsapp*.py"))
+    assert expected and set(expected) <= set(roots)

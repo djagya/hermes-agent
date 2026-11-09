@@ -322,7 +322,7 @@ def _item_json(fields):
 
 def _age_disk_cache(home, seconds=3600):
     """Push the on-disk pull past its TTL and drop L1, as a later process would see it."""
-    path = home / "cache" / "op_cache.json"
+    path = home / "op_cache.json"
     payload = json.loads(path.read_text())
     payload["fetched_at"] -= seconds
     path.write_text(json.dumps(payload))
@@ -648,12 +648,12 @@ def test_rotated_value_replaces_last_good_and_removed_reference_is_pruned(monkey
     op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
     _pull_values(monkeypatch, {"op://V/One/f": "a2"})
     op._CACHE.clear()
-    (tmp_path / "cache" / "op_cache.json").unlink()
+    (tmp_path / "op_cache.json").unlink()
     op.fetch_onepassword_secrets(references={"A": "op://V/One/f"}, binary=fake_op,
                                  cache_ttl_seconds=60, home_path=tmp_path)  # complete pull: prunes OLD
     monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _err(1, _RATE_LIMITED))
     op._CACHE.clear()
-    (tmp_path / "cache" / "op_cache.json").unlink()
+    (tmp_path / "op_cache.json").unlink()
     secrets, _ = op.fetch_onepassword_secrets(references=refs, binary=fake_op,
                                               cache_ttl_seconds=60, home_path=tmp_path)
     assert secrets == {"A": "a2"}  # rotated value served; OLD was pruned, never resurrected
@@ -666,7 +666,7 @@ def test_auth_failure_is_never_masked_by_last_good(monkeypatch, tmp_path):
     _pull_values(monkeypatch, {"op://V/One/f": "a"})
     op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
     op._CACHE.clear()
-    (tmp_path / "cache" / "op_cache.json").unlink()
+    (tmp_path / "op_cache.json").unlink()
     monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _err(1, "[ERROR] 401: Unauthorized"))
     secrets, _ = op.fetch_onepassword_secrets(references=refs, binary=fake_op,
                                               cache_ttl_seconds=60, home_path=tmp_path)
@@ -707,12 +707,12 @@ def test_fresh_cache_hit_seeds_last_good_for_cache_only_children(monkeypatch, tm
     refs = {"A": "op://V/One/f"}
     _pull_values(monkeypatch, {"op://V/One/f": "a"})
     op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
-    (tmp_path / "cache" / "op_last_good.json").unlink()  # e.g. cache written by an older image
+    (tmp_path / "op_last_good.json").unlink()  # e.g. cache written by an older image
     op._CACHE.clear()
     op.fetch_onepassword_secrets(references=refs, binary=fake_op, cache_ttl_seconds=60, home_path=tmp_path)
     monkeypatch.setenv(op.CACHE_ONLY_ENV, "1")
     op._CACHE.clear()
-    (tmp_path / "cache" / "op_cache.json").unlink()
+    (tmp_path / "op_cache.json").unlink()
     secrets, _ = op.fetch_onepassword_secrets(references=refs, binary=fake_op,
                                               cache_ttl_seconds=60, home_path=tmp_path)
     assert secrets == {"A": "a"}

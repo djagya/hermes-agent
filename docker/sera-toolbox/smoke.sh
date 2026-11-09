@@ -9,7 +9,7 @@ need=(
   ffmpeg ffprobe exiftool
   shellcheck ruff markdownlint-cli2
   python3 uv uvx
-  gh gitleaks tirith rclone op himalaya
+  gh rclone op himalaya tmux
   ss dig lsof fuser
   s6-svstat
   hermes-healthcheck
@@ -185,12 +185,12 @@ case "$sqlite_ver" in
   *) echo "BAD sqlite $sqlite_ver (want 3.53.x)" >&2; fail=1 ;;
 esac
 
-if ! grep -q 'snapshot.debian.org/archive/debian/20261104T214428Z' \
+if ! grep -q 'snapshot.debian.org/archive/debian/20261108T082754Z' \
       /etc/apt/sources.list.d/debian.sources ||
-   ! grep -q 'snapshot.debian.org/archive/debian-security/20261104T214428Z' \
+   ! grep -q 'snapshot.debian.org/archive/debian-security/20261108T082754Z' \
       /etc/apt/sources.list.d/debian.sources ||
    ! grep -q 'trixie-security' /etc/apt/sources.list.d/debian.sources; then
-  echo "apt sources missing Debian snapshot 20261104T214428Z main/updates/security" >&2
+  echo "apt sources missing Debian snapshot 20261108T082754Z main/updates/security" >&2
   fail=1
 fi
 
@@ -302,7 +302,7 @@ else
 fi
 
 # Downloaded CLIs: file(1) + --version, not --version alone.
-for name in tirith gh gitleaks op; do
+for name in gh op; do
   bin="$(command -v "$name")"
   desc="$(file "$bin")"
   echo "$name file $desc"

@@ -9,7 +9,7 @@ reference, or one the item JSON can't answer unambiguously, uses
 (``OP_SERVICE_ACCOUNT_TOKEN`` headless, ``OP_SESSION_*`` interactive) — Hermes
 never authenticates on the user's behalf, and failures never block startup.
 Complete pulls are cached in-process and under
-``<hermes_home>/cache/op_cache.json`` (values only; auth material is
+``<hermes_home>/op_cache.json`` (values only; auth material is
 fingerprinted, never stored).
 
 On a rate-limit response the pull stops at once, a backoff marker
@@ -31,7 +31,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from agent.secret_sources._cache import (
-    CachedFetch, SecretCache, atomic_write_json, fingerprint as _fingerprint, resolve_cache_home,
+    CachedFetch, SecretCache, atomic_write_json, current_cache_path, fingerprint as _fingerprint,
+    remove_cache_file, resolve_cache_home,
 )
 from agent.secret_sources.base import (
     ErrorKind, FetchResult, SecretSource, classify_cli_error, coerce_float,
@@ -60,7 +61,7 @@ _OP_ENV_ALLOWLIST = (
 
 # L1 key folds in str(home_path) so a HERMES_HOME switch inside one long-lived
 # process (the gateway) can't return another profile's secrets. The disk key
-# omits home because the file already lives under <home>/cache/.
+# omits home because the file already lives in that home.
 _CacheKey = tuple[str, str, str, str]  # (auth_fp, account, home, refs_fp)
 _DISK_CACHE_BASENAME = "op_cache.json"
 
@@ -79,7 +80,9 @@ _CACHE = _STORE.memory  # tests flush L1 directly
 # (``<root>/cache``, shared by ``<root>/profiles/*``); one entry per identity so a second
 # service account's 429 never overwrites (or clears) the first one's backoff.
 _BACKOFF_BASENAME = "op_rate_limit.json"
-# Last value read per (identity, op:// reference), under the home's cache dir at 0600. Filled
+# Last value read per (identity, op:// reference), at the top of the home at 0600 (beside
+# op_cache.json: it holds secret values, so it lives where a sandbox can hide it by path and an old
+# ``cache/`` copy, which the agent could have written, is deleted unread — dlz). Filled
 # per NAME, so a changed mapping keeps every other secret; pruned on complete pulls so a
 # removed reference does not linger; never consulted after an auth failure.
 _LAST_GOOD_BASENAME = "op_last_good.json"
@@ -365,7 +368,7 @@ def _clear_backoff(home_path: Optional[Path], auth_fp: Optional[str] = None) -> 
 
 
 def _last_good_path(home_path: Optional[Path]) -> Path:
-    return resolve_cache_home(home_path) / "cache" / _LAST_GOOD_BASENAME
+    return current_cache_path(resolve_cache_home(home_path), _LAST_GOOD_BASENAME)
 
 
 def _read_last_good(home_path: Optional[Path], identity: str) -> dict[str, str]:
@@ -677,10 +680,7 @@ def clear_caches(home_path: Optional[Path] = None) -> None:
     the last-good copies, and this identity's rate-limit backoff (other identities keep theirs)."""
     _STORE.clear(home_path)
     _clear_backoff(home_path, _auth_fingerprint(_DEFAULT_TOKEN_ENV))
-    try:
-        _last_good_path(home_path).unlink()
-    except (FileNotFoundError, OSError):
-        pass
+    remove_cache_file(resolve_cache_home(home_path), _LAST_GOOD_BASENAME)
 
 
 _reset_cache_for_tests = clear_caches

@@ -55,6 +55,26 @@ def test_unguarded_larger_runner_fails(tmp_path: Path, label: str):
     assert "tests.yml" in result.stdout
 
 
+def test_unguarded_blacksmith_action_fails(tmp_path: Path):
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "e2e.yml").write_text(
+        "name: E2E\n"
+        "on: workflow_call\n"
+        "jobs:\n"
+        "  e2e:\n"
+        "    runs-on: macos-latest\n"
+        "    steps:\n"
+        "      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1\n",
+        encoding="utf-8",
+    )
+
+    result = _run(tmp_path)
+
+    assert result.returncode == 1
+    assert "useblacksmith/checkout" in result.stdout
+
+
 def test_nous_guard_allows_larger_runner(tmp_path: Path):
     workflows = tmp_path / ".github" / "workflows"
     workflows.mkdir(parents=True)

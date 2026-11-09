@@ -1,6 +1,7 @@
 """Managed-mode routing: ambient CDP/cloud cannot bypass browser-control."""
 
 import json
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 
@@ -256,32 +257,20 @@ def test_release_lease_posts_id_and_token(monkeypatch):
     assert state.auth == ["Bearer secret-key"]
 
 
-def test_cleanup_releases_managed_session(monkeypatch):
-    from tools import browser_tool
-    import tools.browser_tool_cdp as bt_cdp
-    import tools.browser_tool_lifecycle as lifecycle
-    import tools.browser_tool_session as session
+def test_session_cleanup_releases_held_managed_leases(monkeypatch):
+    """The browser session layer's exit cleanup hands every held lease back to control (v0.23
+    browser_session_lifecycle; the old per-session hook went with the deleted built-in session module)."""
+    import tools.browser_session_lifecycle as lifecycle
 
     state = _State()
     httpd, port = _start(state)
-    _managed_env(monkeypatch, port)
-    monkeypatch.setattr(bt_cdp, "_stop_cdp_supervisor", lambda task_id: None)
-    monkeypatch.setattr(browser_tool, "_maybe_stop_recording", lambda task_id: None)
-    monkeypatch.setattr(session, "_run_browser_command", lambda *a, **k: {"success": True})
-    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
-    monkeypatch.setattr(browser_tool, "_active_sessions", {
-        "task-1": {
-            "session_name": "cdp_managed",
-            "bb_session_id": None,
-            "cdp_url": "http://127.0.0.1/slot/research-1/json/version?tok=tok-1",
-            "features": {"managed": True, "cdp_override": True},
-            MANAGED_LEASE_ENV: "lease-1",
-            MANAGED_TOKEN_ENV: "tok-1",
-        }
-    })
-    monkeypatch.setattr(browser_tool, "_session_last_activity", {"task-1": 0.0})
-    lifecycle._cleanup_single_browser_session("task-1")
-    httpd.shutdown()
+    try:
+        _managed_env(monkeypatch, port)
+        assert _resolve(port, monkeypatch, task_id="task-1")[0] is None
+        lifecycle._release_managed_leases()
+        lifecycle._release_managed_leases()  # idempotent
+    finally:
+        httpd.shutdown()
     assert state.releases == [{"lease_id": "lease-1", "token": "tok-1"}]
 
 
@@ -301,84 +290,97 @@ def test_unmanaged_keeps_existing_bu_env(monkeypatch):
     assert env["BU_CDP_WS"] == "ws://operator-override:9222"
 
 
-def test_builtin_get_cdp_override_raw_hides_ambient_in_managed(monkeypatch):
-    import tools.browser_tool_cdp as bt_cdp
+def test_session_cdp_hides_every_ambient_override_in_managed(monkeypatch):
+    import tools.browser_session_cdp as session_cdp
 
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_KEY", "secret-key")
     monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
-    assert bt_cdp._get_cdp_override_raw() == ""
+    monkeypatch.setattr(session_cdp, "_live_overrides", {"default": "ws://127.0.0.1:9222/devtools/browser/x"})
+    monkeypatch.setattr("hermes_constants.hermes_home_key", lambda: "default")
+    assert session_cdp.get_cdp_override_raw() == ""
+    assert session_cdp.get_cdp_override() == ""
+    assert session_cdp.live_cdp_override() == ""
 
 
-def test_is_managed_browser_fails_closed_on_probe_error(monkeypatch):
-    import tools.browser_tool_cdp as bt_cdp
+def test_live_browser_connect_refused_in_managed(monkeypatch):
+    import tools.browser_session_cdp as session_cdp
+
+    monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
+    monkeypatch.setattr(session_cdp, "_live_overrides", {})
+    monkeypatch.setattr(session_cdp, "_live_generations", {})
+    with pytest.raises(ManagedBrowserError, match="scope_denied"):
+        session_cdp.set_live_cdp_override("http://127.0.0.1:9222")
+    assert session_cdp._live_overrides == {}
+    session_cdp.set_live_cdp_override(None)  # a disconnect stays allowed
+
+
+def test_managed_probe_fails_closed_on_probe_error(monkeypatch):
+    import tools.browser_session_cdp as session_cdp
 
     def boom():
         raise RuntimeError("probe exploded")
 
     monkeypatch.setattr("tools.browser_control_route.is_managed", boom)
     monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
-    assert bt_cdp._is_managed_browser() is True
-    assert bt_cdp._get_cdp_override_raw() == ""
+    assert session_cdp.managed_browser() is True
+    assert session_cdp.get_cdp_override_raw() == ""
+    import tools.browser_use_cli as bu_cli
+    import tools.browser_vault_tool as vault
+    assert bu_cli._control_is_managed() is True
+    assert vault._is_managed() is True
 
 
 def test_create_session_fails_closed_when_route_import_breaks(monkeypatch):
-    import importlib
     import sys
 
-    import tools.browser_tool_session as session
+    import tools.browser_session as session
 
     monkeypatch.delenv("HERMES_BROWSER_CONTROL_URL", raising=False)
     monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
-    real = sys.modules["tools.browser_control_route"]
-    sys.modules["tools.browser_control_route"] = None
-    try:
-        with pytest.raises(RuntimeError, match="refusing local/cloud fallback"):
-            session._create_session_for_key("task-nav", force_local=False)
-    finally:
-        sys.modules["tools.browser_control_route"] = real
-        importlib.reload(session)
+    launched = []
+    monkeypatch.setattr(session, "_create_local_session", lambda *a, **k: launched.append(a))
+    monkeypatch.setitem(sys.modules, "tools.browser_control_route", None)
+    with pytest.raises(RuntimeError, match="refusing local/cloud fallback"):
+        session._create_session_for_key("task-nav", force_local=False)
+    assert launched == []
 
 
-def test_builtin_session_refuses_cdp_url_override_in_managed(monkeypatch):
-    from tools import browser_tool
-    import tools.browser_tool_lifecycle as lifecycle
-    import tools.browser_tool_session as session
-
-    monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
-    monkeypatch.setenv("HERMES_BROWSER_CONTROL_KEY", "secret-key")
-    monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
-    monkeypatch.setattr(lifecycle, "_start_browser_cleanup_thread", lambda: None)
-    monkeypatch.setattr(lifecycle, "_update_session_activity", lambda task_id: None)
-    monkeypatch.setattr(browser_tool, "_active_sessions", {})
-    monkeypatch.setattr(browser_tool, "_session_last_activity", {})
-    with pytest.raises(ManagedBrowserError) as caught:
-        session._get_session_info("task-nav")
-    assert "scope_denied" in str(caught.value)
-    assert "cdp_url" in str(caught.value) or "BROWSER_CDP" in str(caught.value)
-
-
-def test_builtin_navigate_refuses_cdp_url_override_in_managed(monkeypatch):
-    from tools import browser_tool
-    import tools.browser_tool_lifecycle as lifecycle
+def test_session_layer_refuses_every_browser_in_managed(monkeypatch):
+    """No CDP override, cloud provider, sandbox, Lightpanda or packaged Chromium in managed mode, even
+    with an ambient override set: a session request is a routing bug and fails closed."""
+    import tools.browser_session as session
+    import tools.browser_session_lifecycle as lifecycle
 
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_KEY", "secret-key")
     monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
-    monkeypatch.setattr(lifecycle, "_start_browser_cleanup_thread", lambda: None)
-    monkeypatch.setattr(lifecycle, "_update_session_activity", lambda task_id: None)
-    monkeypatch.setattr(browser_tool, "_active_sessions", {})
-    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
-    out = json.loads(browser_tool.browser_navigate("https://example.com", task_id="task-nav"))
-    assert out["success"] is False
-    assert "scope_denied" in out["error"]
+    launched = []
+    monkeypatch.setattr(session, "_create_local_session", lambda *a, **k: launched.append(a))
+    monkeypatch.setattr(lifecycle, "start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(lifecycle, "update_session_activity", lambda key: None)
+    monkeypatch.setattr(session, "_active_sessions", {})
+    for key in ("task-nav", "task-nav::local"):
+        with pytest.raises(ManagedBrowserError, match="scope_denied"):
+            session.get_session_info(key)
+    assert launched == [] and session._active_sessions == {}
 
 
-def test_auto_local_disabled_in_managed(monkeypatch):
-    import tools.browser_tool_cloud as bt_cloud
+def test_browser_exec_route_refuses_ambient_cdp_url_in_managed(monkeypatch):
+    monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("HERMES_BROWSER_CONTROL_KEY", "secret-key")
+    monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
+    err = _resolve_backend_cdp({}, "task-nav")
+    assert err and "scope_denied" in err and "BROWSER_CDP_URL" in err
+
+
+def test_cloud_and_local_routing_disabled_in_managed(monkeypatch):
+    import tools.browser_session_cloud as session_cloud
 
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
-    assert bt_cloud._auto_local_for_private_urls() is False
+    assert session_cloud.auto_local_for_private_urls() is False
+    assert session_cloud.get_cloud_provider() is None
+    assert session_cloud.is_local_backend() is False  # the private-network guard stays on
 
 
 def test_managed_cdp_or_error_unmanaged_is_passthrough(monkeypatch):
@@ -406,6 +408,37 @@ def test_managed_skips_own_tab_preamble(tmp_path, monkeypatch):
     posted = stdin_path.read_text()
     assert "_hermes_ensure_own_tab" not in posted
     assert "print(1)" in posted
+
+
+def test_managed_harness_env_is_hardened(tmp_path, monkeypatch):
+    """B5: the managed harness child gets no control key, BH_RECORD=0, and the undumpable sitecustomize
+    FIRST on PYTHONPATH, after browser_exec replaced the inherited PYTHONPATH with the harness site dir."""
+    import stat
+
+    import tools.browser_use_cli as bu_cli
+
+    state = _State()
+    httpd, port = _start(state)
+    _managed_env(monkeypatch, port)
+    monkeypatch.setenv("PYTHONPATH", "/inherited")
+    monkeypatch.setattr("tools.browser_process_hardening._linux", lambda: True)
+    env_path = tmp_path / "env.txt"
+    script = tmp_path / "browser-use"
+    script.write_text(f"#!/bin/sh\nenv > '{env_path}'\ncat > /dev/null\necho ok\n")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setattr(bu_cli, "_find_cli", lambda: [str(script)])
+    try:
+        result = json.loads(bu_cli.browser_exec("print(1)", task_id="t-env"))
+    finally:
+        httpd.shutdown()
+    assert result["success"] is True, result
+    child = dict(line.split("=", 1) for line in env_path.read_text().splitlines() if "=" in line)
+    assert "HERMES_BROWSER_CONTROL_KEY" not in child and "HERMES_BROWSER_CONTROL_KEY_FILE" not in child
+    assert child["BH_RECORD"] == "0"
+    first, *rest = child["PYTHONPATH"].split(os.pathsep)
+    assert first.endswith("hardening-site")
+    assert "/inherited" not in rest
+    assert child["BU_CDP_URL"].endswith("/json/version?tok=tok-1")
 
 
 def test_session_name_still_validated_in_managed(monkeypatch):
@@ -442,41 +475,18 @@ def test_browser_cdp_surfaces_managed_error(monkeypatch):
     assert "No CDP endpoint" not in result["error"]
 
 
-def test_camofox_snapshot_skipped_in_managed(monkeypatch):
-    import tools.browser_camofox as camofox
-    from tools import browser_tool
+def test_plugin_page_backend_never_used_in_managed(monkeypatch):
+    """Camofox and other plugin browsers register page backends (agent/browser_page_registry); a managed
+    vault op never reaches one, whatever the registry holds."""
+    import tools.browser_vault_tool as vault
 
     monkeypatch.setenv("HERMES_BROWSER_CONTROL_URL", "http://127.0.0.1:9")
-    monkeypatch.setenv("HERMES_BROWSER_CONTROL_KEY", "secret-key")
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    monkeypatch.setenv("CAMOFOX_URL", "http://127.0.0.1:9377")
-    monkeypatch.setattr(
-        "tools.tool_backend_helpers.read_selection", lambda *_a, **_k: "camofox"
-    )
-    assert camofox.is_camofox_mode() is False
     called = []
-    monkeypatch.setattr(
-        camofox,
-        "camofox_snapshot",
-        lambda *a, **k: called.append(True) or json.dumps({"success": True, "via": "camofox"}),
-    )
-    import tools.browser_tool_lifecycle as lifecycle
-    import tools.browser_tool_session as session
-
-    monkeypatch.setattr(lifecycle, "_start_browser_cleanup_thread", lambda: None)
-    monkeypatch.setattr(lifecycle, "_update_session_activity", lambda task_id: None)
-    # The managed-session denial must be observed independently of whether CI
-    # installed the local agent-browser binary. No browser process is launched:
-    # session acquisition raises before dispatch can use this inert path.
-    monkeypatch.setattr(session, "_browser_command_preflight", lambda: {"browser_cmd": "/unused/agent-browser"})
-    monkeypatch.setattr(browser_tool, "_active_sessions", {})
-    monkeypatch.setattr(browser_tool, "_session_last_activity", {})
-    monkeypatch.setattr(browser_tool, "_last_session_key", lambda task_id: task_id or "default")
-    out = json.loads(browser_tool.browser_snapshot(task_id="task-snap"))
+    monkeypatch.setattr("agent.browser_page_registry.backend_for_task", lambda task_id: called.append(task_id) or object())
+    assert vault._page_backend("task-snap") is None
     assert called == []
-    assert out.get("success") is False
-    err = out.get("error", "")
-    assert "scope_denied" in err or err.startswith("unavailable") or "unavailable" in err
+    out = json.loads(vault._fenced_page_op("task-snap", lambda: json.dumps({"success": True})))
+    assert out["success"] is False and out["error_type"] == "no_browser_session"
 
 
 def _resolve(port, monkeypatch, **kwargs):
@@ -844,14 +854,59 @@ def test_dropped_lease_retires_its_harness_daemon(monkeypatch):
         httpd.shutdown()
 
 
-def test_stop_harness_daemon_only_stops_a_driven_name(monkeypatch):
+def test_stop_harness_daemon_only_stops_the_owning_profiles_driven_name(monkeypatch):
+    """Lease names are per controller, so two served profiles can share one: retiring profile A's lease
+    must leave B's daemon registered and running. Identities have the real daemon_identity shape."""
+    import tools.browser_use_cli as cli
+    from tools.browser_harness_dirs import daemon_identity
+
+    name = "bu-ctrl-research-1-g-7"
+
+    def identity(home: str) -> tuple:
+        return daemon_identity({"BH_RUNTIME_DIR": f"/{home}/rt", "BH_RUNTIME_DIR_SHARED": f"/{home}/rt-shared",
+                                "BH_TMP_DIR": f"/{home}/tmp", "BH_TMP_DIR_SHARED": f"/{home}/tmp-shared",
+                                "BU_NAME": name})
+
+    a, b = identity("a"), identity("b")
+    assert len(a) == 5 and a[-1] == b[-1] == name
+    stopped = []
+    monkeypatch.setattr(cli, "_reload_daemons", lambda daemons: stopped.extend(daemons))
+    monkeypatch.setattr(cli, "_driven_daemons", {a: "home-a", b: "home-b"})
+    cli.stop_harness_daemon("bu-ctrl-shopping-g-9", "home-a")  # not driven: no-op
+    cli.stop_harness_daemon(name, "home-a")
+    cli.stop_harness_daemon(name, "home-a")  # idempotent
+    assert stopped == [a]
+    assert cli._driven_daemons == {b: "home-b"}
+
+
+def test_retire_daemon_passes_the_callers_profile(monkeypatch):
+    import threading
+
+    import tools.browser_control_route as route
     import tools.browser_use_cli as cli
 
-    stopped = []
-    monkeypatch.setattr(cli, "_reload_daemons", lambda names: stopped.extend(names))
-    driven = ("/rt", "/tmp", "bu-ctrl-research-1-g-7")
-    monkeypatch.setattr(cli, "_driven_daemons", {driven: "home"})
-    cli.stop_harness_daemon("bu-ctrl-shopping-g-9")
-    cli.stop_harness_daemon("bu-ctrl-research-1-g-7")
-    cli.stop_harness_daemon("bu-ctrl-research-1-g-7")
-    assert stopped == [driven]
+    calls, done = [], threading.Event()
+    monkeypatch.setattr(cli, "stop_harness_daemon", lambda name, home: (calls.append((name, home)), done.set()))
+    monkeypatch.setattr("hermes_constants.hermes_home_key", lambda: "home-a")
+    route._retire_daemon("bu-ctrl-research-1-g-7")
+    route._retire_daemon("not-a-lease")  # never a daemon of ours
+    assert done.wait(5)
+    assert calls == [("bu-ctrl-research-1-g-7", "home-a")]
+
+
+def test_registry_handler_passes_managed_kwargs(monkeypatch):
+    """The v0.23 handler wraps browser_exec in record_browser_call; dropping mode/identity there would run a
+    work:<org> call in a research slot (B2b)."""
+    import tools.browser_use_cli as bu_cli
+    from tools.registry import registry
+
+    seen = {}
+    monkeypatch.setattr(bu_cli, "browser_exec", lambda **kw: seen.update(kw) or "{}")
+    monkeypatch.setattr("hermes_cli.observability.shared_metrics_loop.record_browser_call",
+                        lambda call, backend: call())
+    entry = registry.get_entry("browser_exec") if hasattr(registry, "get_entry") else registry._tools["browser_exec"]
+    entry.handler({"code": "print(1)", "mode": "qa", "identity": "work:acme", "qa_targets": ["app.example"],
+                   "on_dialog": "dismiss", "bridge": "b1", "action": "verify"}, task_id="t1")
+    assert {k: seen[k] for k in ("mode", "identity", "qa_targets", "on_dialog", "bridge", "action", "task_id")} == {
+        "mode": "qa", "identity": "work:acme", "qa_targets": ["app.example"], "on_dialog": "dismiss",
+        "bridge": "b1", "action": "verify", "task_id": "t1"}

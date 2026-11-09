@@ -603,3 +603,18 @@ def test_absurd_retention_config_is_clamped_and_ledger_writes_still_work(monkeyp
     assert executions._terminal_retention_hours() <= executions.MAX_TERMINAL_RETENTION_HOURS
     run = executions.create_execution("job", source="builtin")
     assert executions.finish_execution(run["id"], success=True)["status"] == "completed"
+
+
+def test_cap_is_pinned_and_missed_rows_age_out(monkeypatch, tmp_path):
+    """dlz: the 100k cap is the fork's (5925f57d91); upstream's missed rows must age out with
+    the time prune too, not only once the cap is hit."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    assert executions.MAX_TERMINAL_EXECUTIONS == 100_000
+    clock = {"now": datetime(2026, 10, 10, tzinfo=UTC)}
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock["now"])
+    executions.record_missed_occurrences(
+        "skipper", count=2, first_instant=clock["now"].isoformat(), detail="skipped")
+    clock["now"] += timedelta(hours=executions.TERMINAL_RETENTION_HOURS, seconds=1)
+    executions.record_missed_occurrences(  # this write runs the prune
+        "later", count=1, first_instant=clock["now"].isoformat(), detail="skipped")
+    assert [r["job_id"] for r in executions.list_executions(limit=100)] == ["later"]

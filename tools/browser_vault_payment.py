@@ -119,6 +119,19 @@ def _consent_not_given(verdict: str, reason: str | None) -> dict:
     }
 
 
+def _payment_item_unchanged(backend, meta) -> bool:
+    """Inside ``fill_context``: the card still binds what consent was given for. Only a backend with its own
+    context is re-read (``tools.browser_vault_context.snapshot_refusal`` rule); built-in managers freeze nothing."""
+    from tools.browser_vault_context import _has_own_context, saved_origins
+
+    if not _has_own_context(backend):
+        return True
+    fresh = backend.get_meta(meta.id)
+    return (fresh is not None and fresh.kind == "payment" and saved_origins(fresh) == saved_origins(meta)
+            and tuple(fresh.payment_frame_origins) == tuple(meta.payment_frame_origins)
+            and fresh.payment_scope == meta.payment_scope)
+
+
 def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
     from tools import browser_vault_tool as vault
     from tools.approval_prompt import request_elicitation_consent
@@ -159,59 +172,69 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             return json.dumps(_consent_not_given(consent, consent_detail.get("reason")))
         if not supervisor.payment_is_current(inspected):
             return json.dumps({"success": False, "error_type": "payment_page_changed"})
-        # Never resolve at inspection/list time, on decline or on stale consent.
-        secret = validate_card(backend.resolve_secret(meta.id))
-        _register_card_redaction(secret)
-        try:
-            fills = _document_fills(inspected, secret)
-        except ExpiryOptionUnmatched:
-            return json.dumps({
-                "success": False,
-                "error_type": "payment_expiry_option_unmatched",
-                "error": _EXPIRY_UNMATCHED,
-            })
-        if fills is None:
-            return json.dumps({
-                "success": False,
-                "error_type": "payment_fields_incomplete",
-            })
-        # Re-admit at the write if a desktop user took control during consent.
-        if vault._bot_desktop_browser_session(task_id):
-            from tools.bot_desktop import lease
+        # The card is resolved and written inside the backend's fill_context (a plugin backend's lock /
+        # snapshot / manager session), entered only after consent; a plugin item that changed meanwhile
+        # is refused before any value is resolved.
+        from tools.browser_vault_context import fill_context
 
-            lease.assert_agent_may_act()
-        from tools.browser_payment_privacy import mark_payment_session
+        with fill_context(backend):
+            if not _payment_item_unchanged(backend, meta):
+                return json.dumps({"success": False, "error_type": "payment_item_changed",
+                                   "error": "The saved card changed before the fill. Nothing was resolved "
+                                            "or written; list the vault and request fresh consent."})
+            # Never resolve at inspection/list time, on decline or on stale consent.
+            secret = validate_card(backend.resolve_secret(meta.id))
+            _register_card_redaction(secret)
+            try:
+                fills = _document_fills(inspected, secret)
+            except ExpiryOptionUnmatched:
+                return json.dumps({
+                    "success": False,
+                    "error_type": "payment_expiry_option_unmatched",
+                    "error": _EXPIRY_UNMATCHED,
+                })
+            if fills is None:
+                return json.dumps({
+                    "success": False,
+                    "error_type": "payment_fields_incomplete",
+                })
+            # Re-admit at the write if a desktop user took control during consent.
+            if vault._bot_desktop_browser_session(task_id):
+                from tools.bot_desktop import lease
 
-        surface = None
-        if vault._is_managed():
-            from tools.browser_use_cli import vault_route
+                lease.assert_agent_may_act()
+            from tools.browser_payment_privacy import mark_payment_session
 
-            route = vault_route(task_id)
-            # Control's CDP-level capture guard first; no card byte is written unless it holds.
-            refused = _set_control_capture_guard(route)
-            if refused:
-                return json.dumps(refused)
-            surface = {"slot_id": route.get("slot_id", ""),
-                       "browser_generation": route.get("browser_generation", ""),
-                       "wipe_count": route.get("wipe_count", ""),
-                       "profile_kind": route.get("profile_kind", "")}
-        mark_payment_session(task_id, surface)
-        result = supervisor.commit_payment(inspected, fills)
-        if result.get("error_type") == "payment_fields_not_retained":
-            result["error"] = _NOT_RETAINED
-        result.update(
-            kind="payment",
-            backend=backend.name,
-            origin=inspected.merchant_origin,
-            target_origin=inspected.frame_origin,
-            target_origins=list(inspected.target_origins),
-            fields=sorted(f["token"] for f in fills),
-            skipped_optional=sorted(set(prompt["fields"]) - {f["token"] for f in fills}),
-            submitted=False,
-            page_checks=prompt["checks"],
-            merchant_reputation="human_review_required",
-        )
-        return json.dumps(result)
+            surface = None
+            if vault._is_managed():
+                from tools.browser_use_cli import vault_route
+
+                route = vault_route(task_id)
+                # Control's CDP-level capture guard first; no card byte is written unless it holds.
+                refused = _set_control_capture_guard(route)
+                if refused:
+                    return json.dumps(refused)
+                surface = {"slot_id": route.get("slot_id", ""),
+                           "browser_generation": route.get("browser_generation", ""),
+                           "wipe_count": route.get("wipe_count", ""),
+                           "profile_kind": route.get("profile_kind", "")}
+            mark_payment_session(task_id, surface)
+            result = supervisor.commit_payment(inspected, fills)
+            if result.get("error_type") == "payment_fields_not_retained":
+                result["error"] = _NOT_RETAINED
+            result.update(
+                kind="payment",
+                backend=backend.name,
+                origin=inspected.merchant_origin,
+                target_origin=inspected.frame_origin,
+                target_origins=list(inspected.target_origins),
+                fields=sorted(f["token"] for f in fills),
+                skipped_optional=sorted(set(prompt["fields"]) - {f["token"] for f in fills}),
+                submitted=False,
+                page_checks=prompt["checks"],
+                merchant_reputation="human_review_required",
+            )
+            return json.dumps(result)
     except BackendError as exc:
         if type(exc) is BackendError:  # unclassified op failure: keep the opaque refusal below
             return json.dumps({

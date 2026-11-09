@@ -4,6 +4,15 @@ from types import SimpleNamespace
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _upstream_plugin_inventory(monkeypatch):
+    # dlz: the fork image bundles the Home Assistant catalog plugin (plugins/homeassistant), so its
+    # toolset is discovered and on by default; these tests assume upstream's inventory without it.
+    # Runtime keeps HA in CLI/TUI sessions (D22). Only the isolated fixtures treat it as default-off.
+    from hermes_cli import tools_config
+    monkeypatch.setattr(tools_config, "_DEFAULT_OFF_TOOLSETS", tools_config._DEFAULT_OFF_TOOLSETS | {"homeassistant"})
+
 FOCUS = {'agent': {'coding_context': 'focus'}, 'platform_toolsets': {'cli': ['terminal'], 'acp': ['terminal']}}
 
 
@@ -100,7 +109,7 @@ async def test_session_create_selects_the_posture_for_its_named_folder(project, 
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_local import create_local_session
     from hermes_state_local import local_receipt
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -109,7 +118,7 @@ async def test_session_create_selects_the_posture_for_its_named_folder(project, 
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
     try:
         authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='posture')
-        actor = Principal('owner', str(tmp_path), frozenset({'session:create', 'session:read'}), 'socket')
+        actor = SessionActor('owner', str(tmp_path), frozenset({'session:create', 'session:read'}), 'socket')
         ref = create_local_session(authority, actor, {'request_id': 'r', 'source': 'cli', 'cwd': str(project)})
         policy = local_receipt(store._db, ref.session_id)['policy']
     finally:

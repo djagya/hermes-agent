@@ -631,7 +631,7 @@ class TestCronjobToolScriptValidation:
 class TestRunJobEnvVarCleanup:
     """Test that run_job() env vars are cleaned up even on early failure."""
 
-    def test_env_vars_cleaned_on_early_error(self, cron_env, monkeypatch):
+    def test_env_vars_cleaned_on_early_error(self, cron_env, monkeypatch, cron_owner):
         """Origin env vars must be cleaned up even if run_job fails early."""
         # Ensure env vars are clean before test
         for key in (

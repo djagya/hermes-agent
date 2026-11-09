@@ -54,10 +54,16 @@ fi
 curl -fsS --max-time 4 http://127.0.0.1:8642/health >/dev/null
 
 # If the default gateway slot exists, it must be up with a PID.
-# s6-overlay always has /run/service — do not treat a missing slot as
-# unhealthy after curl already passed (CLI / slot not registered yet).
-if [ -e /run/service/gateway-default ]; then
-  st="$(/command/s6-svstat /run/service/gateway-default)" || {
+# Profile gateway slots live in the hermes-owned nested scandir
+# /run/hermes-service (v0.23.0); /run/service is the pre-v0.23 location.
+# Do not treat a missing slot as unhealthy after curl already passed
+# (CLI / slot not registered yet).
+slot=""
+for d in /run/hermes-service/gateway-default /run/service/gateway-default; do
+  if [ -e "$d" ]; then slot="$d"; break; fi
+done
+if [ -n "$slot" ]; then
+  st="$(/command/s6-svstat "$slot")" || {
     echo "healthcheck: s6-svstat failed on gateway-default" >&2
     exit 1
   }

@@ -157,7 +157,6 @@ def _run_job_with_messages(tmp_path, messages, final_response):
          patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
          patch("hermes_cli.env_loader.load_hermes_dotenv"), \
          patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-         patch("hermes_state_registry.acquire", return_value=fake_db), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
              "api_key": "test-key", "base_url": "https://example.invalid/v1",
              "provider": "openrouter", "api_mode": "chat_completions"}), \
@@ -169,7 +168,7 @@ def _run_job_with_messages(tmp_path, messages, final_response):
         return scheduler.run_job({"id": "baff7141c0de", "name": "X monitor", "prompt": "check X"})
 
 
-def test_run_job_fails_when_a_tool_provider_is_out_of_credits(tmp_path):
+def test_run_job_fails_when_a_tool_provider_is_out_of_credits(tmp_path, cron_owner):
     report = "The check is incomplete: x_search is blocked by the xAI spending limit."
     success, output, final_response, error = _run_job_with_messages(
         tmp_path, [_tool("x_search", XAI_SPENDING_LIMIT_RESULT)], report)
@@ -182,7 +181,7 @@ def test_run_job_fails_when_a_tool_provider_is_out_of_credits(tmp_path):
     assert output.rpartition("## Response")[2].strip() == report
 
 
-def test_run_job_stays_ok_without_budget_evidence(tmp_path):
+def test_run_job_stays_ok_without_budget_evidence(tmp_path, cron_owner):
     success, _output, final_response, error = _run_job_with_messages(
         tmp_path, [_tool("x_search", json.dumps({"success": True, "answer": "two posts"}))], "two posts")
     assert (success, error, final_response) == (True, None, "two posts")

@@ -1,6 +1,6 @@
 {
   "source": "https://github.com/NousResearch/hermes-official-plugins (subdir homeassistant)",
-  "commit": "a4e311e433f1470b1fec15434deea6a05e8644eb",
+  "commit": "4d492b1dc5326af3e38bb2cf3e4b9ad6d65f0072",
   "version": "2.0.1",
   "catalog_entry": "plugin-catalog/homeassistant.yaml",
   "why": "The image sets HERMES_DISABLE_LAZY_INSTALLS=1, so the left-core migration cannot fetch this catalog plugin at gateway start. Bundled here (a bundled kind: platform plugin auto-loads deferred; its client tools pre-register) at the catalog pin. Bump together with plugin-catalog/homeassistant.yaml.",
@@ -12,7 +12,7 @@
   ],
   "files": {
     "__init__.py": {
-      "upstream_sha256": "fd8b189761c5eb51451a336a51cec38e136b6f521f2bc4f00c323b0179b3a4da"
+      "upstream_sha256": "f158869159a528228ed2ae3ebd78e860efbbed3e51279f13389fc1ab3b42d7c2"
     },
     "adapter.py": {
       "upstream_sha256": "f5657f04fb744deb896b490e459759f349223cd2cce59b89723a92e63a7002ba",
@@ -20,16 +20,16 @@
       "fork_sha256": "ee84c287b8251e2ce637be8e96dfa95e21ce87d808c6f9b9c571594f6d539974"
     },
     "tools.py": {
-      "upstream_sha256": "16422542d083d5888c56cc6d0bf9b7172b6869299d0a36b670837822d8c4abfe"
+      "upstream_sha256": "c62a97cbcb1890c6830f41d824913fc1f77f81dbad6bf2fb4d36262e75f0c5d8"
     },
     "plugin.yaml": {
-      "upstream_sha256": "86524ca0f18f7993828ec30d35f65f29a94422ffbeeca850a7fd7d1b7fef5c69"
+      "upstream_sha256": "61e7a3b9c87eaf0ddc7f2b9e4e62934c5e370b8900c49739796a17316f7cde89"
     },
     "LICENSE": {
       "upstream_sha256": "5f79d321c17de8ef6e5f34967dc5b484afebeeefd87180890d9741941f6b815f"
     },
     "README.md": {
-      "upstream_sha256": "fb621f417759979f049b4737fa5e12598782ed81a725c0dfdf7b55a40a15062e"
+      "upstream_sha256": "12809312f47e65dd88f0a4e8dbe0257566ace5263c51611d86622bde86b3090f"
     }
   },
   "tests": {
@@ -44,10 +44,10 @@
       "upstream_sha256": "c1d05f0cfd5b784705ab762c8bba3b3ddc81fc9da48f7647d113865c469ed9ae"
     },
     "test_homeassistant_tools.py": {
-      "upstream_sha256": "1e516d28b8877421710cc3f5196291c5b61444116740c6047c887dfbc57ffce5"
+      "upstream_sha256": "a0b026f3c312f837a35cc638c3f3cb0c75b4340e93d21b48ba52bb3dfa99bbf2"
     },
     "test_plugin_registration.py": {
-      "upstream_sha256": "d11e4d0d3fa27f8fce9bfc64bf6849ca3ff8d0c431b940651a413af3e1409b1e"
+      "upstream_sha256": "f4747b0c1e17aa92e9f717afaf848294b1fe9e580ffcb444a3ec42fbd469f9fd"
     }
   }
 }

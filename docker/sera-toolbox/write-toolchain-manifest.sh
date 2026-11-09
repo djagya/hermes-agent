@@ -13,8 +13,6 @@ from pathlib import Path
 
 SOURCE = {
     "gh": ("https://github.com/cli/cli", "MIT"),
-    "gitleaks": ("https://github.com/gitleaks/gitleaks", "MIT"),
-    "tirith": ("https://github.com/sheeki03/tirith", "MIT"),
     "rclone": ("https://github.com/rclone/rclone", "MIT"),
     "op": ("https://developer.1password.com/docs/cli", "proprietary"),
     "bwrap": ("https://github.com/containers/bubblewrap", "LGPL-2.0-or-later"),
@@ -58,7 +56,7 @@ def sha256(path):
 tools = [
     "bwrap", "file", "sqlite3", "jq", "pdftotext", "qpdf", "gs",
     "tesseract", "convert", "pandoc", "soffice", "ffmpeg", "exiftool",
-    "shellcheck", "ruff", "gh", "gitleaks", "tirith", "rclone", "op",
+    "shellcheck", "ruff", "gh", "rclone", "op",
     "markdownlint-cli2", "hermes", "weasyprint", "sera-pymupdf",
     "bsdtar",
 ]

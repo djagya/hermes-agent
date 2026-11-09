@@ -111,9 +111,9 @@ def _ask_human(command: str, description: str, timeout_seconds: int, allow_perma
                approval_callback, allow_session: bool, smart_denied: bool, title: str | None = None) -> str:
     # Redact before any user-visible rendering; the original `command` still executes after approval. Same redactor as
     # memory/log sanitization so tokens mask consistently across surfaces.
-    from agent.redact import redact_sensitive_text
-    display_command = redact_sensitive_text(command)
-    display_description = redact_sensitive_text(description)
+    from agent.redact import redact_approval_display
+    display_command = redact_approval_display(command)
+    display_description = redact_approval_display(description)
     # Smart DENY and a session-less gate both reduce the menu to once/deny.
     once_only = smart_denied or not allow_session
 
@@ -219,13 +219,13 @@ def _present_with_selected_transport(*, command: str, description: str, pattern_
         return _attempt(name, "deny", "unavailable", fallback)
 
     try:
-        from agent.redact import redact_sensitive_text
+        from agent.redact import redact_approval_display
         from hermes_cli.approval_transport import ApprovalRequest, invoke_approval_transport
 
         timeout_seconds = _ctx._get_approval_timeout()
         request = ApprovalRequest.create(
-            command=redact_sensitive_text(command, force=True),
-            description=redact_sensitive_text(description, force=True), pattern_key=pattern_key,
+            command=redact_approval_display(command, force=True),
+            description=redact_approval_display(description, force=True), pattern_key=pattern_key,
             pattern_keys=tuple(pattern_keys), session_key=session_key, surface=surface, allow_session=allow_session,
             allow_permanent=allow_permanent, timeout_seconds=timeout_seconds,
         )
@@ -294,10 +294,19 @@ def _consent_reason(choice) -> str:
     return "timeout" if choice in ("timeout", "cancelled") else "refused"
 
 
+def _remembered_consent(session_key: str, choice, remember_key: str | None, unresolved: str) -> str:
+    """:func:`_consent`, recording a ``session``/``always`` answer under *remember_key*. Without a key
+    those scopes were never offered, so a stale or typed broader answer covers this call only."""
+    if remember_key is not None:
+        from tools import approval as _a
+        _a._persist_choice(session_key, choice, [remember_key])
+    return _consent(choice, unresolved)
+
+
 def request_elicitation_consent(message: str, description: str, *,
                                 timeout_seconds: int | None = None,
                                 surface: str = "mcp-elicitation", title: str = "Confirm this action?",
-                                outcome: dict | None = None) -> str:
+                                remember_key: str | None = None, outcome: dict | None = None) -> str:
     """Route an MCP elicitation request to the surface owning the active session:
     gateway sessions through ``_await_gateway_decision``, CLI/TUI through
     ``prompt_dangerous_approval``. Always fails closed: a missing notify_cb in a
@@ -305,17 +314,23 @@ def request_elicitation_consent(message: str, description: str, *,
     treats them as "user did not approve" rather than retrying or hanging.
     Returns ``"accept" | "decline" | "cancel"``.
 
+    Without *remember_key* the consent covers one call, so every surface offers only
+    once/deny. With it, the session and always choices are offered and recorded under
+    that approval key; the caller checks ``tools.approval.is_approved`` before asking.
+
     ``outcome``, when given, receives ``outcome["reason"]``: one of ``accepted``, ``refused``,
     ``timeout`` or ``unavailable`` (see ``_consent_reason``). The verdict itself is unchanged, so
     callers that only read the return value behave exactly as before."""
-    verdict, reason = _elicit(message, description, timeout_seconds=timeout_seconds, surface=surface, title=title)
+    # dlz: typed consent outcome (fork) on top of upstream's remember_key recording.
+    verdict, reason = _elicit(message, description, timeout_seconds=timeout_seconds, surface=surface, title=title,
+                              remember_key=remember_key)
     if outcome is not None:
         outcome["reason"] = reason
     return verdict
 
 
 def _elicit(message: str, description: str, *, timeout_seconds: int | None,
-            surface: str, title: str) -> tuple[str, str]:
+            surface: str, title: str, remember_key: str | None = None) -> tuple[str, str]:
     """``request_elicitation_consent`` with the reason: ``(verdict, reason)``."""
     from tools import approval as _a
     try:
@@ -327,6 +342,7 @@ def _elicit(message: str, description: str, *, timeout_seconds: int | None,
     # would detach the viewer mid-turn instead of failing closed like the in-process ``-q`` input() path.
     if _ctx._is_single_query_approval_context():
         return "decline", "unavailable"
+    scoped = remember_key is not None
 
     # api_server is an unattended *platform* for the dangerous-command gate, but a live ``/v1/runs`` run
     # registers an approval notify callback and answers via ``POST /v1/runs/{id}/approval``
@@ -347,7 +363,8 @@ def _elicit(message: str, description: str, *, timeout_seconds: int | None,
             decision = _gw._await_gateway_decision(
                 session_key, notify_cb, {"command": message, "description": description,
                                          "pattern_key": "mcp_elicitation",
-                                         "pattern_keys": ["mcp_elicitation"]}, surface=surface)
+                                         "pattern_keys": ["mcp_elicitation"],
+                                         "allow_session": scoped, "allow_permanent": scoped}, surface=surface)
         except Exception as exc:
             logger.error("Elicitation gateway dispatch failed: %s", exc, exc_info=True)
             return "decline", "unavailable"
@@ -356,7 +373,7 @@ def _elicit(message: str, description: str, *, timeout_seconds: int | None,
         if not decision.get("resolved") or decision.get("cancelled"):
             return "cancel", "timeout"  # nobody answered (timeout / prompt withdrawn) — not a user refusal
         choice = decision.get("choice")
-        return _consent(choice, "decline"), _consent_reason(choice)
+        return _remembered_consent(session_key, choice, remember_key, "decline"), _consent_reason(choice)
 
     # Nobody can answer a -q, cron or unattended-platform worker. A `hermes chat -q` turn still has the CLI's
     # panel callback registered, which would wait the full approval timeout before failing closed.
@@ -372,10 +389,9 @@ def _elicit(message: str, description: str, *, timeout_seconds: int | None,
     hook_choice = "cancelled"
     try:
         from tools.terminal_tool import _get_approval_callback
-        # allow_permanent=False: elicitation is a per-call confirmation — no pattern to remember.
         # Pass the agent thread's panel callback: without it prompt_toolkit fails the prompt closed unseen.
         choice = prompt_dangerous_approval(message, description, timeout_seconds=timeout_seconds,
-                                           allow_permanent=False, title=title,
+                                           allow_permanent=scoped, allow_session=scoped, title=title,
                                            approval_callback=_get_approval_callback())
         hook_choice = choice
     except Exception as exc:
@@ -383,4 +399,5 @@ def _elicit(message: str, description: str, *, timeout_seconds: int | None,
         return "decline", "unavailable"
     finally:
         _ctx._fire_approval_hook("post_approval_response", **hook_kwargs, choice=hook_choice)
-    return _consent(choice, "cancel"), _consent_reason(choice)  # timeout mirrors the gateway's unresolved outcome
+    # timeout mirrors the gateway's unresolved outcome
+    return _remembered_consent(session_key, choice, remember_key, "cancel"), _consent_reason(choice)

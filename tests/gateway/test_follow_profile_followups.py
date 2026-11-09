@@ -10,6 +10,15 @@ import pytest
 from tests.gateway.test_session_follow_profile_config import _create, _owner, _route
 
 
+@pytest.fixture(autouse=True)
+def _upstream_plugin_inventory(monkeypatch):
+    # dlz: the fork image bundles the Home Assistant catalog plugin (plugins/homeassistant), so its
+    # toolset is discovered and on by default; these tests assume upstream's inventory without it.
+    # Runtime keeps HA in CLI/TUI sessions (D22). Only the isolated fixtures treat it as default-off.
+    from hermes_cli import tools_config
+    monkeypatch.setattr(tools_config, "_DEFAULT_OFF_TOOLSETS", tools_config._DEFAULT_OFF_TOOLSETS | {"homeassistant"})
+
+
 async def _create_bot_chat(owner, authority, home, request_id, **extra):
     """Desktop's Bot Chat create: no toolsets param (the surface's own selection)."""
     response = await owner.dispatch({'id': request_id, 'method': 'session.create', 'params': dict(
