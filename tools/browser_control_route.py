@@ -165,6 +165,8 @@ def control_key() -> str:
 def clear_held_leases() -> None:
     with _held_lock:
         _held_leases.clear()
+    with _handoffs_lock:
+        _lost_leases.clear()
 
 
 def _hold_key(
@@ -497,6 +499,27 @@ _handoffs_lock = threading.Lock()
 _minted_handoffs: dict[tuple[str, str, str], float] = {}
 
 
+# dlz: recheck P2 (board Take). A held lease this task found dead (control: no longer the agent's, e.g.
+# Danil pressed Take on the slots board, which mints no link) is forgotten so the next call re-acquires;
+# its (task, slot, lease) stays claimable here for one Return, bounded in count and time.
+_LOST_MAX = 64
+_lost_leases: dict[tuple[str, str, str], float] = {}
+
+
+def _note_lost_lease(hold_key: str, snapshot: dict[str, str]) -> None:
+    key = (hold_key.split("|", 1)[0] or "default", str(snapshot.get(MANAGED_SLOT_ENV) or ""),
+           str(snapshot.get(MANAGED_LEASE_ENV) or ""))
+    if not key[1] or not key[2]:
+        return
+    now = _monotonic()
+    with _handoffs_lock:
+        for stale in [k for k, until in _lost_leases.items() if until <= now]:
+            _lost_leases.pop(stale, None)
+        _lost_leases[key] = now + _HANDOFF_MAX_S
+        while len(_lost_leases) > _LOST_MAX:
+            _lost_leases.pop(next(iter(_lost_leases)))
+
+
 def note_handoff(task_id: Optional[str], slot_id: str, lease_id: str, expires_in: Any = None) -> None:
     try:
         ttl = min(max(float(expires_in or 0), 0.0) + 1800.0, _HANDOFF_MAX_S)
@@ -519,7 +542,8 @@ def claim_handback(task_id: str, slot_id: str, lease_id: str) -> bool:
     now = _monotonic()
     with _handoffs_lock:
         until = _minted_handoffs.pop(key, 0.0)
-    if until > now:
+        lost_until = _lost_leases.pop(key, 0.0)
+    if until > now or lost_until > now:
         return True
     return any(lease.get(MANAGED_SLOT_ENV) == key[1] and lease.get(MANAGED_LEASE_ENV) == key[2]
                for lease in held_leases_for_task(key[0]))
@@ -761,6 +785,7 @@ def _resolve_held(
             return None
         # Dead lease: forget it and acquire again (control hands a task its
         # own resumed lease back, or a fresh slot).
+        _note_lost_lease(key, cached)
         _forget_held(key)
         _retire_daemon(cached.get("BU_NAME", ""))
 
@@ -834,6 +859,7 @@ def held_managed_cdp(
     if alive is None:
         return "lease_unavailable"
     if not alive:
+        _note_lost_lease(key, cached)
         _forget_held(key)
         _retire_daemon(cached.get("BU_NAME", ""))
         return "lease_stale"

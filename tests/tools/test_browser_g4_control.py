@@ -163,3 +163,29 @@ def test_d10b_after_restart_a_live_lease_alone_never_wakes_and_one_original_leas
                                                     route.MANAGED_LEASE_ENV: "lease-old"}
     assert post("lease-old") == 202
     assert post("lease-old") == 409 and len(calls) == 1  # one wake per original lease
+
+
+def test_board_take_then_return_still_wakes_after_an_agent_call_found_the_lease_dead(monkeypatch, held):
+    """Recheck P2: a board Take mints no link; the next agent call forgets the dead lease, and the
+    genuine Return for it must still wake Sera once (an unrelated lease id still does not)."""
+    calls = []
+    route._held_leases["s-1||research"] = {route.MANAGED_LEASE_ENV: "lease-taken", route.MANAGED_TOKEN_ENV: "tok",
+                                          route.MANAGED_SLOT_ENV: "research-1", "BU_NAME": "bu-x"}
+    monkeypatch.setattr(route, "_lease_alive", lambda control, lease: False)
+    monkeypatch.setattr(route, "_acquire_waiting", lambda *a, **k: {"error": "busy", "detail": "human holds it"})
+    route.resolve_managed_cdp({}, task_id="s-1")
+    assert not route.held_leases_for_task("s-1")
+    run = lambda lease: asyncio.run(hb.inject(_runner(calls), "s-1", "research-1", lease))
+    assert run("lease-other") == "session_not_found"
+    assert run("lease-taken") == "injected" and len(calls) == 1
+
+
+def test_handoff_ended_does_not_eat_the_return_of_a_newer_link_on_the_same_lease(held):
+    """Recheck P2: link 1 expires (handoff_ended), link 2 on the same live lease is used and returned."""
+    calls = []
+    route._held_leases["s-1|sensitive|research"] = {route.MANAGED_SLOT_ENV: "sensitive",
+                                                    route.MANAGED_LEASE_ENV: "lease-9"}
+    run = lambda **kw: asyncio.run(hb.inject(_runner(calls), "s-1", "sensitive", "lease-9", **kw))
+    assert run(event="handoff_ended", reason_code="link_expired") == "injected"
+    assert run() == "injected" and "Return to Sera" in calls[-1]["content"]
+    assert run() == "replay" and len(calls) == 2
