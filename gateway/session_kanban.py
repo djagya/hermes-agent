@@ -410,9 +410,18 @@ def _run_task_turns(agent, frame, history, context):
         if required_missing:
             raise MissingRequiredSkill(f"required skill(s) missing or disabled in this profile: "
                                        f"{format_missing_skills(required_missing)}")
-        advisory = [s for s in context['skills'] if (s or '').strip() not in required]
-        advisory_prompt, advisory_loaded, missing = build_preloaded_skills_prompt(
-            advisory, task_id=agent.session_id, excluded_loaded_names=set(loaded))
+        # An advisory name that resolves to the SAME skill file as a mandatory one is already in the
+        # prompt; dedupe by that file, never by frontmatter name (``team-a/check`` and ``team-b/check``
+        # can both be ``name: check``). Resolution is skill_view without preprocessing: no side effects.
+        from agent.skill_commands import _load_skill_payload
+
+        def skill_file(identifier):
+            found = _load_skill_payload(identifier, task_id=agent.session_id)
+            return str(Path(found[1]).resolve()) if found and found[1] else None
+        required_files = {f for f in map(skill_file, required) if f}
+        advisory = [s for s in context['skills'] if (s or '').strip() not in required
+                    and (skill_file(s) not in required_files)]
+        advisory_prompt, advisory_loaded, missing = build_preloaded_skills_prompt(advisory, task_id=agent.session_id)
         skills = '\n\n'.join(p for p in (advisory_prompt, required_prompt) if p)
         loaded = [*loaded, *advisory_loaded]
     else:

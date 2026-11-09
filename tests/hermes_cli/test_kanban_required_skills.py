@@ -147,3 +147,30 @@ def test_owner_run_card_renders_each_mandatory_skill_once_into_the_prompt(monkey
     session_kanban._run_task_turns(agent, {"text": "go"}, [], context)
     assert rendered.count("needed") == 1
     assert "BLOCK:needed" in prompts[0] and "BLOCK:advisory" in prompts[0]
+
+
+def test_owner_run_card_dedupes_mandatory_and_advisory_skills_by_file_not_name(monkeypatch):
+    """dlz D03-A: ``team-a/check`` (mandatory) and ``team-b/check`` (advisory) are both ``name:
+    check`` but different skills: both render. An alias of the mandatory file renders once."""
+    from types import SimpleNamespace
+    from agent import kanban_turn_recovery, skill_commands
+    from gateway import session_kanban
+
+    files = {"team-a/check": "/s/team-a/check", "team-b/check": "/s/team-b/check", "check": "/s/team-a/check"}
+
+    def load(ids, excluded_loaded_names=None, **_kwargs):  # the real loader's name-keyed exclusion
+        blocks = [f"BLOCK:{i}" for i in ids if "check" not in (excluded_loaded_names or ())]
+        return "\n\n".join(blocks), ["check"] * len(ids), []
+
+    monkeypatch.setattr(skill_commands, "build_preloaded_skills_prompt", load)
+    monkeypatch.setattr(skill_commands, "_load_skill_payload",
+                        lambda ident, **_k: ({}, files[ident], "check") if ident in files else None)
+    monkeypatch.setattr(kanban_turn_recovery, "recover_failed_kanban_turns", lambda *_a, **_k: None)
+    prompts = []
+    agent = SimpleNamespace(session_id="s1", run_conversation=lambda prompt, **_k: prompts.append(prompt) or {
+        "final_response": "ok", "completed": True})
+    context = {"task_id": "t", "skills": ["team-b/check", "check", "team-a/check"],
+               "required_skills": ["team-a/check"], "context": "", "goal_mode": False}
+    session_kanban._run_task_turns(agent, {"text": "go"}, [], context)
+    assert "BLOCK:team-b/check" in prompts[0]
+    assert prompts[0].count("BLOCK:team-a/check") == 1 and "BLOCK:check" not in prompts[0]
