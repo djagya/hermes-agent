@@ -533,20 +533,45 @@ def note_handoff(task_id: Optional[str], slot_id: str, lease_id: str, expires_in
         _minted_handoffs[key] = now + ttl
 
 
-def claim_handback(task_id: str, slot_id: str, lease_id: str) -> bool:
+def claim_handback(task_id: str, slot_id: str, lease_id: str, *, consume: bool = True) -> bool:
     """True (once) when ``task_id`` minted a handoff for this slot + agent lease, or still
-    holds that lease. A minted handoff is consumed by the claim."""
+    holds that lease. A minted handoff is consumed by the claim; ``consume=False`` only checks
+    (dlz: the handback route consumes it after the wake turn is scheduled, so a failed attempt
+    can be retried)."""
     key = (str(task_id or "").strip() or "default", str(slot_id or ""), str(lease_id or ""))
     if not key[1] or not key[2]:
         return False
     now = _monotonic()
     with _handoffs_lock:
-        until = _minted_handoffs.pop(key, 0.0)
-        lost_until = _lost_leases.pop(key, 0.0)
+        if consume:
+            until = _minted_handoffs.pop(key, 0.0)
+            lost_until = _lost_leases.pop(key, 0.0)
+        else:
+            until = _minted_handoffs.get(key, 0.0)
+            lost_until = _lost_leases.get(key, 0.0)
     if until > now or lost_until > now:
         return True
     return any(lease.get(MANAGED_SLOT_ENV) == key[1] and lease.get(MANAGED_LEASE_ENV) == key[2]
                for lease in held_leases_for_task(key[0]))
+
+
+# dlz: how long the handback route waits for control's confirmation; control's notifier allows 10 s.
+HANDBACK_CONFIRM_TIMEOUT_S = 3.0
+
+
+def confirm_handback_event(event_id: str, fields: dict[str, str]) -> Optional[bool]:
+    """dlz: ``GET /v1/handback/pending?event_id=`` (control-v1). True when control still holds
+    this exact event undelivered (every field equal), False when it says no, None when it did
+    not answer (retry later). Control's outbox is written only by control itself, so the
+    controller key alone (readable by model code) cannot make this True; a delivered event is
+    never confirmed again. Blocking: callers on an event loop run it in a thread."""
+    reply = get_json("/v1/handback/pending?" + urlencode({"event_id": event_id}),
+                     timeout=HANDBACK_CONFIRM_TIMEOUT_S)
+    if "pending" not in reply:
+        return None
+    if reply.get("pending") is not True:
+        return False
+    return all(str(reply.get(k) or "") == str(v or "") for k, v in fields.items())
 
 
 def _forget_held(key: str) -> None:

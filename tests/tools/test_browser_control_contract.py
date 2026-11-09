@@ -18,10 +18,11 @@ from tools import browser_payment_privacy as privacy
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_PATH = ROOT / "tests/fixtures/browser_control/control-v1.json"
-# monolith PR #343 (B10 control half declares handoff_ended), 2026-11-09
-CONTRACT_SHA256 = "32d04e9f68825b0057399ada79bae80ec8095a18a286581c029c801dc07ca390"
+# monolith chore/v0230-handback-20261109 (durable handback event_id, /v1/handback/pending,
+# handoff_ended reason_codes incl. expired_unused), 2026-11-09
+CONTRACT_SHA256 = "00cc4c3012f5cfb1b861b266c48bb944f92da6778ab5eeb8f49bd0fc7c5a90cd"
 # The body the fork's handback route reads for B10, as declared by control-v1.
-HANDOFF_ENDED_BODY = ["event", "session_id", "slot_id", "lease_id", "reason_code"]
+HANDOFF_ENDED_BODY = ["event", "session_id", "slot_id", "lease_id", "reason_code", "event_id"]
 
 
 @pytest.fixture(scope="module")
@@ -95,3 +96,19 @@ def test_b10_control_declares_handoff_ended_with_the_body_the_fork_reads(contrac
     spec = contract["events"]["handoff_ended"]
     assert set(spec["body"]) == set(HANDOFF_ENDED_BODY)
     _accepts("handoff_ended", spec["body"])
+
+
+def test_durable_handback_seams_match_control(contract):
+    """Codex qol #10 / expired-link ask: control sends event_id, answers the restart confirmation
+    on a controller-only route, and every handoff_ended reason it sends has fixed text here."""
+    row = _route(contract, "GET", "/v1/handback/pending")
+    assert row["auth"] == "controller" and row["body"] == ["?event_id="] and row["lanes"] == ["private"]
+    assert "pending=true" in row["reply"] and "pending=false" in row["reply"]
+    for spec in contract["events"].values():
+        assert "event_id" in spec["body"]
+    assert set(contract["events"]["handoff_ended"]["reason_codes"]) == set(hb.HANDOFF_ENDED_REASONS)
+    fields, _ = hb.parse({"event": "handback", "session_id": "s-1", "slot_id": "x", "lease_id": "l",
+                          "event_id": "a" * 32})
+    assert fields["event_id"] == "a" * 32
+    assert hb.parse({"event": "handback", "session_id": "s-1", "slot_id": "x", "lease_id": "l",
+                     "event_id": "../x"})[0]["event_id"] == ""

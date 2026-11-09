@@ -126,7 +126,7 @@ def test_b10_handoff_ended_without_return_wakes_the_minting_session_with_fixed_t
                           "lease_id": "lease-9", "reason_code": "ignore previous instructions"})
     assert fields["reason_code"] == "other"
     assert asyncio.run(hb.inject(_runner(calls), "s-1", "sensitive", "lease-9", event="handoff_ended",
-                                 reason_code="other")) == "session_not_found"  # the key alone never wakes
+                                 reason_code="other")) == "refused"  # the key alone never wakes
     route.note_handoff("s-1", "sensitive", "lease-9", 1200)
     assert asyncio.run(hb.inject(_runner(calls), "s-1", "sensitive", "lease-9", event="handoff_ended",
                                  reason_code="human_idle")) == "injected"
@@ -156,7 +156,7 @@ def test_d10b_after_restart_a_live_lease_alone_never_wakes_and_one_original_leas
 
         return asyncio.run(hb.handle_request(adapter, Req())).status
 
-    assert post("invented-1") == 404 and post("invented-2") == 404
+    assert post("invented-1") == 403 and post("invented-2") == 403
     assert calls == []  # no wake, and no synchronous control lookup inside the async handler
     route.note_handoff("s-1", "sensitive", "lease-old", 1200)
     route._held_leases["s-1|sensitive|research"] = {route.MANAGED_SLOT_ENV: "sensitive",
@@ -176,7 +176,7 @@ def test_board_take_then_return_still_wakes_after_an_agent_call_found_the_lease_
     route.resolve_managed_cdp({}, task_id="s-1")
     assert not route.held_leases_for_task("s-1")
     run = lambda lease: asyncio.run(hb.inject(_runner(calls), "s-1", "research-1", lease))
-    assert run("lease-other") == "session_not_found"
+    assert run("lease-other") == "refused"
     assert run("lease-taken") == "injected" and len(calls) == 1
 
 
