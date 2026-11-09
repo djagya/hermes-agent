@@ -131,6 +131,11 @@ class Context:
             return str(self.github.get(parts[1], ""))
         if parts[0] == "env" and len(parts) == 2:
             return self.env.get(parts[1], "")
+        # dlz: whole contexts, for toJSON(inputs) / toJSON(steps) (setup-pm's cache log step).
+        if parts == ["inputs"]:
+            return dict(self.inputs)
+        if parts == ["steps"]:
+            return {sid: dict(step) for sid, step in self.steps.items()}
         if parts[0] == "inputs" and len(parts) == 2:
             if parts[1] not in self.inputs:
                 raise StepError(
@@ -195,6 +200,9 @@ class Context:
                 if text in STRING_FUNCTIONS and len(args) == 2:
                     fn, (left, right) = STRING_FUNCTIONS[text], args
                     return lambda: fn(left(), right())
+                if text == "toJSON" and len(args) == 1:
+                    (arg,) = args
+                    return lambda: json.dumps(arg(), indent=2)
 
                 def unsupported():
                     raise StepError(f"unsupported function: {text}()")

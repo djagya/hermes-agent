@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -483,12 +484,14 @@ def test_setup_pm_under_lint_inputs_runs_the_pinned_toolchain_steps(repo, monkey
     pm = "./.github/actions/setup-pm > "
     assert outcomes[pm + "Read PM pins with the runner bootstrap Python"] == "success"
     assert outcomes[pm + "Install and verify tools through PM"] == "success"
-    assert outcomes[pm + "Cache verified PM tools"] == "success"  # the miss
-    assert outcomes[pm + "Register uv cache pruning"] == "success"  # skipped locally
+    # dlz: the fork's PM tools cache always restores (the miss) and saves only on main/release pushes.
+    assert outcomes[pm + "Restore verified PM tools"] == "success"
+    assert outcomes[pm + "Log PM cache restore results and save policy"] == "success"  # toJSON contexts
     for off in (
-        "Restore verified PM tools without saving",
+        "Save verified PM tools",
         "Preserve and retrieve the pinned toolchain",
         "Cache uv dependency downloads and builds",
+        "Register uv cache pruning",
         "Require an npm dependency lock for caching",
         "Install the requested Python dependencies through PM",
     ):
@@ -501,7 +504,8 @@ def test_setup_pm_under_lint_inputs_runs_the_pinned_toolchain_steps(repo, monkey
     assert prepare[0] == "prepare" and prepare[2]["_PM_TOOLCHAIN"] == "python"
     assert prepare[2]["_PM_ACTION"] == str(ROOT / ".github/actions/setup-pm")
     assert install[0] == "install" and install[2]["_PM_BOOTSTRAP"] == "/usr/bin/python3"
-    assert next(s for _, s, _ in ran[2:]) == "python scripts/check-windows-footguns.py --all"
+    assert "pm_cache_log.py" in ran[2][1]  # the cache log step, then the job's own steps
+    assert next(s for _, s, _ in ran[3:]) == "python scripts/check-windows-footguns.py --all"
 
 
 def test_a_jobs_untracked_outputs_do_not_reach_the_next_job(repo, monkeypatch):
@@ -530,3 +534,21 @@ jobs:
     assert rjl.main([*argv, "--job", "build"]) == 0
     assert not (repo / "install-stamp.json").exists()
     assert (repo / "mine.txt").exists() and (repo / ".gate-tools").is_dir()
+
+
+def test_tojson_renders_whole_contexts_for_the_setup_pm_cache_log(repo, capsys):
+    # dlz: v0.23.0's setup-pm logs its caches from toJSON(inputs)/toJSON(steps); the box gate
+    # failed that step with "unsupported function: toJSON()".
+    ctx = ctx_for(repo)
+    ctx.inputs = {"save-tools-cache": "true", "cache": "true"}
+    ctx.steps["tools-cache-restore"] = {"outputs": {"cache-hit": "true"}, "outcome": "success",
+                                        "conclusion": "success"}
+    inputs = json.loads(ctx.render("${{ toJSON(inputs) }}"))
+    steps = json.loads(ctx.render("${{ toJSON(steps) }}"))
+    assert inputs == ctx.inputs and steps["tools-cache-restore"]["outputs"]["cache-hit"] == "true"
+    path = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "pm_cache_log.py"
+    spec = importlib.util.spec_from_file_location("pm_cache_log", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.log_caches(inputs, steps, "refs/heads/release/v0.23.0-dlz")
+    assert "[setup-pm cache] " in capsys.readouterr().out
