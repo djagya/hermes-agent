@@ -51,10 +51,17 @@ def _available() -> bool:
     return bool(url) and not route.is_disabled_url(url) and url != route.CONFIG_UNREADABLE_URL
 
 
+_RESEARCH_NAMES = frozenset({"research", "(research)"})
+
+
 def _lease(task_id: Optional[str], identity: str = "", mode: str = "") -> tuple[Optional[dict], Optional[str]]:
     """The lease this task holds (filtered by identity/mode), or an error message."""
     leases = _route().held_leases_for_task(task_id)
-    if identity:
+    # dlz: the research slot has no identity; "research" (as the error below names it) picks it.
+    research = identity.strip().lower() in _RESEARCH_NAMES
+    if research:
+        leases = [lease for lease in leases if not lease.get("identity")]
+    elif identity:
         leases = [lease for lease in leases if lease.get("identity") == identity]
     if mode:
         leases = [lease for lease in leases if lease.get("mode") == mode]
@@ -62,7 +69,7 @@ def _lease(task_id: Optional[str], identity: str = "", mode: str = "") -> tuple[
         return None, ("This task holds no browser lease" + (f" for identity {identity!r}" if identity else "")
                       + ". Run browser_exec first; it acquires the slot.")
     if len(leases) > 1:
-        names = sorted({lease.get("identity") or "(research)" for lease in leases})
+        names = sorted({lease.get("identity") or "research" for lease in leases})
         return None, f"This task holds {len(leases)} leases ({', '.join(names)}); pass identity to pick one."
     return leases[0], None
 
@@ -341,7 +348,7 @@ BROWSER_CONTROL_SCHEMA = {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": list(ACTIONS)},
-            "identity": {"type": "string", "description": "Which held lease (the identity used with browser_exec)."},
+            "identity": {"type": "string", "description": "Which held lease (the identity used with browser_exec; research for the research slot)."},
             "mode": {"type": "string", "enum": ["research", "qa"]},
             "request_id": {"type": "string", "description": "cancel: the queued_id from a busy result."},
             "target_id": {"type": "string", "description": "handoff / native_cancel: CDP targetId of the exact tab."},

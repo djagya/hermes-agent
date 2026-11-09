@@ -113,3 +113,16 @@ def test_cancel_refuses_a_ticket_this_task_was_not_issued(monkeypatch, held):
     route._remember_ticket("t1", "q-mine")
     assert _call(action="cancel", request_id="q-mine")["cancelled"] == "q-mine"
     assert posts == [{"request_id": "q-mine", "task": "t1"}]
+
+
+def test_research_names_the_no_identity_lease_when_two_are_held(held):
+    # dlz: with research and shopping held, "pass identity" was impossible to satisfy for research.
+    route._held_leases["t1|shopping|"] = {route.MANAGED_LEASE_ENV: "lease-2", route.MANAGED_TOKEN_ENV: "tok-2",
+                                          route.MANAGED_SLOT_ENV: "shopping", "BU_NAME": "bu2"}
+    lease, error = tool._lease("t1")
+    assert lease is None and "(research)" not in error and "(research, shopping)" in error
+    for name in ("research", "(research)", "Research"):
+        lease, error = tool._lease("t1", identity=name)
+        assert error is None and lease[route.MANAGED_LEASE_ENV] == "lease-1", name
+    lease, _ = tool._lease("t1", identity="shopping")
+    assert lease[route.MANAGED_LEASE_ENV] == "lease-2"
