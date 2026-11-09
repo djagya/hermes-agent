@@ -657,11 +657,12 @@ class GatewayStartupMixin:
             if not self._resume_owner_authorized(entry.session_key, source):
                 continue
             if held:
-                # dlz D02-B: the authority's FIFO owns this conversation; put its lost turn back there
-                # (boot only: the native recovery that follows drains it; a reconnect keeps the pause).
-                from gateway.session_resume_lost import resume_held_session
-                if platform is None and resume_held_session(self, held, entry):
-                    scheduled += 1
+                # dlz D02-B: the authority's FIFO owns this conversation; boot puts its lost turn back
+                # there off-loop (resume_held_sessions) before the native recovery drains it. A reconnect
+                # keeps upstream's pause.
+                from gateway.session_resume_lost import queue_held_session
+                if platform is None:
+                    queue_held_session(self, held, entry)  # counted by resume_held_sessions, not here
                 continue
             # Claim the slot *before* spawning so an inbound message arriving before the task's first
             # await queues instead of building a duplicate AIAgent.
@@ -1626,6 +1627,8 @@ class GatewayStartupMixin:
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions()
+        from gateway.session_resume_lost import resume_held_sessions
+        await resume_held_sessions(self)  # dlz D02-B: off-loop, before the native recovery below
         await self._finish_startup_restore()
         from gateway.run_runtime import recover_gateway_native_sessions
         await recover_gateway_native_sessions(self)

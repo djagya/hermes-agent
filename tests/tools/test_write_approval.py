@@ -1177,3 +1177,53 @@ def test_predictable_skill_replay_refusal_leaves_record_pending(hermes_home, cas
         ok, message = _apply_staged_skill_record(wa, smt, record["id"])
         assert ok is True, message
         assert "new" in skill_md.read_text(encoding="utf-8")
+
+
+def test_skill_replay_preview_follows_aliases_to_one_skill_md(hermes_home):
+    """dlz B19: batch ops naming ``demo`` and ``cat/demo`` edit one SKILL.md; the preview must add
+    both description changes up, or the replay refuses after consuming the capability."""
+    from tools import skill_manager_tool as smt
+    from tools import write_approval as wa
+
+    skill_md = Path(hermes_home) / "skills" / "cat" / "demo" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    original = "---\nname: demo\ndescription: Use when testing locks.\n---\nold\n"
+    skill_md.write_text(original, encoding="utf-8")
+    ops = [{"action": "patch", "name": "demo", "old_string": "testing", "new_string": "testing" + "x" * 20},
+           {"action": "patch", "name": "cat/demo", "old_string": "locks.", "new_string": "locks" + "y" * 20 + "."}]
+    record = smt.stage_skill_write({"action": "batch", "name": None, "operations": ops}, summary="demo",
+                                   origin="foreground")
+    ok, message = _apply_staged_skill_record(wa, smt, record["id"])
+    assert ok is False and "description" in message.lower(), message
+    assert wa.get_pending(wa.SKILLS, record["id"])["state"] == "pending"
+    assert skill_md.read_text(encoding="utf-8") == original
+
+
+def test_lock_landing_during_an_approved_replay_waits_for_it(hermes_home, monkeypatch):
+    """dlz B19: ``hermes curator lock`` takes the skill-write fence, so it cannot land between the
+    replay's pre-consumption lock check and its write (which would strand the record in applying)."""
+    from tools import skill_manager_tool as smt
+    from tools import skill_usage
+    from tools import write_approval as wa
+
+    skill_md = Path(hermes_home) / "skills" / "demo" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    skill_md.write_text("---\nname: demo\ndescription: Use when testing locks.\n---\nold\n", encoding="utf-8")
+    record = smt.stage_skill_write({"action": "patch", "name": "demo", "old_string": "old", "new_string": "new"},
+                                   summary="demo", origin="foreground")
+    real_consume, lockers = wa.consume_pending_apply_capability, []
+
+    def consume_then_race_a_lock(*args):
+        consumed = real_consume(*args)
+        locker = threading.Thread(target=skill_usage.set_locked, args=("demo", True))
+        locker.start()
+        locker.join(0.5)
+        lockers.append(locker)
+        return consumed
+
+    monkeypatch.setattr(wa, "consume_pending_apply_capability", consume_then_race_a_lock)
+    ok, message = _apply_staged_skill_record(wa, smt, record["id"])
+    lockers[0].join(5)
+    assert ok is True, message
+    assert wa.get_pending(wa.SKILLS, record["id"]) is None and "new" in skill_md.read_text(encoding="utf-8")
+    assert skill_usage.is_locked("demo")

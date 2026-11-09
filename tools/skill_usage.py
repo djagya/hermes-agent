@@ -582,7 +582,11 @@ def set_locked(skill_name: str, locked: bool) -> bool:
     curator — must not change this skill's content. NOT curation-gated: hand-written, bundled and
     hub skills can all be locked; archival eligibility is the separate ``pinned`` axis. True when
     the write landed."""
-    return bool(_mutate(skill_name, lambda rec: rec.update({"locked": bool(locked)}) or True))
+    # dlz B19: under the profile skill-write fence, so a lock cannot land between an approved
+    # replay's pre-consumption lock check and its write (the record would strand in ``applying``).
+    from tools.skill_manager_tool import _skill_write_lock
+    with _skill_write_lock():
+        return bool(_mutate(skill_name, lambda rec: rec.update({"locked": bool(locked)}) or True))
 
 
 def is_locked(skill_name: str) -> bool:

@@ -1068,13 +1068,26 @@ def _pending_replay_refusal(clean: dict[str, Any]) -> Optional[str]:
     default = str(clean.get("name") or "")
     if not isinstance(operations, list):
         operations = [clean]
-    def on_disk(name: str) -> Optional[str]:
-        found = _find_skill(name)
-        with suppress(OSError):
-            return (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8-sig") if found else None
-        return None
+    # Keyed by the SKILL.md the op resolves to, so aliases (``demo``, ``cat/demo``) share one preview.
+    created: dict[str, str] = {}
 
-    current: dict[str, Optional[str]] = {}  # each skill's SKILL.md as the replay will have left it
+    def target_of(name: str, action: str, op: dict) -> tuple[str, Optional[str]]:
+        """(canonical SKILL.md key, its current text on disk)."""
+        if action == "create":
+            key = str((_resolve_skill_dir(name, op.get("category")) / "SKILL.md").resolve(strict=False))
+            created[name] = created[Path(name).name] = key
+            return key, None
+        if name in created or Path(name).name in created:
+            return created.get(name) or created[Path(name).name], None
+        found = _find_skill(name)
+        if not found:
+            return "?" + name, None
+        path = (Path(found["path"]) / "SKILL.md").resolve(strict=False)
+        with suppress(OSError):
+            return str(path), path.read_text(encoding="utf-8-sig")
+        return str(path), None
+
+    current: dict[str, Optional[str]] = {}  # each SKILL.md as the replay will have left it
     unknown: set[str] = set()  # a step this preview cannot reproduce: the replay itself decides
     for op in operations:
         if not isinstance(op, dict):
@@ -1083,34 +1096,34 @@ def _pending_replay_refusal(clean: dict[str, Any]) -> Optional[str]:
         if (locked := _locked_guard(name, action)) is not None:
             return (f"{locked.get('error')} Approving does not override a lock: unlock it "
                     f"(`hermes curator unlock {name}`), then approve again; or reject this write.")
-        if name in unknown:
-            continue
         file_path = op.get("file_path")
-        if name not in current:
-            current[name] = None if action == "create" else on_disk(name)
+        key, disk = target_of(name, action, op)
+        if key in unknown:
+            continue
+        current.setdefault(key, disk)
         if action == "write_file" and _is_skill_md_target(file_path):
             new = op.get("file_content")
         elif action in {"create", "edit"} or (action == "patch" and op.get("content")):
             new = op.get("content")
-        elif action == "patch" and _is_skill_md_target(file_path) and current[name] is not None:
+        elif action == "patch" and _is_skill_md_target(file_path) and current[key] is not None:
             from tools.fuzzy_match import fuzzy_find_and_replace
             new = None
             with suppress(Exception):
                 replaced, _count, _strategy, match_error = fuzzy_find_and_replace(
-                    current[name], op.get("old_string") or "", op.get("new_string") or "",
+                    current[key], op.get("old_string") or "", op.get("new_string") or "",
                     bool(op.get("replace_all")))
                 new = None if match_error else replaced
             if new is None:
-                unknown.add(name)
+                unknown.add(key)
                 continue
         else:
             continue
         if not isinstance(new, str):
-            unknown.add(name)
+            unknown.add(key)
             continue
-        if err := _description_budget_error(new, before=current[name]):
+        if err := _description_budget_error(new, before=current[key]):
             return f"Skill '{name}': {err} Reject this write and restage it with a shorter description."
-        current[name] = new
+        current[key] = new
     return None
 
 

@@ -398,11 +398,17 @@ KANBAN_TURN_AUTHOR = {'id': 'kanban:dispatcher', 'name': 'Kanban dispatcher', 'i
 
 def _run_task_turns(agent, frame, history, context):
     from agent.skill_commands import build_preloaded_skills_prompt
-    skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
-    # dlz: a mandatory skill that did not load stops the card before any model turn (D03-A).
+    # dlz: a mandatory skill that did not load stops the card before any model turn (D03-A). Resolved
+    # on its own: ``missing`` holds display labels ("Ambiguous skill name x: ..."), not identifiers,
+    # and an ambiguous, unknown or disabled mandatory skill is missing alike (fail closed).
     # ``.get``: a claim saved before this key existed carries no mandatory list.
-    if required_missing := [s for s in context.get('required_skills') or () if s.strip() in missing]:
-        raise MissingRequiredSkill(f"required skill(s) missing or disabled in this profile: {', '.join(required_missing)}")
+    if required := [s for s in context.get('required_skills') or () if s and s.strip()]:
+        from agent.skill_commands import format_missing_skills
+        _, _, required_missing = build_preloaded_skills_prompt(required, task_id=agent.session_id)
+        if required_missing:
+            raise MissingRequiredSkill(f"required skill(s) missing or disabled in this profile: "
+                                       f"{format_missing_skills(required_missing)}")
+    skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
     if missing and not loaded:
         raise ValueError('kanban_skills_unavailable')
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)

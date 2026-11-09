@@ -88,7 +88,8 @@ def test_required_missing_among_loaded_refuses_advisory_partial_continues():
         preload(["missing"])
 
 
-def test_owner_run_card_missing_required_skill_books_typed_exit(kanban_home, monkeypatch):
+@pytest.mark.parametrize("label", ["needed", "Ambiguous skill name needed: two skills match"])
+def test_owner_run_card_missing_required_skill_books_typed_exit(kanban_home, monkeypatch, label):
     """dlz D03-A: on the owner-run path a mandatory skill that did not load stops the card before
     any model turn and books exit 77 (blocked missing_skill), even when other skills loaded."""
     import json
@@ -106,8 +107,10 @@ def test_owner_run_card_missing_required_skill_books_typed_exit(kanban_home, mon
     context = {"db": str(kb.kanban_db_path()), "task_id": tid, "run_id": task.current_run_id,
                "claim_lock": task.claim_lock, "skills": ["advisory", "needed"], "required_skills": ["needed"],
                "context": "", "goal_mode": False}
+    # The loader reports an unresolved name by its display label (an ambiguous one is not "needed").
     monkeypatch.setattr(skill_commands, "build_preloaded_skills_prompt",
-                        lambda *_a, **_k: ("advisory prompt", ["advisory"], ["needed"]))
+                        lambda ids, **_k: ("advisory prompt" if "advisory" in ids else "",
+                                           ["advisory"] if "advisory" in ids else [], [label]))
     agent = SimpleNamespace(session_id="s1", run_conversation=MagicMock(side_effect=AssertionError("ran")))
     with pytest.raises(session_kanban.MissingRequiredSkill):
         session_kanban.run_worker_turns(agent, {"policy": {"kanban_json": json.dumps(context)}, "text": "go"}, [])
