@@ -7,6 +7,7 @@ import json
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,7 @@ def fill(monkeypatch):
     events = []
     inspected = SimpleNamespace(
         consumed=False, merchant_origin="https://shop.test", frame_origin="https://psp.test",
+        documents=(), expires_at=time.monotonic() + 120,
         target_origins=("https://psp.test",),
         prompt=lambda: {"merchant_origin": "https://shop.test", "target_origin": "https://psp.test",
                         "fields": ["cc-number"], "checks": []})
