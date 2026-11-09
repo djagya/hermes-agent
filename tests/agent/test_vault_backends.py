@@ -341,7 +341,11 @@ if argv[:2] == ["item", "get"]:
         sys.stderr.write("a vault query must be provided when this command is called by a service account\n"); sys.exit(1)
     if "item-c" in argv:  # a revoked/garbled token: op's own wording mentions a session
         sys.stderr.write("error initializing client: Validation: (failed to session.DecodeSACredentials)\n"); sys.exit(1)
-    print("123456" if "--otp" in argv else "dummy-password"); sys.exit(0)
+    if "--otp" in argv:
+        print("123456"); sys.exit(0)
+    # dlz: password reads take the whole item as JSON (``--format json``), not CSV-quoted ``--fields``.
+    print(json.dumps({"id": argv[2], "fields": [{"id": "password", "purpose": "PASSWORD", "label": "password",
+                                                 "value": "dummy-password"}]})); sys.exit(0)
 sys.exit(2)
 '''
 
@@ -366,10 +370,11 @@ def test_onepassword_service_account_reads_name_the_items_own_vault(fake_op_serv
     fill = new_backend()  # a fill: get_meta proves handle + origin, then the read reuses that listing
     assert fill.get_meta("op:item-b") is not None
     assert fill.resolve_password("op:item-b") == "dummy-password"
-    assert new_backend().resolve_otp("op:item-a") == "123456"  # a code read on a fresh backend lists once
+    # dlz: a fresh backend reuses the TTL-cached listing (1Password read budget) and still proves the handle.
+    assert new_backend().resolve_otp("op:item-a") == "123456"
     calls = [a[:2] if a[:2] == ["item", "list"] else a for a in map(json.loads, log.read_text(encoding="utf-8-sig").splitlines())]
-    assert calls == [["item", "list"], ["item", "get", "item-b", "--vault", "vault-b", "--fields", "label=password", "--reveal"],
-                     ["item", "list"], ["item", "get", "item-a", "--vault", "vault-a", "--otp"]]
+    assert calls == [["item", "list"], ["item", "get", "item-b", "--vault", "vault-b", "--format", "json", "--reveal"],
+                     ["item", "get", "item-a", "--vault", "vault-a", "--otp"]]
 
 
 def test_onepassword_service_account_refusals_name_the_real_cause(fake_op_service_account):
@@ -380,5 +385,8 @@ def test_onepassword_service_account_refusals_name_the_real_cause(fake_op_servic
         new_backend().resolve_password("op:--help")
     assert new_backend().resolve_otp("op:ghost") is None
     assert all(json.loads(a)[:2] != ["item", "get"] for a in log.read_text(encoding="utf-8-sig").splitlines())
-    with pytest.raises(RuntimeError, match="DecodeSACredentials"):
+    # dlz: typed cause (a token cannot be fixed by an interactive unlock), op's own words kept in the detail.
+    from agent.vault_backends.base import BackendAuthExpired
+    with pytest.raises(BackendAuthExpired) as expired:
         new_backend().resolve_password("op:item-c")
+    assert "DecodeSACredentials" in expired.value.detail

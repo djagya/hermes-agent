@@ -167,6 +167,12 @@ class OnePasswordLoginBackend(LoginBackend):
         with _list_cache_lock:
             hit = _list_cache.get(key)
         if hit is not None and now - hit[0] < LIST_CACHE_TTL_S:
+            # A fresh backend (one per tool call) must still prove handles from this listing.
+            self._item_vaults = {}
+            for meta in hit[1]:
+                if meta.kind == "login":
+                    vault_id, item_id = _split_handle(meta.id, self.prefix)
+                    self._item_vaults[item_id] = vault_id or ""
             return list(hit[1])
         items = self._list_items_uncached()
         with _list_cache_lock:
