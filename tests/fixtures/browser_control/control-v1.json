@@ -835,6 +835,16 @@
         "lease_id",
         "resumed_lease_id"
       ]
+    },
+    "handoff_ended": {
+      "to": "BROWSER_HANDBACK_NOTIFY_URL (POST, controller bearer)",
+      "body": [
+        "event",
+        "session_id",
+        "slot_id",
+        "lease_id",
+        "reason_code"
+      ]
     }
   }
 }

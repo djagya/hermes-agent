@@ -18,10 +18,9 @@ from tools import browser_payment_privacy as privacy
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_PATH = ROOT / "tests/fixtures/browser_control/control-v1.json"
-# monolith 0a4e658c9e (origin/main, 2026-11-07)
-CONTRACT_SHA256 = "d0d49bbf9f3cc4adfad6ae8e7bccb21e4686bb0569970435c9d7cb0484657111"
-# The body the fork's handback route reads for B10. Pending: monolith control-v1 must declare it
-# (control half of B10); until then the test below is a strict xfail and turns red when it lands.
+# monolith PR #343 (B10 control half declares handoff_ended), 2026-11-09
+CONTRACT_SHA256 = "32d04e9f68825b0057399ada79bae80ec8095a18a286581c029c801dc07ca390"
+# The body the fork's handback route reads for B10, as declared by control-v1.
 HANDOFF_ENDED_BODY = ["event", "session_id", "slot_id", "lease_id", "reason_code"]
 
 
@@ -92,8 +91,6 @@ def test_every_event_control_declares_is_accepted_by_the_handback_route(contract
         _accepts(name, spec["body"])
 
 
-@pytest.mark.xfail(strict=True, reason="pending-control: monolith control-v1 does not declare handoff_ended yet "
-                   "(B10 control half); re-vendor the contract when it lands")
 def test_b10_control_declares_handoff_ended_with_the_body_the_fork_reads(contract):
     spec = contract["events"]["handoff_ended"]
     assert set(spec["body"]) == set(HANDOFF_ENDED_BODY)
