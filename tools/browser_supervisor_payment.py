@@ -36,6 +36,8 @@ _COVERAGE_REFUSALS = frozenset({
 # well inside commit_payment's 20 s budget. Never a retry window. dlz: 2 s, not 1 s: a reset that
 # lands between 1 and 2 s after the last write was still reported as success.
 _SETTLE_SECONDS = 2.0
+# dlz: commit_payment's whole budget; no write lands in a renderer after it (see _renderer_deadline_ms).
+_COMMIT_BUDGET_SECONDS = 20.0
 _RETENTION_STATES = frozenset({"held", "empty", "changed", "replaced"})
 # Card fields a saved card may lack: left empty for the user instead of refusing the whole fill.
 OPTIONAL_CARD_TOKENS = frozenset({"cc-name", "postal-code"})
@@ -50,6 +52,8 @@ class PaymentDocument:
     object_id: str
     origin: str
     controls: tuple
+    # dlz: host monotonic time just after this document's closure was created (its renderer clock anchor).
+    clock_anchor: float | None = None
 
 
 @dataclass
@@ -67,6 +71,8 @@ class PaymentInspection:
     # dlz: parent frame id -> (session, [(frame id, pinned owner <iframe> handle)]) for every frame from a card
     # document up to the page, all handles of one parent in one isolated world (one call checks them all).
     frame_owners: dict = field(default_factory=dict, repr=False)
+    # dlz: the one release pass (asyncio task) shared by commit and discard.
+    release_task: Any = field(default=None, repr=False, compare=False)
 
     @property
     def controls(self) -> tuple:
@@ -364,6 +370,7 @@ class PaymentSupervisionMixin:
         child_sessions = {}
         operation = secrets.token_hex(16)
         candidates = []
+        anchors: dict = {}
         try:
             tree = await self._payment_tree(sid, child_sessions)
             merchant = https_origin(tree[0][3])
@@ -398,9 +405,11 @@ class PaymentSupervisionMixin:
                     },
                     session_id=fsid,
                 )
+                anchor = time.monotonic()  # after the closure read its clock: see _renderer_deadline_ms
                 obj = reply.get("result", {}).get("result", {}).get("objectId")
                 if not obj:
                     raise PaymentPolicyError("Payment document unavailable")
+                anchors[obj] = anchor
                 raw = _value(
                     await self._cdp(
                         "Runtime.callFunctionOn",
@@ -425,6 +434,8 @@ class PaymentSupervisionMixin:
                         "Runtime.releaseObject", {"objectId": obj}, session_id=fsid
                     )
             documents = _explained_card_documents(candidates, merchant, tree, allowed_frames)
+            for d in documents:
+                d.clock_anchor = anchors.get(d.object_id)
             if await self._payment_tree(sid, child_sessions) != tree:
                 raise PaymentPolicyError("Payment page changed during inspection")
             owners = await self._pin_frame_owners(documents, tree, sid, child_sessions)
@@ -590,36 +601,49 @@ class PaymentSupervisionMixin:
         from agent.async_utils import safe_schedule_threadsafe
         from tools.browser_supervisor import _LoopUnavailable
 
-        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills), self._loop)
+        until = time.monotonic() + _COMMIT_BUDGET_SECONDS
+        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills, until), self._loop)
         if future is None:
             raise _LoopUnavailable("Browser supervisor loop unavailable")
         try:
-            return future.result(timeout=20)
+            return future.result(timeout=_COMMIT_BUDGET_SECONDS)
         except concurrent.futures.TimeoutError:
-            # dlz: stop the commit where it is (no write after its budget); what landed is unknown.
+            # dlz: stop the commit where it is; a write already in flight is refused by the renderer past
+            # `until`, and what landed is unknown. Consumed (never a retry), so the caller skips its discard:
+            # the release pass is awaited here instead (bounded), also when the commit never started.
             future.cancel()
             inspected.consumed = True
+            try:
+                self.discard_payment(inspected)
+            except Exception:  # health: allow BLE001 -- a stalled loop or gone browser; the release task keeps going
+                pass
             return {"success": False, "error_type": "payment_transport_uncertain", "partially_filled": True}
 
-    async def _commit_payment(self, i: PaymentInspection, fills: list[dict]) -> dict:
+    async def _commit_payment(self, i: PaymentInspection, fills: list[dict], until: float | None = None) -> dict:
         if i.consumed:
             return {"success": False, "error_type": "payment_consent_consumed"}
+        try:
+            return await self._commit_payment_once(i, fills, until)
+        finally:
+            # dlz: one cleanup for the whole lifecycle (freshness included) that a cancellation cannot cut short.
+            await self._release_once(i)
+
+    async def _commit_payment_once(self, i: PaymentInspection, fills: list[dict], until: float | None) -> dict:
         if time.monotonic() >= i.expires_at:
             # dlz: the inspection window closed (late approval, slow card lookup): nothing is written, and
             # the result says so instead of reading as a changed page.
             i.consumed = True
-            await self._release_payment_documents(i)
             return {"success": False, "error_type": "payment_consent_expired"}
         if not await self._payment_is_current(i):
             i.consumed = True
-            await self._release_payment_documents(i)
             return {"success": False, "error_type": "payment_page_changed"}
         if time.monotonic() >= i.expires_at:  # dlz: the freshness pass itself can outlast the window
             i.consumed = True
-            await self._release_payment_documents(i)
             return {"success": False, "error_type": "payment_consent_expired"}
         # Consume before ingress; transport uncertainty is never a retry authorization.
         i.consumed = True
+        # dlz: the renderer's write deadline: the consent window or the commit budget, whichever ends first.
+        stop = i.expires_at if until is None else min(i.expires_at, until)
         filled = 0
         try:
             # Every document was re-validated just above. A split checkout is written one
@@ -631,7 +655,8 @@ class PaymentSupervisionMixin:
                     # dlz: no write after the window closes; earlier documents' values are reported, not
                     # completed.
                     return _partial({"success": False, "error_type": "payment_consent_expired"}, filled)
-                result = await self._commit_payment_document(document, document_fills, deadline_ms=_wall_deadline_ms(i))
+                result = await self._commit_payment_document(
+                    document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop))
                 if not result.get("success"):
                     return _partial(result, filled)
                 filled += result.get("filled_fields", 0)
@@ -651,8 +676,6 @@ class PaymentSupervisionMixin:
             return _partial({"success": False, "error_type": "payment_fields_invalid"}, filled)
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
             return _partial({"success": False, "error_type": "payment_transport_uncertain"}, filled)
-        finally:
-            await self._release_payment_documents(i)
 
     async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None) -> dict:
         result = _value(
@@ -699,16 +722,29 @@ class PaymentSupervisionMixin:
             await self._release_payment_object(d.frame_session, d.object_id)
         await self._release_payment_sessions(i.child_sessions)
 
+    async def _release_once(self, i: PaymentInspection) -> None:
+        """dlz: release every pinned object and child session once per inspection. The pass runs as its own
+        task (each CDP call bounded by ``_cdp``'s timeout), so cancelling a commit or a discard that waits on it
+        never cuts it short; a later discard awaits the same pass instead of starting another."""
+        if i.release_task is None:
+            i.release_task = asyncio.ensure_future(self._release_payment_documents(i))
+        await asyncio.shield(i.release_task)
+
     def discard_payment(self, i: PaymentInspection) -> None:
         from tools.browser_supervisor import _schedule
 
         i.consumed = True
-        _schedule(self._release_payment_documents(i), self._loop, timeout=12)
+        _schedule(self._release_once(i), self._loop, timeout=12)
 
 
-def _wall_deadline_ms(i: PaymentInspection) -> float:
-    """dlz: the inspection deadline on the wall clock (ms) the renderer reads with Date.now()."""
-    return time.time() * 1000 + (i.expires_at - time.monotonic()) * 1000
+def _renderer_deadline_ms(d: PaymentDocument, stop: float) -> float:
+    """dlz: the write deadline in the document's own monotonic clock: ms after its closure was created
+    (``born = performance.now()``). The anchor is taken after that creation returned, so the deadline lands
+    at or before ``stop`` on the host however late the commit call runs, and a wall-clock step cannot move
+    it (no margin needed). No anchor: 0, nothing is written."""
+    if d.clock_anchor is None:
+        return 0.0
+    return max(0.0, (stop - d.clock_anchor) * 1000)
 
 
 # dlz: each pinned owner <iframe> is still shown to the user (strict: transparent or hidden ancestors too).
@@ -765,6 +801,8 @@ def _partial(result: dict, filled_before: int) -> dict:
     return {**result, "filled_fields": filled_before + result.get("filled_fields", 0), "partially_filled": True}
 
 _INSPECT = r"""(() => {
+  // dlz: the document's monotonic clock at creation; commit deadlines count from here (_renderer_deadline_ms).
+  const born = performance.now();
   const doc = document, href = location.href;
   // Inputs and selects in document order, including those inside open shadow roots (Unzer UI v2
   // renders every card input in one); closed roots stay out of reach and therefore out of scope. A
@@ -843,8 +881,9 @@ _INSPECT = r"""(() => {
     commit: (fills, deadline) => {
       if (used || !valid()) return {success:false,error_type:'payment_fields_changed'};
       used = true;
-      // dlz: the consent window, on the wall clock; checked here and again before every setter.
-      const late = () => typeof deadline === 'number' && Date.now() >= deadline;
+      // dlz: `deadline` is ms after `born` on this document's monotonic clock (never Date.now(): a wall-clock
+      // step must not reopen the window); checked here and again before every setter. Not a number: late.
+      const late = () => !(typeof deadline === 'number' && performance.now() - born < deadline);
       if (late()) return {success:false,error_type:'payment_consent_expired'};
       if (!Array.isArray(fills) || !fills.length ||
           fills.some(f=>!selected.has(f.index) || typeof f.value !== 'string' || !f.value) ||
