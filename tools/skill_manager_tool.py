@@ -1057,6 +1057,63 @@ def _skill_manage_from(payload: dict[str, Any], **extra) -> str:
         **{k: payload.get(k) for k in _FLAT_OP_KEYS}, **extra)
 
 
+def _pending_replay_refusal(clean: dict[str, Any]) -> Optional[str]:
+    """dlz: refusals an approved replay can predict, checked BEFORE its one-shot capability is
+    consumed (B19). A refusal after consumption strands the record in ``applying``; before it,
+    ``apply_pending_record`` returns the record to pending. Covers every flat/batch target's lock
+    (an approval does not override a lock, D30-A) and the description budget of each root SKILL.md
+    write, step by step as ``_guarded_write`` will see it."""
+    from tools.skill_manager_guards import _locked_guard
+    operations = clean.get("operations")
+    default = str(clean.get("name") or "")
+    if not isinstance(operations, list):
+        operations = [clean]
+    def on_disk(name: str) -> Optional[str]:
+        found = _find_skill(name)
+        with suppress(OSError):
+            return (Path(found["path"]) / "SKILL.md").read_text(encoding="utf-8-sig") if found else None
+        return None
+
+    current: dict[str, Optional[str]] = {}  # each skill's SKILL.md as the replay will have left it
+    unknown: set[str] = set()  # a step this preview cannot reproduce: the replay itself decides
+    for op in operations:
+        if not isinstance(op, dict):
+            continue  # malformed shapes are refused by the replay's own validation, pre-mutation
+        action, name = str(op.get("action") or ""), str(op.get("name") or default)
+        if (locked := _locked_guard(name, action)) is not None:
+            return (f"{locked.get('error')} Approving does not override a lock: unlock it "
+                    f"(`hermes curator unlock {name}`), then approve again; or reject this write.")
+        if name in unknown:
+            continue
+        file_path = op.get("file_path")
+        if name not in current:
+            current[name] = None if action == "create" else on_disk(name)
+        if action == "write_file" and _is_skill_md_target(file_path):
+            new = op.get("file_content")
+        elif action in {"create", "edit"} or (action == "patch" and op.get("content")):
+            new = op.get("content")
+        elif action == "patch" and _is_skill_md_target(file_path) and current[name] is not None:
+            from tools.fuzzy_match import fuzzy_find_and_replace
+            new = None
+            with suppress(Exception):
+                replaced, _count, _strategy, match_error = fuzzy_find_and_replace(
+                    current[name], op.get("old_string") or "", op.get("new_string") or "",
+                    bool(op.get("replace_all")))
+                new = None if match_error else replaced
+            if new is None:
+                unknown.add(name)
+                continue
+        else:
+            continue
+        if not isinstance(new, str):
+            unknown.add(name)
+            continue
+        if err := _description_budget_error(new, before=current[name]):
+            return f"Skill '{name}': {err} Reject this write and restage it with a shorter description."
+        current[name] = new
+    return None
+
+
 def apply_skill_pending(payload: dict[str, Any]) -> str:
     """Replay a staged skill write under a live one-shot approval capability."""
     try:
@@ -1066,6 +1123,10 @@ def apply_skill_pending(payload: dict[str, Any]) -> str:
                 key: value for key, value in payload.items() if not key.startswith("_")
             }
             from tools import write_approval as wa
+
+            # dlz: predictable refusals before consumption leave the record pending (B19, D30-A).
+            if (refusal := _pending_replay_refusal(clean)) is not None:
+                return tool_error(refusal, success=False)
 
             if not wa.consume_pending_apply_capability(wa.SKILLS, payload):
                 return tool_error(

@@ -906,7 +906,15 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             clean_text = persist_override if persist_override is not None else ctx.message
             persist_override = clean_text
             ctx.message = api_text
+        from gateway.session_resume_lost import resumed_turn
+        if (resumed := resumed_turn.get()) is not None:
+            # dlz D02-B: the authority put a restart-cut turn back; it continues with the note that
+            # quotes its request (persisted like the legacy auto-resume's), never as a NEW message.
+            ctx.message = persist_override = resumed
         self._prepend_pending_note("_pending_model_notes")
+        if resumed is not None:
+            self._prepend_pending_note("_pending_skills_reload_notes")
+            return persist_override, ctx.persist_user_timestamp
         # Auto-continue: history ending with a tool result means the previous turn was cut off
         # (restart, crash, SIGTERM). Session-level resume_pending (drain-timeout shutdown) uses
         # stronger reason-aware wording that subsumes this case. Both gate on the age of

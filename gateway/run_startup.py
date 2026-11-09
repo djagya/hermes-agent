@@ -635,8 +635,9 @@ class GatewayStartupMixin:
             # Canonical admissions own restart decisions, including unknown pauses.
             # Legacy synthetic resume must not race their restored FIFO.
             from gateway.session_authorities import all_authorities, holds_admission
-            if any(holds_admission(authority, entry.session_id) for authority in all_authorities(self)):
-                continue
+            held = [authority for authority in all_authorities(self) if holds_admission(authority, entry.session_id)]
+            if any(getattr(authority, 'retiring', False) for authority in held):
+                continue  # dlz: a retained store that may own it: fail closed, never toward resume
             # Epoch math: the marker was stamped naive-local by the previous process, possibly
             # on the other side of a DST change; wall-clock subtraction is off by the shift.
             marker = entry.last_resume_marked_at or entry.updated_at
@@ -654,6 +655,13 @@ class GatewayStartupMixin:
                 )
                 continue
             if not self._resume_owner_authorized(entry.session_key, source):
+                continue
+            if held:
+                # dlz D02-B: the authority's FIFO owns this conversation; put its lost turn back there
+                # (boot only: the native recovery that follows drains it; a reconnect keeps the pause).
+                from gateway.session_resume_lost import resume_held_session
+                if platform is None and resume_held_session(self, held, entry):
+                    scheduled += 1
                 continue
             # Claim the slot *before* spawning so an inbound message arriving before the task's first
             # await queues instead of building a duplicate AIAgent.

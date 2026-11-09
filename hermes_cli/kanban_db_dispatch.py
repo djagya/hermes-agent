@@ -2790,9 +2790,14 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """The profile owner executes; this subprocess only waits for its receipt."""
+    """The profile owner executes; this subprocess only waits for its receipt.
+
+    dlz: ``-P`` (B10): the worker starts with ``cwd=<task workspace>`` and a plain ``-m`` puts that
+    cwd first on ``sys.path``, so a workspace that is itself a Hermes checkout shadowed the
+    installed ``hermes_cli`` (an older tree has no ``kanban_worker_client``: the card died at
+    spawn). ``-P`` drops the cwd entry; the spawn pins this install's root on PYTHONPATH."""
     import sys
-    return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+    return [sys.executable, "-P", "-m", "hermes_cli.kanban_worker_client"]
 
 
 def _open_worker_log(task: Task, board: Optional[str]):
@@ -2955,7 +2960,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # The worker is `-m hermes_cli.kanban_worker_client`: Hermes itself, with no console-script
+    # The worker is `-P -m hermes_cli.kanban_worker_client`: Hermes itself, with no console-script
     # bootstrap. The routed-profile scrub above strips Hermes-owned PYTHONPATH entries (user
     # children must not see our tree), so a PYTHONPATH-launched dispatcher spawned a child that
     # died on `No module named 'hermes_cli'` before it ever reached the owner. Same pin as cron's

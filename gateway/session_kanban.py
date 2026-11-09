@@ -16,6 +16,11 @@ def card_skills(task):
     return list(dict.fromkeys([*(task.skills or ()), *(task.required_skills or ())]))
 
 
+class MissingRequiredSkill(ValueError):
+    """dlz: a card's mandatory skill did not load; the attempt is booked as the typed
+    ``KANBAN_MISSING_SKILL_EXIT_CODE`` (blocked ``missing_skill``), never run without it (D03-A)."""
+
+
 def build_kanban_policy(connection, params, config):
     from hermes_cli import kanban_db as kb
     from hermes_cli.profiles import resolve_profile_env
@@ -65,7 +70,8 @@ def build_kanban_policy(connection, params, config):
         policy = replace(policy, model=_resolve_gateway_model(policy.config()))
     context = dict(params, workspace=cwd, branch=task.branch_name, tenant=task.tenant,
         profile=task.assignee, workspaces_root=str(kb.workspaces_root(board=board).resolve()),
-        skills=skills, goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,
+        skills=skills, required_skills=list(task.required_skills or ()),
+        goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
         max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
     context['db'] = str(path)
@@ -286,6 +292,10 @@ def _run_worker_turns(agent, frame, history):
         code = turn_exit_code(result, kanban_worker=True)
         last_output = str(result.get('final_response') or '')[-500:] if isinstance(result, dict) else ''
         return result
+    except MissingRequiredSkill as exc:
+        from hermes_cli.kanban_db import KANBAN_MISSING_SKILL_EXIT_CODE
+        code, last_output = KANBAN_MISSING_SKILL_EXIT_CODE, str(exc)
+        raise
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
         raise
@@ -389,6 +399,10 @@ KANBAN_TURN_AUTHOR = {'id': 'kanban:dispatcher', 'name': 'Kanban dispatcher', 'i
 def _run_task_turns(agent, frame, history, context):
     from agent.skill_commands import build_preloaded_skills_prompt
     skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
+    # dlz: a mandatory skill that did not load stops the card before any model turn (D03-A).
+    # ``.get``: a claim saved before this key existed carries no mandatory list.
+    if required_missing := [s for s in context.get('required_skills') or () if s.strip() in missing]:
+        raise MissingRequiredSkill(f"required skill(s) missing or disabled in this profile: {', '.join(required_missing)}")
     if missing and not loaded:
         raise ValueError('kanban_skills_unavailable')
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)

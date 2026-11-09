@@ -86,3 +86,30 @@ def test_required_missing_among_loaded_refuses_advisory_partial_continues():
     assert preload([]).preloaded_skills == ["present"]
     with pytest.raises(cli_mod.RequiredSkillError, match="missing"):
         preload(["missing"])
+
+
+def test_owner_run_card_missing_required_skill_books_typed_exit(kanban_home, monkeypatch):
+    """dlz D03-A: on the owner-run path a mandatory skill that did not load stops the card before
+    any model turn and books exit 77 (blocked missing_skill), even when other skills loaded."""
+    import json
+    import os
+    from types import SimpleNamespace
+    from agent import skill_commands
+    from gateway import session_kanban
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="mandatory", assignee="default", required_skills=["needed"])
+        task = kb.claim_task(conn, tid, claimer="host:owner")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "worker_bound", {"pid": os.getpid(), "claim_lock": task.claim_lock},
+                             run_id=task.current_run_id)
+    context = {"db": str(kb.kanban_db_path()), "task_id": tid, "run_id": task.current_run_id,
+               "claim_lock": task.claim_lock, "skills": ["advisory", "needed"], "required_skills": ["needed"],
+               "context": "", "goal_mode": False}
+    monkeypatch.setattr(skill_commands, "build_preloaded_skills_prompt",
+                        lambda *_a, **_k: ("advisory prompt", ["advisory"], ["needed"]))
+    agent = SimpleNamespace(session_id="s1", run_conversation=MagicMock(side_effect=AssertionError("ran")))
+    with pytest.raises(session_kanban.MissingRequiredSkill):
+        session_kanban.run_worker_turns(agent, {"policy": {"kanban_json": json.dumps(context)}, "text": "go"}, [])
+    agent.run_conversation.assert_not_called()
+    assert session_kanban.worker_exit_code(kb.kanban_db_path(), context) == kb.KANBAN_MISSING_SKILL_EXIT_CODE

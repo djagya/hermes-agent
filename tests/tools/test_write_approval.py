@@ -1144,3 +1144,36 @@ def test_staged_hint_keeps_command_for_chat_gateway_platform(hermes_home, monkey
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     r = _stage_one_memory_write()
     assert "/memory pending" in r["message"], r["message"]
+
+
+@pytest.mark.parametrize("case", ["locked_flat", "locked_batch", "long_description"])
+def test_predictable_skill_replay_refusal_leaves_record_pending(hermes_home, case):
+    """dlz B19/D30-A: a lock (or the description budget) refuses an approved replay BEFORE the
+    one-shot capability is consumed, so the record returns to pending instead of sticking in
+    applying; after unlocking, the same record approves."""
+    from tools import skill_manager_tool as smt
+    from tools import skill_usage
+    from tools import write_approval as wa
+
+    skill_md = Path(hermes_home) / "skills" / "demo" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    original = "---\nname: demo\ndescription: Use when testing locks.\n---\nold\n"
+    skill_md.write_text(original, encoding="utf-8")
+    op = {"action": "patch", "name": "demo", "old_string": "old", "new_string": "new"}
+    if case == "long_description":
+        op.update(old_string="Use when testing locks.", new_string="Use when " + "x" * 80 + ".")
+    payload = {"action": "batch", "name": None, "operations": [op]} if case == "locked_batch" else op
+    record = smt.stage_skill_write(payload, summary="demo", origin="foreground")
+    if case != "long_description":
+        skill_usage.set_locked("demo", True)
+
+    ok, message = _apply_staged_skill_record(wa, smt, record["id"])
+    assert ok is False
+    assert ("unlock" if case != "long_description" else "description") in message
+    assert wa.get_pending(wa.SKILLS, record["id"])["state"] == "pending"
+    assert skill_md.read_text(encoding="utf-8") == original
+    if case != "long_description":
+        skill_usage.set_locked("demo", False)
+        ok, message = _apply_staged_skill_record(wa, smt, record["id"])
+        assert ok is True, message
+        assert "new" in skill_md.read_text(encoding="utf-8")

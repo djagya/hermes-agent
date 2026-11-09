@@ -330,6 +330,10 @@ async def execute_admission(authority, ref, row):
     captured = {}
     result_token = execution_result.set(captured)
     token = executing_admission.set(True)
+    # dlz D02-B: a lost turn put back by gateway.session_resume_lost runs with the continue note.
+    from gateway.session_resume_lost import resume_note, resumed_turn
+    resume_token = resumed_turn.set(await asyncio.to_thread(resume_note, authority.db, row)
+                                    if 'native_text_v1' in row['payload'] else None)
     # This drain, not the handler's unwind, releases the turn's crash marker (see below).
     event._turn_marker_handoff = True
     handed = False
@@ -386,6 +390,7 @@ async def execute_admission(authority, ref, row):
             _take_post_delivery(authority, row['admission_id'], event.source, route)
         if not handed:
             await _release_turn_marker(authority, event)
+        resumed_turn.reset(resume_token)
         executing_admission.reset(token)
         execution_result.reset(result_token)
         api_execution.reset(api_token)

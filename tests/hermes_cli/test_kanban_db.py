@@ -1645,6 +1645,26 @@ def test_module_worker_argv_ignores_hermes_checkout_in_workspace(tmp_path):
     assert r.returncode == 0, f"stderr={r.stderr[:300]!r}"
 
 
+def test_kanban_worker_client_argv_ignores_hermes_checkout_in_workspace(tmp_path):
+    """dlz B10: the owner-run worker client also starts in the task workspace; a workspace that is
+    an older Hermes checkout (no ``kanban_worker_client``) shadowed the installed package and the
+    card died at spawn. The real client must load: with no claim env it refuses, exit 1."""
+    import os
+    import subprocess
+    from pathlib import Path
+    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    shadow = tmp_path / "hermes_cli"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("raise SystemExit(97)\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_KANBAN_") and k != "PYTHONPATH"}
+    env = pin_hermes_tree_on_pythonpath(env, Path(kbd.__file__).resolve().parent.parent)
+    r = subprocess.run(kbd._worker_argv(None, "worker", None), cwd=tmp_path, env=env,
+                       capture_output=True, text=True, timeout=120, check=False)
+    assert r.returncode == 1 and "Kanban owner refused" in r.stderr, f"rc={r.returncode} {r.stderr[-300:]!r}"
+
+
 def test_module_worker_argv_keeps_hermes_process_identity():
     """Process-identity matchers must still read the bootstrap as
     ``-m hermes_cli.main <argv>`` (holder/gateway detection, #107002)."""
@@ -1705,7 +1725,7 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
     for resolved in ([sys.executable, "-m", "hermes_cli.main"], ["/opt/hermes/bin/hermes"]):
         monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda resolved=resolved: resolved)
         kbd._default_spawn(task, str(tmp_path / "ws"))
-        assert captured["cmd"][-3:] == [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+        assert captured["cmd"][-4:] == [sys.executable, "-P", "-m", "hermes_cli.kanban_worker_client"]
         assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
 
 
