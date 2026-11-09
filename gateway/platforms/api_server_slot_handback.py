@@ -42,6 +42,26 @@ HANDBACK_TEXT = (
     "to the saved handoff target (workspace file handoff-target) before reading or clicking anything, then "
     "check the page's fresh state. If that tab is gone, stop and tell Danil."
 )
+# dlz: fault-hunt B10. Control tells the session when a handoff ended WITHOUT Return to Sera (the
+# human ended the slot, the link expired unused, the slot parked or was recycled). Only a reason code
+# from this fixed table reaches the text; anything else reads as "other".
+HANDOFF_ENDED_REASONS = {
+    "human_ended": "Danil pressed End on the slot",
+    "link_expired": "the handoff link expired unused",
+    "human_idle": "the human session went idle and the slot parked",
+    "human_disconnected": "the human viewer disconnected and the slot parked",
+    "take_failed": "the takeover failed and the slot parked",
+    "resume_failed": "Return to Sera failed and the slot parked",
+    "recycled": "control recycled the slot",
+    "other": "control ended it",
+}
+HANDOFF_ENDED_TEXT = (
+    "[browser-control] The handoff of browser slot {slot} ended without Return to Sera ({why}). "
+    "The page Danil was on may be gone, and nothing he did there is confirmed. Do not assume the step "
+    "was finished: your next browser_exec gets a fresh lease; check the page's real state there, and "
+    "tell Danil what you found and what still needs him."
+)
+EVENTS = ("handback", "handoff_ended")
 REPLAY_WINDOW_S = 600.0
 _replay_lock = threading.Lock()
 _handled: dict[str, float] = {}
@@ -68,9 +88,12 @@ def check_bearer(header: str) -> Optional[int]:
 
 
 def parse(payload: Any) -> tuple[Optional[dict[str, str]], str]:
-    """``({"session_id", "slot_id"}, "")`` or ``(None, reason)``."""
-    if not isinstance(payload, dict) or payload.get("event") != "handback":
-        return None, "event must be 'handback'"
+    """``({"event", "session_id", "slot_id", "lease_id", "resumed_lease_id", "reason_code"}, "")`` or
+    ``(None, reason)``. ``resumed_lease_id`` is "" unless well formed; ``reason_code`` is a key of
+    :data:`HANDOFF_ENDED_REASONS` ("" for a handback)."""
+    event = payload.get("event") if isinstance(payload, dict) else None
+    if event not in EVENTS:
+        return None, "event must be 'handback' or 'handoff_ended'"
     session_id = str(payload.get("session_id") or "").strip()
     slot_id = str(payload.get("slot_id") or "").strip()
     lease_id = str(payload.get("lease_id") or "").strip()
@@ -80,7 +103,30 @@ def parse(payload: Any) -> tuple[Optional[dict[str, str]], str]:
         return None, "slot_id missing or malformed"
     if not _SLOT_RE.match(lease_id):
         return None, "lease_id missing or malformed"
-    return {"session_id": session_id, "slot_id": slot_id, "lease_id": lease_id}, ""
+    resumed = str(payload.get("resumed_lease_id") or "").strip()
+    reason = ""
+    if event == "handoff_ended":
+        reason = str(payload.get("reason_code") or "").strip()
+        reason = reason if reason in HANDOFF_ENDED_REASONS else "other"
+    return {"event": str(event), "session_id": session_id, "slot_id": slot_id, "lease_id": lease_id,
+            "resumed_lease_id": resumed if _SLOT_RE.match(resumed) else "", "reason_code": reason}, ""
+
+
+def _control_confirms(session_id: str, slot_id: str, resumed_lease_id: str) -> bool:
+    """dlz: D10-B. After a gateway restart the in-memory handoff claims are gone; control's
+    ``/v1/status?lease=`` vouches instead, and only for a handback: the lease Return to Sera
+    minted must be live, agent-owned, on this slot and for this session. Anything else refuses."""
+    if not resumed_lease_id:
+        return False
+    try:
+        from tools.browser_control_route import lease_status
+
+        row = lease_status(resumed_lease_id)
+    except Exception as exc:  # health: allow BLE001 -- control unreachable: refuse (no wake)
+        logger.warning("browser handback: control lease check failed: %s", type(exc).__name__)
+        return False
+    return (isinstance(row, dict) and not row.get("error") and row.get("lease_state") == "live"
+            and row.get("owner") == "agent" and row.get("slot_id") == slot_id and row.get("task") == session_id)
 
 
 def _seen(lease_id: str) -> bool:
@@ -95,7 +141,8 @@ def _seen(lease_id: str) -> bool:
         return False
 
 
-async def inject(runner: Any, session_id: str, slot_id: str, lease_id: str) -> str:
+async def inject(runner: Any, session_id: str, slot_id: str, lease_id: str, *, event: str = "handback",
+                 resumed_lease_id: str = "", reason_code: str = "") -> str:
     """Schedule the wake turn. Returns ``"injected"``, ``"replay"``, ``"session_not_found"`` or ``"unavailable"``.
 
     The control key is readable by same-uid model code, so the key alone never wakes a session: the
@@ -106,8 +153,11 @@ async def inject(runner: Any, session_id: str, slot_id: str, lease_id: str) -> s
     from tools.browser_control_route import claim_handback
 
     if not claim_handback(session_id, slot_id, lease_id):
-        return "session_not_found"
-    if _seen(lease_id):  # only after the claim: a forged id cannot burn the real handback
+        if event != "handback" or not _control_confirms(session_id, slot_id, resumed_lease_id):
+            return "session_not_found"
+        logger.warning("browser handback: no local claim (gateway restarted?); control confirmed lease "
+                       "slot=%s session=%s", slot_id, session_id)
+    if _seen(f"{event}:{lease_id}"):  # only after the claim: a forged id cannot burn the real handback
         return "replay"
     store = getattr(runner, "async_session_store", None)
     entry = None
@@ -120,13 +170,20 @@ async def inject(runner: Any, session_id: str, slot_id: str, lease_id: str) -> s
     schedule = getattr(runner, "_schedule_plugin_message_injection", None)
     if schedule is None:
         return "unavailable"
-    ok = schedule(content=HANDBACK_TEXT.format(slot=slot_id), plugin_id=PLUGIN_ID, session_key=entry.session_key)
+    if event == "handoff_ended":
+        why = HANDOFF_ENDED_REASONS.get(reason_code) or HANDOFF_ENDED_REASONS["other"]
+        content = HANDOFF_ENDED_TEXT.format(slot=slot_id, why=why)
+    else:
+        content = HANDBACK_TEXT.format(slot=slot_id)
+    ok = schedule(content=content, plugin_id=PLUGIN_ID, session_key=entry.session_key)
     if not ok:
         return "unavailable"
-    from tools.browser_exec_dialogs import note_handoff
+    if event == "handback":
+        from tools.browser_exec_dialogs import note_handoff
 
-    note_handoff(session_id)  # the next exec holds beforeunload: the page may hold Danil's unsaved input
-    logger.info("browser handback wake scheduled: slot=%s session=%s", slot_id, session_id)
+        note_handoff(session_id)  # the next exec holds beforeunload: the page may hold Danil's unsaved input
+    logger.info("browser %s wake scheduled: slot=%s session=%s reason=%s", event, slot_id, session_id,
+                reason_code or "-")
     return "injected"
 
 
@@ -153,10 +210,15 @@ async def handle_request(adapter: Any, request: Any):
     if fields is None:
         return _error(reason, 400, "handback_invalid")
     runner = adapter.gateway_runner or request.app.get("gateway_runner")
-    outcome = await inject(runner, fields["session_id"], fields["slot_id"], fields["lease_id"])
+    outcome = await inject(runner, fields["session_id"], fields["slot_id"], fields["lease_id"],
+                           event=fields["event"], resumed_lease_id=fields["resumed_lease_id"],
+                           reason_code=fields["reason_code"])
     if outcome == "replay":
         return _error("This handback was already delivered.", 409, "handback_replay")
     if outcome == "session_not_found":
+        # dlz: D10-B — loud, not silent: a 404 here means Sera is never woken and the slot recycles later.
+        logger.warning("browser %s NOT delivered: no claim and no control confirmation slot=%s session=%s",
+                       fields["event"], fields["slot_id"], fields["session_id"])
         return _error("No live session with that id.", 404, "session_not_found")
     if outcome != "injected":
         return _error("Gateway cannot route the wake turn now.", 503, "handback_unavailable")

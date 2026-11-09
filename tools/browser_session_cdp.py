@@ -12,6 +12,9 @@ from agent.proxy_bypass import loopback_request_kwargs
 from agent.redact import redact_cdp_url
 
 logger = logging.getLogger(__name__)
+# dlz: client read timeout of the /json/version discovery; stays above browser-control's discovery
+# budget (monolith services/browser/contract/control-v1.json ``timeouts``, fault-hunt B5).
+CDP_CLIENT_READ_TIMEOUT_S = 10.0
 
 # Live ``/browser connect`` endpoints, one per profile home (``hermes_home_key()``): a multiplexed
 # gateway serves every profile from this process, so a process-wide value would reach them all.
@@ -66,7 +69,7 @@ def resolve_cdp_override(cdp_url: str) -> str:
     version_url = _cdp_version_url(discovery_url)
     try:
         import requests  # lazy: shared module object, so test patches still apply
-        response = requests.get(version_url, timeout=10, **loopback_request_kwargs(version_url))
+        response = requests.get(version_url, timeout=CDP_CLIENT_READ_TIMEOUT_S, **loopback_request_kwargs(version_url))
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:  # health: allow BLE001 -- any discovery failure falls back to the raw endpoint

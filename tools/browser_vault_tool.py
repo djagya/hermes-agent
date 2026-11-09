@@ -464,6 +464,23 @@ def browser_vault_unlock(backend_name: str) -> str:
     return json.dumps({"success": True, "backend": backend.name})
 
 
+# dlz: sessions with no human chat surface (or with their own masked prompt): the B20 chat text is not for them.
+_NON_CHAT_PLATFORMS = frozenset({"", "cli", "tui", "desktop", "local", "cron", "webhook", "msgraph_webhook",
+                                 "api_server"})
+
+
+def _managed_chat_session() -> bool:
+    """A managed-browser session on a chat platform (Telegram, Discord, ...), not cron or an API turn."""
+    try:
+        from tools.approval_context import _get_session_platform, _is_cron_approval_context
+        from tools.browser_control_route import is_managed
+
+        platform = str(_get_session_platform() or "").strip().lower()
+        return is_managed() and platform not in _NON_CHAT_PLATFORMS and not _is_cron_approval_context()
+    except Exception:  # health: allow BLE001 -- only picks a refusal text; the refusal itself stands
+        return False
+
+
 def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> str:
     """Ask the user (masked prompt on their surface) for the login of the CURRENT page, store it in the local
     vault bound to that origin, and fill the password at once. The values never enter the conversation."""
@@ -479,6 +496,13 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
         return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
     prompt = get_save_login_prompt_callback()
     if prompt is None or not can_prompt_here():
+        if _managed_chat_session():
+            # dlz: B20, a chat (Telegram) has no masked prompt; the user keeps logins in 1Password and a
+            # managed slot can be handed to him. "headless/cron/API, run hermes vault add" was wrong here.
+            return json.dumps({"success": False, "error_type": "prompt_unavailable",
+                               "error": (f"This chat cannot take a password securely: save it in 1Password (Hermes "
+                                         f"vault) for {origin}, or send the user a browser_control handoff for this "
+                                         "tab so they sign in themselves.")})
         return json.dumps({"success": False, "error_type": "prompt_unavailable",
                            "error": (f"This session cannot ask the user for a login (headless/cron/API). Tell them to run "
                                      f"`hermes vault add` or use Desktop → Settings → Passwords & Logins for {origin}.")})
@@ -717,6 +741,20 @@ def _inspect_fill_controls(task_id: str, nonce: str, kind: str) -> tuple[list, l
     return raw_controls, classified, None
 
 
+def _no_match_hint(kind: str, raw_controls: list, classified: list) -> str:
+    """What to do when no control took the saved item, read from the page's controls (never values)."""
+    if kind == "login":
+        if any("new-password" in str(r.get("autocomplete") or "").lower().split()
+               for r in raw_controls if isinstance(r, dict)):
+            return ("The page has a new-password field: for creating an account call fill again with "
+                    "purpose=signup; for a password change, ask the user.")
+        tokens = {getattr(c, "token", "") for c in classified}
+        if tokens & {"username", "email", "tel"} and "current-password" not in tokens:
+            return ("This step asks only for the identifier: type it yourself with the browser's input tool (it is "
+                    "in browser_vault list), continue, then call fill again on the password step.")
+    return "Read the form: the right page or step may not be open yet. Do not retry the same fill unchanged."
+
+
 def _parse_fill_result(fill_result: dict, page_origin: str, secret: Any) -> tuple[Any, Optional[str]]:
     """``(parsed, refusal)``: the native write's JSON, or the origin_changed refusal (secret-scrubbed)."""
     from agent.vault_store import scrub_secret_from_text
@@ -835,7 +873,9 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     if refusal:
         return refusal
     if not classified and signup_target is None:
-        return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
+        return json.dumps({"success": False, "error_type": "no_matching_field",
+                           "error": f"No {meta.kind} form fields were found on the current page. Nothing was written.",
+                           "next": _no_match_hint(meta.kind, raw_controls, classified)})
 
     # ── Resolve secret and fill (secret never enters any logged string) ─────
     try:
@@ -854,9 +894,10 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
         return json.dumps({"success": False, "error_type": "secret_resolution_failed",
                            "error": "Could not resolve the saved item. Nothing was written."})
     if not fills:
-        return json.dumps(
-            {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
-        )
+        # dlz: B19, a typed refusal with a next step (12 retry loops on identifier-first / signup pages).
+        return json.dumps({"success": False, "error_type": "no_matching_field",
+                           "error": f"No fillable {meta.kind} field matched the saved item on this page. Nothing "
+                                    "was written.", "next": _no_match_hint(meta.kind, raw_controls, classified)})
 
     # Register the secret bytes with the model-egress redaction boundary
     # BEFORE they touch the page: any later browser_* result (including
@@ -901,27 +942,29 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
 _TAB_PROBES["letter"] = "!!document.querySelector('input[type=password], input[type=text], input:not([type])')"
 
 
-def _confirm_letter_origin(organization: str, origin: str) -> bool:
-    """The page is not on a host the letter printed: only the user can say it belongs to the sender."""
-    from tools.approval_prompt import request_elicitation_consent
+def _confirm_letter_origin(organization: str, origin: str) -> str:
+    """The page is not on a host the letter printed: only the user can say it belongs to the sender.
+    Returns the consent outcome (tools.browser_vault_signup.ask_consent)."""
+    from tools.browser_vault_signup import ask_consent
 
-    return request_elicitation_consent(
+    return ask_consent(
         f"Sign in to {origin} with the temporary login from the {organization or 'photographed'} letter",
         "The letter does not print this site's address, so Hermes cannot match it to the sender. The "
         "one-time password never enters the conversation. Approve only if this site belongs to the sender.",
-        surface="vault-letter", title="Use letter login on this site?") == "accept"
+        surface="vault-letter", title="Use letter login on this site?")
 
 
-def _confirm_letter_reuse(organization: str, origin: str) -> bool:
-    """Whether a letter's password may be used again is printed by the sender, not knowable here."""
-    from tools.approval_prompt import request_elicitation_consent
+def _confirm_letter_reuse(organization: str, origin: str) -> str:
+    """Whether a letter's password may be used again is printed by the sender, not knowable here.
+    Returns the consent outcome (tools.browser_vault_signup.ask_consent)."""
+    from tools.browser_vault_signup import ask_consent
 
-    return request_elicitation_consent(
+    return ask_consent(
         f"Sign in to {origin} again with the {organization or 'photographed'} letter login",
         "The earlier sign-in worked and its session has expired. Approve only if this letter's password stays "
         "valid for another sign-in (for example, the site says it works until you send the form). Signing in "
         "again does not send, sign or change anything.",
-        surface="vault-letter", title="Sign in again with the letter?") == "accept"
+        surface="vault-letter", title="Sign in again with the letter?")
 
 
 def _letter_refusal(error_type: str, error: str, **extra: Any) -> str:
@@ -954,9 +997,12 @@ def _renewal_refusal(cred, task: str, origin: str) -> Optional[str]:
     early = fill_refusal(cred, session_expired=True, task=task, origin=origin)
     if early:
         return _letter_refusal(*early)
-    if not _confirm_letter_reuse(cred.organization, origin):
-        return _letter_refusal("reuse_declined", "The user did not confirm that this letter's password can be used "
-                                                 "again. Nothing was written.")
+    from tools.browser_vault_signup import not_given, outcome_of
+
+    outcome = outcome_of(_confirm_letter_reuse(cred.organization, origin))
+    if outcome != "accepted":
+        # dlz: B17, a timeout or a missing approval surface is not the user's "no".
+        return not_given("reuse_declined", "Reusing this letter's password", outcome)
     return None
 
 
@@ -1013,8 +1059,11 @@ def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, se
             return refuse("origin_unverified",
                           f"{origin} is not a site printed in the letter ({printed}). If the user's letter really "
                           "sends them here, call again with expected_origin set to this origin to ask the user to confirm.")
-        if not _confirm_letter_origin(cred.organization, origin):
-            return refuse("origin_declined", "The user did not confirm this site for the letter login. Nothing was written.")
+        from tools.browser_vault_signup import not_given, outcome_of
+
+        outcome = outcome_of(_confirm_letter_origin(cred.organization, origin))
+        if outcome != "accepted":
+            return not_given("origin_declined", "This site for the letter login", outcome)
 
     nonce = secrets.token_hex(8)
     controls = _page_controls(effective_task_id, nonce)
@@ -1141,7 +1190,8 @@ BROWSER_VAULT_SCHEMA = {
         "seller reputation check: verify the merchant and checkout terms before requesting consent; it never "
         "submits; purpose=signup separately asks the user to approve account creation with this exact login item "
         "on its exact origin, then fills one unambiguous new-password field on a registration form only; "
-        "confirmation-password, mixed login, OTP and recovery forms are refused; stop on signup_declined); "
+        "confirmation-password, mixed login, OTP and recovery forms are refused; stop on signup_declined when its "
+        "consent_outcome is refused; timeout or unavailable is not a refusal: ask the user to approve once more); "
         "save_login (nothing saved for this site: the user "
         "enters it in a masked prompt, Hermes saves and fills it); enter_code (a one-time/2FA code after the "
         "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
