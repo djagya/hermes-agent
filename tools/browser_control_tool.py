@@ -121,9 +121,17 @@ def _release(task_id: Optional[str], identity: str, mode: str) -> str:
         return tool_error(err)
     route = _route()
     slot_id = lease.get(route.MANAGED_SLOT_ENV, "")
-    failure = route.release_lease(dict(lease))
+    outcome, failure = route.release_lease_outcome(dict(lease))
     if failure:
         return tool_error(failure, slot_id=slot_id)
+    if outcome == route.RELEASE_DEFERRED:
+        # dlz: G2-R7 — control keeps a lease whose handoff link is still open; not an error, never retry.
+        return tool_result({"success": True, "released": slot_id, "deferred": True,
+                            "note": "Released from your side. Control keeps the slot until Danil uses or lets "
+                                    "the open handoff link expire; do not call release again."})
+    if outcome == route.RELEASE_ALREADY_ENDED:
+        return tool_result({"success": True, "released": slot_id, "already_ended": True,
+                            "note": "Control had already ended this lease; the slot is free."})
     return tool_result({"success": True, "released": slot_id,
                         "note": "The slot is free; the next browser_exec acquires afresh."})
 
@@ -253,10 +261,18 @@ def _download(task_id: Optional[str], identity: str, mode: str, name: str) -> st
             claimed = (resp.headers.get(_SHA_HEADER) or "").strip().lower()
     except HTTPError as exc:
         failure = _http_error(exc)
-        if failure["status"] == 404 or (failure["status"] == 409 and "incomplete" in failure["detail"]):
+        if failure["status"] == 409 and "incomplete" in failure["detail"]:
             return tool_result({"success": False, "pending": True, "status": failure["status"],
                                 "detail": failure["detail"] or "not there yet",
                                 "note": "The download has not finished. Wait, then call download again."})
+        if failure["status"] == 404:
+            # dlz: B21 — 404 is "not in the browser's downloads", not "still downloading"; files the
+            # exec code wrote are already in the workspace and never land here.
+            return tool_result({"success": False, "pending": "maybe", "status": 404, "error_type": "not_downloaded",
+                                "error": f"{name} is not in the browser's downloads folder.",
+                                "next": "Only files Chrome itself downloaded land there. If you clicked a download "
+                                        "a moment ago, wait once and retry; files your browser_exec code wrote "
+                                        "are already in the workspace, so do not call download for them."})
         return tool_error(f"{failure['error']}: {failure['detail'] or 'download refused'}", http_status=failure["status"])
     except OSError as exc:
         return tool_error(f"unavailable: control unreachable ({type(exc).__name__})")

@@ -15,9 +15,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -117,6 +119,64 @@ _GATE_REFUSED_HINT = (
     "managed browser gate refused the lease (HTTP 403): it expired, was released or recycled, or a "
     "human holds the browser. Retry the call; there is no Chrome popup to accept."
 )
+# dlz: fault-hunt B16. The harness prints this when control's gate accepted the lease but could not reach the
+# slot's Chrome in time; its "click Allow in Chrome" advice is wrong for a managed slot.
+_HANDSHAKE_MARKERS = ("CDP WS handshake failed", "timed out during opening handshake")
+_SLOT_UNREACHABLE_HINT = (
+    "the browser slot did not answer (control could not reach its Chrome); retry once, then report. "
+    "There is no Chrome popup to accept."
+)
+
+
+# dlz: fault-hunt B25. 104 of 193 evaluate timeouts fell right after a memcg OOM kill of the slot's renderer,
+# and Sera was only ever told "timed out".
+_RENDERER_OOM_HINT = (
+    "the browser slot's Chrome was killed for memory (OOM) during this call, so the page or tab is gone: "
+    "reload it and keep the page lighter (close extra tabs, extract in smaller pieces). This is not a page bug."
+)
+_CRASH_MARKERS = ("timed out", "Target crashed", "targetCrashed", "Inspected target navigated or closed")
+
+
+def _slot_oom_hint(env: dict, started: float) -> str:
+    """The OOM hint when control saw an oom_kill on this call's slot since ``started`` (epoch), else ''."""
+    slot_id = str(env.get("HERMES_BROWSER_SLOT_ID") or "")
+    if not slot_id:
+        return ""
+    try:
+        from tools.browser_control_route import slot_status
+        last = float(slot_status(slot_id).get("last_oom_at") or 0)
+    except Exception:  # health: allow BLE001 -- advisory only; the exec result stands without it
+        return ""
+    return _RENDERER_OOM_HINT if last >= started - 1.0 else ""
+
+
+# dlz: G4 review (codex P1). harness 0.1.13 run.py runs ensure_daemon() (the CDP connect) before
+# exec(code): a connect failure exits 1 before any of the code ran. The first line of the piped code
+# touches this marker, so "marker absent" is the structured proof that execution never started; stderr
+# text alone is not (user code can print the same phrase after it clicked something).
+_EXEC_STARTED_ENV = "HERMES_BU_EXEC_STARTED"
+_EXEC_STARTED_PREAMBLE = (
+    'with __import__("contextlib").suppress(OSError): '
+    f'open(__import__("os").environ.pop("{_EXEC_STARTED_ENV}", "") or __import__("os").devnull, "a").close()\n'
+)
+
+
+def _exec_never_started(proc: Any, marker: str) -> bool:
+    """True only when the CLI exited non-zero and the code's first line never ran."""
+    return bool(marker) and getattr(proc, "returncode", 0) != 0 and not os.path.exists(marker)
+
+
+def _managed_connect_failure(stderr: str) -> str:
+    """'gate' (403 on the lease), 'handshake' (slot Chrome did not answer) or '' for a managed harness stderr.
+    Both fail at daemon connect, before any of the code ran, so one re-route retry is safe."""
+    text = stderr or ""
+    if "permission-blocked" in text:
+        return "gate"
+    if any(marker in text for marker in _HANDSHAKE_MARKERS):
+        return "handshake"
+    return ""
+
+
 _IPC_LINE_HINT = (
     "browser_exec sent the harness a single request over its 64 KiB IPC line limit (a very large js() "
     "expression or CDP params). Write large data to $BH_AGENT_WORKSPACE and send it in smaller pieces."
@@ -658,6 +718,14 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
 # failed attach by its cause instead of as a missing page.
 _VAULT_ROUTES: dict[str, dict[str, str]] = {}
 _VAULT_ROUTES_MAX = 256  # the gateway is long-lived; keep the most recently used tasks
+# dlz: fault-hunt B15. A supervisor that failed to attach to this exact endpoint (same lease URL) is not
+# retried for this long: every exec on a slot with hung tabs re-paid the 15 s start budget (48-54 s execs).
+_ATTACH_FAILURE_CACHE_S = 60.0
+_attach_failures: dict[tuple[str, str], tuple[float, str]] = {}
+_SUPERVISOR_UNAVAILABLE_NOTE = (
+    "unavailable: the page supervisor could not attach to this browser (page dialogs are not answered "
+    "and browser_vault cannot fill on this page); the code still ran. Retry later; report it if it persists."
+)
 
 
 def vault_route(task_id: Optional[str]) -> dict[str, str]:
@@ -678,17 +746,31 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
              "profile_kind": str(env.get("HERMES_BROWSER_PROFILE_KIND") or ""),
              # Gateway memory only (never in a tool result): card fill sets control's capture guard.
              "token": str(env.get("HERMES_BROWSER_COMMAND_TOKEN") or "")}
-    try:
-        from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
-        from tools.browser_supervisor import SUPERVISOR_REGISTRY
-        policy, timeout_s = get_dialog_policy_config()
-        SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=resolve_cdp_override(cdp),
-                                         dialog_policy=policy, dialog_timeout_s=timeout_s)
-    except Exception as exc:
-        from tools.browser_supervisor import _redact_cdp_error_text
-        route["error"] = _redact_cdp_error_text(exc)[:300]
-        # Non-fatal for the exec, but the vault tools are blind until it succeeds: log the cause.
-        logger.warning("browser_exec: CDP supervisor attach failed: %s", route["error"])
+    # dlz: the lease's daemon name, so a released lease stops its supervisor too (B14, stop_harness_daemon).
+    route["bu_name"] = str(env.get("BU_NAME") or "")
+    failure_key = (task_id or "default", cdp)
+    cached = _attach_failures.get(failure_key)
+    if cached and cached[0] > time.monotonic():
+        route["error"] = cached[1]
+    else:
+        _attach_failures.pop(failure_key, None)
+        try:
+            from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
+            from tools.browser_supervisor import SUPERVISOR_REGISTRY
+            policy, timeout_s = get_dialog_policy_config()
+            supervisor = SUPERVISOR_REGISTRY.get_or_start(
+                task_id=task_id or "default", cdp_url=resolve_cdp_override(cdp),
+                dialog_policy=policy, dialog_timeout_s=timeout_s)
+            route["supervisor_url"] = str(getattr(supervisor, "cdp_url", "") or "")
+        except Exception as exc:
+            from tools.browser_supervisor import _redact_cdp_error_text
+            # dlz: B15: the type too; str() of a bare timeout was an empty cause in the log.
+            route["error"] = f"{type(exc).__name__}: {_redact_cdp_error_text(exc)}"[:300]
+            # Non-fatal for the exec, but the vault tools are blind until it succeeds: log the cause.
+            logger.warning("browser_exec: CDP supervisor attach failed: %s", route["error"])
+            for key in [k for k, (until, _) in _attach_failures.items() if until <= time.monotonic()]:
+                _attach_failures.pop(key, None)
+            _attach_failures[failure_key] = (time.monotonic() + _ATTACH_FAILURE_CACHE_S, route["error"])
     _VAULT_ROUTES.pop(task_id or "default", None)
     _VAULT_ROUTES[task_id or "default"] = route
     while len(_VAULT_ROUTES) > _VAULT_ROUTES_MAX:
@@ -999,7 +1081,24 @@ def stop_harness_daemon(name: str, home_key: Optional[str] = None) -> None:
                          if key[-1] == name and home_key in (None, home))
         for key in daemons:
             _driven_daemons.pop(key, None)
+    _stop_lease_supervisors(name)
     _reload_daemons(daemons)
+
+
+def _stop_lease_supervisors(name: str) -> None:
+    """dlz: fault-hunt B14. A released lease's supervisor used to redial the dead lease until its retry
+    budget ran out (658 "invalid HTTP response" warnings); stop the ones attached through this lease."""
+    if not str(name or "").startswith("bu-ctrl-"):
+        return
+    tasks = [(task, route.get("supervisor_url", "")) for task, route in list(_VAULT_ROUTES.items())
+             if route.get("bu_name") == name and route.get("supervisor_url")]
+    if not tasks:
+        return
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    for task, url in tasks:
+        supervisor = SUPERVISOR_REGISTRY.get(task)
+        if supervisor is not None and supervisor.cdp_url == url:
+            SUPERVISOR_REGISTRY.stop(task)
 
 
 def _managed_busy_wait(timeout_s: Any) -> Optional[float]:
@@ -1180,6 +1279,12 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     # The time spent waiting in control's queue comes out of this call's budget.
     timeout = max(_MIN_TIMEOUT_S, _clamp_timeout(timeout_s) - int(_managed_waited_s(managed)))
     started = time.time()
+    start_marker = ""
+    if managed:
+        marker_dir = tempfile.mkdtemp(prefix="hermes-bu-exec-")
+        start_marker = os.path.join(marker_dir, "started")
+        env[_EXEC_STARTED_ENV] = start_marker
+        code = _EXEC_STARTED_PREAMBLE + code
 
     def dispatch() -> dict[str, Any]:
         refused = exec_slot_capture_refusal(code, env)
@@ -1197,8 +1302,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         try:
             return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
         except subprocess.TimeoutExpired:
+            oom = _slot_oom_hint(env, started) if managed else ""
             return {"error_result": tool_error(
-                f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
+                (oom + " " if oom else "")
+                + f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
                 f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
                 "append to workspace files — anything already written to the workspace is preserved."
             )}
@@ -1212,25 +1319,33 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         dispatched = run_fenced({"features": {"local": True}}, dispatch)
     else:
         dispatched = dispatch()
-    if (
-        managed
-        and "proc" in dispatched
-        and "permission-blocked" in (dispatched["proc"].stderr or "")
-    ):
+    connect_failure = (
+        _managed_connect_failure(dispatched["proc"].stderr or "")
+        if managed and "proc" in dispatched and _exec_never_started(dispatched["proc"], start_marker) else ""
+    )
+    if connect_failure:
         # The harness fails at daemon connect, before running any of the code, so one retry is
         # safe. Re-resolving checks the held lease with control and re-acquires if it died.
+        # dlz: a handshake timeout (B16) retries once even on the same live lease: the slot was slow, not gone.
         before = env.get("BU_CDP_URL", "")
         rerouted = dict(env)
         rerouted.pop("BU_CDP_URL", None)
         rerouted.pop("BU_CDP_WS", None)
         if not _route_backend(
             rerouted, session, task_id, False, mode=mode, identity=identity, qa_targets=qa_targets, wait_s=0,
-        ) and rerouted.get("BU_CDP_URL") and rerouted.get("BU_CDP_URL") != before:
+        ) and rerouted.get("BU_CDP_URL") and (
+            connect_failure == "handshake" or rerouted.get("BU_CDP_URL") != before
+        ):
             rerouted.pop(_PRIVATE_BROWSER_SENTINEL, None)
             rerouted.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
             env.clear()
             env.update(rerouted)
+            env[_EXEC_STARTED_ENV] = start_marker
             dispatched = dispatch()
+    never_started = "proc" in dispatched and _exec_never_started(dispatched["proc"], start_marker)
+    if start_marker:
+        shutil.rmtree(os.path.dirname(start_marker), ignore_errors=True)
+        env.pop(_EXEC_STARTED_ENV, None)
     # dlz: undo ux_capture overrides a killed/failed call left on the tab (tools/browser_capture.py).
     from tools.browser_capture import reset_after_failed_exec as _ux_capture_reset
     _ux_capture_reset(code, env, dispatched, cmd, _run_cli_killing_process_group, task_id,
@@ -1258,15 +1373,23 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     result.update(_take_real_profile_note(route_key))
     result.update({"dialogs": dialogs} if dialogs else {})
     stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
-    if managed and "permission-blocked" in stderr:
+    failure = _managed_connect_failure(stderr) if managed and never_started else ""
+    if failure == "gate":
         stderr = _GATE_REFUSED_HINT + "\n" + stderr
+    elif failure == "handshake":
+        stderr = _SLOT_UNREACHABLE_HINT + "\n" + re.sub(r"\s*--\s*click Allow in Chrome if prompted", "", stderr)
     if "chunk is longer than limit" in stderr or "chunk is longer than limit" in (proc.stdout or ""):
         stderr = _IPC_LINE_HINT + ("\n" + stderr if stderr else "")
     if "is not defined in the browser-use CLI" in stderr:
         stderr = _rewrite_name_error(stderr)
+    if managed and proc.returncode != 0 and any(marker in stderr for marker in _CRASH_MARKERS):
+        oom = _slot_oom_hint(env, started)
+        stderr = oom + "\n" + stderr if oom else stderr
     stderr = _cap_stderr(stderr)
     if stderr:
         result["stderr"] = stderr
+    if managed and (_VAULT_ROUTES.get(task_id or "default") or {}).get("error"):
+        result["supervisor"] = _SUPERVISOR_UNAVAILABLE_NOTE
     _apply_control_capture_refusal(result, managed)
     screenshot = _find_screenshot(proc.stdout, started)
     if screenshot:
@@ -1401,8 +1524,9 @@ def _dynamic_schema_overrides() -> dict:
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "QA hostnames/URLs that must match a dedicated registered app. "
-                "Shared proxies are refused."
+                # dlz: control admits registry names only (grant.py admit), never hostnames (fault-hunt B23).
+                "Registered QA app names from the operator's registry (not hostnames or URLs). "
+                "Shared proxies are refused. Public sites need no QA grant: use mode=research."
             ),
         }
         props["bridge"] = {

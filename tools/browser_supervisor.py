@@ -49,6 +49,14 @@ MAX_POST_ATTACH_RECONNECT_FAILURES = 5
 # and keep the initial-attach tries inside start()'s 15 s budget.
 PAGE_ATTACH_TIMEOUT_S = 4.0
 INITIAL_ATTACH_TRIES = 2
+# dlz: one timeout table with browser-control (monolith services/browser/contract/control-v1.json
+# ``timeouts``): server discovery budget (7 s) < client read timeout (10 s) < supervisor start (15 s).
+SUPERVISOR_START_TIMEOUT_S = 15.0
+CDP_CLIENT_TIMEOUT_S = 10.0
+# dlz: fault-hunt B15. Each page attach is attach + 3 enables (4 s each, up to 16 s), so two hung tabs
+# used the whole start budget before the createTarget fallback ran. The initial attach now runs against
+# one deadline and keeps this much of it for the fresh blank tab.
+CREATE_TARGET_RESERVE_S = 4.0
 
 
 def _redact_cdp_error_text(exc: object) -> str:
@@ -62,6 +70,16 @@ def _redact_cdp_error_text(exc: object) -> str:
         return redact_cdp_url(str(exc))
     except Exception:
         return "<error redacted>"
+
+
+def _redial_refused(exc: BaseException) -> bool:
+    """dlz: fault-hunt B14. A 403 on the WebSocket upgrade is control refusing a lease that ended
+    (released, recycled, taken by a human): final, never a reason to redial the dead lease."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)  # legacy websockets InvalidStatusCode
+    return status == 403
 
 
 def _cdp_reconnect_is_handshake_race(redial_failures: int) -> bool:
@@ -136,6 +154,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._ready_event = threading.Event()
+        self._attach_deadline: Optional[float] = None  # monotonic; set by start() for the first attach
         self._start_error: Optional[BaseException] = None
         self._stop_requested = False
         # CDP call tracking (runs on supervisor loop only).
@@ -149,12 +168,14 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
 
     # ── Public sync API ──────────────────────────────────────────────────────
 
-    def start(self, timeout: float = 15.0) -> None:
+    def start(self, timeout: float = SUPERVISOR_START_TIMEOUT_S) -> None:
         """Launch the background loop and block until attachment completes; raises what attach failed with (redacted)."""
         if self._thread and self._thread.is_alive():
             return
         self._ready_event.clear()
         self._start_error, self._stop_requested = None, False
+        # dlz: B15: the first attach finishes (or fails with its real cause) inside start()'s wait.
+        self._attach_deadline = time.monotonic() + max(timeout - 0.5, 0.5)
         self._thread = threading.Thread(target=self._thread_main, name=f"cdp-supervisor-{self.task_id}", daemon=True)
         self._thread.start()
         if not self._ready_event.wait(timeout=timeout):
@@ -366,7 +387,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             loop.run_until_complete(self._run())
         except BaseException as e:
             if not self._fail_start(e):
-                logger.warning("CDP supervisor %s crashed: %s", self.task_id, e)
+                # dlz: B15: repr, redacted; str() of a bare TimeoutError/CancelledError logged an empty cause.
+                logger.warning("CDP supervisor %s crashed: %s", self.task_id, _redact_cdp_error_text(repr(e)))
         finally:
             # Cancel + flush remaining tasks before closing the loop to avoid
             # "Task was destroyed but it is pending" warnings.
@@ -421,9 +443,17 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                           **loopback_connect_kwargs(self.cdp_url)}
         while not self._stop_requested:
             try:
-                self._ws = await asyncio.wait_for(websockets.connect(self.cdp_url, **connect_kwargs), timeout=10.0)
+                self._ws = await asyncio.wait_for(websockets.connect(self.cdp_url, **connect_kwargs),
+                                                  timeout=CDP_CLIENT_TIMEOUT_S)
             except Exception as e:
                 if self._fail_start(e):
+                    return
+                if _redial_refused(e):
+                    # dlz: B14: the lease ended; one line, leave the registry, no 5-try redial loop.
+                    logger.info("CDP supervisor %s: lease ended (gate refused the redial with 403); stopping",
+                                self.task_id)
+                    if SUPERVISOR_REGISTRY.get(self.task_id) is self:
+                        SUPERVISOR_REGISTRY._pop(self.task_id)
                     return
                 reconnect_failures += 1
                 redial_failures += 1
@@ -484,36 +514,68 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 10.0)
 
-    async def _attach_page(self, target_id: str, *, timeout: float) -> str:
+    async def _attach_page(self, target_id: str, *, timeout: float, deadline: Optional[float] = None) -> str:
         """Attach flattened, enable domains, install the dialog bridge; returns the session id. A target
-        that does not answer (crashed renderer, hung tab) is detached again and the error re-raised."""
-        attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
+        that does not answer (crashed renderer, hung tab) is detached again and the error re-raised.
+        dlz: with ``deadline`` (monotonic) the attach and all enables together finish by then (B15)."""
+        def left() -> float:
+            return timeout if deadline is None else max(0.05, min(timeout, deadline - time.monotonic()))
+
+        attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=left())
         sid = attach["result"]["sessionId"]
         self._main_page_target = target_id
         try:
-            await self._enable_page_domains(sid, timeout=timeout)
+            enable = self._enable_page_domains(sid, timeout=timeout)
+            if deadline is None:
+                await enable
+            else:
+                await asyncio.wait_for(enable, timeout=left())
         except BaseException:
             with contextlib.suppress(Exception):
-                await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=2.0)
+                await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=min(2.0, left()))
             raise
-        await self._install_dialog_bridge(sid)
+        if deadline is None:
+            await self._install_dialog_bridge(sid)
+            return sid
+        # dlz: G4 review (codex P2): the bridge's 3 best-effort calls (up to 13 s) count against the same
+        # deadline. Past it the page stays attached without the bridge, as when a bridge step fails.
+        try:
+            await asyncio.wait_for(self._install_dialog_bridge(sid), timeout=left())
+        except TimeoutError:
+            logger.info("CDP supervisor %s: dialog bridge install ran past the attach budget; attached without it",
+                        self.task_id)
         return sid
 
     async def _attach_initial_page(self) -> None:
         """Attach the first page target that answers, else a new blank one. One crashed tab first in
         the list used to fail the whole supervisor, and with it every vault fill."""
-        targets = (await self._cdp("Target.getTargets")).get("result", {}).get("targetInfos", [])
-        pages = [t for t in targets if t.get("type") == "page"]
+        # dlz: B15: one deadline for the whole initial attach (start()'s, or a fresh start budget on a
+        # reconnect); existing tabs get what is left after the createTarget reserve.
+        deadline = self._attach_deadline if not self._ready_event.is_set() and self._attach_deadline \
+            else time.monotonic() + SUPERVISOR_START_TIMEOUT_S
+
+        def left() -> float:
+            return deadline - time.monotonic()
+
+        # A short start budget (tests, callers passing start_timeout) keeps most of it for the existing tabs.
+        reserve = min(CREATE_TARGET_RESERVE_S, max(left(), 0.0) * 0.3)
+        targets = (await self._cdp("Target.getTargets", timeout=max(0.05, min(CDP_CLIENT_TIMEOUT_S, left()))))
+        pages = [t for t in targets.get("result", {}).get("targetInfos", []) if t.get("type") == "page"]
         for page_target in pages[:INITIAL_ATTACH_TRIES]:
+            if left() - reserve < 0.5:
+                break
             try:
                 self._page_session_id = await self._attach_page(page_target["targetId"],
-                                                                timeout=PAGE_ATTACH_TIMEOUT_S)
+                                                                timeout=PAGE_ATTACH_TIMEOUT_S,
+                                                                deadline=deadline - reserve)
                 return
             except Exception as e:  # health: allow BLE001 -- one crashed tab must not fail the supervisor; logged redacted
                 logger.debug("CDP supervisor %s: page target did not answer, skipping: %s",
                              self.task_id, _redact_cdp_error_text(e))
-        page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"}))["result"]
-        self._page_session_id = await self._attach_page(page_target["targetId"], timeout=10.0)
+        page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"},
+                                       timeout=max(0.5, min(CDP_CLIENT_TIMEOUT_S, left()))))["result"]
+        self._page_session_id = await self._attach_page(page_target["targetId"], timeout=CDP_CLIENT_TIMEOUT_S,
+                                                        deadline=max(deadline, time.monotonic() + 0.5))
 
     async def _cdp(self, method: str, params: Optional[dict[str, Any]] = None, *,
                    session_id: Optional[str] = None, timeout: Optional[float] = 10.0) -> dict[str, Any]:
@@ -592,7 +654,8 @@ class _SupervisorRegistry:
         return capture(self, task_id, timeout=timeout)
 
     def get_or_start(self, task_id: str, cdp_url: str, *, dialog_policy: str = DEFAULT_DIALOG_POLICY,
-                     dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0) -> CDPSupervisor:
+                     dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S,
+                     start_timeout: float = SUPERVISOR_START_TIMEOUT_S) -> CDPSupervisor:
         """Idempotently ensure a supervisor runs for ``(task_id, cdp_url)``; one bound to a
         different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced."""
         from hermes_constants import hermes_home_key

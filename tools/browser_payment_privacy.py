@@ -15,8 +15,12 @@ a wipe, can restore the payment tab. They persist in
 a mark on a *temporary* slot that recorded control's wipe counter at fill time,
 once control reports that slot with a higher counter and a different browser
 generation (its profile was wiped after the fill; :func:`_prune_wiped`). Any
-missing, malformed or unreachable answer keeps the mark. Every other mark is
-cleared only by an operator (``python -m tools.browser_payment_privacy clear``)
+missing, malformed or unreachable answer keeps the mark. dlz: a slot mark of any
+profile kind also clears once control reports an explicit human clear on that
+slot (``GET /v1/capture-guard`` ``human_clear``, the slots-board button) later
+than the mark, with control's own flag off (D2-A); control records only a
+Serve/Access principal there, never a controller-key caller. Every other mark
+is cleared only by an operator (``python -m tools.browser_payment_privacy clear``)
 after confirming the slot's payment tab is gone. Each clear, automatic or
 operator, is appended to ``payment-capture-guard.log`` beside the file. An
 unreadable mark file refuses every capture.
@@ -50,6 +54,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -124,7 +129,9 @@ def mark_payment_session(task_id: str, surface: dict[str, str] | None = None) ->
     generation = str((surface or {}).get("browser_generation") or "").strip()
     wipe_count = str((surface or {}).get("wipe_count") or "").strip()
     profile_kind = str((surface or {}).get("profile_kind") or "").strip()
-    mark: dict[str, Any] = {"task_id": str(task_id or ""), "marked_at": _now()}
+    # dlz: marked_epoch (D2-A) orders the mark against control's human-clear time without the
+    # ISO string's second truncation.
+    mark: dict[str, Any] = {"task_id": str(task_id or ""), "marked_at": _now(), "marked_epoch": time.time()}
     if slot_id and generation:
         mark.update(scope=SLOT_SCOPE, slot_id=slot_id, browser_generation=generation)
         if profile_kind:
@@ -165,40 +172,88 @@ def _wiped_since(mark: dict[str, Any], row: dict[str, Any]) -> bool:
     return generation != str(mark.get("browser_generation") or "")
 
 
+def _mark_epoch(mark: dict[str, Any]) -> float | None:
+    """When the mark was written (epoch s), rounded up when only the second-truncated ISO time is known."""
+    raw = mark.get("marked_epoch")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return float(raw)
+    try:
+        return datetime.fromisoformat(str(mark.get("marked_at") or "")).timestamp() + 1.0
+    except ValueError:
+        return None
+
+
+def _human_cleared_since(mark: dict[str, Any], view: dict[str, Any]) -> str:
+    """dlz: D2-A. The ``human:<principal>`` of a human clear control recorded on this slot after
+    ``mark``, with control's own flag now off; "" otherwise (missing, malformed or older = keep)."""
+    if not isinstance(view, dict) or view.get("error") or view.get("slot_id") != mark.get("slot_id"):
+        return ""
+    if view.get("capture_blocked") is not False:
+        return ""
+    clear = view.get("human_clear")
+    if not isinstance(clear, dict):
+        return ""
+    at = clear.get("at")
+    principal = str(clear.get("principal") or "").strip()
+    marked = _mark_epoch(mark)
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not principal or marked is None:
+        return ""
+    return f"human:{principal}"[:160] if float(at) > marked else ""
+
+
 def _prune_wiped(marks: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
-    """Drop slot marks whose temporary profile control reports wiped since the mark.
+    """Drop slot marks control reports cleared since the mark: a wipe of the slot's temporary
+    profile, or (D2-A) an explicit human clear on the slots board, on any profile kind.
 
     Asks control once per marked slot, outside the lock; any failure keeps the
     mark. The file is re-read under the lock so a mark added meanwhile stays.
     """
     if not marks or not _managed():
         return marks
-    candidates = {
+    wiped_candidates = {
         str(m.get("slot_id")) for m in marks
         if m.get("scope") == SLOT_SCOPE and m.get("slot_id") and m.get("profile_kind") == "temporary"
         and _int_field(m.get("wipe_count")) is not None
     }
-    if not candidates:
+    slots = {str(m.get("slot_id")) for m in marks if m.get("scope") == SLOT_SCOPE and m.get("slot_id")}
+    if not slots:
         return marks
     try:
-        from tools.browser_control_route import slot_status
+        from tools.browser_control_route import capture_guard_view, slot_status
     except Exception:  # health: allow BLE001 -- no control client: keep every mark
         return marks
     rows: dict[str, dict[str, Any]] = {}
-    for slot_id in sorted(candidates):
+    views: dict[str, dict[str, Any]] = {}
+    for slot_id in sorted(slots):
+        try:
+            view = capture_guard_view(slot_id)
+        except Exception:  # health: allow BLE001 -- control unreachable: keep the mark
+            view = None
+        if isinstance(view, dict):
+            views[slot_id] = view
+        if slot_id not in wiped_candidates:
+            continue
         try:
             row = slot_status(slot_id)
         except Exception:  # health: allow BLE001 -- control unreachable: keep the mark
             continue
         if isinstance(row, dict):
             rows[slot_id] = row
-    if not rows:
+    if not rows and not views:
         return marks
 
+    def cleared_by(mark: dict[str, Any]) -> str:
+        if mark.get("scope") != SLOT_SCOPE:
+            return ""
+        slot_id = str(mark.get("slot_id") or "")
+        row = rows.get(slot_id)
+        if mark.get("profile_kind") == "temporary" and row is not None and _wiped_since(mark, row):
+            return "auto:temporary-profile-wiped"
+        view = views.get(slot_id)
+        return _human_cleared_since(mark, view) if view is not None else ""
+
     def stale(mark: dict[str, Any]) -> bool:
-        row = rows.get(str(mark.get("slot_id") or ""))
-        return (mark.get("scope") == SLOT_SCOPE and mark.get("profile_kind") == "temporary" and row is not None
-                and _wiped_since(mark, row))
+        return bool(cleared_by(mark))
 
     with _LOCK:
         path = _state_path()
@@ -212,11 +267,17 @@ def _prune_wiped(marks: list[dict[str, Any]] | None) -> list[dict[str, Any]] | N
         _write_marks(path, kept)
         with path.with_suffix(".log").open("a", encoding="utf-8") as log:
             for slot_id in sorted({str(m.get("slot_id")) for m in removed}):
-                log.write(json.dumps({
-                    "cleared_at": _now(), "slot_id": slot_id, "confirmed_by": "auto:temporary-profile-wiped",
-                    "wipe_count": rows[slot_id].get("wipe_count"),
-                    "marks": [m for m in removed if str(m.get("slot_id")) == slot_id],
-                }, sort_keys=True) + "\n")
+                slot_marks = [m for m in removed if str(m.get("slot_id")) == slot_id]
+                entry: dict[str, Any] = {
+                    "cleared_at": _now(), "slot_id": slot_id,
+                    "confirmed_by": ",".join(sorted({cleared_by(m) for m in slot_marks})),
+                    "marks": slot_marks,
+                }
+                if slot_id in rows:
+                    entry["wipe_count"] = rows[slot_id].get("wipe_count")
+                if slot_id in views and isinstance(views[slot_id].get("human_clear"), dict):
+                    entry["human_clear_at"] = views[slot_id]["human_clear"].get("at")
+                log.write(json.dumps(entry, sort_keys=True) + "\n")
         return kept
 
 
@@ -332,7 +393,8 @@ def screenshot_refusal() -> dict:
         "success": False,
         "error_type": "payment_screenshot_blocked",
         "error": "Screenshots/PDF/recordings are disabled on this browser after card fill. Use redacted "
-        "text inspection, or capture with browser_exec in a research slot that never held the payment page.",
+        "text inspection, or capture with browser_exec in a research slot that never held the payment page. "
+        "Danil can lift it with Clear payment guard on the slots board once the payment tab is closed.",
     }
 
 

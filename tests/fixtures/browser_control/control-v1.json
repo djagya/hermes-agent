@@ -1,0 +1,840 @@
+{
+  "protocol": "browser-control.v1",
+  "doc": "browser-control v1 contract: every route the control server answers (method, auth, body, reply, reasons it may refuse with), the frozen error codes, the reason table (code + HTTP status), the shared CDP timeout table and the events control sends. tests/test_control_contract.py proves server.py implements exactly these routes. The fork vendors this file pinned by sha.",
+  "auth": {
+    "controller": "Authorization: Bearer <controller key>; peer in BROWSER_CONTROLLER_PEERS; Serve headers refused",
+    "controller_peer+command_token": "controller peer; the lease command token in ?tok=",
+    "human": "private lane: Tailscale Serve principal; public lane: Cloudflare Access JWT, Origin and Sec-Fetch pinned",
+    "human+observe_token": "human, plus the slot's current observe token in ?tok=",
+    "human+handoff_origin": "human, plus Origin/Host/Sec-Fetch-Site equal to the handoff origin"
+  },
+  "errors": [
+    "busy",
+    "stale",
+    "scope_denied",
+    "unavailable"
+  ],
+  "reasons": {
+    "lease_ended": {
+      "code": "stale",
+      "status": 403
+    },
+    "token_not_current": {
+      "code": "stale",
+      "status": 403
+    },
+    "lease_owner_mismatch": {
+      "code": "stale",
+      "status": 403
+    },
+    "unknown_slot": {
+      "code": "unavailable",
+      "status": 409
+    },
+    "fence_down": {
+      "code": "unavailable",
+      "status": 409
+    },
+    "human_required": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "principal_mismatch": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "not_taker": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "slot_busy_human": {
+      "code": "busy",
+      "status": 409
+    },
+    "slot_not_active": {
+      "code": "unavailable",
+      "status": 409
+    },
+    "slot_parked": {
+      "code": "unavailable",
+      "status": 409
+    },
+    "slot_transient": {
+      "code": "busy",
+      "status": 409
+    },
+    "pool_exhausted": {
+      "code": "busy",
+      "status": 409
+    },
+    "cdp_not_ready": {
+      "code": "unavailable",
+      "status": 409
+    },
+    "handover_failed": {
+      "code": "unavailable",
+      "status": 409
+    },
+    "handoff_pending": {
+      "code": "busy",
+      "status": 409
+    },
+    "target_not_visible": {
+      "code": "stale",
+      "status": 403
+    },
+    "no_prompt": {
+      "code": "stale",
+      "status": 403
+    },
+    "guard_clear_principal": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "public_route_denied": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "public_origin_denied": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "public_cross_site": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "public_identity_header": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "public_request_denied": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "access_session_invalid": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "handoff_unavailable": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "handoff_lease_changed": {
+      "code": "stale",
+      "status": 403
+    },
+    "handoff_session_unavailable": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "handoff_ownership_changed": {
+      "code": "stale",
+      "status": 403
+    },
+    "handoff_origin_denied": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "handoff_json_required": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "cdp_relay_missing": {
+      "code": "unavailable",
+      "status": 409
+    },
+    "handoff_held": {
+      "code": "busy",
+      "status": 409
+    },
+    "csrf_failed": {
+      "code": "scope_denied",
+      "status": 403
+    },
+    "bad_request": {
+      "code": "unavailable",
+      "status": 400
+    },
+    "upstream_timeout": {
+      "code": "unavailable",
+      "status": 503
+    },
+    "upstream_io": {
+      "code": "unavailable",
+      "status": 503
+    },
+    "no_route": {
+      "code": "unavailable",
+      "status": 404
+    },
+    "internal_error": {
+      "code": "unavailable",
+      "status": 500
+    }
+  },
+  "timeouts": {
+    "cdp_probe_timeout_s": 2.0,
+    "cdp_discovery_budget_s": 7.0,
+    "cdp_client_read_timeout_s": 10.0,
+    "cdp_supervisor_start_s": 15.0,
+    "supervisor_watchdog_stale_s": 30.0
+  },
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/v1/status",
+      "auth": "controller",
+      "body": [
+        "?lease=|?lease_id=",
+        "?slot=",
+        "?task="
+      ],
+      "reply": "pool view (slots, queue_length, park_history, capture_guard_history, idle_recycles, decisions, timeouts, capabilities) | ?slot= slot row | ?lease= slot row + lease_state=live + handoff_pending",
+      "errors": [
+        "lease_ended (lease_state ended|unknown, ended_by, ended_at)",
+        "unknown_slot"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capture-guard",
+      "auth": "controller",
+      "body": [
+        "?slot="
+      ],
+      "reply": "slot_id, capture_blocked, capture_blocked_at, wipe_count, human_clear {at, principal}|null, history",
+      "errors": [
+        "unknown_slot"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/acquire",
+      "auth": "controller",
+      "body": [
+        "task",
+        "mode",
+        "identity",
+        "qa_targets"
+      ],
+      "reply": "lease view (lease_id, slot_id, command_token, observe_token, cdp_path, browser_generation, ownership_epoch, wipe_count, profile_kind, capture_blocked) | queued ticket (queued, position, retry_after_s, error=busy)",
+      "errors": [
+        "fence_down",
+        "slot_busy_human",
+        "pool_exhausted",
+        "cdp_not_ready"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/release",
+      "auth": "controller",
+      "body": [
+        "lease_id",
+        "command_token"
+      ],
+      "reply": "released, closed_transports",
+      "errors": [
+        "lease_ended",
+        "token_not_current",
+        "fence_down",
+        "handoff_pending (deferred, not an error: the lease is kept until the handoff link is used or expires; treat as released-later, do not retry; deferred=true)",
+        "slot_transient"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/cancel",
+      "auth": "controller",
+      "body": [
+        "request_id",
+        "task"
+      ],
+      "reply": "cancelled",
+      "errors": [],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/handoff",
+      "auth": "controller",
+      "body": [
+        "lease_id",
+        "command_token",
+        "ttl",
+        "target_id"
+      ],
+      "reply": "url, expires_in, target_id",
+      "errors": [
+        "lease_ended",
+        "token_not_current",
+        "fence_down"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/native",
+      "auth": "controller",
+      "body": [
+        "action",
+        "lease_id",
+        "command_token",
+        "target_id"
+      ],
+      "reply": "action, key, sent, target_id, page_has_focus_after, next",
+      "errors": [
+        "lease_ended",
+        "token_not_current",
+        "fence_down",
+        "target_not_visible",
+        "no_prompt"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/establish-fence",
+      "auth": "controller",
+      "body": [],
+      "reply": "fence_established",
+      "errors": [],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/controller-lost",
+      "auth": "controller",
+      "body": [],
+      "reply": "closed_transports, fence_established",
+      "errors": [],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/capture-guard",
+      "auth": "controller",
+      "body": [
+        "lease_id",
+        "command_token"
+      ],
+      "reply": "capture_blocked, slot_id, capture_blocked_at, wipe_count, closed_capture_streams (set-only)",
+      "errors": [
+        "lease_ended",
+        "token_not_current",
+        "fence_down"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/recover",
+      "auth": "controller",
+      "body": [
+        "slot_id"
+      ],
+      "reply": "recovered, closed_transports, replay",
+      "errors": [
+        "fence_down"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/take",
+      "auth": "human",
+      "body": [
+        "slot_id"
+      ],
+      "reply": "lease view of the human lease",
+      "errors": [
+        "slot_busy_human",
+        "slot_not_active",
+        "slot_parked",
+        "slot_transient",
+        "handover_failed"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/resume",
+      "auth": "human",
+      "body": [
+        "slot_id | lease_id+command_token"
+      ],
+      "reply": "agent lease view",
+      "errors": [
+        "lease_ended",
+        "token_not_current",
+        "fence_down",
+        "not_taker"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/end",
+      "auth": "human",
+      "body": [
+        "slot_id"
+      ],
+      "reply": "ended, closed_transports",
+      "errors": [
+        "principal_mismatch"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/capture-guard/clear",
+      "auth": "human",
+      "body": [
+        "slot_id",
+        "confirmed_by"
+      ],
+      "reply": "slot_id, capture_blocked=false, cleared, cleared_at",
+      "errors": [
+        "guard_clear_principal",
+        "unknown_slot"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/input",
+      "auth": "human",
+      "body": [],
+      "reply": "always refused (no direct input route)",
+      "errors": [],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/human/take",
+      "auth": "human",
+      "body": [
+        "slot_id"
+      ],
+      "reply": "same as /v1/take (public lane: ok only)",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/human/resume",
+      "auth": "human",
+      "body": [
+        "slot_id"
+      ],
+      "reply": "same as /v1/resume (public lane: ok only)",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/human/end",
+      "auth": "human",
+      "body": [
+        "slot_id"
+      ],
+      "reply": "same as /v1/end (public lane: ok only)",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/human/capture-guard-clear",
+      "auth": "human",
+      "body": [
+        "slot_id"
+      ],
+      "reply": "same as /v1/capture-guard/clear (public lane: ok only)",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/handoff/consume",
+      "auth": "human+handoff_origin",
+      "body": [
+        "token"
+      ],
+      "reply": "303 /handoff/control + session cookie; a re-tap of a used link while its session lives: 303 /handoff/control (this browser) or 409 page (another device), never a second session",
+      "errors": [
+        "handoff_unavailable",
+        "handoff_lease_changed",
+        "handoff_origin_denied",
+        "handoff_held",
+        "handoff_json_required",
+        "cdp_relay_missing",
+        "slot_busy_human",
+        "slot_parked",
+        "slot_transient",
+        "cdp_not_ready",
+        "handover_failed",
+        "fence_down"
+      ],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "html"
+    },
+    {
+      "method": "POST",
+      "path": "/handoff/return",
+      "auth": "human+handoff_origin",
+      "body": [],
+      "reply": "303 /ui/ (also for a repeat within 120 s of a successful return)",
+      "errors": [
+        "handoff_session_unavailable",
+        "handoff_ownership_changed",
+        "handoff_origin_denied",
+        "cdp_not_ready",
+        "handover_failed"
+      ],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "html"
+    },
+    {
+      "method": "GET",
+      "path": "/handoff",
+      "auth": "human",
+      "body": [],
+      "reply": "handoff page or script",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "html"
+    },
+    {
+      "method": "GET",
+      "path": "/handoff/",
+      "auth": "human",
+      "body": [],
+      "reply": "handoff page or script",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "html"
+    },
+    {
+      "method": "GET",
+      "path": "/handoff/auth",
+      "auth": "human",
+      "body": [],
+      "reply": "handoff page or script",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "html"
+    },
+    {
+      "method": "GET",
+      "path": "/handoff/start.js",
+      "auth": "human",
+      "body": [],
+      "reply": "handoff page or script",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "html"
+    },
+    {
+      "method": "GET",
+      "path": "/handoff/control",
+      "auth": "human",
+      "body": [],
+      "reply": "handoff page or script",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "html"
+    },
+    {
+      "method": "GET",
+      "path": "/ui/",
+      "auth": "human",
+      "body": [],
+      "reply": "slot board HTML",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/ui",
+      "auth": "human",
+      "body": [],
+      "reply": "slot board HTML",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/ui/state",
+      "auth": "human",
+      "body": [],
+      "reply": "board JSON",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/ui/static/{asset}",
+      "auth": "human",
+      "body": [],
+      "reply": "board asset",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/ui/shot/{slot}",
+      "auth": "human",
+      "body": [
+        "?w="
+      ],
+      "reply": "PNG thumbnail",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/novnc/{file}",
+      "auth": "human",
+      "body": [],
+      "reply": "noVNC file",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/observe/{slot}",
+      "auth": "human+observe_token",
+      "body": [
+        "?tok=<observe token>"
+      ],
+      "reply": "RFB over WebSocket; first text frame {type: caps, input, view, fields}; public lane: {type: expired} before the close at sign-in expiry",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "upgrade": "websocket",
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/slot/{slot}/json/version",
+      "auth": "controller_peer+command_token",
+      "body": [
+        "?tok="
+      ],
+      "reply": "Chrome /json/version rewritten onto the gate (optional WebSocket upgrade)",
+      "errors": [
+        "lease_ended",
+        "token_not_current",
+        "fence_down",
+        "cdp_not_ready",
+        "unknown_slot"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/slot/{slot}/json/list",
+      "auth": "controller_peer+command_token",
+      "body": [
+        "?tok="
+      ],
+      "reply": "Chrome /json/list rewritten onto the gate",
+      "errors": [
+        "lease_ended",
+        "token_not_current",
+        "fence_down"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/devtools/{target}",
+      "auth": "controller_peer+command_token",
+      "body": [
+        "?tok="
+      ],
+      "reply": "CDP WebSocket splice (capture guard)",
+      "errors": [
+        "lease_ended",
+        "token_not_current",
+        "fence_down"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "upgrade": "websocket",
+      "refusal": "json"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/files/downloads/{name}",
+      "auth": "controller_peer+command_token",
+      "body": [
+        "?tok="
+      ],
+      "reply": "file bytes + X-Sha256",
+      "errors": [
+        "lease_ended",
+        "token_not_current",
+        "fence_down"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/files/staging/{name}",
+      "auth": "controller_peer+command_token",
+      "body": [
+        "?tok=",
+        "X-Sha256 header",
+        "bytes"
+      ],
+      "reply": "name, size, sha256",
+      "errors": [
+        "lease_ended",
+        "token_not_current",
+        "fence_down"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    }
+  ],
+  "events": {
+    "handback": {
+      "to": "BROWSER_HANDBACK_NOTIFY_URL (POST, controller bearer)",
+      "body": [
+        "event",
+        "session_id",
+        "slot_id",
+        "lease_id",
+        "resumed_lease_id"
+      ]
+    }
+  }
+}

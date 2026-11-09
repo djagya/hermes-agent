@@ -7,11 +7,57 @@ resolved, fills exactly one explicit new-password input, and never submits.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Callable, Optional
 
+logger = logging.getLogger(__name__)
 
-def _refuse(error_type: str, error: str) -> str:
-    return json.dumps({"success": False, "error_type": error_type, "error": error})
+# dlz: a consent that was not given has three causes (fault hunt 11-07 B17: a timed-out DataForSEO signup
+# approval was reported as the user's refusal with "Do not retry"). Only a refusal is final.
+CONSENT_OUTCOMES = ("refused", "timeout", "unavailable")
+_NOT_GIVEN = {
+    "refused": "The user refused.",
+    "timeout": "Nobody answered the approval in time.",
+    "unavailable": "The approval could not be shown to the user.",
+}
+
+
+def _refuse(error_type: str, error: str, **extra: Any) -> str:
+    return json.dumps({"success": False, "error_type": error_type, "error": error, **extra})
+
+
+def ask_consent(message: str, description: str, *, surface: str, title: str) -> str:
+    """One native consent: ``accepted``, ``refused``, ``timeout`` or ``unavailable``; one INFO line, no values."""
+    from tools.approval_prompt import request_elicitation_consent
+
+    detail: dict = {}
+    try:
+        verdict = request_elicitation_consent(message, description, surface=surface, title=title, outcome=detail)
+    except Exception:  # health: allow BLE001 -- no approval surface means no consent: fail closed
+        verdict, detail = "decline", {"reason": "unavailable"}
+    reason = detail.get("reason")
+    if verdict == "accept":
+        reason = "accepted"
+    elif reason not in CONSENT_OUTCOMES:  # a stub or a surface without a reason: infer from the verdict
+        reason = "timeout" if verdict == "cancel" else "refused"
+    logger.info("vault consent surface=%s outcome=%s", surface, reason)
+    return reason
+
+
+def outcome_of(answer: Any) -> str:
+    """A consent helper's answer as an outcome; a plain bool (older callers, test stubs) is accepted/refused."""
+    if answer is True or answer == "accepted":
+        return "accepted"
+    return answer if answer in CONSENT_OUTCOMES else "refused"
+
+
+def not_given(error_type: str, what: str, outcome: str) -> str:
+    """The stop result for a consent that was not given. ``error_type`` is unchanged (callers stop on it);
+    ``consent_outcome`` says why, and only a refusal says "Do not retry"."""
+    nxt = ("Do not retry." if outcome == "refused" else
+           "This is not a refusal: ask the user to approve again (one new request), do not loop.")
+    return _refuse(error_type, f"{what} was not approved. {_NOT_GIVEN[outcome]} Nothing was written. {nxt}",
+                   consent_outcome=outcome)
 
 
 def kind_refusal(purpose: str, kind: str) -> Optional[str]:
@@ -21,19 +67,14 @@ def kind_refusal(purpose: str, kind: str) -> Optional[str]:
     return None
 
 
-def confirm_signup_fill(handle: str, label: str, origin: str) -> bool:
-    """Fresh native human decision, never inherited from ordinary login permission."""
-    from tools.approval_prompt import request_elicitation_consent
-
-    try:
-        return request_elicitation_consent(
-            f"Create account on {origin} using saved login '{label}' (handle: {handle})?",
-            "Approve entering this saved password into exactly one new-password field to create an account "
-            "on this exact origin. This is not an ordinary login or password reset. The password never enters "
-            "the conversation. Nothing will be submitted; confirmation-password fields are unsupported.",
-            surface="vault-signup", title="Confirm signup password fill?") == "accept"
-    except Exception:  # health: allow BLE001 -- no approval surface means no consent: fail closed, nothing resolved
-        return False
+def confirm_signup_fill(handle: str, label: str, origin: str) -> str:
+    """Fresh native human decision, never inherited from ordinary login permission; returns the outcome."""
+    return ask_consent(
+        f"Create account on {origin} using saved login '{label}' (handle: {handle})?",
+        "Approve entering this saved password into exactly one new-password field to create an account "
+        "on this exact origin. This is not an ordinary login or password reset. The password never enters "
+        "the conversation. Nothing will be submitted; confirmation-password fields are unsupported.",
+        surface="vault-signup", title="Confirm signup password fill?")
 
 
 def gate(purpose: str, raw_controls: list[Any], handle: str, label: str, page_origin: str,
@@ -49,9 +90,9 @@ def gate(purpose: str, raw_controls: list[Any], handle: str, label: str, page_or
         return None, _refuse("signup_target_unsupported",
                              "Signup requires exactly one explicit new-password input on a registration form; "
                              "confirmation, mixed login, OTP and recovery forms are unsupported. Nothing was written.")
-    if not confirm_signup_fill(handle, label, page_origin):
-        return None, _refuse("signup_declined",
-                             "Signup password fill was not approved. Nothing was written. Do not retry.")
+    outcome = outcome_of(confirm_signup_fill(handle, label, page_origin))
+    if outcome != "accepted":
+        return None, not_given("signup_declined", "Signup password fill", outcome)
     if current_origin() != page_origin:
         return None, _refuse("origin_changed", "The page origin changed during approval. Nothing was written.")
     return target, None

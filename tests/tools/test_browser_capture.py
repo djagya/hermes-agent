@@ -175,7 +175,10 @@ def test_payment_slot_refuses_ux_capture_at_dispatch_and_in_the_harness(managed_
     grants[:] = [_lease("research-1")]
     assert json.loads(browser_use_cli.browser_exec(code, task_id="t"))["success"] is True
     sent, env = runs[0]
-    assert sent.startswith("# hermes: ux capture helpers") and str(browser_capture.HARNESS_MODULE) in sent
+    # Managed mode: line 1 is the exec-start marker (browser_use_cli._EXEC_STARTED_PREAMBLE), then the helpers.
+    marker, _, rest = sent.partition("\n")
+    assert marker + "\n" == browser_use_cli._EXEC_STARTED_PREAMBLE
+    assert rest.startswith("# hermes: ux capture helpers") and str(browser_capture.HARNESS_MODULE) in rest
     assert env[h.GUARD_ENV] == str(guard._state_path()) and env[h.ROOT_ENV].endswith("artifacts/ux-capture")
     # Code that never names the helpers is passed through unchanged.
     browser_use_cli.browser_exec("print(page_info())", task_id="t")

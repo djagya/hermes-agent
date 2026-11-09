@@ -424,6 +424,12 @@ def slot_status(slot_id: str) -> dict[str, Any]:
     return get_json("/v1/status?" + urlencode({"slot": slot_id}))
 
 
+def capture_guard_view(slot_id: str) -> dict[str, Any]:
+    """dlz: ``GET /v1/capture-guard?slot=<id>`` (control-v1): control's guard for one slot, with
+    ``human_clear {at, principal}`` (the last explicit human clear, None when none), or an error dict."""
+    return get_json("/v1/capture-guard?" + urlencode({"slot": slot_id}))
+
+
 # Rollout escape hatch: a control without the capture-guard route (404) lets
 # a card fill go ahead on the local mark alone. Off by default (fail closed).
 CAPTURE_GUARD_OPTIONAL_ENV = "HERMES_BROWSER_CAPTURE_GUARD_OPTIONAL"
@@ -872,14 +878,27 @@ def managed_cdp_or_error(
 
 
 def release_lease(env: dict[str, str]) -> Optional[str]:
-    """Best-effort ``POST /v1/release`` with lease id + command token."""
+    """Best-effort ``POST /v1/release`` with lease id + command token. None = released (now, already, or later)."""
+    return release_lease_outcome(env)[1]
+
+
+# dlz: release outcomes besides "released" that are not errors (fault-hunt B22, G2-R7).
+RELEASE_ALREADY_ENDED = "already_ended"
+RELEASE_DEFERRED = "deferred"
+
+
+def release_lease_outcome(env: dict[str, str]) -> tuple[str, Optional[str]]:
+    """``(outcome, error)``. ``outcome`` is ``released``, ``already_ended`` (control had
+    already recycled the lease: the slot is free) or ``deferred`` (control keeps the lease
+    until a minted handoff link is used or expires: ``handoff_pending``); ``error`` is set
+    only on a real failure. Never retries: a deferred release is done from this side."""
     control = control_url()
     lease_id = str(env.get(MANAGED_LEASE_ENV) or "").strip()
     token = str(env.get(MANAGED_TOKEN_ENV) or "").strip()
     if not control or not lease_id:
-        return None
+        return "released", None
     if is_disabled_url(control):
-        return OPERATOR_DISABLED_ERROR
+        return "", OPERATOR_DISABLED_ERROR
     cache_name = str(env.get("BU_NAME") or "").strip()
     retired = {cache_name}
     with _held_lock:
@@ -892,15 +911,32 @@ def release_lease(env: dict[str, str]) -> Optional[str]:
     for name in retired:
         _retire_daemon(name)
     if not control_key():
-        return f"unavailable: {MANAGED_KEY_ENV} missing"
+        return "", f"unavailable: {MANAGED_KEY_ENV} missing"
     result = _post(
         control,
         "/v1/release",
         {"lease_id": lease_id, "token": token},
     )
-    if result.get("error"):
-        return _format_error(result)
-    return None
+    if not result.get("error"):
+        return "released", None
+    if result.get("deferred") is True or result.get("reason") == "handoff_pending":
+        logger.info("browser control: release deferred lease=%s reason=handoff_pending", lease_id[:12])
+        return RELEASE_DEFERRED, None
+    if result.get("error") == "stale":
+        # The lease was already recycled (idle sweep, human End, restart): the slot is free.
+        logger.info("browser control: release of an ended lease=%s treated as done", lease_id[:12])
+        return RELEASE_ALREADY_ENDED, None
+    return "", _format_error(result)
+
+
+def _handoff_open(snapshot: dict[str, str]) -> bool:
+    """dlz: D10-B. True while a handoff link this process minted for the snapshot's lease is open."""
+    slot, lease = str(snapshot.get(MANAGED_SLOT_ENV) or ""), str(snapshot.get(MANAGED_LEASE_ENV) or "")
+    if not slot or not lease:
+        return False
+    now = _monotonic()
+    with _handoffs_lock:
+        return any(k[1] == slot and k[2] == lease and until > now for k, until in _minted_handoffs.items())
 
 
 def release_task_leases(owners: Any) -> int:
@@ -916,6 +952,9 @@ def release_task_leases(owners: Any) -> int:
         return 0
     with _held_lock:
         keys = [key for key in _held_leases if key.split("|", 1)[0] in wanted]
+        # dlz: D10-B — a lease Danil may be about to take through an open handoff link stays held
+        # (control keeps it too); the handback claim still finds it after /new, /reset or cron end.
+        keys = [key for key in keys if not _handoff_open(_held_leases[key])]
         snapshots = [_held_leases.pop(key) for key in keys]
     for snapshot in snapshots:
         try:
@@ -930,6 +969,11 @@ def release_all_held_leases() -> None:
         held = list(_held_leases.values())
         _held_leases.clear()
     for snapshot in held:
+        if _handoff_open(snapshot):
+            # dlz: D10-B — exit (atexit) must not release the lease an open handoff link points at.
+            logger.warning("browser control: exit keeps lease slot=%s: a handoff link is open",
+                           snapshot.get(MANAGED_SLOT_ENV, ""))
+            continue
         try:
             release_lease(snapshot)
         except Exception:
