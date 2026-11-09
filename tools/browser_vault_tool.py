@@ -1212,8 +1212,9 @@ BROWSER_VAULT_SCHEMA = {
         "save_declined; never retry payment_declined (the user refused the card-fill approval; never a bank or "
         "issuer decline). payment_consent_missing: no approval arrived (consent_outcome timeout or unavailable), "
         "nothing was written; stop and ask the user once before a new fill, which shows a new prompt. "
-        "payment_consent_expired: the approval came after the 120 s inspection window; nothing was written; ask "
-        "again. payment_fields_not_retained: "
+        "payment_consent_expired: the 120 s inspection window closed; with partially_filled false nothing was "
+        "written, ask again; with partially_filled true some fields were written: stop, do not submit or retry, "
+        "tell the user. payment_fields_not_retained: "
         "fields were written but did not all hold after the page settled; do not submit or retry, tell the user."
     ),
     "parameters": {
