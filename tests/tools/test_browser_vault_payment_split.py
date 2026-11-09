@@ -510,15 +510,121 @@ def test_four_hosted_frames_cost_one_visibility_call_per_parent_per_pass():
     assert sup.calls.count("Runtime.callFunctionOn") == 2 + 4 + 4  # owner checks + commits + retention reads
 
 
-def test_every_document_write_carries_the_wall_clock_deadline():
+@pytest.mark.parametrize("consent_s, expected_ms", [(30, 20_000), (5, 5_000)])
+def test_renderer_deadline_is_the_earlier_of_consent_and_commit_budget(consent_s, expected_ms):
+    """A write dispatched just inside the 20 s commit budget must not land after it once the host has
+    reported uncertainty: the renderer gets min(consent, budget), counted from its closure anchor."""
     import time as _time
 
     sup, i = _FakeSupervisor([{"success": True, "filled_fields": 1}] * 2), _split_inspection()
-    i.expires_at = _time.monotonic() + 30
-    asyncio.run(sup._commit_payment(i, [{"index": 0, "token": "cc-number", "value": "4242", "document": 0},
-                                        {"index": 0, "token": "cc-csc", "value": "837", "document": 1}]))
-    expected = _time.time() * 1000 + 30_000
-    assert len(sup.deadlines) == 2 and all(abs(d - expected) < 2_000 for d in sup.deadlines)
+    now = _time.monotonic()
+    i.expires_at = now + consent_s
+    i.documents[0].clock_anchor = now
+    asyncio.run(sup._commit_payment(i, [{"index": 0, "token": "cc-csc", "value": "837", "document": 0},
+                                        {"index": 0, "token": "cc-number", "value": "4242", "document": 1}],
+                                    until=now + 20))
+    first, unanchored = sup.deadlines
+    assert abs(first - expected_ms) < 1 and unanchored == 0.0  # no anchor: nothing may be written
+
+
+_COMMIT_HARNESS = r"""
+let mono = 1000, dateCalls = 0, writes = 0;
+const performance = {now: () => mono};
+Date.now = () => { dateCalls += 1; return 0; };  // the wall clock stepped back to the epoch
+class HTMLInputElement { get value() { return this.held || ''; } set value(v) { writes += 1; this.held = v; } }
+class HTMLSelectElement { get value() { return ''; } set value(v) {} }
+class Event {} class InputEvent extends Event {} class FocusEvent extends Event {}
+const document = {forms: []};
+const el = Object.assign(new HTMLInputElement(), {tagName: 'INPUT', autocomplete: 'cc-number', name: 'n', id: 'n',
+  labels: null, placeholder: '', type: 'text', form: null, maxLength: 0, disabled: false, readOnly: false,
+  isConnected: true, tabIndex: 0, shadowRoot: null, ownerDocument: document, style: {setProperty() {}},
+  getAttribute: () => null, hasAttribute: () => false, getBoundingClientRect: () => ({width: 100, height: 20}),
+  getClientRects: () => [1], dispatchEvent: () => true, blur() {}, focus() { mono += CASE.focus; }});
+document.querySelectorAll = () => [el];
+const location = {href: 'https://www.paypal.com/card'};
+const getComputedStyle = () => ({visibility: 'visible', opacity: '1', pointerEvents: 'auto'});
+const api = INSPECT;
+mono += CASE.elapsed;
+const result = api.commit([{index: 0, token: 'cc-number', value: '4242'}], CASE.deadline);
+process.stdout.write(JSON.stringify({result, writes, dateCalls}));
+"""
+
+
+@pytest.mark.parametrize("case, writes", [
+    ({"elapsed": 500, "focus": 0, "deadline": 1000}, 1),
+    ({"elapsed": 1500, "focus": 0, "deadline": 1000}, 0),  # past it, though Date.now() went backwards
+    ({"elapsed": 900, "focus": 200, "deadline": 1000}, 0),  # page code on focus crossed it: no setter
+    ({"elapsed": 0, "focus": 0, "deadline": None}, 0),  # no deadline is never "no limit"
+])
+def test_renderer_expiry_reads_the_monotonic_document_clock_not_date_now(case, writes):
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for the synthetic commit closure")
+    values = {"CASE": json.dumps(case), "INSPECT": sp._INSPECT}
+    harness = re.sub(r"\bCASE\b|\bINSPECT\b", lambda m: values[m.group(0)], _COMMIT_HARNESS)
+    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
+    assert run.returncode == 0, run.stderr
+    out = json.loads(run.stdout)
+    assert out["writes"] == writes and out["dateCalls"] == 0
+    assert out["result"]["success"] is bool(writes)
+    if not writes:
+        assert out["result"]["error_type"] == "payment_consent_expired"
+
+
+class _CancelSupervisor(sp.PaymentSupervisionMixin):
+    """Real commit and release code over a fake CDP; ``stall`` holds the commit at freshness or at the
+    first release long enough for commit_payment's budget to run out."""
+
+    def __init__(self, stall, loop):
+        self.stall, self._loop, self.released, self.detached = stall, loop, [], []
+
+    async def _payment_is_current(self, i):
+        if self.stall == "freshness":
+            await asyncio.sleep(5)
+        return True
+
+    async def _cdp(self, method, params=None, session_id=None, timeout=None):
+        params = params or {}
+        if method == "Runtime.releaseObject":
+            if self.stall == "cleanup" and not self.released:
+                await asyncio.sleep(0.6)
+            self.released.append(params["objectId"])
+        elif method == "Target.detachFromTarget":
+            self.detached.append(params["sessionId"])
+        fn = params.get("functionDeclaration", "")
+        if fn == sp._OWNERS_SHOWN:
+            return {"result": {"result": {"value": [True] * len(params["arguments"])}}}
+        if "commit(" in fn:
+            return {"result": {"result": {"value": {"success": True, "filled_fields": 1}}}}
+        if "retained()" in fn:
+            return {"result": {"result": {"value": [{"token": "cc-number", "state": "held", "length": 4}]}}}
+        return {"result": {}}
+
+
+@pytest.mark.parametrize("stall", ["freshness", "cleanup"])
+def test_a_timed_out_commit_still_releases_every_pinned_owner_and_child_session(stall, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(sp, "_COMMIT_BUDGET_SECONDS", 0.3)
+    tree = (("top", "", "", MERCHANT, ""), ("btn", "", "", _PAYPAL, "top"), ("card", "", "", _PAYPAL, "btn"))
+    i = _owned_inspection(tree, [PaymentDocument("card", "sc", "oc", _PAYPAL, _controls("cc-number"))])
+    i.child_sessions = {"btn": "s-btn", "card": "sc"}
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    sup = _CancelSupervisor(stall, loop)
+    try:
+        out = sup.commit_payment(i, [{"index": 0, "token": "cc-number", "value": "4242", "document": 0}])
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(2)
+    assert out["error_type"] == "payment_transport_uncertain" and i.consumed
+    # The caller skips its discard once consumed, so commit_payment itself must have finished the release.
+    assert sorted(sup.released) == ["btn", "card", "oc"] and sorted(sup.detached) == ["s-btn", "sc"]
 
 
 def test_commit_after_the_inspection_window_is_expired_not_a_changed_page():
