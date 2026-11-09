@@ -119,71 +119,87 @@ def password_fills(target: Any, classified: list[Any], password: str) -> list[di
     return fills
 
 
-def fill_expression(fills: list[dict[str, Any]], page_origin: str, nonce: str, target: Any) -> str:
+def fill_expression(fills: list[dict[str, Any]], page_origin: str, nonce: str, target: Any, *, bind: str = "",
+                    tokens: Optional[dict[str, str]] = None, refusal_tag: str = "") -> str:
     from agent.vault_login_classifier import build_fill_js, build_signup_fill_js
 
     if target is None:
-        return build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
-    return build_signup_fill_js(fills, page_origin, nonce, target)
+        return build_fill_js(fills, expected_origin=page_origin, nonce=nonce, refusal_tag=refusal_tag)
+    return build_signup_fill_js(fills, page_origin, nonce, target, bind=bind, tokens=tokens or {})
+
+
+def outcome_tokens() -> dict[str, str]:
+    """Fresh per-fill outcome tokens for the signup writer (see agent.vault_login_classifier.SIGNUP_OUTCOMES)."""
+    from agent.vault_login_classifier import new_signup_outcome_tokens
+
+    return new_signup_outcome_tokens()
 
 
 _NO_SUBMIT = "Nothing was submitted. Do not submit the form and do not retry the fill; tell the user."
-_PAIR_FAILURES = {
-    "signup_fill_partial": "The new-password field may have been filled, but the confirm-password field was not "
-                           "reliably filled: the form changed or a write failed after the first field "
-                           "(fields_possibly_written says how many writes started). " + _NO_SUBMIT,
-    "signup_fields_not_retained": "Both password fields were written, but after the page settled at least one no "
-                                  "longer held the password (field_retention names which). " + _NO_SUBMIT,
-    "signup_fill_uncertain": "The browser did not confirm the paired fill: one or both password fields may have "
+_FAILURES = {
+    "signup_fill_partial": "The fill stopped part-way: the form changed or a write failed between fields, so up to "
+                           "fields_possibly_written of the approved password fields may hold the password. "
+                           + _NO_SUBMIT,
+    "signup_form_changed": "The password was written into every approved field, but afterwards the form no longer "
+                           "matched what was approved (a field, its type or role, the form or its action changed, or "
+                           "another password or code field appeared), so the fill cannot be confirmed. " + _NO_SUBMIT,
+    "signup_fields_not_retained": "The password was written, but after the page settled at least one approved field "
+                                  "no longer held it (field_retention names which). " + _NO_SUBMIT,
+    "signup_fill_uncertain": "The browser did not return a verifiable answer: one or more password fields may have "
                              "been written. " + _NO_SUBMIT,
 }
+_ROLES = ("new-password", "confirm-password")
 
 
-def _pair_failure(error_type: str, base: dict[str, Any], **extra: Any) -> str:
-    return json.dumps({"success": False, "error_type": error_type, "error": _PAIR_FAILURES[error_type],
+def _failure(error_type: str, base: dict[str, Any], **extra: Any) -> str:
+    return json.dumps({"success": False, "error_type": error_type, "error": _FAILURES[error_type],
                        "partially_filled": True, **extra, **base})
-
-
-def uncertain(target: Any, backend_name: str, kind: str, page_origin: str) -> Optional[str]:
-    """For a paired target, the result when the native write failed or its answer is unreadable: a write
-    may have happened, so never "Nothing was written". None for a one-field target (unchanged)."""
-    if target is None or target.confirm is None:
-        return None
-    return _pair_failure("signup_fill_uncertain", _base(backend_name, kind, page_origin))
 
 
 def _base(backend_name: str, kind: str, page_origin: str) -> dict[str, Any]:
     return {"backend": backend_name, "kind": kind, "origin": page_origin, "purpose": "signup"}
 
 
-def finish(parsed: Any, backend_name: str, kind: str, page_origin: str, target: Any = None) -> str:
-    """Result of a signup write that the native transport ran: counts and states only, never submitted.
+def uncertain(target: Any, backend_name: str, kind: str, page_origin: str) -> Optional[str]:
+    """For a signup target, the result when the native write failed or never answered: a write may have
+    happened, so never "Nothing was written". None for a login fill (its own handling)."""
+    if target is None:
+        return None
+    return _failure("signup_fill_uncertain", _base(backend_name, kind, page_origin))
 
-    One field: success when it was filled (unchanged). Pair: success only when BOTH fields were written
-    and both still held the value after the page settled; otherwise a typed non-success."""
-    if isinstance(parsed, dict) and parsed.get("refused") == "signup_target_changed":
-        return _refuse("signup_target_changed", "The approved signup target changed. Nothing was written.")
+
+def finish(raw: Any, backend_name: str, kind: str, page_origin: str, target: Any,
+           tokens: dict[str, str]) -> str:
+    """Result of a signup write that the native transport ran: states only, never submitted, never a value.
+
+    ``raw`` is the script's answer: one of this fill's outcome tokens, or anything else (garbled or forged by
+    the page), which is uncertain. Success only when every approved field was written and still held the
+    value after the page settled and the form was revalidated."""
+    if isinstance(raw, str) and raw.startswith('"'):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            pass
+    outcome = {token: name for name, token in tokens.items()}.get(raw) if isinstance(raw, str) else None
     base = _base(backend_name, kind, page_origin)
-    if target is not None and target.confirm is not None:
-        if not isinstance(parsed, dict):
-            return _pair_failure("signup_fill_uncertain", base)
-        if parsed.get("partial") in ("signup_target_changed", "signup_write_failed"):
-            attempted = parsed.get("attempted")
-            return _pair_failure("signup_fill_partial", base, reason=parsed["partial"],
-                                 fields_possibly_written=attempted if attempted in (1, 2) else 2)
-        retained = parsed.get("retained")
-        if parsed.get("filled") != 2 or not (isinstance(retained, list) and len(retained) == 2):
-            return _pair_failure("signup_fill_uncertain", base)
-        if retained != [True, True]:
-            states = {token: ("held" if held is True else "lost")
-                      for token, held in zip(("new-password", "confirm-password"), retained)}
-            return _pair_failure("signup_fields_not_retained", base, filled_fields=sum(h is True for h in retained),
-                                 field_retention=states)
-        return json.dumps({"success": True, "filled_fields": 2, "retention_verified": True,
-                           "fields": ["new-password", "confirm-password"], **base,
-                           "next": "Both password fields filled with the same saved password; nothing submitted. "
-                                   "Review the account-creation form before submitting."})
-    filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
-    return json.dumps({"success": bool(filled), "filled_fields": int(filled), **base,
-                       "next": "Password filled only; nothing submitted. Review the account-creation form before "
-                               "submitting."})
+    fields = list(_ROLES[:len(target.controls)])
+    if outcome == "none":
+        return _refuse("signup_target_changed", "The approved signup target changed. Nothing was written.")
+    if outcome == "origin":
+        return _refuse("origin_changed", "The page navigated away from the approved origin before the fill. "
+                                         "Nothing was written.")
+    if outcome in ("partial:1", "partial:2") and int(outcome[-1]) <= len(fields):
+        return _failure("signup_fill_partial", base, fields_possibly_written=int(outcome[-1]))
+    if outcome == "changed":
+        return _failure("signup_form_changed", base, fields=fields)
+    bits = outcome[len("mask:"):] if outcome and outcome.startswith("mask:") else ""
+    if len(bits) != len(fields):
+        return _failure("signup_fill_uncertain", base)
+    if bits == "1" * len(fields):
+        nxt = ("Both password fields filled with the same saved password; nothing submitted. " if len(fields) == 2
+               else "Password filled only; nothing submitted. ")
+        return json.dumps({"success": True, "filled_fields": len(fields), "retention_verified": True,
+                           "fields": fields, **base,
+                           "next": nxt + "Review the account-creation form before submitting."})
+    return _failure("signup_fields_not_retained", base, filled_fields=bits.count("1"),
+                    field_retention={f: ("held" if b == "1" else "lost") for f, b in zip(fields, bits)})

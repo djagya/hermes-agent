@@ -484,12 +484,13 @@ class TestBrowserVaultTools:
             assert "window.location.origin" in expression
             assert '"https://example.com"' in expression
             # Simulate the page having navigated cross-origin by the time
-            # the fill script executes: the script's own assert fires.
+            # the fill script executes: the script's own assert fires and
+            # answers with this fill's refusal tag (its pre-write proof).
+            import re
+            tag = re.search(r'tag: "(hv-[0-9a-f]+)"', expression).group(1)
             return {
                 "success": True,
-                "result": json.dumps(
-                    {"refused": "origin_changed", "found": "https://evil.com"}
-                ),
+                "result": json.dumps({"refused": "origin_changed", "tag": tag}),
             }
 
         with patch("agent.vault_store.get_vault_store", return_value=store), \
