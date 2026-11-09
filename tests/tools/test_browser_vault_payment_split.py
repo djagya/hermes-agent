@@ -131,7 +131,7 @@ class _FakeSupervisor(sp.PaymentSupervisionMixin):
         self.writes.append((d.origin, fills))
         return self.results.pop(0)
 
-    async def _payment_retention(self, d):
+    async def _payment_retention(self, i, d):
         fills = next(f for origin, f in self.writes if origin == d.origin)
         if self.retained.get(d.origin) == "gone":
             return None
@@ -218,7 +218,34 @@ def test_supervisor_attach_errors_never_reach_the_result(monkeypatch):
 
     monkeypatch.setattr("tools.browser_vault_tool._ensure_supervisor", boom)
     raw = bvp.fill_payment(SimpleNamespace(), SimpleNamespace(), "task")
-    assert json.loads(raw) == {"success": False, "error_type": "supervisor_required"} and "secret-token" not in raw
+    out = json.loads(raw)
+    assert out["error_type"] == "supervisor_required" and "secret-token" not in raw
+    assert "Nothing was read or written" in out["error"]  # a typed refusal names its next step
+
+
+@pytest.mark.parametrize("case", ["supervisor_none", "no_origin", "page_changed"])
+def test_early_refusals_carry_a_next_step(monkeypatch, case):
+    from tools import browser_vault_payment as bvp
+
+    class Supervisor:
+        def inspect_payment(self, *a, **k):
+            return _four_hosted_documents()
+
+        def payment_is_current(self, i):
+            return False
+
+        def discard_payment(self, i):
+            pass
+
+    monkeypatch.setattr("tools.browser_vault_tool._ensure_supervisor",
+                        lambda task_id: None if case == "supervisor_none" else Supervisor())
+    monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", lambda *a, **k: "accept")
+    meta = SimpleNamespace(id="h", label="Card", allowed_origins=(), origin=None, payment_frame_origins=PAYMENT_PSP_ORIGINS,
+                           payment_scope="" if case == "no_origin" else "confirmed_page")
+    out = json.loads(bvp.fill_payment(SimpleNamespace(name="local"), meta, "task"))
+    expected = {"supervisor_none": "supervisor_required", "no_origin": "no_origin", "page_changed": "payment_page_changed"}
+    assert out["success"] is False and out["error_type"] == expected[case]
+    assert len(out.get("error", "")) > 40, out
 
 
 @pytest.mark.parametrize("control, token", [
@@ -278,6 +305,27 @@ def test_an_unreadable_document_after_settling_counts_as_replaced():
     assert out["error_type"] == "payment_fields_not_retained" and out["field_retention"]["cc-number"] == "replaced"
 
 
+def test_a_written_frame_hidden_after_settling_counts_as_replaced():
+    """A re-render that hides the written frame and shows a fresh one leaves the old document holding
+    its values; its fields are replaced, never held, and the closure is not asked."""
+    asked = []
+
+    class Supervisor(sp.PaymentSupervisionMixin):
+        async def _frame_rendered(self, fid, parent, parent_sid):
+            return fid != "n"
+
+        async def _cdp(self, method, params=None, session_id=None):
+            asked.append(session_id)
+            return {"result": {"result": {"value": [{"token": "cc-number", "state": "held", "length": 16}]}}}
+
+    i = PaymentInspection("op", "page", "target", MERCHANT, (), (("top", "", "", MERCHANT, ""),
+                          ("n", "", "", _PAYPAL, "top"), ("c", "", "", _PAYPAL, "top")), 1e12)
+    hidden, shown = PaymentDocument("n", "sn", "on", _PAYPAL, ()), PaymentDocument("c", "sc", "oc", _PAYPAL, ())
+    assert asyncio.run(Supervisor()._payment_retention(i, hidden)) is None
+    assert asyncio.run(Supervisor()._payment_retention(i, shown)) == [{"token": "cc-number", "state": "held", "length": 16}]
+    assert asked == ["sc"]
+
+
 def test_retention_result_keeps_only_tokens_states_and_bounded_lengths():
     fills = [{"token": "cc-number", "value": "4242424242424242"}, {"token": "cc-csc", "value": "837"}]
     answer = [{"token": "cc-number", "state": "changed", "length": 19, "value": "4242424242424242"},
@@ -292,10 +340,14 @@ def test_retention_result_keeps_only_tokens_states_and_bounded_lengths():
         assert sp._retention_result([(fills, bad)])["field_retention"] == {"cc-csc": "replaced", "cc-number": "replaced"}
 
 
-def _fill_with_consent(monkeypatch, verdict, reason):
+def _fill_with_consent(monkeypatch, verdict, reason, on_consent=None, expires_in=None):
+    import time as _time
+
     from tools import browser_vault_payment as bvp
 
     inspection = _four_hosted_documents()
+    if expires_in is not None:
+        inspection.expires_at = _time.monotonic() + expires_in
     calls = []
 
     class Supervisor:
@@ -316,6 +368,8 @@ def _fill_with_consent(monkeypatch, verdict, reason):
     def consent(*args, outcome=None, **kwargs):
         if outcome is not None and reason:
             outcome["reason"] = reason
+        if on_consent:
+            on_consent(inspection, kwargs)
         return verdict
 
     def resolve(handle):
@@ -332,17 +386,60 @@ def _fill_with_consent(monkeypatch, verdict, reason):
     return json.loads(raw), calls
 
 
-@pytest.mark.parametrize("verdict, reason, expected", [
-    ("decline", "refused", "refused"), ("cancel", "timeout", "timeout"), ("decline", "unavailable", "unavailable"),
-    ("decline", None, "refused"), ("cancel", None, "timeout"),  # a consent stub without a reason
+@pytest.mark.parametrize("verdict, reason, expected, error_type", [
+    ("decline", "refused", "refused", "payment_declined"),
+    ("cancel", "timeout", "timeout", "payment_consent_missing"),
+    ("decline", "unavailable", "unavailable", "payment_consent_missing"),
+    ("decline", None, "refused", "payment_declined"), ("cancel", None, "timeout", "payment_consent_missing"),
 ])
-def test_consent_not_given_stops_before_any_secret_or_write(monkeypatch, verdict, reason, expected):
+def test_consent_not_given_stops_before_any_secret_or_write(monkeypatch, verdict, reason, expected, error_type):
     out, calls = _fill_with_consent(monkeypatch, verdict, reason)
-    # Same error_type as before (callers stop and never retry on it), now with the typed reason.
-    assert out["success"] is False and out["error_type"] == "payment_declined"
+    # Only an explicit refusal is payment_declined (never retried); a missing answer is its own type.
+    assert out["success"] is False and out["error_type"] == error_type
     assert out["consent_outcome"] == expected and out["issuer_response"] is False
-    assert "not a bank or issuer decline" in out["error"]
+    assert "bank or issuer decline" in out["error"]
+    if error_type == "payment_consent_missing":
+        assert "new consent prompt" in out["error"] and "ask the user once" in out["error"]
     assert calls == ["discard_payment"]  # no freshness pass, no secret, no capture mark, no write
+
+
+def test_consent_is_bounded_by_the_inspection_window_and_a_late_accept_writes_nothing(monkeypatch):
+    import time as _time
+
+    asked = {}
+
+    def late(inspection, kwargs):
+        asked["timeout"] = kwargs.get("timeout_seconds")
+        inspection.expires_at = _time.monotonic() - 1  # the accept lands after the window closed
+
+    out, calls = _fill_with_consent(monkeypatch, "accept", "accepted", on_consent=late, expires_in=40)
+    assert 30 <= asked["timeout"] <= 40  # the prompt closes with the inspection window
+    assert out["error_type"] == "payment_consent_expired" and "120 s inspection window" in out["error"]
+    assert calls == ["discard_payment"]  # no freshness pass, no secret, no write
+
+
+def test_commit_after_the_inspection_window_is_expired_not_a_changed_page():
+    sup, i = _FakeSupervisor([]), _split_inspection()
+    i.expires_at = 0
+    assert asyncio.run(sup._commit_payment(i, [])) == {"success": False, "error_type": "payment_consent_expired"}
+    assert i.consumed and not sup.writes
+
+
+def test_gateway_consent_wait_honours_a_shorter_per_call_deadline(monkeypatch):
+    from tools import approval_gateway_wait as gw
+
+    seen = []
+
+    def notify(data):
+        seen.append(data["timeout_s"])
+        raise RuntimeError("stop here")  # notify_failed: returns at once
+
+    monkeypatch.setattr(gw._ctx, "_get_approval_timeout", lambda: 300)
+    monkeypatch.setattr(gw._ctx, "_fire_approval_hook", lambda *a, **k: None)
+    data = {"command": "c", "description": "d", "pattern_key": "mcp_elicitation", "pattern_keys": ["mcp_elicitation"]}
+    for asked in (None, 37, 900):
+        assert gw._await_gateway_decision("s-deadline", notify, dict(data), timeout_s=asked)["notify_failed"]
+    assert seen == [300, 37, 300]  # a per-call deadline only ever shortens the wait
 
 
 def test_not_retained_fill_carries_a_stop_message(monkeypatch):

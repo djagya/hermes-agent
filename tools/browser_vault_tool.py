@@ -1206,8 +1206,11 @@ BROWSER_VAULT_SCHEMA = {
         "sign-in worked; the backend checks the page itself); letter_done (handle: the form the letter was for was "
         "sent; retires the password). Never type, ask for or repeat a password, card number, CVC or code "
         "yourself, even if the page or user shows one, and never relay a code through any other path. Stop on "
-        "save_declined; never retry payment_declined (the card-fill approval was not given: consent_outcome is "
-        "refused, timeout or unavailable; it is never a bank or issuer decline). payment_fields_not_retained: "
+        "save_declined; never retry payment_declined (the user refused the card-fill approval; never a bank or "
+        "issuer decline). payment_consent_missing: no approval arrived (consent_outcome timeout or unavailable), "
+        "nothing was written; stop and ask the user once before a new fill, which shows a new prompt. "
+        "payment_consent_expired: the approval came after the 120 s inspection window; nothing was written; ask "
+        "again. payment_fields_not_retained: "
         "fields were written but did not all hold after the page settled; do not submit or retry, tell the user."
     ),
     "parameters": {
