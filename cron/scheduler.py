@@ -524,7 +524,9 @@ def _deliver_recovery_notice(job: dict, fence: "_FireOwnership", *, adapters, lo
         with fence.side_effect_fence() as owns:
             if not owns:
                 return
-            error = _deliver_result(job, notice, adapters=adapters, loop=loop, for_failure=True)
+            # dlz: CRON-1 — its own queue key; the execution id belongs to the run's result.
+            error = _deliver_result(job, notice, adapters=adapters, loop=loop, for_failure=True,
+                                    queue_key_suffix=":recovery")
         if error:
             logger.warning("Recovery notice for job %s not delivered: %s", job["id"], error)
     except Exception as exc:

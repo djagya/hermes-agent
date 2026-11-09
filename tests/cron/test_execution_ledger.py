@@ -618,3 +618,24 @@ def test_cap_is_pinned_and_missed_rows_age_out(monkeypatch, tmp_path):
     executions.record_missed_occurrences(  # this write runs the prune
         "later", count=1, first_instant=clock["now"].isoformat(), detail="skipped")
     assert [r["job_id"] for r in executions.list_executions(limit=100)] == ["later"]
+
+
+@pytest.mark.parametrize("prune", ["age", "count"])
+def test_retention_keeps_runs_whose_delivery_is_still_queued(monkeypatch, tmp_path, prune):
+    """CRON-2: the drain settles a job through its queued run; pruning that row strands the job."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    clock = {"now": datetime(2026, 10, 10, tzinfo=UTC)}
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock["now"])
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 1 if prune == "count" else 100)
+    queued = executions.create_execution("queued", source="builtin")
+    executions.finish_execution(queued["id"], success=True, delivery_outcome="queued")
+    settled = executions.create_execution("settled", source="builtin")
+    executions.finish_execution(settled["id"], success=True, delivery_outcome="delivered")
+    if prune == "age":
+        clock["now"] += timedelta(hours=executions.TERMINAL_RETENTION_HOURS, seconds=1)
+    newer = executions.create_execution("newer", source="builtin")
+    executions.finish_execution(newer["id"], success=True)
+
+    assert executions.get_execution(settled["id"]) is None
+    assert executions.settle_delivery_outcome(queued["id"], "delivered")
+    assert executions.get_execution(queued["id"])["delivery_outcome"] == "delivered"

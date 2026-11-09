@@ -259,11 +259,15 @@ def _terminal_retention_hours() -> float:
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
+    # dlz: CRON-2 — a run whose delivery is still queued is not history yet: the drain settles
+    # the job through this row (``delivery_outcome._settle_job_record``), so neither prune may
+    # drop it, or the job stays ``delivery_queued`` forever after a long outage.
     cutoff = (_hermes_now() - timedelta(hours=_terminal_retention_hours())).isoformat()
     conn.execute(
         # dlz: cancelled/missed rows age out too, or the time prune never drops them (only the cap).
         """DELETE FROM executions
            WHERE status IN ('completed','failed','unknown','cancelled','missed')
+             AND COALESCE(delivery_outcome, '') <> 'queued'
              AND julianday(COALESCE(finished_at, claimed_at)) < julianday(?)""",
         (cutoff,),
     )
@@ -271,6 +275,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown','cancelled','missed')
+               AND COALESCE(delivery_outcome, '') <> 'queued'
              ORDER BY julianday(finished_at) DESC, finished_at DESC,
                       julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",

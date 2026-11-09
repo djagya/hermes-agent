@@ -4820,9 +4820,12 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
 
         last_visible_role = _last_template_visible_role(compressed)
-        if self._has_merged_inflight_replay(inflight):
+        from agent.voice_provenance import fold_inflight_voice, restate_inflight_voice
+        inflight_is_carrier = self._has_merged_inflight_replay(inflight)
+        if inflight_is_carrier:
             # Never copy a summary carrier (its metadata marks it synthetic): restate as a plain user row.
             replay = {"role": "user", "content": task_text}
+            restate_inflight_voice(replay, inflight)  # dlz: GW-1, the absorbed voice binding
         else:
             replay = _fresh_compaction_message_copy(inflight)
         replay.pop(_COMPACTION_TAIL_MARKER, None)
@@ -4901,6 +4904,8 @@ Write only the summary body. Do not include any preamble or prefix."""
             drop_stale_api_content(carrier)
             # The carrier absorbed a durable user turn: record its uid (merge witness).
             record_absorbed_message(carrier, inflight)
+            # dlz: GW-1 — and its voice binding, so a later restatement restores it.
+            fold_inflight_voice(carrier, inflight, inflight_is_carrier=inflight_is_carrier)
             return compressed
 
         compressed.append(replay)

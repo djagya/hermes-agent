@@ -240,7 +240,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         await adapter.send(source.chat_id, content, metadata=metadata)
 
     async def _deliver_media_from_response(
-        self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[dict[str, Any]] = None
+        self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[dict[str, Any]] = None,
+        include_url_images: bool = True,
     ) -> None:
         """Deliver explicit attachments from an already-streamed response (text already delivered).
         EXPLICIT-ONLY, unlike the non-streaming path in ``gateway/platforms/base.py``: a bare local
@@ -271,6 +272,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # extraction left a streamed reply that showed the tag as text and never sent the image
             # (#141806).
             url_images, _ = adapter.extract_images(cleaned)
+            if not include_url_images:
+                # dlz: the text send already consumed the inline photos (inline_images_consumed).
+                url_images = []
             _thread_meta = (
                 dict(thread_metadata)
                 if thread_metadata is not None
@@ -328,6 +332,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        inline_images_consumed = False
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -366,9 +371,20 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     except Exception as _qe:
                         logger.debug("Queued-lane reconcile edit failed (%s); falling back to send.", _qe)
                 if not _reconciled:
+                    # dlz: B11 — a fresh send mirrors the ordinary final (extract_response_content +
+                    # final_text_metadata): keep the image tags when the adapter renders them inline,
+                    # mark the attachment fallback, and skip the URL photos below once consumed.
+                    _send_text, _send_metadata = text_content, metadata
+                    _preserves = getattr(adapter, "preserves_inline_images", None)
+                    if callable(_preserves) and _preserves(response):
+                        _send_text = adapter.extract_media(response)[1].replace(
+                            "[[audio_as_voice]]", "").strip()
+                        _send_metadata = {**(metadata or {}), "inline_images_fallback": True}
                     _sent = await self._send_queued_final_text(
-                        adapter, source, text_content, metadata, event_message_id, session_key,
+                        adapter, source, _send_text, _send_metadata, event_message_id, session_key,
                         inbound_message_id)
+                    _raw = getattr(_sent, "raw_response", None)
+                    inline_images_consumed = isinstance(_raw, dict) and bool(_raw.get("inline_images_consumed"))
                     if not getattr(_sent, "success", False):
                         # The text never landed. Report it undelivered and skip the attachments too:
                         # the caller's normal completion send replays the whole response (text and
@@ -380,7 +396,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return True
         await self._deliver_media_from_response(
             response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
-            thread_metadata=metadata,
+            thread_metadata=metadata, include_url_images=not inline_images_consumed,
         )
         return True
 
