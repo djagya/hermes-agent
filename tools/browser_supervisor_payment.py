@@ -64,6 +64,9 @@ class PaymentInspection:
     consumed: bool = False
     owner: Any = field(default=None, repr=False)
     child_sessions: dict = field(default_factory=dict, repr=False)
+    # dlz: parent frame id -> (session, [(frame id, pinned owner <iframe> handle)]) for every frame from a card
+    # document up to the page, all handles of one parent in one isolated world (one call checks them all).
+    frame_owners: dict = field(default_factory=dict, repr=False)
 
     @property
     def controls(self) -> tuple:
@@ -424,6 +427,7 @@ class PaymentSupervisionMixin:
             documents = _explained_card_documents(candidates, merchant, tree, allowed_frames)
             if await self._payment_tree(sid, child_sessions) != tree:
                 raise PaymentPolicyError("Payment page changed during inspection")
+            owners = await self._pin_frame_owners(documents, tree, sid, child_sessions)
             return PaymentInspection(
                 operation,
                 sid,
@@ -434,6 +438,7 @@ class PaymentSupervisionMixin:
                 time.monotonic() + 120,
                 owner=self,
                 child_sessions=child_sessions,
+                frame_owners=owners,
             )
         except Exception:
             for _, fsid, obj, _, _ in candidates:
@@ -441,10 +446,69 @@ class PaymentSupervisionMixin:
             await self._release_payment_sessions(child_sessions)
             raise
 
-    async def _frame_rendered(self, fid: str, parent: str, parent_sid: str, *, strict: bool = False) -> bool:
-        """Whether the iframe element hosting ``fid`` is laid out and visible in its parent document.
-        ``strict`` (dlz, retention only) also refuses a transparent iframe or one under a transparent or
-        hidden ancestor element."""
+    async def _pin_frame_owners(self, documents: tuple, tree: tuple, page_sid: str, child_sessions: dict) -> dict:
+        """dlz: pin the owner <iframe> of every frame between a card document and the page, grouped by parent
+        document (one isolated world each). Unresolvable: the inspection is refused."""
+        by_id = {f[0]: f for f in tree}
+        frames: list = []
+        for d in documents:
+            fid = d.frame_id
+            while fid in by_id and by_id[fid][4] and fid not in frames:
+                frames.append(fid)
+                fid = by_id[fid][4]
+        groups: dict = {}
+        contexts: dict = {}
+        try:
+            for fid in frames:
+                parent = by_id[fid][4]
+                psid = child_sessions.get(parent, page_sid)
+                if parent not in contexts:
+                    contexts[parent] = (await self._cdp("Page.createIsolatedWorld", {
+                        "frameId": parent, "worldName": "hermes-payment-owners"}, session_id=psid))["result"]["executionContextId"]
+                owner = (await self._cdp("DOM.getFrameOwner", {"frameId": fid}, session_id=psid))["result"]
+                obj = (await self._cdp("DOM.resolveNode", {"backendNodeId": owner["backendNodeId"],
+                                                           "executionContextId": contexts[parent]},
+                                       session_id=psid))["result"]["object"]["objectId"]
+                groups.setdefault(parent, (psid, []))[1].append((fid, obj))
+        except Exception:  # health: allow BLE001 -- no pinned owner, no verifiable card frame; fail closed
+            await self._release_frame_owners(groups)
+            raise PaymentPolicyError("Payment document unavailable") from None
+        return groups
+
+    async def _release_frame_owners(self, groups: dict) -> None:
+        for psid, items in groups.values():
+            for _fid, obj in items:
+                await self._release_payment_object(psid, obj)
+
+    async def _shown_documents(self, i: PaymentInspection) -> set:
+        """dlz: frame ids of the card documents the user still sees: every pinned owner <iframe> from the
+        document up to the page is connected, laid out, visible and not transparent (ancestors included).
+        One call per parent document; any failure counts as not shown."""
+        shown: dict = {}
+        for psid, items in i.frame_owners.values():
+            try:
+                answer = _value(await self._cdp("Runtime.callFunctionOn", {
+                    "objectId": items[0][1], "functionDeclaration": _OWNERS_SHOWN,
+                    "arguments": [{"objectId": obj} for _fid, obj in items], "returnByValue": True,
+                }, session_id=psid))
+            except Exception:  # health: allow BLE001 -- an unreadable owner is not a frame the user sees
+                answer = None
+            ok = isinstance(answer, list) and len(answer) == len(items)
+            for k, (fid, _obj) in enumerate(items):
+                shown[fid] = ok and answer[k] is True
+        by_id = {f[0]: f for f in i.tree}
+        out = set()
+        for d in i.documents:
+            fid, chain_ok = d.frame_id, d.frame_id in by_id
+            while chain_ok and by_id[fid][4]:
+                chain_ok = shown.get(fid) is True and by_id[fid][4] in by_id
+                fid = by_id[fid][4]
+            if chain_ok:
+                out.add(d.frame_id)
+        return out
+
+    async def _frame_rendered(self, fid: str, parent: str, parent_sid: str) -> bool:
+        """Whether the iframe element hosting ``fid`` is laid out and visible in its parent document."""
         obj = None
         try:
             owner = (await self._cdp("DOM.getFrameOwner", {"frameId": fid}, session_id=parent_sid))["result"]
@@ -456,12 +520,9 @@ class PaymentSupervisionMixin:
                 session_id=parent_sid))["result"]["object"]["objectId"]
             return _value(await self._cdp("Runtime.callFunctionOn", {
                 "objectId": obj,
-                "functionDeclaration": "function(strict){const r=this.getBoundingClientRect();return this.isConnected&&"
+                "functionDeclaration": "function(){const r=this.getBoundingClientRect();return this.isConnected&&"
                                        "this.getClientRects().length>0&&r.width>2&&r.height>2&&"
-                                       "getComputedStyle(this).visibility!=='hidden'&&(!strict||"
-                                       "(Number(getComputedStyle(this).opacity)>0&&(typeof this.checkVisibility!=="
-                                       "'function'||this.checkVisibility({opacityProperty:true,visibilityProperty:true}))))}",
-                "arguments": [{"value": strict}],
+                                       "getComputedStyle(this).visibility!=='hidden'}",
                 "returnByValue": True,
             }, session_id=parent_sid)) is True
         except (KeyError, TypeError, PaymentPolicyError):
@@ -524,9 +585,21 @@ class PaymentSupervisionMixin:
             return False
 
     def commit_payment(self, inspected: PaymentInspection, fills: list[dict]) -> dict:
-        from tools.browser_supervisor import _schedule
+        import concurrent.futures
 
-        return _schedule(self._commit_payment(inspected, fills), self._loop, timeout=20)
+        from agent.async_utils import safe_schedule_threadsafe
+        from tools.browser_supervisor import _LoopUnavailable
+
+        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills), self._loop)
+        if future is None:
+            raise _LoopUnavailable("Browser supervisor loop unavailable")
+        try:
+            return future.result(timeout=20)
+        except concurrent.futures.TimeoutError:
+            # dlz: stop the commit where it is (no write after its budget); what landed is unknown.
+            future.cancel()
+            inspected.consumed = True
+            return {"success": False, "error_type": "payment_transport_uncertain", "partially_filled": True}
 
     async def _commit_payment(self, i: PaymentInspection, fills: list[dict]) -> dict:
         if i.consumed:
@@ -558,7 +631,7 @@ class PaymentSupervisionMixin:
                     # dlz: no write after the window closes; earlier documents' values are reported, not
                     # completed.
                     return _partial({"success": False, "error_type": "payment_consent_expired"}, filled)
-                result = await self._commit_payment_document(document, document_fills)
+                result = await self._commit_payment_document(document, document_fills, deadline_ms=_wall_deadline_ms(i))
                 if not result.get("success"):
                     return _partial(result, filled)
                 filled += result.get("filled_fields", 0)
@@ -567,10 +640,12 @@ class PaymentSupervisionMixin:
             # later, and a later document (brand detection on the number, a blur) can clear an
             # earlier one, so success is only reported once EVERY document still holds its values.
             await asyncio.sleep(_SETTLE_SECONDS)
+            # dlz: every frame up to the page must be shown before AND after the reads: a frame hidden while
+            # the answers were collected is not the one the user sees, so its fields count as replaced.
+            before = await self._shown_documents(i)
             answers = [(d, f, await self._payment_retention(i, d)) for d, f in written]
-            # dlz: and once more after every read: a frame hidden while the answers were collected is not
-            # the one the user sees, so its fields count as replaced.
-            return _retention_result([(f, a if a is not None and await self._frames_shown(i, d) else None)
+            after = await self._shown_documents(i)
+            return _retention_result([(f, a if d.frame_id in before and d.frame_id in after else None)
                                       for d, f, a in answers])
         except PaymentPolicyError:
             return _partial({"success": False, "error_type": "payment_fields_invalid"}, filled)
@@ -579,14 +654,14 @@ class PaymentSupervisionMixin:
         finally:
             await self._release_payment_documents(i)
 
-    async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict]) -> dict:
+    async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None) -> dict:
         result = _value(
             await self._cdp(
                 "Runtime.callFunctionOn",
                 {
                     "objectId": d.object_id,
-                    "functionDeclaration": "function(fills){return this.commit(fills)}",
-                    "arguments": [{"value": fills}],
+                    "functionDeclaration": "function(fills,deadline){return this.commit(fills,deadline)}",
+                    "arguments": [{"value": fills}, {"value": deadline_ms}],
                     "returnByValue": True,
                 },
                 session_id=d.frame_session,
@@ -603,14 +678,9 @@ class PaymentSupervisionMixin:
 
     async def _payment_retention(self, i: PaymentInspection, d: PaymentDocument) -> list | None:
         """Per written field ``{token, state, length}`` from the document's commit closure, or None when
-        the document cannot answer (navigated, replaced, transport failure) or its frame is no longer
-        shown in its parent: its fields are then unknown and reported as replaced. Never retried, never
-        a value."""
-        # dlz: a provider that re-renders by hiding the written frame and showing a fresh, empty one
-        # leaves the old document holding every value; from inside, that document still looks visible.
+        the document cannot answer (navigated, replaced, transport failure): its fields are then unknown
+        and reported as replaced. Never retried, never a value. Frame visibility: ``_shown_documents``."""
         try:
-            if not await self._frames_shown(i, d):
-                return None
             states = _value(await self._cdp("Runtime.callFunctionOn", {
                 "objectId": d.object_id,
                 "functionDeclaration": "function(){return this.retained()}",
@@ -622,28 +692,9 @@ class PaymentSupervisionMixin:
             return None
         return states
 
-    async def _frames_shown(self, i: PaymentInspection, d: PaymentDocument) -> bool:
-        """dlz: whether the document's frame AND every frame above it is still shown to the user: laid out,
-        visible and not transparent in its parent (strict check, retention only). Any failure: False."""
-        by_id = {f[0]: f for f in i.tree}
-        fid = d.frame_id
-        try:
-            for _ in range(len(by_id)):
-                record = by_id.get(fid)
-                if record is None:
-                    return False
-                parent = record[4]
-                if not parent:
-                    return True
-                if not await self._frame_rendered(fid, parent, i.child_sessions.get(parent, i.page_session),
-                                                  strict=True):
-                    return False
-                fid = parent
-        except Exception:  # health: allow BLE001 -- an unreadable frame is not a frame the user sees
-            return False
-        return False
-
     async def _release_payment_documents(self, i: PaymentInspection) -> None:
+        await self._release_frame_owners(i.frame_owners)
+        i.frame_owners = {}
         for d in i.documents:
             await self._release_payment_object(d.frame_session, d.object_id)
         await self._release_payment_sessions(i.child_sessions)
@@ -653,6 +704,19 @@ class PaymentSupervisionMixin:
 
         i.consumed = True
         _schedule(self._release_payment_documents(i), self._loop, timeout=12)
+
+
+def _wall_deadline_ms(i: PaymentInspection) -> float:
+    """dlz: the inspection deadline on the wall clock (ms) the renderer reads with Date.now()."""
+    return time.time() * 1000 + (i.expires_at - time.monotonic()) * 1000
+
+
+# dlz: each pinned owner <iframe> is still shown to the user (strict: transparent or hidden ancestors too).
+_OWNERS_SHOWN = ("function(...els){return els.map(e=>{if(!e||!e.isConnected)return false;"
+                 "const r=e.getBoundingClientRect(),s=getComputedStyle(e);return e.getClientRects().length>0&&"
+                 "r.width>2&&r.height>2&&s.visibility!=='hidden'&&Number(s.opacity)>0&&"
+                 "(typeof e.checkVisibility!=='function'||e.checkVisibility({opacityProperty:true,"
+                 "visibilityProperty:true}))})}")
 
 
 def _commit_order(i: PaymentInspection, groups: list) -> list:
@@ -776,9 +840,12 @@ _INSPECT = r"""(() => {
         return {token:f.token,state:same(el.value,f.value)?'held':el.value?'changed':'empty',length:el.value.length};
       });
     },
-    commit: fills => {
+    commit: (fills, deadline) => {
       if (used || !valid()) return {success:false,error_type:'payment_fields_changed'};
       used = true;
+      // dlz: the consent window, on the wall clock; checked here and again before every setter.
+      const late = () => typeof deadline === 'number' && Date.now() >= deadline;
+      if (late()) return {success:false,error_type:'payment_consent_expired'};
       if (!Array.isArray(fills) || !fills.length ||
           fills.some(f=>!selected.has(f.index) || typeof f.value !== 'string' || !f.value) ||
           new Set(fills.map(f=>f.index)).size !== fills.length)
@@ -805,8 +872,10 @@ _INSPECT = r"""(() => {
         const el = elements[f.index];
         if (!live(el) || location.href !== href)
           return {success:false,error_type:'payment_fields_changed',filled_fields:attempted,partially_filled:attempted>0};
-        attempted += 1;
         el.focus();
+        if (late())  // focus handlers run page code; never write past the window
+          return {success:false,error_type:'payment_consent_expired',filled_fields:attempted,partially_filled:attempted>0};
+        attempted += 1;
         if (isSelect(el)) {
           selectSetter.call(el,f.value);
           el.dispatchEvent(new Event('input',{bubbles:true}));

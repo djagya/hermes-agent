@@ -127,7 +127,8 @@ class _FakeSupervisor(sp.PaymentSupervisionMixin):
     async def _payment_is_current(self, i):
         return True
 
-    async def _commit_payment_document(self, d, fills):
+    async def _commit_payment_document(self, d, fills, deadline_ms=None):
+        self.deadlines = getattr(self, "deadlines", []) + [deadline_ms]
         self.writes.append((d.origin, fills))
         return self.results.pop(0)
 
@@ -138,8 +139,8 @@ class _FakeSupervisor(sp.PaymentSupervisionMixin):
         return [{"token": f.get("token", ""), "state": self.retained.get(f.get("token"), "held"),
                  "length": 0 if self.retained.get(f.get("token")) == "empty" else len(f["value"])} for f in fills]
 
-    async def _frames_shown(self, i, d):
-        return True
+    async def _shown_documents(self, i):
+        return {d.frame_id for d in i.documents}
 
     async def _release_payment_documents(self, i):
         self.released = True
@@ -308,27 +309,6 @@ def test_an_unreadable_document_after_settling_counts_as_replaced():
     assert out["error_type"] == "payment_fields_not_retained" and out["field_retention"]["cc-number"] == "replaced"
 
 
-def test_a_written_frame_hidden_after_settling_counts_as_replaced():
-    """A re-render that hides the written frame and shows a fresh one leaves the old document holding
-    its values; its fields are replaced, never held, and the closure is not asked."""
-    asked = []
-
-    class Supervisor(sp.PaymentSupervisionMixin):
-        async def _frame_rendered(self, fid, parent, parent_sid, strict=False):
-            return fid != "n"
-
-        async def _cdp(self, method, params=None, session_id=None):
-            asked.append(session_id)
-            return {"result": {"result": {"value": [{"token": "cc-number", "state": "held", "length": 16}]}}}
-
-    i = PaymentInspection("op", "page", "target", MERCHANT, (), (("top", "", "", MERCHANT, ""),
-                          ("n", "", "", _PAYPAL, "top"), ("c", "", "", _PAYPAL, "top")), 1e12)
-    hidden, shown = PaymentDocument("n", "sn", "on", _PAYPAL, ()), PaymentDocument("c", "sc", "oc", _PAYPAL, ())
-    assert asyncio.run(Supervisor()._payment_retention(i, hidden)) is None
-    assert asyncio.run(Supervisor()._payment_retention(i, shown)) == [{"token": "cc-number", "state": "held", "length": 16}]
-    assert asked == ["sc"]
-
-
 def test_retention_result_keeps_only_tokens_states_and_bounded_lengths():
     fills = [{"token": "cc-number", "value": "4242424242424242"}, {"token": "cc-csc", "value": "837"}]
     answer = [{"token": "cc-number", "state": "changed", "length": 19, "value": "4242424242424242"},
@@ -449,8 +429,8 @@ def test_commit_never_writes_after_the_window_closes(lapse_at):
                 inspection.expires_at = 0
             return True
 
-        async def _commit_payment_document(self, d, fills):
-            out = await super()._commit_payment_document(d, fills)
+        async def _commit_payment_document(self, d, fills, deadline_ms=None):
+            out = await super()._commit_payment_document(d, fills, deadline_ms)
             i.expires_at = 0  # the first document's write ends after the window
             return out
 
@@ -464,33 +444,81 @@ def test_commit_never_writes_after_the_window_closes(lapse_at):
                        "partially_filled": True} and len(sup.writes) == 1
 
 
-@pytest.mark.parametrize("hidden", ["ancestor", "during_collection"])
-def test_retention_needs_every_frame_shown_before_and_after_the_reads(hidden):
-    """A guest card form inside /smart/buttons: hiding the buttons frame hides the card frame too, and a
-    frame hidden between its own read and the end of collection is not verified either."""
+class _OwnerSupervisor(sp.PaymentSupervisionMixin):
+    """Real commit/retention/visibility code over a fake CDP: ``shown(pass_no, frame)`` answers the owner check."""
+
+    def __init__(self, shown):
+        self.shown, self.passes, self.calls = shown, 0, []
+
+    async def _payment_is_current(self, i):
+        return True
+
+    async def _cdp(self, method, params=None, session_id=None, timeout=None):
+        self.calls.append(method)
+        fn = (params or {}).get("functionDeclaration", "")
+        if fn == sp._OWNERS_SHOWN:
+            self.passes += 1
+            frames = [o["objectId"] for o in params["arguments"]]
+            return {"result": {"result": {"value": [self.shown(self.passes, f) for f in frames]}}}
+        if "commit(" in fn:
+            return {"result": {"result": {"value": {"success": True, "filled_fields": 1}}}}
+        if "retained()" in fn:
+            return {"result": {"result": {"value": [{"token": "cc-number", "state": "held", "length": 4}]}}}
+        return {"result": {}}
+
+
+def _owned_inspection(tree, docs):
     import time as _time
 
+    by_id = {f[0]: f for f in tree}
+    owners = {}
+    for d in docs:
+        fid = d.frame_id
+        while by_id[fid][4] and fid not in [x for _s, items in owners.values() for x, _o in items]:
+            owners.setdefault(by_id[fid][4], ("s-" + by_id[fid][4], []))[1].append((fid, fid))
+            fid = by_id[fid][4]
+    return PaymentInspection("op", "page", "target", MERCHANT, tuple(docs), tree, _time.monotonic() + 60,
+                             frame_owners=owners)
+
+
+@pytest.mark.parametrize("hidden", ["ancestor", "during_collection", "transparent_owner_answer"])
+def test_retention_needs_every_frame_shown_before_and_after_the_reads(hidden):
+    """A guest card form inside /smart/buttons: hiding the buttons frame hides the card frame too, and a
+    frame hidden while the answers are collected is not verified either."""
     tree = (("top", "", "", MERCHANT, ""), ("btn", "", "", _PAYPAL, "top"), ("card", "", "", _PAYPAL, "btn"))
     doc = PaymentDocument("card", "sc", "oc", _PAYPAL, _controls("cc-number"))
-    i = PaymentInspection("op", "page", "target", MERCHANT, (doc,), tree, _time.monotonic() + 60)
-    checks = []
-
-    class Supervisor(_FakeSupervisor):
-        async def _frame_rendered(self, fid, parent, parent_sid, strict=False):
-            checks.append((fid, strict))
-            if hidden == "ancestor":
-                return fid != "btn"
-            return len(checks) <= 2  # shown for the pre-read pass, hidden by the post-read pass
-
-        async def _cdp(self, method, params=None, session_id=None):
-            return {"result": {"result": {"value": [{"token": "cc-number", "state": "held", "length": 4}]}}}
-
-    sup = Supervisor([{"success": True, "filled_fields": 1}])
-    sup._payment_retention = sp.PaymentSupervisionMixin._payment_retention.__get__(sup)
-    sup._frames_shown = sp.PaymentSupervisionMixin._frames_shown.__get__(sup)
-    out = asyncio.run(sup._commit_payment(i, [{"index": 0, "token": "cc-number", "value": "4242", "document": 0}]))
+    shown = {"ancestor": lambda n, f: f != "btn", "during_collection": lambda n, f: n <= 2,
+             "transparent_owner_answer": lambda n, f: "yes"}[hidden]  # only a literal true counts
+    out = asyncio.run(_OwnerSupervisor(shown)._commit_payment(
+        _owned_inspection(tree, [doc]), [{"index": 0, "token": "cc-number", "value": "4242", "document": 0}]))
     assert out["error_type"] == "payment_fields_not_retained" and out["field_retention"] == {"cc-number": "replaced"}
-    assert all(strict for _, strict in checks) and ("btn", True) in checks
+
+
+def test_four_hosted_frames_cost_one_visibility_call_per_parent_per_pass():
+    """The PayPal layout (four card frames in the merchant page) must stay inside commit's 20 s budget:
+    two batched owner checks in total, not several CDP calls per frame per pass."""
+    tree = (("top", "", "", MERCHANT, ""),) + tuple((f"f{n}", "", "", _PAYPAL, "top") for n in range(4))
+    docs = [PaymentDocument(f"f{n}", f"s{n}", f"o{n}", _PAYPAL, _controls(t))
+            for n, t in enumerate(("cc-name", "cc-exp", "cc-csc", "cc-number"))]
+    sup = _OwnerSupervisor(lambda n, f: True)
+    fills = [{"index": 0, "token": t, "value": v, "document": n} for n, (t, v) in enumerate(
+        (("cc-name", "Ada"), ("cc-exp", "07/35"), ("cc-csc", "837"), ("cc-number", "4242")))]
+    i = _owned_inspection(tree, docs)
+    # Each fake document answers for cc-number; only the call budget is under test here.
+    asyncio.run(sup._commit_payment(i, fills))
+    assert sup.passes == 2
+    assert sup.calls.count("Runtime.callFunctionOn") == 2 + 4 + 4  # owner checks + commits + retention reads
+
+
+def test_every_document_write_carries_the_wall_clock_deadline():
+    import time as _time
+
+    sup, i = _FakeSupervisor([{"success": True, "filled_fields": 1}] * 2), _split_inspection()
+    i.expires_at = _time.monotonic() + 30
+    asyncio.run(sup._commit_payment(i, [{"index": 0, "token": "cc-number", "value": "4242", "document": 0},
+                                        {"index": 0, "token": "cc-csc", "value": "837", "document": 1}]))
+    expected = _time.time() * 1000 + 30_000
+    assert len(sup.deadlines) == 2 and all(abs(d - expected) < 2_000 for d in sup.deadlines)
 
 
 def test_commit_after_the_inspection_window_is_expired_not_a_changed_page():

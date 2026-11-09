@@ -161,6 +161,13 @@ _CONSENT_EXPIRED_PARTIAL = (
 )
 
 
+_TRANSPORT_UNCERTAIN = (
+    "The card fill did not finish cleanly (browser transport failed or the fill ran out of time), so some card "
+    "fields may hold values and others not. Nothing was submitted. Do not submit the checkout and do not retry; "
+    "tell the user. Another fill needs a new approval."
+)
+
+
 def _remaining_seconds(inspected) -> int:
     """Whole seconds left in the inspection window: the consent prompt's own deadline (at least 1)."""
     return max(1, int(inspected.expires_at - time.monotonic()))
@@ -282,6 +289,8 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
                 result["error"] = _PAGE_CHANGED
             elif result.get("error_type") == "payment_consent_expired":
                 result["error"] = _CONSENT_EXPIRED_PARTIAL if result.get("partially_filled") else _CONSENT_EXPIRED
+            elif result.get("error_type") == "payment_transport_uncertain":
+                result["error"] = _TRANSPORT_UNCERTAIN
             result.update(
                 kind="payment",
                 backend=backend.name,
