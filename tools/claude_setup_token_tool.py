@@ -1,9 +1,9 @@
 """dlz: model-facing start/submit/status/cancel for the owner-authenticated ``claude setup-token`` intake.
 
-The model never sees the authorize URL or token: it starts a flow, relays the handoff link (which
-grants nothing without the owner's dashboard sign-in), and reads status and opaque handles. Owner
-policy 2026-11-09: Danil may paste the one-time final localhost callback URL in chat; ``submit``
-hands it, unechoed, to the same strict parse and one-shot delivery the dashboard page uses. The
+The model never sees the callback, code or token. Owner policy 2026-11-09: the whole flow may run in
+chat: start/status return the CLI-issued, allowlisted authorize URL (plus the dashboard handoff link)
+for Danil, and he pastes the one-time final localhost callback URL back in chat; ``submit`` hands it,
+unechoed, to the same strict parse and one-shot delivery the dashboard page uses. The
 broker and its intake live in ``agent.claude_setup_token``.
 """
 
@@ -63,6 +63,24 @@ def _session_id(kwargs: dict) -> str:
     return str(sid or "")
 
 
+_NEXT = ("Send Danil the authorize_url in chat (or the handoff_url, the same step on his signed-in "
+         "dashboard). After approving at Claude his browser lands on a page that does not load: he pastes "
+         "that final http://localhost address back in chat (or on the dashboard page). Call submit with this "
+         "flow and callback set to exactly that address. Do not repeat it. Then poll status.")
+
+
+def _with_authorize(flow) -> dict:
+    """dlz: owner policy 2026-11-09: the CLI-issued authorize URL (already parsed and allowlisted by
+    ``parse_authorize_url``) is not secret and may go to Danil in chat while the callback is awaited.
+    Callback, code and token never appear here."""
+    out = flow.model_view()
+    native = flow.native  # read once: a concurrent finish clears it
+    if flow.state == "awaiting_callback" and native is not None:
+        out["authorize_url"] = native.authorize_url
+        out["next"] = _NEXT
+    return out
+
+
 def claude_setup_token(args: dict[str, Any], **kwargs) -> str:
     from agent.claude_setup_token import IntakeRejected, get_broker, profile_key
     broker = get_broker()
@@ -75,17 +93,13 @@ def claude_setup_token(args: dict[str, Any], **kwargs) -> str:
     try:
         if action == "start":
             flow = broker.start(profile=profile, session_id=session_id, owner=_owner_principal())
-            out = flow.model_view()
-            if flow.state == "awaiting_callback":
+            out = _with_authorize(flow)
+            if "authorize_url" in out:
                 out["handoff_url"] = f"{_handoff_base()}{HANDOFF_PATH}#h={flow.handoff_id}"
-                out["next"] = ("Send Danil the handoff_url. He signs in to the dashboard there and approves "
-                               "at Claude, then pastes the browser's final http://localhost address either on "
-                               "that page or here in chat. If he sends it in chat, call submit with this flow "
-                               "and callback set to exactly that address. Do not repeat it. Then poll status.")
             return tool_result(out)
         flow_id = str(args.get("flow") or "")
         if action == "status":
-            return tool_result(broker.status(flow_id, profile=profile, session_id=session_id).model_view())
+            return tool_result(_with_authorize(broker.status(flow_id, profile=profile, session_id=session_id)))
         if action == "cancel":
             return tool_result(broker.cancel(flow_id, profile=profile, session_id=session_id).model_view())
         if action == "submit":
@@ -101,9 +115,10 @@ CLAUDE_SETUP_TOKEN_SCHEMA = {
     "name": "claude_setup_token",
     "description": (
         "Create a new long-lived Claude subscription token (`claude setup-token`) when Danil explicitly "
-        "asks for it. start runs the native CLI and returns a handoff_url for Danil; he approves at "
-        "Claude and either submits the browser's final http://localhost callback address on that "
-        "signed-in dashboard page or pastes it to you in chat. For a pasted address call submit with the "
+        "asks for it. start runs the native CLI and returns authorize_url (send it to Danil in chat; "
+        "status repeats it while the callback is awaited) and a handoff_url (the same step on his "
+        "signed-in dashboard). After approving at Claude he pastes the final http://localhost address "
+        "back to you in chat (or on the dashboard page). For a pasted address call submit with the "
         "flow handle and callback set to exactly that address; never repeat it back or store it. "
         "status/cancel take the flow handle. Results are status and opaque handles only: the token goes "
         "to a concealed pending store, is not installed as the runtime credential, and is not proven for "
