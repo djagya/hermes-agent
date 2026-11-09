@@ -81,8 +81,12 @@ def settle_queued_delivery(job_id: Optional[str], execution_id: Optional[str]) -
         return False
     from cron.executions import settle_delivery_outcome
 
-    settle_delivery_outcome(str(execution_id), terminal[0])
+    # dlz: job record FIRST. The ledger row's ``queued`` outcome is what exempts it from retention
+    # and keeps it in reconciliation; settling it first let a failed job write (or a prune between
+    # the two) strand the job ``delivery_queued`` forever. A job write that raises leaves both
+    # unsettled, so the next drain tick retries; a fenced-out job (a newer run) still settles the row.
     _settle_job_record(str(job_id), str(execution_id), terminal[1])
+    settle_delivery_outcome(str(execution_id), terminal[0])
     return True
 
 
@@ -106,6 +110,9 @@ def reconcile_queued_deliveries() -> int:
     settled = 0
     for execution_id, job_id in queued:
         if (found or {}).get(execution_id) in _TERMINAL:
-            settle_quietly(job_id, execution_id)
-            settled += 1
+            try:
+                settled += bool(settle_queued_delivery(job_id, execution_id))
+            except Exception:
+                logger.warning("Cron delivery %s: reconcile write-back failed; retried next tick",
+                               execution_id, exc_info=True)
     return settled

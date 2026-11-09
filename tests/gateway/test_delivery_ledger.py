@@ -412,6 +412,22 @@ class TestGatewayRedeliverySweep:
         return adapter
 
     @pytest.mark.asyncio
+    async def test_uncertain_redelivery_is_closed_not_replayed(self):
+        """A recovered send the adapter marks uncertain (e.g. a reset reading Telegram's ack after it
+        accepted the message) uses the initial send's terminalization: closed, never re-sent."""
+        from gateway.platforms.base import SendResult
+
+        _record()
+        _orphan("ob-1")
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(
+            success=False, error="Connection reset by peer", raw_response={"delivery_uncertain": True}))
+        await self._runner(adapter)._redeliver_pending_obligations()
+        assert _row("ob-1")["state"] == "delivered"
+        assert dl.sweep_failed_for_runtime("slack") == [] and dl.sweep_recoverable() == []
+        adapter.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_pending_redelivers_plain_and_clears_resume(self):
         _record()  # pending
         _orphan("ob-1")

@@ -4244,20 +4244,11 @@ class BasePlatformAdapter(ABC):
         backoff has passed instead of waiting for the next restart (#91653)."""
         try:
             from gateway.dead_targets import classify_dead_error
-            from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
-            if getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, obligation_id)
-                return
-            _raw = getattr(result, "raw_response", None)
-            if isinstance(_raw, dict) and _raw.get("delivery_uncertain"):
-                # dlz: the platform may already have this message (e.g. a reset reading Telegram's
-                # ack): no runtime redelivery may replay it. Close the obligation.
-                logger.warning("[%s] final send outcome uncertain; ledger obligation closed without "
-                               "redelivery: %s", delivery_adapter.name, getattr(result, "error", ""))
-                await asyncio.to_thread(mark_delivered, obligation_id)
+            from gateway.delivery_ledger import is_reconnect_only, terminalize_send
+            # dlz: shared with recovered deliveries (run_startup); an uncertain send is closed.
+            if await asyncio.to_thread(terminalize_send, obligation_id, result) != "failed":
                 return
             error = str(getattr(result, "error", "") or "")
-            await asyncio.to_thread(mark_failed, obligation_id, error)
             if is_reconnect_only(error):
                 redeliver = getattr(
                     self.gateway_runner, "_redeliver_failed_obligations_for_platform", None)

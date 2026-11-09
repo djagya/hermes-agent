@@ -472,7 +472,7 @@ class GatewayStartupMixin:
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+            from gateway.delivery_ledger import RECOVERED_MARKER
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
@@ -495,16 +495,14 @@ class GatewayStartupMixin:
                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
                 result = None
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
-                if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                # dlz: same terminalization as the initial send: an uncertain redelivery (the
+                # platform may have it) is closed, never scheduled for another full send.
+                from gateway.delivery_ledger import terminalize_send
+                if await asyncio.to_thread(terminalize_send, row["obligation_id"], result) == "delivered":
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
-                    )
-                else:
-                    await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
                     )
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.

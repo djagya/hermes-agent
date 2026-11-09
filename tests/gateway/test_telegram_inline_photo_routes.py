@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from telegram.error import BadRequest, NetworkError, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from gateway.platforms.base import SendResult
 from gateway.platforms.base_response import final_text_metadata
@@ -182,7 +182,12 @@ async def test_queued_edit_reconcile_keeps_inline_photos(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure, sends', [(NetworkError('Connection reset by peer'), 1), (_pool_timeout(), 2)])
+@pytest.mark.parametrize('failure, sends', [
+    (NetworkError('Connection reset by peer'), 1),
+    (TelegramError('Invalid server response'), 1),  # PTB: unparseable ack after HTTP success
+    (_pool_timeout(), 2),
+    (RetryAfter(1), 2),  # Telegram's own refusal: the message was not accepted
+])
 async def test_rich_retry_and_ledger_replay_only_proven_non_delivery(monkeypatch, failure, sends):
     """The base retry loop and the delivery ledger see the same certainty: an uncertain rich send
     is neither retried, nor re-sent as plain text, nor left for ledger redelivery."""

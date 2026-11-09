@@ -1477,12 +1477,18 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramHeldInboundMixin, Teleg
         if self._exception_graph_matches(exc, "connecterror", "connection refused", "all connection attempts failed"):
             return True
         try:
-            from telegram.error import BadRequest, NetworkError, TelegramError
-        except (ImportError, AttributeError):
+            import telegram.error as tg_error
+        except ImportError:
             return False
-        # PTB's BadRequest subclasses NetworkError but is Telegram's answer; other NetworkErrors
-        # (TimedOut included) are transport failures with unknown delivery.
-        return isinstance(exc, BadRequest) or (isinstance(exc, TelegramError) and not isinstance(exc, NetworkError))
+        # Only an explicit API refusal is Telegram's answer. A generic TelegramError is NOT: PTB
+        # raises it for an unparseable (invalid-JSON) ack after HTTP success, when the message may
+        # already be accepted; other NetworkErrors (TimedOut included) are transport failures.
+        refusals = tuple(cls for cls in (
+            getattr(tg_error, name, None) for name in (
+                "BadRequest", "Forbidden", "RetryAfter", "InvalidToken", "ChatMigrated", "Conflict",
+                "EndPointNotFound"))
+            if isinstance(cls, type))
+        return bool(refusals) and isinstance(exc, refusals)
 
     def _rich_transient_result(self, exc: Exception, what: str, *, retry_after: Any = None) -> SendResult:
         """SendResult for a transient/unknown rich-API failure (the caller must NOT legacy-resend).

@@ -658,6 +658,20 @@ def test_retention_keeps_unsettled_queued_runs_until_job_and_ledger_settle(monke
     unrelated_prune()
     assert kept() == ["pending", "terminal"]
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **kw: "fixture: no transport")
+    from cron import delivery_outcome
+    real_save, calls = jobs.save_jobs, []
+
+    def flaky_save(*args, **kwargs):  # the first job write-back times out
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("jobs store busy")
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(jobs, "save_jobs", flaky_save)
+    assert delivery_outcome.reconcile_queued_deliveries() == 0  # partial settlement stays retryable
+    assert executions.get_execution(rows["terminal"])["delivery_outcome"] == "queued"
+    unrelated_prune()
+    assert "terminal" in kept()
     scheduler.drain_delivery_queue({}, None)
     assert jobs.get_job(job_ids["terminal"])["last_status"] == "ok"
     assert executions.get_execution(rows["terminal"])["delivery_outcome"] == "delivered"

@@ -319,6 +319,24 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def terminalize_send(obligation_id: str, result: Any) -> str:
+    """dlz: the one terminalization for initial AND recovered final sends. ``delivered`` on success;
+    ``uncertain`` when the adapter marks the outcome unknown (``raw_response.delivery_uncertain``:
+    the platform may already have the message) — the obligation is closed, no redelivery may
+    replay it; otherwise ``failed`` (a definite rejection, eligible for redelivery)."""
+    if result is not None and getattr(result, "success", False):
+        mark_delivered(obligation_id)
+        return "delivered"
+    raw = getattr(result, "raw_response", None)
+    if isinstance(raw, dict) and raw.get("delivery_uncertain"):
+        logger.warning("obligation %s: send outcome uncertain; closed without redelivery: %s",
+                       obligation_id, getattr(result, "error", ""))
+        mark_delivered(obligation_id)
+        return "uncertain"
+    mark_failed(obligation_id, str(getattr(result, "error", "") or "send failed"))
+    return "failed"
+
+
 def record_delivery_receipt(db, *, session_id: str, row_id: int,
                             receipt: dict[str, Any]) -> int:
     """Persist a confirmed delivery receipt onto the exact assistant row (best-effort).
