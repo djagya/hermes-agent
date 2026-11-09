@@ -127,8 +127,9 @@ class _FakeSupervisor(sp.PaymentSupervisionMixin):
     async def _payment_is_current(self, i):
         return True
 
-    async def _commit_payment_document(self, d, fills, deadline_ms=None):
+    async def _commit_payment_document(self, d, fills, deadline_ms=None, wall_deadline_ms=None):
         self.deadlines = getattr(self, "deadlines", []) + [deadline_ms]
+        self.walls = getattr(self, "walls", []) + [wall_deadline_ms]
         self.writes.append((d.origin, fills))
         return self.results.pop(0)
 
@@ -429,8 +430,8 @@ def test_commit_never_writes_after_the_window_closes(lapse_at):
                 inspection.expires_at = 0
             return True
 
-        async def _commit_payment_document(self, d, fills, deadline_ms=None):
-            out = await super()._commit_payment_document(d, fills, deadline_ms)
+        async def _commit_payment_document(self, d, fills, deadline_ms=None, wall_deadline_ms=None):
+            out = await super()._commit_payment_document(d, fills, deadline_ms, wall_deadline_ms)
             i.expires_at = 0  # the first document's write ends after the window
             return out
 
@@ -525,12 +526,13 @@ def test_renderer_deadline_is_the_earlier_of_consent_and_commit_budget(consent_s
                                     until=now + 20))
     first, unanchored = sup.deadlines
     assert abs(first - expected_ms) < 1 and unanchored == 0.0  # no anchor: nothing may be written
+    assert abs(sup.walls[0] - (_time.time() * 1000 + expected_ms)) < 1000  # the same stop, as an epoch instant
 
 
 _COMMIT_HARNESS = r"""
-let mono = 1000, dateCalls = 0, writes = 0;
+let mono = 1000, wallNow = CASE.wallNow, writes = 0;
 const performance = {now: () => mono};
-Date.now = () => { dateCalls += 1; return 0; };  // the wall clock stepped back to the epoch
+Date.now = () => wallNow;
 class HTMLInputElement { get value() { return this.held || ''; } set value(v) { writes += 1; this.held = v; } }
 class HTMLSelectElement { get value() { return ''; } set value(v) {} }
 class Event {} class InputEvent extends Event {} class FocusEvent extends Event {}
@@ -545,18 +547,25 @@ const location = {href: 'https://www.paypal.com/card'};
 const getComputedStyle = () => ({visibility: 'visible', opacity: '1', pointerEvents: 'auto'});
 const api = INSPECT;
 mono += CASE.elapsed;
-const result = api.commit([{index: 0, token: 'cc-number', value: '4242'}], CASE.deadline);
-process.stdout.write(JSON.stringify({result, writes, dateCalls}));
+const result = api.commit([{index: 0, token: 'cc-number', value: '4242'}], CASE.deadline, CASE.wall);
+process.stdout.write(JSON.stringify({result, writes}));
 """
 
 
+_IN_TIME = {"wallNow": 5_000, "wall": 10_000}
+
+
 @pytest.mark.parametrize("case, writes", [
-    ({"elapsed": 500, "focus": 0, "deadline": 1000}, 1),
-    ({"elapsed": 1500, "focus": 0, "deadline": 1000}, 0),  # past it, though Date.now() went backwards
-    ({"elapsed": 900, "focus": 200, "deadline": 1000}, 0),  # page code on focus crossed it: no setter
-    ({"elapsed": 0, "focus": 0, "deadline": None}, 0),  # no deadline is never "no limit"
+    ({"elapsed": 500, "focus": 0, "deadline": 1000, **_IN_TIME}, 1),
+    # past it on the monotonic clock, though the wall clock stepped back to the epoch
+    ({"elapsed": 1500, "focus": 0, "deadline": 1000, "wallNow": 0, "wall": 10_000}, 0),
+    ({"elapsed": 900, "focus": 200, "deadline": 1000, **_IN_TIME}, 0),  # page code on focus crossed it: no setter
+    ({"elapsed": 0, "focus": 0, "deadline": None, **_IN_TIME}, 0),  # no deadline is never "no limit"
+    # a remote browser slept: its monotonic clock paused inside the window, the wall clock is past it
+    ({"elapsed": 500, "focus": 0, "deadline": 1000, "wallNow": 11_000, "wall": 10_000}, 0),
+    ({"elapsed": 500, "focus": 0, "deadline": 1000, "wallNow": 5_000, "wall": None}, 0),  # no wall instant: late
 ])
-def test_renderer_expiry_reads_the_monotonic_document_clock_not_date_now(case, writes):
+def test_renderer_writes_only_while_both_its_monotonic_and_wall_clocks_are_inside(case, writes):
     import re
     import shutil
     import subprocess
@@ -569,7 +578,7 @@ def test_renderer_expiry_reads_the_monotonic_document_clock_not_date_now(case, w
     run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
     assert run.returncode == 0, run.stderr
     out = json.loads(run.stdout)
-    assert out["writes"] == writes and out["dateCalls"] == 0
+    assert out["writes"] == writes
     assert out["result"]["success"] is bool(writes)
     if not writes:
         assert out["result"]["error_type"] == "payment_consent_expired"
