@@ -763,7 +763,15 @@ def _action_create(a: dict[str, Any]) -> str:
 
 
 def _action_list(a: dict[str, Any]) -> str:
-    jobs = [_format_job(job) for job in list_jobs(include_disabled=a["include_disabled"])]
+    # dlz (R-op-20261109-A7): list with job_id answers for that one job; a one-job repair read the
+    # whole ~185 KB registry before.
+    if a.get("job_id"):
+        job, error = _resolve_job_or_error(a["job_id"])
+        if error:
+            return error
+        jobs = [_format_job(job)]
+    else:
+        jobs = [_format_job(job) for job in list_jobs(include_disabled=a["include_disabled"])]
     _result = {"success": True, "count": len(jobs), "jobs": jobs}
     # Same inert-job class as create; an empty list has nothing inert.
     if jobs:
@@ -1152,7 +1160,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "job_id": {
                 "type": "string",
-                "description": "Required for update/pause/resume/remove/run/cancel."
+                "description": "Required for update/pause/resume/remove/run/cancel. With list: show only that job."
             },
             "pinned": {
                 "type": "boolean",

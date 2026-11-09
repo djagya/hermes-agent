@@ -242,6 +242,16 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_list_with_job_id_answers_for_that_one_job(self):
+        # dlz (R-op-20261109-A7): a one-job repair read the whole ~185 KB registry.
+        ids = [json.loads(cronjob(action="create", prompt=f"p{n}", schedule="every 1h", name=f"Job {n}"))["job_id"]
+               for n in range(3)]
+        one = json.loads(cronjob(action="list", job_id=ids[1]))
+        assert one["success"] is True and one["count"] == 1 and one["jobs"][0]["name"] == "Job 1"
+        missing = json.loads(cronjob(action="list", job_id="nope"))
+        assert missing["success"] is False and "not found" in missing["error"]
+        assert json.loads(cronjob(action="list"))["count"] == 3
+
     def test_create_with_natural_weekday_schedule(self):
         # The documented "every monday 9am" form must create a real cron job
         # through the tool path, not error out (issue: parser rejected it).
