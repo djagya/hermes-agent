@@ -63,7 +63,19 @@ if argv[:2] == ["item", "list"]:
 if argv[:2] == ["item", "get"]:
     if "--vault" not in argv or argv[argv.index("--vault") + 1] != "vault-123":
         sys.stderr.write("a vault query must be provided when this command is called by a service account\n"); sys.exit(1)
-    print("123456" if "--otp" in argv else "plain sentence nobody would flag 8"); sys.exit(0)
+    if "--otp" in argv:
+        print("123456"); sys.exit(0)
+    item_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "item.json")
+    item = json.load(open(item_path, encoding="utf-8")) if os.path.exists(item_path) else {"id": "abc", "fields": [
+        {"id": "username", "type": "STRING", "purpose": "USERNAME", "label": "username", "value": "jane@example.com"},
+        {"id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password",
+         "value": "plain sentence nobody would flag 8"}]}
+    if "--fields" in argv:  # real op prints the value CSV-quoted when it holds a quote, comma or space edge
+        value = next(f["value"] for f in item["fields"] if f.get("label") == "password")
+        print('"' + value.replace('"', '""') + '"' if any(c in value for c in '",\n') or value != value.strip() else value)
+        sys.exit(0)
+    if "--format" in argv and "--reveal" in argv:
+        print(json.dumps(item)); sys.exit(0)
 sys.exit(2)
 '''
 
@@ -113,6 +125,45 @@ def test_onepassword_handles_carry_vault_scope_and_legacy_handles_resolve(tmp_pa
     get_calls = [call for call in calls if call[:2] == ["item", "get"]]
     assert get_calls and all("--vault" in call and call[call.index("--vault") + 1] == "vault-123"
                              for call in get_calls)
+
+
+def _op_backend(tmp_path, monkeypatch, fields):
+    exe = tmp_path / "op"
+    exe.write_text(_FAKE_OP, encoding="utf-8")
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    (tmp_path / "item.json").write_text(json.dumps({"id": "abc", "fields": fields}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    backend = OnePasswordLoginBackend({"enabled": True, "binary_path": str(exe)})
+    backend._service_token = "service-token"
+    return backend
+
+
+@pytest.mark.parametrize("password", ['pa"ss,wo""rd', "  spaced both ends  ", "пароль-ünïcødé 🔑", "a,b", "'single'"])
+def test_onepassword_password_is_byte_exact(tmp_path, monkeypatch, password):
+    """R-sera-2026-10-19-2: the CSV-quoted ``--fields`` output put literal quotes into the filled password."""
+    backend = _op_backend(tmp_path, monkeypatch, [
+        {"id": "username", "purpose": "USERNAME", "label": "username", "value": "jane"},
+        {"id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password", "value": password}])
+    assert backend.resolve_password("op:vault-123:abc") == password
+
+
+def test_onepassword_password_field_choice_and_repeated_labels(tmp_path, monkeypatch):
+    from agent.vault_backends.base import BackendError
+
+    # The built-in PASSWORD field wins over a custom field that is also labelled "password".
+    backend = _op_backend(tmp_path, monkeypatch, [
+        {"id": "x1", "section": {"id": "s"}, "label": "password", "value": "old one"},
+        {"id": "password", "purpose": "PASSWORD", "label": "password", "value": "the login one"}])
+    assert backend.resolve_password("op:vault-123:abc") == "the login one"
+    # Repeated labels with the same value are fine; different values are refused, never guessed.
+    backend = _op_backend(tmp_path, monkeypatch, [
+        {"id": "a", "label": "password", "value": "same"}, {"id": "b", "label": "Password", "value": "same"}])
+    assert backend.resolve_password("op:vault-123:abc") == "same"
+    backend = _op_backend(tmp_path, monkeypatch, [
+        {"id": "a", "label": "password", "value": "first-secret"}, {"id": "b", "label": "password", "value": "second-secret"}])
+    with pytest.raises(BackendError) as exc:
+        backend.resolve_password("op:vault-123:abc")
+    assert "secret" not in str(exc.value.detail) and "secret" not in str(exc.value)
 
 
 def test_locked_manager_is_reported_not_prompted_when_headless(fake_bw, monkeypatch):

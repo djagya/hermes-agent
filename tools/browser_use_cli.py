@@ -267,6 +267,9 @@ def _base_subprocess_env() -> dict:
     env["PATH"] = _floor_subprocess_path(env.get("PATH", ""))
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
     namespace_harness_dirs(env, _served_profile_tag())  # a served profile's own harness runtime/tmp dirs
+    # dlz: harness auto-recording screenshots every action outside the payment capture guard.
+    # BH_RECORD=0 outranks the harness config file and refuses start_recording(); always forced.
+    env["BH_RECORD"] = "0"
     return env
 
 
@@ -594,6 +597,7 @@ def _resolve_backend_cdp(
     identity: str = "",
     qa_targets: Optional[list[str]] = None,
     force_local_sidecar: bool = False,
+    wait_s: Optional[float] = None,
 ) -> Optional[str]:
     """Point the harness at the configured backend's CDP endpoint; error string on failure.
 
@@ -629,6 +633,7 @@ def _resolve_backend_cdp(
             mode=mode,
             identity=identity,
             qa_targets=qa_targets,
+            wait_s=wait_s,
         )
     if _has_cdp_env(env):
         return None
@@ -738,7 +743,11 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
         return
     route = {"cdp": cdp, "lease": str(env.get("HERMES_BROWSER_LEASE_ID") or ""), "error": "",
              "slot_id": str(env.get("HERMES_BROWSER_SLOT_ID") or ""),
-             "browser_generation": str(env.get("HERMES_BROWSER_GENERATION") or "")}
+             "browser_generation": str(env.get("HERMES_BROWSER_GENERATION") or ""),
+             "wipe_count": str(env.get("HERMES_BROWSER_WIPE_COUNT") or ""),
+             "profile_kind": str(env.get("HERMES_BROWSER_PROFILE_KIND") or ""),
+             # Gateway memory only (never in a tool result): card fill sets control's capture guard.
+             "token": str(env.get("HERMES_BROWSER_COMMAND_TOKEN") or "")}
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
         from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
@@ -766,6 +775,7 @@ def _route_backend(
     qa_targets: Optional[list[str]] = None,
     force_local_sidecar: bool = False,
     real_profile: bool = True,
+    wait_s: Optional[float] = None,
 ) -> Optional[str]:
     """Resolve where the harness connects; returns an error string or None. Real-profile consent runs
     BEFORE provider resolution so a hit short-circuits the cloud path via the BU_CDP_* env contract. Named
@@ -784,6 +794,7 @@ def _route_backend(
             return "scope_denied: managed browser mode refuses local=true / real-profile"
         return _resolve_backend_cdp(
             env, task_id, session_name=session, mode=mode, identity=identity, qa_targets=qa_targets,
+            wait_s=wait_s,
         )
     # ``real_profile=False``: this route already fell back, so it stays on its fresh browser instead
     # of swapping browsers mid-task once the profile frees up.
@@ -946,21 +957,114 @@ def _take_real_profile_note(route_key: str) -> dict:
     return {"real_profile_unavailable": _real_profile_fallback[route_key]}
 
 
+def stop_harness_daemon(name: str) -> None:
+    """Stop the daemons this process drove under ``BU_NAME`` ``name``; a no-op for any other name."""
+    with _driven_daemons_lock:
+        daemons = sorted(key for key in _driven_daemons if key[-1] == name)
+        for key in daemons:
+            _driven_daemons.pop(key, None)
+    _reload_daemons(daemons)
+
+
+def _managed_busy_wait(timeout_s: Any) -> Optional[float]:
+    """Fair-queue wait budget for a managed acquire: at most half this call's timeout."""
+    try:
+        from tools.browser_control_route import busy_wait_budget
+    except ImportError:
+        return None
+    return busy_wait_budget(_clamp_timeout(timeout_s))
+
+
+def _managed_waited_s(managed: bool) -> float:
+    if not managed:
+        return 0.0
+    from tools.browser_control_route import last_busy_wait_s
+    return last_busy_wait_s()
+
+
+def _arm_dialogs(managed: bool, task_id: Optional[str], env: dict, on_dialog: str, identity: str) -> None:
+    """Managed slots: this call's page-dialog policy on the task's supervisor (``tools.browser_exec_dialogs``)."""
+    if managed:
+        from tools import browser_exec_dialogs
+        browser_exec_dialogs.arm(task_id, env, on_dialog=on_dialog, identity=identity)
+
+
+def _managed_dialogs(managed: bool, task_id: Optional[str], env: dict, started: float,
+                     identity: str) -> Optional[dict]:
+    """Dialogs this call left pending or answered (``tools.browser_exec_dialogs``); never fails the exec."""
+    if not managed:
+        return None
+    try:
+        from tools import browser_exec_dialogs
+        found = browser_exec_dialogs.collect(task_id, started)
+        browser_exec_dialogs.disarm(task_id, env, identity=identity)
+        return found
+    except Exception as e:  # health: allow BLE001 -- dialog reporting is advisory
+        logger.debug("browser_exec dialog report failed: %s", e)
+        return None
+
+
+# CDP error message prefix browser-control uses when its capture guard refuses a method.
+_CONTROL_CAPTURE_REFUSAL = "payment_screenshot_blocked"
+
+
+def _apply_control_capture_refusal(result: dict, managed: bool) -> None:
+    """browser-control answered a capture method with its guard error (card-filled slot)."""
+    if managed and _CONTROL_CAPTURE_REFUSAL in str(result.get("stderr") or ""):
+        from tools.browser_payment_privacy import screenshot_refusal
+
+        result.update(screenshot_refusal())
+
+
+def _with_dialogs(result_json: str, dialogs: Optional[dict]) -> str:
+    if not dialogs:
+        return result_json
+    try:
+        data = json.loads(result_json)
+    except ValueError:
+        return result_json
+    if isinstance(data, dict):
+        data["dialogs"] = dialogs
+        return json.dumps(data, ensure_ascii=False)
+    return result_json
+
+
+def _bridge_or_usage_error(code: str, **bridge_args) -> Optional[str]:
+    """A pinned bridge call's result, the usage error for a call with no code, or None for code."""
+    from agent.redact import redact_sensitive_text
+    from tools.browser_managed_bridge import dispatch_browser_exec
+    from tools.registry import tool_error, tool_result
+
+    bridge_result = dispatch_browser_exec(code=code, default_timeout_s=_DEFAULT_TIMEOUT_S, **bridge_args)
+    if bridge_result is not None:
+        return redact_sensitive_text(tool_result(bridge_result), force=True)
+    if not code or not code.strip():
+        return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
+    return None
+
+
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False,
-                 mode: str = "", identity: str = "", qa_targets: Optional[list[str]] = None):
+                 mode: str = "", identity: str = "", qa_targets: Optional[list[str]] = None,
+                 on_dialog: str = "auto", bridge: str = "", action: str = ""):
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
     from tools.browser_payment_privacy import exec_capture_refusal, exec_slot_capture_refusal
+
+    early = _bridge_or_usage_error(
+        code, binding_id=bridge, action=action, session=session, timeout_s=timeout_s,
+        local=local, mode=mode, identity=identity, qa_targets=qa_targets, on_dialog=on_dialog,
+        task_id=task_id,
+    )
+    if early is not None:
+        return early
 
     # Unmanaged: a card fill blocks capture for the whole profile. Managed: the slot control
     # grants this call is checked in dispatch(), so a re-route is checked too.
     refused = exec_capture_refusal(code, task_id)
     if refused:
         return refused
-    if not code or not code.strip():
-        return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 
     # The verdict is carried into the route, never re-derived: the predicate resolves DNS, so a second
     # evaluation could relax the floor and still pick the cloud for a rebinding host.
@@ -993,10 +1097,11 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         env["BU_NAME"] = session
     env, route_err, local_sidecar, generation = _route_exec_current(
         env, session, task_id, bool(local), local_sidecar, route_key,
-        mode=mode, identity=identity, qa_targets=qa_targets,
+        mode=mode, identity=identity, qa_targets=qa_targets, wait_s=_managed_busy_wait(timeout_s),
     )
     if route_err:
-        return tool_error(route_err)
+        # A managed ``busy`` carries its queue ticket / position / retry hint.
+        return tool_error(route_err, **getattr(route_err, "fields", {}))
     if local_sidecar:
         env["BU_NAME"] = _sidecar_daemon_name(session)
     _exec_route_is_sidecar[route_key] = local_sidecar
@@ -1014,11 +1119,20 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     managed = _code_is_managed()
     if managed:
         code = _MANAGED_TIMEOUT_PREAMBLE + _MANAGED_FRONT_TAB_PREAMBLE + code
+        # The controller key stays in Hermes: browser_control does control calls for the model.
+        env.pop("HERMES_BROWSER_CONTROL_KEY", None)
+        env.pop("HERMES_BROWSER_CONTROL_KEY_FILE", None)
+        # Harness processes carry the slot's command token: make them undumpable (Linux).
+        from tools.browser_process_hardening import harden_harness_env
+        harden_harness_env(env)
 
     workspace = _workspace_dir(task_id)
     if workspace:
         env["BH_AGENT_WORKSPACE"] = workspace
         code = _WORKSPACE_PREAMBLE + code
+    # dlz: ux_capture helpers (tools/browser_capture.py), loaded only when the code names them.
+    from tools.browser_capture import prepare_exec as _ux_capture_prepare
+    code = _ux_capture_prepare(code, env, task_id)
 
     # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no local
     # Chrome/CDP endpoint is reachable (their API key authenticates it)
@@ -1033,7 +1147,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     ):
         env["BU_AUTOSPAWN"] = "1"
 
-    timeout = _clamp_timeout(timeout_s)
+    # The time spent waiting in control's queue comes out of this call's budget.
+    timeout = max(_MIN_TIMEOUT_S, _clamp_timeout(timeout_s) - int(_managed_waited_s(managed)))
     started = time.time()
 
     def dispatch() -> dict[str, Any]:
@@ -1041,6 +1156,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         if refused:
             return {"error_result": refused}
         _attach_vault_supervisor(env, task_id)
+        _arm_dialogs(managed, task_id, env, on_dialog, identity)
         with _driven_daemons_lock:
             daemon = daemon_identity(env)
             _driven_daemons[daemon] = hermes_home_key()
@@ -1072,17 +1188,22 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         rerouted.pop("BU_CDP_URL", None)
         rerouted.pop("BU_CDP_WS", None)
         if not _route_backend(
-            rerouted, session, task_id, False, mode=mode, identity=identity, qa_targets=qa_targets,
+            rerouted, session, task_id, False, mode=mode, identity=identity, qa_targets=qa_targets, wait_s=0,
         ) and rerouted.get("BU_CDP_URL") and rerouted.get("BU_CDP_URL") != before:
             rerouted.pop(_PRIVATE_BROWSER_SENTINEL, None)
             rerouted.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
             env.clear()
             env.update(rerouted)
             dispatched = dispatch()
+    # dlz: undo ux_capture overrides a killed/failed call left on the tab (tools/browser_capture.py).
+    from tools.browser_capture import reset_after_failed_exec as _ux_capture_reset
+    _ux_capture_reset(code, env, dispatched, cmd, _run_cli_killing_process_group, task_id,
+                      fenced=bot_desktop_browser)
+    dialogs = _managed_dialogs(managed, task_id, env, started, identity)
     _reload_if_republished(env, generation)
     if "proc" not in dispatched:
         if "error_result" in dispatched:
-            return dispatched["error_result"]
+            return _with_dialogs(dispatched["error_result"], dialogs)
         return tool_result(dispatched)
     proc = dispatched["proc"]
 
@@ -1098,6 +1219,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     if session:
         result["session"] = session
     result.update(_take_real_profile_note(route_key))
+    result.update({"dialogs": dialogs} if dialogs else {})
     stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
     if managed and "permission-blocked" in stderr:
         stderr = _GATE_REFUSED_HINT + "\n" + stderr
@@ -1108,6 +1230,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     stderr = _cap_stderr(stderr)
     if stderr:
         result["stderr"] = stderr
+    _apply_control_capture_refusal(result, managed)
     screenshot = _find_screenshot(proc.stdout, started)
     if screenshot:
         result["screenshot_path"] = screenshot
@@ -1220,6 +1343,17 @@ def _dynamic_schema_overrides() -> dict:
                 "work:<org>, shopping, or sensitive. Omit for research slots."
             ),
         }
+        props["on_dialog"] = {
+            "type": "string",
+            "enum": ["auto", "accept", "dismiss"],
+            "default": "auto",
+            "description": (
+                "Page dialogs (alert/confirm/prompt/leave-page) that open during this call. auto: alerts "
+                "close, confirm/prompt are dismissed, leave-page is accepted. accept/dismiss: answer them so. "
+                "On payment, order, deletion or sensitive pages dialogs are never auto-answered: they stay "
+                "pending in the result's `dialogs` until answered explicitly."
+            ),
+        }
         props["qa_targets"] = {
             "type": "array",
             "items": {"type": "string"},
@@ -1228,7 +1362,18 @@ def _dynamic_schema_overrides() -> dict:
                 "Shared proxies are refused."
             ),
         }
-        overrides["parameters"] = {**BROWSER_EXEC_SCHEMA["parameters"], "properties": props}
+        props["bridge"] = {
+            "type": "string",
+            "description": "Operator-installed pinned bridge id. Supply only bridge and action; no code or route overrides.",
+        }
+        props["action"] = {
+            "type": "string",
+            "enum": ["verify", "fill", "route", "capture", "archive"],
+            "description": "Action exposed by the pinned bridge binding.",
+        }
+        overrides["parameters"] = {
+            **BROWSER_EXEC_SCHEMA["parameters"], "properties": props, "required": [],
+        }
     return overrides
 
 
@@ -1266,6 +1411,9 @@ registry.register(
         mode=args.get("mode", "") or "",
         identity=args.get("identity", "") or "",
         qa_targets=args.get("qa_targets"),
+        on_dialog=str(args.get("on_dialog") or "auto"),
+        bridge=str(args.get("bridge", "") or ""),
+        action=str(args.get("action", "") or ""),
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,

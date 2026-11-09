@@ -248,6 +248,10 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
          if job.get("no_agent") else ""),
         ("Workdir", job.get("workdir")),
         ("Python", job.get("interpreter")),
+        ("Timeout", f"{job['script_timeout_seconds']}s script timeout"
+         if job.get("script_timeout_seconds") else ""),
+        ("Catch-up", ("one missed slot" if job["catch_up_missed"] else "off")
+         if isinstance(job.get("catch_up_missed"), bool) else ""),
         ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
          if job.get("last_status") else ""),
         ("Dispatch", _dispatch_display(job.get("last_dispatch"))),
@@ -762,7 +766,9 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
-                   ("interpreter", "interpreter"))
+                   ("interpreter", "interpreter"),
+                   ("script_timeout_seconds", "script_timeout_seconds"),
+                   ("catch_up_missed", "catch_up_missed"))
 
 
 def _job_api_kwargs(args) -> dict[str, Any]:
@@ -777,7 +783,9 @@ _JOB_DETAIL_LINES = (
     ("no_agent", "  Mode: no-agent (script stdout delivered directly)"),
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
     ("workdir", "  Workdir: {}"),
-    ("interpreter", "  Python: {}"))
+    ("interpreter", "  Python: {}"),
+    ("alert_after_consecutive_failures", "  Alerts: after {} failed runs in a row"),
+    ("alert_when_stale_minutes", "  Alerts: once failing for {} min"))
 
 
 def _print_job_details(job_data: dict[str, Any]) -> None:
@@ -842,7 +850,10 @@ def cron_edit(args):
     result = _cron_api(action="update", job_id=args.job_id,
                        schedule=getattr(args, "schedule", None),
                        prompt=getattr(args, "prompt", None), skills=final_skills,
-                       no_agent=getattr(args, "no_agent", None), **_job_api_kwargs(args))
+                       no_agent=getattr(args, "no_agent", None),
+                       alert_after_consecutive_failures=getattr(args, "alert_after_failures", None),
+                       alert_when_stale_minutes=getattr(args, "alert_when_stale_minutes", None),
+                       **_job_api_kwargs(args))
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1

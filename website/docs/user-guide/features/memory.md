@@ -353,6 +353,14 @@ This is the answer to "the agent saved a wrong assumption about me": set
 `write_approval: true`, and every save — especially the unprompted background
 ones — waits for your yes/no before it ever enters your profile.
 
+Because the background review can add but never remove, its adds can fill memory
+to the limit and leave no room for things you ask it to remember. Set
+`memory.background_add_ceiling` (a fraction of each store's char limit, default
+`1.0`) to keep headroom: an unattended review add that would cross it is not
+saved, and the review is told to save nothing more and put procedures in a skill
+instead. Foreground saves and `/refine` are not affected. For example, `0.8`
+keeps the last 20% of `MEMORY.md` and `USER.md` for foreground turns.
+
 A staged `patch` or `remove` (the background review stages these even with the
 gate off) records the full entry it targets, and `/memory pending` shows it.
 Approval applies to exactly that entry: if it changed after the write was staged,
@@ -360,6 +368,19 @@ the write is refused and stays pending for you to reject. A `replace`/`patch`/`r
 staged before this pinning existed has no verifiable target and is refused too:
 reject it and recreate the change. `/memory approve` lists the full text of
 every entry it overwrote or removed.
+
+The unattended background review's own proposals are kept tidy so the queue
+cannot rot (foreground writes and proposals from an explicit `/refine` are never
+touched):
+
+- **Expiry:** a proposal nobody approved within `memory.pending_ttl_days`
+  (default `14`; `0` = never) is moved to `pending/memory/expired/` with a log
+  line. Nothing is deleted; move a file back to `pending/memory/` to restore it.
+- **Latest wins:** when the review stages a proposal that covers every operation
+  of an earlier one (the same entries, the same added text), the earlier one is
+  dropped. An earlier proposal with any other operation is kept.
+- **The review sees its queue:** each memory review is shown its own pending
+  proposals, quoted as data, so it does not stage the same consolidation again.
 
 ## Background review notifications (`display.memory_notifications`)
 

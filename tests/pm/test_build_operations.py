@@ -305,6 +305,8 @@ def test_requirements_build_installs_offline_markers_and_seals_only_build_pth(tm
     assert executable.parent.parent == out
     assert bool(list(out.rglob("__editable__.app_dep-1.0.pth"))) is not sealed
     assert list(out.rglob("app_dep.pth")), "load-bearing .pth must survive sealing"
+    # uv 0.13 stopped writing the distutils shim (astral-sh/uv#22096), so neither arm has it.
+    assert not list(out.rglob("_virtualenv.pth"))
     assert not poison.exists()
     assert not Path(build_tools["HERMES_HOME"]).exists()
     assert dict(os.environ) == before

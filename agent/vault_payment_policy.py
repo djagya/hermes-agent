@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Mapping
 from urllib.parse import urlsplit
@@ -20,12 +21,22 @@ class PaymentProvider:
     # Path prefixes of the card-field documents when the origin also serves other pages (PayPal's
     # www.paypal.com hosts card fields AND its wallet and login); empty = any path on the origin.
     paths: tuple = ()
+    # Paths of the provider's own non-card documents that may CONTAIN a card-field document (PayPal's
+    # guest card form renders inside its /smart/buttons frame). Never fill targets themselves.
+    ancestor_paths: tuple = ()
+
+    @staticmethod
+    def _on(url: str, prefixes: tuple) -> bool:
+        path = urlsplit(url).path
+        return any(path == p or path.startswith(p.rstrip("/") + "/") for p in prefixes)
 
     def admits(self, url: str) -> bool:
-        if not self.paths:
-            return True
-        path = urlsplit(url).path
-        return any(path == p or path.startswith(p.rstrip("/") + "/") for p in self.paths)
+        return not self.paths or self._on(url, self.paths)
+
+    def admits_ancestor(self, url: str) -> bool:
+        """A frame on this origin that may sit above a card-field document: a card path, a listed
+        ancestor path, or an about:blank/srcdoc frame (it carries the origin of the document that made it)."""
+        return self.admits(url) or self._on(url, self.ancestor_paths) or url in ("about:blank", "about:srcdoc")
 
 
 # Always on (the reviewed set before provider profiles existed). Datatrans Secure Fields puts the
@@ -43,14 +54,27 @@ OPT_IN_PROVIDERS = (
     PaymentProvider("worldpay-hpp", ("https://payments.worldpay.com",), 2, ("/app/hpp/",)),
     PaymentProvider("worldpay-access-checkout", ("https://access.worldpay.com",), 4, ("/access-checkout/",)),
     PaymentProvider("braintree-hosted-fields", ("https://assets.braintreegateway.com",), 4, ("/web/",)),
-    PaymentProvider("paypal-card-fields", ("https://www.paypal.com",), 4, ("/smart/card-field",)),
+    # SDK card-fields (/smart/card-field) and the Buttons guest card form (/smart/card-fields, rendered
+    # inside /smart/buttons; captured 2026-11-03 on a live merchant checkout).
+    PaymentProvider("paypal-card-fields", ("https://www.paypal.com",), 4, ("/smart/card-field", "/smart/card-fields"),
+                    ("/smart/buttons",)),
     PaymentProvider("checkoutcom-frames", ("https://js.checkout.com",), 4, ("/framesv2/",)),
     PaymentProvider("mollie-components", ("https://js.mollie.com",), 4, ("/v1/component/",)),
     PaymentProvider("unzer-ui-v2", ("https://static-cc.unzer.com",), 2, ("/v2/card-ui/",)),
     PaymentProvider("unzer-ui-v1", ("https://payment.unzer.com",), 4, ("/v1/cardframe/",)),
     PaymentProvider("saferpay-fields", ("https://www.saferpay.com",), 4, ("/Fields/",)),
+    # PAYONE Client API hosted iFrames: one frame per field (number, CVC, expiry month and year as
+    # <select>), the holder on the merchant page: 5 documents. Captured 2026-11-03 on a live checkout.
+    PaymentProvider("payone-hosted-iframes", ("https://secure.pay1.de",), 5,
+                    ("/client-api/js/v1/payone_iframe.html",)),
 )
 PAYMENT_PROVIDERS = DEFAULT_PROVIDERS + OPT_IN_PROVIDERS
+# Hosted card-field products reviewed and found unsupported (payment-providers.md). Never admitted;
+# named in a refusal so the cause reads as the payment provider, not the shop.
+UNSUPPORTED_PROVIDERS = {
+    "https://payment.direct.worldline-solutions.com": "Worldline Direct Hosted Tokenization Page, not supported",
+    "https://www.computop-paygate.com": "Computop Paygate, not supported",
+}
 PAYMENT_PSP_ORIGINS = tuple(o for p in DEFAULT_PROVIDERS for o in p.origins)
 
 
@@ -73,6 +97,27 @@ def reviewed_origins() -> tuple:
 
 def provider_for_origin(origin: str) -> PaymentProvider | None:
     return next((p for p in PAYMENT_PROVIDERS if origin in p.origins), None)
+
+
+def coverage_hint(tree: tuple, merchant: str, allowed: tuple) -> str:
+    """Why a checkout yielded no complete reviewed card document, from frame origins and paths only
+    (nothing is read from an unreviewed frame). ``tree`` rows are ``(id, loader, url, origin,
+    parent)`` with the browser's security origin. Only constant provider text and a sanitized path
+    of a reviewed origin appear; '' when nothing specific applies."""
+    notes = []
+    for _fid, _loader, url, origin, parent in tree:
+        if not parent or origin == merchant:
+            continue
+        provider = provider_for_origin(origin)
+        if origin in UNSUPPORTED_PROVIDERS:
+            notes.append(f"card frames on {origin}: {UNSUPPORTED_PROVIDERS[origin]}")
+        elif provider is not None and origin not in allowed:
+            notes.append(f"{origin} is reviewed provider {provider.name}, not enabled in vault.payment_providers")
+        elif provider is not None and not provider.admits(url):
+            path = re.sub(r"[^A-Za-z0-9/_.-]", "", urlsplit(url).path)[:40]
+            notes.append(f"{origin}{path} is not a {provider.name} card-field document "
+                         "(wallet, buttons and guest-checkout pages are out of scope)")
+    return "; ".join(dict.fromkeys(notes))[:400]
 
 
 def effective_frame_origins(override: tuple = ()) -> tuple:

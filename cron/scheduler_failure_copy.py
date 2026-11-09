@@ -154,12 +154,13 @@ def inactivity_notice(job_name: str, job_id: str) -> str:
 
 
 def blocked_config_notice(job_name: str, reason: str) -> str:
-    """One-time notice when the pre-run configuration check refused to start the job."""
+    """Notice when the pre-run configuration check refused to start the job (repeats on the
+    incident reminder cadence while the job stays blocked)."""
     reason = reason.rstrip()
     if reason and reason[-1] not in ".!?":
         reason += "."
     return (
         f"⛔ Cron '{job_name}' did not run: {reason} Nothing was charged. Hermes will try again at "
-        "the next scheduled time and will not repeat this alert; check with "
+        "the next scheduled time and repeats this alert while the job stays blocked; check with "
         "`hermes cron doctor`."
     )

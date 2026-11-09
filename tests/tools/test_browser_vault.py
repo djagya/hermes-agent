@@ -1169,7 +1169,7 @@ class TestExplicitCodeMode:
              patch.object(browser_vault_tool, "_fenced_page_op", side_effect=lambda tid, fn: fn()):
             browser_vault_tool._handle_vault(
                 {"action": "fill", "handle": "op:card", "merchant_origin": "https://shop.example"}, task_id="t")
-        assert seen == {"handle": "op:card", "task_id": "t", "merchant_origin": "https://shop.example"}
+        assert seen == {"handle": "op:card", "task_id": "t", "merchant_origin": "https://shop.example", "purpose": "login"}
 
     def test_handle_bound_to_several_origins_accepts_any_of_them(self):
         from types import SimpleNamespace

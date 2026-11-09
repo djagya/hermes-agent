@@ -39,3 +39,29 @@ def test_default_and_uncomputable_still_catch_up(tmp_path, monkeypatch, uncomput
         if uncomputable:
             monkeypatch.setattr(jobs, "compute_next_run", lambda *args: None)
         assert [row["id"] for row in jobs.get_due_jobs()] == [job["id"]]
+
+
+@pytest.mark.parametrize(("global_on", "own"), [(False, True), (True, False)])
+def test_job_catch_up_missed_overrides_config(tmp_path, monkeypatch, global_on, own):
+    """An idempotent job can run its one missed slot while the global default stays off (and
+    a job can opt out while it is on). Clearing the field returns it to config."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"cron:\n  catch_up_missed: {str(global_on).lower()}\n", encoding="utf-8")
+    with jobs.use_cron_store(tmp_path / "cron"):
+        job = jobs.create_job(prompt="own", schedule="every 1h", model="fixture",
+                              deliver="local", catch_up_missed=own)
+        assert job["catch_up_missed"] is own
+
+        def stale_and_due():
+            stored = jobs.load_jobs()
+            stored[0]["next_run_at"] = (jobs._hermes_now() - timedelta(hours=4)).isoformat()
+            jobs.save_jobs(stored)
+            return [row["id"] for row in jobs.get_due_jobs()] == [job["id"]]
+
+        assert stale_and_due() is own
+        jobs.update_job(job["id"], {"catch_up_missed": ""})
+        assert "catch_up_missed" not in jobs.load_jobs()[0]
+        assert stale_and_due() is global_on
+        with pytest.raises(ValueError):
+            jobs.update_job(job["id"], {"catch_up_missed": "sometimes"})

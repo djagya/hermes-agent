@@ -19,6 +19,7 @@ extra = project['optional-dependencies']['sera-toolbox']
 # The smoke's import names differ from their distribution names. Assert the
 # image really installed the declared extra, not just the test runner's deps.
 required = {
+    'beautifulsoup4': 'bs4',
     'PyMuPDF': 'fitz',
     'weasyprint': 'weasyprint',
     'python-docx': 'docx',

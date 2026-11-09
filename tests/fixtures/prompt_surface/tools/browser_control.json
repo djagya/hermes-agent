@@ -1,0 +1,67 @@
+{
+  "description": "Managed browser slot operations for the lease this task's browser_exec holds. The controller key and lease tokens stay inside Hermes. Actions: status (slots, which are yours, handoff availability); release (free your slot now); cancel (drop a queued acquire: request_id = queued_id from a busy result); handoff (single-use link for Danil to finish a CAPTCHA/login on exactly target_id, the targetId printed from current_tab() in browser_exec; returns url + expires_in); native_cancel (one Escape for Chrome's native passkey prompt on target_id); upload (local path -> /staging/<name> in the browser); download (finished file <name> from the browser's downloads -> your workspace, sha256-checked); dialog (answer a pending page dialog from a browser_exec result: dialog_action accept|dismiss, dialog_id, prompt_text for prompts). Pass identity when the task holds more than one lease.",
+  "name": "browser_control",
+  "parameters": {
+    "properties": {
+      "action": {
+        "enum": [
+          "status",
+          "release",
+          "cancel",
+          "handoff",
+          "native_cancel",
+          "upload",
+          "download",
+          "dialog"
+        ],
+        "type": "string"
+      },
+      "dialog_action": {
+        "enum": [
+          "accept",
+          "dismiss"
+        ],
+        "type": "string"
+      },
+      "dialog_id": {
+        "description": "dialog: id from the result's dialogs.pending.",
+        "type": "string"
+      },
+      "identity": {
+        "description": "Which held lease (the identity used with browser_exec).",
+        "type": "string"
+      },
+      "mode": {
+        "enum": [
+          "research",
+          "qa"
+        ],
+        "type": "string"
+      },
+      "name": {
+        "description": "upload: staging name (default the file name); download: file name.",
+        "type": "string"
+      },
+      "path": {
+        "description": "upload: local file to stage.",
+        "type": "string"
+      },
+      "prompt_text": {
+        "description": "dialog: text for a prompt() dialog.",
+        "type": "string"
+      },
+      "request_id": {
+        "description": "cancel: the queued_id from a busy result.",
+        "type": "string"
+      },
+      "target_id": {
+        "description": "handoff / native_cancel: CDP targetId of the exact tab.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "action"
+    ],
+    "type": "object"
+  }
+}

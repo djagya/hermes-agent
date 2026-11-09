@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
 import logging
+import math
 import shutil
 import sys
 import threading
@@ -1716,6 +1717,20 @@ def _normalize_failure_deliver(value: Any) -> Optional[str]:
     return _normalize_job_optional_text(value)
 
 
+def _normalize_alert_threshold(value: Any) -> Optional[int]:
+    """``alert_after_consecutive_failures`` / ``alert_when_stale_minutes``: a positive whole
+    number, or None (unset: every first failure alerts, the default). 0 / "" clear the setting."""
+    if value is None or value == "" or value is False:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Alert threshold must be a whole number, got {value!r}.") from None
+    if number < 0 or number != float(value):
+        raise ValueError(f"Alert threshold must be a whole number >= 0, got {value!r}.")
+    return number or None
+
+
 def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     """Spelling-only validation via the shared parser (cron knob never stricter/looser than
     config.yaml); model capability is deliberately NOT checked (model unknowable at create time,
@@ -1737,6 +1752,37 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_script_timeout(value: Any) -> Optional[int]:
+    """Per-job ``script_timeout_seconds``: a positive whole number of seconds, or None/""/0 to clear
+    (back to ``cron.script_timeout_seconds``). Bools are rejected: ``True`` is not a duration."""
+    if value is None or value == "" or value == 0:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("script_timeout_seconds must be a positive number of seconds.")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid script_timeout_seconds {value!r}.") from None
+    if not math.isfinite(seconds) or seconds <= 0 or seconds != int(seconds):
+        raise ValueError(f"Invalid script_timeout_seconds {value!r}: use whole seconds > 0.")
+    return int(seconds)
+
+
+def _normalize_catch_up_missed(value: Any) -> Optional[bool]:
+    """Per-job ``catch_up_missed``: True/False overrides ``cron.catch_up_missed``; None/"" clears.
+    Text from the CLI ("true"/"false") is accepted; anything else raises."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "yes", "on", "1"}:
+        return True
+    if text in {"false", "no", "off", "0"}:
+        return False
+    raise ValueError(f"Invalid catch_up_missed {value!r}: use true, false or '' to clear.")
+
+
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
@@ -1752,6 +1798,8 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
     "interpreter": _normalize_job_optional_text,
+    "script_timeout_seconds": _normalize_script_timeout,
+    "catch_up_missed": _normalize_catch_up_missed,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1761,6 +1809,10 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "script_timeout_seconds": _normalize_script_timeout,
+    "catch_up_missed": _normalize_catch_up_missed,
+    "alert_after_consecutive_failures": _normalize_alert_threshold,
+    "alert_when_stale_minutes": _normalize_alert_threshold,
 }
 
 
@@ -1811,6 +1863,8 @@ def create_job(
     paused_reason: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
+    script_timeout_seconds: Optional[int] = None,
+    catch_up_missed: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1909,6 +1963,8 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
+        ("script_timeout_seconds", f["script_timeout_seconds"]),
+        ("catch_up_missed", f["catch_up_missed"]),
     ):
         if value is not None:
             job[key] = value
@@ -2095,6 +2151,9 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        for _optional in ("script_timeout_seconds", "catch_up_missed"):
+            if _optional in updates and updated.get(_optional) is None:
+                updated.pop(_optional, None)  # cleared: absent key = global config
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
@@ -2289,35 +2348,39 @@ def remove_job(job_id: str) -> bool:
         return True
 
 
-def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
-    """Set/clear a persisted alert-dedup marker (alert exactly once until the condition heals;
-    survives restarts) and return the PRIOR value. Field: ``preflight_alerted`` (blocked config).
+def claim_preflight_alert(job_id: str, repeat_hours: float) -> bool:
+    """Stamp a blocked-config alert for *job_id*; return True when this tick should deliver it.
 
-    The marker records that the operator was already alerted about this job's condition, so the scheduler
-    alerts exactly once and stays silent on subsequent ticks until the condition heals (same alert-once
-    shape as the dead-pin auto-pause in #73506).
+    A blocked job never runs, so alert-once would leave a job that silently stopped working with
+    no further signal. The first blocked tick alerts; later ones stay silent until *repeat_hours*
+    have passed since the last alert, then alert again (``<= 0``: every tick). A bare legacy
+    ``preflight_alerted`` marker without ``preflight_alerted_at`` alerts again once and is stamped.
     """
+    now = _hermes_now()
+
     def apply(jobs, _i, job):
-        prior = bool(job.get(field))
-        if value:
-            job[field] = True
-        else:
-            job.pop(field, None)
-        if prior != value:
+        if repeat_hours <= 0:
+            # Every tick alerts; stamp once instead of rewriting jobs.json per blocked tick.
+            if not job.get("preflight_alerted"):
+                job["preflight_alerted"] = True
+                job["preflight_alerted_at"] = now.isoformat()
+                save_jobs(jobs)
+            return True
+        due = True
+        last = job.get("preflight_alerted_at")
+        if job.get("preflight_alerted") and last:
+            try:
+                last_dt = _ensure_aware(datetime.fromisoformat(str(last)))
+                due = _elapsed_seconds(now, last_dt) >= repeat_hours * 3600
+            except (TypeError, ValueError):
+                due = True
+        if due:
+            job["preflight_alerted"] = True
+            job["preflight_alerted_at"] = now.isoformat()
             save_jobs(jobs)
-        return prior
+        return due
 
-    return _with_job(job_id, apply, False)
-
-
-def mark_preflight_alerted(job_id: str) -> bool:
-    """Mark the job as preflight-alerted; return True if it already was."""
-    return _set_alert_flag(job_id, "preflight_alerted", True)
-
-
-def clear_preflight_alerted(job_id: str) -> None:
-    """Clear the preflight alert-dedup marker (config validates again)."""
-    _set_alert_flag(job_id, "preflight_alerted", False)
+    return _with_job(job_id, apply, True)
 
 
 def note_fire_forward_failure(job_id: str, detail: str) -> bool:
@@ -2347,15 +2410,23 @@ def _record_run_outcome(
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
     job["last_error"] = None if success else error
-    if success:
-        # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
-        # the forward-failure stamp so it only describes CURRENT auto-fire health.
+    if status != "blocked_config":
+        # The job got past every pre-run gate and really ran (ok or not): drop the blocked-config
+        # alert markers so a FUTURE block alerts at once.
         job.pop("preflight_alerted", None)
+        job.pop("preflight_alerted_at", None)
+    if success:
+        # Healthy run: clear the forward-failure stamp so it only describes CURRENT auto-fire
+        # health.
         job.pop("last_fire_error", None)
         job["failure_streak"] = 0
+        job.pop("failing_since", None)
     else:
         # Consecutive agent-failure streak; delivery failures do NOT count
         # (scheduler._failure_streak_nudge).
+        if not int(job.get("failure_streak") or 0):
+            # First failure of a streak: the clock alert_when_stale_minutes measures against.
+            job["failing_since"] = now
         job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
         # Sticky last-failure stamp (#118354): the next success resets last_status and
         # failure_streak, which erases the only job-level trace that a run ever failed —
@@ -3123,6 +3194,15 @@ def _reanchor_stale_cron(d: _DueJob) -> bool:
     return False
 
 
+def _job_catches_up(job: dict[str, Any]) -> bool:
+    """A job's own ``catch_up_missed`` (bool) beats ``cron.catch_up_missed``: an idempotent refresh
+    can run its one missed slot after a restart while the global default stays off."""
+    own = job.get("catch_up_missed")
+    if isinstance(own, bool):
+        return own
+    return bool(_cron_config_number("catch_up_missed", True, lambda value: value is not False))
+
+
 def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
     """Re-anchor accumulated misses; return whether catch-up was explicitly disabled.
 
@@ -3138,7 +3218,7 @@ def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
         return False
     d.scan.persist(d.job["id"], next_run_at=new_next)
     if (_instant_after(_ensure_aware(datetime.fromisoformat(new_next)), d.scan.now)
-            and not _cron_config_number("catch_up_missed", True, lambda value: value is not False)):
+            and not _job_catches_up(d.job)):
         logger.info(
             "Job '%s' missed its scheduled time (%s, grace=%ds). "
             "Skipping missed occurrence because cron.catch_up_missed is false; next run: %s",

@@ -4,8 +4,8 @@
 # See #70480 and https://sqlite.org/wal.html#walresetbug.
 # Pinned by the multi-arch index digest: uv and node already come from pm's
 # sha-verified lock, and a tag alone would let the base drift under them.
-FROM debian:trixie-20261020@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308 AS sqlite_build
-ARG DEBIAN_SNAPSHOT=20261022T143025Z
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS sqlite_build
+ARG DEBIAN_SNAPSHOT=20261104T214428Z
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
@@ -431,15 +431,23 @@ RUN /opt/hermes/.venv/bin/python -m docker.build_agent
 # PM's npm shim lives in the sealed tool store, so npm's implicit global
 # prefix is that store, not /usr/local. Install the toolbox packages into the
 # runtime-copied /usr/local tree used by smoke.sh and start-baked-mcp.sh.
+# axe-core is data, not a command: browser_exec's ux_capture.audit_a11y()
+# injects axe.min.js into the page and refuses a file whose sha256 differs
+# from AXE_SHA256 in tools/browser_capture_harness.py (bump both together).
 RUN npm install -g --prefix /usr/local --omit=dev \
-        markdownlint-cli2@0.23.3 \
-        caldav-mcp@0.10.0 && \
+        markdownlint-cli2@0.24.0 \
+        caldav-mcp@0.10.0 \
+        axe-core@4.14.0 && \
     test -x /usr/local/bin/markdownlint-cli2 && \
-    test -f /usr/local/lib/node_modules/caldav-mcp/package.json
+    test -f /usr/local/lib/node_modules/caldav-mcp/package.json && \
+    printf '%s  %s\n' 20c09fe157a8a34a30e241aaa1fcdade657734f08ab379ecfbeb7d45cc46e878 \
+        /usr/local/lib/node_modules/axe-core/axe.min.js > /tmp/axe.sha256 && \
+    sha256sum -c /tmp/axe.sha256 && \
+    rm -f /tmp/axe.sha256
 
 # clickup-mcp 1.8.0 (and 1.9.0) pin @modelcontextprotocol/sdk 1.15.1
 # exactly (CVE-2026-104850 fixed in 1.31.0; CVE-2026-111767/111768 in
-# 1.32.0). `npm install -g` ignores
+# 1.32.0); body-parser 2.4.0 is overridden for CVE-2026-111181. `npm install -g` ignores
 # `overrides`, so install it from its lock project (SDK override,
 # integrity-hashed) with the shallow global layout, then move the package
 # dir into the global tree and link its bin the way `npm install -g` does.
@@ -453,7 +461,8 @@ RUN cp -r docker/sera-toolbox/clickup-mcp /tmp/clickup-mcp && \
     cd / && rm -rf /tmp/clickup-mcp && npm cache clean --force && \
     m=/usr/local/lib/node_modules/@hauptsache.net/clickup-mcp && \
     test "$(node -p "require('$m/package.json').version")" = 1.8.0 && \
-    test "$(node -p "require('$m/node_modules/@modelcontextprotocol/sdk/package.json').version")" = 1.32.1
+    test "$(node -p "require('$m/node_modules/@modelcontextprotocol/sdk/package.json').version")" = 1.32.1 && \
+    test "$(node -p "require('$m/node_modules/body-parser/package.json').version")" = 2.4.0
 
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, dep assembly, npm install all run as root) and
@@ -645,14 +654,14 @@ ARG HERMES_GIT_SHA=
 LABEL HERMES_GIT_SHA="${HERMES_GIT_SHA}" \
       org.opencontainers.image.revision="${HERMES_GIT_SHA}"
 ARG HERMES_BOT_DESKTOP=0
-ARG DEBIAN_SNAPSHOT=20261022T143025Z
+ARG DEBIAN_SNAPSHOT=20261104T214428Z
 COPY docker/sera-toolbox/pin-debian-snapshot.sh /tmp/pin-debian-snapshot.sh
 RUN chmod 0755 /tmp/pin-debian-snapshot.sh && /tmp/pin-debian-snapshot.sh && \
     apt-get -o Acquire::Retries=3 update && \
     DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --only-upgrade --no-install-recommends \
       bsdutils gzip libblkid1 liblastlog2-2 libmount1 libpcre2-8-0 libsmartcols1 \
       libsqlite3-0 libuuid1 login mount util-linux \
-      libssl3t64 openssl openssl-provider-legacy && \
+      libssl3t64 openssl openssl-provider-legacy apt libapt-pkg7.0 && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 python3-venv \
     libffi8 libolm3 libatomic1 procps git openssh-client xz-utils \
@@ -700,7 +709,8 @@ RUN ldconfig && \
     test -x /usr/local/bin/markdownlint-cli2 && \
     test -x /usr/local/bin/uv && test -x /usr/local/bin/uvx && \
     test -f /usr/local/lib/node_modules/@hauptsache.net/clickup-mcp/package.json && \
-    test -f /usr/local/lib/node_modules/caldav-mcp/package.json
+    test -f /usr/local/lib/node_modules/caldav-mcp/package.json && \
+    test -f /usr/local/lib/node_modules/axe-core/axe.min.js
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/tools HERMES_RUNTIME_DIR=/opt/hermes/tools
 # TUI gateway children need the sealed runtime, not the build-helper system Python (upstream 48353b2b89).

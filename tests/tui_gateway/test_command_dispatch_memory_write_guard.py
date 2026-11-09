@@ -1,15 +1,13 @@
-"""dlz: ``/memory pending`` then ``approve`` on a staged write that carries the fork's write guard.
+"""dlz: ``/memory pending`` then ``approve`` on a staged write through ``command.dispatch``.
 
-The fork's variant of upstream's test of the same name (#118812) in test_tui_gateway_server.py:
-the fork's approve replays only payloads carrying a base-state guard, so the staged write here
-builds one. Kept in its own file so upstream's 23k-line module carries no fork lines.
+The fork's variant of upstream's test of the same name (#118812) in test_tui_gateway_server.py,
+kept in its own file so upstream's 23k-line module carries no fork lines.
 """
 
 import threading
 import types
 
 from tools import write_approval as wa
-from tools.memory_tool import MemoryStore, _build_memory_write_guard
 from tui_gateway import server
 
 
@@ -38,10 +36,7 @@ def test_command_dispatch_memory_pending_reviews_staged_writes(tmp_path, monkeyp
     home.mkdir()
     (home / "config.yaml").write_text("memory:\n  write_approval: true\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
-    store = MemoryStore()
-    store.load_from_disk()
-    wa.stage_write(wa.MEMORY, {"action": "add", "target": "memory", "content": "dispatched fact",
-                               "_write_guard": _build_memory_write_guard(store, "memory")},
+    wa.stage_write(wa.MEMORY, {"action": "add", "target": "memory", "content": "dispatched fact"},
                    summary="add dispatched fact", origin="foreground")
     server._sessions["sid-wa"] = _session(profile_home=str(home))
     try:

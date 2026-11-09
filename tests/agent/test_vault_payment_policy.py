@@ -4,6 +4,7 @@ import pytest
 
 from agent.vault_payment_policy import (
     PaymentPolicyError,
+    coverage_hint,
     https_origin,
     onepassword_payment_metadata,
 )
@@ -75,3 +76,29 @@ def test_shared_origin_provider_admits_only_its_card_field_paths(url, admitted):
     from agent.vault_payment_policy import provider_for_origin
 
     assert provider_for_origin("https://www.paypal.com").admits(url) is admitted
+
+
+_SHOP = "https://shop.example"
+
+
+def _tree(*frames):
+    return (("main", "", _SHOP + "/checkout", _SHOP, ""),
+            *((f"f{n}", "", url, origin, "main") for n, (url, origin) in enumerate(frames)))
+
+
+@pytest.mark.parametrize("frame,allowed,expected", [
+    (("https://www.computop-paygate.com/paySSL.aspx?x=1", "https://www.computop-paygate.com"), (),
+     "card frames on https://www.computop-paygate.com: Computop"),
+    (("https://secure.pay1.de/client-api/js/v1/payone_iframe.html", "https://secure.pay1.de"), (),
+     "https://secure.pay1.de is reviewed provider payone-hosted-iframes, not enabled"),
+    (("https://js.mollie.com/v1/component/card", "https://js.mollie.com"), (),
+     "https://js.mollie.com is reviewed provider mollie-components, not enabled in vault.payment_providers"),
+    (("https://www.paypal.com/smart/buttons<b>?q=1", "https://www.paypal.com"), ("https://www.paypal.com",),
+     "https://www.paypal.com/smart/buttonsb is not a paypal-card-fields card-field document"),
+    (("https://www.paypal.com/smart/card-field/x", "https://www.paypal.com"), ("https://www.paypal.com",), ""),
+    (("https://ads.example/frame", "https://ads.example"), (), ""),
+])
+def test_coverage_hint_names_the_provider_level_cause(frame, allowed, expected):
+    hint = coverage_hint(_tree(frame), _SHOP, allowed)
+    assert (expected in hint) if expected else hint == ""
+    assert "<" not in hint and "?" not in hint and "ads.example" not in hint

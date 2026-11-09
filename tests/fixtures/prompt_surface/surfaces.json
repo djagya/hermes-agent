@@ -5,12 +5,13 @@
       "stable": 1935,
       "volatile": 1813
     },
-    "tool_tokens": 13469,
+    "tool_tokens": 13959,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
       "browser_console",
+      "browser_control",
       "browser_dialog",
       "browser_exec",
       "browser_get_images",
@@ -48,12 +49,13 @@
       "stable": 1445,
       "volatile": 1813
     },
-    "tool_tokens": 13469,
+    "tool_tokens": 13959,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
       "browser_console",
+      "browser_control",
       "browser_dialog",
       "browser_exec",
       "browser_get_images",
@@ -91,12 +93,13 @@
       "stable": 1866,
       "volatile": 1811
     },
-    "tool_tokens": 13469,
+    "tool_tokens": 13959,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
       "browser_console",
+      "browser_control",
       "browser_dialog",
       "browser_exec",
       "browser_get_images",
@@ -134,12 +137,13 @@
       "stable": 2640,
       "volatile": 1809
     },
-    "tool_tokens": 13625,
+    "tool_tokens": 14115,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
       "browser_console",
+      "browser_control",
       "browser_dialog",
       "browser_exec",
       "browser_get_images",
@@ -177,12 +181,13 @@
       "stable": 1445,
       "volatile": 1813
     },
-    "tool_tokens": 13469,
+    "tool_tokens": 13959,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
       "browser_console",
+      "browser_control",
       "browser_dialog",
       "browser_exec",
       "browser_get_images",
@@ -220,12 +225,13 @@
       "stable": 1317,
       "volatile": 1813
     },
-    "tool_tokens": 13469,
+    "tool_tokens": 13959,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
       "browser_console",
+      "browser_control",
       "browser_dialog",
       "browser_exec",
       "browser_get_images",
@@ -263,12 +269,13 @@
       "stable": 1579,
       "volatile": 1814
     },
-    "tool_tokens": 14103,
+    "tool_tokens": 14593,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
       "browser_console",
+      "browser_control",
       "browser_dialog",
       "browser_exec",
       "browser_get_images",
@@ -307,12 +314,13 @@
       "stable": 1349,
       "volatile": 1814
     },
-    "tool_tokens": 13469,
+    "tool_tokens": 13959,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
       "browser_console",
+      "browser_control",
       "browser_dialog",
       "browser_exec",
       "browser_get_images",
@@ -350,12 +358,13 @@
       "stable": 1382,
       "volatile": 1814
     },
-    "tool_tokens": 13469,
+    "tool_tokens": 13959,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
       "browser_console",
+      "browser_control",
       "browser_dialog",
       "browser_exec",
       "browser_get_images",

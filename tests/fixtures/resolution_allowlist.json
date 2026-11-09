@@ -669,5 +669,10 @@
     "symbol": "_installed_git",
     "kind": "bare_which",
     "reason": "only asks whether the caller's bare git is on PATH; when it is not (Desktop on a Windows install whose only git is install.ps1's PM-staged copy) it defers to update_pause_record._git_executable, the updater's own resolution"
+  },
+  {
+    "path": "tools/browser_capture_harness.py",
+    "symbol": "Recording.start",
+    "kind": "bare_which"
   }
 ]

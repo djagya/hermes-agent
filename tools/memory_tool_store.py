@@ -3,7 +3,6 @@ Entries are joined by ``ENTRY_DELIMITER``; budgets are in chars (model-independe
 Module state that tests monkeypatch (``get_memory_dir``, ``fcntl``/``msvcrt``) stays
 in ``tools.memory_tool`` and is read lazily."""
 
-import hashlib
 import logging
 import os
 import re
@@ -336,20 +335,8 @@ class MemoryStore:
                    usage=self._usage(target),
                    **({"closest_entries": closest_entries} if closest_entries else {})))
 
-    def _pending_guard_error(self, target: str, expected_sha256: Optional[str]) -> Optional[dict[str, Any]]:
-        if expected_sha256 is None:
-            return None
-        path = self._path_for(target)
-        try:
-            actual = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "ABSENT"
-        except OSError:
-            return _read_failed_error(path)
-        if actual != expected_sha256:
-            return {"success": False, "error": "Pending memory write is stale: target changed since it was staged; inspect current memory and restage.", "target": target}
-        return None
-
     def _mutate(self, target: str, mutate, *, skip_drift: bool = False,
-                expected_sha256: Optional[str] = None, before_write=None) -> dict[str, Any]:
+                before_write=None) -> dict[str, Any]:
         """Lock, re-read from disk, run ``mutate(entries, limit)`` -> ``(new_entries, message)``
         or an error dict, then persist and return the success response. The reload aborts
         on an existing-but-unreadable file (even append-only ``add`` rewrites the whole
@@ -362,9 +349,6 @@ class MemoryStore:
         success payload of a read-only closure (``resolve_entry``, ``resolve_batch_entries``)."""
         path = self._path_for(target)
         with self._file_lock(path):
-            guard_error = self._pending_guard_error(target, expected_sha256)
-            if guard_error is not None:
-                return guard_error
             raw, read_ok = self._read_raw_checked(path)
             if not read_ok:
                 return _read_failed_error(path)
@@ -387,8 +371,7 @@ class MemoryStore:
             extra_fields = result[2] if len(result) > 2 else {}
             return self._success_response(target, result[1], **extra_fields)
 
-    def add(self, target: str, content: str, *, expected_sha256: Optional[str] = None,
-            before_write=None) -> dict[str, Any]:
+    def add(self, target: str, content: str, *, before_write=None) -> dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
         if not content:
@@ -409,12 +392,10 @@ class MemoryStore:
             return entries + [content], "Entry added."
         # Append-only: skip the drift guard (appending never clobbers foreign
         # content) but still refuse a failed read — add rewrites the WHOLE file.
-        return self._mutate(target, _add, skip_drift=True, expected_sha256=expected_sha256,
-                            before_write=before_write)
+        return self._mutate(target, _add, skip_drift=True, before_write=before_write)
 
     def replace(self, target: str, old_text: str, new_content: str,
-                matched_entry: Optional[str] = None, *, expected_sha256: Optional[str] = None,
-                before_write=None) -> dict[str, Any]:
+                matched_entry: Optional[str] = None, *, before_write=None) -> dict[str, Any]:
         """Find the entry containing old_text (whole-entry exact match first) and
         replace the WHOLE entry with new_content — old_text only locates the entry;
         the matched span is not spliced into it."""
@@ -426,11 +407,10 @@ class MemoryStore:
         if scan_error := _scan_memory_content(new_content):
             return _error(scan_error, "scan_blocked")
         return self._edit(target, old_text.strip(), new_content, matched_entry,
-                          expected_sha256=expected_sha256, before_write=before_write)
+                          before_write=before_write)
 
     def patch(self, target: str, old_text: str, new_text: str,
-              matched_entry: Optional[str] = None, *, expected_sha256: Optional[str] = None,
-              before_write=None) -> dict[str, Any]:
+              matched_entry: Optional[str] = None, *, before_write=None) -> dict[str, Any]:
         """Find the entry containing *old_text* and replace that one span with *new_text*;
         the rest of the entry is preserved verbatim. This is the partial-edit shape
         ``replace`` deliberately is not (replace overwrites the WHOLE entry). A span that
@@ -441,11 +421,10 @@ class MemoryStore:
             return _error(f"new_text cannot be empty. {PATCH_DROP_HINT}", "missing_content")
         # The span keeps its whitespace: it is part of the text being replaced ("tea " -> "coffee ").
         return self._patch(target, old_text, str(new_text), matched_entry,
-                           expected_sha256=expected_sha256, before_write=before_write)
+                           before_write=before_write)
 
     def _patch(self, target: str, old_text: str, new_text: str,
-               matched_entry: Optional[str] = None, *, expected_sha256: Optional[str] = None,
-               before_write=None) -> dict[str, Any]:
+               matched_entry: Optional[str] = None, *, before_write=None) -> dict[str, Any]:
         """Locked find-and-splice inside the matched entry (#124582)."""
         def _apply(entries, limit):
             idx = self._locate(entries, old_text, "patch", matched_entry)
@@ -464,15 +443,15 @@ class MemoryStore:
                     f"(see current_entries below), then retry — all in this turn."))
             return patched, "Entry patched.", {
                 "patched_entry_before": before, "patched_entry_after": after}
-        return self._mutate(target, _apply, expected_sha256=expected_sha256, before_write=before_write)
+        return self._mutate(target, _apply, before_write=before_write)
 
     def remove(self, target: str, old_text: str, matched_entry: Optional[str] = None,
-               *, expected_sha256: Optional[str] = None, before_write=None) -> dict[str, Any]:
+               *, before_write=None) -> dict[str, Any]:
         """Remove the entry containing old_text substring."""
         if not old_text.strip():
             return _error("old_text cannot be empty.", "missing_old_text")
         return self._edit(target, old_text.strip(), None, matched_entry,
-                          expected_sha256=expected_sha256, before_write=before_write)
+                          before_write=before_write)
 
     def _locate(self, entries: list[str], old_text: str, verb: str, matched_entry: Optional[str] = None):
         """Index of the entry *old_text* selects, or the error dict the edit returns. A write
@@ -500,8 +479,7 @@ class MemoryStore:
         return self._mutate(target, _resolve, skip_drift=True)
 
     def _edit(self, target: str, old_text: str, new_content: Optional[str],
-              matched_entry: Optional[str] = None, *, expected_sha256: Optional[str] = None,
-              before_write=None) -> dict[str, Any]:
+              matched_entry: Optional[str] = None, *, before_write=None) -> dict[str, Any]:
         """Locked replace (``new_content`` set) or remove (None) of the entry matching *old_text*."""
         def _apply(entries, limit):
             idx = self._locate(entries, old_text, "replace" if new_content else "remove", matched_entry)
@@ -517,8 +495,7 @@ class MemoryStore:
                     f"'operations' batch with this replace plus removes/shortenings of other stale entries "
                     f"(see current_entries below) — the limit is checked only on the batch result."))
             return replaced, "Entry replaced.", {"replaced_entry": entries[idx]}
-        return self._mutate(target, _apply, expected_sha256=expected_sha256,
-                            before_write=before_write)
+        return self._mutate(target, _apply, before_write=before_write)
 
     @staticmethod
     def _apply_batch_op(working: list[str], act: str, content: str, old_text: str, pos: str,
@@ -569,13 +546,12 @@ class MemoryStore:
         return None, previous_content, "none", patched
 
     def apply_batch(self, target: str, operations: list[dict[str, Any]],
-                    *, expected_sha256: Optional[str] = None, before_write=None) -> dict[str, Any]:
+                    *, before_write=None) -> dict[str, Any]:
         """Apply add/replace/remove ops atomically against the FINAL budget, so one call
         can free space and add entries. All-or-nothing: any malformed / unmatched op or
         an over-limit result writes NOTHING and returns the first failure. Aborts do not
         echo ``current_entries`` — the store is unchanged and the model already has it."""
-        return self._batch(target, operations, commit=True, expected_sha256=expected_sha256,
-                           before_write=before_write)
+        return self._batch(target, operations, commit=True, before_write=before_write)
 
     def resolve_batch_entries(self, target: str, operations: list[dict[str, Any]]) -> dict[str, Any]:
         """Dry-run ``apply_batch`` under the lock without persisting: the same content scan,
@@ -585,7 +561,7 @@ class MemoryStore:
         return self._batch(target, operations, commit=False)
 
     def _batch(self, target: str, operations: list[dict[str, Any]], *, commit: bool,
-               expected_sha256: Optional[str] = None, before_write=None) -> dict[str, Any]:
+               before_write=None) -> dict[str, Any]:
         from tools.memory_tool import _memory_target_error
         if target_error := _memory_target_error(self, target, operations):
             return target_error
@@ -648,8 +624,7 @@ class MemoryStore:
             if removed:
                 replaced_fields["removed_entries"] = removed
             return working, f"Applied {len(operations)} operation(s).", replaced_fields
-        return self._mutate(target, _apply, skip_drift=not commit, expected_sha256=expected_sha256,
-                            before_write=before_write)
+        return self._mutate(target, _apply, skip_drift=not commit, before_write=before_write)
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch

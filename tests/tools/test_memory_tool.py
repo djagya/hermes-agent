@@ -215,7 +215,6 @@ class TestMemoryStoreReplace:
         write-approval replay) must agree on the final entry for the same op (#117952).
         Each surface gets its OWN store dir — the surfaces share nothing but the op."""
         from tools.memory_tool import apply_memory_pending
-        from tools.memory_tool import _build_memory_write_guard
         from tools import write_approval as wa
         entry = "alpha fact. beta fact. gamma fact."
         op = {"action": "replace", "old_text": "beta fact.", "content": "beta fact, updated."}
@@ -223,8 +222,7 @@ class TestMemoryStoreReplace:
 
         def replay(store):
             payload = {"action": "batch", "target": "memory",
-                       "operations": [{**op, "matched_entry": entry}],
-                       "_write_guard": _build_memory_write_guard(store, "memory")}
+                       "operations": [{**op, "matched_entry": entry}]}
             pending = wa.stage_write(wa.MEMORY, payload, summary="replace", origin="foreground")
             def apply(record):
                 outcome = apply_memory_pending(record["payload"], store)

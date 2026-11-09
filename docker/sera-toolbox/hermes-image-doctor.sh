@@ -175,7 +175,7 @@ fi
 
 python3 - <<'PY' || bad "required python imports failed"
 import importlib
-for name in ("fitz", "weasyprint", "docx", "yt_dlp", "ddgs", "fal_client", "faster_whisper"):
+for name in ("bs4", "fitz", "weasyprint", "docx", "yt_dlp", "ddgs", "fal_client", "faster_whisper"):
     importlib.import_module(name)
     print("OK   py", name)
 PY

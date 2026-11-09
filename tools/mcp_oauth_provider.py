@@ -38,6 +38,10 @@ _REFRESH_TRANSIENT_ERRORS = frozenset({"server_error", "temporarily_unavailable"
 _REFRESH_SAFE_OAUTH_ERRORS = _REFRESH_TERMINAL_ERRORS | _REFRESH_TRANSIENT_ERRORS
 _REFRESH_MAX_ATTEMPTS = 3
 _REFRESH_RETRY_DEADLINE_SECONDS = 15.0
+# Treat an access token as expired this long before its recorded expiry (capped at a tenth of its
+# issued lifetime). The SDK keeps sending it until ``time.time() <= expiry``, with no margin, and
+# answers the resulting 401 with a full authorization-code login instead of a refresh.
+_TOKEN_EXPIRY_SKEW_SECONDS = 60
 _REFRESH_BACKOFF_SECONDS = (1.0, 2.0)
 
 
@@ -154,10 +158,72 @@ class HermesProviderMixin:
 
     def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser", **kwargs: Any):
         super().__init__(*args, **kwargs)
+        self._hermes_install_expiry_skew()
         self._hermes_oauth_flow = oauth_flow
         # oauth.user_agent — stamped onto token-endpoint requests only; some authorization servers/WAFs
         # reject httpx's default (#75576).
         self._hermes_token_user_agent = token_user_agent
+
+    def _hermes_install_expiry_skew(self) -> None:
+        """Make the SDK refresh shortly BEFORE the access token expires, not at the exact second.
+
+        ``OAuthContext.is_token_valid`` accepts a token until ``time.time() <= expiry``. A request sent
+        in the last moments reaches the server after its expiry (the local stamp is also later than the
+        server's by the refresh round trip) and gets 401, and the SDK's 401 branch skips the refresh token
+        and starts a browser login, which non-interactive callers cannot complete. Every expiry write goes
+        through ``context.update_token_expiry`` (SDK token/refresh handlers, ``_store_tokens``, disk
+        adoption, cold load), so the margin is applied there once. It is capped at a tenth of the token's
+        issued lifetime so short-lived tokens stay usable, and skipped for a token without a refresh token.
+        For a pair reloaded from disk ``expires_in`` is only the remaining time, so the cap uses the
+        lifetime the storage recorded at issue."""
+        ctx = self.context
+        sdk_update = ctx.update_token_expiry
+
+        def _update_with_skew(token) -> None:
+            sdk_update(token)
+            # The server's own expiry, kept so a failed early refresh can fall back to it.
+            self._hermes_hard_expiry = (token, ctx.token_expiry_time)
+            remaining = getattr(token, "expires_in", None)
+            # No refresh token: nothing to refresh early with, so keep sending it until it expires.
+            if ctx.token_expiry_time is None or not remaining or not getattr(token, "refresh_token", None):
+                return
+            issued = getattr(ctx.storage, "issued_lifetime", None)
+            lifetime = max(int(remaining), issued if isinstance(issued, int) else 0)
+            ctx.token_expiry_time -= min(_TOKEN_EXPIRY_SKEW_SECONDS, lifetime // 10)
+
+        ctx.update_token_expiry = _update_with_skew
+
+    # (token, unskewed expiry) of the last expiry write, and the snapshot taken when a refresh
+    # starts inside the margin; see _hermes_restore_after_early_refresh_failure.
+    _hermes_hard_expiry: tuple[Any, float | None] | None = None
+    _hermes_early_refresh: tuple[Any, float] | None = None
+
+    def _hermes_snapshot_early_refresh(self) -> None:
+        """Remember the access token when a refresh starts before its real expiry (inside the margin)."""
+        self._hermes_early_refresh = None
+        tokens, hard = self._hermes_hard_expiry or (None, None)
+        if tokens is not None and tokens is self.context.current_tokens and hard is not None and time.time() < hard:
+            self._hermes_early_refresh = (tokens, hard)
+
+    def _hermes_restore_after_early_refresh_failure(self, exc: BaseException) -> bool:
+        """After an early refresh fails, keep sending the still-live access token until it expires.
+
+        Without this the margin would cost the token's last seconds: the SDK adds the Bearer header only
+        when ``is_token_valid()``, so the request would go out bare, get 401 and start a browser login.
+        The real expiry is restored (no margin), so the next refresh comes at expiry, as without the
+        margin. A grant the server rejected is not kept: only its access token is."""
+        early, self._hermes_early_refresh = self._hermes_early_refresh, None
+        if early is None or time.time() >= early[1]:
+            return False
+        tokens, hard = early
+        if isinstance(exc, MCPRefreshError) and exc.kind == "oauth_rejected":
+            tokens = tokens.model_copy(update={"refresh_token": None})
+        self.context.current_tokens = tokens
+        self.context.token_expiry_time = hard
+        self._hermes_logger.warning(
+            "MCP OAuth: early token refresh failed (%s); using the current access token until it expires",
+            getattr(exc, "kind", type(exc).__name__))
+        return True
 
     async def _perform_authorization(self):
         info = self.context.client_info
@@ -304,7 +370,10 @@ class HermesProviderMixin:
         the original request with the winner's access token, never POSTing
         the burned refresh token.
         """
+        from tools.mcp_oauth import RefreshFenceTimeout
         while True:
+            # No reset of ``_hermes_early_refresh`` here: a flow starting now (outside context.lock) would
+            # wipe the snapshot of the flow that is refreshing. ``_refresh_token`` resets it under the lock.
             inner = super().async_auth_flow(request)
             discovery_failures: list[str] = []
             try:
@@ -365,8 +434,17 @@ class HermesProviderMixin:
                             discovery_failures.append(failure)
                         elif getattr(sent, "status_code", None) == 200:
                             sent = await self._hermes_accept_origin_issued_metadata(sent)
+            except (MCPRefreshError, RefreshFenceTimeout) as exc:
+                if not self._hermes_restore_after_early_refresh_failure(exc):
+                    raise
             finally:
-                await self._hermes_release_refresh_fence()
+                # A failure raised here (not by the SDK) leaves the SDK generator suspended inside
+                # ``async with context.lock``; close it now so the lock is free for the next flow, not at
+                # GC. A no-op once the generator has finished.
+                try:
+                    await inner.aclose()
+                finally:
+                    await self._hermes_release_refresh_fence()
 
     @staticmethod
     def _hermes_refresh_was_not_sent(request, exc: BaseException) -> bool:
@@ -402,6 +480,7 @@ class HermesProviderMixin:
         refreshes inside one process.
         """
         self._coerce_client_secret_post()
+        self._hermes_snapshot_early_refresh()
         await self._hermes_acquire_refresh_fence()
         try:
             # Re-read under the fence: a peer may have rotated while we waited
@@ -548,6 +627,8 @@ class HermesProviderMixin:
             ok = await self._hermes_handle_refresh_response(response)
         finally:
             await self._hermes_release_refresh_fence()
+        if ok:
+            self._hermes_early_refresh = None
         # Only a 4xx refusal says the grant is dead. A 5xx, a throttle (408/425/429) or an
         # unreadable 2xx says nothing about it: the refresh token on disk may still be good.
         status = response.status_code

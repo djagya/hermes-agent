@@ -10,6 +10,8 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 
 def _point_ledger(monkeypatch, tmp_path):
     from cron import executions
@@ -564,3 +566,40 @@ def test_history_orders_by_instant_across_dst_fall_back(monkeypatch, tmp_path):
     ]
     page = executions.list_executions(job_id="dst-job", before_claimed_at=later["claimed_at"])
     assert [r["id"] for r in page] == [earlier["id"]]
+
+
+def test_retention_window_follows_config_but_never_drops_below_two_days(monkeypatch, tmp_path):
+    """``cron.executions_retention_hours`` lengthens the audit window; a smaller value is ignored."""
+    import hermes_cli.config as hermes_config
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    clock = {"now": datetime(2026, 10, 10, tzinfo=UTC)}
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock["now"])
+    cfg = {"cron": {"executions_retention_hours": 14 * 24}}
+    monkeypatch.setattr(hermes_config, "load_config_readonly", lambda: cfg)
+
+    old = executions.create_execution("old", source="builtin")
+    executions.finish_execution(old["id"], success=False, error="kept for the audit")
+    clock["now"] += timedelta(days=3)
+    executions.finish_execution(executions.create_execution("new", source="builtin")["id"], success=True)
+    assert executions.get_execution(old["id"]) is not None
+
+    cfg["cron"]["executions_retention_hours"] = 24  # below the floor: the 48 h default holds
+    clock["now"] += timedelta(hours=1)
+    recent = executions.create_execution("recent", source="builtin")
+    executions.finish_execution(recent["id"], success=True)
+    assert executions.get_execution(old["id"]) is None
+    assert executions.get_execution(recent["id"]) is not None
+
+
+@pytest.mark.parametrize("value", [1e8, float("inf"), float("nan"), "inf"])
+def test_absurd_retention_config_is_clamped_and_ledger_writes_still_work(monkeypatch, tmp_path, value):
+    """A config typo must not overflow timedelta inside every ledger write."""
+    import hermes_cli.config as hermes_config
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(hermes_config, "load_config_readonly",
+                        lambda: {"cron": {"executions_retention_hours": value}})
+    assert executions._terminal_retention_hours() <= executions.MAX_TERMINAL_RETENTION_HOURS
+    run = executions.create_execution("job", source="builtin")
+    assert executions.finish_execution(run["id"], success=True)["status"] == "completed"

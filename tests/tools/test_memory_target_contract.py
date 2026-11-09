@@ -9,7 +9,7 @@ import pytest
 
 from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS
 from hermes_cli.config import load_config, save_config
-from tools.memory_tool import MemoryStore, _build_memory_write_guard, apply_memory_pending
+from tools.memory_tool import MemoryStore, apply_memory_pending
 from tools.registry import registry
 from tools.skill_provenance import reset_current_write_origin, set_current_write_origin
 from tools import write_approval as wa
@@ -20,9 +20,7 @@ def _call(route, store, args):
         return store.apply_batch(args.get("target"), args["operations"])
     if route == "replay":
         payload = {"action": "batch", **args}
-        # dlz: replay needs the staged base-state guard and the one-shot approval capability.
-        if args.get("target") in ("memory", "user"):
-            payload["_write_guard"] = _build_memory_write_guard(store, args["target"])
+        # dlz: replay needs the one-shot approval capability.
         with patch.object(wa, "consume_pending_apply_capability", return_value=True):
             return apply_memory_pending(payload, store)
     if route == "inline":
@@ -116,8 +114,7 @@ def test_replay_without_a_live_approval_capability_is_refused_not_raised():
     store.load_from_disk()
     assert store.add("user", "Existing user fact")["success"]
     before = store._path_for("user").read_bytes()
-    payload = {"action": "batch", "target": "user", "operations": [{"action": "add", "content": "Fact"}],
-               "_write_guard": _build_memory_write_guard(store, "user")}
+    payload = {"action": "batch", "target": "user", "operations": [{"action": "add", "content": "Fact"}]}
     result = apply_memory_pending(payload, store)
     assert result["success"] is False and "capability is not live" in result["error"]
     assert store._path_for("user").read_bytes() == before

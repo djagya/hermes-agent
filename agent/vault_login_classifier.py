@@ -14,6 +14,7 @@ Scoring:
 - label/name regex heuristics .................. 70-75
 Hard exclusions: autocomplete ``new-password`` / ``one-time-code``, and
 label/name text matching ``(new|confirm|create|repeat)\\s*password``.
+Explicit signup selection is separate and never weakens these login exclusions.
 """
 
 from __future__ import annotations
@@ -35,18 +36,19 @@ ADDRESS_AUTOFILL_TOKENS = ("address-line1", "address-line2", "address-level2", "
                            "postal-code", "country-name", "country")
 # Labels are matched after _normalize_text (lower-case ASCII, umlauts/accents folded: "Prüfnummer" ->
 # "prufnummer"). Besides English: German, French, Dutch, Spanish and Italian checkout labels; the CVC row
-# comes before the number row because "Kartenprüfnummer" also names a number.
+# comes before the number row because "Kartenprüfnummer" also names a number. ``cardpan``, ``cardcvc2``,
+# ``cardexpiremonth`` and ``cardexpireyear`` are the PAYONE Client API hosted-iFrame field names.
 _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:cvc|cvv|csc|cvn|ccv|security\s*code|card\s*code|(?:karten)?prufnummer|prufziffer|"
                 r"sicherheitscode|cryptogramme|code\s*de\s*securite|beveiligingscode|codigo\s*de\s*seguridad|"
-                r"codice\s*di\s*sicurezza)\b"), "cc-csc"),
+                r"codice\s*di\s*sicurezza|cardcvc2?)\b"), "cc-csc"),
     (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num|pan|kartennummer|numero\s*de\s*(?:la\s*)?carte|"
-                r"kaartnummer|numero\s*de\s*(?:la\s*)?tarjeta|numero\s*(?:della\s*)?carta)\b"), "cc-number"),
+                r"kaartnummer|numero\s*de\s*(?:la\s*)?tarjeta|numero\s*(?:della\s*)?carta|cardpan)\b"), "cc-number"),
     (re.compile(r"\b(?:name\s*on\s*card|cardholder|cc\s*name|ccname|karteninhaber(?:in|s)?|name\s*auf\s*der\s*karte|"
                 r"titulaire(?:\s*de\s*la\s*carte)?|kaarthouder|titular(?:\s*de\s*la\s*tarjeta)?|"
                 r"intestatario(?:\s*della\s*carta)?)\b"), "cc-name"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?\s*month|exp\s*mm|ccmonth|ablaufmonat)\b"), "cc-exp-month"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?\s*year|exp\s*yy(?:yy)?|ccyear|ablaufjahr)\b"), "cc-exp-year"),
+    (re.compile(r"\b(?:exp(?:iry|iration)?\s*month|exp\s*mm|ccmonth|ablaufmonat|cardexpiremonth)\b"), "cc-exp-month"),
+    (re.compile(r"\b(?:exp(?:iry|iration)?\s*year|exp\s*yy(?:yy)?|ccyear|ablaufjahr|cardexpireyear)\b"), "cc-exp-year"),
     (re.compile(r"\b(?:exp(?:iry|iration)?(?:\s*date)?|mm\s*yy|valid\s*thru|ablaufdatum|gultig\s*bis|"
                 r"verfallsdatum|date\s*d\s*expiration|vervaldatum|fecha\s*de\s*(?:caducidad|vencimiento)|"
                 r"data\s*di\s*scadenza|scadenza)\b"), "cc-exp"),
@@ -91,6 +93,11 @@ class LoginControl:
     name: str
     type: str
     max_length: Optional[int] = None
+    # ``<select>`` only: ``(value, visible text, disabled)`` per option, in DOM order. Months and years
+    # are not secrets; the native card fill matches the expiry against them (match_expiry_option).
+    options: tuple = ()
+    page_url: str = ""
+    form_action: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
@@ -104,7 +111,17 @@ class LoginControl:
             name=str(raw.get("name") or ""),
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
+            options=_options(raw.get("options")),
+            page_url=str(raw.get("pageUrl") or ""),
+            form_action=str(raw.get("formAction") or ""),
         )
+
+
+def _options(raw: Any) -> tuple:
+    if not isinstance(raw, list):
+        return ()
+    return tuple((str(o[0]), str(o[1]), o[2] is True) for o in raw[:400]
+                 if isinstance(o, (list, tuple)) and len(o) == 3)
 
 
 @dataclass(frozen=True)
@@ -170,6 +187,46 @@ def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginC
     return out
 
 
+def select_signup_control(controls: list[LoginControl]) -> Optional[ClassifiedLoginControl]:
+    """Conservative, separate signup intent: one explicit new password, no confirmation.
+
+    Require a registration route and a real form; refuse recovery/change routes,
+    OTP, mixed login forms and unrelated credential forms anywhere on the page.
+    This never relaxes the ordinary login classifier's exclusions.
+    """
+    from urllib.parse import unquote, urlsplit
+
+    passwords = [c for c in controls if c.type == "password" or
+                 {"current-password", "new-password"}.intersection(c.autocomplete.lower().split())]
+    if len(passwords) != 1 or classify_otp_controls(controls):
+        return None
+    target = passwords[0]
+    if (target.type != "password" or target.form_index is None or
+            target.autocomplete.lower().split() != ["new-password"]):
+        return None
+    text = _normalize_text(target.name + " " + target.label)
+    if re.search(r"\b(?:confirm\w*|repeat\w*|retype\w*|re ?enter\w*|again|reset|recover\w*|change|current|old)\b", text):
+        return None
+    page, action = urlsplit(target.page_url), urlsplit(target.form_action)
+    if (page.scheme != "https" or not page.netloc or
+            (page.scheme, page.netloc) != (action.scheme, action.netloc)):
+        return None
+    routes = " ".join(unquote(urlsplit(u).path + "?" + urlsplit(u).query + "#" + urlsplit(u).fragment)
+                      for u in (target.page_url, target.form_action))
+    route_words = _normalize_text(routes)
+    if (re.search(r"reset|recover|forgot|changepassword|passwordchange", route_words.replace(" ", "")) or
+            re.search(r"\b(?:change|update|security|settings|login|log in|signin|sign in)\b", route_words)):
+        return None
+    page_path = _normalize_text(unquote(page.path))
+    if not re.search(r"\b(?:register|registration|signup|sign up|create account)\b", page_path):
+        return None
+    # Other visible login/identifier controls must belong to the target's form.
+    for control in controls:
+        if classify_login_control(control) is not None and control.form_index != target.form_index:
+            return None
+    return ClassifiedLoginControl(target, 100, "new-password")
+
+
 def select_password_fill(
     classified: list[ClassifiedLoginControl],
     password: str,
@@ -195,9 +252,22 @@ def select_password_fill(
     ]
 
 
+_SELECT_CARD_TOKENS = frozenset({"cc-exp-month", "cc-exp-year"})
+
+
 def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
     """Classify one control as a payment/address fill target (autocomplete token exact match 100,
-    label/name heuristic 70), or None. Password/email inputs are never checkout targets."""
+    label/name heuristic 70), or None. Password/email inputs are never checkout targets. A ``<select>``
+    is only ever an expiry month or year among the card tokens (PAYONE, Worldline HTP, Computop), never
+    the number, CVC, holder or a combined expiry."""
+    result = _classify_checkout_control(control)
+    if (result is not None and control.type == "select" and result.token.startswith("cc-")
+            and result.token not in _SELECT_CARD_TOKENS):
+        return None
+    return result
+
+
+def _classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
     tokens = [t for t in control.autocomplete.lower().split() if t]
     for token in PAYMENT_AUTOFILL_TOKENS + ADDRESS_AUTOFILL_TOKENS:
         if token in tokens:
@@ -232,6 +302,25 @@ def _fit_expiry(token: str, value: str, max_length: Optional[int]) -> str:
     if token == "cc-exp-year" and value.isdigit() and max_length == 2:
         return value[-2:]
     return value
+
+
+def match_expiry_option(token: str, value: str, options: tuple) -> Optional[str]:
+    """The value of the ONE enabled option of an expiry ``<select>`` whose value or visible text is the
+    month ("07" or "7") or the year (four-digit "2035" or two-digit "35"), or None when no option or
+    several options match: the caller then refuses the fill. Only numbers match, never a month name, so
+    a zero-based month list ("6" shown as "07") reads as ambiguous instead of picking June."""
+    if not value.isdigit():
+        return None
+    if token == "cc-exp-month":
+        wanted = {str(int(value)), str(int(value)).zfill(2)}
+    elif token == "cc-exp-year" and len(value) == 4:
+        wanted = {value, value[-2:]}
+    else:
+        return None
+    matches = [o for o in options if not o[2] and o[0] and (o[0].strip() in wanted or o[1].strip() in wanted)]
+    if len(matches) != 1 or sum(o[0] == matches[0][0] for o in options) != 1:
+        return None
+    return matches[0][0]
 
 
 def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict[str, str],
@@ -304,6 +393,8 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     return [{
       autocomplete: element.autocomplete || "",
       formIndex: resolvedFormIndex >= 0 ? resolvedFormIndex : null,
+      pageUrl: document.URL,
+      formAction: element.form ? element.form.action : "",
       index,
       maxLength: element.maxLength > 0 ? element.maxLength : null,
       label: [
@@ -319,6 +410,36 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   });
   return JSON.stringify(out);
 })()"""
+
+
+def build_signup_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str,
+                         control: LoginControl) -> str:
+    """Revalidate approved field intent synchronously before the native secret write.
+
+    Exact URL/action binding also rejects same-origin navigation during approval.
+    Only the existing secret transport may evaluate this expression.
+    """
+    guard = """(() => {
+      const bound = __BOUND__;
+      const visible = e => !e.disabled && !e.readOnly && e.getClientRects().length > 0 &&
+        getComputedStyle(e).display !== 'none' && getComputedStyle(e).visibility !== 'hidden';
+      const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
+      const targets = document.querySelectorAll('[data-hermes-vault-slot="' + bound.stamp + '"]');
+      const el = targets.length === 1 ? targets[0] : null;
+      if (window.location.href !== bound.url || !el || !visible(el) || !el.form ||
+          el.form.action !== bound.action || el.type !== 'password' ||
+          Array.from(el.form.elements || []).some(e => e.hasAttribute && e.hasAttribute('formaction')) ||
+          el.autocomplete.trim().toLowerCase() !== 'new-password' ||
+          inputs.filter(e => e.type === 'password' || /(?:current|new)-password/.test(e.autocomplete)).length !== 1 ||
+          inputs.some(e => /one-time-code/.test(e.autocomplete)))
+        return JSON.stringify({refused: 'signup_target_changed', filled: 0});
+      return __FILL__;
+    })()"""
+    bound = json.dumps({"stamp": f"{nonce}:{control.index}", "url": control.page_url,
+                        "action": control.form_action})
+    # Splice once: never rescan secret bytes as template placeholders.
+    values = {"__BOUND__": bound, "__FILL__": build_fill_js(fills, expected_origin, nonce)}
+    return re.sub(r"__BOUND__|__FILL__", lambda m: values[m.group(0)], guard)
 
 
 def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "") -> str:

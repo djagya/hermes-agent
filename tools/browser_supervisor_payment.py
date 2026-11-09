@@ -8,6 +8,7 @@ eval or a model tool argument.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -17,12 +18,24 @@ from agent.vault_login_classifier import LoginControl, classify_checkout_control
 from agent.vault_payment_policy import (
     PAYMENT_PSP_ORIGINS,
     PaymentPolicyError,
+    coverage_hint,
     https_origin,
     provider_for_origin,
 )
 
 
 _MAX_CARD_DOCUMENTS = 4
+# Refusals that mean "no complete reviewed card document": these get coverage_hint's reason.
+_COVERAGE_REFUSALS = frozenset({
+    "Missing, ambiguous or split payment documents",
+    "Incomplete or ambiguous card fields",
+    "Missing card expiry fields",
+})
+# Bounded wait between the last document's write and the all-documents retention check: long enough
+# for a provider's deferred re-render, validation or brand detection to land, short enough to stay
+# well inside commit_payment's 20 s budget. Never a retry window.
+_SETTLE_SECONDS = 1.0
+_RETENTION_STATES = frozenset({"held", "empty", "changed", "replaced"})
 # Card fields a saved card may lack: left empty for the user instead of refusing the whole fill.
 OPTIONAL_CARD_TOKENS = frozenset({"cc-name", "postal-code"})
 
@@ -109,6 +122,18 @@ def _card_documents(candidates: list, merchant: str) -> tuple:
     return tuple(PaymentDocument(*c) for c in candidates)
 
 
+def _explained_card_documents(candidates: list, merchant: str, tree: tuple, allowed: tuple) -> tuple:
+    """``_card_documents``, with a coverage refusal naming the provider-level cause it can see in the
+    frame tree (an unsupported PSP, a reviewed one not enabled, a non-card-field page)."""
+    try:
+        return _card_documents(candidates, merchant)
+    except PaymentPolicyError as exc:
+        hint = coverage_hint(tree, merchant, allowed) if str(exc) in _COVERAGE_REFUSALS else ""
+        if hint:
+            raise PaymentPolicyError(f"{exc} ({hint})") from None
+        raise
+
+
 def _frame_admitted(record: tuple, by_id: dict, merchant: str, allowed: tuple) -> bool:
     """Whether a frame ``(id, loader, url, origin, parent)`` may hold card fields: the merchant or a
     reviewed provider origin, on that provider's card-field path, under an ancestry of the same. False
@@ -118,6 +143,10 @@ def _frame_admitted(record: tuple, by_id: dict, merchant: str, allowed: tuple) -
         provider = provider_for_origin(r[3]) if r[3] != merchant else None
         return provider is None or provider.admits(r[2])
 
+    def may_contain(r: tuple) -> bool:
+        provider = provider_for_origin(r[3]) if r[3] != merchant else None
+        return provider is None or provider.admits_ancestor(r[2])
+
     # Ignore unrelated ads, but never inspect/inject into an arbitrary PSP.
     if record[3] not in (merchant, *allowed) or not on_card_path(record):
         return False
@@ -125,7 +154,7 @@ def _frame_admitted(record: tuple, by_id: dict, merchant: str, allowed: tuple) -
     ancestor = record[4]
     while ancestor:
         above = by_id.get(ancestor)
-        if above is None or above[3] not in (merchant, *allowed) or not on_card_path(above):
+        if above is None or above[3] not in (merchant, *allowed) or not may_contain(above):
             raise PaymentPolicyError("Unapproved payment frame ancestry")  # e.g. inside a wallet page
         ancestor = above[4]
     return True
@@ -270,7 +299,13 @@ class PaymentSupervisionMixin:
                 ]["frameTree"]
                 # Replace the parent's placeholder with the child's authoritative loader/origin.
                 frames[:] = [f for f in frames if f[0] != fid]
+                known = {f[0] for f in frames}
                 walk(child, parent)
+                # Same-origin frames inside this OOPIF (PayPal's guest card form inside /smart/buttons)
+                # are in its process: they are reached through its session, never the page's.
+                for f in frames:
+                    if f[0] not in known:
+                        child_sessions.setdefault(f[0], fsid)
                 pending.remove(target)
                 progress = True
             if not progress:
@@ -385,7 +420,7 @@ class PaymentSupervisionMixin:
                     await self._cdp(
                         "Runtime.releaseObject", {"objectId": obj}, session_id=fsid
                     )
-            documents = _card_documents(candidates, merchant)
+            documents = _explained_card_documents(candidates, merchant, tree, allowed_frames)
             if await self._payment_tree(sid, child_sessions) != tree:
                 raise PaymentPolicyError("Payment page changed during inspection")
             return PaymentInspection(
@@ -431,7 +466,8 @@ class PaymentSupervisionMixin:
                 await self._release_payment_object(parent_sid, obj)
 
     async def _release_payment_sessions(self, sessions: dict) -> None:
-        for sid in sessions.values():
+        # In-process child frames share their OOPIF's session: detach each session once.
+        for sid in dict.fromkeys(sessions.values()):
             try:
                 await self._cdp("Target.detachFromTarget", {"sessionId": sid})
             except Exception:
@@ -500,12 +536,18 @@ class PaymentSupervisionMixin:
             # Every document was re-validated just above. A split checkout is written one
             # document at a time: no cross-document transaction exists, so a later failure
             # reports what an earlier document already received instead of retrying.
+            written = []
             for document, document_fills in _commit_order(i, _fills_by_document(i, fills)):
                 result = await self._commit_payment_document(document, document_fills)
                 if not result.get("success"):
                     return _partial(result, filled)
                 filled += result.get("filled_fields", 0)
-            return {"success": True, "filled_fields": filled}
+                written.append((document, document_fills))
+            # A document's own check runs right after its writes. Providers reset controlled inputs
+            # later, and a later document (brand detection on the number, a blur) can clear an
+            # earlier one, so success is only reported once EVERY document still holds its values.
+            await asyncio.sleep(_SETTLE_SECONDS)
+            return _retention_result([(f, await self._payment_retention(d)) for d, f in written])
         except PaymentPolicyError:
             return _partial({"success": False, "error_type": "payment_fields_invalid"}, filled)
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
@@ -535,6 +577,22 @@ class PaymentSupervisionMixin:
             return {"success": False, "error_type": "payment_result_invalid"}
         return result
 
+    async def _payment_retention(self, d: PaymentDocument) -> list | None:
+        """Per written field ``{token, state, length}`` from the document's commit closure, or None when
+        the document cannot answer (navigated, replaced, transport failure): its fields are then
+        unknown and reported as replaced. Never retried, never a value."""
+        try:
+            states = _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": d.object_id,
+                "functionDeclaration": "function(){return this.retained()}",
+                "returnByValue": True,
+            }, session_id=d.frame_session))
+        except Exception:  # health: allow BLE001 -- a gone document is a failed retention check, never a value
+            return None
+        if not isinstance(states, list):
+            return None
+        return states
+
     async def _release_payment_documents(self, i: PaymentInspection) -> None:
         for d in i.documents:
             await self._release_payment_object(d.frame_session, d.object_id)
@@ -555,6 +613,37 @@ def _commit_order(i: PaymentInspection, groups: list) -> list:
     return sorted(pairs, key=lambda p: any(c.token == "cc-number" for c in p[0].controls))
 
 
+def _retention_result(documents: list) -> dict:
+    """Success only when every written field of every document still holds its value after settling.
+    ``documents`` pairs each document's fills with its ``retained()`` answer (None: unreadable). The
+    result names tokens, states and lengths only."""
+    states: dict = {}
+    lengths: dict = {}
+    held = total = 0
+    for fills, answer in documents:
+        answer = answer if isinstance(answer, list) and len(answer) == len(fills) else [None] * len(fills)
+        for f, entry in zip(fills, answer):  # the closure answers in fill order
+            token = str(f.get("token") or "")
+            entry = entry if isinstance(entry, dict) and entry.get("token") == token else {}
+            state = entry.get("state") if entry.get("state") in _RETENTION_STATES else "replaced"
+            total += 1
+            held += state == "held"
+            states[token] = state
+            if state != "held":
+                length = entry.get("length")
+                lengths[token] = length if type(length) is int and 0 <= length <= 256 else 0
+    if total and held == total:
+        return {"success": True, "filled_fields": held, "retention_verified": True}
+    return {
+        "success": False,
+        "error_type": "payment_fields_not_retained",
+        "filled_fields": held,
+        "partially_filled": True,
+        "field_retention": dict(sorted(states.items())),
+        "field_lengths": dict(sorted(lengths.items())),
+    }
+
+
 def _partial(result: dict, filled_before: int) -> dict:
     """A failed document after earlier documents of a split checkout already received values."""
     if not filled_before:
@@ -563,13 +652,14 @@ def _partial(result: dict, filled_before: int) -> dict:
 
 _INSPECT = r"""(() => {
   const doc = document, href = location.href;
-  // Inputs in document order, including those inside open shadow roots (Unzer UI v2 renders every
-  // card input in one); closed roots stay out of reach and therefore out of scope.
+  // Inputs and selects in document order, including those inside open shadow roots (Unzer UI v2
+  // renders every card input in one); closed roots stay out of reach and therefore out of scope. A
+  // select is only ever an expiry month or year (PAYONE, Worldline HTP, Computop).
   const allInputs = () => {
     const out = [];
     const walk = root => {
       for (const n of root.querySelectorAll('*')) {
-        if (n.tagName === 'INPUT') out.push(n);
+        if (n.tagName === 'INPUT' || n.tagName === 'SELECT') out.push(n);
         if (n.shadowRoot) walk(n.shadowRoot);
       }
     };
@@ -577,11 +667,16 @@ _INSPECT = r"""(() => {
     return out;
   };
   const elements = allInputs();
+  const isSelect = e => e.tagName === 'SELECT';
+  // A select's options (months, years: never a secret) are part of the description, so a list that
+  // is re-populated after consent fails valid() like any other changed field.
   const describe = () => elements.map((e,index) => ({index, autocomplete:e.autocomplete,
     name:e.name+' '+e.id, label:(e.labels?Array.from(e.labels,l=>l.textContent).join(' '):'')+' '+
       (e.getAttribute('aria-label')||'')+' '+(e.placeholder||''),
-    type:e.type, formIndex:e.form?Array.from(doc.forms).indexOf(e.form):null,
-    maxLength:e.maxLength>0?e.maxLength:null}));
+    type:isSelect(e)?(e.multiple?'select-multiple':'select'):e.type,
+    formIndex:e.form?Array.from(doc.forms).indexOf(e.form):null,
+    maxLength:e.maxLength>0?e.maxLength:null,
+    ...(isSelect(e)?{options:Array.from(e.options,o=>[o.value,o.text.slice(0,64),o.disabled]).slice(0,400)}:{})}));
   // Honeypots and visually-hidden inputs are never fill targets: Shopify's PCI frames carry one
   // aria-hidden, tabindex=-1, 1px input per card token around the real field, and filling one
   // is a fraud signal.
@@ -597,7 +692,7 @@ _INSPECT = r"""(() => {
        e.checkVisibility({opacityProperty: true, visibilityProperty: true}));  // a transparent ancestor too
   };
   const entries = elements.map((e,index)=>({e,index})).filter(x=>visible(x.e) &&
-    !['hidden','submit','button','reset','file','image','checkbox','radio'].includes(x.e.type));
+    !['hidden','submit','button','reset','file','image','checkbox','radio','select-multiple'].includes(x.e.type));
   const selected = new Set(entries.map(x=>x.index));
   const signature = JSON.stringify(describe());
   const valid = () => document === doc && location.href === href &&
@@ -605,9 +700,30 @@ _INSPECT = r"""(() => {
     (now => now.length === elements.length && now.every((e,n)=>e === elements[n]))(allInputs()) &&
     entries.every(x=>visible(x.e));
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
-  let used = false;
+  const selectSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;
+  // A select fill names the value of exactly one enabled option, chosen on the inspected options.
+  const oneOption = (el,v) => Array.from(el.options).filter(o=>o.value === v && !o.disabled).length === 1 &&
+    Array.from(el.options).filter(o=>o.value === v).length === 1;
+  // One value in two spellings: providers re-format as they mask ("07/35" -> "07 / 35" or "0735",
+  // grouped card numbers, upper-cased names). Anything else is a different value.
+  const same = (a,b) => a.replace(/[\s\/.-]/g,'').toUpperCase() === b.replace(/[\s\/.-]/g,'').toUpperCase();
+  const live = el => el.isConnected && el.ownerDocument === doc && allInputs().includes(el);
+  let used = false, written = null;
   return {
     describe:()=>describe().filter(x=>selected.has(x.index)), valid,
+    // After every document was written and the page had time to settle: does each written field still
+    // hold its value? States and lengths only; a value never leaves this world. Answers once.
+    retained: () => {
+      const w = written;
+      written = null;
+      if (!w) return null;
+      const page = document === doc && location.href === href;
+      return w.map(f => {
+        const el = elements[f.index];
+        if (!page || !live(el)) return {token:f.token,state:'replaced',length:0};
+        return {token:f.token,state:same(el.value,f.value)?'held':el.value?'changed':'empty',length:el.value.length};
+      });
+    },
     commit: fills => {
       if (used || !valid()) return {success:false,error_type:'payment_fields_changed'};
       used = true;
@@ -615,6 +731,13 @@ _INSPECT = r"""(() => {
           fills.some(f=>!selected.has(f.index) || typeof f.value !== 'string' || !f.value) ||
           new Set(fills.map(f=>f.index)).size !== fills.length)
         return {success:false,error_type:'payment_fields_invalid'};
+      // Every select target is checked before ANY write in this document: zero or several matching
+      // options leave the whole document untouched.
+      const selects = fills.filter(f=>isSelect(elements[f.index]));
+      if (selects.some(f=>!['cc-exp-month','cc-exp-year'].includes(f.token)))
+        return {success:false,error_type:'payment_fields_invalid'};
+      if (selects.some(f=>!oneOption(elements[f.index],f.value)))
+        return {success:false,error_type:'payment_expiry_option_unmatched'};
       // Native setters in an isolated world, one field at a time with its own events, the card number
       // last: a controlled form (Stripe Card/Payment Element) re-renders on each input event and would
       // reset sibling fields written before the event they never saw; brand detection on the number
@@ -624,7 +747,7 @@ _INSPECT = r"""(() => {
       // Page handlers run between these writes, so each target is re-checked first, and success is
       // judged on the inputs still in the document: a re-render that replaced a node must not let
       // its detached copy report a value the live form does not hold.
-      const live = el => el.isConnected && el.ownerDocument === doc && allInputs().includes(el);
+      written = fills.map(f=>({index:f.index,token:String(f.token||''),value:f.value}));
       let attempted = 0;
       for (const f of ordered) {
         const el = elements[f.index];
@@ -632,14 +755,18 @@ _INSPECT = r"""(() => {
           return {success:false,error_type:'payment_fields_changed',filled_fields:attempted,partially_filled:attempted>0};
         attempted += 1;
         el.focus();
-        setter.call(el,f.value);
-        el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
+        if (isSelect(el)) {
+          selectSetter.call(el,f.value);
+          el.dispatchEvent(new Event('input',{bubbles:true}));
+        } else {
+          setter.call(el,f.value);
+          el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
+        }
         el.dispatchEvent(new Event('change',{bubbles:true}));
         el.dispatchEvent(new FocusEvent('blur'));
         el.blur();
       }
-      const held = fills.filter(f=>live(elements[f.index]) &&
-        elements[f.index].value.replace(/[ -]/g,'') === f.value.replace(/[ -]/g,'')).length;
+      const held = fills.filter(f=>live(elements[f.index]) && same(elements[f.index].value,f.value)).length;
       return held === fills.length && location.href === href ? {success:true,filled_fields:held} :
         {success:false,error_type:'payment_validation_failed',filled_fields:held,partially_filled:true};
     }

@@ -272,6 +272,18 @@ def close_incidents_for_recovered_job(job_id: str) -> int:
         return int(cursor.rowcount or 0)
 
 
+def count_alerted_incidents(job_id: str) -> int:
+    """How many of ``job_id``'s open incidents already pinged the operator (``alerted``). The
+    recovery notice is sent only when this is non-zero: a failure nobody was told about needs no
+    "recovered" message."""
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM cron_incidents WHERE job_id=? AND state='alerted'",
+            (str(job_id or ""),),
+        ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
 def _state_filter(state: Optional[str]) -> tuple[str, tuple]:
     return ("", ()) if state is None else (" WHERE state=?", (state,))
 
