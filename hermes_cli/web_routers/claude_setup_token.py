@@ -127,7 +127,7 @@ button,a.btn{display:inline-block;margin:8px 0;padding:10px 16px;font-size:16px}
 <p id="msg">Loading…</p>
 <p id="step1" hidden><a id="auth" class="btn" target="_blank" rel="noopener noreferrer">1. Approve at Claude</a></p>
 <form id="step2" hidden autocomplete="off"><p>2. After approving, the browser lands on a page that does not load
-(<code>localhost</code>). Copy that whole address and paste it here. Do not paste it in chat.</p>
+(<code>localhost</code>). Copy that whole address and paste it here (or send it in your chat with Hermes).</p>
 <textarea id="cb" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
 <button type="submit">Send to Hermes</button></form>
 <script nonce="__NONCE__">

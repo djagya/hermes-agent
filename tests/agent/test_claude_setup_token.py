@@ -38,7 +38,7 @@ class H(http.server.BaseHTTPRequestHandler):
 srv = http.server.HTTPServer(("127.0.0.1", 0), H)
 port = srv.server_address[1]
 print("Browser didn't open? Use the url below to sign in", flush=True)
-print("\x1b[1mhttps://claude.com/cai/oauth/authorize?code=true&client_id=synthetic-client&response_type=code"
+print("\x1b[1mhttps://" + ("claude.com.evil.io" if mode == "evil" else "claude.com") + "/cai/oauth/authorize?code=true&client_id=synthetic-client&response_type=code"
       "&redirect_uri=http%3A%2F%2Flocalhost%3A" + str(port) + "%2Fcallback&scope=user%3Ainference"
       "&code_challenge=SYNTHCHALLENGE&code_challenge_method=S256&state=" + os.environ["FAKE_STATE"] + "\x1b[0m",
       flush=True)
@@ -80,9 +80,10 @@ def env(tmp_path, monkeypatch):
 
     def make(mode="ok", sink=None, **kw):
         kw.setdefault("listener_check", lambda port, pgid: True)
+        kw.setdefault("url_wait_s", 20)
         return cst.Broker(argv=[sys.executable, str(script), mode, str(record)],
                           sink_factory=(lambda: sink) if sink else (lambda: cst.FilePendingSink(tmp_path / "sink")),
-                          url_wait_s=20, **kw)
+                          **kw)
 
     def received():
         return [line for line in record.read_text().splitlines() if line]
@@ -357,7 +358,10 @@ def test_canaries_absent_from_logs_tool_envelopes_argv_and_errors(env, caplog, m
         started = json.loads(tool.claude_setup_token({"action": "start"}, session_id="s1"))
         flow_id = started["flow"]
         flow = broker._flows[flow_id]
-        envelopes = [json.dumps(started)]
+        # dlz: the allowlisted authorize URL (with its state) is shown to Danil by policy; nothing else.
+        assert started["authorize_url"] == flow.native.authorize_url
+        assert CODE not in json.dumps(started) and TOKEN not in json.dumps(started)
+        envelopes = [json.dumps({k: v for k, v in started.items() if k != "authorize_url"})]
         rejected = cst.control_verb({"action": "submit", "handoff": flow.handoff_id, "profile": flow.profile,
                                      "principal": "session-token", "callback": _callback(flow, state="nope")}, "uid:1")
         envelopes.append(json.dumps(rejected))
@@ -377,7 +381,50 @@ def test_canaries_absent_from_logs_tool_envelopes_argv_and_errors(env, caplog, m
         assert not any(c in text for c in CANARIES), text
     assert started["handoff_url"].startswith("https://dash.example/claude-code/setup-token#h=")
     assert not flow.output  # PTY bytes dropped once settled
-    assert set(tool.CLAUDE_SETUP_TOKEN_SCHEMA["parameters"]["properties"]) == {"action", "flow"}
+    assert set(tool.CLAUDE_SETUP_TOKEN_SCHEMA["parameters"]["properties"]) == {"action", "flow", "callback"}
+
+
+def test_chat_pasted_callback_submit_delivers_once_and_never_echoes(env, caplog, monkeypatch):
+    """dlz: owner policy 2026-11-09: Danil may paste the final localhost callback in chat; the tool's
+    submit goes through the same strict parse and one-shot delivery, scoped to the starting session."""
+    make, received, _ = env
+    caplog.set_level(logging.DEBUG)
+    broker = make()
+    cst.install_broker(broker)
+    from tools import claude_setup_token_tool as tool
+    monkeypatch.setattr(tool, "_cfg", lambda: {"enabled": True, "handoff_base_url": "https://dash.example"})
+    call = lambda session="s1", **a: json.loads(tool.claude_setup_token(a, session_id=session))
+    try:
+        started = call(action="start")
+        flow_id = started["flow"]
+        flow = broker._flows[flow_id]
+        good = _callback(flow)
+        assert started["authorize_url"].startswith("https://claude.com/cai/oauth/authorize?")
+        assert call(action="status", flow=flow_id)["authorize_url"] == started["authorize_url"]
+        assert "paste" in started["next"] and "in chat" in started["next"] and "handoff_url" in started
+        outs = [call(action="submit", flow=flow_id, callback=good, session="other"),
+                call(action="submit", flow=flow_id, callback=_callback(flow, state="nope")),
+                call(action="submit", flow=flow_id, callback=good.replace("localhost", "127.0.0.1")),
+                call(action="submit", flow=flow_id, callback=good)]
+        outs.append(call(action="submit", flow=flow_id, callback=good))  # replay
+        _settled(flow)
+        outs.append(call(action="status", flow=flow_id))
+    finally:
+        cst.install_broker(cst.Broker())
+    assert [o.get("error") for o in outs[:3]] == ["claude_setup_token: not_found", "claude_setup_token: callback_wrong_state",
+                                                  "claude_setup_token: callback_wrong_redirect"]
+    assert outs[3]["state"] in (cst.DELIVERED, cst.STORED) and "error" in outs[4]
+    assert outs[-1]["state"] == cst.STORED and received() == [f"/callback?code={CODE}&state={STATE}"]
+    for text in [json.dumps(o) for o in outs] + [caplog.text]:
+        assert not any(c in text for c in CANARIES) and "localhost:" not in text, text
+    assert "authorize_url" not in outs[-1]  # no longer awaiting
+    # Allowlist still enforced: a CLI printing a look-alike host never surfaces a URL.
+    cst.install_broker(make("evil", url_wait_s=3))
+    try:
+        evil = call(action="start")
+    finally:
+        cst.install_broker(cst.Broker())
+    assert evil["state"] == cst.FAILED and "authorize_url" not in evil and "evil" not in json.dumps(evil)
 
 
 # 6. Credential recovery --------------------------------------------------------------------------
@@ -411,6 +458,17 @@ def test_tool_is_off_by_default_and_vault_boundaries_unchanged():
     assert tool.check_available() is False  # needs explicit config + the gateway intake
     import model_tools
     assert "browser_vault" in model_tools._VAULT_NO_PASSWORD_NOTE
+    # dlz: owner policy 2026-11-09: one-time codes/callbacks may come from chat, long-lived secrets never.
+    from tools.browser_vault_tool import BROWSER_VAULT_SCHEMA
+    for text in (model_tools._VAULT_NO_PASSWORD_NOTE, BROWSER_VAULT_SCHEMA["description"],
+                 BROWSER_VAULT_SCHEMA["parameters"]["properties"]["code"]["description"]):
+        assert "one-time code the user sent" in text and "in chat" in text
+        assert "Never ask the user for a code in chat" not in text and "or accept one in chat" not in text
+    assert "never accept a password, card data, API key or token" in model_tools._VAULT_NO_PASSWORD_NOTE
+    assert "never accept a password, card data, API key or token" in BROWSER_VAULT_SCHEMA["description"]
+    desc = tool.CLAUDE_SETUP_TOKEN_SCHEMA["description"]
+    assert "authorize_url (send it to Danil in chat" in desc and "back to you in chat" in desc and "call submit" in desc and "never in chat" not in desc
+    assert "never ask for or accept the resulting token, a password, API key or card data in chat" in desc
     src = Path(cst.__file__).read_text() + Path(tool.__file__).read_text()
     for forbidden in ("allow_private_urls", "set_code_prompt_callback", "set_unlock_prompt_callback",
                       "redact", "approval"):
