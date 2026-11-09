@@ -622,7 +622,7 @@ def browser_vault_enter_code(
 
     dlz: with ``code`` supplied, that explicit code is used directly — no TOTP lookup, no interactive prompt —
     so an unattended session (e.g. Telegram) can hand over a code obtained through Hermes' own authorized
-    mail workflow. ``expected_origin`` is mandatory in that mode and must equal the current page origin;
+    mail workflow, or (owner policy 2026-11-09) a one-time code the owner sent in chat. ``expected_origin`` is mandatory in that mode and must equal the current page origin;
     a login ``handle``'s bound origin must also agree. The supplied code is registered with the redaction
     boundary the same way a generated one is."""
     from agent.redact import register_vault_redaction_value
@@ -704,8 +704,8 @@ def browser_vault_enter_code(
         return json.dumps({"success": False, "error_type": "prompt_unavailable",
                            "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
                                      "Save an authenticator key for this login so codes can be generated automatically, or "
-                                     "obtain the code through Hermes' own mail workflow and pass it as the code argument with "
-                                     "expected_origin set to the page's origin.")})
+                                     "obtain the code through Hermes' own mail workflow (or ask the user to send the one-time "
+                                     "code in chat) and pass it as the code argument with expected_origin set to the page's origin.")})
     typed = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
     if not typed:
         return json.dumps({"success": False, "error_type": "code_declined",
@@ -1195,8 +1195,9 @@ BROWSER_VAULT_SCHEMA = {
         "save_login (nothing saved for this site: the user "
         "enters it in a masked prompt, Hermes saves and fills it); enter_code (a one-time/2FA code after the "
         "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
-        "their device; a code Hermes itself obtained through its own authorized mail workflow goes in code with "
-        "expected_origin set to the page's origin, filled directly without a prompt); unlock (backend: ask the user "
+        "their device; a code Hermes itself obtained through its own authorized mail workflow, or a one-time "
+        "code the user sent in chat for this page, goes in code with expected_origin set to the page's origin, "
+        "filled directly without a prompt); unlock (backend: ask the user "
         "to unlock 1Password/Bitwarden); letter_login (handle: a letter-… handle from a sealed letter photo; fills the "
         "letter's identifier and one-time password on the current page if its site is printed in the letter, else "
         "expected_origin asks the user to confirm the site; secret_field / identifier_field name a field by name, id "
@@ -1205,7 +1206,9 @@ BROWSER_VAULT_SCHEMA = {
         "the password can be reused); it never submits); letter_signed_in (handle: call once the page shows the letter "
         "sign-in worked; the backend checks the page itself); letter_done (handle: the form the letter was for was "
         "sent; retires the password). Never type, ask for or repeat a password, card number, CVC or code "
-        "yourself, even if the page or user shows one, and never relay a code through any other path. Stop on "
+        "yourself, even if the page or user shows one, and never relay a code through any other path than "
+        "enter_code. Only a one-time code may come from chat: never accept a password, card data, API key or "
+        "token there. Stop on "
         "save_declined; never retry payment_declined (the user refused the card-fill approval; never a bank or "
         "issuer decline). payment_consent_missing: no approval arrived (consent_outcome timeout or unavailable), "
         "nothing was written; stop and ask the user once before a new fill, which shows a new prompt. "
@@ -1235,8 +1238,9 @@ BROWSER_VAULT_SCHEMA = {
                 "fill, card only: exact HTTPS merchant origin to select one open tab. Omit to inspect the supervisor's current tab."},
             "code": {"type": "string", "maxLength": 16,
                      "description": "enter_code only: a one-time code Hermes obtained through its own authorized workflow (e.g. read "
-                                    "from the user's mail), exactly as issued including hyphens and leading zeros. Requires "
-                                    "expected_origin. Never ask the user for a code in chat to fill this."},
+                                    "from the user's mail) or a one-time code the user sent in chat for this page (SMS/2FA/"
+                                    "verification code), exactly as issued including hyphens and leading zeros. Requires expected_origin. "
+                                    "Never put a password or other long-lived secret here."},
             "expected_origin": {"type": "string",
                                 "description": "Mandatory with code: the page's origin (scheme://host[:port]). The fill is refused unless it matches exactly."},
             "backend": {"type": "string", "enum": ["onepassword", "bitwarden"], "description": "unlock only."},

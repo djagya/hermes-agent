@@ -377,7 +377,38 @@ def test_canaries_absent_from_logs_tool_envelopes_argv_and_errors(env, caplog, m
         assert not any(c in text for c in CANARIES), text
     assert started["handoff_url"].startswith("https://dash.example/claude-code/setup-token#h=")
     assert not flow.output  # PTY bytes dropped once settled
-    assert set(tool.CLAUDE_SETUP_TOKEN_SCHEMA["parameters"]["properties"]) == {"action", "flow"}
+    assert set(tool.CLAUDE_SETUP_TOKEN_SCHEMA["parameters"]["properties"]) == {"action", "flow", "callback"}
+
+
+def test_chat_pasted_callback_submit_delivers_once_and_never_echoes(env, caplog, monkeypatch):
+    """dlz: owner policy 2026-11-09: Danil may paste the final localhost callback in chat; the tool's
+    submit goes through the same strict parse and one-shot delivery, scoped to the starting session."""
+    make, received, _ = env
+    caplog.set_level(logging.DEBUG)
+    broker = make()
+    cst.install_broker(broker)
+    from tools import claude_setup_token_tool as tool
+    monkeypatch.setattr(tool, "_cfg", lambda: {"enabled": True, "handoff_base_url": "https://dash.example"})
+    call = lambda session="s1", **a: json.loads(tool.claude_setup_token(a, session_id=session))
+    try:
+        flow_id = call(action="start")["flow"]
+        flow = broker._flows[flow_id]
+        good = _callback(flow)
+        outs = [call(action="submit", flow=flow_id, callback=good, session="other"),
+                call(action="submit", flow=flow_id, callback=_callback(flow, state="nope")),
+                call(action="submit", flow=flow_id, callback=good.replace("localhost", "127.0.0.1")),
+                call(action="submit", flow=flow_id, callback=good)]
+        outs.append(call(action="submit", flow=flow_id, callback=good))  # replay
+        _settled(flow)
+        outs.append(call(action="status", flow=flow_id))
+    finally:
+        cst.install_broker(cst.Broker())
+    assert [o.get("error") for o in outs[:3]] == ["claude_setup_token: not_found", "claude_setup_token: callback_wrong_state",
+                                                  "claude_setup_token: callback_wrong_redirect"]
+    assert outs[3]["state"] in (cst.DELIVERED, cst.STORED) and "error" in outs[4]
+    assert outs[-1]["state"] == cst.STORED and received() == [f"/callback?code={CODE}&state={STATE}"]
+    for text in [json.dumps(o) for o in outs] + [caplog.text]:
+        assert not any(c in text for c in CANARIES) and "localhost:" not in text, text
 
 
 # 6. Credential recovery --------------------------------------------------------------------------
@@ -411,6 +442,17 @@ def test_tool_is_off_by_default_and_vault_boundaries_unchanged():
     assert tool.check_available() is False  # needs explicit config + the gateway intake
     import model_tools
     assert "browser_vault" in model_tools._VAULT_NO_PASSWORD_NOTE
+    # dlz: owner policy 2026-11-09: one-time codes/callbacks may come from chat, long-lived secrets never.
+    from tools.browser_vault_tool import BROWSER_VAULT_SCHEMA
+    for text in (model_tools._VAULT_NO_PASSWORD_NOTE, BROWSER_VAULT_SCHEMA["description"],
+                 BROWSER_VAULT_SCHEMA["parameters"]["properties"]["code"]["description"]):
+        assert "one-time code the user sent" in text and "in chat" in text
+        assert "Never ask the user for a code in chat" not in text and "or accept one in chat" not in text
+    assert "never accept a password, card data, API key or token" in model_tools._VAULT_NO_PASSWORD_NOTE
+    assert "never accept a password, card data, API key or token" in BROWSER_VAULT_SCHEMA["description"]
+    desc = tool.CLAUDE_SETUP_TOKEN_SCHEMA["description"]
+    assert "pastes it to you in chat" in desc and "call submit" in desc and "never in chat" not in desc
+    assert "never ask for or accept the resulting token, a password, API key or card data in chat" in desc
     src = Path(cst.__file__).read_text() + Path(tool.__file__).read_text()
     for forbidden in ("allow_private_urls", "set_code_prompt_callback", "set_unlock_prompt_callback",
                       "redact", "approval"):

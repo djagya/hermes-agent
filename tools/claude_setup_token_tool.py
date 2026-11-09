@@ -1,8 +1,10 @@
-"""dlz: model-facing start/status/cancel for the owner-authenticated ``claude setup-token`` intake.
+"""dlz: model-facing start/submit/status/cancel for the owner-authenticated ``claude setup-token`` intake.
 
-The model never handles the callback, code, authorize URL or token: it starts a flow, relays the
-handoff link (which grants nothing without the owner's dashboard sign-in), and reads status and
-opaque handles. The broker and its intake live in ``agent.claude_setup_token``.
+The model never sees the authorize URL or token: it starts a flow, relays the handoff link (which
+grants nothing without the owner's dashboard sign-in), and reads status and opaque handles. Owner
+policy 2026-11-09: Danil may paste the one-time final localhost callback URL in chat; ``submit``
+hands it, unechoed, to the same strict parse and one-shot delivery the dashboard page uses. The
+broker and its intake live in ``agent.claude_setup_token``.
 """
 
 from __future__ import annotations
@@ -76,18 +78,23 @@ def claude_setup_token(args: dict[str, Any], **kwargs) -> str:
             out = flow.model_view()
             if flow.state == "awaiting_callback":
                 out["handoff_url"] = f"{_handoff_base()}{HANDOFF_PATH}#h={flow.handoff_id}"
-                out["next"] = ("Send Danil the handoff_url. He signs in to the dashboard there, approves "
-                               "at Claude, and pastes the browser's final address on that page, not in chat. "
-                               "Then poll status. Never ask for the code or the address in chat.")
+                out["next"] = ("Send Danil the handoff_url. He signs in to the dashboard there and approves "
+                               "at Claude, then pastes the browser's final http://localhost address either on "
+                               "that page or here in chat. If he sends it in chat, call submit with this flow "
+                               "and callback set to exactly that address. Do not repeat it. Then poll status.")
             return tool_result(out)
         flow_id = str(args.get("flow") or "")
         if action == "status":
             return tool_result(broker.status(flow_id, profile=profile, session_id=session_id).model_view())
         if action == "cancel":
             return tool_result(broker.cancel(flow_id, profile=profile, session_id=session_id).model_view())
+        if action == "submit":
+            # dlz: status only; the callback is never echoed, logged or kept past delivery.
+            out = broker.submit_from_session(flow_id, args.get("callback"), profile=profile, session_id=session_id)
+            return tool_result({"flow": flow_id, "state": out["state"], "reason": out["reason"]})
     except IntakeRejected as exc:
         return tool_error(f"claude_setup_token: {exc.code}")
-    return tool_error("action must be start, status or cancel")
+    return tool_error("action must be start, submit, status or cancel")
 
 
 CLAUDE_SETUP_TOKEN_SCHEMA = {
@@ -95,18 +102,22 @@ CLAUDE_SETUP_TOKEN_SCHEMA = {
     "description": (
         "Create a new long-lived Claude subscription token (`claude setup-token`) when Danil explicitly "
         "asks for it. start runs the native CLI and returns a handoff_url for Danil; he approves at "
-        "Claude and submits the result on that signed-in dashboard page, never in chat. status/cancel "
-        "take the returned flow handle. Results are status and opaque handles only: the token goes to a "
-        "concealed pending store, is not installed as the runtime credential, and is not proven for model "
-        "requests (both separate operator steps). This is the only supported path for this callback: "
-        "never ask for, copy or forward an OAuth code, callback address, password, card or 2FA code "
-        "from chat, and the browser password/card/2FA rules are unchanged."
+        "Claude and either submits the browser's final http://localhost callback address on that "
+        "signed-in dashboard page or pastes it to you in chat. For a pasted address call submit with the "
+        "flow handle and callback set to exactly that address; never repeat it back or store it. "
+        "status/cancel take the flow handle. Results are status and opaque handles only: the token goes "
+        "to a concealed pending store, is not installed as the runtime credential, and is not proven for "
+        "model requests (both separate operator steps). Only this one-time callback may come from chat: "
+        "never ask for or accept the resulting token, a password, API key or card data in chat."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["start", "status", "cancel"]},
-            "flow": {"type": "string", "description": "Flow handle from start (status/cancel)."},
+            "action": {"type": "string", "enum": ["start", "submit", "status", "cancel"]},
+            "flow": {"type": "string", "description": "Flow handle from start (submit/status/cancel)."},
+            "callback": {"type": "string", "maxLength": 4096,
+                         "description": "submit only: the final http://localhost callback address Danil pasted "
+                                        "in chat, exactly as sent."},
         },
         "required": ["action"],
     },

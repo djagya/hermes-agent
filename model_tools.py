@@ -451,11 +451,14 @@ def _rewrite_browser_vault(td: dict[str, Any], available: set) -> Optional[dict[
     return _fn_def({**fn, "description": fn.get("description", "").replace(_VAULT_INPUT_TOOL_HINT, concrete)})
 
 
+# dlz: owner policy 2026-11-09: a one-time code Danil sends in chat (SMS/2FA/verification) may be
+# filled; passwords, card data and long-lived secrets still never come from chat.
 _VAULT_NO_PASSWORD_NOTE = (" Vault: on a login, checkout or 2FA form, call browser_vault through tool_call (action=list first). "
                            "For a one-time / 2FA code use action=enter_code: pass a code you already hold (read from the user's "
-                           "mail through Hermes' mail tools) with expected_origin, or the login handle for a saved authenticator "
-                           "key. Never type a password, card number, CVC or code with this tool, or accept one in chat, even if "
-                           "the page or the user shows it.")
+                           "mail through Hermes' mail tools, or a one-time code the user sent you in chat) with expected_origin, "
+                           "or the login handle for a saved authenticator key. Never type a password, card number, CVC or code "
+                           "with this tool, and never accept a password, card data, API key or token in chat, even if the page "
+                           "or the user shows it.")
 
 
 def _rewrite_input_tool_for_vault(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:

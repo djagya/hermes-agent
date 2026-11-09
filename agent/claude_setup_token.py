@@ -2,8 +2,8 @@
 
 A containerized Hermes can start ``claude setup-token`` but the owner's browser cannot reach the
 CLI's dynamically allocated ``http://localhost:<port>/callback``. This broker owns that native CLI
-run and lets the authenticated owner hand the provider's callback URL back to it, outside the
-conversation:
+run and lets the authenticated owner hand the provider's callback URL back to it, on the dashboard
+or (one-time callback material, owner policy 2026-11-09) pasted in chat:
 
     model tool start -> broker spawns the CLI on a private PTY (its PKCE verifier never leaves it)
     -> the CLI-issued authorize URL is parsed and allowlisted, never rewritten
@@ -11,6 +11,8 @@ conversation:
        pastes the callback URL there -> dashboard -> gateway control socket (same-uid peer) ->
        :meth:`Broker.submit` validates it against the recorded redirect + state, claims the one
        delivery and sends it to the recorded loopback listener only
+       (dlz: or Danil pastes it in chat and the starting session's model tool hands it to
+       :meth:`Broker.submit_from_session`, which runs the same validation and one-shot delivery)
     -> the CLI does its own token exchange and prints the token on the PTY
     -> the broker extracts it privately, stores it in the concealed sink, compares a private readback
     -> the model reads status and opaque handles only.
@@ -390,7 +392,17 @@ class Broker:
 
     def submit(self, handoff_id: str, callback: str, *, profile: str, principal: str) -> dict:
         """Validate the owner's callback and deliver it once to the recorded live CLI listener."""
-        flow = self._owner_flow(handoff_id, profile, principal)
+        return self._submit_flow(self._owner_flow(handoff_id, profile, principal), callback)
+
+    def submit_from_session(self, flow_id: str, callback: str, *, profile: str, session_id: str) -> dict:
+        """dlz: the callback URL Danil pasted in chat (owner policy 2026-11-09: one-time OAuth callback
+        material may travel via chat), handed in by the model tool of the session that started the flow.
+        Same strict parse and one-shot delivery as :meth:`submit`; the answer is status only."""
+        flow = self._owned(flow_id, profile, session_id)
+        self._expire_if_due(flow)
+        return self._submit_flow(flow, callback)
+
+    def _submit_flow(self, flow: Flow, callback: str) -> dict:
         with self._lock:
             if flow.state != AWAITING or flow.native is None:
                 raise IntakeRejected("not_awaiting" if flow.state not in _TERMINAL else flow.state)
