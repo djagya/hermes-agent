@@ -126,14 +126,23 @@ def _managed_supervisor(task_id: str, *, admit: bool = False):
 
 # A secret-bearing script runs inside this wrapper on EVERY transport (CDP supervisor and plugin page
 # backends), so a page exception is answered in-page and its message (which may quote the script or, after
-# a write, carry the value a page handler read back) never reaches a backend's error path or logs. The
-# expression is awaited inside the catch: an async script's rejection is answered the same way.
-_PAGE_FILL_FAILED = {"hermes_vault_eval_failed": True}
+# a write, carry the value a page handler read back) never reaches a backend's error path or logs.
+# Every answer is a string primitive: an object (the old sentinel, or anything a hooked JSON.stringify
+# returns) would be assimilated through a page-defined ``then`` outside any catch. An async script is
+# observed with the Promise intrinsics captured BEFORE it runs: its value or rejection lands on the wrapper's
+# own promise, never passing through a page-reachable ``then``/``await``. Strict mode (inherited by the
+# wrapped script): a page function the script calls gets ``.caller === null``, never the secret-bearing source.
+_PAGE_FILL_FAILED = "hermes_vault_eval_failed"
 
 
 def _secret_wrapped(expression: str) -> str:
-    return ("(async () => { try { return await (" + expression + "); } catch (_) { return "
-            + json.dumps(_PAGE_FILL_FAILED) + "; } })()")
+    failed = json.dumps(_PAGE_FILL_FAILED)
+    return ("(() => { \"use strict\"; const F = " + failed + "; const P0 = Promise, then0 = Promise.prototype.then, "
+            "apply = Reflect.apply; let r; try { r = (" + expression + "); } catch (_) { return F; } "
+            "if (typeof r === \"string\") return r; let settle = null; "
+            "try { const done = new P0((ok) => { settle = ok; }); "
+            "apply(then0, r, [(v) => { settle(typeof v === \"string\" ? v : F); }, () => { settle(F); }]); "
+            "return done; } catch (_) { return F; } })()")
 
 
 def _page_backend(task_id: str):
@@ -695,7 +704,9 @@ def browser_vault_enter_code(
             parsed = _parse_json_result(parsed)
         if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
             return json.dumps({"success": False, "error_type": "origin_changed", "error": "The page navigated before the code could be entered. Nothing was written."})
-        filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+        filled = _filled_count(parsed, len(fills))
+        if filled is None:
+            return json.dumps(_FILL_UNVERIFIED)
         return json.dumps({"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
                            "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
@@ -775,11 +786,7 @@ def _parse_fill_result(fill_result: dict, page_origin: str, refusal_tag: str = "
         parsed = _parse_json_result(parsed)
     if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
         if refusal_tag and parsed.get("tag") != refusal_tag:
-            return parsed, json.dumps({
-                "success": False, "error_type": "fill_result_unverified",
-                "error": "The page answered the fill with a result Hermes could not verify; the password may have "
-                         "been written. Nothing was submitted. Do not submit or retry; check the page and tell the user.",
-            })
+            return parsed, json.dumps(_FILL_UNVERIFIED)
         return parsed, json.dumps(
             {
                 "success": False,
@@ -791,6 +798,25 @@ def _parse_fill_result(fill_result: dict, page_origin: str, refusal_tag: str = "
             }
         )
     return parsed, None
+
+
+_FILL_UNVERIFIED = {
+    "success": False, "error_type": "fill_result_unverified",
+    "error": "The page answered the fill with a result Hermes could not verify; the value may have been written. "
+             "Nothing was submitted. Do not submit or retry; check the page and tell the user.",
+}
+
+
+def _filled_count(parsed: Any, most: int) -> Optional[int]:
+    """The write script's ``filled`` count, or None when the page-produced answer is not a plain integer in
+    ``0..most``: a string or float (a hooked JSON.stringify can return ``{"filled": "<char codes>"}``) is never
+    converted or echoed. A dict without ``filled`` counts as 0 (nothing claimed)."""
+    if not isinstance(parsed, dict):
+        return 0
+    filled = parsed.get("filled", 0)
+    if type(filled) is not int or not 0 <= filled <= most:  # bool is not a count either
+        return None
+    return filled
 
 
 def _register_redactions(values: Any) -> Optional[str]:
@@ -950,9 +976,11 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     parsed, refusal = _parse_fill_result(fill_result, page_origin, refusal_tag)
     if refusal:
         return refusal
-    filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
+    filled = _filled_count(parsed, len(fills))
+    if filled is None:
+        return json.dumps(_FILL_UNVERIFIED)
 
-    out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
+    out = {"success": bool(filled), "filled_fields": filled, "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
     if meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"
@@ -1123,7 +1151,9 @@ def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, se
         parsed = _parse_json_result(parsed)
     if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
         return refuse("origin_changed", "The page navigated before the fill could run. Nothing was written.")
-    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+    filled = _filled_count(parsed, len(fills))
+    if filled is None:
+        return refuse(_FILL_UNVERIFIED["error_type"], _FILL_UNVERIFIED["error"])
     if filled < len(fills):
         return refuse("fill_incomplete", f"Only {filled} of {len(fills)} fields took a value; the form was not "
                                          "submitted. Inspect the form and retry with secret_field/identifier_field.",

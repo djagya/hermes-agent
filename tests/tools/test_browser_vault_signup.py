@@ -8,8 +8,8 @@ from unittest.mock import Mock
 import pytest
 
 from agent.vault_login_classifier import (
-    SIGNUP_OUTCOMES, LoginControl, SignupTargets, bind_key, build_fill_js, build_signup_fill_js, classify_login_control,
-    select_signup_targets,
+    _REGISTER_JS, SIGNUP_OUTCOMES, LoginControl, SignupTargets, build_fill_js, build_signup_fill_js,
+    classify_login_control, registry_name, select_signup_targets,
 )
 from tools import browser_vault_signup as signup
 from tools import browser_vault_tool as vault
@@ -54,10 +54,10 @@ def core(monkeypatch):
 def _honest(script):
     """What an unchanged page answers: every approved field held (signup), or one field filled (login)."""
     import re
-    marks = re.search(r'"marks": \[([^\]]*)\]', script)
-    if marks is None:
+    indices = re.search(r'"indices": \[([^\]]*)\]', script)
+    if indices is None:
         return json.dumps({"filled": 1})
-    return TOKENS["mask:" + "1" * len(marks.group(1).split(","))]
+    return TOKENS["mask:" + "1" * len(indices.group(1).split(","))]
 
 
 def confirm(**changes):
@@ -174,6 +174,10 @@ BAD_CONTROLS = [
     [field(name="updatePassword"), confirm(name="confirmPassword", label="")], [field(name="oldpassword")],
     [field(name="changepassword")], [field(label="Existing password")], [field(), confirm(rendered=False)],
     [{k: v for k, v in field().items() if k != "rendered"}],
+    # A password-edit form, by field intent or by route.
+    [field(name="editPassword"), confirm(name="confirmPassword", label="")],
+    [field(pageUrl=ORIGIN + "/register/password/edit", formAction=ORIGIN + "/register/password/edit"),
+     confirm(pageUrl=ORIGIN + "/register/password/edit", formAction=ORIGIN + "/register/password/edit")],
 ]
 
 
@@ -364,11 +368,18 @@ let focusEvents = 0;
 const window = { location: { origin: spec.origin, href: spec.url }, innerWidth: 1280, innerHeight: 800, scrollY: 0 };
 class Event { constructor(type) { this.type = type; } }
 class InputEvent extends Event {}
-const KEY = spec.key;
-const mark = (node, v) => Object.defineProperty(node, KEY, { value: v, configurable: true });
-class Form { constructor(action) { this.tagName = 'FORM'; this.action = action; this.elements = []; } }
-class HTMLInputElement {
+// The getters the writer captures live on the same prototypes as in a browser.
+class EventTarget { dispatchEvent(ev) { for (const f of this.listeners[ev.type] || []) f(ev); return true; } }
+class Node extends EventTarget { get isConnected() { return this.connected; } }
+class HTMLFormElement {
+  constructor(action) { this.tagName = 'FORM'; this.action = action; this.elements = []; }
+  get action() { return this._action; }
+  set action(v) { this._action = v; }
+}
+const Form = HTMLFormElement;
+class HTMLInputElement extends Node {
   constructor(c) {
+    super();
     Object.assign(this, { tagName: c.type === 'select' ? 'SELECT' : 'INPUT', type: c.type, autocomplete: c.autocomplete || '',
       name: c.name || '', id: '', idx: c.index, disabled: false, readOnly: false, labels: [], connected: true, held: '',
       listeners: {}, form: null, shown: true, transparent: false, rect: { left: 10, top: 10 + 40 * c.index, width: 200, height: 30 },
@@ -376,7 +387,8 @@ class HTMLInputElement {
   }
   get value() { return this.held; }
   set value(v) { if (this.throws) throw new Error('setter'); writes.push(this.idx); this.held = v; }
-  get isConnected() { return this.connected; }
+  get form() { return this._form; }
+  set form(f) { this._form = f; }
   getAttribute(n) { return n in this.attrs ? this.attrs[n] : null; }
   hasAttribute(n) { return n in this.attrs; }
   removeAttribute(n) { delete this.attrs[n]; }
@@ -387,21 +399,20 @@ class HTMLInputElement {
   getRootNode() { return this.root || document; }
   focus() { focusEvents += 1; (this.listeners.focus || []).forEach((f) => f()); }
   on(t, f) { (this.listeners[t] = this.listeners[t] || []).push(f); }
-  dispatchEvent(ev) { for (const f of this.listeners[ev.type] || []) f(ev); return true; }
 }
 const forms = [];
 const formFor = (c) => {
   if (c.formIndex === null || c.formIndex === undefined) return null;
-  if (!forms[c.formIndex]) { forms[c.formIndex] = new Form(c.formAction); mark(forms[c.formIndex], 'f:' + c.formIndex); }
+  if (!forms[c.formIndex]) forms[c.formIndex] = new Form(c.formAction);
   return forms[c.formIndex];
 };
 const make = (c) => { const e = new HTMLInputElement(c); e.form = formFor(c); if (e.form) e.form.elements.push(e); return e; };
 const clone = (e) => { const c = make({ index: e.idx, type: e.type, autocomplete: e.autocomplete, name: e.name,
   label: e.attrs.placeholder }); c.attrs = { ...e.attrs }; c.form = e.form; return c; };  // attributes (stamp
-// included) copy exactly, JS identity marks do not
+// included) copy exactly
 let light = [], shadow = [];
 const byIdx = {};
-for (const c of spec.controls) { const e = make(c); mark(e, 'e:' + c.index); byIdx[c.index] = e; (c.shadow ? shadow : light).push(e); }
+for (const c of spec.controls) { const e = make(c); byIdx[c.index] = e; (c.shadow ? shadow : light).push(e); }
 const select = (list, s) => {
   if (s === '*') return list;
   const m = /^\[data-hermes-vault-slot(?:="(.*)")?\]$/.exec(s);
@@ -416,6 +427,11 @@ const document = {
   getElementById: () => null,
 };
 const later = (f) => setTimeout(f, 5);
+if (spec.register) {  // what the inspection leaves behind (the real registration code), by control index
+  const inspected = [];
+  for (const k in byIdx) inspected[k] = byIdx[k];
+  (@@REGISTER@@)(spec.registry, spec.bind, inspected, forms);
+}
 @@MUTATE@@
 shadow.forEach((e) => { e.root = host.shadowRoot; });
 Promise.resolve(@@SCRIPT@@).then((raw) => {
@@ -426,13 +442,15 @@ Promise.resolve(@@SCRIPT@@).then((raw) => {
 '''
 
 
-def _run(script, controls, mutate="", expected=SECRET, nonce="nonce"):
+def _run(script, controls, mutate="", expected=SECRET, nonce="nonce", register=True):
     node = shutil.which("node")
     if not node:
         pytest.skip("Node required for synthetic JS probe")
     import re
-    spec = {"controls": controls, "origin": ORIGIN, "url": ORIGIN + "/register", "nonce": nonce, "key": bind_key(BIND)}
-    values = {"@@SPEC@@": json.dumps(spec), "@@EXPECTED@@": json.dumps(expected), "@@MUTATE@@": mutate, "@@SCRIPT@@": script}
+    spec = {"controls": controls, "origin": ORIGIN, "url": ORIGIN + "/register", "nonce": nonce, "bind": BIND,
+            "registry": registry_name(nonce), "register": register}
+    values = {"@@SPEC@@": json.dumps(spec), "@@EXPECTED@@": json.dumps(expected), "@@MUTATE@@": mutate,
+              "@@REGISTER@@": _REGISTER_JS, "@@SCRIPT@@": script}
     harness = re.sub("|".join(values), lambda m: values[m.group(0)], _DOM)  # one pass: never rescans values
     run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=20, check=False)
     assert run.returncode == 0, run.stderr.replace(expected, "[redacted]")
@@ -525,21 +543,65 @@ def test_page_census_refuses_what_the_classifier_refuses(quick_settle, extra):
 
 @pytest.mark.parametrize("shadow", [False, True])
 def test_real_inspection_then_real_writer_on_one_page(quick_settle, shadow):
-    """The inspection's stamps, identity marks and rendered flag are what the writer checks: inspect, select in
-    Python, then (same DOM, inspection re-run first) write."""
-    from agent.vault_login_classifier import build_inspection_js
-
+    """The inspection's stamps, identity registry and rendered flag are what the writer checks: inspect, select
+    in Python, then (same DOM, inspection re-run first) write."""
     controls = [dict(c, shadow=shadow) for c in PAIR]
-    inspection = build_inspection_js("nonce", BIND)
-    inspected = json.loads(_run(inspection, controls)["raw"])
-    assert [c["rendered"] for c in inspected] == [True, True]
-    targets = select_signup_targets([LoginControl.from_dict(c) for c in inspected])
-    assert targets is not None and targets.confirm is not None
-    observed = _run(_signup_script(None, targets=targets), controls, mutate=inspection + ";")
+    inspection, targets = _inspected(controls)
+    observed = _run(_signup_script(None, targets=targets), controls, mutate=inspection + ";", register=False)
     assert observed["outcome"] == "mask:11" and all(observed["held"].values())
     clone = _run(_signup_script(None, targets=targets), controls,
-                 mutate=inspection + "; light = light.map(clone); shadow = shadow.map(clone);")
+                 mutate=inspection + "; light = light.map(clone); shadow = shadow.map(clone);", register=False)
     assert clone["outcome"] == "none" and clone["writes"] == []
+
+
+def _inspected(controls):
+    """The real inspection script and the targets Python selects from what it reported."""
+    from agent.vault_login_classifier import build_inspection_js
+
+    inspection = build_inspection_js("nonce", BIND)
+    inspected = json.loads(_run(inspection, controls, register=False)["raw"])
+    assert all(c["rendered"] for c in inspected)
+    targets = select_signup_targets([LoginControl.from_dict(c) for c in inspected])
+    assert targets is not None and len(targets.controls) == len(controls)
+    return inspection, targets
+
+
+# Copies every own property (non-enumerable ones included) of the inspected inputs and form onto clones and a
+# replacement form: whatever an inspection put ON a node travels with the copy.
+_COPY_IDENTITY = """
+const copyOwn = (from, to) => { for (const k of Object.getOwnPropertyNames(from)) if (!(k in to) || k.startsWith('hermesVault'))
+  Object.defineProperty(to, k, Object.getOwnPropertyDescriptor(from, k)); };
+const twin = new Form(spec.url); copyOwn(forms[0], twin); twin.elements = []; forms[0] = twin;
+light = light.map((e) => { const c = clone(e); copyOwn(e, c); c.form = twin; twin.elements.push(c); return c; });
+"""
+
+
+def test_identity_is_the_inspected_object_not_a_copyable_property(quick_settle):
+    inspection, targets = _inspected(PAIR)
+    observed = _run(_signup_script(None, targets=targets), PAIR, mutate=inspection + ";" + _COPY_IDENTITY,
+                    register=False)
+    assert observed["outcome"] == "none" and observed["writes"] == []
+
+
+# The confirmation's input handler clears the primary and makes Array iteration yield the confirmation twice
+# for the approved-set array: a for...of read-back would certify both fields.
+_ITERATOR_SWAP = """
+byIdx[2].on('input', () => {
+  byIdx[1].held = '';
+  const iter = Array.prototype[Symbol.iterator];
+  Array.prototype[Symbol.iterator] = function () {
+    const target = this !== light && this.length === 2 && this[0] === byIdx[1] && this[1] === byIdx[2];
+    return iter.call(target ? [byIdx[2], byIdx[2]] : this);
+  };
+});
+"""
+
+
+def test_retention_reads_each_approved_field_by_index(quick_settle):
+    inspection, targets = _inspected(PAIR)
+    observed = _run(_signup_script(None, targets=targets), PAIR, mutate=inspection + ";" + _ITERATOR_SWAP,
+                    register=False)
+    assert observed["outcome"] == "mask:01" and observed["held"] == {"1": False, "2": True}
 
 
 def test_login_writer_rechecks_its_target_after_focus():
@@ -581,6 +643,70 @@ def test_secret_wrapper_answers_an_async_rejection_in_page():
     assert observed["raw"] == vault._PAGE_FILL_FAILED
 
 
+# Page code that runs mid-script (a write's input handler) installs an inherited ``then`` getter throwing the
+# value it read, and breaks Promise; the script then rejects (async) or hands back an object (sync).
+_POISON = ("Object.defineProperty(Object.prototype, 'then', { configurable: true, get() { throw new Error("
+           + json.dumps(SECRET) + "); } }); Promise = function () { throw new Error('no promise'); };")
+
+
+@pytest.mark.parametrize("script", [
+    "(async () => { " + _POISON + " await new Promise(() => {}); })()",
+    "(() => { " + _POISON + " return { filled: 1 }; })()",
+])
+def test_secret_wrapper_answer_is_a_primitive_no_page_then_can_assimilate(script):
+    observed = _run(vault._secret_wrapped(script), [])  # _run: exit 0, secret on neither stdout nor stderr
+    assert observed["raw"] == vault._PAGE_FILL_FAILED
+
+
+# Page hooks on builtins the scripts call directly: in sloppy code ``hook.caller`` is the calling function, whose
+# source embeds the value. A hook that sees it throws, so the write path visibly fails.
+_CALLER_SNOOP = """
+const snoop = (hook) => { const c = hook.caller; if (c && String(c).includes(expected)) throw new Error('source read'); };
+const hookOn = (proto, key) => { const f = proto[key]; proto[key] = function hook(...a) { snoop(hook); return f.apply(this, a); }; };
+hookOn(EventTarget.prototype, 'dispatchEvent'); hookOn(HTMLInputElement.prototype, 'getAttribute');
+hookOn(Array.prototype, 'filter'); hookOn(Array.prototype, 'map');
+"""
+
+
+@pytest.mark.parametrize("writer", ["signup", "login"])
+def test_page_hooks_cannot_read_the_script_source_through_caller(quick_settle, writer):
+    if writer == "signup":
+        observed = _run(vault._secret_wrapped(_signup_script(PAIR)), PAIR, _CALLER_SNOOP)
+        assert observed["outcome"] == "mask:11"
+    else:
+        controls = [field(autocomplete="current-password")]
+        script = build_fill_js([{"index": 1, "token": "current-password", "value": SECRET}], ORIGIN, "nonce")
+        observed = _run(vault._secret_wrapped(script), controls, _CALLER_SNOOP)
+        assert json.loads(observed["raw"]) == {"filled": 1}
+
+
+@pytest.mark.parametrize("primary,accepted", [
+    (field(name="householdPassword"), True),
+    (field(label="New password (do not reuse an existing password)"), True),
+    (field(label="New password, must differ from your old password"), True),
+    (field(name="editPassword"), False), (field(name="updatePassword"), False), (field(name="oldpassword"), False),
+    (field(name="password_reset"), False), (field(label="Current password"), False),
+    (field(label="Change your password"), False),
+])
+def test_field_intent_is_read_in_context_by_python_and_the_page_gate(quick_settle, primary, accepted):
+    controls = [primary, confirm()]
+    assert (select_signup_targets([LoginControl.from_dict(c) for c in controls]) is not None) is accepted
+    forced = SignupTargets(LoginControl.from_dict(primary), LoginControl.from_dict(confirm()))
+    observed = _run(_signup_script(controls, targets=forced), controls)
+    assert observed["outcome"] == ("mask:11" if accepted else "none")
+
+
+@pytest.mark.parametrize("filled", [
+    "".join(str(ord(ch)) for ch in "synthetic"), "1", 1.0, True, 2, -1, [1], {"n": 1},
+])
+def test_login_count_must_be_a_small_integer_and_is_never_echoed(core, filled):
+    core.inspect.return_value["result"] = json.dumps([field(autocomplete="current-password")])
+    core.write.side_effect = lambda task, script: {"success": True, "result": json.dumps({"filled": filled})}
+    result = json.loads(vault.browser_vault_fill(HANDLE))
+    assert result["success"] is False and result["error_type"] == "fill_result_unverified"
+    assert "filled_fields" not in result and str(filled) not in json.dumps(result)
+
+
 @pytest.mark.parametrize("route", ["page", "supervisor"])
 def test_every_secret_transport_gets_the_wrapper(monkeypatch, route):
     seen = []
@@ -592,7 +718,7 @@ def test_every_secret_transport_gets_the_wrapper(monkeypatch, route):
     monkeypatch.setattr(vault, "_ensure_supervisor", lambda task: sup)
     monkeypatch.setattr(vault, "_bot_desktop_browser_session", lambda task: False)
     out = vault._eval_js_secret("t", "fill()")
-    assert seen == [vault._secret_wrapped("fill()")] and seen[0].startswith("(async () => { try { return await (")
+    assert seen == [vault._secret_wrapped("fill()")] and "r = (fill());" in seen[0]
     assert out["success"] is False and out["error_type"] == "eval_failed"
 
 
