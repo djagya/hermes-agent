@@ -492,8 +492,9 @@ def held_leases_for_task(task_id: Optional[str]) -> list[dict[str, str]]:
     return out
 
 
-# Handoffs this process minted: (task, slot, agent lease) -> expiry (monotonic). The gateway's
-# handback route wakes a session only for a handoff it minted or a lease it still holds.
+# Handoffs this process minted: (task, slot, agent lease) -> expiry (monotonic). dlz: Codex recheck
+# P1 — a claim here never wakes a session on its own (the handback route needs control's
+# confirmation of the exact event for every wake); the route forgets it once the wake is admitted.
 _HANDOFF_MAX_S = 2 * 3600.0
 _handoffs_lock = threading.Lock()
 _minted_handoffs: dict[tuple[str, str, str], float] = {}
@@ -535,9 +536,9 @@ def note_handoff(task_id: Optional[str], slot_id: str, lease_id: str, expires_in
 
 def claim_handback(task_id: str, slot_id: str, lease_id: str, *, consume: bool = True) -> bool:
     """True (once) when ``task_id`` minted a handoff for this slot + agent lease, or still
-    holds that lease. A minted handoff is consumed by the claim; ``consume=False`` only checks
-    (dlz: the handback route consumes it after the wake turn is scheduled, so a failed attempt
-    can be retried)."""
+    holds that lease. A minted handoff is consumed by the claim; ``consume=False`` only checks.
+    dlz: not an authorization for a wake (control's confirmation is); the handback route
+    consumes it after the wake turn is admitted."""
     key = (str(task_id or "").strip() or "default", str(slot_id or ""), str(lease_id or ""))
     if not key[1] or not key[2]:
         return False

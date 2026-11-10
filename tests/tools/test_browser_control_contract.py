@@ -18,9 +18,9 @@ from tools import browser_payment_privacy as privacy
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_PATH = ROOT / "tests/fixtures/browser_control/control-v1.json"
-# monolith chore/v0230-handback-20261109 (durable handback event_id, /v1/handback/pending,
-# handoff_ended reason_codes incl. expired_unused), 2026-11-09
-CONTRACT_SHA256 = "00cc4c3012f5cfb1b861b266c48bb944f92da6778ab5eeb8f49bd0fc7c5a90cd"
+# monolith chore/v0230-fix-handback-20261110 (durable handback event_id, /v1/handback/pending
+# asked for every wake, handback_not_saved, handoff_ended reason_codes incl. expired_unused), 2026-11-10
+CONTRACT_SHA256 = "b11a4cb78c1d610de92e812f2091ad3a8aec16accb98d86b549fd0b92179255d"
 # The body the fork's handback route reads for B10, as declared by control-v1.
 HANDOFF_ENDED_BODY = ["event", "session_id", "slot_id", "lease_id", "reason_code", "event_id"]
 
