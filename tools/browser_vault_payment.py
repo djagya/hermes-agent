@@ -432,6 +432,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
             if refused:
                 return json.dumps(refused)
+            # dlz (Codex A3 r2 #2): the re-admission's status call can outlast the window too.
+            if time.monotonic() >= inspected.expires_at:
+                return json.dumps(_expired())
             # Never resolve at inspection/list time, on decline or on stale consent.
             raw, verdict = _resolve_card(backend, meta, bound_revision)
             if raw is None:

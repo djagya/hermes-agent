@@ -218,6 +218,24 @@ def test_consent_expiring_during_the_claim_resolves_nothing(fill):
     assert out["error_type"] == "payment_consent_expired" and "resolve" not in events
 
 
+def test_consent_expiring_during_the_final_readmission_resolves_nothing(fill):
+    # Codex A3 r2 #2: the re-admission after the claim waits on control's status; expiry is checked again
+    # after it, immediately before the card is read.
+    run, events, monkeypatch = fill
+    monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface",
+                        lambda sup, i: events.append("claim"))
+    real = bvp._ownership_refusal
+
+    def slow_readmission(vault, task_id, supervisor, inspected, lease):
+        if "claim" in events:
+            inspected.expires_at = time.monotonic() - 1
+        return real(vault, task_id, supervisor, inspected, lease)
+
+    monkeypatch.setattr(bvp, "_ownership_refusal", slow_readmission)
+    out = run()
+    assert out["error_type"] == "payment_consent_expired" and "resolve" not in events
+
+
 @pytest.fixture
 def routed(monkeypatch):
     sup = _claimed()
