@@ -10,7 +10,7 @@ from agent.vault_backends import BackendError
 from agent.vault_login_classifier import match_expiry_option, select_checkout_fills
 from agent.vault_payment_card import validate_card
 from agent.vault_payment_policy import PaymentPolicyError, effective_frame_origins
-from agent.vault_store import PAYMENT_FIELDS
+from agent.vault_store import PAYMENT_FIELDS, revision_binding
 from tools.browser_supervisor_payment import OPTIONAL_CARD_TOKENS
 
 logger = logging.getLogger(__name__)
@@ -241,11 +241,18 @@ def _binds_revisions(backend) -> bool:
     return getattr(backend, "payment_revisions", False) is True
 
 
-def _payment_item_current(backend, meta) -> bool:
+def _bound_revision(backend, meta) -> str:
+    """dlz (A8): the revision a fill binds, from metadata only: ``backend.payment_revision`` (1Password looks the
+    item's ``version`` up when its listing has none), else the listed ``meta.revision``."""
+    lookup = getattr(backend, "payment_revision", None)
+    return str((lookup(meta) if callable(lookup) else getattr(meta, "revision", "")) or "")
+
+
+def _payment_item_current(backend, meta, bound: str) -> bool:
     """Inside ``fill_context``: the card still binds what consent was given for. dlz: every backend is
-    re-read (metadata only, never a value); a backend with revisions must report the same revision the prompt
-    was shown for. A 1Password listing may come from its 60 s metadata cache; the revision op reports with
-    the revealed card is checked again in ``_resolve_card``."""
+    re-read (metadata only, never a value); a backend with revisions must report the revision ``bound`` the
+    prompt was shown for, through the same lookup. The revision op reports with the revealed card is checked
+    again in ``_resolve_card``."""
     from agent.vault_store import revision_verdict
     from tools.browser_vault_context import saved_origins
 
@@ -255,10 +262,10 @@ def _payment_item_current(backend, meta) -> bool:
             and tuple(fresh.payment_frame_origins) == tuple(meta.payment_frame_origins)
             and fresh.payment_scope == meta.payment_scope
             and (not _binds_revisions(backend)
-                 or revision_verdict(meta.revision, getattr(fresh, "revision", "")) == "match"))
+                 or revision_verdict(bound, _bound_revision(backend, fresh)) == "match"))
 
 
-def _resolve_card(backend, meta) -> tuple[dict | None, str]:
+def _resolve_card(backend, meta, bound: str) -> tuple[dict | None, str]:
     """The card's raw payload and ``match``, or ``(None, "changed"|"unavailable")`` when the revision read is
     not provably the one the prompt was shown for (the value is dropped here, unwritten). A backend without
     revisions (plugins) relies on its own fill_context and the in-context metadata re-read."""
@@ -271,7 +278,7 @@ def _resolve_card(backend, meta) -> tuple[dict | None, str]:
         secret, revision = backend.resolve_secret(meta.id), None
     if not _binds_revisions(backend):
         return secret, "match"
-    verdict = revision_verdict(meta.revision, revision)
+    verdict = revision_verdict(bound, revision)
     return (secret, verdict) if verdict == "match" else (None, verdict)
 
 
@@ -316,8 +323,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
     before its setter. Reviewed fills keep ``strict=False``.
 
     Order after consent (design v2 A6): backend context -> item revision -> live ownership -> page freshness
-    -> capture guard and local mark -> expiry -> read the card -> its revision -> fills -> commit fence
-    (ownership again, expiry) -> commit with its own per-document and per-setter checks."""
+    -> capture guard (for the approved lease only) and local mark -> expiry -> live ownership again -> read the
+    card -> its revision -> fills -> commit fence (ownership again, expiry) -> commit with its own per-document
+    and per-setter checks."""
     from tools import browser_vault_tool as vault
     from tools.approval_prompt import request_elicitation_consent
 
@@ -338,7 +346,8 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         if not bound and meta.payment_scope != "confirmed_page":
             return json.dumps({"success": False, "error_type": "no_origin", "error": _NO_ORIGIN})
         # dlz: a backend with revisions must name the card's revision now, or no prompt is shown at all.
-        if _binds_revisions(backend) and not getattr(meta, "revision", ""):
+        bound_revision = _bound_revision(backend, meta) if _binds_revisions(backend) else ""
+        if _binds_revisions(backend) and not bound_revision:
             return json.dumps({"success": False, "error_type": "payment_item_revision_unavailable",
                                "error": _REVISION_UNAVAILABLE})
         # dlz: the lease this approval is for, snapshotted before the prompt (managed mode).
@@ -374,7 +383,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         from tools.browser_vault_context import fill_context
 
         with fill_context(backend):
-            if not _payment_item_current(backend, meta):
+            if not _payment_item_current(backend, meta, bound_revision):
                 return json.dumps({"success": False, "error_type": "payment_item_changed", "error": _ITEM_CHANGED})
             # dlz: live ownership and page freshness inside the context, right before the card is read.
             refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
@@ -390,7 +399,12 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             if vault._is_managed():
                 from tools.browser_use_cli import vault_route
 
-                route = vault_route(task_id)
+                route = vault_route(task_id) or {}
+                # dlz: the guard protects the approved lease only: a route replaced meanwhile (another browser
+                # operation during the freshness pass) is not the browser this approval was for.
+                if str(route.get("lease") or "") != lease:
+                    return json.dumps({"success": False, "error_type": "payment_browser_changed",
+                                       "error": _BROWSER_CHANGED})
                 refused = _set_control_capture_guard(route, strict=strict)
                 if refused:
                     return json.dumps(refused)
@@ -403,8 +417,13 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             # before any secret is read.
             if time.monotonic() >= inspected.expires_at:
                 return json.dumps(_expired())
+            # dlz (Codex A2 r3 #3): re-admit right before the card is read: the lease the guard was set for must
+            # still be the live owner; a route replaced meanwhile refuses here, before any card byte is read.
+            refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
+            if refused:
+                return json.dumps(refused)
             # Never resolve at inspection/list time, on decline or on stale consent.
-            raw, verdict = _resolve_card(backend, meta)
+            raw, verdict = _resolve_card(backend, meta, bound_revision)
             if raw is None:
                 if verdict == "changed":
                     return json.dumps({"success": False, "error_type": "payment_item_changed",
@@ -458,6 +477,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 submitted=False,
                 page_checks=prompt["checks"],
                 merchant_reputation="human_review_required",
+                # dlz: how strongly the card read was tied to the approved item (never a value): "version",
+                # "record" (local digest), "updated_at_only" (1Password reported no version: weaker), "none".
+                revision_binding=revision_binding(bound_revision),
             )
             return json.dumps(result)
     except BackendError as exc:

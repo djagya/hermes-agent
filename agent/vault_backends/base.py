@@ -115,6 +115,11 @@ class LoginBackend(ABC):
         logins, so the base returns the password-only shape."""
         return {"password": self.resolve_password(handle)}
 
+    def payment_revision(self, meta: VaultItemMeta) -> str:
+        """The revision a card fill binds for ``meta``, from metadata only (never a value): the listed
+        ``meta.revision`` here; a backend whose listing can lack its strongest part looks it up (1Password)."""
+        return str(getattr(meta, "revision", "") or "")
+
     def resolve_payment_secret(self, handle: str) -> tuple[dict[str, str], Optional[str]]:
         """A card payload plus the revision of the item it was read from (``VaultItemMeta.revision``), both
         from one read. ``None``: this backend cannot say which revision it returned (plugins today); the

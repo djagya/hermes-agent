@@ -87,6 +87,55 @@ def test_card_fill_sets_the_control_guard_before_any_write(fill):
     assert [e for e in events if e != "admit"] == ["meta", "current", ("set", "lease-shop", "tok-shop"), "local-mark",
                                                    "resolve", "commit"]
     assert events.index("admit") < events.index("current") and events[-2:] == ["admit", "commit"]
+    # Codex A2 r3 #3: a live re-admission right before the card is read, after the guard and the mark.
+    assert events[events.index("resolve") - 1] == "admit"
+
+
+@pytest.mark.parametrize("replaced_at", ["freshness", "local_mark"])
+def test_a_route_replaced_after_admission_never_reads_the_card(fill, replaced_at):
+    """Codex A2 r3 #3: another browser operation replaces the route while the page freshness pass (or the
+    guard and mark) runs. The guard is never set for the new lease, and the card is never read."""
+    from tools import browser_vault_tool as vault
+
+    run, events, monkeypatch = fill
+    state = {"lease": "lease-shop"}
+
+    def current(i):
+        events.append("current")
+        if replaced_at == "freshness":
+            state["lease"] = "lease-new"
+        return True
+
+    def mark(task_id, surface=None):
+        events.append("local-mark")
+        if replaced_at == "local_mark":
+            state["lease"] = "lease-new"
+
+    monkeypatch.setattr(run.supervisor, "payment_is_current", current, raising=False)
+    monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session", mark)
+    monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: {
+        "lease": state["lease"], "token": "tok-" + state["lease"], "slot_id": "shopping"})
+    monkeypatch.setattr(vault, "_managed_supervisor",
+                        lambda task_id, admit=False: events.append("admit") or run.supervisor)
+    out = run((True, ""))
+    assert out["success"] is False and out["error_type"] == "payment_browser_changed"
+    assert "resolve" not in events and "commit" not in events
+    assert not any(isinstance(e, tuple) and e[1] == "lease-new" for e in events)
+
+
+@pytest.mark.parametrize("bound, binding", [
+    ("op.version=3;op.updated_at=2026-11-09T10:00:00Z", "version"),
+    ("op.updated_at=2026-11-09T10:00:00Z", "updated_at_only"),  # op reported no version: weaker, and said so
+    ("local=0123abcd", "record"),
+])
+def test_the_fill_result_says_how_strongly_the_card_read_was_bound(fill, bound, binding):
+    """Codex A2 r3 #4: the result (never the card) names the revision binding the fill relied on."""
+    run, events, _ = fill
+    run.backend.payment_revisions = True
+    run.meta.revision = bound
+    run.backend.resolve_payment_secret = lambda handle: (events.append("resolve") or {"card_number": "x"}, bound)
+    out = run((True, ""))
+    assert out["success"] is True and out["revision_binding"] == binding
 
 
 @pytest.mark.parametrize("answer, optional, filled", [
@@ -191,7 +240,7 @@ def test_a_takeover_between_prompt_and_write_never_writes_the_card(fill, at, err
     def admit(task_id, admit=False):
         admits.append(admit)
         events.append("admit")
-        if at == "lease_ended" or (at == "lease_ended_at_commit" and len(admits) == 2):
+        if at == "lease_ended" or (at == "lease_ended_at_commit" and len(admits) == 3):  # 3rd: commit fence
             raise vault._PageUnavailable("lease_unavailable", "lease ended")
         return SimpleNamespace() if at == "supervisor_replaced" else run.supervisor
 

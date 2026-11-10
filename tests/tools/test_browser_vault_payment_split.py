@@ -130,7 +130,7 @@ class _FakeSupervisor(sp.PaymentSupervisionMixin):
     async def _payment_scope_current(self, i, documents):
         return True  # pinned-scope checks are exercised over a fake CDP in _PayPalPage below
 
-    async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False):
+    async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False, paced=None):
         self.deadlines = getattr(self, "deadlines", []) + [deadline_ms]
         self.writes.append((d.origin, fills))
         return self.results.pop(0)
@@ -433,7 +433,7 @@ def test_commit_never_writes_after_the_window_closes(lapse_at):
                 inspection.expires_at = 0
             return True
 
-        async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False):
+        async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False, paced=None):
             out = await super()._commit_payment_document(d, fills, deadline_ms)
             i.expires_at = 0  # the first document's write ends after the window
             return out
@@ -626,10 +626,31 @@ n.onfocus = {none: () => {}, hide: () => { n.hidden = true; }, hide_other: () =>
   navigate: () => { location.href = 'https://psp.example/elsewhere'; }, cover: () => { cover = {}; },
   parent_transparent: () => { owner.op = '0'; }, top_replaced: () => { parentWin.location.href += '?step=2'; },
   slow_checks: () => { n.slow = true; }}[CASE.focus];
-const result = api.commit([{index: 0, token: 'cc-csc', value: '837'}, {index: 1, token: 'cc-number', value: '4242'}],
-                          CASE.focus === 'slow_checks' ? 1500 : 60000, CASE.strict);
-process.stdout.write(JSON.stringify({result, writes}));
+let result = api.commit([{index: 0, token: 'cc-csc', value: '837'}, {index: 1, token: 'cc-number', value: '4242'}],
+                        CASE.focus === 'slow_checks' ? 1500 : 60000, CASE.strict, CASE.paced === true);
+const paused = [];  // [fields written so far, setter calls so far] at each pause
+while (result && result.pending === true && paused.length < 4) {
+  paused.push([result.filled_fields, writes.length]);
+  if (CASE.paused === 'hide' && result.filled_fields === 1) n.hidden = true;  // between the pause and resume()
+  result = api.resume();
+}
+process.stdout.write(JSON.stringify({result, writes, paused}));
 """
+
+
+def _setter_harness(case: dict) -> dict:
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for the synthetic commit closure")
+    values = {"CASE": json.dumps(case), "INSPECT": sp._INSPECT}
+    harness = re.sub(r"\bCASE\b|\bINSPECT\b", lambda m: values[m.group(0)], _SETTER_HARNESS)
+    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
 
 
 @pytest.mark.parametrize("focus, strict, writes", [
@@ -643,25 +664,28 @@ process.stdout.write(JSON.stringify({result, writes}));
 def test_a_focus_handler_that_changes_the_pinned_set_stops_the_next_setter(focus, strict, writes):
     """Design v2 A5: page code runs on focus; the field is written only if the whole pinned set still holds
     right before its setter (and, strict, the field is what a click at its centre would hit)."""
-    import re
-    import shutil
-    import subprocess
-
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("Node required for the synthetic commit closure")
-    values = {"CASE": json.dumps({"focus": focus, "strict": strict}), "INSPECT": sp._INSPECT}
-    harness = re.sub(r"\bCASE\b|\bINSPECT\b", lambda m: values[m.group(0)], _SETTER_HARNESS)
-    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
-    assert run.returncode == 0, run.stderr
-    out = json.loads(run.stdout)
-    assert out["writes"] == writes
+    out = _setter_harness({"focus": focus, "strict": strict})
+    assert out["writes"] == writes and out["paused"] == []
     if len(writes) == 1:
         error_type = "payment_consent_expired" if focus == "slow_checks" else "payment_fields_changed"
         assert out["result"] == {"success": False, "error_type": error_type, "filled_fields": 1,
                                  "partially_filled": True}
     else:
         assert out["result"]["success"] is True
+
+
+@pytest.mark.parametrize("paused, writes", [("none", ["c", "n"]), ("hide", ["c"])])
+def test_a_paced_commit_pauses_after_each_focus_and_rechecks_before_the_setter(paused, writes):
+    """Codex A2 r3 #1 (closure side): paced, the commit stops after each focus with no setter run yet, and
+    resume() re-runs the local checks first: a field hidden while the supervisor checked the parents is not
+    written."""
+    out = _setter_harness({"focus": "none", "strict": True, "paced": True, "paused": paused})
+    assert out["paused"] == [[0, 0], [1, 1]] and out["writes"] == writes
+    if paused == "none":
+        assert out["result"] == {"success": True, "filled_fields": 2}
+    else:
+        assert out["result"] == {"success": False, "error_type": "payment_fields_changed", "filled_fields": 1,
+                                 "partially_filled": True}
 
 
 class _PayPalPage(sp.PaymentSupervisionMixin):
@@ -677,7 +701,8 @@ class _PayPalPage(sp.PaymentSupervisionMixin):
         self.latency, self.now, self.calls, self.writes, self.mutate = latency, 0.0, 0, [], None
         self._active, self._page_session_id, self._state_lock = True, "page", threading.Lock()
         self.frames = {f"f{n}": [f"L{n}", _PAYPAL + "/smart/card-field/f", _PAYPAL] for n in range(4)}
-        self.top_url, self.hidden, self.gone = MERCHANT + "/checkout", set(), set()
+        self.top_url, self.hidden, self.gone, self.covered = MERCHANT + "/checkout", set(), set(), set()
+        self.on_focus, self.focused = None, []
 
     async def _cdp(self, method, params=None, session_id=None, timeout=None):
         self.now += self.latency
@@ -710,21 +735,40 @@ class _PayPalPage(sp.PaymentSupervisionMixin):
             return {"result": {"object": {"objectId": "owner-" + p["backendNodeId"]}}}
         if method == "Runtime.callFunctionOn":
             fn = p["functionDeclaration"]
+            args = [a.get("value", a.get("objectId")) for a in p.get("arguments", [])]
             if fn == sp._OWNERS_SHOWN:
                 return value([o["objectId"][len("owner-"):] not in self.hidden for o in p["arguments"]])
+            scope, hit = getattr(sp, "_OWNERS_SCOPE", None), getattr(sp, "_OWNER_HIT", None)
+            if fn in (scope, hit):  # in the merchant page's pinned world
+                if args[:2] != [self.top_url, MERCHANT]:
+                    return value(None)
+                if fn == scope:
+                    return value([o[len("owner-"):] not in self.hidden for o in args[2:]])
+                frame = p["objectId"][len("owner-"):]
+                return value(None if frame in self.hidden | self.covered else [args[2] + 100, args[3] + 100])
             if "commit(" in fn:
-                if self.now * 1000 >= p["arguments"][1]["value"]:  # the renderer's own deadline (anchor 0)
+                if self.now * 1000 >= args[1]:  # the renderer's own deadline (anchor 0)
                     return value({"success": False, "error_type": "payment_consent_expired"})
-                self.writes.append(p["objectId"])
-                if self.mutate and len(self.writes) == 1:
-                    self.mutate(self)
-                return value({"success": True, "filled_fields": 1})
+                if len(args) > 3 and args[3] is True:  # paced: focused, then paused before the setter
+                    self.focused.append(p["objectId"])
+                    if self.on_focus:
+                        self.on_focus(self, p["objectId"])
+                    return value({"pending": True, "filled_fields": 0, "x": 10, "y": 10})
+                return self._write(p["objectId"])
+            if "resume()" in fn:
+                return self._write(p["objectId"])
             if "retained()" in fn:
                 return value([{"token": self.TOKENS[int(p["objectId"][1:])], "state": "held", "length": 4}])
             return value(True)  # ancestry ownerDocument check, valid()
         return {"result": {}}
 
-    def run(self, monkeypatch):
+    def _write(self, obj):
+        self.writes.append(obj)
+        if self.mutate and len(self.writes) == 1:
+            self.mutate(self)
+        return {"result": {"result": {"value": {"success": True, "filled_fields": 1}}}}
+
+    def run(self, monkeypatch, strict=False):
         """Inspect-time tree from the real discovery path, then one commit of four documents."""
         monkeypatch.setattr(sp, "time", SimpleNamespace(monotonic=lambda: self.now))
 
@@ -744,7 +788,7 @@ class _PayPalPage(sp.PaymentSupervisionMixin):
                               frame_owners={"top": ("page", [(f"f{n}", f"owner-f{n}") for n in range(4)])})
         self.now = self.calls = 0
         fills = [{"index": 0, "token": t, "value": "x", "document": n} for n, t in enumerate(self.TOKENS)]
-        return asyncio.run(self._commit_payment(i, fills, until=sp._COMMIT_BUDGET_SECONDS))
+        return asyncio.run(self._commit_payment(i, fills, until=sp._COMMIT_BUDGET_SECONDS, strict=strict))
 
 
 def test_a_four_frame_split_fill_stays_well_inside_the_budget_at_180_ms_per_round_trip(monkeypatch):
@@ -755,22 +799,26 @@ def test_a_four_frame_split_fill_stays_well_inside_the_budget_at_180_ms_per_roun
     out = page.run(monkeypatch)
     assert out == {"success": True, "filled_fields": 4, "retention_verified": True}
     assert page.writes == ["o0", "o1", "o2", "o3"]
-    # Measured: 13.16 s incl. the 2 s settle and the release pass (base 80848d4404: 11.36 s; a full rescan per
-    # document: 22.86 s, expired before the number). Each between-document check is 3 round trips.
+    # Measured: 13.70 s incl. the 2 s settle and the release pass (e330d50371: 13.16 s, next document only; base
+    # 80848d4404: 11.36 s; a full rescan per document: 22.86 s, expired before the number). The check before
+    # document k reads the k+1 receiving frames plus one owner call per parent: 3, 4, 5 round trips.
     assert page.now < 0.7 * sp._COMMIT_BUDGET_SECONDS, page.now
 
 
-@pytest.mark.parametrize("change", ["owner_hidden", "frame_navigated", "frame_gone", "top_navigated"])
+@pytest.mark.parametrize("change", ["owner_hidden", "frame_navigated", "frame_gone", "top_navigated",
+                                    # Codex A2 r3 #2: the frame that already received its fields changed
+                                    "earlier_owner_hidden", "earlier_frame_navigated", "earlier_frame_gone"])
 def test_a_later_document_is_not_written_once_the_page_changed_after_the_first(monkeypatch, change):
-    """Split checkout: the first document's handlers hide or navigate the next card frame, detach it, or move
-    the top page: the next document gets no write and the earlier one is reported."""
+    """Split checkout: the first document's handlers hide or navigate the next card frame (or the one just
+    filled), detach it, or move the top page: the next document gets no write and the earlier one is reported."""
     def mutate(page):
-        if change == "owner_hidden":
-            page.hidden.add("f1")
-        elif change == "frame_navigated":
-            page.frames["f1"][0] = "L-new"
-        elif change == "frame_gone":
-            page.gone.add("f1")
+        frame = "f0" if change.startswith("earlier_") else "f1"
+        if change.endswith("owner_hidden"):
+            page.hidden.add(frame)
+        elif change.endswith("frame_navigated"):
+            page.frames[frame][0] = "L-new"
+        elif change.endswith("frame_gone"):
+            page.gone.add(frame)
         else:
             page.top_url = MERCHANT + "/elsewhere"
 
@@ -779,6 +827,40 @@ def test_a_later_document_is_not_written_once_the_page_changed_after_the_first(m
     out = page.run(monkeypatch)
     assert out == {"success": False, "error_type": "payment_page_changed", "filled_fields": 1, "partially_filled": True}
     assert page.writes == ["o0"]
+
+
+@pytest.mark.parametrize("on_focus", ["none", "own_iframe_transparent", "merchant_url_changed", "field_covered",
+                                      "later_iframe_transparent"])
+def test_a_strict_frame_fill_checks_the_owner_chain_from_the_parent_after_each_focus(monkeypatch, on_focus):
+    """Codex A2 r3 #1: a cross-origin parent is out of the card frame's reach, and focusing the field can blur a
+    merchant input whose handler makes the iframe transparent, covers it or rewrites the merchant URL. Strict
+    fills pause after each focus; the supervisor checks the chain from the parent and the field is written only
+    if it holds. Stops before that field's setter, earlier fields reported."""
+    def focused(page, obj):
+        frame = "f" + obj[1:]
+        if on_focus == "own_iframe_transparent" and obj == "o0":
+            page.hidden.add(frame)
+        elif on_focus == "merchant_url_changed" and obj == "o0":
+            page.top_url = MERCHANT + "/checkout?step=2"
+        elif on_focus == "field_covered" and obj == "o0":
+            page.covered.add(frame)
+        elif on_focus == "later_iframe_transparent" and obj == "o1":
+            page.hidden.add(frame)
+
+    page = _PayPalPage(latency=0.18)
+    page.on_focus = focused
+    out = page.run(monkeypatch, strict=True)
+    if on_focus == "none":
+        assert out == {"success": True, "filled_fields": 4, "retention_verified": True}
+        assert page.focused == page.writes == ["o0", "o1", "o2", "o3"]
+        # Measured: 15.14 s at 180 ms per round trip (reviewed: 13.70 s; each paced field adds 2 round trips).
+        assert page.now < 0.8 * sp._COMMIT_BUDGET_SECONDS, page.now
+    elif on_focus == "later_iframe_transparent":
+        assert out == {"success": False, "error_type": "payment_page_changed", "filled_fields": 1,
+                       "partially_filled": True} and page.writes == ["o0"]
+    else:
+        assert out == {"success": False, "error_type": "payment_page_changed", "filled_fields": 0,
+                       "partially_filled": False} and page.writes == []
 
 
 def test_a_top_document_that_navigated_after_the_fill_is_reported():

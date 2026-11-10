@@ -281,6 +281,29 @@ class OnePasswordLoginBackend(LoginBackend):
         except Exception:
             raise ValueError("Payment card resolution failed") from None
 
+    def payment_revision(self, meta: VaultItemMeta) -> str:
+        """dlz (design v2 A8): version-based binding when op can give one. The listing's revision when it
+        carries ``op.version``; else one metadata ``op item get`` (no ``--reveal``; only ``version`` and
+        ``updated_at`` are kept, the rest is dropped, never logged or returned) for the item's version, the same JSON shape
+        the reveal returns. Neither has a version: the listing's ``updated_at``-only revision, which the fill
+        result reports as ``updated_at_only``. A lookup that fails refuses (typed or fixed error, no output)."""
+        from agent.vault_store import revision_binding
+
+        listed = str(getattr(meta, "revision", "") or "")
+        if revision_binding(listed) == "version":
+            return listed
+        vault_id, item_id = _split_handle(str(getattr(meta, "id", "") or ""), self.prefix)
+        if not vault_id or not item_id or vault_id.startswith("-") or item_id.startswith("-"):
+            raise ValueError("A vault-qualified card handle is required")
+        try:
+            looked = _item_revision(json.loads(self._run("item", "get", item_id, "--vault", vault_id,
+                                                         "--format", "json")))
+        except (UnlockRequired, ItemNotFound, BackendRateLimited, BackendAuthExpired, BackendNetwork):
+            raise  # typed causes carry no card data, only the scrubbed CLI error
+        except Exception:
+            raise BackendError(self.display_name, "card revision lookup failed") from None
+        return looked if revision_binding(looked) == "version" else listed
+
     def resolve_otp(self, handle: str) -> Optional[str]:
         # `--otp` mints the current TOTP from the item's one-time-password field; items without one error out.
         # A typed outage (rate budget, expired token, network, missing item) is raised so the caller does not
@@ -325,9 +348,9 @@ def _login_password(item: object, backend: str) -> str:
 
 def _item_revision(item: object) -> str:
     """The item's revision from metadata only (never a field value): ``op.version`` (1Password bumps it on
-    every edit) and ``op.updated_at``, each when op reported it. The same function reads the listing and the
-    revealed item, and ``revision_verdict`` compares the parts both carry, so a field missing from one
-    response cannot fake a change and a field missing from both cannot fake a match. "" = neither."""
+    every edit) and ``op.updated_at``, each when op reported it. The same function reads the listing, the
+    metadata lookup (``payment_revision``) and the revealed item; ``revision_verdict`` needs the same parts on
+    both sides, so a part missing from one response is never compared away. "" = neither."""
     if not isinstance(item, dict):
         return ""
     parts = []

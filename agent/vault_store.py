@@ -706,14 +706,26 @@ def _revision_parts(revision: Optional[str]) -> dict[str, str]:
 def revision_verdict(bound: Optional[str], read: Optional[str]) -> str:
     """``match`` / ``changed`` / ``unavailable`` for the revision a prompt was shown for and one read later.
 
-    dlz: compared on the parts both sides carry (a 1Password response that lacks ``version`` on one path
-    still compares on ``updated_at``), and every shared part must agree. Nothing shared - including both
-    sides empty - is ``unavailable``, never a match."""
+    dlz (Codex A2 r3 #4): both sides must carry the SAME parts, and every part must agree. A part only one
+    side has (``op.version`` from the reveal, none in the listing) is not comparable: ``unavailable``, so an
+    item edited within one ``updated_at`` value cannot pass on the timestamp alone. Both sides empty is
+    ``unavailable`` too, never a match."""
     a, b = _revision_parts(bound), _revision_parts(read)
-    shared = a.keys() & b.keys()
-    if not shared:
+    if not a or a.keys() != b.keys():
         return "unavailable"
-    return "match" if all(a[k] == b[k] for k in shared) else "changed"
+    return "match" if all(a[k] == b[k] for k in a) else "changed"
+
+
+def revision_binding(revision: Optional[str]) -> str:
+    """How strongly a bound revision ties the read card to the approved item, for the fill result (never a
+    value): ``version`` (1Password item version), ``record`` (local keyed digest), ``updated_at_only``
+    (1Password reported no version anywhere; an edit within the same timestamp is not seen), ``none``."""
+    parts = _revision_parts(revision)
+    if "op.version" in parts:
+        return "version"
+    if "local" in parts:
+        return "record"
+    return "updated_at_only" if "op.updated_at" in parts else "none"
 
 
 def get_vault_store() -> VaultStore:
