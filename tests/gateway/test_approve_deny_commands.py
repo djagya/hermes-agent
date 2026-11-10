@@ -202,6 +202,26 @@ class TestApproveCommand:
         assert e2.result == "session"
 
 
+    @pytest.mark.asyncio
+    async def test_approve_says_an_oldest_card_fill_needs_the_owners_button(self):
+        """dlz (Codex A1 P2): a typed /approve meant for a waiting card fill approves nothing else
+        and tells the user why, instead of "nothing pending"."""
+        from tools.approval import _gateway_queues
+        from tools.approval_gateway_wait import _ApprovalEntry
+        from tools.payment_consent_prompt import TYPED_APPROVE_HELD
+
+        runner = _make_runner()
+        session_key = runner._session_key_for_source(_make_source())
+        payment = _ApprovalEntry({"command": "fill", "exact_request": True, "approver": "telegram:111"})
+        ordinary = _ApprovalEntry({"command": "cmd1"})
+        _gateway_queues[session_key] = [payment, ordinary]
+
+        assert await runner._handle_approve_command(_make_event("/approve")) == TYPED_APPROVE_HELD
+        assert ordinary.result is None and payment.result is None
+        result = await runner._handle_approve_command(_make_event("/approve all"))
+        assert ordinary.result == "once" and payment.result is None and TYPED_APPROVE_HELD in result
+
+
 # ------------------------------------------------------------------
 # /deny command
 # ------------------------------------------------------------------

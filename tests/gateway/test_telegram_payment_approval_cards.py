@@ -259,3 +259,36 @@ def test_undeliverable_payment_card_raises_so_the_prompt_is_unavailable(monkeypa
         _turn_runner(adapter, GROUP)._render_approval_sync(data)
     Plain.send.assert_not_called()
     Plain.send_exec_approval.assert_not_called()
+
+
+def test_a_card_that_posts_after_the_delivery_timeout_is_retired(monkeypatch):
+    """Codex A1 review P3: the wait gives up after SEND_TIMEOUT_S, but Telegram may still post the
+    card later. That late card must lose its buttons, not look live for a withdrawn request."""
+    import concurrent.futures
+    from gateway import payment_approval
+    from tools import approval_context
+    monkeypatch.setattr(approval_context, "payment_approver", lambda: OWNER)
+    monkeypatch.setattr(payment_approval, "SEND_TIMEOUT_S", 0.01)
+
+    class Card:
+        send = AsyncMock()
+        send_exec_approval = AsyncMock()
+        send_payment_approval = AsyncMock(return_value=SimpleNamespace(success=True, message_id="9"))
+        retire_payment_card = AsyncMock()
+
+    scheduled, send = [], concurrent.futures.Future()
+
+    def schedule(coro, _msg, loop=None):
+        scheduled.append(coro)
+        coro.close()  # the adapter calls are AsyncMocks: only the scheduling matters here
+        return send if len(scheduled) == 1 else concurrent.futures.Future()
+
+    runner = _turn_runner(Card(), OWNER_ID)
+    runner._schedule = schedule
+    data = dict(_pending(exact_request=True, approver=OWNER, payment=_facts().to_dict()).data)
+    with pytest.raises(payment_approval.PaymentCardUndeliverable):
+        payment_approval.deliver(runner, data)
+    assert len(scheduled) == 1
+    send.set_result(SimpleNamespace(success=True, message_id="9"))  # the card posts late
+    assert len(scheduled) == 2
+    Card.retire_payment_card.assert_called_once_with(data["request_id"], "unavailable")

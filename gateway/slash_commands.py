@@ -1227,6 +1227,17 @@ class GatewaySlashCommandsMixin(
             return session_key, t(stale_key)
         return session_key, t(none_key)
 
+    @staticmethod
+    def _card_fill_held(session_key: str, resolve_all: bool) -> str:
+        """dlz: the reply line when typed /approve left a card fill pending, else ''. Bare /approve
+        stops at a card fill that is oldest (it never approves a later prompt instead); /approve all
+        approves the others and leaves it. Only the owner's button approves it (tools.approval)."""
+        from tools.approval import list_gateway_approvals
+        from tools.payment_consent_prompt import TYPED_APPROVE_HELD
+        waiting = list_gateway_approvals(session_key)
+        exact = [d for d in (waiting if resolve_all else waiting[:1]) if d.get("exact_request")]
+        return TYPED_APPROVE_HELD if exact else ""
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve — unblock waiting agent thread(s). They block inside tools/approval.py;
         signalling the event resumes them so the command executes inline (same flow as the CLI)."""
@@ -1239,10 +1250,14 @@ class GatewaySlashCommandsMixin(
         args = event.get_command_args().strip().lower().split()
         choices = {_APPROVE_CHOICE_BY_ARG[a] for a in args if a in _APPROVE_CHOICE_BY_ARG}
         choice = "always" if "always" in choices else "session" if "session" in choices else "once"
-        count = resolve_gateway_approval(session_key, choice, resolve_all="all" in args)
+        resolve_all = "all" in args
+        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        held = self._card_fill_held(session_key, resolve_all)
         if not count:
-            return t("gateway.approve.no_pending")
+            return held or t("gateway.approve.no_pending")
         confirmation_text = t(f"gateway.approve.{choice}_{'plural' if count > 1 else 'singular'}", count=count)
+        if held:
+            confirmation_text += "\n" + held
         logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
         return await self._deliver_approval_confirmation(event, confirmation_text, "approve")
 

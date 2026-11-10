@@ -179,8 +179,9 @@ def resolve_gateway_approval(session_key: str, choice: str,
     relayed to the agent in the BLOCKED message. Returns the number resolved.
 
     dlz: an entry this resolver may not settle (see ``_entry_accepts``) stays pending and is not
-    counted: FIFO and ``resolve_all`` skip exact entries for every choice but ``deny``, and an
-    approver-bound entry ignores a non-deny choice from anyone else. *approver* is the
+    counted: ``resolve_all`` skips exact entries for every choice but ``deny``; bare FIFO settles
+    nothing when the oldest entry is one it may not settle (it never moves on to a later one); and
+    an approver-bound entry ignores a non-deny choice from anyone else. *approver* is the
     authenticated principal of the resolver (only the Telegram button path sets it).
     """
     with _lock:
@@ -193,9 +194,12 @@ def resolve_gateway_approval(session_key: str, choice: str,
             matching = [entry for entry in queue if entry.data.get("request_id") == request_id
                         and (exact_id is not None or not entry.data.get("exact_request"))]
             targets = [entry for entry in matching if _entry_accepts(entry, choice, approver, by_id=True)]
+        elif resolve_all:
+            targets = [entry for entry in queue if _entry_accepts(entry, choice, approver, by_id=False)]
         else:
-            eligible = [entry for entry in queue if _entry_accepts(entry, choice, approver, by_id=False)]
-            targets = eligible if resolve_all else eligible[:1]
+            # Bare FIFO means "the oldest": when this resolver may not settle the oldest (a payment
+            # needs its owner's button), settle nothing rather than the next one the user never meant.
+            targets = queue[:1] if _entry_accepts(queue[0], choice, approver, by_id=False) else []
         if not targets:
             return 0
         queue[:] = [entry for entry in queue if entry not in targets]

@@ -27,6 +27,20 @@ def _approver_user_id(approver) -> str:
     return user_id
 
 
+def _retire_if_sent_late(turn_runner, adapter, fut, request_id: str) -> None:
+    """The prompt is already unavailable (the wait withdraws it). The send is not cancelled, since a
+    cancelled in-flight send could still post a card that was never armed; instead a card that posts
+    after this (Telegram's own deadline is longer than ``SEND_TIMEOUT_S``) is retired at once, so no
+    card with live-looking buttons outlives its request."""
+    def done(f) -> None:
+        if f.cancelled() or f.exception() is not None or not getattr(f.result(), "success", False):
+            return
+        turn_runner._schedule(adapter.retire_payment_card(request_id, "unavailable"),
+                              "late payment card retire scheduling error")
+
+    fut.add_done_callback(done)
+
+
 def deliver(turn_runner, approval_data: dict) -> None:
     """Send the card through the session's own Telegram adapter to the approver's private chat,
     arm the card's retirement for when the prompt settles, and post the neutral notice to a group."""
@@ -58,6 +72,7 @@ def deliver(turn_runner, approval_data: dict) -> None:
     try:
         result = fut.result(timeout=SEND_TIMEOUT_S)
     except Exception as exc:  # timeout included: a card that may have posted is still unavailable
+        _retire_if_sent_late(turn_runner, adapter, fut, request_id)
         raise PaymentCardUndeliverable(f"payment card send failed: {type(exc).__name__}") from None
     if not getattr(result, "success", False):
         raise PaymentCardUndeliverable("payment card send failed")
