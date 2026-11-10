@@ -152,4 +152,5 @@ def test_secret_write_re_admits_after_a_takeover_during_the_code_prompt(monkeypa
     lease.acquire("human")  # takeover while the prompt was open
     res = vault._eval_js_secret("default", "fill()")
     assert res["success"] is False and res["error_type"] == "human_has_control"
-    assert evaluated == ["fill()"], "the credential must not reach the page under a human lease"
+    # One evaluation (the agent's), wrapped so a page exception is answered in-page.
+    assert evaluated == [vault._secret_wrapped("fill()")], "the credential must not reach the page under a human lease"

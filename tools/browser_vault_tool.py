@@ -124,9 +124,25 @@ def _managed_supervisor(task_id: str, *, admit: bool = False):
                                f"Could not open the vault's CDP connection to the managed browser: {cause}") from None
 
 
-# A secret-bearing script runs inside this wrapper on a page backend, so a page exception is answered
-# in-page and its message (which may quote the script) never reaches the backend's error path or logs.
-_PAGE_FILL_FAILED = {"hermes_vault_eval_failed": True}
+# A secret-bearing script runs inside this wrapper on EVERY transport (CDP supervisor and plugin page
+# backends), so a page exception is answered in-page and its message (which may quote the script or, after
+# a write, carry the value a page handler read back) never reaches a backend's error path or logs.
+# Every answer is a string primitive: an object (the old sentinel, or anything a hooked JSON.stringify
+# returns) would be assimilated through a page-defined ``then`` outside any catch. An async script is
+# observed with the Promise intrinsics captured BEFORE it runs: its value or rejection lands on the wrapper's
+# own promise, never passing through a page-reachable ``then``/``await``. Strict mode (inherited by the
+# wrapped script): a page function the script calls gets ``.caller === null``, never the secret-bearing source.
+_PAGE_FILL_FAILED = "hermes_vault_eval_failed"
+
+
+def _secret_wrapped(expression: str) -> str:
+    failed = json.dumps(_PAGE_FILL_FAILED)
+    return ("(() => { \"use strict\"; const F = " + failed + "; const P0 = Promise, then0 = Promise.prototype.then, "
+            "apply = Reflect.apply; let r; try { r = (" + expression + "); } catch (_) { return F; } "
+            "if (typeof r === \"string\") return r; let settle = null; "
+            "try { const done = new P0((ok) => { settle = ok; }); "
+            "apply(then0, r, [(v) => { settle(typeof v === \"string\" ? v : F); }, () => { settle(F); }]); "
+            "return done; } catch (_) { return F; } })()")
 
 
 def _page_backend(task_id: str):
@@ -141,10 +157,8 @@ def _page_backend(task_id: str):
 
 
 def _page_eval(backend: Any, task_id: str, expression: str, *, secret: bool) -> dict[str, Any]:
-    """Evaluate on a plugin page backend. On the secret path every failure gets fixed text."""
-    if secret:
-        expression = ("(() => { try { return (" + expression + "); } catch (_) { return "
-                      + json.dumps(_PAGE_FILL_FAILED) + "; } })()")
+    """Evaluate on a plugin page backend. On the secret path every failure gets fixed text (the caller,
+    _eval_js_secret, has already wrapped the expression with _secret_wrapped)."""
     try:
         result = backend.evaluate(task_id, expression, secret=secret)
     except Exception as exc:  # health: allow BLE001 -- plugin failure becomes a typed refusal
@@ -218,6 +232,7 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     nothing is written. A plugin browser holding the task's page (no CDP endpoint) carries the
     expression over its own transport instead; see ``agent.browser_page_backend``.
     """
+    expression = _secret_wrapped(expression)
     page = _page_backend(task_id)  # always None in managed mode
     supervisor = None
     if page is None:
@@ -254,6 +269,8 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     if page is not None:
         return _page_eval(page, task_id, expression, secret=True)
     sup = supervisor.evaluate_runtime(expression)
+    if sup.get("ok") and _parse_json_result(sup.get("result")) == _PAGE_FILL_FAILED:
+        return {"success": False, "error_type": "eval_failed", "error": "The browser could not run the vault script"}
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {
@@ -687,7 +704,9 @@ def browser_vault_enter_code(
             parsed = _parse_json_result(parsed)
         if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
             return json.dumps({"success": False, "error_type": "origin_changed", "error": "The page navigated before the code could be entered. Nothing was written."})
-        filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+        filled = _filled_count(parsed, len(fills))
+        if filled is None:
+            return json.dumps(_FILL_UNVERIFIED)
         return json.dumps({"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
                            "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
@@ -713,13 +732,14 @@ def browser_vault_enter_code(
     return write(typed, "user")
 
 
-def _inspect_fill_controls(task_id: str, nonce: str, kind: str) -> tuple[list, list, Optional[str]]:
-    """``(raw_controls, classified, refusal)`` for this inspection's stamps; nothing secret is involved yet."""
+def _inspect_fill_controls(task_id: str, nonce: str, kind: str, bind: str = "") -> tuple[list, list, Optional[str]]:
+    """``(raw_controls, classified, refusal)`` for this inspection's stamps (and, with ``bind``, its identity
+    marks for the signup writer); nothing secret is involved yet."""
     from agent.vault_login_classifier import (
         ClassifiedLoginControl, LoginControl, build_inspection_js, classify_checkout_control, classify_login_control,
     )
 
-    inspect = _eval_js(task_id, build_inspection_js(nonce))
+    inspect = _eval_js(task_id, build_inspection_js(nonce, bind))
     if not inspect.get("success"):
         return [], [], json.dumps(
             {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
@@ -755,27 +775,48 @@ def _no_match_hint(kind: str, raw_controls: list, classified: list) -> str:
     return "Read the form: the right page or step may not be open yet. Do not retry the same fill unchanged."
 
 
-def _parse_fill_result(fill_result: dict, page_origin: str, secret: Any) -> tuple[Any, Optional[str]]:
-    """``(parsed, refusal)``: the native write's JSON, or the origin_changed refusal (secret-scrubbed)."""
-    from agent.vault_store import scrub_secret_from_text
+def _parse_fill_result(fill_result: dict, page_origin: str, refusal_tag: str = "") -> tuple[Any, Optional[str]]:
+    """``(parsed, refusal)``: the native write's JSON, or the origin_changed refusal.
 
+    The answer is page-produced: no page string is echoed (a forged ``found`` could carry an encoded value),
+    and with ``refusal_tag`` the no-write claim is made only when the answer carries this fill's tag, which
+    the script returns solely from its pre-write origin check."""
     parsed = _parse_json_result(fill_result.get("result"))
     if isinstance(parsed, str):
         parsed = _parse_json_result(parsed)
     if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
+        if refusal_tag and parsed.get("tag") != refusal_tag:
+            return parsed, json.dumps(_FILL_UNVERIFIED)
         return parsed, json.dumps(
             {
                 "success": False,
                 "error_type": "origin_changed",
                 "error": (
                     "Refused: the page navigated away from the bound origin "
-                    f"({page_origin}) before the fill could run "
-                    f"(now on {scrub_secret_from_text(str(parsed.get('found') or 'unknown'), secret)}). "
-                    "Nothing was written."
+                    f"({page_origin}) before the fill could run. Nothing was written."
                 ),
             }
         )
     return parsed, None
+
+
+_FILL_UNVERIFIED = {
+    "success": False, "error_type": "fill_result_unverified",
+    "error": "The page answered the fill with a result Hermes could not verify; the value may have been written. "
+             "Nothing was submitted. Do not submit or retry; check the page and tell the user.",
+}
+
+
+def _filled_count(parsed: Any, most: int) -> Optional[int]:
+    """The write script's ``filled`` count, or None when the page-produced answer is not a plain integer in
+    ``0..most``: a string or float (a hooked JSON.stringify can return ``{"filled": "<char codes>"}``) is never
+    converted or echoed. A dict without ``filled`` counts as 0 (nothing claimed)."""
+    if not isinstance(parsed, dict):
+        return 0
+    filled = parsed.get("filled", 0)
+    if type(filled) is not int or not 0 <= filled <= most:  # bool is not a count either
+        return None
+    return filled
 
 
 def _register_redactions(values: Any) -> Optional[str]:
@@ -865,7 +906,8 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
 
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-    raw_controls, classified, refusal = _inspect_fill_controls(effective_task_id, nonce, meta.kind)
+    bind = secrets.token_hex(8)  # never in the DOM: names the identity marks the signup writer checks
+    raw_controls, classified, refusal = _inspect_fill_controls(effective_task_id, nonce, meta.kind, bind)
     if refusal:
         return refusal
     signup_target, refusal = signup.gate(purpose, raw_controls, handle, meta.label, page_origin,
@@ -907,29 +949,38 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     if refusal:
         return refusal
 
+    tokens = signup.outcome_tokens() if signup_target is not None else None
+    refusal_tag = "hv-" + secrets.token_hex(12)
     try:
         fill_result = _eval_js_secret(
-            effective_task_id, signup.fill_expression(fills, page_origin, nonce, signup_target)
+            effective_task_id, signup.fill_expression(fills, page_origin, nonce, signup_target, bind=bind,
+                                                      tokens=tokens, refusal_tag=refusal_tag)
         )
     except Exception as exc:  # health: allow BLE001 -- any CDP failure becomes a typed result; its text is scrubbed of the secret
-        return json.dumps(
+        return signup.uncertain(signup_target, backend.name, meta.kind, page_origin) or json.dumps(
             {"success": False, "error": scrub_secret_from_text(str(exc), secret)}
         )
     if not fill_result.get("success"):
+        # dlz: a signup write may have landed before the transport failed: never "nothing written".
+        unsure = signup.uncertain(signup_target, backend.name, meta.kind, page_origin)
+        if unsure:
+            return unsure
         err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
         out = {"success": False, "error": err}
         if fill_result.get("error_type"):
             out["error_type"] = fill_result["error_type"]
         return json.dumps(out)
 
-    parsed, refusal = _parse_fill_result(fill_result, page_origin, secret)
+    if signup_target is not None:  # its answer is one of this fill's outcome tokens, never page JSON
+        return signup.finish(fill_result.get("result"), backend.name, meta.kind, page_origin, signup_target, tokens)
+    parsed, refusal = _parse_fill_result(fill_result, page_origin, refusal_tag)
     if refusal:
         return refusal
-    if signup_target is not None:
-        return signup.finish(parsed, backend.name, meta.kind, page_origin)
-    filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
+    filled = _filled_count(parsed, len(fills))
+    if filled is None:
+        return json.dumps(_FILL_UNVERIFIED)
 
-    out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
+    out = {"success": bool(filled), "filled_fields": filled, "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
     if meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"
@@ -1100,7 +1151,9 @@ def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, se
         parsed = _parse_json_result(parsed)
     if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
         return refuse("origin_changed", "The page navigated before the fill could run. Nothing was written.")
-    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+    filled = _filled_count(parsed, len(fills))
+    if filled is None:
+        return refuse(_FILL_UNVERIFIED["error_type"], _FILL_UNVERIFIED["error"])
     if filled < len(fills):
         return refuse("fill_incomplete", f"Only {filled} of {len(fills)} fields took a value; the form was not "
                                          "submitted. Inspect the form and retry with secret_field/identifier_field.",
@@ -1189,9 +1242,13 @@ BROWSER_VAULT_SCHEMA = {
         "duplicate or ambiguous fields, a missing number/CVC/expiry and unlisted origins are refused; HTTPS is not a "
         "seller reputation check: verify the merchant and checkout terms before requesting consent; it never "
         "submits; purpose=signup separately asks the user to approve account creation with this exact login item "
-        "on its exact origin, then fills one unambiguous new-password field on a registration form only; "
-        "confirmation-password, mixed login, OTP and recovery forms are refused; stop on signup_declined when its "
-        "consent_outcome is refused; timeout or unavailable is not a refusal: ask the user to approve once more); "
+        "on its exact origin, then fills one unambiguous new-password field on a registration form, plus its ONE "
+        "explicitly labelled confirm-password field in the same form when there is one (same password in both); "
+        "ambiguous password pairs, a third password, mixed login, OTP and recovery forms are refused; stop on "
+        "signup_declined when its consent_outcome is refused; timeout or unavailable is not a refusal: ask the user "
+        "to approve once more; it succeeds only when every approved field holds the password after the page "
+        "settled: signup_fill_partial, signup_form_changed, signup_fields_not_retained or signup_fill_uncertain mean "
+        "a field may hold it, so do not submit or retry, tell the user); "
         "save_login (nothing saved for this site: the user "
         "enters it in a masked prompt, Hermes saves and fills it); enter_code (a one-time/2FA code after the "
         "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
@@ -1221,7 +1278,9 @@ BROWSER_VAULT_SCHEMA = {
         "(browser_exec/browser_cdp reads there return payment_surface_protected): payment_controls lists its "
         "buttons, links and checkboxes ({ref, role, text, disabled}; never inputs, digits masked); payment_click "
         "(ref) makes one trusted click on a listed control. The user's chat go for the purchase covers pressing "
-        "Pay there; never click Pay without it."
+        "Pay there; never click Pay without it. "
+        "fill_result_unverified: the page's answer to a fill could not be verified and a field may hold the "
+        "password; do not submit or retry, tell the user."
     ),
     "parameters": {
         "type": "object",
@@ -1234,7 +1293,8 @@ BROWSER_VAULT_SCHEMA = {
             "purpose": {"type": "string", "enum": ["login", "signup"], "default": "login",
                         "description": "fill only: login preserves current-password behavior; signup requires fresh "
                                        "native approval to create an account with this exact login item and origin. "
-                                       "Only one explicit new-password input is supported; never submits."},
+                                       "Fills one explicit new-password input, or that input plus one explicitly "
+                                       "labelled confirm-password input in the same form; never submits."},
             "secret_field": {"type": "string", "description":
                 "letter_login only: the field for the letter's password/code (name, id or visible label) when not recognised."},
             "identifier_field": {"type": "string", "description":
