@@ -45,8 +45,8 @@ async def _press_telegram_card(request_id):
     adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
     await adapter.send_exec_approval(chat_id="1", command="rm -rf build", session_key=SESSION, request_id=request_id)
     query = AsyncMock()
-    query.data = f"ea:once:{next(iter(adapter._approval_state))}"
-    query.message = SimpleNamespace(chat_id=1, chat=SimpleNamespace(type="private"))
+    query.data = f"ea:once:{next(iter(adapter._approval_cards))}"
+    query.message = SimpleNamespace(chat_id=1, message_id=42, chat=SimpleNamespace(type="private"))
     query.from_user = SimpleNamespace(id=1, first_name="Alice")
     with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}):
         await adapter._handle_callback_query(SimpleNamespace(callback_query=query), MagicMock())

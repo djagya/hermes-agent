@@ -383,3 +383,24 @@ def _get_approval_transport_config() -> tuple[str, str | None]:
         # prompt on a built-in surface the operator may not be watching.
         return "config-error", None
     return selected or "builtin", "builtin" if fallback == "builtin" else None
+
+
+def payment_approver() -> str | None:
+    """dlz: ``approvals.payment_approver``, the one principal whose button approves a card fill:
+    ``"telegram:<numeric user id>"``, listed by id in the platform-wide ``TELEGRAM_ALLOWED_USERS``
+    (so the bot may DM that user; a ``*`` wildcard or a group-scoped list does not count). None when
+    unset or invalid: payment prompts are then unavailable, never shown to someone else."""
+    raw = _get_approval_config().get("payment_approver")
+    if not isinstance(raw, str):
+        return None
+    platform, _, user_id = raw.strip().partition(":")
+    if platform != "telegram" or not user_id.isascii() or not user_id.isdigit():
+        return None
+    try:
+        from gateway.platforms._shared import platform_gate_env
+        allowed = platform_gate_env("TELEGRAM_ALLOWED_USERS")
+    except Exception:
+        return None
+    if user_id not in {uid.strip() for uid in allowed.split(",")}:
+        return None
+    return f"telegram:{user_id}"

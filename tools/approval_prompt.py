@@ -306,7 +306,8 @@ def _remembered_consent(session_key: str, choice, remember_key: str | None, unre
 def request_elicitation_consent(message: str, description: str, *,
                                 timeout_seconds: int | None = None,
                                 surface: str = "mcp-elicitation", title: str = "Confirm this action?",
-                                remember_key: str | None = None, outcome: dict | None = None) -> str:
+                                remember_key: str | None = None, outcome: dict | None = None,
+                                payment: dict | None = None) -> str:
     """Route an MCP elicitation request to the surface owning the active session:
     gateway sessions through ``_await_gateway_decision``, CLI/TUI through
     ``prompt_dangerous_approval``. Always fails closed: a missing notify_cb in a
@@ -320,13 +321,74 @@ def request_elicitation_consent(message: str, description: str, *,
 
     ``outcome``, when given, receives ``outcome["reason"]``: one of ``accepted``, ``refused``,
     ``timeout`` or ``unavailable`` (see ``_consent_reason``). The verdict itself is unchanged, so
-    callers that only read the return value behave exactly as before."""
+    callers that only read the return value behave exactly as before.
+
+    dlz: a ``vault-payment`` prompt (``payment`` holds ``PaymentPromptFacts.to_dict()``) takes
+    :func:`_elicit_payment` instead: owner-only Telegram card, once/deny, never coalesced; when it
+    cannot be shown, ``outcome["detail"]`` carries the fixed next-step text."""
+    if surface == "vault-payment" or payment is not None:
+        verdict, reason, detail = _elicit_payment(message, description, timeout_seconds=timeout_seconds,
+                                                  payment=payment)
+        if outcome is not None:
+            outcome["reason"] = reason
+            if detail:
+                outcome["detail"] = detail
+        return verdict
     # dlz: typed consent outcome (fork) on top of upstream's remember_key recording.
     verdict, reason = _elicit(message, description, timeout_seconds=timeout_seconds, surface=surface, title=title,
                               remember_key=remember_key)
     if outcome is not None:
         outcome["reason"] = reason
     return verdict
+
+
+def _elicit_payment(message: str, description: str, *, timeout_seconds: int | None,
+                    payment: dict | None) -> tuple[str, str, str]:
+    """dlz: a card-fill approval: ``(verdict, reason, detail)``.
+
+    Shown only as the payment card in the owner's private Telegram chat, by a gateway notifier that
+    renders it (``renders_payment_cards``). The entry is an exact request (own minted id, once/deny,
+    never coalesced) bound to ``approvals.payment_approver``, so only the owner's button accepts and
+    every other resolver can only deny. Anything else (no approver, CLI/TUI panel, api_server, a
+    notifier that cannot render the card, invalid facts) is ``unavailable`` before anything is shown."""
+    from tools import approval as _a
+    from tools import payment_consent_prompt as _pay
+
+    unavailable = ("decline", "unavailable")
+    if payment is None:
+        return (*unavailable, _pay.UNAVAILABLE_FACTS)
+    try:
+        _pay.PaymentPromptFacts.from_dict(payment)
+    except Exception:  # health: allow BLE001 -- malformed facts: nothing is shown
+        return (*unavailable, _pay.UNAVAILABLE_FACTS)
+    approver = _ctx.payment_approver()
+    if approver is None:
+        return (*unavailable, _pay.UNAVAILABLE_APPROVER)
+    try:
+        session_key = _ctx.get_current_session_key()
+    except Exception:  # pragma: no cover -- defensive
+        return (*unavailable, _pay.UNAVAILABLE_SURFACE)
+    if _ctx._no_user_can_answer() or not _ctx._is_gateway_approval_context():
+        return (*unavailable, _pay.UNAVAILABLE_SURFACE)
+    notify_cb = _a._gateway_notify_cb(session_key)
+    if notify_cb is None or not getattr(notify_cb, "renders_payment_cards", False):
+        return (*unavailable, _pay.UNAVAILABLE_SURFACE)
+    approval_data = {"command": message, "description": description, "pattern_key": "mcp_elicitation",
+                     "pattern_keys": ["mcp_elicitation"], "allow_session": False, "allow_permanent": False,
+                     "exact_request": True, "approver": approver, "payment": dict(payment)}
+    try:
+        decision = _gw._await_gateway_decision(session_key, notify_cb, approval_data, surface="vault-payment",
+                                               timeout_s=timeout_seconds)
+    except Exception as exc:
+        logger.error("Payment approval dispatch failed: %s", type(exc).__name__)
+        return (*unavailable, _pay.UNAVAILABLE_INCOMPLETE)
+    if decision.get("notify_failed"):
+        return (*unavailable, _pay.UNAVAILABLE_INCOMPLETE)
+    if not decision.get("resolved") or decision.get("cancelled"):
+        return "cancel", "timeout", ""
+    if decision.get("choice") == "once":
+        return "accept", "accepted", ""
+    return "decline", "refused", ""
 
 
 def _elicit(message: str, description: str, *, timeout_seconds: int | None,

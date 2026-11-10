@@ -188,7 +188,8 @@ def _payment_item_unchanged(backend, meta) -> bool:
 
 def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
     from tools import browser_vault_tool as vault
-    from tools.approval_prompt import request_elicitation_consent
+    from tools.payment_consent_prompt import (
+        UNAVAILABLE_FACTS, PaymentConsent, facts_for_inspection, request_payment_approval)
 
     try:
         supervisor = vault._ensure_supervisor(task_id)
@@ -209,23 +210,20 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             frame_origins=effective_frame_origins(meta.payment_frame_origins),
         )
         prompt = inspected.prompt()
-        consent_detail: dict = {}
-        consent = request_elicitation_consent(
-            f"Fill '{meta.label}' on {prompt['merchant_origin']}",
-            f"Card fields will be sent to {prompt['target_origin']}. HTTPS and the selected document/fields "
-            "were checked. These checks do not establish seller legitimacy: verify the seller and the "
-            "checkout terms independently. This one-use approval expires after 120 seconds; the native "
-            "tool only fills and never submits payment.",
-            surface="vault-payment",
-            title="Approve card fill on this merchant?",
-            outcome=consent_detail,
-            # dlz: the prompt closes with the inspection window, not the global approval timeout.
-            timeout_seconds=_remaining_seconds(inspected),
-        )
-        if consent != "accept":
+        # dlz: the owner-only payment card (tools.payment_consent_prompt): every fact or no prompt.
+        try:
+            facts = facts_for_inspection(inspected, card_label=meta.label)
+        except Exception:  # health: allow BLE001 -- facts out of bounds: no prompt, no fill
+            facts = None
+        consent = (request_payment_approval(facts, timeout_seconds=_remaining_seconds(inspected)) if facts is not None
+                   else PaymentConsent("unavailable", "unavailable", UNAVAILABLE_FACTS))
+        if not consent.accepted:
             # Stop here: no secret resolved, no field written. A refusal is payment_declined, a missing
             # answer payment_consent_missing; both stop, and consent_outcome says why.
-            return json.dumps(_consent_not_given(consent, consent_detail.get("reason")))
+            refusal = _consent_not_given(consent.verdict, consent.reason)
+            if consent.detail:
+                refusal["error"] += " " + consent.detail
+            return json.dumps(refusal)
         if time.monotonic() >= inspected.expires_at:
             return json.dumps({"success": False, "error_type": "payment_consent_expired", "error": _CONSENT_EXPIRED})
         if not supervisor.payment_is_current(inspected):

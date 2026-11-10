@@ -32,6 +32,10 @@ class PendingControls:
             if 'edit' in data:
                 prompt['edit'] = deepcopy(data['edit'])
                 prompt['choices'] = ['once', 'deny']
+            if data.get('approver'):
+                # dlz: an owner-bound prompt (card fill) is approved only by the owner's Telegram button;
+                # a viewer can only deny it (tools.approval.resolve_gateway_approval enforces this too).
+                prompt['choices'] = ['deny']
             if timeout_s is not None:
                 prompt['timeout_s'] = timeout_s
             self.pending[prompt_id] = (route, prompt)

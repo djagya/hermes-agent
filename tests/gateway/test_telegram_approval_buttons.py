@@ -32,6 +32,13 @@ def _make_adapter(extra=None):
     return adapter
 
 
+def _arm_card(adapter, nonce, session_key, *, chat_id=12345, message_id=7, request_id=None):
+    """Record a sent ``ea:`` card the way ``send_exec_approval`` does (nonce-bound to its message)."""
+    adapter._arm_approval_card(nonce, "ea", SimpleNamespace(chat_id=chat_id, message_id=message_id),
+                               chat_id=str(chat_id), session_key=session_key, request_id=request_id,
+                               choices=("once", "session", "always", "deny"))
+
+
 class _AuthRunner:
     """Minimal runner shim for callback auth tests."""
 
@@ -212,14 +219,15 @@ class TestTelegramApprovalCallback:
         rest of a long-running turn after a button click.
         """
         adapter = _make_adapter()
-        adapter._approval_state[5] = "agent:main:telegram:group:12345:99"
+        _arm_card(adapter, "n5", "agent:main:telegram:group:12345:99")
         adapter.pause_typing_for_chat("12345")
         assert "12345" in adapter._typing_paused
 
         query = AsyncMock()
-        query.data = "ea:once:5"
+        query.data = "ea:once:n5"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 7
         query.from_user = MagicMock()
         query.from_user.first_name = "Norbert"
         query.from_user.id = "12345"
@@ -240,12 +248,13 @@ class TestTelegramApprovalCallback:
     @pytest.mark.asyncio
     async def test_approval_callback_escapes_dynamic_user_name(self):
         adapter = _make_adapter()
-        adapter._approval_state[3] = "agent:main:telegram:group:12345:99"
+        _arm_card(adapter, "n3", "agent:main:telegram:group:12345:99")
 
         query = AsyncMock()
-        query.data = "ea:once:3"
+        query.data = "ea:once:n3"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 7
         query.from_user = MagicMock()
         query.from_user.first_name = "Alice_Bob"
         query.answer = AsyncMock()
@@ -366,11 +375,12 @@ async def test_resolved_approval_keeps_the_request_and_appends_the_decision():
     from telegram.error import BadRequest
     for edit_fails in (False, True):
         adapter = _make_adapter()
-        adapter._approval_state[7] = "agent:main:telegram:group:12345:99"
+        _arm_card(adapter, "n7", "agent:main:telegram:group:12345:99")
         query = AsyncMock()
-        query.data = "ea:once:7"
+        query.data = "ea:once:n7"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_id = 7
         prompt_html = "<b>Dangerous command</b>\n<pre>rm -rf ./build &amp;&amp; ls</pre>\nReason: delete"
         query.message.text_html = prompt_html + adapter._ea_deadline_line()  # moot once decided: dropped
         query.from_user = MagicMock(first_name="Ana & Bo", id="12345")
@@ -394,10 +404,10 @@ async def test_resolved_approval_network_error_does_not_overwrite_the_prompt():
     have landed must not replace the kept prompt."""
     from telegram.error import TimedOut
     adapter = _make_adapter()
-    adapter._approval_state[7] = "agent:main:telegram:group:12345:99"
+    _arm_card(adapter, "n7", "agent:main:telegram:group:12345:99")
     query = AsyncMock()
-    query.data = "ea:once:7"
-    query.message = MagicMock(chat_id=12345, text_html="<b>Dangerous command</b>\n<pre>rm -rf ./build</pre>")
+    query.data = "ea:once:n7"
+    query.message = MagicMock(chat_id=12345, message_id=7, text_html="<b>Dangerous command</b>\n<pre>rm -rf ./build</pre>")
     query.from_user = MagicMock(first_name="Ana", id="12345")
     query.edit_message_text = AsyncMock(side_effect=[TimedOut("timed out"), None])
     with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False), \

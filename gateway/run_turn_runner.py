@@ -716,9 +716,19 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             authority.register_approval(session_id, generation, self._ctx.session_key, approval_data,
                                         timeout_s=local_viewer_events.prompt_timeout_s(self, "approval"))
 
+    # dlz: this notifier renders card-fill approvals (``gateway.payment_approval``); a notifier without
+    # the marker makes ``tools.approval_prompt._elicit_payment`` return unavailable before queueing.
+    _approval_notify_sync.renders_payment_cards = True
+
     def _render_approval_sync(self, approval_data: dict) -> None:
         """Send the approval request from the agent thread: the adapter's interactive button
         approvals (``send_exec_approval``) when available, else plain text with ``/approve`` steps."""
+        if "payment" in approval_data:
+            # dlz: the owner's private payment card or nothing; raising makes the prompt unavailable,
+            # and the text /approve fallback below is never used for a card fill.
+            from gateway.payment_approval import deliver
+            deliver(self, approval_data)
+            return
         from gateway.run import _approval_send_outcome, _format_exec_approval_fallback, _interim_metadata, _redact_approval_command
         from gateway.run_turn_runner_approval_settle import register_timeout_notice
         ctx = self._ctx

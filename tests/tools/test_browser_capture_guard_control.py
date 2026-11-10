@@ -23,7 +23,10 @@ def fill(monkeypatch):
     events = []
     inspected = SimpleNamespace(
         consumed=False, merchant_origin="https://shop.test", frame_origin="https://psp.test",
-        documents=(), expires_at=time.monotonic() + 120,
+        # One card document: the owner's approval card is built from it (payment_consent_prompt).
+        operation_id="f" * 32, documents=(SimpleNamespace(origin="https://psp.test",
+                                                          controls=(SimpleNamespace(token="cc-number"),)),),
+        expires_at=time.monotonic() + 120,
         target_origins=("https://psp.test",),
         prompt=lambda: {"merchant_origin": "https://shop.test", "target_origin": "https://psp.test",
                         "fields": ["cc-number"], "checks": []})
