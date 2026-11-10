@@ -209,25 +209,34 @@ def claim_payment_surface(supervisor: Any, inspected: Any) -> Optional[dict]:
     return None
 
 
-def _surface(supervisor: Any) -> Optional[_Surface]:
-    """The supervisor's protected set, refreshed from control; the last known set on failure."""
+def _refresh(supervisor: Any) -> tuple[Optional[_Surface], bool]:
+    """(the supervisor's protected set refreshed from control, whether THIS refresh succeeded and control
+    named this connection the native one). A failed or malformed refresh keeps the last known set (fail
+    closed) and is never native."""
     with _LOCK:
         known = _SURFACES.get(supervisor)
     if known is None:
-        return None
+        return None, False
     try:
         reply = _wait(supervisor._cdp(STATUS_METHOD, {}, timeout=5), supervisor._loop, timeout=7)
-        status = reply.get("result") or {}
+        status = reply.get("result") if isinstance(reply, dict) else None
+        if not isinstance(status, dict):
+            raise SurfaceRefused("malformed status")
     except Exception:  # health: allow BLE001 -- control unreachable: keep the protection (fail closed)
-        return known
+        return known, False
     if status.get("protected") is not True:
         with _LOCK:
             if _SURFACES.get(supervisor) is known:
                 _SURFACES.pop(supervisor, None)
-        return None
+        return None, False
     known.frames = frozenset(status.get("frames") or known.frames)
     known.targets = frozenset(status.get("targets") or known.targets)
-    return known
+    return known, status.get("native") is True
+
+
+def _surface(supervisor: Any) -> Optional[_Surface]:
+    """The supervisor's protected set, refreshed from control; the last known set on failure."""
+    return _refresh(supervisor)[0]
 
 
 def protected_frames(supervisor: Any) -> frozenset:
@@ -528,9 +537,14 @@ async def _click(sup: Any, surface: _Surface, ref: str, progress: list, deadline
 
 
 def _run(supervisor: Any, coro_factory, progress: list | None = None) -> dict:
-    surface = _surface(supervisor)
+    surface, native = _refresh(supervisor)
     if surface is None:
         return _refusal("payment_surface_none", "No protected card frame on this page: use browser_exec as usual.")
+    if not native:
+        # Only the connection control confirmed (just now) as the surface's native owner may act inside it.
+        return _refusal(UNAVAILABLE, "Browser control did not confirm that this connection holds the protected "
+                                     "card frame, so the native action did not run; nothing was clicked. Finish "
+                                     "on the merchant page or ask the user.")
     # Taken before the wait starts, so the press deadline always falls before the caller's timeout.
     deadline = time.monotonic() + _ACTION_TIMEOUT_S - _PRESS_MARGIN_S
     try:
