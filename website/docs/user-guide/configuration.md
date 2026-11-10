@@ -3157,6 +3157,17 @@ approvals:
 
 Patterns are case-insensitive fnmatch globs and must be quoted in YAML (a bare leading `*` is a parse error). See [Security — User-Defined Deny Rules](./security.md#user-defined-deny-rules-approvalsdeny) for details.
 
+### Card-fill approver
+
+`approvals.payment_approver` names the one account that may approve a saved-card fill (`browser_vault` payment actions). It must be a Telegram user written as `telegram:<numeric id>`, and that id must also be listed explicitly in `TELEGRAM_ALLOWED_USERS` (a `*` wildcard does not count). Empty (the default) means no card fill can be approved: every fill returns unavailable and names this setting.
+
+```yaml
+approvals:
+  payment_approver: "telegram:123456789"
+```
+
+The approval card is sent only to that user's private chat, with "Approve fill once" and "Deny" buttons. Every other surface — typed `/approve`, `/approve all`, the CLI/TUI, the API server, other platforms and other group members — can only deny a card fill.
+
 ### Custom smart-approval policy
 
 `approvals.smart_policy` lets you append your own rules to the smart-approval reviewer's instructions. When set, the text is added to the guardian LLM's system prompt (the trusted channel — never alongside the untrusted command text), so you can tighten or relax its judgment for your environment without editing code:
