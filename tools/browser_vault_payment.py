@@ -415,6 +415,14 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             # before any secret is read.
             if time.monotonic() >= inspected.expires_at:
                 return json.dumps(_expired())
+            # dlz: A9: browser-control must confirm this supervisor's claim on the card documents before
+            # any value exists in the page; another connection holding them refuses the fill.
+            if vault._is_managed():
+                from tools.browser_payment_surface import claim_payment_surface
+
+                refused = claim_payment_surface(supervisor, inspected)
+                if refused:
+                    return json.dumps(refused)
             # dlz (Codex A2 r3 #3): re-admit right before the card is read: the lease the guard was set for must
             # still be the live owner; a route replaced meanwhile refuses here, before any card byte is read.
             refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)

@@ -65,6 +65,9 @@ def fill(monkeypatch):
     monkeypatch.setattr(bvp, "_document_fills", lambda i, s: [{"index": 0, "token": "cc-number", "document": 0}])
     monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session",
                         lambda task_id, surface=None: events.append("local-mark"))
+    # A9: control confirms the payment-surface claim (tests/tools/test_browser_payment_surface.py).
+    monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface",
+                        lambda sup, i: events.append("claim"))
     meta = SimpleNamespace(id="h", kind="payment", label="Card", allowed_origins=("https://shop.test",), origin=None,
                            payment_scope="bound", payment_frame_origins=())
     backend = SimpleNamespace(name="local", get_meta=lambda handle: events.append("meta") or meta,
@@ -88,9 +91,9 @@ def test_card_fill_sets_the_control_guard_before_any_write(fill):
     # dlz: design v2 A6 order: item re-read, live lease admission, page freshness, then the guard and the local
     # mark BEFORE the card is read, and a second admission (commit fence) before the write.
     assert [e for e in events if e != "admit"] == ["meta", "current", ("set", "lease-shop", "tok-shop"), "local-mark",
-                                                   "resolve", "commit"]
+                                                   "claim", "resolve", "commit"]
     assert events.index("admit") < events.index("current") and events[-2:] == ["admit", "commit"]
-    # Codex A2 r3 #3: a live re-admission right before the card is read, after the guard and the mark.
+    # A9 claim after the guard and mark; Codex A2 r3 #3: a live re-admission right before the card is read.
     assert events[events.index("resolve") - 1] == "admit"
 
 
