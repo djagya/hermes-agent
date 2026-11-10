@@ -34,7 +34,8 @@ class FakeSup:
         threading.Thread(target=self._loop.run_forever, daemon=True).start()
         self._ws, self._state_lock = object(), threading.Lock()
         self._page_session_id, self._active = "S-page", True
-        self.calls, self.status = [], {"protected": True, "frames": ["CARD"], "targets": ["CARD"]}
+        self.calls, self.status = [], {"protected": True, "native": True, "frames": ["CARD"],
+                                        "targets": ["CARD"]}
         self.hit, self.at_point = True, 77
         self.on = on or self.default
         self.delays = {}  # method -> seconds before its reply (a slow Chrome)
@@ -396,6 +397,33 @@ def test_payment_click_refuses(change, error_type):
         sup.status = {"protected": False}
     assert surface.payment_click(sup, ref)["error_type"] == error_type
     assert not sup.sent("Input.dispatchMouseEvent")
+
+
+@pytest.mark.parametrize("status", [
+    {"protected": True, "native": False, "frames": ["CARD"], "targets": ["CARD"]},  # another connection holds it
+    {"protected": True, "frames": ["CARD"], "targets": ["CARD"]},  # control did not say native
+    RuntimeError("control unreachable"),  # no fresh status: the cached set is not enough to act
+    None,  # malformed reply (no result): not fresh either, and the gate keeps the set
+])
+def test_native_actions_need_a_fresh_native_status(status):
+    # Codex A3 r2 hardening: the native actions run only when control confirms, on this very refresh,
+    # that this connection is the surface's native owner. Otherwise they refuse before touching the card.
+    sup = _claimed()
+    ref = surface.payment_controls(sup)["controls"][0]["ref"]
+    base, before = sup.on, len(sup.calls)
+
+    def on(method, params, session):
+        if method == "Hermes.paymentSurfaceStatus":
+            if isinstance(status, Exception):
+                raise status
+            return status
+        return base(method, params, session)
+
+    sup.on = on
+    for out in (surface.payment_controls(sup), surface.payment_click(sup, ref)):
+        assert out["error_type"] == "payment_surface_unavailable" and "did not run" in out["error"]
+    assert {c[0] for c in sup.calls[before:]} == {"Hermes.paymentSurfaceStatus"}
+    assert "CARD" in surface.protected_frames(sup)
 
 
 _LISTER_HARNESS = r"""
