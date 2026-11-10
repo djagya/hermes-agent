@@ -151,6 +151,10 @@
       "code": "scope_denied",
       "status": 403
     },
+    "handback_not_saved": {
+      "code": "unavailable",
+      "status": 503
+    },
     "cdp_relay_missing": {
       "code": "unavailable",
       "status": 409
@@ -574,13 +578,14 @@
         "token",
         "ask (new_link, on an expired link)"
       ],
-      "reply": "303 /handoff/control + session cookie; a re-tap of a used link while its session lives: 303 /handoff/control (this browser) or 409 page (another device), never a second session; ask=new_link on an expired unused link: 200 page, and handoff_ended reason_code=expired_unused is sent to the minting session once",
+      "reply": "303 /handoff/control + session cookie; a re-tap of a used link while its session lives: 303 /handoff/control (this browser) or 409 page (another device), never a second session; ask=new_link on an expired unused link: 200 page only once handoff_ended reason_code=expired_unused is saved in the outbox for the minting session (sent once); not saved: handback_not_saved page, the link stays askable",
       "errors": [
         "handoff_unavailable",
         "handoff_link_expired",
         "handoff_lease_changed",
         "handoff_origin_denied",
         "handoff_held",
+        "handback_not_saved",
         "handoff_json_required",
         "cdp_relay_missing",
         "slot_busy_human",

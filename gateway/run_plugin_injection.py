@@ -187,19 +187,30 @@ class GatewayPluginInjectionMixin:
 
     async def _dispatch_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str, plugin_home: Optional[Path] = None,
+        expected_session_id: str = "", admission_id: str = "",
     ) -> bool:
-        """Route a plugin-triggered turn through the session's live adapter."""
+        """Route a plugin-triggered turn through the session's live adapter.
+
+        dlz: ``expected_session_id`` — the conversation the caller authorized; the key is looked up
+        again here, and a key that now resolves to another conversation (/new, a reset) is refused,
+        never redirected. ``admission_id`` — the caller's idempotency key: under a session authority
+        it becomes the durable FIFO request id, so the same id admitted twice (a retry after a lost
+        reply or a gateway restart) is the one admission, not a second turn."""
         if not self._plugin_injection_accepting():
             return False
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None or not self._plugin_injection_accepting():
+            return False
+        if expected_session_id and entry.session_id != expected_session_id:
+            logger.warning("Plugin message injection refused: plugin=%s session=%s now resolves to session_id=%s, "
+                           "not the authorized %s", plugin_id, session_key, entry.session_id, expected_session_id)
             return False
 
         from gateway.session_identity import replace_source
         source = replace_source(self._restored_source(entry))
         if source.platform == Platform.LOCAL:
             return await self._dispatch_plugin_local_injection(source, entry, content=content, plugin_id=plugin_id,
-                                                               plugin_home=plugin_home)
+                                                               plugin_home=plugin_home, admission_id=admission_id)
         if not self._plugin_messaging_session_owned(session_key, plugin_home=plugin_home, plugin_id=plugin_id):
             return False
         if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=f"session={session_key}"):
@@ -212,7 +223,7 @@ class GatewayPluginInjectionMixin:
         async with self._plugin_injection_scope(source):
             admitted = await self._admit_plugin_injection(
                 adapter, source, session_key=session_key, session_id=entry.session_id,
-                content=content, plugin_id=plugin_id)
+                content=content, plugin_id=plugin_id, admission_id=admission_id)
             if admitted is not None:
                 return admitted
             await adapter.handle_message(MessageEvent(
@@ -231,7 +242,8 @@ class GatewayPluginInjectionMixin:
         return True
 
     async def _dispatch_plugin_local_injection(self, source: SessionSource, entry, *, content: str,
-                                               plugin_id: str, plugin_home: Optional[Path]) -> bool:
+                                               plugin_id: str, plugin_home: Optional[Path],
+                                               admission_id: str = "") -> bool:
         """A local (CLI/TUI/Desktop) session has no messaging adapter or chat allowlist: the plugin
         turn is committed to its FIFO on the live session's own source and adapter, as a bot delivery
         is, only when the plugin's own profile's authority holds the session (checked before entering
@@ -242,7 +254,7 @@ class GatewayPluginInjectionMixin:
         async with self._plugin_injection_scope(source, plugin_home):
             return bool(await self._admit_plugin_injection(
                 self._adapter_for_source(live.source), live.source, session_key=entry.session_key,
-                session_id=entry.session_id, content=content, plugin_id=plugin_id))
+                session_id=entry.session_id, content=content, plugin_id=plugin_id, admission_id=admission_id))
 
     def _served_profile_for_home(self, home: Optional[Path]) -> Optional[str]:
         """Name of the profile this gateway serves at *home* (a plugin manager's immutable home), or
@@ -362,12 +374,17 @@ class GatewayPluginInjectionMixin:
 
     async def _admit_plugin_injection(
         self, adapter, source: SessionSource, *, session_key: str, session_id: str, content: str,
-        plugin_id: str,
+        plugin_id: str, admission_id: str = "",
     ) -> Optional[bool]:
         """Under a session authority, commit the plugin turn into the session's durable FIFO as a
         trusted producer admission (the heartbeat / completion seam) instead of running it on the
         in-process lane beside an admitted turn. ``None`` means no authority serves this scope and
-        the caller keeps the standalone adapter path; a refused admission is ``False``, logged."""
+        the caller keeps the standalone adapter path; a refused admission is ``False``, logged.
+
+        dlz: a caller ``admission_id`` is the FIFO request id (the store's UNIQUE principal/target/
+        request key), so its replay is the existing admission, across restarts. A replay whose
+        borrowed route envelope changed since (a newer human turn) conflicts on the payload digest;
+        the row at that identity already exists, so it too counts as admitted, never as a second turn."""
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
         if authority is None:
@@ -375,7 +392,8 @@ class GatewayPluginInjectionMixin:
         import json
         import uuid
         from hermes_state_runtime import RuntimeStoreError
-        identity = json.dumps(["plugin", plugin_id, session_key, uuid.uuid4().hex], separators=(",", ":"))
+        identity = json.dumps(["plugin", plugin_id, session_key, admission_id or uuid.uuid4().hex],
+                              separators=(",", ":"))
         event = MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
             allow_gateway_control=False, message_id=identity,
@@ -384,9 +402,30 @@ class GatewayPluginInjectionMixin:
         try:
             await authority.admit_automation(adapter, event, identity)
         except RuntimeStoreError as exc:
+            if admission_id and exc.reason == "admission_conflict" and await asyncio.to_thread(
+                    _admission_exists, authority, session_key, session_id, identity):
+                logger.info("Plugin message injection already admitted: plugin=%s session=%s id=%s",
+                            plugin_id, session_key, admission_id)
+                return True
             logger.warning("Plugin message injection refused by the session authority: plugin=%s session=%s (%s)",
                            plugin_id, session_key, exc.reason)
             return False
         logger.info("Plugin message injection admitted: plugin=%s session=%s session_id=%s",
                     plugin_id, session_key, session_id)
         return True
+
+
+def _admission_exists(authority, session_key: str, session_id: str, identity: str) -> bool:
+    """dlz: an automation admission already holds this exact identity (any status) for the session's
+    admission owner: its compression root or reset fork, or the physical id."""
+    from gateway.session_authorities import admission_owner
+    from hermes_state_runtime import find_session_admission
+    owners = {session_id}
+    for resolve in (authority.logical_owner, lambda sid: admission_owner(authority, sid)):
+        try:
+            owners.add(resolve(session_id))
+        except Exception:  # a lineage read failing only narrows the lookup
+            logger.debug("admission owner lookup failed", exc_info=True)
+    return any(find_session_admission(authority.db, principal_id="automation:" + session_key,
+                                      session_id=owner, request_id=identity) is not None
+               for owner in owners if owner)
