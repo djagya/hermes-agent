@@ -66,13 +66,17 @@ def test_every_resolver_but_the_owner_can_only_deny():
     assert entry.result == "deny"
 
 
-def test_fifo_approve_skips_the_payment_and_takes_the_next_ordinary_prompt():
+def test_fifo_approve_stops_at_an_oldest_payment_and_approve_all_skips_it():
+    """Codex A1 review P2: bare /approve meant for the oldest (a payment) must not approve the
+    ordinary prompt queued after it. /approve all approves the ordinary ones and leaves the payment."""
     payment = _queue_payment()
     ordinary = _ApprovalEntry({"command": "rm -rf build"})
     with approval._lock:
         approval._gateway_queues[SESSION].append(ordinary)
-    assert approval.resolve_gateway_approval(SESSION, "once") == 1
-    assert ordinary.result == "once" and payment.result is None
+    assert approval.resolve_gateway_approval(SESSION, "once") == 0
+    assert ordinary.result is None and payment.result is None
+    assert approval.resolve_gateway_approval(SESSION, "once", resolve_all=True) == 1
+    assert ordinary.result == "once" and payment.result is None and approval.has_blocking_approval(SESSION)
 
 
 def test_identical_exact_requests_are_never_coalesced():

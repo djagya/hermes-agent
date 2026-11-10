@@ -45,6 +45,9 @@ _UNSAFE_TEXT_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u206
 APPROVE_LABEL = "Approve fill once"
 DENY_LABEL = "Deny"
 GROUP_NOTICE = "Card-fill approval sent to the owner privately."
+# Reply to a typed /approve that a waiting card fill stopped (FIFO) or that skipped it (/approve all).
+TYPED_APPROVE_HELD = ("A card fill is waiting: only the owner's Approve button in the private Telegram chat "
+                      "approves it. Typed /approve does not; /deny refuses it.")
 
 PAGE_MATCH_LINES = {
     "matched": "Page check: the page shows this total (text check only).",
