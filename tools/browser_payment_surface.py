@@ -19,8 +19,12 @@ the runtime's half:
   on a listed control at its hit-tested centre.
 
 The protected set is refreshed from control (``Hermes.paymentSurfaceStatus``), so it
-lifts here when control's watcher sees the card frame navigate away. A failed refresh
-keeps the last known set (fail closed).
+lifts here when control's watcher sees the card frame navigate away. Malformed data never
+removes protection: the status reply goes through one strict parser (:func:`_parse_status`),
+and only a valid reply narrows or clears the set. A failed or malformed refresh, or one that
+raced a claim (the set changed while it was in flight), keeps the newest, wider set. Every
+write to the set bumps a generation; a claim also bumps a claim epoch, and a ``browser_cdp``
+call over the native socket that overlaps a claim is withheld (:func:`supervisor_route_call`).
 """
 
 from __future__ import annotations
@@ -92,6 +96,50 @@ class _Surface:
 
 _LOCK = threading.Lock()
 _SURFACES: weakref.WeakKeyDictionary[Any, _Surface] = weakref.WeakKeyDictionary()
+# Under _LOCK: _GEN counts every write to a supervisor's set, _EPOCH every claim registered (a
+# widening), _CLAIMING the claims still in flight. A refresh applies control's answer only when the
+# generation it started from is still current and no claim is in flight.
+_GEN: weakref.WeakKeyDictionary[Any, int] = weakref.WeakKeyDictionary()
+_EPOCH: weakref.WeakKeyDictionary[Any, int] = weakref.WeakKeyDictionary()
+_CLAIMING: weakref.WeakKeyDictionary[Any, int] = weakref.WeakKeyDictionary()
+_MAX_STATUS_IDS = 256
+
+
+def _set_surface(sup: Any, surface: Optional[_Surface]) -> None:
+    """The only writer of ``_SURFACES``; caller holds ``_LOCK``."""
+    if surface is None:
+        _SURFACES.pop(sup, None)
+    else:
+        _SURFACES[sup] = surface
+    _GEN[sup] = _GEN.get(sup, 0) + 1
+
+
+def _ids(value: Any) -> Optional[frozenset]:
+    """A list of non-empty string ids, or None (malformed)."""
+    if not isinstance(value, list) or len(value) > _MAX_STATUS_IDS:
+        return None
+    if not all(isinstance(item, str) and item for item in value):
+        return None
+    return frozenset(value)
+
+
+def _parse_status(reply: Any) -> Optional[tuple[bool, bool, frozenset, frozenset]]:
+    """``(protected, native, frames, targets)`` from a ``Hermes.paymentSurfaceStatus`` reply, or None
+    when it is not exactly control's shape: ``result`` with bool ``protected``/``native`` and id lists
+    ``frames``/``targets``, non-empty when protected and empty (and not native) when not. A malformed
+    reply is a failed refresh, never "unprotected"."""
+    result = reply.get("result") if isinstance(reply, dict) else None
+    if not isinstance(result, dict):
+        return None
+    protected, native = result.get("protected"), result.get("native")
+    frames, targets = _ids(result.get("frames")), _ids(result.get("targets"))
+    if type(protected) is not bool or type(native) is not bool or frames is None or targets is None:
+        return None
+    if protected and (not frames or not targets):
+        return None
+    if not protected and (frames or targets or native):
+        return None
+    return protected, native, frames, targets
 
 
 def _refusal(error_type: str, message: str) -> dict:
@@ -162,32 +210,40 @@ async def _claim(sup: Any, inspected: Any) -> _Surface:
         else:
             provisional = _Surface(existing.frames | frozenset(frames), existing.targets | frozenset(targets),
                                    existing.oopif or oopif, ws)
-        _SURFACES[sup] = provisional
+        _set_surface(sup, provisional)
+        _EPOCH[sup] = _EPOCH.get(sup, 0) + 1
+        _CLAIMING[sup] = _CLAIMING.get(sup, 0) + 1
     try:
-        reply = await sup._cdp(CLAIM_METHOD, {"frames": frames, "targets": targets}, timeout=_CLAIM_TIMEOUT_S)
-        result = reply.get("result") if isinstance(reply, dict) else None
-        if not isinstance(result, dict) or result.get("claimed") is not True or sup._ws is not ws:
-            raise SurfaceRefused("claim not confirmed")
-        held_frames = frozenset(result.get("frames") or ())
-        held_targets = frozenset(result.get("targets") or ())
-        if not set(frames) <= held_frames or not set(targets) <= held_targets:
-            raise SurfaceRefused("claim does not cover the card documents")
-    except BaseException as exc:
-        # Only control's own refusal proves nothing changed: restore what was protected before (an earlier
-        # fill stays protected). On any uncertain failure keep the wider provisional scope; the next status
-        # refresh (_surface) narrows it to control's real set or lifts it.
-        if _control_refused(exc):
-            with _LOCK:
-                if _SURFACES.get(sup) is provisional:
-                    if existing is None:
-                        _SURFACES.pop(sup, None)
-                    else:
-                        _SURFACES[sup] = existing
-        raise
-    confirmed = _Surface(held_frames, held_targets, any(t != inspected.page_id for t in held_targets), ws)
-    with _LOCK:
-        _SURFACES[sup] = confirmed
-    return confirmed
+        try:
+            reply = await sup._cdp(CLAIM_METHOD, {"frames": frames, "targets": targets},
+                                   timeout=_CLAIM_TIMEOUT_S)
+            result = reply.get("result") if isinstance(reply, dict) else None
+            if not isinstance(result, dict) or result.get("claimed") is not True or sup._ws is not ws:
+                raise SurfaceRefused("claim not confirmed")
+            held_frames, held_targets = _ids(result.get("frames")), _ids(result.get("targets"))
+            if held_frames is None or held_targets is None:
+                raise SurfaceRefused("claim reply malformed")
+            if not set(frames) <= held_frames or not set(targets) <= held_targets:
+                raise SurfaceRefused("claim does not cover the card documents")
+        except BaseException as exc:
+            # Only control's own refusal proves nothing changed: restore what was protected before (an
+            # earlier fill stays protected). On any uncertain failure keep the wider provisional scope; the
+            # next valid status refresh (_surface) narrows it to control's real set or lifts it.
+            if _control_refused(exc):
+                with _LOCK:
+                    if _SURFACES.get(sup) is provisional:
+                        _set_surface(sup, existing)
+            raise
+        # Control's whole set, never narrower than what this cache already protects.
+        with _LOCK:
+            current = _SURFACES.get(sup) or provisional
+            confirmed = _Surface(held_frames | current.frames, held_targets | current.targets,
+                                 current.oopif or any(t != inspected.page_id for t in held_targets), ws)
+            _set_surface(sup, confirmed)
+        return confirmed
+    finally:
+        with _LOCK:
+            _CLAIMING[sup] = _CLAIMING.get(sup, 1) - 1
 
 
 def claim_payment_surface(supervisor: Any, inspected: Any) -> Optional[dict]:
@@ -211,27 +267,30 @@ def claim_payment_surface(supervisor: Any, inspected: Any) -> Optional[dict]:
 
 def _refresh(supervisor: Any) -> tuple[Optional[_Surface], bool]:
     """(the supervisor's protected set refreshed from control, whether THIS refresh succeeded and control
-    named this connection the native one). A failed or malformed refresh keeps the last known set (fail
-    closed) and is never native."""
+    named this connection the native one). Only a valid status reply (:func:`_parse_status`) that did not
+    race a claim narrows or clears the set; anything else returns the newest set (fail closed), never
+    native."""
     with _LOCK:
-        known = _SURFACES.get(supervisor)
+        known, gen = _SURFACES.get(supervisor), _GEN.get(supervisor, 0)
     if known is None:
         return None, False
     try:
-        reply = _wait(supervisor._cdp(STATUS_METHOD, {}, timeout=5), supervisor._loop, timeout=7)
-        status = reply.get("result") if isinstance(reply, dict) else None
-        if not isinstance(status, dict):
-            raise SurfaceRefused("malformed status")
+        status = _parse_status(_wait(supervisor._cdp(STATUS_METHOD, {}, timeout=5), supervisor._loop, timeout=7))
     except Exception:  # health: allow BLE001 -- control unreachable: keep the protection (fail closed)
-        return known, False
-    if status.get("protected") is not True:
-        with _LOCK:
-            if _SURFACES.get(supervisor) is known:
-                _SURFACES.pop(supervisor, None)
-        return None, False
-    known.frames = frozenset(status.get("frames") or known.frames)
-    known.targets = frozenset(status.get("targets") or known.targets)
-    return known, status.get("native") is True
+        status = None
+    with _LOCK:
+        current = _SURFACES.get(supervisor)
+        if status is None or _GEN.get(supervisor, 0) != gen or _CLAIMING.get(supervisor):
+            # Malformed, failed, or stale: a claim (or another refresh) changed the set while this reply
+            # was in flight, so the reply may predate it. Decide against the newest set.
+            return current, False
+        protected, native, frames, targets = status
+        if not protected:
+            _set_surface(supervisor, None)
+            return None, False
+        fresh = _Surface(frames, targets, known.oopif, known.ws)
+        _set_surface(supervisor, fresh)
+        return fresh, native
 
 
 def _surface(supervisor: Any) -> Optional[_Surface]:
@@ -339,14 +398,53 @@ def supervisor_route_refusal(supervisor: Any, frame_id: str, method: str, params
     surface = _surface(supervisor)
     if surface is None:
         return None
-    reason = _denial(low, params if isinstance(params, dict) else {},
-                     protected_session=_session_protected(supervisor, frame_id, session_id, surface),
-                     surface=surface)
+    if params is not None and not isinstance(params, dict):
+        reason = "malformed params are refused while a payment frame is protected"
+    else:
+        reason = _denial(low, params or {},
+                         protected_session=_session_protected(supervisor, frame_id, session_id, surface),
+                         surface=surface)
     if not reason:
         return None
     return _refusal(PROTECTED, f"{reason}. The card frame is protected after a card fill until it navigates "
                                "away; continue with browser_vault payment_controls / payment_click or the "
                                "merchant page.")
+
+
+_OVERLAP_TEXT = ("A card fill started while this browser_cdp call ran, so {what}. Continue with browser_vault "
+                 "payment_controls / payment_click or the merchant page.")
+
+
+def supervisor_route_call(supervisor: Any, frame_id: str, method: str, params: Any, session_id: Optional[str],
+                          timeout: float) -> dict:
+    """``browser_cdp(frame_id=…)`` over the native socket: the gate, then the call, serialized with claims.
+
+    Returns ``{"refusal": dict}`` or ``{"reply": msg}`` (exceptions from the call propagate). The claim
+    epoch is read before the gate decides; the call is sent only if no claim registered since (checked on
+    the supervisor loop, where claims register, right before the send), and its reply is withheld if one
+    registered while it ran (an ``awaitPromise`` started before a fill must not return a value after it)."""
+    with _LOCK:
+        epoch = _EPOCH.get(supervisor, 0)
+    refused = supervisor_route_refusal(supervisor, frame_id, method, params, session_id)
+    if refused:
+        return {"refusal": refused}
+
+    async def send() -> Optional[dict]:
+        with _LOCK:
+            if _EPOCH.get(supervisor, 0) != epoch:
+                return None
+        return await supervisor._cdp(method, params or {}, session_id=session_id, timeout=timeout)
+
+    # _wait cancels the send on a timeout, so a call reported as failed is never sent later.
+    reply = _wait(send(), supervisor._loop, timeout=timeout + 2)
+    if reply is None:
+        return {"refusal": _refusal(PROTECTED, _OVERLAP_TEXT.format(what="it was not sent"))}
+    with _LOCK:
+        overlapped = _EPOCH.get(supervisor, 0) != epoch
+    if overlapped:
+        return {"refusal": _refusal(PROTECTED, _OVERLAP_TEXT.format(
+            what="its reply was withheld (the command itself may have run)"))}
+    return {"reply": reply}
 
 
 # ------------------------------------------------------------ native actions

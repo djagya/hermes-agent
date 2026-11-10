@@ -357,22 +357,17 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
         return tool_error("CDP supervisor loop is not running. Try reconnecting with /browser connect.")
 
     # dlz: A9: this socket is the runtime's native one, which browser-control cannot tell apart from
-    # the payment code; refuse here what control refuses on every other connection after a card fill.
-    from tools.browser_payment_surface import supervisor_route_refusal
-
-    refused = supervisor_route_refusal(supervisor, frame_id, method, params or {}, child_sid)
-    if refused:
-        return json.dumps(refused)
+    # the payment code; refuse here what control refuses on every other connection after a card fill,
+    # serialized with claims (a call that overlaps a card fill's claim is not sent or its reply withheld).
+    from tools.browser_payment_surface import supervisor_route_call
 
     try:
-        from agent.async_utils import safe_schedule_threadsafe
-        fut = safe_schedule_threadsafe(
-            supervisor._cdp(method, params or {}, session_id=child_sid, timeout=timeout), loop)  # type: ignore[attr-defined]
-        if fut is None:
-            return tool_error("CDP call via supervisor failed: loop unavailable", cdp_docs=CDP_DOCS_URL)
-        result_msg = fut.result(timeout=timeout + 2)
+        routed = supervisor_route_call(supervisor, frame_id, method, params, child_sid, timeout)
     except Exception as exc:
         return tool_error(f"CDP call via supervisor failed: {type(exc).__name__}: {exc}", cdp_docs=CDP_DOCS_URL)
+    if "refusal" in routed:
+        return json.dumps(routed["refusal"])
+    result_msg = routed["reply"]
 
     return json.dumps({"success": True, "method": method, "frame_id": frame_id, "session_id": child_sid,
                        "result": result_msg.get("result", {})}, ensure_ascii=False)

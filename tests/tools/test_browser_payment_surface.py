@@ -291,7 +291,7 @@ def test_browser_cdp_via_supervisor_keeps_other_frames_and_lifts_with_control(ro
     out, forwarded = call("Hermes.claimPaymentSurface", "ADS", {"frames": ["ADS"], "targets": ["ADS"]})
     assert out["error_type"] == "payment_surface_protected" and not forwarded
     # Control's watcher saw the card frame navigate away: the gate lifts here too.
-    sup.status = {"protected": False, "frames": [], "targets": []}
+    sup.status = {"protected": False, "native": False, "frames": [], "targets": []}
     assert call("Runtime.evaluate", "CARD")[1]
 
 
@@ -394,14 +394,14 @@ def test_payment_click_refuses(change, error_type):
     sup.hit = change != "covered"
     sup.at_point = 99 if change == "overlay" else 77
     if change == "lifted":
-        sup.status = {"protected": False}
+        sup.status = {"protected": False, "native": False, "frames": [], "targets": []}
     assert surface.payment_click(sup, ref)["error_type"] == error_type
     assert not sup.sent("Input.dispatchMouseEvent")
 
 
 @pytest.mark.parametrize("status", [
     {"protected": True, "native": False, "frames": ["CARD"], "targets": ["CARD"]},  # another connection holds it
-    {"protected": True, "frames": ["CARD"], "targets": ["CARD"]},  # control did not say native
+    {"protected": True, "frames": ["CARD"], "targets": ["CARD"]},  # control did not say native (malformed)
     RuntimeError("control unreachable"),  # no fresh status: the cached set is not enough to act
     None,  # malformed reply (no result): not fresh either, and the gate keeps the set
 ])
@@ -461,3 +461,92 @@ def test_lister_never_lists_inputs_selects_or_controls_holding_them():
         ("button", "Pay 4242 4242"), ("button", "Cancel"), ("checkbox", "Save card"), ("button", "Confirm")]
     # Python masks the digit runs before anything reaches the model.
     assert surface._mask(rows[0]["text"]) == "Pay •••• ••••"
+
+
+_GOOD = {"protected": False, "native": False, "frames": [], "targets": []}
+
+
+@pytest.mark.parametrize("status", [
+    {},  # Codex A3 r3 P1 repro: {"result": {}}
+    None,  # no result
+    {"protected": False},  # missing keys
+    {"protected": None, "native": False, "frames": [], "targets": []},
+    {**_GOOD, "protected": "false"},
+    {**_GOOD, "protected": 0},
+    {**_GOOD, "native": None},
+    {**_GOOD, "frames": None},
+    {**_GOOD, "frames": "CARD"},
+    {**_GOOD, "targets": [1]},
+    {**_GOOD, "frames": ["CARD"], "targets": ["CARD"]},  # "unprotected" yet naming frames: contradictory
+    {"protected": True, "native": True, "frames": [], "targets": []},  # protected with an empty set
+    {"result": _GOOD},  # extra nesting
+    [_GOOD],
+])
+def test_a_malformed_status_never_lifts_protection(routed, status):
+    sup, call = routed
+    sup.status = status
+    out, forwarded = call("Runtime.evaluate", "CARD", {"expression": "document.querySelector('input').value"})
+    assert out["error_type"] == "payment_surface_protected" and not forwarded
+    assert {"CARD", "NAMEF"} <= surface.protected_frames(sup)
+    assert surface.payment_controls(sup)["error_type"] == "payment_surface_unavailable"
+    # Only control's valid explicit answer lifts it.
+    sup.status = dict(_GOOD)
+    assert call("Runtime.evaluate", "CARD")[1]
+
+
+def _slow_stale_status(sup):
+    """Status answers 'unprotected' at once, but the reply reaches _refresh only after a pause."""
+    asked = threading.Event()
+    real = sup._cdp
+
+    async def cdp(method, params=None, *, session_id=None, timeout=10.0):
+        if method != "Hermes.paymentSurfaceStatus":
+            return await real(method, params, session_id=session_id, timeout=timeout)
+        reply = {"id": 0, "result": dict(_GOOD)}
+        asked.set()
+        await asyncio.sleep(0.6)
+        return reply
+
+    sup._cdp = cdp
+    return asked
+
+
+def test_a_stale_refresh_racing_a_newer_claim_keeps_the_newer_scope(routed):
+    # Codex A3 r3 P1 repro: an "unprotected" status is received, another claim completes, then the old
+    # reply is processed. It must not admit the read: the read is decided against the newest scope.
+    sup, _call = routed
+    asked = _slow_stale_status(sup)
+    out = {}
+    worker = threading.Thread(target=lambda: out.update(r=surface.supervisor_route_refusal(
+        sup, "CARD", "Runtime.evaluate", {"expression": "1"}, "S-card")))
+    worker.start()
+    assert asked.wait(2)
+    assert surface.claim_payment_surface(sup, _inspected()) is None
+    worker.join(3)
+    assert out["r"] and out["r"]["error_type"] == "payment_surface_protected"
+    with surface._LOCK:
+        assert {"CARD", "NAMEF"} <= surface._SURFACES[sup].frames, "the stale reply cleared nothing"
+
+
+def test_a_browser_cdp_call_overlapping_a_claim_is_withheld(monkeypatch):
+    # Serialized with claims: a read admitted before any card fill, still running when the fill's claim
+    # registers (an awaitPromise that resolves later), never returns its value.
+    sup = FakeSup()
+    frames = [{"frame_id": "PAGE"}, {"frame_id": "CARD", "session_id": "S-card"}]
+    sup.snapshot = lambda: SimpleNamespace(frame_tree={"top": frames[0], "children": frames[1:]})
+    sup._frames = {f["frame_id"]: SimpleNamespace(cdp_session_id=f.get("session_id")) for f in frames}
+    monkeypatch.setattr("tools.browser_supervisor.SUPERVISOR_REGISTRY.get", lambda task_id: sup)
+    sup.delays = {"Runtime.evaluate": 0.4}
+    out = {}
+    worker = threading.Thread(target=lambda: out.update(r=json.loads(cdp_tool._browser_cdp_via_supervisor(
+        "t", "CARD", "Runtime.evaluate", {"expression": "card()", "awaitPromise": True}, 5))))
+    worker.start()
+    time.sleep(0.1)
+    assert surface.claim_payment_surface(sup, _inspected()) is None
+    worker.join(3)
+    assert out["r"]["error_type"] == "payment_surface_protected" and "result" not in out["r"]
+    # Without a claim in between, the same call returns as before.
+    sup2 = FakeSup()
+    sup2.snapshot, sup2._frames = sup.snapshot, sup._frames
+    monkeypatch.setattr("tools.browser_supervisor.SUPERVISOR_REGISTRY.get", lambda task_id: sup2)
+    assert json.loads(cdp_tool._browser_cdp_via_supervisor("t", "CARD", "Runtime.evaluate", {}, 5))["success"]
