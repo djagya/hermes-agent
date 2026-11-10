@@ -9,6 +9,7 @@ eval or a model tool argument.
 from __future__ import annotations
 
 import asyncio
+import math
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -595,14 +596,16 @@ class PaymentSupervisionMixin:
         except Exception:  # health: allow BLE001 -- any CDP failure means the approved page is not current; fail closed
             return False
 
-    def commit_payment(self, inspected: PaymentInspection, fills: list[dict]) -> dict:
+    def commit_payment(self, inspected: PaymentInspection, fills: list[dict], strict: bool = False) -> dict:
+        """Write the fills. ``strict`` (unreviewed destinations) adds a hit test at each field's centre
+        before its setter; reviewed provider shapes keep ``False`` so they cannot regress."""
         import concurrent.futures
 
         from agent.async_utils import safe_schedule_threadsafe
         from tools.browser_supervisor import _LoopUnavailable
 
         until = time.monotonic() + _COMMIT_BUDGET_SECONDS
-        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills, until), self._loop)
+        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills, until, strict), self._loop)
         if future is None:
             raise _LoopUnavailable("Browser supervisor loop unavailable")
         try:
@@ -619,16 +622,18 @@ class PaymentSupervisionMixin:
                 pass
             return {"success": False, "error_type": "payment_transport_uncertain", "partially_filled": True}
 
-    async def _commit_payment(self, i: PaymentInspection, fills: list[dict], until: float | None = None) -> dict:
+    async def _commit_payment(self, i: PaymentInspection, fills: list[dict], until: float | None = None,
+                              strict: bool = False) -> dict:
         if i.consumed:
             return {"success": False, "error_type": "payment_consent_consumed"}
         try:
-            return await self._commit_payment_once(i, fills, until)
+            return await self._commit_payment_once(i, fills, until, strict)
         finally:
             # dlz: one cleanup for the whole lifecycle (freshness included) that a cancellation cannot cut short.
             await self._release_once(i)
 
-    async def _commit_payment_once(self, i: PaymentInspection, fills: list[dict], until: float | None) -> dict:
+    async def _commit_payment_once(self, i: PaymentInspection, fills: list[dict], until: float | None,
+                                   strict: bool = False) -> dict:
         if time.monotonic() >= i.expires_at:
             # dlz: the inspection window closed (late approval, slow card lookup): nothing is written, and
             # the result says so instead of reading as a changed page.
@@ -650,13 +655,24 @@ class PaymentSupervisionMixin:
             # document at a time: no cross-document transaction exists, so a later failure
             # reports what an earlier document already received instead of retrying.
             written = []
-            for document, document_fills in _commit_order(i, _fills_by_document(i, fills)):
+            order = _commit_order(i, _fills_by_document(i, fills))
+            for document, document_fills in order:
                 if time.monotonic() >= i.expires_at:
                     # dlz: no write after the window closes; earlier documents' values are reported, not
                     # completed.
                     return _partial({"success": False, "error_type": "payment_consent_expired"}, filled)
+                # dlz: an earlier document's page handlers ran after its writes: before the next document, every
+                # approved chain is checked again against the pinned state (bounded: no OOPIF rediscovery), and
+                # each document written so far must still be the one that received its fields.
+                if written and not await self._payment_scope_current(i, [d for d, _f in written] + [document]):
+                    return _partial({"success": False, "error_type": "payment_page_changed"}, filled)
+                # dlz: strict fills in a frame pause after each focus for the owner-chain check from the parents
+                # (a cross-origin parent's blur handler is out of the frame's reach).
+                paced = (lambda point, d=document: self._owner_chain_current(i, d, point)) \
+                    if strict and _has_parent(i, document) else None
                 result = await self._commit_payment_document(
-                    document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop))
+                    document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop), strict=strict,
+                    paced=paced)
                 if not result.get("success"):
                     return _partial(result, filled)
                 filled += result.get("filled_fields", 0)
@@ -670,26 +686,146 @@ class PaymentSupervisionMixin:
             before = await self._shown_documents(i)
             answers = [(d, f, await self._payment_retention(i, d)) for d, f in written]
             after = await self._shown_documents(i)
-            return _retention_result([(f, a if d.frame_id in before and d.frame_id in after else None)
-                                      for d, f, a in answers])
+            result = _retention_result([(f, a if d.frame_id in before and d.frame_id in after else None)
+                                        for d, f, a in answers])
+            if await self._top_navigated(i):
+                result["navigated_after_fill"] = True
+            return result
         except PaymentPolicyError:
             return _partial({"success": False, "error_type": "payment_fields_invalid"}, filled)
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
             return _partial({"success": False, "error_type": "payment_transport_uncertain"}, filled)
 
-    async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None) -> dict:
+    async def _payment_scope_current(self, i: PaymentInspection, receiving: list) -> bool:
+        """dlz: between the documents of a split fill, bounded and against the pinned state (no OOPIF
+        rediscovery), over EVERY approved chain:
+        - each ``receiving`` document (those written so far and the next) still has its inspected id, loader,
+          URL and origin in its own session (one ``Page.getFrameTree`` per session);
+        - every parent document on any card chain is still at its inspected URL and origin, and all its
+          pinned owner <iframe>s are connected and shown (one call per parent, in the parent's pinned world:
+          a new parent document destroys that world and the call fails).
+        Frames off the card chains (ads) are ignored. Any failure to answer counts as changed."""
+        by_id = {f[0]: f for f in i.tree}
+        framed: set = set()
+        for d in i.documents:
+            fid, hops = d.frame_id, 0
+            while fid in by_id and by_id[fid][4] and hops < 16:
+                framed.add(fid)
+                fid, hops = by_id[fid][4], hops + 1
+            if fid not in by_id or by_id[fid][4]:
+                return False
+        pinned = {fid for _sid, items in i.frame_owners.values() for fid, _obj in items}
+        if not framed <= pinned or any(p not in by_id for p in i.frame_owners):
+            return False
+        leaves = list(dict.fromkeys(d.frame_id for d in receiving))
+        try:
+            seen: dict = {}
+            for sid in dict.fromkeys(i.child_sessions.get(fid, i.page_session) for fid in leaves):
+                frames: dict = {}
+
+                def walk(node):
+                    frame = node["frame"]
+                    frames[frame["id"]] = (frame.get("loaderId", ""), frame.get("url", ""),
+                                           frame.get("securityOrigin", ""))
+                    for child in node.get("childFrames", []):
+                        walk(child)
+
+                walk((await self._cdp("Page.getFrameTree", session_id=sid))["result"]["frameTree"])
+                seen[sid] = frames
+            for fid in leaves:
+                sid = i.child_sessions.get(fid, i.page_session)
+                if seen[sid].get(fid) != tuple(by_id[fid][1:4]):
+                    return False
+            for parent, (psid, items) in i.frame_owners.items():
+                answer = _value(await self._cdp("Runtime.callFunctionOn", {
+                    "objectId": items[0][1], "functionDeclaration": _OWNERS_SCOPE,
+                    "arguments": [{"value": by_id[parent][2]}, {"value": by_id[parent][3]}]
+                                 + [{"objectId": obj} for _fid, obj in items],
+                    "returnByValue": True,
+                }, session_id=psid))
+                if not (isinstance(answer, list) and len(answer) == len(items) and all(a is True for a in answer)):
+                    return False
+            return True
+        except Exception:  # health: allow BLE001 -- an unreadable page is not the approved page; fail closed
+            return False
+
+    async def _owner_chain_current(self, i: PaymentInspection, d: PaymentDocument, point) -> bool:
+        """dlz: strict fills, after the focus and before each setter (Codex A2 r3 #1): from the card document up
+        to the page, each parent document is still at its inspected URL and origin, the pinned owner <iframe>
+        is connected, shown and not transparent, and the focused field's centre, mapped into the parent, hits
+        that <iframe> (nothing of the merchant's covers it). One call per parent; unprovable = False."""
+        by_id = {f[0]: f for f in i.tree}
+        if not (isinstance(point, (list, tuple)) and len(point) == 2
+                and all(type(v) in (int, float) and math.isfinite(v) for v in point)):
+            return False
+        x, y = point
+        fid, hops = d.frame_id, 0
+        try:
+            while fid in by_id and by_id[fid][4]:
+                parent = by_id[fid][4]
+                psid, items = i.frame_owners.get(parent, (None, ()))
+                owner = next((obj for f, obj in items if f == fid), None)
+                hops += 1
+                if parent not in by_id or owner is None or hops > 16:
+                    return False
+                answer = _value(await self._cdp("Runtime.callFunctionOn", {
+                    "objectId": owner, "functionDeclaration": _OWNER_HIT,
+                    "arguments": [{"value": by_id[parent][2]}, {"value": by_id[parent][3]},
+                                  {"value": x}, {"value": y}],
+                    "returnByValue": True,
+                }, session_id=psid))
+                if not (isinstance(answer, list) and len(answer) == 2
+                        and all(type(v) in (int, float) and math.isfinite(v) for v in answer)):
+                    return False
+                x, y = answer
+                fid = parent
+        except Exception:  # health: allow BLE001 -- an owner chain that cannot answer is not provably the approved one
+            return False
+        return fid in by_id and not by_id[fid][4]
+
+    async def _top_navigated(self, i: PaymentInspection) -> bool:
+        """dlz: whether the top document's URL differs from the inspected one after the fill (True only when
+        read and different; an unreadable page is reported through retention instead)."""
+        try:
+            tree = await self._cdp("Page.getFrameTree", session_id=i.page_session)
+            url = tree["result"]["frameTree"]["frame"]["url"]
+        except Exception:  # health: allow BLE001 -- retention already reports a page that cannot answer
+            return False
+        return bool(i.tree) and isinstance(url, str) and url != i.tree[0][2]
+
+    async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None,
+                                       strict: bool = False, paced=None) -> dict:
+        """One document's commit. ``paced`` (strict fills in a frame): an async ``check(point)`` run after each
+        focus, before that field's setter; False stops the document with nothing more written."""
         result = _value(
             await self._cdp(
                 "Runtime.callFunctionOn",
                 {
                     "objectId": d.object_id,
-                    "functionDeclaration": "function(fills,deadline){return this.commit(fills,deadline)}",
-                    "arguments": [{"value": fills}, {"value": deadline_ms}],
+                    "functionDeclaration": "function(fills,deadline,strict,paced){"
+                                           "return this.commit(fills,deadline,strict,paced)}",
+                    "arguments": [{"value": fills}, {"value": deadline_ms}, {"value": strict is True},
+                                  {"value": paced is not None}],
                     "returnByValue": True,
                 },
                 session_id=d.frame_session,
             )
         )
+        for _ in range(len(fills) + 1):
+            if paced is None or not isinstance(result, dict) or result.get("pending") is not True:
+                break
+            attempted = result.get("filled_fields")
+            if set(result) != {"pending", "filled_fields", "x", "y"} or type(attempted) is not int \
+                    or not 0 <= attempted < len(fills):
+                return {"success": False, "error_type": "payment_result_invalid"}
+            if not await paced((result["x"], result["y"])):
+                # dlz: the focused field is never written; earlier fields of this document are reported.
+                return {"success": False, "error_type": "payment_page_changed", "filled_fields": attempted,
+                        "partially_filled": attempted > 0}
+            result = _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": d.object_id, "functionDeclaration": "function(){return this.resume()}",
+                "returnByValue": True,
+            }, session_id=d.frame_session))
         if not isinstance(result, dict) or set(result) - {
             "success",
             "filled_fields",
@@ -748,11 +884,31 @@ def _renderer_deadline_ms(d: PaymentDocument, stop: float) -> float:
 
 
 # dlz: each pinned owner <iframe> is still shown to the user (strict: transparent or hidden ancestors too).
-_OWNERS_SHOWN = ("function(...els){return els.map(e=>{if(!e||!e.isConnected)return false;"
-                 "const r=e.getBoundingClientRect(),s=getComputedStyle(e);return e.getClientRects().length>0&&"
-                 "r.width>2&&r.height>2&&s.visibility!=='hidden'&&Number(s.opacity)>0&&"
-                 "(typeof e.checkVisibility!=='function'||e.checkVisibility({opacityProperty:true,"
-                 "visibilityProperty:true}))})}")
+_OWNER_VISIBLE = ("e=>{if(!e||!e.isConnected)return false;"
+                  "const r=e.getBoundingClientRect(),s=getComputedStyle(e);return e.getClientRects().length>0&&"
+                  "r.width>2&&r.height>2&&s.visibility!=='hidden'&&Number(s.opacity)>0&&"
+                  "(typeof e.checkVisibility!=='function'||e.checkVisibility({opacityProperty:true,"
+                  "visibilityProperty:true}))}")
+_OWNERS_SHOWN = "function(...els){return els.map(" + _OWNER_VISIBLE + ")}"
+# dlz: in the parent's pinned world: the parent document is still at its inspected URL (CDP frame URLs carry
+# no fragment) and origin, and each owner <iframe> belongs to it and is shown. null = the parent changed.
+_PARENT_AT = ("if(String(location.href).split('#')[0]!==href||location.origin!==origin)return null;")
+_OWNERS_SCOPE = ("function(href,origin,...els){" + _PARENT_AT + "return els.map(e=>!!e&&e.ownerDocument===document&&("
+                 + _OWNER_VISIBLE + ")(e))}")
+# dlz: strict, per setter: as _OWNERS_SCOPE for this one owner, plus a hit test of the focused field's centre
+# (x, y in the child's viewport) mapped through the <iframe>'s border and padding; the mapped point, or null.
+_OWNER_HIT = ("function(href,origin,x,y){" + _PARENT_AT + "const e=this;"
+              "if(e.ownerDocument!==document||!(" + _OWNER_VISIBLE + ")(e))return null;"
+              "const r=e.getBoundingClientRect(),s=getComputedStyle(e);if(s.pointerEvents==='none')return null;"
+              "const px=r.left+e.clientLeft+(parseFloat(s.paddingLeft)||0)+x,"
+              "py=r.top+e.clientTop+(parseFloat(s.paddingTop)||0)+y;"
+              "const n=e.getRootNode&&e.getRootNode(),root=n&&typeof n.elementFromPoint==='function'?n:document;"
+              "return root.elementFromPoint(px,py)===e?[px,py]:null}")
+
+
+def _has_parent(i: PaymentInspection, d: PaymentDocument) -> bool:
+    record = next((f for f in i.tree if f[0] == d.frame_id), None)
+    return record is None or bool(record[4])  # an unknown frame is paced too (and then refused)
 
 
 def _commit_order(i: PaymentInspection, groups: list) -> list:
@@ -852,7 +1008,33 @@ _INSPECT = r"""(() => {
     !['hidden','submit','button','reset','file','image','checkbox','radio','select-multiple'].includes(x.e.type));
   const selected = new Set(entries.map(x=>x.index));
   const signature = JSON.stringify(describe());
-  const valid = () => document === doc && location.href === href &&
+  // dlz: the owner chain this document can reach synchronously (same-origin ancestors, pinned now) and the
+  // top URL when readable: page code run by focus can hide a parent iframe or rewrite the top URL
+  // (history.replaceState) without touching this document. Cross-origin ancestors are out of reach of
+  // this document's scripts, and out of this check (between documents, control re-checks the owners).
+  const scopeChain = [];
+  for (let w = globalThis, k = 0; k < 8; k++) {
+    let fe = null, pw = null, ph = null;
+    try { fe = w.frameElement; pw = w.parent; ph = fe && pw ? pw.location.href : null; } catch (_) { fe = null; }
+    if (!fe || !pw || pw === w || typeof ph !== 'string') break;
+    scopeChain.push({fe, pw, ph});
+    w = pw;
+  }
+  const readTop = () => { try { const t = globalThis.top; return t && t !== globalThis ? String(t.location.href) : null; }
+                          catch (_) { return null; } };
+  const topHref = readTop();
+  const ownerShown = e => {
+    const v = e.ownerDocument && e.ownerDocument.defaultView;
+    if (!e.isConnected || !v) return false;
+    const r = e.getBoundingClientRect(), s = v.getComputedStyle(e);
+    return e.getClientRects().length > 0 && r.width > 2 && r.height > 2 && s.visibility !== 'hidden' &&
+      Number(s.opacity) > 0 && (typeof e.checkVisibility !== 'function' ||
+        e.checkVisibility({opacityProperty: true, visibilityProperty: true}));
+  };
+  const scope = () => scopeChain.every(c => { try { return c.pw.location.href === c.ph && ownerShown(c.fe); }
+                                             catch (_) { return false; } }) &&
+    (topHref === null || readTop() === topHref);
+  const valid = () => document === doc && location.href === href && scope() &&
     JSON.stringify(describe()) === signature &&
     (now => now.length === elements.length && now.every((e,n)=>e === elements[n]))(allInputs()) &&
     entries.every(x=>visible(x.e));
@@ -865,7 +1047,20 @@ _INSPECT = r"""(() => {
   // grouped card numbers, upper-cased names). Anything else is a different value.
   const same = (a,b) => a.replace(/[\s\/.-]/g,'').toUpperCase() === b.replace(/[\s\/.-]/g,'').toUpperCase();
   const live = el => el.isConnected && el.ownerDocument === doc && allInputs().includes(el);
-  let used = false, written = null;
+  // dlz: strict mode (unreviewed destinations): the focused field is what the user would hit at its centre.
+  const hits = el => {
+    const r = el.getBoundingClientRect(), root = el.getRootNode ? el.getRootNode() : doc;
+    const at = (root && typeof root.elementFromPoint === 'function' ? root : doc)
+      .elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return at === el;
+  };
+  let used = false, written = null, paused = null;
+  // One step of the commit; a finished (or never started) commit answers changed, never a second run.
+  const advance = () => {
+    const step = paused ? paused.next() : {done: true, value: {success:false,error_type:'payment_fields_changed'}};
+    if (step.done) paused = null;
+    return step.value;
+  };
   return {
     describe:()=>describe().filter(x=>selected.has(x.index)), valid,
     // After every document was written and the page had time to settle: does each written field still
@@ -882,7 +1077,7 @@ _INSPECT = r"""(() => {
         return {token:f.token,state:same(el.value,f.value)?'held':el.value?'changed':'empty',length:el.value.length};
       });
     },
-    commit: (fills, deadline) => {
+    commit: (fills, deadline, strict, paced) => {
       if (used || !valid()) return {success:false,error_type:'payment_fields_changed'};
       used = true;
       // dlz: `deadline` is ms after `born` on this document's monotonic clock (never Date.now(): a wall-clock
@@ -912,28 +1107,51 @@ _INSPECT = r"""(() => {
       // its detached copy report a value the live form does not hold.
       written = fills.map(f=>({index:f.index,token:String(f.token||''),value:f.value}));
       let attempted = 0;
-      for (const f of ordered) {
-        const el = elements[f.index];
-        if (!live(el) || location.href !== href)
-          return {success:false,error_type:'payment_fields_changed',filled_fields:attempted,partially_filled:attempted>0};
-        el.focus();
-        if (late())  // focus handlers run page code; never write past the window
-          return {success:false,error_type:'payment_consent_expired',filled_fields:attempted,partially_filled:attempted>0};
-        attempted += 1;
-        if (isSelect(el)) {
-          selectSetter.call(el,f.value);
-          el.dispatchEvent(new Event('input',{bubbles:true}));
-        } else {
-          setter.call(el,f.value);
-          el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
+      const changed = () => ({success:false,error_type:'payment_fields_changed',filled_fields:attempted,
+                              partially_filled:attempted>0});
+      const expired = () => ({success:false,error_type:'payment_consent_expired',filled_fields:attempted,
+                              partially_filled:attempted>0});
+      // dlz: `paced` (strict fills in a frame): after each focus the closure pauses and hands back the field's
+      // centre; the supervisor checks the cross-origin owner chain from the parents (unreachable from here)
+      // and only then calls resume(), which re-runs every local check before the setter. Unpaced, the same
+      // steps run in one go.
+      const steps = function* () {
+        for (const f of ordered) {
+          const el = elements[f.index];
+          if (!valid() || !live(el))
+            return changed();
+          el.focus();
+          if (late())  // focus handlers run page code; never write past the window
+            return expired();
+          if (paced === true) {
+            const r = el.getBoundingClientRect();
+            yield {pending:true,filled_fields:attempted,x:r.left + r.width / 2,y:r.top + r.height / 2};
+          }
+          // dlz: focus handlers can hide, swap, relabel or navigate: the whole pinned set is re-checked
+          // right before this setter, not only before the loop.
+          if (!valid() || !live(el) || !shown(el) || (strict === true && !hits(el)))
+            return changed();
+          if (late())  // the checks above run page-visible code too (layout, style): the window again, last
+            return expired();
+          attempted += 1;
+          if (isSelect(el)) {
+            selectSetter.call(el,f.value);
+            el.dispatchEvent(new Event('input',{bubbles:true}));
+          } else {
+            setter.call(el,f.value);
+            el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
+          }
+          el.dispatchEvent(new Event('change',{bubbles:true}));
+          el.dispatchEvent(new FocusEvent('blur'));
+          el.blur();
         }
-        el.dispatchEvent(new Event('change',{bubbles:true}));
-        el.dispatchEvent(new FocusEvent('blur'));
-        el.blur();
-      }
-      const held = fills.filter(f=>live(elements[f.index]) && same(elements[f.index].value,f.value)).length;
-      return held === fills.length && location.href === href ? {success:true,filled_fields:held} :
-        {success:false,error_type:'payment_validation_failed',filled_fields:held,partially_filled:true};
-    }
+        const held = fills.filter(f=>live(elements[f.index]) && same(elements[f.index].value,f.value)).length;
+        return held === fills.length && location.href === href ? {success:true,filled_fields:held} :
+          {success:false,error_type:'payment_validation_failed',filled_fields:held,partially_filled:true};
+      };
+      paused = steps();
+      return advance();
+    },
+    resume: () => advance()
   };
 })()"""

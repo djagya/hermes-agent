@@ -79,6 +79,9 @@ class LoginBackend(ABC):
     display_name: str        # user-facing
     prefix: str              # handle prefix ("vault_", "op:", "bw:")
     needs_unlock: bool = False
+    # dlz: True when ``VaultItemMeta.revision`` and ``resolve_payment_secret`` name the item revision; a card
+    # fill then refuses an item without one before consent. False (plugins): the in-context re-read only.
+    payment_revisions: bool = False
 
     def owns(self, handle: str) -> bool:
         return handle.startswith(self.prefix)
@@ -111,6 +114,17 @@ class LoginBackend(ABC):
         """Full payload of a payment/address item (server-side only). External managers list only
         logins, so the base returns the password-only shape."""
         return {"password": self.resolve_password(handle)}
+
+    def payment_revision(self, meta: VaultItemMeta) -> str:
+        """The revision a card fill binds for ``meta``, from metadata only (never a value): the listed
+        ``meta.revision`` here; a backend whose listing can lack its strongest part looks it up (1Password)."""
+        return str(getattr(meta, "revision", "") or "")
+
+    def resolve_payment_secret(self, handle: str) -> tuple[dict[str, str], Optional[str]]:
+        """A card payload plus the revision of the item it was read from (``VaultItemMeta.revision``), both
+        from one read. ``None``: this backend cannot say which revision it returned (plugins today); the
+        card fill then relies on its in-context metadata re-read alone."""
+        return self.resolve_secret(handle), None
 
 
 def run_with_stdin_secret(argv: Sequence[str], *, env: dict[str, str], secret: str, timeout: float,

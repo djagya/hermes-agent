@@ -68,6 +68,7 @@ class OnePasswordLoginBackend(LoginBackend):
     display_name = "1Password"
     prefix = "op:"
     needs_unlock = True
+    payment_revisions = True  # every card fill binds and re-checks the item revision (version / updated_at)
 
     def __init__(self, cfg: Optional[dict] = None):
         self.cfg = cfg or {}
@@ -200,7 +201,8 @@ class OnePasswordLoginBackend(LoginBackend):
                     out.append(VaultItemMeta(
                         id=payment.handle, kind="payment", label=str(item.get("title") or "Payment card"),
                         origin=None, created_at=str(item.get("created_at") or ""),
-                        payment_scope="confirmed_page"))  # hosted origins: the reviewed set at fill time
+                        payment_scope="confirmed_page",  # hosted origins: the reviewed set at fill time
+                        revision=_item_revision(item)))
                 continue
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origins = _all_origins(urls)
@@ -260,6 +262,11 @@ class OnePasswordLoginBackend(LoginBackend):
 
     def resolve_secret(self, handle: str) -> dict[str, str]:
         """Reveal a single card only inside the trusted native filler, never in tool output."""
+        return self.resolve_payment_secret(handle)[0]
+
+    def resolve_payment_secret(self, handle: str) -> tuple[dict[str, str], Optional[str]]:
+        """The card and the ``version`` of the item op revealed (same JSON). The fill compares it with the
+        version the prompt was shown for, so an item edited meanwhile is never written."""
         from agent.vault_payment_card import parse_onepassword_card
 
         vault_id, item_id = _split_handle(handle, self.prefix)
@@ -267,11 +274,35 @@ class OnePasswordLoginBackend(LoginBackend):
             raise ValueError("A vault-qualified card handle is required")
         try:
             raw = self._run("item", "get", item_id, "--vault", vault_id, "--format", "json", "--reveal")
-            return parse_onepassword_card(json.loads(raw), item_id=item_id, vault_id=vault_id)
+            item = json.loads(raw)
+            return parse_onepassword_card(item, item_id=item_id, vault_id=vault_id), _item_revision(item)
         except (UnlockRequired, ItemNotFound, BackendRateLimited, BackendAuthExpired, BackendNetwork):
             raise  # typed causes carry no card data, only the scrubbed CLI error
         except Exception:
             raise ValueError("Payment card resolution failed") from None
+
+    def payment_revision(self, meta: VaultItemMeta) -> str:
+        """dlz (design v2 A8): version-based binding when op can give one. The listing's revision when it
+        carries ``op.version``; else one metadata ``op item get`` (no ``--reveal``; only ``version`` and
+        ``updated_at`` are kept, the rest is dropped, never logged or returned) for the item's version, the same JSON shape
+        the reveal returns. Neither has a version: the listing's ``updated_at``-only revision, which the fill
+        result reports as ``updated_at_only``. A lookup that fails refuses (typed or fixed error, no output)."""
+        from agent.vault_store import revision_binding
+
+        listed = str(getattr(meta, "revision", "") or "")
+        if revision_binding(listed) == "version":
+            return listed
+        vault_id, item_id = _split_handle(str(getattr(meta, "id", "") or ""), self.prefix)
+        if not vault_id or not item_id or vault_id.startswith("-") or item_id.startswith("-"):
+            raise ValueError("A vault-qualified card handle is required")
+        try:
+            looked = _item_revision(json.loads(self._run("item", "get", item_id, "--vault", vault_id,
+                                                         "--format", "json")))
+        except (UnlockRequired, ItemNotFound, BackendRateLimited, BackendAuthExpired, BackendNetwork):
+            raise  # typed causes carry no card data, only the scrubbed CLI error
+        except Exception:
+            raise BackendError(self.display_name, "card revision lookup failed") from None
+        return looked if revision_binding(looked) == "version" else listed
 
     def resolve_otp(self, handle: str) -> Optional[str]:
         # `--otp` mints the current TOTP from the item's one-time-password field; items without one error out.
@@ -313,6 +344,25 @@ def _login_password(item: object, backend: str) -> str:
         if len(values) > 1:
             raise BackendError(backend, "the item has several different password fields; keep one")
     raise BackendError(backend, "the item has no password field")
+
+
+def _item_revision(item: object) -> str:
+    """The item's revision from metadata only (never a field value): ``op.version`` (1Password bumps it on
+    every edit) and ``op.updated_at``, each when op reported it. The same function reads the listing, the
+    metadata lookup (``payment_revision``) and the revealed item; ``revision_verdict`` needs the same parts on
+    both sides, so a part missing from one response is never compared away. "" = neither."""
+    if not isinstance(item, dict):
+        return ""
+    parts = []
+    version = item.get("version")
+    if type(version) is int and version >= 0:
+        parts.append(f"op.version={version}")
+    elif isinstance(version, str) and version.isascii() and version.isdecimal():
+        parts.append(f"op.version={int(version)}")
+    updated = item.get("updated_at")
+    if isinstance(updated, str) and 0 < len(updated) <= 64 and not set(updated) & set(";= \t\r\n"):
+        parts.append(f"op.updated_at={updated}")
+    return ";".join(parts)
 
 
 def _no_otp_field(detail: str) -> bool:
