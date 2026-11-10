@@ -191,9 +191,10 @@ class VaultItemMeta:
     allowed_origins: tuple = ()
     payment_scope: str = "origin_bound"
     payment_frame_origins: tuple = ()
-    # dlz: a non-secret snapshot id of the stored item (1Password ``version``; for the local store a keyed
-    # digest of the record). Bound when a card-fill prompt is shown and re-checked when the card is read;
-    # "" = the backend cannot tell one revision from another. Never in to_dict / model output.
+    # dlz: a non-secret snapshot id of the stored item as ``key=value`` parts joined by ";" (1Password
+    # ``op.version`` and/or ``op.updated_at``; the local store ``local`` = a keyed digest of the record).
+    # Bound when a card-fill prompt is shown and re-checked when the card is read (``revision_verdict``);
+    # "" = no revision known. Never in to_dict / model output.
     revision: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -690,7 +691,29 @@ _REVISION_KEY = secrets.token_bytes(32)
 def _record_revision(rec: dict[str, Any]) -> str:
     """A non-secret id of the stored record: changes whenever any field or secret value changes."""
     canonical = json.dumps(rec, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-    return "local:" + hmac.new(_REVISION_KEY, canonical, hashlib.sha256).hexdigest()[:32]
+    return "local=" + hmac.new(_REVISION_KEY, canonical, hashlib.sha256).hexdigest()[:32]
+
+
+def _revision_parts(revision: Optional[str]) -> dict[str, str]:
+    parts: dict[str, str] = {}
+    for part in (revision or "").split(";"):
+        key, sep, value = part.partition("=")
+        if sep and key and value:
+            parts[key] = value
+    return parts
+
+
+def revision_verdict(bound: Optional[str], read: Optional[str]) -> str:
+    """``match`` / ``changed`` / ``unavailable`` for the revision a prompt was shown for and one read later.
+
+    dlz: compared on the parts both sides carry (a 1Password response that lacks ``version`` on one path
+    still compares on ``updated_at``), and every shared part must agree. Nothing shared - including both
+    sides empty - is ``unavailable``, never a match."""
+    a, b = _revision_parts(bound), _revision_parts(read)
+    shared = a.keys() & b.keys()
+    if not shared:
+        return "unavailable"
+    return "match" if all(a[k] == b[k] for k in shared) else "changed"
 
 
 def get_vault_store() -> VaultStore:

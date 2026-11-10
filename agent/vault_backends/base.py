@@ -79,6 +79,9 @@ class LoginBackend(ABC):
     display_name: str        # user-facing
     prefix: str              # handle prefix ("vault_", "op:", "bw:")
     needs_unlock: bool = False
+    # dlz: True when ``VaultItemMeta.revision`` and ``resolve_payment_secret`` name the item revision; a card
+    # fill then refuses an item without one before consent. False (plugins): the in-context re-read only.
+    payment_revisions: bool = False
 
     def owns(self, handle: str) -> bool:
         return handle.startswith(self.prefix)

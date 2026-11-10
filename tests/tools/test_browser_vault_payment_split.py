@@ -127,8 +127,8 @@ class _FakeSupervisor(sp.PaymentSupervisionMixin):
     async def _payment_is_current(self, i):
         return True
 
-    async def _payment_tree(self, sid, child_sessions=None):
-        return ()  # the synthetic inspections' tree
+    async def _payment_scope_current(self, i, documents):
+        return True  # pinned-scope checks are exercised over a fake CDP in _PayPalPage below
 
     async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False):
         self.deadlines = getattr(self, "deadlines", []) + [deadline_ms]
@@ -455,11 +455,10 @@ class _OwnerSupervisor(sp.PaymentSupervisionMixin):
         self.shown, self.passes, self.calls = shown, 0, []
 
     async def _payment_is_current(self, i):
-        self.tree = i.tree
         return True
 
-    async def _payment_tree(self, sid, child_sessions=None):
-        return self.tree
+    async def _payment_scope_current(self, i, documents):
+        return True
 
     async def _cdp(self, method, params=None, session_id=None, timeout=None):
         self.calls.append(method)
@@ -514,9 +513,8 @@ def test_four_hosted_frames_cost_one_visibility_call_per_parent_per_pass():
     i = _owned_inspection(tree, docs)
     # Each fake document answers for cc-number; only the call budget is under test here.
     asyncio.run(sup._commit_payment(i, fills))
-    # dlz: settle before/after (2) plus one visibility pass before each later document (3, design v2 A5).
-    assert sup.passes == 2 + 3
-    assert sup.calls.count("Runtime.callFunctionOn") == 5 + 4 + 4  # owner checks + commits + retention reads
+    assert sup.passes == 2
+    assert sup.calls.count("Runtime.callFunctionOn") == 2 + 4 + 4  # owner checks + commits + retention reads
 
 
 @pytest.mark.parametrize("consent_s, expected_ms", [(30, 20_000), (5, 5_000)])
@@ -596,8 +594,13 @@ def test_renderer_writes_only_while_both_its_monotonic_and_wall_clocks_are_insid
 
 
 _SETTER_HARNESS = r"""
-let writes = [], els, cover = null;
-const performance = {now: () => 1000};
+let writes = [], els, cover = null, mono = 1000;
+const performance = {now: () => mono};
+// The receiving frame's same-origin parent iframe and the top page (frameElement / parent / top).
+const parentWin = {location: {href: 'https://shop.example/checkout'}};
+const owner = {isConnected: true, op: '1', ownerDocument: {defaultView: {getComputedStyle: e => ({visibility: 'visible',
+  opacity: e.op})}}, getBoundingClientRect: () => ({width: 300, height: 200}), getClientRects: () => [1]};
+Object.assign(globalThis, {frameElement: owner, parent: parentWin, top: parentWin});
 class HTMLInputElement { get value() { return this.held || ''; } set value(v) { writes.push(this.id); this.held = v; } }
 class HTMLSelectElement { get value() { return ''; } set value(v) {} }
 class Event {} class InputEvent extends Event {} class FocusEvent extends Event {}
@@ -608,7 +611,8 @@ const mk = (id, token, top) => Object.assign(new HTMLInputElement(), {tagName: '
   isConnected: true, tabIndex: 0, shadowRoot: null, ownerDocument: document, hidden: false, top,
   style: {setProperty() {}}, hasAttribute: () => false, dispatchEvent: () => true, blur() {},
   getAttribute(n) { return n === 'aria-label' ? (this.aria || null) : null; },
-  getBoundingClientRect() { return this.hidden ? {width: 0, height: 0, left: 0, top: 0} : {width: 100, height: 20, left: 0, top: this.top}; },
+  getBoundingClientRect() { if (this.slow) mono += 1000;
+    return this.hidden ? {width: 0, height: 0, left: 0, top: 0} : {width: 100, height: 20, left: 0, top: this.top}; },
   getClientRects() { return this.hidden ? [] : [1]; }, getRootNode: () => document,
   focus() { if (this.onfocus) this.onfocus(); }});
 els = [mk('c', 'cc-csc', 0), mk('n', 'cc-number', 40)];
@@ -619,9 +623,11 @@ const api = INSPECT;
 const n = els[1];
 n.onfocus = {none: () => {}, hide: () => { n.hidden = true; }, hide_other: () => { els[0].hidden = true; },
   relabel: () => { n.aria = 'Gift card'; }, swap: () => { els = [els[0], mk('n2', 'cc-number', 40)]; },
-  navigate: () => { location.href = 'https://psp.example/elsewhere'; }, cover: () => { cover = {}; }}[CASE.focus];
+  navigate: () => { location.href = 'https://psp.example/elsewhere'; }, cover: () => { cover = {}; },
+  parent_transparent: () => { owner.op = '0'; }, top_replaced: () => { parentWin.location.href += '?step=2'; },
+  slow_checks: () => { n.slow = true; }}[CASE.focus];
 const result = api.commit([{index: 0, token: 'cc-csc', value: '837'}, {index: 1, token: 'cc-number', value: '4242'}],
-                          60000, CASE.strict);
+                          CASE.focus === 'slow_checks' ? 1500 : 60000, CASE.strict);
 process.stdout.write(JSON.stringify({result, writes}));
 """
 
@@ -630,6 +636,9 @@ process.stdout.write(JSON.stringify({result, writes}));
     ("none", True, ["c", "n"]), ("cover", False, ["c", "n"]),  # reviewed shapes keep today's behaviour
     ("hide", False, ["c"]), ("hide_other", False, ["c"]), ("relabel", False, ["c"]), ("swap", False, ["c"]),
     ("navigate", False, ["c"]), ("cover", True, ["c"]),
+    # the parent iframe turned transparent / the top URL rewritten by focus code (same-origin chain)
+    ("parent_transparent", True, ["c"]), ("top_replaced", True, ["c"]),
+    ("slow_checks", False, ["c"]),  # the re-checks themselves crossed the deadline: no setter after it
 ])
 def test_a_focus_handler_that_changes_the_pinned_set_stops_the_next_setter(focus, strict, writes):
     """Design v2 A5: page code runs on focus; the field is written only if the whole pinned set still holds
@@ -648,31 +657,128 @@ def test_a_focus_handler_that_changes_the_pinned_set_stops_the_next_setter(focus
     out = json.loads(run.stdout)
     assert out["writes"] == writes
     if len(writes) == 1:
-        assert out["result"] == {"success": False, "error_type": "payment_fields_changed", "filled_fields": 1,
+        error_type = "payment_consent_expired" if focus == "slow_checks" else "payment_fields_changed"
+        assert out["result"] == {"success": False, "error_type": error_type, "filled_fields": 1,
                                  "partially_filled": True}
     else:
         assert out["result"]["success"] is True
 
 
-@pytest.mark.parametrize("change", ["hidden", "tree", "unreadable"])
-def test_a_later_document_is_not_written_once_the_page_changed_after_the_first(change):
-    """Split checkout: the first document's handlers hide the next card frame or change the frame tree;
-    the next document gets no write and the earlier one is reported."""
-    class Supervisor(_FakeSupervisor):
-        async def _payment_tree(self, sid, child_sessions=None):
-            if self.writes and change == "unreadable":
-                raise RuntimeError("frame gone")
-            return (("x",),) if self.writes and change == "tree" else ()
+class _PayPalPage(sp.PaymentSupervisionMixin):
+    """Four PayPal card-field OOPIFs under the merchant page over a fake CDP. Every round trip costs
+    ``latency`` virtual seconds; ``sp.time``/``sp.asyncio.sleep`` run on the same virtual clock, so the
+    commit's own deadlines (consent, 20 s budget, renderer) apply as they would on a slow remote browser."""
 
-        async def _shown_documents(self, i):
-            return {"a"} if self.writes and change == "hidden" else {d.frame_id for d in i.documents}
+    TOKENS = ("cc-name", "cc-exp", "cc-csc", "cc-number")
 
-    sup = Supervisor([{"success": True, "filled_fields": 1}] * 2)
-    out = asyncio.run(sup._commit_payment(_split_inspection(), [
-        {"index": 0, "token": "cc-csc", "value": "837", "document": 0},
-        {"index": 0, "token": "cc-number", "value": "4242", "document": 1}]))
+    def __init__(self, latency=0.18):
+        import threading
+
+        self.latency, self.now, self.calls, self.writes, self.mutate = latency, 0.0, 0, [], None
+        self._active, self._page_session_id, self._state_lock = True, "page", threading.Lock()
+        self.frames = {f"f{n}": [f"L{n}", _PAYPAL + "/smart/card-field/f", _PAYPAL] for n in range(4)}
+        self.top_url, self.hidden, self.gone = MERCHANT + "/checkout", set(), set()
+
+    async def _cdp(self, method, params=None, session_id=None, timeout=None):
+        self.now += self.latency
+        self.calls += 1
+        await asyncio.sleep(0)
+        p = params or {}
+
+        def node(fid):
+            loader, url, origin = self.frames[fid]
+            return {"frame": {"id": fid, "loaderId": loader, "url": url, "securityOrigin": origin}}
+
+        def value(v):
+            return {"result": {"result": {"value": v}}}
+
+        if method == "Page.getFrameTree":
+            if session_id == "page":
+                return {"result": {"frameTree": {
+                    "frame": {"id": "top", "loaderId": "LT", "url": self.top_url, "securityOrigin": MERCHANT},
+                    "childFrames": [{"frame": {"id": f"f{n}", "url": "", "securityOrigin": ""}} for n in range(4)]}}}
+            if session_id[1:] in self.gone:
+                raise RuntimeError("target detached")
+            return {"result": {"frameTree": node(session_id[1:])}}
+        if method == "Target.getTargets":
+            return {"result": {"targetInfos": [{"type": "iframe", "targetId": f"f{n}"} for n in range(4)]}}
+        if method == "DOM.getFrameOwner":
+            return {"result": {"backendNodeId": p["frameId"]}}
+        if method == "Page.createIsolatedWorld":
+            return {"result": {"executionContextId": 1}}
+        if method == "DOM.resolveNode":
+            return {"result": {"object": {"objectId": "owner-" + p["backendNodeId"]}}}
+        if method == "Runtime.callFunctionOn":
+            fn = p["functionDeclaration"]
+            if fn == sp._OWNERS_SHOWN:
+                return value([o["objectId"][len("owner-"):] not in self.hidden for o in p["arguments"]])
+            if "commit(" in fn:
+                if self.now * 1000 >= p["arguments"][1]["value"]:  # the renderer's own deadline (anchor 0)
+                    return value({"success": False, "error_type": "payment_consent_expired"})
+                self.writes.append(p["objectId"])
+                if self.mutate and len(self.writes) == 1:
+                    self.mutate(self)
+                return value({"success": True, "filled_fields": 1})
+            if "retained()" in fn:
+                return value([{"token": self.TOKENS[int(p["objectId"][1:])], "state": "held", "length": 4}])
+            return value(True)  # ancestry ownerDocument check, valid()
+        return {"result": {}}
+
+    def run(self, monkeypatch):
+        """Inspect-time tree from the real discovery path, then one commit of four documents."""
+        monkeypatch.setattr(sp, "time", SimpleNamespace(monotonic=lambda: self.now))
+
+        async def vsleep(seconds):
+            self.now += seconds
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(sp, "asyncio", SimpleNamespace(sleep=vsleep, ensure_future=asyncio.ensure_future,
+                                                           shield=asyncio.shield))
+        monkeypatch.setattr(sp, "_SETTLE_SECONDS", 2.0)
+        sessions = {f"f{n}": f"sf{n}" for n in range(4)}
+        tree = asyncio.run(self._payment_tree("page", sessions))
+        docs = tuple(PaymentDocument(f"f{n}", f"sf{n}", f"o{n}", _PAYPAL, _controls(t), clock_anchor=0.0)
+                     for n, t in enumerate(self.TOKENS))
+        i = PaymentInspection("op", "page", "target", MERCHANT, docs, tree, 120.0, owner=self,
+                              child_sessions=dict(sessions),
+                              frame_owners={"top": ("page", [(f"f{n}", f"owner-f{n}") for n in range(4)])})
+        self.now = self.calls = 0
+        fills = [{"index": 0, "token": t, "value": "x", "document": n} for n, t in enumerate(self.TOKENS)]
+        return asyncio.run(self._commit_payment(i, fills, until=sp._COMMIT_BUDGET_SECONDS))
+
+
+def test_a_four_frame_split_fill_stays_well_inside_the_budget_at_180_ms_per_round_trip(monkeypatch):
+    """Codex A2 r2 #4: between documents the pinned chain is re-checked without OOPIF rediscovery. With
+    every CDP round trip at 180 ms (and the real 2 s settle), all four PayPal frames are written and verified
+    with a wide margin to the 20 s commit budget; a full rescan per document did not reach the number."""
+    page = _PayPalPage(latency=0.18)
+    out = page.run(monkeypatch)
+    assert out == {"success": True, "filled_fields": 4, "retention_verified": True}
+    assert page.writes == ["o0", "o1", "o2", "o3"]
+    # Measured: 13.16 s incl. the 2 s settle and the release pass (base 80848d4404: 11.36 s; a full rescan per
+    # document: 22.86 s, expired before the number). Each between-document check is 3 round trips.
+    assert page.now < 0.7 * sp._COMMIT_BUDGET_SECONDS, page.now
+
+
+@pytest.mark.parametrize("change", ["owner_hidden", "frame_navigated", "frame_gone", "top_navigated"])
+def test_a_later_document_is_not_written_once_the_page_changed_after_the_first(monkeypatch, change):
+    """Split checkout: the first document's handlers hide or navigate the next card frame, detach it, or move
+    the top page: the next document gets no write and the earlier one is reported."""
+    def mutate(page):
+        if change == "owner_hidden":
+            page.hidden.add("f1")
+        elif change == "frame_navigated":
+            page.frames["f1"][0] = "L-new"
+        elif change == "frame_gone":
+            page.gone.add("f1")
+        else:
+            page.top_url = MERCHANT + "/elsewhere"
+
+    page = _PayPalPage(latency=0.0)
+    page.mutate = mutate
+    out = page.run(monkeypatch)
     assert out == {"success": False, "error_type": "payment_page_changed", "filled_fields": 1, "partially_filled": True}
-    assert len(sup.writes) == 1
+    assert page.writes == ["o0"]
 
 
 def test_a_top_document_that_navigated_after_the_fill_is_reported():

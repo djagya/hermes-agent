@@ -207,6 +207,20 @@ _ITEM_CHANGED_ON_READ = (
 )
 
 
+_REVISION_UNAVAILABLE = (
+    "The password manager did not report a revision for this saved card (no version or update time), so an "
+    "edit between the approval and the fill could not be detected. Nothing was read or written. Tell the "
+    "user; do not retry until the card item is fixed or re-saved."
+)
+
+
+_REVISION_UNAVAILABLE_ON_READ = (
+    "The saved card read for this fill carried no revision comparable with the one the approval was shown for, "
+    "so it was dropped and no card field was written. Nothing was submitted. Tell the user; do not retry on "
+    "your own."
+)
+
+
 _REQUIRES_MANAGED = (
     "A card fill on an unreviewed payment destination needs the managed browser, where browser-control locks "
     "capture; this browser is not managed. Nothing was read or written. Tell the user; do not retry on another "
@@ -223,11 +237,16 @@ def _remaining_seconds(inspected) -> int:
     return max(1, int(inspected.expires_at - time.monotonic()))
 
 
+def _binds_revisions(backend) -> bool:
+    return getattr(backend, "payment_revisions", False) is True
+
+
 def _payment_item_current(backend, meta) -> bool:
     """Inside ``fill_context``: the card still binds what consent was given for. dlz: every backend is
-    re-read (metadata only, never a value), and the item's revision must be the one the prompt was shown
-    for. A 1Password listing may come from its 60 s metadata cache; the version op reports with the revealed
-    card is checked again in ``_resolve_card``."""
+    re-read (metadata only, never a value); a backend with revisions must report the same revision the prompt
+    was shown for. A 1Password listing may come from its 60 s metadata cache; the revision op reports with
+    the revealed card is checked again in ``_resolve_card``."""
+    from agent.vault_store import revision_verdict
     from tools.browser_vault_context import saved_origins
 
     fresh = backend.get_meta(meta.id)
@@ -235,21 +254,25 @@ def _payment_item_current(backend, meta) -> bool:
             and saved_origins(fresh) == saved_origins(meta)
             and tuple(fresh.payment_frame_origins) == tuple(meta.payment_frame_origins)
             and fresh.payment_scope == meta.payment_scope
-            and getattr(fresh, "revision", "") == getattr(meta, "revision", ""))
+            and (not _binds_revisions(backend)
+                 or revision_verdict(meta.revision, getattr(fresh, "revision", "")) == "match"))
 
 
-def _resolve_card(backend, meta) -> dict | None:
-    """The card's raw payload, or None when the backend says it read a different revision than the one the
-    prompt was shown for (the value is dropped here, unwritten). A backend that cannot name the revision it
-    read (``None``) relies on the in-context metadata re-read."""
+def _resolve_card(backend, meta) -> tuple[dict | None, str]:
+    """The card's raw payload and ``match``, or ``(None, "changed"|"unavailable")`` when the revision read is
+    not provably the one the prompt was shown for (the value is dropped here, unwritten). A backend without
+    revisions (plugins) relies on its own fill_context and the in-context metadata re-read."""
+    from agent.vault_store import revision_verdict
+
     resolve = getattr(backend, "resolve_payment_secret", None)
     if callable(resolve):
         secret, revision = resolve(meta.id)
     else:  # duck-typed backends (tests, old plugins) without the revision-aware call
         secret, revision = backend.resolve_secret(meta.id), None
-    if revision is not None and revision != getattr(meta, "revision", ""):
-        return None
-    return secret
+    if not _binds_revisions(backend):
+        return secret, "match"
+    verdict = revision_verdict(meta.revision, revision)
+    return (secret, verdict) if verdict == "match" else (None, verdict)
 
 
 def _route_lease(task_id: str) -> str:
@@ -314,6 +337,10 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         bound = tuple(meta.allowed_origins) or ((meta.origin,) if meta.origin else ())
         if not bound and meta.payment_scope != "confirmed_page":
             return json.dumps({"success": False, "error_type": "no_origin", "error": _NO_ORIGIN})
+        # dlz: a backend with revisions must name the card's revision now, or no prompt is shown at all.
+        if _binds_revisions(backend) and not getattr(meta, "revision", ""):
+            return json.dumps({"success": False, "error_type": "payment_item_revision_unavailable",
+                               "error": _REVISION_UNAVAILABLE})
         # dlz: the lease this approval is for, snapshotted before the prompt (managed mode).
         lease = _route_lease(task_id) if vault._is_managed() else ""
         inspected = supervisor.inspect_payment(
@@ -377,10 +404,13 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             if time.monotonic() >= inspected.expires_at:
                 return json.dumps(_expired())
             # Never resolve at inspection/list time, on decline or on stale consent.
-            raw = _resolve_card(backend, meta)
+            raw, verdict = _resolve_card(backend, meta)
             if raw is None:
-                return json.dumps({"success": False, "error_type": "payment_item_changed",
-                                   "error": _ITEM_CHANGED_ON_READ})
+                if verdict == "changed":
+                    return json.dumps({"success": False, "error_type": "payment_item_changed",
+                                       "error": _ITEM_CHANGED_ON_READ})
+                return json.dumps({"success": False, "error_type": "payment_item_revision_unavailable",
+                                   "error": _REVISION_UNAVAILABLE_ON_READ})
             secret = validate_card(raw)
             _register_card_redaction(secret)
             try:

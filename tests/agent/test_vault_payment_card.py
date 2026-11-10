@@ -107,6 +107,28 @@ def test_card_revision_is_the_op_version_from_the_listing_and_from_the_revealed_
     backend = OnePasswordLoginBackend({"binary_path": str(script)})
     backend._service_token = "synthetic-service-token"
     meta = backend.get_meta("op:vault:card")
-    assert meta.revision == "op:3" and "revision" not in meta.to_dict()
+    assert meta.revision == "op.version=3" and "revision" not in meta.to_dict()
     card, revision = backend.resolve_payment_secret("op:vault:card")
-    assert revision == "op:4" and card["card_number"] == CARD["fields"][0]["value"]
+    assert revision == "op.version=4" and card["card_number"] == CARD["fields"][0]["value"]
+
+
+_AT = "2026-11-09T10:00:00Z"
+
+
+@pytest.mark.parametrize("listed, revealed, verdict", [
+    ({"version": 3, "updated_at": _AT}, {"version": 3, "updated_at": _AT}, "match"),
+    ({"version": 3, "updated_at": _AT}, {"version": 4, "updated_at": _AT}, "changed"),
+    ({"updated_at": _AT}, {"updated_at": _AT}, "match"),  # no version anywhere: updated_at decides
+    ({"updated_at": _AT}, {"updated_at": "2026-11-09T10:00:05Z"}, "changed"),
+    ({"version": 3, "updated_at": _AT}, {"updated_at": _AT}, "match"),  # version missing on one path only
+    ({"updated_at": _AT}, {"version": 3, "updated_at": _AT}, "match"),
+    ({"version": 3}, {"updated_at": _AT}, "unavailable"),  # nothing both carry
+    ({}, {}, "unavailable"),  # missing never equals missing
+    ({"version": True, "updated_at": "a;b"}, {"version": True, "updated_at": "a;b"}, "unavailable"),
+])
+def test_op_revision_compares_only_metadata_both_responses_carry(listed, revealed, verdict):
+    from agent.vault_backends.onepassword import _item_revision
+    from agent.vault_store import revision_verdict
+
+    assert revision_verdict(_item_revision({**CARD, **listed}), _item_revision({**CARD, **revealed})) == verdict
+    assert all(f["value"] not in _item_revision(CARD) for f in CARD["fields"])

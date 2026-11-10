@@ -59,7 +59,7 @@ def test_a_payment_record_revision_follows_the_stored_record(tmp_path):
     meta = store.add_item("payment", "Synthetic card", card)
     secret, revision = store.resolve_secret_with_revision(meta.id)
     assert revision == meta.revision == store.get_meta(meta.id).revision and secret["cvc"] == "837"
-    assert re.fullmatch(r"local:[0-9a-f]{32}", revision)  # keyed digest only, never card digits
+    assert re.fullmatch(r"local=[0-9a-f]{32}", revision)  # keyed digest only, never card digits
     records = store._read_all()
     records[0]["secret"]["cvc"] = "838"
     store._write_all(records)

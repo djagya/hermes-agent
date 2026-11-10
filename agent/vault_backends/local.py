@@ -19,6 +19,7 @@ class LocalLoginBackend(LoginBackend):
     name = "local"
     display_name = "Hermes vault"
     prefix = "vault_"
+    payment_revisions = True  # keyed digest of the stored record
 
     def list_items(self) -> list[VaultItemMeta]:
         return _store().list_items()

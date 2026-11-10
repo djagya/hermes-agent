@@ -660,9 +660,10 @@ class PaymentSupervisionMixin:
                     # dlz: no write after the window closes; earlier documents' values are reported, not
                     # completed.
                     return _partial({"success": False, "error_type": "payment_consent_expired"}, filled)
-                # dlz: an earlier document's page handlers ran after its writes: before the next document,
-                # the frame topology and every card frame's visibility are checked again.
-                if written and not await self._payment_scope_current(i, [d for d, _f in order]):
+                # dlz: an earlier document's page handlers ran after its writes: before the next document, its
+                # pinned frame chain and owners are checked again (bounded: no OOPIF rediscovery; an earlier
+                # document that changed is caught by the settled retention check).
+                if written and not await self._payment_scope_current(i, [document]):
                     return _partial({"success": False, "error_type": "payment_page_changed"}, filled)
                 result = await self._commit_payment_document(
                     document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop), strict=strict)
@@ -690,11 +691,38 @@ class PaymentSupervisionMixin:
             return _partial({"success": False, "error_type": "payment_transport_uncertain"}, filled)
 
     async def _payment_scope_current(self, i: PaymentInspection, documents: list) -> bool:
-        """dlz: between the documents of a split fill: the frame tree is still the inspected one and every
-        card frame being filled is still shown. Any failure to answer counts as changed."""
-        try:
-            if await self._payment_tree(i.page_session, i.child_sessions) != i.tree:
+        """dlz: between the documents of a split fill, bounded and against the pinned state (no OOPIF
+        rediscovery): every frame from a card document up to the page still has its inspected id, loader, URL
+        and origin in the session that inspected it (one ``Page.getFrameTree`` per session), and every pinned
+        owner <iframe> is still connected and shown (``_shown_documents``, one call per parent). Frames off
+        the card chains (ads) are ignored. Any failure to answer counts as changed."""
+        by_id = {f[0]: f for f in i.tree}
+        chain: list = []
+        for d in documents:
+            fid = d.frame_id
+            while fid in by_id and fid not in chain:
+                chain.append(fid)
+                fid = by_id[fid][4]
+            if fid and fid not in by_id:
                 return False
+        try:
+            seen: dict = {}
+            for sid in dict.fromkeys(i.child_sessions.get(fid, i.page_session) for fid in chain):
+                frames: dict = {}
+
+                def walk(node):
+                    frame = node["frame"]
+                    frames[frame["id"]] = (frame.get("loaderId", ""), frame.get("url", ""),
+                                           frame.get("securityOrigin", ""))
+                    for child in node.get("childFrames", []):
+                        walk(child)
+
+                walk((await self._cdp("Page.getFrameTree", session_id=sid))["result"]["frameTree"])
+                seen[sid] = frames
+            for fid in chain:
+                sid = i.child_sessions.get(fid, i.page_session)
+                if seen[sid].get(fid) != tuple(by_id[fid][1:4]):
+                    return False
             return {d.frame_id for d in documents} <= await self._shown_documents(i)
         except Exception:  # health: allow BLE001 -- an unreadable page is not the approved page; fail closed
             return False
@@ -885,7 +913,33 @@ _INSPECT = r"""(() => {
     !['hidden','submit','button','reset','file','image','checkbox','radio','select-multiple'].includes(x.e.type));
   const selected = new Set(entries.map(x=>x.index));
   const signature = JSON.stringify(describe());
-  const valid = () => document === doc && location.href === href &&
+  // dlz: the owner chain this document can reach synchronously (same-origin ancestors, pinned now) and the
+  // top URL when readable: page code run by focus can hide a parent iframe or rewrite the top URL
+  // (history.replaceState) without touching this document. Cross-origin ancestors are out of reach of
+  // this document's scripts, and out of this check (between documents, control re-checks the owners).
+  const scopeChain = [];
+  for (let w = globalThis, k = 0; k < 8; k++) {
+    let fe = null, pw = null, ph = null;
+    try { fe = w.frameElement; pw = w.parent; ph = fe && pw ? pw.location.href : null; } catch (_) { fe = null; }
+    if (!fe || !pw || pw === w || typeof ph !== 'string') break;
+    scopeChain.push({fe, pw, ph});
+    w = pw;
+  }
+  const readTop = () => { try { const t = globalThis.top; return t && t !== globalThis ? String(t.location.href) : null; }
+                          catch (_) { return null; } };
+  const topHref = readTop();
+  const ownerShown = e => {
+    const v = e.ownerDocument && e.ownerDocument.defaultView;
+    if (!e.isConnected || !v) return false;
+    const r = e.getBoundingClientRect(), s = v.getComputedStyle(e);
+    return e.getClientRects().length > 0 && r.width > 2 && r.height > 2 && s.visibility !== 'hidden' &&
+      Number(s.opacity) > 0 && (typeof e.checkVisibility !== 'function' ||
+        e.checkVisibility({opacityProperty: true, visibilityProperty: true}));
+  };
+  const scope = () => scopeChain.every(c => { try { return c.pw.location.href === c.ph && ownerShown(c.fe); }
+                                             catch (_) { return false; } }) &&
+    (topHref === null || readTop() === topHref);
+  const valid = () => document === doc && location.href === href && scope() &&
     JSON.stringify(describe()) === signature &&
     (now => now.length === elements.length && now.every((e,n)=>e === elements[n]))(allInputs()) &&
     entries.every(x=>visible(x.e));
@@ -965,6 +1019,8 @@ _INSPECT = r"""(() => {
         // right before this setter, not only before the loop.
         if (!valid() || !live(el) || !shown(el) || (strict === true && !hits(el)))
           return changed();
+        if (late())  // the checks above run page-visible code too (layout, style): the window again, last
+          return {success:false,error_type:'payment_consent_expired',filled_fields:attempted,partially_filled:attempted>0};
         attempted += 1;
         if (isSelect(el)) {
           selectSetter.call(el,f.value);

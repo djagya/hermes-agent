@@ -219,10 +219,30 @@ def test_an_edited_card_is_never_written(fill, edit):
     or in the revealed item itself, refuses with payment_item_changed and writes nothing."""
     run, events, _ = fill
     meta = run.meta
-    meta.revision = "op:3"
-    fresh = SimpleNamespace(**{**vars(meta), "revision": "op:4" if edit == "during_consent" else "op:3"})
+    run.backend.payment_revisions = True
+    meta.revision = "op.version=3"
+    fresh = SimpleNamespace(**{**vars(meta), "revision": "op.version=4" if edit == "during_consent" else "op.version=3"})
     run.backend.get_meta = lambda handle: events.append("meta") or fresh
-    run.backend.resolve_payment_secret = lambda handle: (events.append("resolve") or {"card_number": "x"}, "op:4")
+    run.backend.resolve_payment_secret = lambda handle: (events.append("resolve") or {"card_number": "x"},
+                                                         "op.version=4")
     out = run((True, ""))
     assert out["error_type"] == "payment_item_changed" and "commit" not in events
     assert ("resolve" in events) is (edit == "at_read")
+
+
+@pytest.mark.parametrize("bound, read, error_type", [
+    ("", None, "payment_item_revision_unavailable"),  # no revision at prompt time: no prompt at all
+    ("op.version=3", "", "payment_item_revision_unavailable"),  # nothing comparable read: dropped
+    ("op.version=3", None, "payment_item_revision_unavailable"),
+])
+def test_a_card_without_a_comparable_revision_is_never_written(fill, monkeypatch, bound, read, error_type):
+    """Codex A2 r2 #2: a missing revision never equals a missing revision."""
+    run, events, _ = fill
+    asked = []
+    monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", lambda *a, **k: asked.append(1) or "accept")
+    run.backend.payment_revisions = True
+    run.meta.revision = bound
+    run.backend.resolve_payment_secret = lambda handle: (events.append("resolve") or {"card_number": "x"}, read)
+    out = run((True, ""))
+    assert out["error_type"] == error_type and "commit" not in events
+    assert bool(asked) is bool(bound) and ("resolve" in events) is bool(bound)

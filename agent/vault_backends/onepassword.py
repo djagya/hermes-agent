@@ -68,6 +68,7 @@ class OnePasswordLoginBackend(LoginBackend):
     display_name = "1Password"
     prefix = "op:"
     needs_unlock = True
+    payment_revisions = True  # every card fill binds and re-checks the item revision (version / updated_at)
 
     def __init__(self, cfg: Optional[dict] = None):
         self.cfg = cfg or {}
@@ -323,14 +324,22 @@ def _login_password(item: object, backend: str) -> str:
 
 
 def _item_revision(item: object) -> str:
-    """The item's ``version`` (op JSON, list and get alike; 1Password bumps it on every edit) as text, or ""
-    when op did not report one. Non-secret."""
-    version = item.get("version") if isinstance(item, dict) else None
+    """The item's revision from metadata only (never a field value): ``op.version`` (1Password bumps it on
+    every edit) and ``op.updated_at``, each when op reported it. The same function reads the listing and the
+    revealed item, and ``revision_verdict`` compares the parts both carry, so a field missing from one
+    response cannot fake a change and a field missing from both cannot fake a match. "" = neither."""
+    if not isinstance(item, dict):
+        return ""
+    parts = []
+    version = item.get("version")
     if type(version) is int and version >= 0:
-        return f"op:{version}"
-    if isinstance(version, str) and version.isascii() and version.isdecimal():
-        return f"op:{int(version)}"
-    return ""
+        parts.append(f"op.version={version}")
+    elif isinstance(version, str) and version.isascii() and version.isdecimal():
+        parts.append(f"op.version={int(version)}")
+    updated = item.get("updated_at")
+    if isinstance(updated, str) and 0 < len(updated) <= 64 and not set(updated) & set(";= \t\r\n"):
+        parts.append(f"op.updated_at={updated}")
+    return ";".join(parts)
 
 
 def _no_otp_field(detail: str) -> bool:
