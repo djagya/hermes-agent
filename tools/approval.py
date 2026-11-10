@@ -16,6 +16,7 @@ import hashlib
 import importlib
 import logging
 import os
+import re
 import threading
 from typing import Optional
 
@@ -141,30 +142,63 @@ def unregister_gateway_notify(session_key: str) -> None:
             entry.event.set()
 
 
+# dlz: an exact request (``exact_request``, every vault-payment prompt) is selected only by its own
+# request id, minted as ``uuid4().hex`` in ``approval_gateway_wait._ApprovalEntry``. Anything else
+# (``""``, ``" "``, ``None``, another shape) is no id and can never select it.
+_REQUEST_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def valid_request_id(request_id) -> Optional[str]:
+    """``request_id`` when it is a minted approval id, else None."""
+    return request_id if isinstance(request_id, str) and _REQUEST_ID_RE.fullmatch(request_id) else None
+
+
+def _entry_accepts(entry, choice: str, approver: Optional[str], by_id: bool) -> bool:
+    """Whether ``choice`` from this resolver may settle ``entry``. ``deny`` always may. An exact
+    entry accepts only ``once``, and only when selected by its own id. An entry naming an
+    approver accepts a non-deny choice only from that approver (the Telegram adapter passes
+    ``telegram:<from_user.id>``; every other resolver passes none and so can only deny)."""
+    if choice == "deny":
+        return True
+    data = entry.data
+    if data.get("exact_request") and (choice != "once" or not by_id):
+        return False
+    required = data.get("approver")
+    return not required or (isinstance(approver, str) and approver == required)
+
+
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
+                             request_id: Optional[str] = None,
+                             approver: Optional[str] = None) -> int:
     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
 
     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
     (FIFO) or the one matching *request_id*. *reason* is the ``/deny <reason>`` free text,
     relayed to the agent in the BLOCKED message. Returns the number resolved.
+
+    dlz: an entry this resolver may not settle (see ``_entry_accepts``) stays pending and is not
+    counted: FIFO and ``resolve_all`` skip exact entries for every choice but ``deny``, and an
+    approver-bound entry ignores a non-deny choice from anyone else. *approver* is the
+    authenticated principal of the resolver (only the Telegram button path sets it).
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
+        exact_id = valid_request_id(request_id)
         if request_id:
-            targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
-            if not targets:
-                return 0
-            queue[:] = [entry for entry in queue if entry not in targets]
-        elif resolve_all:
-            targets = list(queue)
-            queue.clear()
+            # An exact entry matches only a valid id; other entries keep the plain string match.
+            matching = [entry for entry in queue if entry.data.get("request_id") == request_id
+                        and (exact_id is not None or not entry.data.get("exact_request"))]
+            targets = [entry for entry in matching if _entry_accepts(entry, choice, approver, by_id=True)]
         else:
-            targets = [queue.pop(0)]
+            eligible = [entry for entry in queue if _entry_accepts(entry, choice, approver, by_id=False)]
+            targets = eligible if resolve_all else eligible[:1]
+        if not targets:
+            return 0
+        queue[:] = [entry for entry in queue if entry not in targets]
         if not queue:
             _gateway_queues.pop(session_key, None)
         # Popping the entry and committing its outcome are ONE critical section: the waiter's
@@ -178,15 +212,17 @@ def resolve_gateway_approval(session_key: str, choice: str,
     return len(targets)
 
 
-def resolve_gateway_approval_card(session_key: str, choice: str, request_id: Optional[str]) -> int:
+def resolve_gateway_approval_card(session_key: str, choice: str, request_id: Optional[str],
+                                  approver: Optional[str] = None) -> int:
     """Resolve the approval a native button card was rendered for.
 
     With the card's request id only that request can resolve: a card whose request already
     settled (timed out, answered by ``/approve``) resolves nothing instead of the next queued
     approval in the same session. A card sent without an id keeps the FIFO behaviour."""
+    principal = {"approver": approver} if approver else {}  # other adapters' call shape is unchanged
     if request_id:
-        return resolve_gateway_approval(session_key, choice, request_id=request_id)
-    return resolve_gateway_approval(session_key, choice)
+        return resolve_gateway_approval(session_key, choice, request_id=request_id, **principal)
+    return resolve_gateway_approval(session_key, choice, **principal)
 
 
 def withdraw_gateway_approval(session_key: str, request_id: str, cause: str) -> bool:

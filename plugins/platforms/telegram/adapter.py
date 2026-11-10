@@ -186,6 +186,7 @@ from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
+from plugins.platforms.telegram.telegram_approval_cards import TelegramApprovalCardsMixin
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
@@ -518,7 +519,8 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramInlinePhotosMixin, TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramInlinePhotosMixin, TelegramHeldInboundMixin, TelegramTopicRoutingMixin,
+                      TelegramApprovalCardsMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -712,8 +714,8 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramHeldInboundMixin, Teleg
         self._max_doc_bytes: int = 2 * 1024 * 1024 * 1024 if extra.get("base_url") else 20 * 1024 * 1024
         self._model_picker_state: dict[str, dict] = {}  # per-chat interactive picker state
         self._choice_picker_state: dict[str, dict] = {}
-        self._approval_state: dict[int, str] = {}  # message_id → session_key
-        self._approval_request_ids: dict[int, str] = {}  # message_id → tools.approval request id
+        # dlz: random single-use card nonce → card record (telegram_approval_cards); ea: and pa: cards.
+        self._approval_cards: dict[str, dict] = {}
         self._slash_confirm_state: dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: dict[str, str] = {}  # clarify_id → session_key
         # "important" (default): only final responses, approvals and slash confirmations notify;
@@ -4303,17 +4305,15 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramHeldInboundMixin, Teleg
         """Inline-keyboard approval prompt; buttons call ``resolve_gateway_approval()`` like the
         text ``/approve`` flow."""
         def build():
-            # Short monotonic ids in callback_data map back to session_key.
-            import itertools
-            if not hasattr(self, "_approval_counter"):
-                self._approval_counter = itertools.count(1)
-            approval_id = next(self._approval_counter)
-            buttons = [InlineKeyboardButton(label, callback_data=f"ea:{choice}:{approval_id}")
+            # dlz: a random single-use nonce bound to this card's request, chat, thread and message
+            # (telegram_approval_cards), never a counter an adapter restart would reuse.
+            import secrets
+            nonce = secrets.token_urlsafe(16)
+            buttons = [InlineKeyboardButton(label, callback_data=f"ea:{choice}:{nonce}")
                        for label, choice, _ in prompt.actions]
-            def on_sent(_msg):
-                self._approval_state[approval_id] = prompt.session_key
-                if prompt.request_id:
-                    self._approval_request_ids[approval_id] = prompt.request_id
+            def on_sent(msg):
+                self._arm_approval_card(nonce, "ea", msg, chat_id=prompt.chat_id, session_key=prompt.session_key,
+                                        request_id=prompt.request_id, choices=prompt.choices)
             return prompt.text, InlineKeyboardMarkup(self._rows_of_two(buttons)), on_sent
         return await self._send_prompt(
             "send_exec_approval", prompt.chat_id, prompt.metadata, build, parse_mode=ParseMode.HTML,
@@ -4782,6 +4782,7 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramHeldInboundMixin, Teleg
                 return
         for prefix, handler in (
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
+            ("pa:", self._handle_payment_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
             if data.startswith(prefix):
@@ -4798,29 +4799,21 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramHeldInboundMixin, Teleg
         return session_key
 
     async def _handle_exec_approval_callback(self, query, data: str, cb: dict[str, Any]) -> None:
-        """``ea:<choice>:<approval_id>`` — resolve a pending exec approval."""
-        parts = data.split(":", 2)
-        if len(parts) != 3:
+        """``ea:<choice>:<nonce>`` — resolve a pending exec approval (the card's own request only)."""
+        claimed = await self._claim_approval_card(
+            query, data, cb, "ea", _unauthorized(), already=_toast("platform.telegram.approval.toast_already_resolved"),
+            invalid=_toast("platform.telegram.approval.toast_invalid_data"))
+        if claimed is None:
             return
-        choice = parts[1]  # once, session, always, deny
-        try:
-            approval_id = int(parts[2])
-        except (ValueError, IndexError):
-            await query.answer(text=_toast("platform.telegram.approval.toast_invalid_data"))
-            return
-        session_key = await self._claim_callback_state(
-            query, cb, self._approval_state, approval_id, _unauthorized(),
-            _toast("platform.telegram.approval.toast_already_resolved"))
-        if not session_key:
-            return
-        request_id = self._approval_request_ids.pop(approval_id, None)
+        record, choice, presser = claimed  # choice: one the card offered (once, session, always, deny)
+        session_key, request_id = record["session_key"], record["request_id"]
         user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
         try:
             # Rendering happens after so the message reflects what actually occurred: a tap that lands after
             # the approval wait timed out (count == 0) must NOT claim "Approved" — the command was already
             # denied and will not run (#63501 regression follow-up: 60s waits made stale taps common).
             from tools.approval import resolve_gateway_approval_card
-            count = resolve_gateway_approval_card(session_key, choice, request_id)
+            count = resolve_gateway_approval_card(session_key, choice, request_id, approver=presser)
             logger.info(
                 "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)", count, session_key, choice, user_display)
         except Exception as exc:

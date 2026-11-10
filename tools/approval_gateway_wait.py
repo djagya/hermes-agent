@@ -29,6 +29,10 @@ class _ApprovalEntry:
     def __init__(self, data: dict):
         self.event = threading.Event()
         self.data = dict(data)
+        if self.data.get("exact_request"):
+            # dlz: an exact request is selected only by an id this module minted; a caller-supplied one
+            # (empty, reused, guessable) is replaced, so an empty or foreign id can never accept it.
+            self.data["request_id"] = uuid.uuid4().hex
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
         # Surface hook run once when the wait ends by ANY path (answer, timeout, interrupt, /approve from
@@ -184,9 +188,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     while True:
         with _approval._lock:
             leader = None
-            if not preparing_terminal_approval():
+            # dlz: an exact request (vault-payment) is never coalesced, in either direction: it gets its
+            # own entry, prompt and id, and no other request can adopt its answer.
+            if not preparing_terminal_approval() and not approval_data.get("exact_request"):
                 leader = next((e for e in _approval._gateway_queues.get(session_key, [])
-                               if e.data.get("command") == approval_data.get("command")
+                               if not e.data.get("exact_request")
+                               and e.data.get("command") == approval_data.get("command")
                                and list(e.data.get("pattern_keys") or []) == keys), None)
             if leader is None:
                 _enqueue()

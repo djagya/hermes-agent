@@ -19,6 +19,7 @@ class LocalLoginBackend(LoginBackend):
     name = "local"
     display_name = "Hermes vault"
     prefix = "vault_"
+    payment_revisions = True  # keyed digest of the stored record
 
     def list_items(self) -> list[VaultItemMeta]:
         return _store().list_items()
@@ -36,3 +37,7 @@ class LocalLoginBackend(LoginBackend):
 
     def resolve_secret(self, handle: str) -> dict[str, str]:
         return {k: str(v) for k, v in _store().resolve_secret(handle).items()}
+
+    def resolve_payment_secret(self, handle: str) -> tuple[dict[str, str], Optional[str]]:
+        secret, revision = _store().resolve_secret_with_revision(handle)
+        return {k: str(v) for k, v in secret.items()}, revision

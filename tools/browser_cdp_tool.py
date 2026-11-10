@@ -356,6 +356,14 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
     if loop is None or not loop.is_running():
         return tool_error("CDP supervisor loop is not running. Try reconnecting with /browser connect.")
 
+    # dlz: A9: this socket is the runtime's native one, which browser-control cannot tell apart from
+    # the payment code; refuse here what control refuses on every other connection after a card fill.
+    from tools.browser_payment_surface import supervisor_route_refusal
+
+    refused = supervisor_route_refusal(supervisor, frame_id, method, params or {}, child_sid)
+    if refused:
+        return json.dumps(refused)
+
     try:
         from agent.async_utils import safe_schedule_threadsafe
         fut = safe_schedule_threadsafe(
@@ -439,6 +447,12 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
         if "payment_screenshot_blocked" in str(exc):
             # browser-control's capture guard refused the method on a card-filled slot.
             return json.dumps(screenshot_refusal())
+        if "payment_surface_protected" in str(exc):
+            # dlz: A9: browser-control refused a read of a protected card frame on this connection.
+            return json.dumps({"success": False, "error_type": "payment_surface_protected",
+                               "error": "The card frame is protected after a card fill until it navigates away. "
+                                        "Use browser_vault payment_controls / payment_click inside it, or the "
+                                        "merchant page."})
         return tool_error(str(exc), method=method)
     except WebSocketException as exc:
         return tool_error(f"WebSocket error talking to CDP at {endpoint}: {exc}. The browser may have "
