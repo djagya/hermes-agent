@@ -232,7 +232,7 @@
       "body": [
         "?slot="
       ],
-      "reply": "slot_id, capture_blocked, capture_blocked_at, wipe_count, human_clear {at, principal}|null, history",
+      "reply": "slot_id, capture_blocked, capture_blocked_at, wipe_count, human_clear {at, principal}|null, payment_surface {frames, targets, native_connected, claimed_at}, history",
       "errors": [
         "unknown_slot"
       ],
@@ -484,7 +484,7 @@
         "slot_id",
         "confirmed_by"
       ],
-      "reply": "slot_id, capture_blocked=false, cleared, cleared_at",
+      "reply": "slot_id, capture_blocked=false, cleared, cleared_at (also releases the payment surface)",
       "errors": [
         "guard_clear_principal",
         "unknown_slot"
@@ -821,7 +821,7 @@
       "body": [
         "?tok="
       ],
-      "reply": "CDP WebSocket splice (capture guard)",
+      "reply": "CDP WebSocket splice (capture guard, payment surface: cdp_methods)",
       "errors": [
         "lease_ended",
         "token_not_current",
@@ -906,5 +906,29 @@
         "other"
       ]
     }
+  },
+  "cdp_methods": {
+    "doc": "CDP methods the splice answers itself on every /devtools and /slot/{slot}/json/version WebSocket; never forwarded to Chrome. Errors use the CDP error shape {id, sessionId?, error {code -32000, message '<code>: ...'}}.",
+    "methods": {
+      "Hermes.claimPaymentSurface": {
+        "params": "frames [frameId, 1..8], targets [targetId, 1..8]: every frame must live in one of the targets (an OOPIF document is its own target; an in-process frame names the target whose frame tree holds it)",
+        "result": "claimed=true, frames, targets (the slot's whole protected set)",
+        "errors": [
+          "payment_surface_unavailable"
+        ],
+        "rules": "first connection to claim a slot with an empty set becomes its native connection; only it can extend the set; any other claim, a claim after the native socket closed or after a control restart, and an unverifiable frame are refused; the runtime refuses the card fill unless its own claim succeeded"
+      },
+      "Hermes.paymentSurfaceStatus": {
+        "params": "none",
+        "result": "protected, native (this connection is the native one), frames, targets",
+        "errors": []
+      }
+    },
+    "errors": {
+      "payment_surface_unavailable": "the claim cannot be confirmed or another connection holds the slot",
+      "payment_surface_protected": "a non-native connection asked for a read, interception or copy path on a protected slot, or Chrome's reply on a protected session answers a command sent before the protection",
+      "cdp_method_blocked": "any other Hermes.* method, and Target.exposeDevToolsProtocol"
+    },
+    "clears": "a protected frame's cross-document navigation (new loaderId), detach or target loss seen by control's own CDP watcher; a temporary-profile wipe; a human POST /v1/capture-guard/clear; never a controller-key route"
   }
 }

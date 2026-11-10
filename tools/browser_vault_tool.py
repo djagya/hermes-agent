@@ -1215,13 +1215,21 @@ BROWSER_VAULT_SCHEMA = {
         "payment_consent_expired: the 120 s inspection window closed; with partially_filled false nothing was "
         "written, ask again; with partially_filled true some fields were written: stop, do not submit or retry, "
         "tell the user. payment_fields_not_retained: "
-        "fields were written but did not all hold after the page settled; do not submit or retry, tell the user."
+        "fields were written but did not all hold after the page settled; do not submit or retry, tell the user. "
+        "payment_surface_unavailable: browser control could not protect the card frames; nothing was read or "
+        "written, stop and tell the user. After a card fill the card frame is protected until it navigates away "
+        "(browser_exec/browser_cdp reads there return payment_surface_protected): payment_controls lists its "
+        "buttons, links and checkboxes ({ref, role, text, disabled}; never inputs, digits masked); payment_click "
+        "(ref) makes one trusted click on a listed control. The user's chat go for the purchase covers pressing "
+        "Pay there; never click Pay without it."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock", "letter_login",
-                                                  "letter_signed_in", "letter_done"]},
+                                                  "letter_signed_in", "letter_done", "payment_controls",
+                                                  "payment_click"]},
+            "ref": {"type": "string", "description": "payment_click only: a ref from payment_controls."},
             "handle": {"type": "string", "description": "fill / enter_code / letter_*: a handle from list or a letter note."},
             "purpose": {"type": "string", "enum": ["login", "signup"], "default": "login",
                         "description": "fill only: login preserves current-password behavior; signup requires fresh "
@@ -1281,6 +1289,19 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     return res["raw"] if "raw" in res else json.dumps(res)
 
 
+def _payment_surface_action(task_id: Optional[str], ref: Optional[str]) -> str:
+    """dlz: A9 native actions inside a protected card document (managed browser only)."""
+    from tools import browser_payment_surface as surface
+
+    if not _is_managed():
+        return json.dumps({"success": False, "error_type": "payment_surface_none",
+                           "error": "Only the managed browser protects card frames; use browser_exec as usual."})
+    supervisor = _managed_supervisor(task_id or "default")
+    if ref is None:
+        return json.dumps(surface.payment_controls(supervisor))
+    return json.dumps(surface.payment_click(supervisor, ref))
+
+
 def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
     action = str(args.get("action") or "")
@@ -1305,10 +1326,13 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
             after_failed_login=args.get("after_failed_login") is True,
             session_expired=args.get("session_expired") is True),
         "letter_signed_in": lambda: browser_vault_letter_signed_in(handle, task_id=tid),
+        "payment_controls": lambda: _payment_surface_action(tid, None),
+        "payment_click": lambda: _payment_surface_action(tid, str(args.get("ref") or "")),
     }
     if action not in page_ops:
         return json.dumps({"success": False, "error": f"Unknown action {action!r}; use list, fill, save_login, "
-                                                       "enter_code, unlock, letter_login, letter_signed_in or letter_done."})
+                                                       "enter_code, unlock, letter_login, letter_signed_in, "
+                                                       "letter_done, payment_controls or payment_click."})
     return _fenced_page_op(tid, page_ops[action])
 
 

@@ -18,9 +18,9 @@ from tools import browser_payment_privacy as privacy
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_PATH = ROOT / "tests/fixtures/browser_control/control-v1.json"
-# monolith chore/v0230-handback-20261109 (durable handback event_id, /v1/handback/pending,
-# handoff_ended reason_codes incl. expired_unused), 2026-11-09
-CONTRACT_SHA256 = "00cc4c3012f5cfb1b861b266c48bb944f92da6778ab5eeb8f49bd0fc7c5a90cd"
+# monolith feat/pay-a3-surface-20261110 (A9 protected payment surface: cdp_methods,
+# capture-guard view payment_surface), 2026-11-10
+CONTRACT_SHA256 = "79397728e6377f7f5de0a07ad77364d75f761ff1630f7e5393462abe7bdfb481"
 # The body the fork's handback route reads for B10, as declared by control-v1.
 HANDOFF_ENDED_BODY = ["event", "session_id", "slot_id", "lease_id", "reason_code", "event_id"]
 
@@ -112,3 +112,13 @@ def test_durable_handback_seams_match_control(contract):
     assert fields["event_id"] == "a" * 32
     assert hb.parse({"event": "handback", "session_id": "s-1", "slot_id": "x", "lease_id": "l",
                      "event_id": "../x"})[0]["event_id"] == ""
+
+
+def test_a9_payment_surface_cdp_methods_match_the_fork(contract):
+    from tools import browser_payment_surface as surface
+
+    table = contract["cdp_methods"]
+    assert set(table["methods"]) == {surface.CLAIM_METHOD, surface.STATUS_METHOD}
+    assert table["methods"][surface.CLAIM_METHOD]["errors"] == [surface.UNAVAILABLE]
+    assert surface.PROTECTED in table["errors"]
+    assert "payment_surface" in _route(contract, "GET", "/v1/capture-guard")["reply"]

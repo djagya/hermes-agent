@@ -245,6 +245,14 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "") -> str:
             if time.monotonic() >= inspected.expires_at:
                 return json.dumps({"success": False, "error_type": "payment_consent_expired",
                                    "error": _CONSENT_EXPIRED})
+            # dlz: A9: browser-control must confirm this supervisor's claim on the card documents before
+            # any value exists in the page; another connection holding them refuses the fill.
+            if vault._is_managed():
+                from tools.browser_payment_surface import claim_payment_surface
+
+                refused = claim_payment_surface(supervisor, inspected)
+                if refused:
+                    return json.dumps(refused)
             # Never resolve at inspection/list time, on decline or on stale consent.
             secret = validate_card(backend.resolve_secret(meta.id))
             _register_card_redaction(secret)

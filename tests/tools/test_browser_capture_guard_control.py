@@ -56,6 +56,9 @@ def fill(monkeypatch):
     monkeypatch.setattr(bvp, "_document_fills", lambda i, s: [{"index": 0, "token": "cc-number", "document": 0}])
     monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session",
                         lambda task_id, surface=None: events.append("local-mark"))
+    # A9: control confirms the payment-surface claim (tests/tools/test_browser_payment_surface.py).
+    monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface",
+                        lambda sup, i: events.append("claim"))
     backend = SimpleNamespace(name="local", resolve_secret=lambda handle: {"card_number": "synthetic"})
     meta = SimpleNamespace(id="h", label="Card", allowed_origins=("https://shop.test",), origin=None,
                            payment_scope="bound", payment_frame_origins=())
@@ -74,7 +77,7 @@ def fill(monkeypatch):
 def test_card_fill_sets_the_control_guard_before_any_write(fill):
     run, events, _ = fill
     assert run((True, ""))["success"] is True
-    assert events == [("set", "lease-shop", "tok-shop"), "local-mark", "commit"]
+    assert events == ["claim", ("set", "lease-shop", "tok-shop"), "local-mark", "commit"]
 
 
 @pytest.mark.parametrize("answer, optional, filled", [
