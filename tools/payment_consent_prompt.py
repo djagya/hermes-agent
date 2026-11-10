@@ -319,8 +319,10 @@ def request_payment_approval(facts: PaymentPromptFacts, *, timeout_seconds: Opti
     return PaymentConsent(outcome, reason, str(detail.get("detail") or ""))
 
 
-def facts_for_inspection(inspected, *, card_label: str) -> PaymentPromptFacts:
-    """Facts for today's reviewed fill: the inspected documents' origins and fields, no stated cart."""
+def facts_for_inspection(inspected, *, card_label: str, cart: Optional[StatedCart] = None) -> PaymentPromptFacts:
+    """Facts for a fill: the inspected documents' origins and fields. dlz (Track B): with ``cart`` (Sera's stated
+    cart), the page check the inspection pinned (``inspected.page_match``: state and where it looked) goes with it;
+    without one the card says no cart was stated."""
     from agent.vault_payment_policy import provider_for_origin
 
     merchant = inspected.merchant_origin
@@ -335,4 +337,6 @@ def facts_for_inspection(inspected, *, card_label: str) -> PaymentPromptFacts:
     return PaymentPromptFacts(
         ref=inspected.operation_id, card_label=card_label, merchant_origin=merchant, receiving=receiving,
         expires_in_s=max(1, min(600, int(inspected.expires_at - time.monotonic()))),
+        cart=cart,
+        page_match=PageMatch(*getattr(inspected, "page_match", ("not_checked", ""))) if cart is not None else PageMatch(),
         unreviewed=any(r.status == "UNREVIEWED" for r in receiving))

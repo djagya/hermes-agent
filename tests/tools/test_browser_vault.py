@@ -1173,8 +1173,11 @@ class TestExplicitCodeMode:
         with patch.object(browser_vault_tool, "browser_vault_fill", side_effect=lambda **kw: seen.update(kw) or "{}"), \
              patch.object(browser_vault_tool, "_fenced_page_op", side_effect=lambda tid, fn: fn()):
             browser_vault_tool._handle_vault(
-                {"action": "fill", "handle": "op:card", "merchant_origin": "https://shop.example"}, task_id="t")
-        assert seen == {"handle": "op:card", "task_id": "t", "merchant_origin": "https://shop.example", "purpose": "login"}
+                {"action": "fill", "handle": "op:card", "merchant_origin": "https://shop.example",
+                 "cart": {"items": []}, "approve_origins": ["https://psp.example"]}, task_id="t")
+        # dlz (Track B): the stated cart and approve_origins go through unchanged; fill_payment validates them.
+        assert seen == {"handle": "op:card", "task_id": "t", "merchant_origin": "https://shop.example", "purpose": "login",
+                        "cart": {"items": []}, "approve_origins": ["https://psp.example"]}
 
     def test_handle_bound_to_several_origins_accepts_any_of_them(self):
         from types import SimpleNamespace

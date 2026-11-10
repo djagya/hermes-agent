@@ -135,6 +135,47 @@ class PaymentPolicyError(ValueError):
     """Fixed-message refusal; never include supplied metadata or values."""
 
 
+class PaymentDestinationError(PaymentPolicyError):
+    """dlz: a typed refusal with a fixed ``error_type``, a fixed message and a sanitized ``detail`` (origins,
+    field tokens and counts only; never a frame URL, label or page text). Raised for the unreviewed-destination
+    discovery (``payment_fields_unsupported`` / ``payment_fields_ambiguous``) and for a page over the traversal
+    bounds on either path (``payment_page_too_large``)."""
+
+    def __init__(self, error_type: str, message: str, detail: dict | None = None):
+        super().__init__(message)
+        self.error_type = error_type
+        self.detail = dict(detail or {})
+
+
+# dlz (design v2 B6): the switch for owner-approved fills on unreviewed hosted payment forms, and the config keys
+# whose values form its policy generation (a change to either withdraws a fill waiting on its approval).
+DESTINATION_CONSENT_KEY = "payment_destination_consent"
+_POLICY_KEYS = (DESTINATION_CONSENT_KEY, "payment_providers")
+DESTINATION_OFF_HINT = ("card fields may be on an unreviewed hosted payment form; owner-approved destinations are "
+                        "off (vault.payment_destination_consent)")
+
+
+def destination_policy() -> tuple[bool, str]:
+    """``(enabled, generation)``: enabled only for a literal ``True`` in ``vault.payment_destination_consent``;
+    ``generation`` is a digest of that key and ``vault.payment_providers``. Unreadable config is ``(False, "")``.
+    The switch only lets the discovery inspection and the owner's prompt be offered: it admits no origin."""
+    import hashlib
+    import json
+
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        config = load_config()
+        values = {key: cfg_get(config, "vault", key, default=None) for key in _POLICY_KEYS}
+        generation = hashlib.sha256(json.dumps(values, sort_keys=True, default=repr).encode()).hexdigest()
+    except Exception:  # health: allow BLE001 -- unreadable config means the feature is off
+        return False, ""
+    return values[DESTINATION_CONSENT_KEY] is True, generation
+
+
+def destination_consent_enabled() -> bool:
+    return destination_policy()[0]
+
+
 def https_origin(value: str) -> str:
     """Require a canonical live HTTPS origin, not a URL or inferred origin."""
     if not isinstance(value, str) or not value or any(c.isspace() for c in value):

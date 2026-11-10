@@ -2462,6 +2462,10 @@ DEFAULT_CONFIG = {
             "enabled": True,        # `bw` CLI (Password Manager, not Secrets Manager); run `bw login` once first.
             "binary_path": "",      # absolute path to bw; empty = PATH.
         },
+        # dlz: owner-approved card fills on hosted payment forms Hermes has not reviewed. Only a literal true
+        # turns it on; it admits no origin itself: every such fill shows the owner one approval card naming each
+        # receiving origin, and switching it off withdraws a fill still in progress.
+        "payment_destination_consent": False,
     },
     "secrets": {
         # Optional ordering of enabled sources (e.g. [onepassword, bitwarden]); default registration
