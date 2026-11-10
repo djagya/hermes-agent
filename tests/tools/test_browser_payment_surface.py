@@ -37,6 +37,7 @@ class FakeSup:
         self.calls, self.status = [], {"protected": True, "frames": ["CARD"], "targets": ["CARD"]}
         self.hit, self.at_point = True, 77
         self.on = on or self.default
+        self.delays = {}  # method -> seconds before its reply (a slow Chrome)
 
     def default(self, method, params, session):
         if method == "Hermes.claimPaymentSurface":
@@ -68,6 +69,8 @@ class FakeSup:
 
     async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
         self.calls.append((method, params or {}, session_id))
+        if method in self.delays:
+            await asyncio.sleep(self.delays[method])
         return {"id": len(self.calls), "result": self.on(method, params or {}, session_id)}
 
     async def _payment_tree(self, sid, child_sessions):
@@ -103,12 +106,16 @@ def test_claim_names_each_card_document_and_the_target_holding_it():
     assert params == {"frames": ["CARD", "NAMEF"], "targets": ["CARD", "PAGE"]} and session is None
 
 
-@pytest.mark.parametrize("answer", [
-    RuntimeError("CDP error on id=3: {'message': 'payment_surface_unavailable: held by another connection'}"),
-    {"claimed": True, "frames": ["CARD"], "targets": ["CARD"]},  # does not cover NAMEF/PAGE
-    {"claimed": False},
+@pytest.mark.parametrize("answer, kept", [
+    # control's own refusal: it changed nothing, so nothing stays registered here
+    (RuntimeError("CDP error on id=3: {'message': 'payment_surface_unavailable: held by another connection'}"),
+     False),
+    # uncertain outcomes keep the requested scope until a status refresh narrows or lifts it
+    ({"claimed": True, "frames": ["CARD"], "targets": ["CARD"]}, True),  # does not cover NAMEF/PAGE
+    ({"claimed": False}, True),
+    (RuntimeError("boom"), True),
 ])
-def test_unconfirmed_claim_refuses_with_a_fixed_type(answer):
+def test_unconfirmed_claim_refuses_with_a_fixed_type(answer, kept):
     sup = FakeSup()
 
     def on(method, params, session):
@@ -121,7 +128,32 @@ def test_unconfirmed_claim_refuses_with_a_fixed_type(answer):
     sup.on = on
     out = surface.claim_payment_surface(sup, _inspected())
     assert out["error_type"] == "payment_surface_unavailable" and "another connection" not in out["error"]
-    assert surface.protected_frames(sup) == frozenset()
+    with surface._LOCK:
+        found = surface._SURFACES.get(sup)
+    assert (found.frames if found else frozenset()) == ({"CARD", "NAMEF"} if kept else frozenset())
+
+
+@pytest.mark.parametrize("failure", [
+    RuntimeError("CDP error on id=9: {'message': 'payment_surface_unavailable: could not verify the frames'}"),
+    RuntimeError("socket reset"),
+])
+def test_a_failed_extension_never_lifts_an_earlier_fill(failure):
+    # Codex A3 r1 #3: CARD is filled and protected; a later claim for another document fails. Control still
+    # treats this socket as native for CARD, so the gate here must keep refusing reads of CARD.
+    sup = _claimed()
+    later = SimpleNamespace(documents=(SimpleNamespace(frame_id="CARD2", frame_session="S-page"),),
+                            page_session="S-page", page_id="PAGE", child_sessions={})
+
+    def on(method, params, session):
+        if method in {"Hermes.claimPaymentSurface", "Hermes.paymentSurfaceStatus"}:
+            raise failure  # status unreachable too: only the cache decides
+        return sup.default(method, params, session)
+
+    sup.on = on
+    assert surface.claim_payment_surface(sup, later)["error_type"] == "payment_surface_unavailable"
+    frames = surface.protected_frames(sup)
+    assert {"CARD", "NAMEF"} <= frames
+    assert ("CARD2" in frames) is not surface._control_refused(failure), "uncertain: keep the wider scope"
 
 
 @pytest.fixture
@@ -172,6 +204,20 @@ def test_fill_refuses_without_a_confirmed_claim_and_resolves_nothing(fill):
     assert events == ["guard", "claim", "resolve", "commit"]
 
 
+def test_consent_expiring_during_the_claim_resolves_nothing(fill):
+    # Codex A3 r1 #7: a slow claim verification can outlast the approval window; expiry is checked again
+    # right after the claim, before anything is resolved.
+    run, events, monkeypatch = fill
+
+    def slow_claim(sup, inspected):
+        events.append("claim")
+        inspected.expires_at = time.monotonic() - 1
+
+    monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface", slow_claim)
+    out = run()
+    assert out["error_type"] == "payment_consent_expired" and "resolve" not in events
+
+
 @pytest.fixture
 def routed(monkeypatch):
     sup = _claimed()
@@ -201,6 +247,15 @@ def routed(monkeypatch):
     ("Page.createIsolatedWorld", "ADS", {"frameId": "CARD"}),
     ("Input.dispatchKeyEvent", "ADS", {"type": "keyDown", "key": "c", "modifiers": 2}),
     ("Page.navigate", "CARD", {"url": "javascript:alert(1)"}),
+    # Codex A3 r1 #2: Page.* on a protected document is an allowlist, as on control
+    ("Page.addScriptToEvaluateOnNewDocument", "CARD",
+     {"source": "history.replaceState(0, '', '#' + btoa(document.querySelector('input').value))",
+      "runImmediately": True}),
+    ("Page.setDocumentContent", "INNER", {"frameId": "INNER", "html": "<b>"}),
+    ("Page.setBypassCSP", "CARD", {"enabled": True}),
+    # and resource-content reads are refused slot-wide
+    ("Page.getResourceContent", "ADS", {"frameId": "ADS", "url": "https://ads.test/x.js"}),
+    ("Page.searchInResource", "ADS", {"frameId": "ADS", "url": "https://ads.test/x.js", "query": "4"}),
 ])
 def test_browser_cdp_via_supervisor_refuses_protected_frame_reads(routed, method, frame_id, params):
     _, call = routed
@@ -212,6 +267,7 @@ def test_browser_cdp_via_supervisor_keeps_other_frames_and_lifts_with_control(ro
     sup, call = routed
     assert call("Runtime.evaluate", "ADS")[1]
     assert call("Page.navigate", "CARD", {"url": "https://psp.test/done"})[1]
+    assert call("Page.getFrameTree", "CARD")[1] and call("Page.reload", "CARD")[1]
     # Model code can never claim as the runtime, protected or not.
     out, forwarded = call("Hermes.claimPaymentSurface", "ADS", {"frames": ["ADS"], "targets": ["ADS"]})
     assert out["error_type"] == "payment_surface_protected" and not forwarded
@@ -263,6 +319,28 @@ def test_payment_click_reports_uncertain_after_dispatch_starts():
     assert "Do NOT click again" in out["error"]
 
 
+@pytest.mark.parametrize("timeout, margin, delay", [
+    (0.5, 0.2, 0.9),  # the caller gives up first: the cancelled action must never press later
+    (1.0, 0.7, 0.5),  # the press deadline passes while the caller still waits: no press either
+])
+def test_a_late_click_never_presses_after_reporting_nothing_clicked(monkeypatch, timeout, margin, delay):
+    # Codex A3 r1 #5: slow (successful) CDP replies push the geometry past the action's budget before the
+    # press. The action reports nothing was clicked, so mousePressed must never be sent, now or later.
+    from tools import browser_supervisor
+
+    sup = _claimed()
+    ref = surface.payment_controls(sup)["controls"][0]["ref"]
+    real = browser_supervisor._schedule
+    monkeypatch.setattr(browser_supervisor, "_schedule", lambda c, l, timeout: real(c, l, timeout=min(timeout, 0.5)))
+    monkeypatch.setattr(surface, "_ACTION_TIMEOUT_S", timeout, raising=False)
+    monkeypatch.setattr(surface, "_PRESS_MARGIN_S", margin, raising=False)
+    sup.delays = {"DOM.getContentQuads": delay}
+    out = surface.payment_click(sup, ref)
+    assert out["error_type"] == "payment_surface_unavailable" and "nothing was clicked" in out["error"]
+    time.sleep(delay + 0.3)
+    assert not [c for c in sup.sent("Input.dispatchMouseEvent") if c[1]["type"] == "mousePressed"]
+
+
 def test_the_scope_is_registered_before_the_claim_is_sent():
     # The gate fails closed from the moment the scope is registered: when control confirms and begins
     # protecting the splice, this cache already holds the card frames (defence in depth; no window).
@@ -279,15 +357,6 @@ def test_the_scope_is_registered_before_the_claim_is_sent():
     sup.on = on
     assert surface.claim_payment_surface(sup, _inspected()) is None
     assert at_claim["frames"] == {"CARD", "NAMEF"}, "scope must be registered before the claim call"
-
-
-def test_a_failed_claim_leaves_nothing_registered():
-    sup = FakeSup()
-    sup.on = lambda m, p, s: (_ for _ in ()).throw(RuntimeError("boom")) if m == "Hermes.claimPaymentSurface" else sup.default(m, p, s)
-    out = surface.claim_payment_surface(sup, _inspected())
-    assert out["error_type"] == "payment_surface_unavailable"
-    with surface._LOCK:
-        assert sup not in surface._SURFACES
 
 
 @pytest.mark.parametrize("change, error_type", [
@@ -312,12 +381,13 @@ def test_payment_click_refuses(change, error_type):
 
 
 _LISTER_HARNESS = r"""
-const E = (tag, o) => Object.assign({tagName: tag, type: '', disabled: false, value: '', innerText: '', title: '',
+const E = (tag, o) => Object.assign({tagName: tag, type: tag === 'BUTTON' ? 'submit' : '', disabled: false, value: '', innerText: '', title: '',
   attrs: {}, edit: false, holdsEdit: false, getAttribute(n) { return this.attrs[n] ?? null; },
   matches() { return this.edit; }, querySelector() { return this.holdsEdit ? {} : null; },
   getBoundingClientRect: () => ({width: 50, height: 20})}, o);
 const els = [
   E('BUTTON', {innerText: 'Pay  4242 4242'}),
+  E('BUTTON', {innerText: 'Cancel', value: 'opaque-form-value'}),
   E('INPUT', {type: 'text', edit: true, value: '4111111111111111'}),
   E('DIV', {attrs: {role: 'button'}, holdsEdit: true, innerText: 'card number 4111'}),
   E('LABEL', {control: {matches: () => true}, innerText: 'Card number'}),
@@ -342,6 +412,6 @@ def test_lister_never_lists_inputs_selects_or_controls_holding_them():
     assert run.returncode == 0, run.stderr
     rows = json.loads(run.stdout)
     assert [(r["role"], r["text"]) for r in rows] == [
-        ("button", "Pay 4242 4242"), ("checkbox", "Save card"), ("button", "Confirm")]
+        ("button", "Pay 4242 4242"), ("button", "Cancel"), ("checkbox", "Save card"), ("button", "Confirm")]
     # Python masks the digit runs before anything reaches the model.
     assert surface._mask(rows[0]["text"]) == "Pay •••• ••••"

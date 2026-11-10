@@ -423,6 +423,10 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 refused = claim_payment_surface(supervisor, inspected)
                 if refused:
                     return json.dumps(refused)
+                # dlz (Codex A3 r1 #7): the claim's verification can take seconds; the approval window is
+                # checked again right after it, before the re-admission and any secret is resolved.
+                if time.monotonic() >= inspected.expires_at:
+                    return json.dumps(_expired())
             # dlz (Codex A2 r3 #3): re-admit right before the card is read: the lease the guard was set for must
             # still be the live owner; a route replaced meanwhile refuses here, before any card byte is read.
             refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
