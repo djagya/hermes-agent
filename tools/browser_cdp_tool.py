@@ -49,7 +49,11 @@ _CDP_FLAGGED_BINARY_PATHS: dict[str, tuple] = {
 
 # Protocol identifiers in CDP results (targetId, sessionId, frameId, nodeId, backendNodeIds, id, ...) keep their
 # value only when it has the shape Chrome issues: a key name alone is page-controllable (a header named "id").
-_PROTOCOL_ID = re.compile(r"(?:id|[a-z][A-Za-z]*Ids?)")
+_PROTOCOL_ID_KEYS = frozenset({  # Chrome-issued id fields only (DOM publicId/systemId are page text)
+    "id", "targetId", "sessionId", "frameId", "loaderId", "openerId", "openerFrameId", "browserContextId",
+    "parentId", "parentFrameId", "nodeId", "backendNodeId", "nodeIds", "backendNodeIds", "objectId",
+    "executionContextId", "exceptionId", "scriptId", "contextId", "browserContextIds",
+})
 # Methods whose results carry no page-authored data under an id-like key outside a RemoteObject's "value"
 # (checked against the CDP schema); every other method (Network.*, Storage, ...) keeps the full scrub.
 _ID_METHODS = frozenset({
@@ -118,7 +122,7 @@ def _redact_cdp_output(
     redacted: dict[str, Any] = {}
     for key, item in value.items():
         opaque = leaf(always_paths, key) or (leaf(flagged_paths, key) and base64_flagged)
-        if ids and not _page and isinstance(key, str) and _PROTOCOL_ID.fullmatch(key) and (
+        if ids and not _page and key in _PROTOCOL_ID_KEYS and (
                 _id_value(item) or isinstance(item, list) and all(_id_value(v) for v in item)):
             # dlz: Chrome-issued ids (targetId, nodeId, ...) are echoed back; masking them breaks the next call.
             # Inside a RemoteObject's by-value payload (its "value") a key may only imitate one: scrubbed there.

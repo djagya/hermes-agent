@@ -310,3 +310,14 @@ def test_cdp_ids_are_exempt_only_with_chrome_shapes():
                                       ids="Network.loadNetworkResource" in cdp_tool._ID_METHODS)
     assert "4711" not in json.dumps(net), net
     assert out["result"][0]["value"]["objectId"] == oid and out["targetId"] == "0123456789ABCDEF0123456789ABCDEF"
+
+
+def test_doctype_ids_and_mixed_separator_card_groups_are_scrubbed():
+    # r16 Codex P2: DOM publicId/systemId are page text; "4000.0566-5566.5556" escaped the group rule
+    redact.register_card_window("shopping", digits=(CARD["card_number"], CARD["cvc"]))
+    redact.register_vault_redaction_value("4711")
+    out = cdp_tool._redact_cdp_output({"root": {"nodeId": 1, "publicId": "4711" + "A" * 28, "systemId": "4711.1.1"}},
+                                      ids=True)
+    assert "4711" not in json.dumps(out) and out["root"]["nodeId"] == 1
+    for text in ("4000.0566-5566.5556", "4000.0566 5566.5556"):
+        assert "4000" not in redact.redact_sensitive_text(text, force=True), text
