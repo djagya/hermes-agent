@@ -47,12 +47,16 @@ _CDP_FLAGGED_BINARY_PATHS: dict[str, tuple] = {
 }
 
 
-# Protocol identifiers in CDP results (targetId, sessionId, frameId, nodeId, backendNodeIds, id, ...).
+# Protocol identifiers in CDP results (targetId, sessionId, frameId, nodeId, backendNodeIds, id, ...) keep their
+# value only when it has the shape Chrome issues: a key name alone is page-controllable (a header named "id").
 _PROTOCOL_ID = re.compile(r"(?:id|[a-z][A-Za-z]*Ids?)")
+_CHROME_ID = re.compile(r"[0-9A-F]{32}|-?\d{1,20}\.\d{1,10}\.\d{1,10}")  # target/frame/loader/session; objectId
 
 
 def _id_value(v: Any) -> bool:
-    return isinstance(v, (str, int)) and not isinstance(v, bool)
+    if isinstance(v, bool):
+        return False
+    return isinstance(v, int) or isinstance(v, str) and bool(_CHROME_ID.fullmatch(v))
 
 
 def _redact_cdp_output(
@@ -105,7 +109,7 @@ def _redact_cdp_output(
         if not _page and isinstance(key, str) and _PROTOCOL_ID.fullmatch(key) and (
                 _id_value(item) or isinstance(item, list) and all(_id_value(v) for v in item)):
             # dlz: Chrome-issued ids (targetId, nodeId, ...) are echoed back; masking them breaks the next call.
-            # Inside a by-value page object (under "value") a key may only imitate one, so it is scrubbed there.
+            # Inside a RemoteObject's by-value payload (its "value") a key may only imitate one: scrubbed there.
             redacted[key] = item
             continue
         out_key = redact_sensitive_text(key, force=True, vault="browser") if isinstance(key, str) else key  # by-value objects can carry a secret as a KEY
@@ -114,7 +118,7 @@ def _redact_cdp_output(
             always_paths=descend(always_paths, key),
             flagged_paths=descend(flagged_paths, key),
             _depth=_depth + 1,
-            _page=_page or key == "value",
+            _page=_page or (key == "value" and "type" in value),  # a RemoteObject's by-value page payload
         )
     return redacted
 

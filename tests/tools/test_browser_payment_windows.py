@@ -293,3 +293,16 @@ def test_dotted_groups_mask_cards_not_decimals():
     redact.register_card_window("shopping", digits=(CARD["card_number"], CARD["cvc"]))
     assert "4000" not in redact.redact_sensitive_text("4000.0566.5566.5556", force=True)
     assert redact.redact_sensitive_text("x 87.33334350585938", force=True) == "x 87.33334350585938"
+
+
+def test_cdp_ids_are_exempt_only_with_chrome_shapes():
+    # r14 Codex P2: header "id" and appId kept page text; PropertyDescriptor.value objectId was corrupted
+    redact.register_card_window("shopping", digits=(CARD["card_number"], CARD["cvc"]))
+    redact.register_vault_redaction_value("4711")
+    oid = "1162551095705784180.1.1"
+    out = cdp_tool._redact_cdp_output({
+        "resource": {"headers": {"id": "4711"}}, "appId": "https://shop.example/4711",
+        "result": [{"name": "x", "value": {"type": "object", "objectId": oid}}],
+        "targetId": "0123456789ABCDEF0123456789ABCDEF"})
+    assert out["resource"]["headers"]["id"] == "••••" and "4711" not in out["appId"]
+    assert out["result"][0]["value"]["objectId"] == oid and out["targetId"] == "0123456789ABCDEF0123456789ABCDEF"
