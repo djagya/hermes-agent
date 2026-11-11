@@ -273,6 +273,9 @@ process.stdout.write(JSON.stringify({exposed: EXPOSED(el)}));
     ({"rect": [100, 100, 200, 30], "wrap": [0, 0, 1000, 600], "css": {"clipPath": "polygon(0 0, 0 0, 0 0)"},
       "covered": True}, False),
     ({"rect": [100, 100, 200, 30], "wrap": [0, 0, 1000, 600], "css": {"clipPath": "inset(0px round 8px)"}}, True),
+    # Codex B r2 #4: below the fold, a 10x10 copy inside the corner a rounded inset cuts away: unknown, not exposed.
+    ({"rect": [2, 1502, 10, 10], "wrap": [0, 1500, 200, 200], "wrapCss": {"clipPath": "inset(0px round 100px)"}},
+     None),
 ])
 def test_exposure_predicate_table(case, exposed):
     case = {"wrapCss": {}, "css": {}, "covered": False, **case}
@@ -377,8 +380,19 @@ process.stdout.write(JSON.stringify({pin, before, after: w.valid()}));
     ("Total -EUR 22.66", 2266, "EUR", "not_found"),
     ("Total € -22,66", 2266, "EUR", "not_found"),
     ("Total $22.66 CAD", 2266, "USD", "ambiguous"),
-    ("Total 22,66 € (25,00 CHF)", 2266, "EUR", "matched"),  # a second amount after the labelled one
     ("VAT 22,66 €\nTotal 22,66 €", 2266, "EUR", "matched"),  # a word that is no currency code
+    # Codex B r2 #3: no grammar. One unit per side, then 8 characters free of any other currency, sign, digit or
+    # negative-marking bracket; anything else beside a total is unclear, never matched (a second amount right
+    # after the total too, by its digits).
+    ("Total 22,66 € (25,00 CHF)", 2266, "EUR", "ambiguous"),
+    ("Total CAD $22.66", 2266, "USD", "ambiguous"),
+    ("Total -EUR $22.66", 2266, "USD", "not_found"),
+    ("Total 22.66 USD CAD", 2266, "USD", "ambiguous"),
+    ("Total (EUR 22.66)", 2266, "EUR", "not_found"),
+    ("Total (€22.66)", 2266, "EUR", "not_found"),
+    ("Total 22.66\nTotal EUR 22.66", 2266, "EUR", "ambiguous"),  # a total without a unit is unclear
+    ("Total: EUR 22.66 inkl. MwSt.", 2266, "EUR", "matched"),
+    ("Gesamt (inkl. MwSt.) 22,66 €", 2266, "EUR", "matched"),  # a bracket that cannot mark a negative
 ])
 def test_amount_witness_states(text, cents, currency, state):
     values = {"__TEXT__": json.dumps(text), "__LATER__": json.dumps(text), "__WITNESS__": sp._AMOUNT_WITNESS,
@@ -987,3 +1001,142 @@ def test_typed_unsupported_result_carries_no_page_path(flow):
     out = run(cart=CART, approve_origins=[KPS])
     assert out["error_type"] == "payment_fields_unsupported"
     assert paypal in out["reviewed_refusal"] and "ABCsecret" not in json.dumps(out)
+
+
+# ----------------------------------------------------------------------------------------------- Codex B r2
+
+class _WrittenDocumentChanges(_Filling):
+    """The real during-fill freshness over the stubbed tree: the merchant document's input handler injects a card
+    field into it once its holder field is written (its valid() turns false)."""
+
+    _payment_is_current = sp.PaymentSupervisionMixin._payment_is_current
+
+    def __init__(self):
+        super().__init__(cart_after=99)
+        self._state_lock, self._active, self._page_session_id = threading.Lock(), True, "page"
+
+    async def _payment_tree(self, sid, child_sessions=None):
+        return _TREE
+
+    async def _cdp(self, method, params=None, session_id=None, timeout=None):
+        if "this.valid()" in params["functionDeclaration"]:
+            changed = params["objectId"] == "o-top" and "cc-name" in self.writes
+            return {"result": {"result": {"value": not changed}}}
+        return await super()._cdp(method, params, session_id, timeout)
+
+
+def test_an_already_written_document_that_changes_stops_the_fill():
+    """Codex B r2 #1: every receiving document's valid() runs during the fill, those already written included."""
+    sup = _WrittenDocumentChanges()
+    out = _two_document_fill(sup)
+    assert sup.writes == ["cc-name"]
+    assert out == {"success": False, "error_type": "payment_page_changed", "filled_fields": 1, "partially_filled": True}
+
+
+class _Replies(sp.PaymentSupervisionMixin):
+    """One document's commit over scripted closure replies; an exception is a lost reply."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+
+    async def _cdp(self, method, params=None, session_id=None, timeout=None):
+        reply = self.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return {"result": {"result": {"value": reply}}}
+
+
+def _pending(n):
+    return {"pending": True, "filled_fields": n, "x": 1, "y": 1}
+
+
+@pytest.mark.parametrize("replies, paced, error_type, filled", [
+    ([_pending(0), _pending(1), RuntimeError("lost")], True, "payment_transport_uncertain", 1),
+    ([_pending(0), _pending(1), {"pending": True, "filled_fields": 1}], True, "payment_result_invalid", 1),  # no x/y
+    ([_pending(0), _pending(1), _pending(0)], True, "payment_result_invalid", 1),  # the count went backwards
+    ([_pending(0), _pending(1), _pending(2), {"success": True, "filled_fields": "3"}], True,
+     "payment_result_invalid", 2),  # a malformed final answer is no success
+    ([RuntimeError("lost")], False, "payment_transport_uncertain", 0),  # unpaced: the commit call ran the setters
+])
+def test_a_lost_or_malformed_reply_after_a_write_reports_what_may_have_been_written(replies, paced, error_type, filled):
+    """Codex B r2 #2: the last acknowledged count survives, and a write whose outcome is unknown is never reported
+    as nothing written."""
+    tokens = ("cc-csc", "cc-exp", "cc-number")
+    doc = PaymentDocument("kps", "s-kps", "o-kps", KPS, _controls(*tokens))
+    fills = [{"index": n, "token": t, "value": "x"} for n, t in enumerate(tokens)]
+
+    async def check(point):
+        return True
+
+    out = asyncio.run(_Replies(replies)._commit_payment_document(doc, fills, 1000.0, strict=True,
+                                                                 paced=check if paced else None))
+    assert out == {"success": False, "error_type": error_type, "filled_fields": filled, "partially_filled": True,
+                   "write_uncertain": True}
+    bvp._commit_text(out)
+    assert "may hold values" in out["error"]
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("target detached"), TimeoutError(),
+                                     asyncio.CancelledError()])
+def test_a_strict_owner_check_that_fails_in_transport_is_unverifiable(failure):
+    """Codex B r2 #5: a CDP error or timeout is unknown, typed; cancellation propagates; the owner is released."""
+    released = []
+
+    class Owner(sp.PaymentSupervisionMixin):
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if method == "Runtime.callFunctionOn":
+                raise failure
+            if method == "Runtime.releaseObject":
+                released.append(params["objectId"])
+            return {"DOM.getFrameOwner": {"result": {"backendNodeId": 1}},
+                    "Page.createIsolatedWorld": {"result": {"executionContextId": 2}},
+                    "DOM.resolveNode": {"result": {"object": {"objectId": "o"}}},
+                    "Runtime.releaseObject": {"result": {}}}[method]
+
+    cancelled = isinstance(failure, asyncio.CancelledError)
+    with pytest.raises(asyncio.CancelledError if cancelled else PaymentDestinationError) as caught:
+        asyncio.run(Owner()._owner_check("f", "top", "page", "function(){}", strict=True))
+    assert cancelled or caught.value.error_type == "payment_page_unverifiable"
+    assert released == ["o"]
+
+
+def test_a_failed_describe_releases_the_object_it_pinned():
+    """Codex B r2 #6: the closure is released even when its first describe() throws."""
+    class Failing(_DiscoveryPage):
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if method == "Runtime.callFunctionOn" and params["objectId"] == "doc-kps" \
+                    and "describe()" in params["functionDeclaration"]:
+                return {"result": {"exceptionDetails": {"text": "page threw"}}}
+            return await super()._cdp(method, params, session_id, timeout)
+
+    page = Failing(_PAGE, exposed={"kps", "ad"}, controls={"kps": _CARD_FORM})
+    with pytest.raises(PaymentPolicyError):
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True))
+    assert "doc-kps" in page.released
+
+
+def test_clock_anchors_are_kept_per_frame_session(monkeypatch):
+    """Codex B r2 #7: object ids are session-scoped; two card documents whose sessions hand out the same id keep
+    their own clock anchors (a later anchor would shorten the earlier document's renderer deadline)."""
+    tree = (("top", "L0", MERCHANT + "/checkout", MERCHANT, ""), ("kps", "L2", _KPS_URL, KPS, "top"))
+
+    class SameIds(_DiscoveryPage):
+        async def _payment_tree(self, sid, child_sessions=None):
+            out = await super()._payment_tree(sid, child_sessions)
+            child_sessions["kps"] = "s-kps"  # an out-of-process card frame
+            return out
+
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if method == "Runtime.evaluate":
+                return {"result": {"result": {"objectId": "1"}}}
+            if method == "Runtime.callFunctionOn" and "describe()" in params["functionDeclaration"]:
+                tokens = ("cc-name",) if session_id == "page" else _KPS_SET[1:]
+                return {"result": {"result": {"value": [_desc(n, t) for n, t in enumerate(tokens)]}}}
+            return await super()._cdp(method, params, session_id, timeout)
+
+    clock = iter(range(1000))  # every monotonic read is a later tick
+    monkeypatch.setattr(sp, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    i = asyncio.run(SameIds(tree, exposed={"kps"}, controls={})._inspect_payment("", (), (STRIPE,), unreviewed=True))
+    top, kps = i.documents
+    assert (top.frame_session, kps.frame_session) == ("page", "s-kps") and top.object_id == kps.object_id
+    assert top.clock_anchor < kps.clock_anchor

@@ -174,9 +174,9 @@ _CONSENT_EXPIRED_PARTIAL = (
 
 
 _TRANSPORT_UNCERTAIN = (
-    "The card fill did not finish cleanly (browser transport failed or the fill ran out of time), so some card "
-    "fields may hold values and others not. " + _SUBMITTED_NOTHING + " Do not submit the checkout and do not "
-    "retry; tell the user. Another fill needs a new approval."
+    "The card fill did not finish cleanly (browser transport failed, the page answered in an unexpected shape, "
+    "or the fill ran out of time), so some card fields may hold values and others not. " + _SUBMITTED_NOTHING
+    + " Do not submit the checkout and do not retry; tell the user. Another fill needs a new approval."
 )
 
 
@@ -479,15 +479,19 @@ _COMMIT_TEXTS = {
     "payment_fields_changed": (_PAGE_CHANGED, _PAGE_CHANGED_PARTIAL),
     "payment_consent_expired": (_CONSENT_EXPIRED, _CONSENT_EXPIRED_PARTIAL),
     "payment_transport_uncertain": (_TRANSPORT_UNCERTAIN, _TRANSPORT_UNCERTAIN),
+    "payment_result_invalid": (_TRANSPORT_UNCERTAIN, _TRANSPORT_UNCERTAIN),
     "payment_cart_changed": (_CART_CHANGED, _CART_CHANGED_PARTIAL),
     "payment_destination_disabled": (_DESTINATION_DISABLED + _READ_NOT_WRITTEN, _DESTINATION_DISABLED_PARTIAL),
 }
 
 
 def _commit_text(result: dict) -> None:
-    """Set the fixed text for a stopped commit; a partial stop always says that fields were written."""
+    """Set the fixed text for a stopped commit; a partial stop always says that fields were written. dlz (Codex B r2
+    #2): a write whose outcome is unknown (lost, failed or malformed answer) always says fields may hold values."""
     error_type = result.get("error_type")
-    if error_type == "payment_fields_not_retained":
+    if not result.get("success") and result.get("write_uncertain"):
+        result["error"] = _TRANSPORT_UNCERTAIN
+    elif error_type == "payment_fields_not_retained":
         result["error"] = _NOT_RETAINED
     elif error_type in _COMMIT_TEXTS:
         result["error"] = _COMMIT_TEXTS[error_type][1 if result.get("partially_filled") else 0]
