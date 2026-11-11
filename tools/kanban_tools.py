@@ -731,8 +731,10 @@ def _handle_complete(args: dict, **kw) -> str:
     result = _redact_opt(args.get("result"))
     metadata = args.get("metadata")
     if isinstance(metadata, dict):
-        # Keep the unredacted dict if the redacted JSON cannot be re-parsed.
-        metadata = _redact_metadata(metadata) or metadata
+        redacted = _redact_metadata(metadata)
+        # dlz: never store the unredacted dict when the redacted JSON cannot be re-parsed (it may hold secrets)
+        _check(redacted is not None, "metadata could not be redacted safely; remove secrets or unusual text and retry")
+        metadata = redacted
     created_cards = _coerce_str_list(
         args.get("created_cards"), "created_cards", "task ids", strip=True)
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)

@@ -192,3 +192,22 @@ class TestVaultRedactionByAudience:
                 {"count": "••••", "rows": 3}
         finally:
             redact.clear_vault_redaction_values()
+
+    def test_duplicate_keys_and_padded_pins_leave_nothing_unscrubbed(self):
+        # r10 Codex/peer P3: a duplicate key hid the first value from the parsed comparison; "4711 " was an
+        # exact non-digit value (an oracle for "is it 4711?")
+        import json
+
+        from agent import redact
+
+        try:
+            redact.clear_vault_redaction_values()
+            redact.register_vault_redaction_value("hunter-42-pw")
+            out = redact.redact_json_text('{"command":"hunter-42-pw","command":"safe"}', "authored")
+            assert "hunter-42-pw" not in out
+            redact.clear_vault_redaction_values()
+            redact.register_vault_redaction_value("4711 ")
+            assert redact.redact_sensitive_text("4711 4712", force=True) == "•••• ••••"
+            assert json.loads(redact.redact_json_text('{"a": 1}', "authored")) == {"a": 1}
+        finally:
+            redact.clear_vault_redaction_values()

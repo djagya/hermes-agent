@@ -94,6 +94,14 @@ def _valid_id(value: Any) -> bool:
     return isinstance(value, str) and bool(_ID_RE.fullmatch(value))
 
 
+def _shown_origin(url: Any) -> str:
+    """The site of ``url`` as the model may see it: a hostname can carry what a page copied there (a card
+    number as a subdomain), so it goes through the browser-audience vault scrub (never used to compare)."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(_url_origin(url), force=True, vault="browser")
+
+
 def _url_origin(url: Any) -> str:
     """``scheme://host[:port]`` of an http(s) URL, else ''."""
     if not isinstance(url, str):
@@ -778,7 +786,7 @@ def _dialog_report(supervisor: Any) -> dict:
         dialog = mine[0]
         on_top, on_shop = _dialog_place(supervisor, dialog, top)
         out = {"dialog_pending": {"id": dialog.id, "type": dialog.type,
-                                  "origin": _url_origin(getattr(dialog, "url", "")), "on_payment_tab_top": on_top,
+                                  "origin": _shown_origin(getattr(dialog, "url", "")), "on_payment_tab_top": on_top,
                                   "on_shop_page": on_shop, "text": _dialog_text(dialog.message, supervisor)},
                "dialogs_pending": len(mine)}
     if len(held) > len(mine):
@@ -865,7 +873,7 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
         seen = {k: info[k] for k in ("url", "title") if k in info} or seen
         report = _dialog_report(supervisor)
         if "dialog_pending" in report:  # a held dialog blocks the payment tab: hand it over now, not after the wait
-            return _refusal("payment_dialog_pending", _DIALOG_PENDING, url=_url_origin(seen.get("url", "")),
+            return _refusal("payment_dialog_pending", _DIALOG_PENDING, url=_shown_origin(seen.get("url", "")),
                             title="", lock_released=False, **told, **report)
         if state == "ready":
             page = info
@@ -875,7 +883,7 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     if page is None:
         # The tab is still locked: like browser-control for every agent connection, report its site only
         # (a locked page's title and path could carry what a planted script copied there).
-        return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=_url_origin(seen.get("url", "")),
+        return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=_shown_origin(seen.get("url", "")),
                         title="", lock_released=False, **told, **_dialog_report(supervisor))
     context = page.pop("browser_context", None)
     raw_url = page["url"]  # the tab must open exactly this; only what is returned to the model is scrubbed

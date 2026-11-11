@@ -79,7 +79,7 @@ def register_vault_redaction_value(value, *, known_to_model: bool = False, ttl_s
     it to (CR/LF stripped), since that is what the page holds. ``ttl_s`` (one-time codes) lets the value
     lapse after that many seconds; a permanent registration of the same bytes is kept regardless.
     A pure-digit value masks by length for ``LOGIN_MASK_S`` (or its TTL, if shorter); with
-    ``length_mask=False`` (an identifier such as a numeric username) it is scrubbed in logs only. A
+    ``length_mask=False`` (an identifier such as a numeric username) it is not scrubbed by any audience. A
     pure-digit ``known_to_model`` value (a code the model typed) is not registered at all.
     """
     if not isinstance(value, str) or not value:
@@ -87,8 +87,9 @@ def register_vault_redaction_value(value, *, known_to_model: bool = False, ttl_s
     normalized = value.replace("\r", "").replace("\n", "")
     if not normalized:
         return
-    # a value that is digits once CR/LF are gone is a digit value: its raw form is never an exact non-digit one
-    forms = (normalized,) if _ALL_DIGITS.fullmatch(normalized) else (value, normalized)
+    # a value that is digits once CR/LF and surrounding blanks are gone is a digit value: its raw forms are never
+    # exact non-digit ones (a placeholder on "4711 " would answer "is it 4711?")
+    forms = (normalized.strip(),) if _ALL_DIGITS.fullmatch(normalized.strip()) else (value, normalized)
     now = time.monotonic()
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
@@ -258,6 +259,13 @@ def _scrub_json(value, audience: str, depth: int = 0):
     return value
 
 
+def _unique_pairs(pairs: list) -> dict:
+    keys = [k for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate JSON key")
+    return dict(pairs)
+
+
 def redact_json_text(text: str, audience: str = "model", then=None) -> str:
     """Vault scrub of serialized JSON that stays valid JSON: string leaves and keys are scrubbed one by one
     (a registered ``true``, a trailing backslash or a masked-length number cannot break the syntax). Text that
@@ -266,8 +274,8 @@ def redact_json_text(text: str, audience: str = "model", then=None) -> str:
     if not isinstance(text, str) or not text:
         return text
     try:
-        parsed = json.loads(text)
-    except (ValueError, RecursionError):
+        parsed = json.loads(text, object_pairs_hook=_unique_pairs)
+    except (ValueError, RecursionError):  # a duplicate key too: parsing would drop the first value unscrubbed
         out = redact_registered_vault_values(text, audience=audience)
     else:
         scrubbed = _scrub_json(parsed, audience)

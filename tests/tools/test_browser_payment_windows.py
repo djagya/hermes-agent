@@ -191,3 +191,20 @@ def test_browser_cdp_guard_refusals_are_redacted(monkeypatch):
     monkeypatch.setattr(cdp_tool, "_current_page_private_url", lambda endpoint, target_id: "http://10.0.0.5/?p=hunter-42-pw")
     out = cdp_tool.browser_cdp("DOM.getDocument")
     assert "private or internal address" in out and "hunter-42-pw" not in out, out
+
+
+def test_origins_and_vault_errors_shown_to_the_model_are_scrubbed(monkeypatch):
+    # r10 Codex/peer P2: a planted tab at a card-number subdomain came back raw in the locked tab list and
+    # in payment_done refusals; a page-quoting vault error returned a registered password verbatim
+    from tools import browser_payment_done as done
+    from tools import browser_vault_tool as vault
+
+    redact.register_card_window("shopping", digits=(CARD["card_number"], CARD["cvc"]))
+    shown = done._shown_origin("https://4000056655665556.exfil.test/x")
+    assert "4000056655665556" not in shown and shown.startswith("https://")
+    assert surface._origin_only("https://4000056655665556.exfil.test/") == shown
+    redact.register_vault_redaction_value("hunter-42-pw")
+    monkeypatch.setattr(vault, "_handle_vault_inner", lambda args, **kw: json.dumps(
+        {"success": False, "error": "Could not inspect page inputs: hunter-42-pw"}))
+    out = json.loads(vault._handle_vault({"action": "fill", "handle": "op:x"}))
+    assert "hunter-42-pw" not in out["error"] and out["success"] is False

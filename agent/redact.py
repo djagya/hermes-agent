@@ -1450,7 +1450,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
 
     ``vault`` names who reads the result, for the vault-value registry (agent/redact_vault.py): ``model``
     (default: a tool result the model did not write), ``browser`` (a browser tool result), ``log`` (a log
-    file: exact replacement) or ``authored`` (persisted model-authored text: non-digit values only).
+    file: digit values length-masked only in their mask window, never replaced exactly) or ``authored`` (persisted model-authored text: non-digit values only).
 
     Safe on any string. Enabled by default (``security.redact_secrets: false``
     disables); ``force=True`` is for safety boundaries that must never return
@@ -1956,7 +1956,7 @@ class RedactingFormatter(logging.Formatter):
     """Log formatter that redacts secrets from all log messages."""
 
     def format(self, record: logging.LogRecord) -> str:
-        line = super().format(record)  # logs are not model-visible: exact vault scrub; the timestamp is kept
+        line = super().format(record)  # log audience (a terminal can read logs): no exact digit scrub; the timestamp is kept
         head = getattr(record, "asctime", "") if self.usesTime() else ""
         if head and line.startswith(head):
             return head + redact_sensitive_text(line[len(head):], vault="log")

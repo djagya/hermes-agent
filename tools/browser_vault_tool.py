@@ -1585,6 +1585,22 @@ def _payment_done_action(task_id: Optional[str], expected_origin: str) -> str:
 
 
 def _handle_vault(args: dict[str, Any], **kwargs) -> str:
+    """dlz: a failed result's ``error`` text can quote the page (an inspection error, a CDP message), so it gets
+    the browser-audience vault scrub; the rest is left alone (handles and origins must stay usable)."""
+    out = _handle_vault_inner(args, **kwargs)
+    try:
+        result = json.loads(out)
+    except (TypeError, ValueError):
+        return out
+    if not isinstance(result, dict) or result.get("success") is not False or not isinstance(result.get("error"), str):
+        return out
+    from agent.redact import redact_sensitive_text
+
+    scrubbed = redact_sensitive_text(result["error"], force=True, vault="browser")
+    return out if scrubbed == result["error"] else json.dumps({**result, "error": scrubbed})
+
+
+def _handle_vault_inner(args: dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
     action = str(args.get("action") or "")
     handle, label = str(args.get("handle") or ""), str(args.get("label") or "")

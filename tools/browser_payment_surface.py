@@ -366,9 +366,9 @@ RECOVERY_METHODS = ("Target.getTargets", "Target.closeTarget")
 
 
 def _origin_only(url: Any) -> str:
-    from tools.browser_payment_done import _url_origin
+    from tools.browser_payment_done import _shown_origin
 
-    return _url_origin(url)
+    return _shown_origin(url)
 
 
 async def _page_tabs(sup: Any) -> list:
