@@ -49,7 +49,7 @@ LOGIN_MASK_S = 900.0  # a pure-digit login secret masks digit runs of its length
 AUDIENCES = ("model", "browser", "log", "authored")
 _LONG = 12  # shortest card number: a pure-digit value this long also masks longer runs and spaced groups
 _ALL_DIGITS = re.compile(r"\d+")
-_GROUPED = re.compile(r"\d+(?:[ .-]\d+)+")  # spaced, dashed or dotted card groups
+_GROUPED = re.compile(r"\d+(?:[ -]\d+)+|\d{2,6}(?:\.\d{2,6}){2,}")  # spaced, dashed or dotted (3+ short groups) card groups
 
 
 class _Entry:

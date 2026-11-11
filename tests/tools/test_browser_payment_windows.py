@@ -286,3 +286,10 @@ def test_cdp_protocol_ids_survive_a_mask_window_but_page_values_do_not():
     assert out["targetInfos"][0]["targetId"] == tid and out["nodeId"] == 1234 and out["backendNodeIds"] == [1234, 5678]
     assert out["targetInfos"][0]["title"] == "pin ••••"
     assert out["result"]["value"] == {"targetId": "••••", "n": "••••"}
+
+
+def test_dotted_groups_mask_cards_not_decimals():
+    # r13 peer P3: a 16-digit decimal (box-model coordinate) was masked as a dotted card group
+    redact.register_card_window("shopping", digits=(CARD["card_number"], CARD["cvc"]))
+    assert "4000" not in redact.redact_sensitive_text("4000.0566.5566.5556", force=True)
+    assert redact.redact_sensitive_text("x 87.33334350585938", force=True) == "x 87.33334350585938"
