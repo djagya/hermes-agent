@@ -361,7 +361,7 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
     # connection. The epoch is read first: a reply that straddles a claim is withheld below.
     from tools import browser_payment_surface as pay
 
-    before = pay.epoch()
+    before = pay.epoch(supervisor)
     refused = pay.supervisor_route_refusal(supervisor, frame_id, method, params or {}, child_sid)
     if refused:
         return json.dumps(refused)
@@ -374,10 +374,10 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
             return tool_error("CDP call via supervisor failed: loop unavailable", cdp_docs=CDP_DOCS_URL)
         result_msg = fut.result(timeout=timeout + 2)
     except Exception as exc:
-        if pay.epoch() != before:  # the error text may quote the page too
+        if pay.epoch(supervisor) != before:  # the error text may quote the page too
             return json.dumps(pay.locked_withheld())
         return tool_error(f"CDP call via supervisor failed: {type(exc).__name__}: {exc}", cdp_docs=CDP_DOCS_URL)
-    if pay.epoch() != before:
+    if pay.epoch(supervisor) != before:
         # A card payment claimed the slot while this call was in flight: its result may hold card data.
         return json.dumps(pay.locked_withheld())
 

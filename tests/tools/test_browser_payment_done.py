@@ -47,10 +47,11 @@ class FakeSup:
         self._state_lock = threading.Lock()
         self._page_session_id, self._active = "S-page", True
         self.trees, self.tree = list(trees), None
-        self.snapshot = dict(SNAPSHOT)
+        self.page = dict(SNAPSHOT)
         self.status = status if status is not None else dict(UNLOCKED)
         self.calls, self.fail = [], set()
         self.tab_open = True
+        self.dialogs, self.extra_tabs, self.closing = [], [], []
 
     async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
         self.calls.append((method, params or {}, session_id, self.tree))
@@ -62,7 +63,8 @@ class FakeSup:
         if method == "Target.getTargets":
             tabs = [{"targetId": "TAB", "type": "page", "url": (self.tree or CHECKOUT)[0][2], "title": "Shop",
                      "browserContextId": "CTX"}] if self.tab_open else []
-            return {"targetInfos": tabs + [{"targetId": "OTHER", "type": "page", "url": "https://x.test/"}]}
+            return {"targetInfos": tabs + self.extra_tabs + [{"targetId": "OTHER", "type": "page",
+                                                              "url": "https://x.test/"}]}
         if method == "Target.getTargetInfo":
             return {"targetInfo": {"targetId": "TAB"}}
         if method == "Page.createIsolatedWorld":
@@ -70,7 +72,7 @@ class FakeSup:
         if method == "Runtime.evaluate":
             if params["expression"] != done.SNAPSHOT_JS:  # the payment_controls lister
                 return {"result": {"objectId": "arr"}}
-            return {"result": {"type": "object", "value": self.snapshot}}
+            return {"result": {"type": "object", "value": self.page}}
         if method == "Runtime.callFunctionOn":
             fn = params["functionDeclaration"]
             if fn == surface._DESCRIBE:
@@ -82,6 +84,8 @@ class FakeSup:
             return frame_tree(self.tree)
         if method == "Target.createTarget":
             return {"targetId": "NEWTAB"}
+        if method == "Target.closeTarget":
+            self.closing.append(getattr(self, "_payment_handover_closing", None))
         if method == "Hermes.paymentSurfaceStatus":
             return self.status
         return {}
@@ -106,6 +110,17 @@ class FakeSup:
 
     def sent(self, method):
         return [c for c in self.calls if c[0] == method]
+
+    def snapshot(self):
+        return SimpleNamespace(pending_dialogs=list(self.dialogs))
+
+    def respond_to_dialog(self, action, *, prompt_text=None, dialog_id=None, timeout=10.0):
+        found = [d for d in self.dialogs if d.id == dialog_id]
+        self.calls.append(("respond_to_dialog", {"action": action, "dialog_id": dialog_id}, None, self.tree))
+        if not found:
+            return {"ok": False, "error": "no dialog"}
+        self.dialogs.remove(found[0])
+        return {"ok": True, "dialog": {"id": dialog_id}}
 
     def index(self, method):
         return next(i for i, c in enumerate(self.calls) if c[0] == method)
@@ -183,7 +198,7 @@ SAME_DOC_CARD = (SAME_DOC[0], ("CARD", "LC2", STRIPE + "/v3/loading.html", STRIP
 def test_no_handover_until_a_safe_confirmation_and_the_lock_stays(tree, snapshot):
     sup = _paid([CHECKOUT, tree])
     if snapshot:
-        sup.snapshot.update(snapshot)
+        sup.page.update(snapshot)
     out = done.payment_done(sup)
     assert out["error_type"] == "payment_confirmation_not_reached" and out["success"] is False
     assert out["lock_released"] is False and set(out) == {"success", "error_type", "error", "url", "title",
@@ -227,14 +242,14 @@ def test_lock_released_only_when_status_proves_it(status, released):
 
 def test_single_page_shop_confirmation_once_the_card_frames_are_gone():
     sup = _paid([CHECKOUT, SAME_DOC])
-    sup.snapshot.update(url=SHOP + "/thanks")
+    sup.page.update(url=SHOP + "/thanks")
     out = done.payment_done(sup)
     assert out["success"] is True and out["url"] == SHOP + "/thanks"
     assert {c[3] for c in sup.sent("Runtime.evaluate")} == {SAME_DOC}
     # the same document never counts when the merchant page itself received a card field
     for merchant_fields in (True, "subframe"):
         sup = _paid([CHECKOUT, SAME_DOC], merchant_fields=merchant_fields)
-        sup.snapshot.update(url=SHOP + "/thanks")
+        sup.page.update(url=SHOP + "/thanks")
         assert done.payment_done(sup)["error_type"] == "payment_confirmation_not_reached"
         assert not sup.sent("Runtime.evaluate")
 
@@ -258,7 +273,7 @@ def _paid_on_provider_page(trees):
     tree = (("TOP", "L0", HPP + "/app/hpp/pay", HPP, ""),)
     done.record_payment(sup, SimpleNamespace(page_id="TAB", merchant_origin=HPP, tree=tree, unreviewed_origins=(),
                                              documents=(SimpleNamespace(frame_id="TOP", origin=HPP),)))
-    sup.snapshot.update(url=TICKETS + "/order/77", origin=TICKETS)
+    sup.page.update(url=TICKETS + "/order/77", origin=TICKETS)
     return sup
 
 
@@ -267,7 +282,7 @@ def _paid_on_provider_page(trees):
 def test_expected_origin_is_required_and_strict_on_a_provider_page_checkout(origin):
     sup = _paid_on_provider_page([TICKET_PAGE])
     assert done.payment_done(sup, origin)["error_type"] == "payment_done_origin_invalid"
-    assert not sup.calls
+    assert [c[0] for c in sup.calls] == ["Target.getTargets"]  # which tabs are still open; nothing read
     sup = _paid_on_provider_page([TICKET_PAGE])
     assert done.payment_done(sup, TICKETS)["success"] is True
 
@@ -392,10 +407,11 @@ def test_locked_payment_tab_top_document_is_listed_and_clicked_natively(tree):
 def test_top_document_never_offered_when_it_is_a_card_frame(tree, merchant_fields, recorded):
     sup = _paid([tree], merchant_fields=merchant_fields) if recorded else FakeSup([tree])
     _top_controls(sup)
-    # never listed as the payment tab's own page (the wide lister); a card document stays a card document
-    assert not [c for c in sup.sent("Runtime.evaluate") if c[1]["expression"] == surface._TOP_LISTER]
-    if not merchant_fields:
-        assert _top_ref(sup, tree) is None
+    wide = [c for c in sup.sent("Runtime.evaluate") if c[1]["expression"] == surface._TOP_LISTER]
+    if merchant_fields:  # listed as the card document it is (keyed by its loader), with the top's wide bound
+        assert len(wide) == 1 and _top_ref(sup, tree) is not None
+    else:
+        assert not wide and _top_ref(sup, tree) is None
     if not merchant_fields:  # nothing at all is read on a provider page or without a recorded payment
         assert not sup.sent("Page.createIsolatedWorld")
     assert not sup.sent("Input.dispatchMouseEvent")
@@ -442,3 +458,43 @@ def test_card_scan_reaches_open_shadow_roots_and_refuses_past_its_bound(bound, e
     out = json.loads(run.stdout)
     assert out["card_fields"] == expected  # 1: found inside two shadow roots; -1: scan bound hit
     assert done._valid_snapshot(out, "https://shop.test") is None  # either way: never a safe document
+
+
+def _confirm(text, opened=1.0, kind="confirm", did="d-1"):
+    return SimpleNamespace(id=did, type=kind, message=text, opened_at=opened)
+
+
+def test_a_held_confirm_is_reported_masked_and_answered_once():
+    sup = _paid([ACS])
+    sup.dialogs = [_confirm("Place  order 4111111111111111 for 22.66 EUR? " + "x" * 300),
+                   _confirm("Leave?", opened=0.5, kind="alert", did="d-0")]  # an alert is never held
+    out = done.payment_done(sup)
+    held = out["dialog_pending"]
+    assert out["error_type"] == "payment_confirmation_not_reached" and held["type"] == "confirm"
+    assert held["text"].startswith("Place order •••••••••••••••• for 22.66 EUR?") and len(held["text"]) == 200
+    assert "4111" not in json.dumps(out)
+    assert surface.payment_controls(sup)["dialog_pending"] == held
+    assert done.payment_dialog(sup, "true")["error_type"] == "payment_dialog_invalid"
+    assert done.payment_dialog(sup, True) == {"success": True, "answered": "accept", "type": "confirm"}
+    assert [c[1] for c in sup.sent("respond_to_dialog")] == [{"action": "accept", "dialog_id": "d-1"}]
+    assert done.payment_dialog(sup, True)["error_type"] == "payment_dialog_none"  # one answer per dialog
+    assert "dialog_pending" not in surface.payment_controls(sup)
+    assert done.payment_dialog(FakeSup([CONFIRM]), False)["error_type"] == "payment_dialog_none"  # no payment
+
+
+def test_a_beforeunload_is_allowed_only_while_payment_done_closes_the_tab():
+    sup = _paid([CONFIRM])
+    assert done.payment_done(sup)["payment_tab_closed"] is True
+    assert sup.closing == [True] and sup._payment_handover_closing is False
+
+
+def test_a_closed_recorded_tab_never_makes_payment_done_ambiguous():
+    # peer r2 P2-a: tab A was paid and closed outside payment_done; the retry on tab TAB is handed over
+    sup = _paid([CONFIRM])
+    done.record_payment(sup, SimpleNamespace(page_id="TABA", merchant_origin=SHOP, tree=CHECKOUT,
+                                             documents=(SimpleNamespace(frame_id="CARD", origin=STRIPE),),
+                                             unreviewed_origins=()))
+    sup.extra_tabs = [{"targetId": "TABA", "type": "page", "url": SHOP + "/checkout"}]
+    assert done.payment_done(sup)["error_type"] == "payment_done_ambiguous"  # both still open: ambiguous
+    sup.extra_tabs = []  # TABA was closed
+    assert done.payment_done(sup)["success"] is True

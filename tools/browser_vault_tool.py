@@ -29,6 +29,7 @@ autofill (kernel-login-autofill.ts / fill_from_vault.ts).
 
 from __future__ import annotations
 
+import contextvars
 import json
 import secrets
 import logging
@@ -178,7 +179,8 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     dlz: managed mode reads only the supervisor on the leased slot browser_exec last drove
     (:func:`_managed_supervisor`; raises :class:`_PageUnavailable`)."""
     if _is_managed():
-        sup = _managed_supervisor(task_id).evaluate_runtime(expression)
+        managed = _managed_supervisor(task_id)
+        sup = _native(managed, lambda: managed.evaluate_runtime(expression))
         if sup.get("ok"):
             return {"success": True, "result": sup.get("result")}
         return {"success": False, "error": str(sup.get("error") or "eval failed")}
@@ -189,7 +191,7 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     if supervisor is None:
         return {"success": False, "error": "no supervised browser session for this task; open the page with "
                                            "browser_exec first"}
-    sup = supervisor.evaluate_runtime(expression)
+    sup = _native(supervisor, lambda: supervisor.evaluate_runtime(expression))
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {"success": False, "error": str(sup.get("error") or "evaluate failed")}
@@ -268,7 +270,7 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
 
     if page is not None:
         return _page_eval(page, task_id, expression, secret=True)
-    sup = supervisor.evaluate_runtime(expression)
+    sup = _native(supervisor, lambda: supervisor.evaluate_runtime(expression))
     if sup.get("ok") and _parse_json_result(sup.get("result")) == _PAGE_FILL_FAILED:
         return {"success": False, "error_type": "eval_failed", "error": "The browser could not run the vault script"}
     if sup.get("ok"):
@@ -336,12 +338,12 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
         supervisor = None
     if supervisor is None:
         return None
-    focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
-    if not focused.get("ok"):
+    focused = _native(supervisor, lambda: supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind)))
+    if not focused.get("ok") and not _fence_refused():
         # The probe reads only the top document, so a field in a shadow root or an iframe is invisible to it.
         # The supervisor's previous page is usually the exec's blank first tab: a tab on the exact origin is
         # still the better target, and the classifier decides whether it holds the form.
-        focused = supervisor.focus_page(origin)
+        focused = _native(supervisor, lambda: supervisor.focus_page(origin))
     return (origin or focused.get("url")) if focused.get("ok") else None
 
 
@@ -1309,7 +1311,12 @@ BROWSER_VAULT_SCHEMA = {
         "a second press needs a new payment_controls. "
         "The user's chat "
         "go for the purchase covers pressing Pay once; never click Pay without it, never click it again when "
-        "payment_click_uncertain says a press may have landed. On 3-D Secure or redirect pages, normally just "
+        "payment_click_uncertain says a press may have landed. Page dialogs while locked: alerts are accepted and "
+        "prompts dismissed by Hermes; a confirm waits and payment_controls / payment_click / payment_done report "
+        "dialog_pending {type, text} (text bounded, digit runs masked); answer it once with payment_dialog "
+        "(accept true or false; never retried). The chat go for Pay covers accepting the shop's own 'place this "
+        "order?' confirm right after Pay; any other confirm: ask the user first. An unanswered confirm is "
+        "dismissed after the dialog timeout. On 3-D Secure or redirect pages, normally just "
         "wait and call payment_done; click a bank page only when it asks for a button and the user agreed. "
         "After pressing Pay, call payment_done once; it is what ends the lock: it waits up to 120 s (through 3-D Secure and payment-provider pages) for the order "
         "confirmation on the checkout's origin (expected_origin only when the checkout ran on a payment provider's own "
@@ -1327,8 +1334,10 @@ BROWSER_VAULT_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock", "letter_login",
                                                   "letter_signed_in", "letter_done", "payment_controls",
-                                                  "payment_click", "payment_done"]},
+                                                  "payment_click", "payment_done", "payment_dialog"]},
             "ref": {"type": "string", "description": "payment_click only: a ref from payment_controls."},
+            "accept": {"type": "boolean", "description": "payment_dialog only: true accepts, false dismisses the "
+                                                         "dialog_pending confirm."},
             "handle": {"type": "string", "description": "fill / enter_code / letter_*: a handle from list or a letter note."},
             "purpose": {"type": "string", "enum": ["login", "signup"], "default": "login",
                         "description": "fill only: login preserves current-password behavior; signup requires fresh "
@@ -1416,17 +1425,61 @@ def _payment_lock_refusal(task_id: Optional[str]) -> Optional[str]:
     return json.dumps(refused) if refused else None
 
 
-def _outside_payment_lock(task_id: Optional[str], op) -> str:
-    """dlz (payment lockdown): run a non-card page operation only while no card payment locks the slot; its
-    whole payload (success or error) is withheld when a claim started while it ran (the epoch moved)."""
-    from tools import browser_payment_surface as pay
+# dlz (payment lockdown): the fence of the non-card page operation running in this context, if any.
+_VAULT_FENCE: contextvars.ContextVar = contextvars.ContextVar("vault_payment_fence", default=None)
 
-    before = pay.epoch()
+
+def _outside_payment_lock(task_id: Optional[str], op) -> str:
+    """dlz (payment lockdown): run a non-card page operation only while no card payment locks the slot. Every
+    native read or write it dispatches (``_native``) is fenced again right before it goes out, so a claim
+    during a user prompt (enter_code waits for the code) stops the next write; the whole payload (success or
+    error) is withheld when a claim happened while the operation ran. Human waits never hold the claim lock."""
+    from tools import browser_payment_surface as pay
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
     refused = _payment_lock_refusal(task_id)
     if refused:
         return refused
-    out = op()
-    return json.dumps(pay.locked_withheld()) if pay.epoch() != before else out
+    supervisor = SUPERVISOR_REGISTRY.get(task_id or "default")
+    fence = {"sup": supervisor, "before": pay.epoch(supervisor) if supervisor is not None else 0, "refused": None}
+    token = _VAULT_FENCE.set(fence)
+    try:
+        out = op()
+    finally:
+        _VAULT_FENCE.reset(token)
+    if fence["refused"] is not None:
+        return json.dumps(fence["refused"])
+    if fence["sup"] is not None and pay.epoch(fence["sup"]) != fence["before"]:
+        return json.dumps(pay.locked_withheld())
+    return out
+
+
+def _fence_refused() -> bool:
+    fence = _VAULT_FENCE.get()
+    return fence is not None and fence["refused"] is not None
+
+
+def _native(supervisor: Any, call) -> dict:
+    """One native dispatch (evaluate, focus) on the supervisor socket. Inside a fenced non-card operation it
+    goes out only under the claim lock, with the slot unlocked and no claim since the operation started (a
+    different supervisor than the one first seen refuses too); a refusal dispatches nothing."""
+    fence = _VAULT_FENCE.get()
+    if fence is None:
+        return call()
+    from tools import browser_payment_surface as pay
+
+    if fence["refused"] is not None:
+        return {"ok": False, "error": pay.LOCKED}
+    if fence["sup"] is None:
+        fence["sup"], fence["before"] = supervisor, pay.epoch(supervisor)
+    if fence["sup"] is not supervisor:
+        fence["refused"] = pay.locked_withheld()
+        return {"ok": False, "error": pay.LOCKED}
+    state, out = pay.fenced_dispatch(supervisor, fence["before"], call)
+    if state != "ok":
+        fence["refused"] = out
+        return {"ok": False, "error": pay.LOCKED}
+    return out
 
 
 def _payment_surface_action(task_id: Optional[str], ref: Optional[str]) -> str:
@@ -1440,6 +1493,16 @@ def _payment_surface_action(task_id: Optional[str], ref: Optional[str]) -> str:
     if ref is None:
         return json.dumps(surface.payment_controls(supervisor))
     return json.dumps(surface.payment_click(supervisor, ref))
+
+
+def _payment_dialog_action(task_id: Optional[str], accept: Any) -> str:
+    """dlz (lockdown, owner decision 2026-11-11): one native answer to a confirm the payment lock holds."""
+    from tools.browser_payment_done import payment_dialog
+
+    if not _is_managed():
+        return json.dumps({"success": False, "error_type": "payment_surface_none",
+                           "error": "Only the managed browser locks a card payment; use the browser tools as usual."})
+    return json.dumps(payment_dialog(_managed_supervisor(task_id or "default"), accept))
 
 
 def _payment_done_action(task_id: Optional[str], expected_origin: str) -> str:
@@ -1483,11 +1546,13 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
         "payment_controls": lambda: _payment_surface_action(tid, None),
         "payment_click": lambda: _payment_surface_action(tid, str(args.get("ref") or "")),
         "payment_done": lambda: _payment_done_action(tid, str(args.get("expected_origin") or "")),
+        "payment_dialog": lambda: _payment_dialog_action(tid, args.get("accept")),
     }
     if action not in page_ops:
         return json.dumps({"success": False, "error": f"Unknown action {action!r}; use list, fill, save_login, "
                                                        "enter_code, unlock, letter_login, letter_signed_in, "
-                                                       "letter_done, payment_controls, payment_click or payment_done."})
+                                                       "letter_done, payment_controls, payment_click, payment_done or "
+                                                       "payment_dialog."})
     return _fenced_page_op(tid, page_ops[action])
 
 

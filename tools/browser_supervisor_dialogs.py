@@ -163,15 +163,29 @@ class DialogSupervisionMixin:
             logger.debug("%s failed (%s): %s", method, what, e)
 
     def _payment_locked(self) -> bool:
-        """dlz (payment lockdown): while a card payment locks the slot, dialog automation stands down: no tab
-        watching, no automatic or watchdog answer (a held dialog waits for the user). Local state only: this
-        runs on the loop and cannot wait for control's status."""
+        """dlz (payment lockdown): while a card payment locks the slot, dialog automation stands down (no tab
+        watching, no bridge install, no policy answer) and only :meth:`_lock_answer`'s rules apply. Local
+        state only: this runs on the loop and cannot wait for control's status."""
         try:
             from tools.browser_payment_surface import locally_locked
 
             return locally_locked(self)
         except Exception:  # health: allow BLE001 -- unknown lock state: stand down (fail closed)
             return True
+
+    def _lock_answer(self, dialog: PendingDialog) -> Optional[tuple[bool, str]]:
+        """dlz (owner decision 2026-11-11): the answer while a card payment locks the slot, or None to hold it.
+        An alert is accepted (OK is its only answer), a prompt dismissed (no text is ever typed), a
+        beforeunload accepted only while payment_done closes the payment tab. A confirm (or another
+        beforeunload) is held for browser_vault payment_dialog; the watchdog dismisses it if nobody answers,
+        so no dialog stalls the page for good."""
+        if dialog.type == "alert":
+            return True, ""
+        if dialog.type == "prompt":
+            return False, ""
+        if dialog.type == "beforeunload" and getattr(self, "_payment_handover_closing", False):
+            return True, ""
+        return None
 
     async def _install_dialog_bridge(self, session_id: str) -> None:
         """Install the dialog-bridge init script + Fetch interceptor on a session. Idempotent at
@@ -188,6 +202,8 @@ class DialogSupervisionMixin:
              3.0, f"dialog bridge inject sid={sid}"),
         )
         for method, params, timeout, what in steps:
+            if self._payment_locked():  # checked before every step: a claim can land during any await
+                return
             await self._cdp_quiet(method, params, session_id=session_id, timeout=timeout, what=what)
 
     # ── Capture ──────────────────────────────────────────────────────────────
@@ -271,8 +287,7 @@ class DialogSupervisionMixin:
             frame_id=frame_id, bridge_request_id=bridge_request_id, url=self._dialog_page_url(frame_id, url),
             top_url=self._dialog_top_url(session_id),
         )
-        locked = self._payment_locked()
-        auto = None if locked else self._decide_dialog(dialog)
+        auto = self._lock_answer(dialog) if self._payment_locked() else self._decide_dialog(dialog)
         if auto is not None:
             with self._state_lock:
                 self._archive_dialog_locked(dialog, "auto_policy", action="accept" if auto[0] else "dismiss")
@@ -312,8 +327,20 @@ class DialogSupervisionMixin:
             params["promptText"] = prompt_text
         await self._cdp("Page.handleJavaScriptDialog", params, session_id=session_id, timeout=5.0)
 
-    async def _respond_quiet(self, dialog: PendingDialog, *, accept: bool, prompt_text: Optional[str]) -> None:
-        """Auto-policy / watchdog response (already archived by the caller); failures logged only."""
+    async def _respond_quiet(self, dialog: PendingDialog, *, accept: bool, prompt_text: Optional[str],
+                             watchdog: bool = False) -> None:
+        """Auto-policy / watchdog response (already archived by the caller); failures logged only. dlz: the
+        lock's rules are applied again here, at dispatch: a slot locked since the answer was decided gets the
+        lock's answer, or the dialog goes back to pending (a watchdog dismiss always goes through)."""
+        if not watchdog and self._payment_locked():
+            locked_answer = self._lock_answer(dialog)
+            if locked_answer is None:
+                with self._state_lock:
+                    self._recent_dialogs = [r for r in self._recent_dialogs if r.id != dialog.id]
+                    self._pending_dialogs[dialog.id] = dialog
+                self._arm_dialog_watchdog(dialog.id)
+                return
+            accept, prompt_text = locked_answer
         try:
             await self._respond(dialog, accept=accept, prompt_text=prompt_text)
         except Exception as e:
@@ -332,14 +359,13 @@ class DialogSupervisionMixin:
             dialog = self._pending_dialogs.get(dialog_id)
         if dialog is None:
             return
-        if self._payment_locked():  # no watchdog answer on a locked slot: look again after another period
-            self._arm_dialog_watchdog(dialog_id)
-            return
+        # dlz: also while a card payment locks the slot: a dismiss reveals nothing and cancels safely, and no
+        # dialog may stall the page for good.
         logger.warning("CDP supervisor %s: dialog %s (%s) auto-dismissed after %ss timeout",
                        self.task_id, dialog_id, dialog.type, self.dialog_timeout_s)
         # Archive with watchdog tag BEFORE unblocking the page.
         self._retire_dialog(dialog_id, "watchdog", action="dismiss")
-        await self._respond_quiet(dialog, accept=False, prompt_text=None)
+        await self._respond_quiet(dialog, accept=False, prompt_text=None, watchdog=True)
 
     # ── Bookkeeping ──────────────────────────────────────────────────────────
 
@@ -441,6 +467,11 @@ class DialogSupervisionMixin:
             logger.debug("dialog tab attach failed for %s: %s", target_id[:12], e)
             if not tabs.get(target_id):
                 tabs.pop(target_id, None)
+            return
+        if self._payment_locked():  # locked while the attach was in flight: no session work, let it go
+            tabs.pop(target_id, None)
+            await self._cdp_quiet("Target.detachFromTarget", {"sessionId": sid}, session_id=None, timeout=3.0,
+                                  what="dialog tab")
             return
         tabs[target_id] = sid
         await self._cdp_quiet("Page.enable", {}, session_id=sid, timeout=3.0, what="dialog tab")

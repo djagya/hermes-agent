@@ -376,9 +376,32 @@ _UNPROVEN = ("The confirmation was read, the new tab opened and the payment tab 
              "yet confirmed the unlock. Use text and links; if browser actions are still refused, ask the user.")
 
 
+def _drop_closed_tabs(supervisor: Any) -> list:
+    """Forget recorded payment tabs that are no longer open (closed by the user, by the agent's recovery
+    call, or by a close whose answer was lost), read fresh from the browser. A failed read keeps them all."""
+    with _LOCK:
+        recorded = list((_PAYMENTS.get(supervisor) or {}).keys())
+    if not recorded:
+        return []
+    try:
+        from tools.browser_payment_surface import _page_tabs
+
+        open_tabs = {t["targetId"] for t in _wait(_page_tabs(supervisor), supervisor._loop, timeout=10)}
+    except Exception as exc:  # health: allow BLE001 -- unknown: keep every record (an ambiguous refusal at worst)
+        logger.info("payment_done: open tabs not read (%s)", type(exc).__name__)
+        return []
+    gone = [tab for tab in recorded if tab not in open_tabs]
+    for tab in gone:
+        _forget(supervisor, tab)
+    return gone
+
+
 def _payment_for(supervisor: Any) -> tuple[Optional[_Payment], Optional[dict]]:
+    gone = _drop_closed_tabs(supervisor)
     with _LOCK:
         tabs = dict(_PAYMENTS.get(supervisor) or {})
+    if not tabs and gone:
+        return None, _refusal("payment_tab_gone", _TAB_GONE, lock_released=_released(supervisor))
     if not tabs:
         return None, _refusal("payment_done_no_payment", _NO_PAYMENT)
     if len(tabs) > 1:
@@ -512,6 +535,59 @@ def _released(supervisor: Any) -> bool:
         time.sleep(min(_RELEASE_POLL_S, left))
 
 
+_DIALOG_TYPES_HELD = ("confirm", "beforeunload")
+MAX_DIALOG_TEXT = 200
+
+
+def _dialog_text(message: Any) -> str:
+    """A held dialog's text for the model: whitespace collapsed, every run of 4+ digits masked, 200 chars."""
+    text = re.sub(r"\s+", " ", str(message or "")).strip()
+    return re.sub(r"\d{4,}", lambda m: "•" * len(m.group(0)), text)[:MAX_DIALOG_TEXT]
+
+
+def _held_dialog(supervisor: Any) -> Any:
+    """The oldest dialog the lock holds for an answer (a confirm, or a beforeunload outside a handover)."""
+    try:
+        dialogs = list(supervisor.snapshot().pending_dialogs)
+    except Exception:  # health: allow BLE001 -- no supervisor state: nothing to report
+        return None
+    held = [d for d in dialogs if getattr(d, "type", "") in _DIALOG_TYPES_HELD]
+    return min(held, key=lambda d: d.opened_at) if held else None
+
+
+def _dialog_report(supervisor: Any) -> dict:
+    """``{"dialog_pending": {type, text}}`` while a held dialog waits on the page, else {}."""
+    dialog = _held_dialog(supervisor)
+    if dialog is None:
+        return {}
+    return {"dialog_pending": {"type": dialog.type, "text": _dialog_text(dialog.message)}}
+
+
+_DIALOG_NONE = ("No page dialog is waiting for an answer on this payment. Nothing was done.")
+_DIALOG_FAILED = ("The dialog could not be answered (it may have closed already); it is not retried. Call "
+                  "payment_controls or payment_done to see where the payment tab is.")
+
+
+def payment_dialog(supervisor: Any, accept: Any) -> dict:
+    """``browser_vault action=payment_dialog accept=true|false``: one native answer to the held dialog
+    (``dialog_pending``) of a card payment. One answer per dialog, never retried."""
+    if type(accept) is not bool:
+        return _refusal("payment_dialog_invalid", "accept must be true or false. Nothing was done.")
+    if not has_payment(supervisor):
+        return _refusal("payment_dialog_none", _DIALOG_NONE)
+    dialog = _held_dialog(supervisor)
+    if dialog is None:
+        return _refusal("payment_dialog_none", _DIALOG_NONE)
+    try:
+        out = supervisor.respond_to_dialog("accept" if accept else "dismiss", dialog_id=dialog.id)
+    except Exception as exc:  # health: allow BLE001 -- CDP text can quote the page; fixed type only
+        logger.info("payment_dialog: answer failed (%s)", type(exc).__name__)
+        out = {"ok": False}
+    if not out.get("ok"):
+        return _refusal("payment_dialog_failed", _DIALOG_FAILED)
+    return {"success": True, "answered": "accept" if accept else "dismiss", "type": dialog.type}
+
+
 def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     """``browser_vault action=payment_done``: see the module docstring."""
     loop = getattr(supervisor, "_loop", None)
@@ -552,7 +628,7 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
         # The tab is still locked: like browser-control for every agent connection, report its site only
         # (a locked page's title and path could carry what a planted script copied there).
         return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=_url_origin(seen.get("url", "")),
-                        title="", lock_released=False, **told)
+                        title="", lock_released=False, **told, **_dialog_report(supervisor))
     context = page.pop("browser_context", None)
     result = {"success": True, **page, "new_tab": None, "payment_tab_closed": False, "lock_released": False, **told}
     try:  # the new tab first: the payment tab is closed only once the confirmation has somewhere to go
@@ -561,12 +637,16 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
         logger.info("payment_done: new tab failed (%s)", type(exc).__name__)
         return {**result, "note": _NO_NEW_TAB}
     on_tab = False
+    supervisor._payment_handover_closing = True  # a beforeunload on this close is accepted (owner decision)
     try:
         on_tab = _wait(_close_tab(supervisor, payment.tab), loop, timeout=10)
         result["payment_tab_closed"] = True
         _forget(supervisor, payment.tab)
     except Exception as exc:  # health: allow BLE001 -- the status below decides what is reported
         logger.info("payment_done: closing the payment tab failed (%s)", type(exc).__name__)
+        _drop_closed_tabs(supervisor)  # the close may have happened with its answer lost
+    finally:
+        supervisor._payment_handover_closing = False
     result["lock_released"] = _released(supervisor)
     if on_tab and result["lock_released"]:  # attaching installs the dialog bridge: never on a locked slot
         try:
