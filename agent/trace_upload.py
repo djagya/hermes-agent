@@ -46,13 +46,13 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def _redact(text: Any, enabled: bool) -> Any:
+def _redact(text: Any, enabled: bool, vault: str = "model") -> Any:
     """Redact a string body when enabled (``force=True``: an upload scrubs even if log redaction is off)."""
     if not enabled or not isinstance(text, str) or not text:
         return text
     try:
         from agent.redact import redact_sensitive_text
-        return redact_sensitive_text(text, force=True)
+        return redact_sensitive_text(text, force=True, vault=vault)
     except Exception as exc:
         logger.warning("Trace upload redaction failed; refusing upload", exc_info=True)
         raise TraceRedactionError(_REDACTION_BLOCKED_MESSAGE) from exc
@@ -98,7 +98,9 @@ def _tool_calls_to_blocks(tool_calls: Any, redact: bool) -> list[dict[str, Any]]
         parsed = _parse_tool_args(fn.get("arguments"))
         if redact:
             try:
-                parsed = json.loads(_redact(json.dumps(parsed), redact))
+                from agent.redact import redact_json_text
+                parsed = json.loads(redact_json_text(
+                    json.dumps(parsed), "model", then=lambda s: _redact(s, redact, vault="none")))
             except (json.JSONDecodeError, ValueError):
                 logger.warning("Trace upload redacted tool arguments are not valid JSON; refusing upload")
                 raise TraceRedactionError(_REDACTION_BLOCKED_MESSAGE)

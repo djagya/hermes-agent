@@ -68,7 +68,7 @@ def _redact_cdp_output(
     from agent.redact import (
         REDACT_WALK_DEPTH_MARKER,
         REDACT_WALK_MAX_DEPTH,
-        redact_registered_vault_values,
+        redact_number,
         redact_sensitive_text,
     )
     if _depth >= REDACT_WALK_MAX_DEPTH:
@@ -77,8 +77,7 @@ def _redact_cdp_output(
         return redact_sensitive_text(value, force=True, vault="browser")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         # dlz: a number is page data too (``value: 4711``): masked by length like text, returned as the mask
-        masked = redact_registered_vault_values(str(value), audience="browser")
-        return value if masked == str(value) else masked
+        return redact_number(value, "browser")
     if isinstance(value, (list, tuple)):
         return type(value)(
             _redact_cdp_output(item, _depth=_depth + 1) for item in value
@@ -149,8 +148,16 @@ def _resolve_cdp_endpoint() -> str:
     return (get_cdp_override() or "").strip()
 
 
+def _err(message: str, **extra: Any) -> str:
+    """A refusal or error result. Its text can quote the page or the target (a URL, a frame id, an
+    exception), so it is scrubbed like any other browser result."""
+    from agent.redact import redact_sensitive_text
+
+    return tool_error(redact_sensitive_text(message, force=True, vault="browser"), **extra)
+
+
 def _blocked(message: str, method: str) -> str:
-    return tool_error(message, method=method, cdp_docs=CDP_DOCS_URL)
+    return _err(message, method=method, cdp_docs=CDP_DOCS_URL)
 
 
 def _expression_private_target(params: dict[str, Any], blocked: Callable[[str], bool]) -> Optional[str]:
@@ -338,12 +345,12 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
     except Exception as exc:  # pragma: no cover — defensive
-        return tool_error(f"CDP supervisor is not available: {exc}. frame_id routing requires a running "
+        return _err(f"CDP supervisor is not available: {exc}. frame_id routing requires a running "
                           "supervisor attached via /browser connect or an active Browserbase session.")
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is None:
-        return tool_error(f"No CDP supervisor is attached for task={task_id!r}. Call browser_exec or "
+        return _err(f"No CDP supervisor is attached for task={task_id!r}. Call browser_exec or "
                           "/browser connect first so the supervisor can attach; Page.getFrameTree lists the "
                           "frame ids you can pass here.")
 
@@ -355,18 +362,18 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
             raw = supervisor._frames.get(frame_id)  # type: ignore[attr-defined]
         frame_info = raw.to_dict() if raw is not None else None
     if frame_info is None:
-        return tool_error(f"frame_id {frame_id!r} not found in supervisor state. "
+        return _err(f"frame_id {frame_id!r} not found in supervisor state. "
                           "Call Page.getFrameTree to see the current frames.")
 
     child_sid = frame_info.get("session_id")
     if not child_sid:  # same-origin iframes have no dedicated session; reach them via contentWindow/contentDocument
-        return tool_error(f"frame_id {frame_id!r} is not an out-of-process iframe (no dedicated CDP session). "
+        return _err(f"frame_id {frame_id!r} is not an out-of-process iframe (no dedicated CDP session). "
                           "For same-origin iframes, use `browser_cdp(method='Runtime.evaluate', params={'expression': "
                           "\"document.querySelector('iframe').contentDocument.title\"})` at the top-level page instead.")
 
     loop = supervisor._loop  # type: ignore[attr-defined]
     if loop is None or not loop.is_running():
-        return tool_error("CDP supervisor loop is not running. Try reconnecting with /browser connect.")
+        return _err("CDP supervisor loop is not running. Try reconnecting with /browser connect.")
 
     # dlz (payment lockdown): this socket is the runtime's native one, which browser-control does not
     # filter; while the slot is locked for a card payment, refuse here what control refuses on every other
@@ -393,7 +400,7 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
     except Exception as exc:
         if pay.epoch(supervisor) != before:  # the error text may quote the page too
             return json.dumps(pay.locked_withheld())
-        return tool_error(f"CDP call via supervisor failed: {type(exc).__name__}: {_exc_text(exc)}",
+        return _err(f"CDP call via supervisor failed: {type(exc).__name__}: {_exc_text(exc)}",
                           cdp_docs=CDP_DOCS_URL)
     if result_msg is None or pay.epoch(supervisor) != before:
         # A card payment claimed the slot while this call was in flight: its result may hold card data.
@@ -463,7 +470,7 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
         try:
             frame_endpoint = _resolve_cdp_endpoint() if _WS_AVAILABLE else ""
         except ManagedBrowserError as exc:  # dlz: surfaced, never swallowed into a guess
-            return tool_error(str(exc))
+            return _err(str(exc))
         blocked = _browser_cdp_private_guard(method=method, params=params or {}, target_id=frame_id,
                                              endpoint=frame_endpoint)
         if blocked:
@@ -472,24 +479,24 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
                                            params=params, timeout=timeout)
 
     if not method or not isinstance(method, str):
-        return tool_error("'method' is required (e.g. 'Target.getTargets')", cdp_docs=CDP_DOCS_URL)
+        return _err("'method' is required (e.g. 'Target.getTargets')", cdp_docs=CDP_DOCS_URL)
     if not _WS_AVAILABLE:
-        return tool_error("The 'websockets' Python package is required but not installed. "
+        return _err("The 'websockets' Python package is required but not installed. "
                           "Run: hermes pm repair")
     try:
         endpoint = _resolve_cdp_endpoint()
     except ManagedBrowserError as exc:  # dlz: managed mode refusal, surfaced as itself
-        return tool_error(str(exc))
+        return _err(str(exc))
     if not endpoint:
-        return tool_error("No CDP endpoint is available. Run '/browser connect' to attach to a running Chrome, "
+        return _err("No CDP endpoint is available. Run '/browser connect' to attach to a running Chrome, "
                           "Brave, Chromium, or Edge browser, or set 'browser.cdp_url' in config.yaml.", cdp_docs=CDP_DOCS_URL)
     if not endpoint.startswith(("ws://", "wss://")):
-        return tool_error(f"CDP endpoint is not a WebSocket URL: {endpoint!r}. Expected ws://... or wss://... — "
+        return _err(f"CDP endpoint is not a WebSocket URL: {endpoint!r}. Expected ws://... or wss://... — "
                           "the /browser connect resolver should have rewritten this. Check that a Chromium-family "
                           "browser is actually listening on the debug port.")
     call_params: dict[str, Any] = params or {}
     if not isinstance(call_params, dict):
-        return tool_error(f"'params' must be an object/dict, got {type(call_params).__name__}")
+        return _err(f"'params' must be an object/dict, got {type(call_params).__name__}")
 
     blocked = _browser_cdp_private_guard(method=method, params=call_params, endpoint=endpoint, target_id=target_id)
     if blocked:
@@ -503,7 +510,7 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     try:
         result = _run_async(_cdp_call(endpoint, method, call_params, target_id, safe_timeout))
     except TimeoutError as exc:
-        return tool_error(f"CDP call timed out after {safe_timeout}s: {_exc_text(exc)}", method=method)
+        return _err(f"CDP call timed out after {safe_timeout}s: {_exc_text(exc)}", method=method)
     except RuntimeError as exc:
         if "payment_screenshot_blocked" in str(exc):
             # browser-control's capture guard refused the method on a card-filled slot.
@@ -515,13 +522,13 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
             from tools.browser_payment_surface import LOCKED, LOCKED_TEXT
 
             return json.dumps({"success": False, "error_type": LOCKED, "error": LOCKED_TEXT})
-        return tool_error(_exc_text(exc), method=method)
+        return _err(_exc_text(exc), method=method)
     except WebSocketException as exc:
-        return tool_error(f"WebSocket error talking to CDP at {endpoint}: {_exc_text(exc)}. The browser may have "
+        return _err(f"WebSocket error talking to CDP at {endpoint}: {_exc_text(exc)}. The browser may have "
                           "disconnected — try '/browser connect' again.", method=method)
     except Exception as exc:  # pragma: no cover — unexpected
         logger.exception("browser_cdp unexpected error")
-        return tool_error(f"Unexpected error: {type(exc).__name__}: {_exc_text(exc)}", method=method)
+        return _err(f"Unexpected error: {type(exc).__name__}: {_exc_text(exc)}", method=method)
 
     payload: dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
         result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),

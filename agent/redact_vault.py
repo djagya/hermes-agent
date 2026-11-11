@@ -18,8 +18,9 @@ dlz: the scrub depends on who reads the text (``audience``, :func:`redact_regist
   whatever the value is. A pure-digit login secret masks for ``LOGIN_MASK_S`` after its registration (a
   one-time code for its TTL), then leaves the length classes. A pure-digit value the model supplied itself
   is never registered (it knows it; masking it would answer "does my guess equal the PIN?").
-* ``log`` (log files, not model-visible): every live value is replaced exactly (a pure-digit one only as a
-  whole digit run), and the card windows still mask by length.
+* ``log`` (log files, not model-visible): every non-digit value is replaced exactly; a pure-digit value is
+  length-masked during its window and then not scrubbed at all (an exact scrub of a PIN would let logs answer
+  "is it 4711?"); the card windows still mask by length.
 * ``authored`` (persisted text the model wrote: tool-call arguments): only values with a non-digit
   character, so the JSON stays valid and a reload marks nothing.
 
@@ -30,6 +31,7 @@ A confirmed lock release keeps the window for browser results only (the page may
 the window goes when the slot's mark is cleared.
 """
 
+import json
 import re
 import threading
 import time
@@ -83,10 +85,14 @@ def register_vault_redaction_value(value, *, known_to_model: bool = False, ttl_s
     if not isinstance(value, str) or not value:
         return
     normalized = value.replace("\r", "").replace("\n", "")
+    if not normalized:
+        return
+    # a value that is digits once CR/LF are gone is a digit value: its raw form is never an exact non-digit one
+    forms = (normalized,) if _ALL_DIGITS.fullmatch(normalized) else (value, normalized)
     now = time.monotonic()
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
-        for v in dict.fromkeys((value, normalized)):
+        for v in dict.fromkeys(forms):
             digits = bool(_ALL_DIGITS.fullmatch(v))
             if not v or (digits and known_to_model):
                 continue
@@ -205,19 +211,17 @@ def redact_registered_vault_values(text: str, *, nondigit_only: bool = False, au
     itself)."""
     if not isinstance(text, str) or not text:
         return text
+    if audience == "none":  # a caller that scrubbed the vault values leaf by leaf and wants only the rest
+        return text
     audience = audience if audience in AUDIENCES else "model"
     scope, now = _vault_scope(), time.monotonic()
     with _VAULT_REDACTION_LOCK:
         bucket = _live(scope)
         windows = [w for w in (_CARD_WINDOWS.get(scope) or {}).values()
                    if not w[2] or audience in ("browser", "log")]
-    exact_digits = audience == "log" and not nondigit_only
     for value in sorted(bucket, key=len, reverse=True):  # longest first: a substring never shadows its superstring
-        if not _ALL_DIGITS.fullmatch(value):
-            if value in text:
-                text = text.replace(value, PLACEHOLDER)
-        elif exact_digits and bucket[value].mask_until <= now:  # in its mask window logs mask by length too
-            text = re.sub(rf"(?<!\d){value}(?!\d)", PLACEHOLDER, text)
+        if not _ALL_DIGITS.fullmatch(value) and value in text:
+            text = text.replace(value, PLACEHOLDER)
     for name in sorted({n for _d, names, _r in windows for n in names}, key=len, reverse=True):
         text = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", CARD_PLACEHOLDER, text, flags=re.IGNORECASE)
     if nondigit_only or audience == "authored":
@@ -227,3 +231,45 @@ def redact_registered_vault_values(text: str, *, nondigit_only: bool = False, au
     if lengths:
         text = _mask_runs(text, {n for n in lengths if n < _LONG}, min((n for n in lengths if n >= _LONG), default=0))
     return text
+
+
+_JSON_MAX_DEPTH = 200
+
+
+def redact_number(value, audience: str = "model"):
+    """A number leaf of parsed data (``value: 4711``): masked by length like text, and then returned as the
+    mask string, never as the number."""
+    masked = redact_registered_vault_values(str(value), audience=audience)
+    return value if masked == str(value) else masked
+
+
+def _scrub_json(value, audience: str, depth: int = 0):
+    if depth >= _JSON_MAX_DEPTH:
+        return "[redacted: nested too deep]"
+    if isinstance(value, str):
+        return redact_registered_vault_values(value, audience=audience)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):  # a number is data too: masked as a string
+        return redact_number(value, audience)
+    if isinstance(value, list):
+        return [_scrub_json(v, audience, depth + 1) for v in value]
+    if isinstance(value, dict):
+        return {(_scrub_json(k, audience, depth + 1) if isinstance(k, str) else k): _scrub_json(v, audience, depth + 1)
+                for k, v in value.items()}
+    return value
+
+
+def redact_json_text(text: str, audience: str = "model", then=None) -> str:
+    """Vault scrub of serialized JSON that stays valid JSON: string leaves and keys are scrubbed one by one
+    (a registered ``true``, a trailing backslash or a masked-length number cannot break the syntax). Text that
+    does not parse gets the plain text scrub. ``then`` (optional) is applied last to the serialized text, for
+    a caller's own generic pass (use ``vault="none"`` there: the vault values are already done)."""
+    if not isinstance(text, str) or not text:
+        return text
+    try:
+        parsed = json.loads(text)
+    except (ValueError, RecursionError):
+        out = redact_registered_vault_values(text, audience=audience)
+    else:
+        scrubbed = _scrub_json(parsed, audience)
+        out = text if scrubbed == parsed else json.dumps(scrubbed, ensure_ascii=False)
+    return then(out) if then else out

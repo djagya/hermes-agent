@@ -878,10 +878,11 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
         return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=_url_origin(seen.get("url", "")),
                         title="", lock_released=False, **told, **_dialog_report(supervisor))
     context = page.pop("browser_context", None)
+    raw_url = page["url"]  # the tab must open exactly this; only what is returned to the model is scrubbed
     page = _redacted_page(page)  # dlz: while the payment window is still open, before the release below
     result = {"success": True, **page, "new_tab": None, "payment_tab_closed": False, "lock_released": False, **told}
     try:  # the new tab first: the payment tab is closed only once the confirmation has somewhere to go
-        result["new_tab"] = _wait(_open_tab(supervisor, page["url"], context), loop, timeout=15)
+        result["new_tab"] = _wait(_open_tab(supervisor, raw_url, context), loop, timeout=15)
     except Exception as exc:  # health: allow BLE001 -- fixed text; the payment tab stays open and locked
         logger.info("payment_done: new tab failed (%s)", type(exc).__name__)
         return {**result, "note": _NO_NEW_TAB}

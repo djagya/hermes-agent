@@ -80,9 +80,9 @@ class TestVaultRedactionByAudience:
         finally:
             redact.clear_vault_redaction_values()
 
-    def test_a_login_pin_masks_for_fifteen_minutes_and_logs_keep_the_exact_scrub(self, monkeypatch):
-        # r9 (peer P2-2): length masking only for 15 minutes; logs mask by length in that window too (no
-        # oracle for a model that can read log files), then keep only the exact scrub
+    def test_a_login_pin_masks_for_fifteen_minutes_and_logs_never_scrub_it_exactly(self, monkeypatch):
+        # r9 (peer P2-2): length masking only for 15 minutes; logs mask by length in that window too. r10 (peer
+        # P2-1): afterwards logs do not scrub a pure-digit value at all (an exact scrub is a PIN oracle)
         import logging
 
         from agent import redact, redact_vault
@@ -99,7 +99,7 @@ class TestVaultRedactionByAudience:
             assert any(ch.isdigit() for ch in log.format(record).split(" pin ")[0])  # the timestamp is kept
             clock[0] += redact_vault.LOGIN_MASK_S + 1
             assert redact.redact_sensitive_text("port 8080 pin 4711", force=True) == "port 8080 pin 4711"
-            assert log.format(record).endswith(" pin «redacted-vault-secret» HTTP 404 after 1234 ms")
+            assert log.format(record).endswith(" pin 4711 HTTP 404 after 1234 ms")
             redact.register_vault_redaction_value("1234567890", length_mask=False)  # a numeric username
             assert redact.redact_sensitive_text("ts 1762862047", force=True) == "ts 1762862047"
         finally:
@@ -120,5 +120,75 @@ class TestVaultRedactionByAudience:
             out = _durable_tool_calls([{"id": "c", "type": "function",
                                         "function": {"name": "terminal", "arguments": args}}])
             assert json.loads(out[0]["function"]["arguments"]) == json.loads(args)
+        finally:
+            redact.clear_vault_redaction_values()
+
+    def test_persisted_tool_call_arguments_stay_valid_json_whatever_a_secret_is(self):
+        # r10 Codex P2: a registered password "true" turned {"background": true} into invalid JSON
+        import json
+
+        from agent import redact
+        from agent.session_persistence import _durable_tool_calls
+
+        def persisted(args):
+            out = _durable_tool_calls([{"id": "c", "type": "function",
+                                        "function": {"name": "terminal", "arguments": args}}])
+            return out[0]["function"]["arguments"]
+
+        try:
+            redact.clear_vault_redaction_values()
+            redact.register_vault_redaction_value("true")
+            redact.register_vault_redaction_value("pw\\")  # ends in a backslash
+            out = json.loads(persisted(json.dumps({"background": True, "command": "echo true", "k": "pw\\"})))
+            assert out == {"background": True, "command": "echo «redacted-vault-secret»",
+                           "k": "«redacted-vault-secret»"}
+            assert persisted("not json true") == "not json «redacted-vault-secret»"  # old behaviour
+        finally:
+            redact.clear_vault_redaction_values()
+
+    def test_serialized_json_callers_get_valid_json_during_a_mask_window(self):
+        # r10 peer P3-2: kanban metadata (and trace upload, request dumps) re-parsed redacted JSON
+        import json
+
+        from agent import redact
+        from tools.kanban_tools import _redact_metadata
+
+        try:
+            redact.clear_vault_redaction_values()
+            redact.register_vault_redaction_value("true")
+            redact.register_vault_redaction_value("4711")
+            text = redact.redact_json_text(json.dumps({"ok": True, "n": 4711, "m": 12, "s": "x true"}), "model")
+            assert json.loads(text) == {"ok": True, "n": "••••", "m": 12, "s": "x «redacted-vault-secret»"}
+            assert _redact_metadata({"ok": True, "n": 4711, "s": "true"}) == \
+                {"ok": True, "n": "••••", "s": "«redacted-vault-secret»"}
+        finally:
+            redact.clear_vault_redaction_values()
+
+    def test_a_pin_with_a_trailing_newline_is_the_digit_value(self):
+        # r10 peer P3: "4711\n" was also kept as an exact non-digit value: an oracle for "is it 4711?"
+        from agent import redact
+
+        outs = []
+        try:
+            for shown in ("4711", "4712"):
+                redact.clear_vault_redaction_values()
+                redact.register_vault_redaction_value("4711\n")
+                outs.append(redact.redact_sensitive_text(f"{shown}\n", force=True))  # what print(...) writes
+            assert outs == ["••••\n", "••••\n"], outs
+        finally:
+            redact.clear_vault_redaction_values()
+
+    def test_a_numeric_leaf_of_the_vault_preview_is_masked(self):
+        # r10 peer P3: preview reads masked strings only; a number of a masked length leaked a PIN
+        import json
+
+        from agent import redact
+        from tools.browser_vault_preview import redact_preview_result
+
+        try:
+            redact.clear_vault_redaction_values()
+            redact.register_vault_redaction_value("4711")
+            assert json.loads(redact_preview_result(json.dumps({"count": 4711, "rows": 3}))) == \
+                {"count": "••••", "rows": 3}
         finally:
             redact.clear_vault_redaction_values()

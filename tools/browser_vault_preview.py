@@ -92,12 +92,14 @@ def run_preview_vault(callback: PreviewCallback | None, operation: Callable[[], 
 
 
 def _redact(value: Any, depth: int = 0) -> Any:
-    from agent.redact import REDACT_WALK_DEPTH_MARKER, REDACT_WALK_MAX_DEPTH, redact_registered_vault_values
+    from agent.redact import REDACT_WALK_DEPTH_MARKER, REDACT_WALK_MAX_DEPTH, redact_number, redact_registered_vault_values
 
     if depth >= REDACT_WALK_MAX_DEPTH:
         return REDACT_WALK_DEPTH_MARKER
     if isinstance(value, str):
         return redact_registered_vault_values(value, audience="browser")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):  # a number is page data too
+        return redact_number(value, "browser")
     if isinstance(value, list):
         return [_redact(v, depth + 1) for v in value]
     if isinstance(value, dict):

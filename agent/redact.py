@@ -34,7 +34,8 @@ REDACT_WALK_DEPTH_MARKER = "[redacted: nesting limit]"
 # Vault-value redaction registry (profile-scoped, bounded; oracle-free for pure-digit values): agent/redact_vault.py
 from agent.redact_vault import (  # re-exported: callers and tests patch agent.redact.*
     _VAULT_REDACTION_LOCK, _VAULT_REDACTION_VALUES, _vault_scope, bump_card_window, card_window_generations,
-    card_window_keys, clear_vault_redaction_values, redact_registered_vault_values, register_card_window,
+    card_window_keys, clear_vault_redaction_values, redact_json_text, redact_number, redact_registered_vault_values,
+    register_card_window,
     register_vault_redaction_value, release_card_window,
 )
 

@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
-from agent.redact import redact_sensitive_text
+from agent.redact import redact_json_text, redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -356,7 +356,8 @@ def _redact_opt(value: Any) -> Any:
 def _redact_metadata(metadata: dict) -> Optional[dict]:
     """Redact via a JSON round-trip; None if the result can't be re-parsed."""
     try:
-        return json.loads(redact_sensitive_text(json.dumps(metadata), force=True))
+        return json.loads(redact_json_text(
+            json.dumps(metadata), "model", then=lambda s: redact_sensitive_text(s, force=True, vault="none")))
     except json.JSONDecodeError:
         return None
 

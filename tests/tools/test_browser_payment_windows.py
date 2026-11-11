@@ -163,3 +163,31 @@ def done_payment(sup):
     from tools.browser_payment_done import payment_done
 
     return payment_done(sup)
+
+
+def test_payment_done_opens_the_raw_confirmation_url_and_returns_the_masked_one(monkeypatch):
+    # r9 Codex P1: the masked URL was what the new tab opened ("/c/•••e7d••••bc/..."): a dead page
+    _routes(monkeypatch)
+    sup = _paid([CHECKOUT, CONFIRM])
+    raw = "https://shop.test/c/9f8e7d123abc/thank-you"
+    sup.page = {**sup.page, "url": raw}
+    with surface._LOCK:
+        surface._KNOWN_LOCKED.add(sup)
+    bvp._register_card_redaction(CARD, sup)  # a 3-digit CVC window is open
+    out = done_payment(sup)
+    assert out["success"] and out["new_tab"] == "NEWTAB", out
+    assert [c[1]["url"] for c in sup.sent("Target.createTarget")] == [raw]
+    assert out["url"] == "https://shop.test/c/9f8e7d•••abc/thank-you", out
+
+
+def test_browser_cdp_guard_refusals_are_redacted(monkeypatch):
+    # r9 Codex P2: the page-URL refusal quoted a registered password sitting in the page URL
+    import tools.browser_url_policy as policy
+
+    redact.register_vault_redaction_value("hunter-42-pw")
+    monkeypatch.setattr(cdp_tool, "_WS_AVAILABLE", True)
+    monkeypatch.setattr(cdp_tool, "_resolve_cdp_endpoint", lambda: "ws://127.0.0.1:9/devtools/browser/x")
+    monkeypatch.setattr(policy, "eval_ssrf_guard_active", lambda: True)
+    monkeypatch.setattr(cdp_tool, "_current_page_private_url", lambda endpoint, target_id: "http://10.0.0.5/?p=hunter-42-pw")
+    out = cdp_tool.browser_cdp("DOM.getDocument")
+    assert "private or internal address" in out and "hunter-42-pw" not in out, out
