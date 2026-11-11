@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 
 from agent.vault_backends import BackendError
 from agent.vault_login_classifier import match_expiry_option, select_checkout_fills
 from agent.vault_payment_card import validate_card
-from agent.vault_payment_policy import PaymentPolicyError, effective_frame_origins
+from agent.vault_payment_policy import (
+    DESTINATION_OFF_HINT,
+    PaymentDestinationError,
+    PaymentPolicyError,
+    destination_policy,
+    effective_frame_origins,
+)
 from agent.vault_store import PAYMENT_FIELDS, revision_binding
-from tools.browser_supervisor_payment import OPTIONAL_CARD_TOKENS
+from tools.browser_supervisor_payment import _COVERAGE_REFUSALS, OPTIONAL_CARD_TOKENS
 
 logger = logging.getLogger(__name__)
 
@@ -167,9 +174,9 @@ _CONSENT_EXPIRED_PARTIAL = (
 
 
 _TRANSPORT_UNCERTAIN = (
-    "The card fill did not finish cleanly (browser transport failed or the fill ran out of time), so some card "
-    "fields may hold values and others not. " + _SUBMITTED_NOTHING + " Do not submit the checkout and do not "
-    "retry; tell the user. Another fill needs a new approval."
+    "The card fill did not finish cleanly (browser transport failed, the page answered in an unexpected shape, "
+    "or the fill ran out of time), so some card fields may hold values and others not. " + _SUBMITTED_NOTHING
+    + " Do not submit the checkout and do not retry; tell the user. Another fill needs a new approval."
 )
 
 
@@ -230,6 +237,126 @@ _REQUIRES_MANAGED = (
 
 # Appended when a check after the card was read stops the fill: the value never reached the page.
 _READ_NOT_WRITTEN = " The card was read inside Hermes for this fill and dropped; no field received it."
+
+
+# dlz (Track B): owner-approved fills on unreviewed hosted payment forms. Fixed texts, each naming the next step.
+_APPROVAL_REQUIRED = (
+    "Card fields on this checkout go to a payment form Hermes has not reviewed (receiving lists each origin and the "
+    "fields it would get). Nothing was read or written. Tell the user which origins would receive the card. Then call "
+    "fill again with cart (the items, quantities, total and currency exactly as the checkout shows them; the user sees "
+    "them marked as stated by you, next to Hermes' page check) and approve_origins set to exactly approval_origins. "
+    "That shows the user one approval card naming these origins; only the user's own button approves it."
+)
+_DESTINATION_CHANGED = (
+    "approve_origins does not match the origins that would receive the card on the page now (approval_origins). "
+    "Nothing was read or written and no approval was shown. Check the checkout, tell the user the current origins, "
+    "then call fill again with approve_origins equal to approval_origins."
+)
+_DESTINATION_DISABLED = (
+    "Owner-approved card fills on unreviewed payment forms were switched off, or their policy changed, while this "
+    "fill was in progress, so no card field was written and nothing was submitted. Do not retry; tell the user."
+)
+_CART_CHANGED = (
+    "The checkout's total text changed after the approval card was built (Hermes' page check no longer reads the "
+    "same), so no card field was written and nothing was submitted. Check the cart, then call fill again with the "
+    "current cart; it shows a new approval."
+)
+_CART_INVALID = (
+    "cart must be {items: [{description: 1-80 characters, quantity: 1-99}] (1-8 items), total: a decimal with two "
+    "places such as \"22.66\", currency: a three-letter code such as \"EUR\"}. Nothing was read or written. Call fill "
+    "again with a valid cart, or without one."
+)
+_CART_TOTAL = re.compile(r"(0|[1-9][0-9]{0,6})\.[0-9]{2}")
+_CART_CURRENCY = re.compile(r"[A-Z]{3}")
+
+
+def _stated_cart(cart):
+    """dlz (B5): the cart exactly as Sera stated it, as a ``StatedCart``, or None when it is missing or invalid.
+    Nothing here is checked against the page except the total, separately, as a transcription sanity check."""
+    from tools.payment_consent_prompt import CartItem, FactsInvalid, StatedCart
+
+    if isinstance(cart, str):  # some model clients send a nested object as JSON text
+        try:
+            cart = json.loads(cart)
+        except ValueError:
+            return None
+    if not isinstance(cart, dict) or set(cart) != {"items", "total", "currency"}:
+        return None
+    items, total, currency = cart["items"], cart["total"], cart["currency"]
+    if not (isinstance(total, str) and _CART_TOTAL.fullmatch(total)
+            and isinstance(currency, str) and _CART_CURRENCY.fullmatch(currency)):
+        return None
+    if not isinstance(items, list) or not 1 <= len(items) <= 8 or any(
+            not isinstance(i, dict) or set(i) != {"description", "quantity"} or type(i["quantity"]) is not int
+            or not isinstance(i["description"], str) or not 1 <= len(i["description"]) <= 80 for i in items):
+        return None
+    try:
+        return StatedCart(items=tuple(CartItem(i["description"], i["quantity"]) for i in items), total=total,
+                          currency=currency)
+    except FactsInvalid:
+        return None
+
+
+def _cents(stated) -> tuple:
+    return int(stated.total.replace(".", "")), stated.currency
+
+
+def _origin_set(value) -> list | None:
+    """``approve_origins`` as a list of distinct strings, or None when missing or malformed."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if not isinstance(value, list) or not value or len(value) > 8 or any(not isinstance(o, str) for o in value):
+        return None
+    return value if len(set(value)) == len(value) else None
+
+
+def _is_coverage_refusal(exc: PaymentPolicyError) -> bool:
+    """The reviewed pass found no complete reviewed card document (coverage), as opposed to a merchant or ancestry
+    mismatch, a changed page or a typed refusal: only coverage may lead to the discovery pass."""
+    return type(exc) is PaymentPolicyError and str(exc).split(" (", 1)[0] in _COVERAGE_REFUSALS
+
+
+def _destination_gate(inspected, stated, approve_origins) -> dict | None:
+    """dlz (B7, B8 steps 5-6): None when the stated cart is valid and ``approve_origins`` equals the one approval-origin
+    set; else the typed result (no prompt, nothing read). ``approval_origins`` is EVERY origin that receives a card
+    field, the merchant included when its document holds fields, in document order."""
+    merchant = inspected.merchant_origin
+    approval_origins = list(inspected.target_origins)
+    receiving = []
+    for origin in approval_origins:
+        tokens = sorted({c.token for d in inspected.documents if d.origin == origin for c in d.controls})
+        receiving.append({"origin": origin, "reviewed": "merchant" if origin == merchant
+                          else origin not in inspected.unreviewed_origins, "fields": tokens})
+    base = {"success": False, "merchant_origin": merchant, "approval_origins": approval_origins,
+            "receiving": receiving, "documents": len(inspected.documents)}
+    approve = _origin_set(approve_origins)
+    needs = (["cart"] if stated is None else []) + (["approve_origins"] if approve is None else [])
+    if needs:
+        return {**base, "error_type": "payment_destination_approval_required", "needs": needs,
+                "error": _APPROVAL_REQUIRED}
+    if set(approve) != set(approval_origins):
+        return {**base, "error_type": "payment_destination_changed", "error": _DESTINATION_CHANGED}
+    return None
+
+
+_CART_CHANGED_PARTIAL = (
+    "The checkout's total text changed part-way through the fill (Hermes' page check no longer reads the same), so "
+    "the fill stopped: some card fields were written, the rest were not. " + _SUBMITTED_NOTHING + " Do not submit the "
+    "checkout and do not retry; tell the user. Another fill needs a new approval."
+)
+_DESTINATION_DISABLED_PARTIAL = (
+    "Owner-approved card fills on unreviewed payment forms were switched off, or their policy changed, part-way "
+    "through the fill, so it stopped: some card fields were written, the rest were not. " + _SUBMITTED_NOTHING
+    + " Do not submit the checkout and do not retry; tell the user."
+)
+
+
+def _disabled(after_read: bool = False) -> dict:
+    return {"success": False, "error_type": "payment_destination_disabled",
+            "error": _DESTINATION_DISABLED + (_READ_NOT_WRITTEN if after_read else "")}
 
 
 def _remaining_seconds(inspected) -> int:
@@ -317,10 +444,181 @@ def _expired() -> dict:
     return {"success": False, "error_type": "payment_consent_expired", "error": _CONSENT_EXPIRED}
 
 
-def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, strict: bool = False) -> str:
+def _discover(supervisor, vault, reviewed: PaymentPolicyError, merchant_origin: str, bound: tuple,
+              frame_origins: tuple, witness: dict):
+    """dlz (Track B, B8 steps 1-4): after the reviewed pass refused with ``reviewed``: ``(inspection, policy)`` from
+    the discovery pass, or a typed result dict. Raises the reviewed refusal again when it was not about coverage,
+    when the switch is off (with its hint) or when discovery found no unreviewed receiving origin."""
+    if not _is_coverage_refusal(reviewed):
+        raise reviewed
+    policy = destination_policy()
+    if not policy[0]:
+        raise PaymentPolicyError(f"{reviewed}; {DESTINATION_OFF_HINT}") from None
+    if not vault._is_managed():
+        return {"success": False, "error_type": "payment_destination_requires_managed_browser",
+                "error": _REQUIRES_MANAGED}
+    try:
+        inspected = supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
+                                               unreviewed=True, **witness)
+    except PaymentDestinationError as found:
+        coverage = getattr(reviewed, "coverage", "")
+        if found.error_type == "payment_fields_unsupported" and coverage:
+            # The reviewed pass's provider-level hint: registry origins and fixed text, never a page path (#8).
+            found.detail["reviewed_refusal"] = coverage
+        raise
+    if not inspected.unreviewed_origins:
+        # Discovery found no unreviewed receiving origin: the reviewed refusal stands as it was.
+        supervisor.discard_payment(inspected)
+        raise reviewed from None
+    return inspected, policy
+
+
+# dlz (Codex B r4 #1): every stop commit_payment can answer has fixed text.
+_FIELDS_INVALID = (
+    "The checkout refused the card fill before any write (the fields Hermes was to fill no longer matched the "
+    "approved form), so no card field was written and nothing was submitted. Do not retry; tell the user. Another "
+    "fill needs a new approval."
+)
+_CONSENT_CONSUMED = (
+    "This approval was already used for one fill, so nothing was written now and nothing was submitted. Do not "
+    "retry; another fill needs a new approval."
+)
+_VALIDATION_FAILED = (
+    "Card fields were written, but right after the writes not every field held its value or the page moved. "
+    + _SUBMITTED_NOTHING + " Do not submit the checkout and do not retry the fill; tell the user. Another fill "
+    "needs a new approval."
+)
+
+
+# dlz: the model-facing text for each commit stop: (nothing written, something written).
+_COMMIT_TEXTS = {
+    "payment_fields_invalid": (_FIELDS_INVALID, _PARTIAL_STOPPED),
+    "payment_expiry_option_unmatched": (_EXPIRY_UNMATCHED, _PARTIAL_STOPPED),
+    "payment_consent_consumed": (_CONSENT_CONSUMED, _CONSENT_CONSUMED),
+    "payment_validation_failed": (_VALIDATION_FAILED, _VALIDATION_FAILED),
+    "payment_page_changed": (_PAGE_CHANGED, _PAGE_CHANGED_PARTIAL),
+    "payment_fields_changed": (_PAGE_CHANGED, _PAGE_CHANGED_PARTIAL),
+    "payment_consent_expired": (_CONSENT_EXPIRED, _CONSENT_EXPIRED_PARTIAL),
+    "payment_transport_uncertain": (_TRANSPORT_UNCERTAIN, _TRANSPORT_UNCERTAIN),
+    "payment_result_invalid": (_TRANSPORT_UNCERTAIN, _TRANSPORT_UNCERTAIN),
+    "payment_cart_changed": (_CART_CHANGED, _CART_CHANGED_PARTIAL),
+    "payment_destination_disabled": (_DESTINATION_DISABLED + _READ_NOT_WRITTEN, _DESTINATION_DISABLED_PARTIAL),
+}
+
+
+def _wrote(result: dict) -> bool:
+    """dlz (Codex B r3 #1): whether a stopped commit wrote anything: its partial flag or any counted field."""
+    count = result.get("filled_fields")
+    return bool(result.get("partially_filled")) or (type(count) is int and count > 0)
+
+
+def _commit_text(result: dict) -> None:
+    """Set the fixed text for a stopped commit; a partial stop always says that fields were written. dlz (Codex B r2
+    #2): a write whose outcome is unknown (lost, failed or malformed answer) always says fields may hold values."""
+    error_type = result.get("error_type")
+    if not result.get("success") and result.get("write_uncertain"):
+        result["error"] = _TRANSPORT_UNCERTAIN
+    elif error_type == "payment_fields_not_retained":
+        result["error"] = _NOT_RETAINED
+    elif error_type in _COMMIT_TEXTS:
+        result["error"] = _COMMIT_TEXTS[error_type][1 if _wrote(result) else 0]
+    elif not result.get("success") and _wrote(result):
+        result["error"] = _PARTIAL_STOPPED
+
+
+def _describe_result(result: dict, backend, inspected, fills: list, prompt: dict, bound_revision: str,
+                     unreviewed: bool, stated) -> dict:
+    result.update(
+        kind="payment",
+        backend=backend.name,
+        origin=inspected.merchant_origin,
+        target_origin=inspected.frame_origin,
+        target_origins=list(inspected.target_origins),
+        fields=sorted(f["token"] for f in fills),
+        skipped_optional=sorted(set(prompt["fields"]) - {f["token"] for f in fills}),
+        submitted=False,
+        page_checks=prompt["checks"],
+        merchant_reputation="human_review_required",
+        # dlz: how strongly the card read was tied to the approved item (never a value): "version",
+        # "record" (local digest), "updated_at_only" (1Password reported no version: weaker), "none".
+        revision_binding=revision_binding(bound_revision),
+    )
+    if unreviewed:
+        result.update(destination_reviewed=False, approval_origins=list(inspected.target_origins))
+    if stated is not None:  # nothing after the commit may raise: the result must say what was written
+        result.update(cart_stated_by="sera",
+                      page_match=str((getattr(inspected, "page_match", None) or ("not_checked",))[0]))
+    return result
+
+
+def _page_refusal(supervisor, inspected, unreviewed: bool, policy) -> dict | None:
+    """Inside the fill context, right before the capture guard: the page, the cart witnesses and (dlz, after
+    those asynchronous checks) the destination policy still hold. None = may proceed."""
+    if not supervisor.payment_is_current(inspected):
+        return {"success": False, "error_type": "payment_page_changed", "error": _PAGE_CHANGED}
+    # dlz (B5): the page check's pinned reading (total-labelled amounts, occurrences) is unchanged.
+    if getattr(inspected, "witnesses", ()) and not supervisor.payment_cart_current(inspected):
+        return {"success": False, "error_type": "payment_cart_changed", "error": _CART_CHANGED}
+    if unreviewed and destination_policy() != policy:
+        return _disabled()
+    return None
+
+
+def _guard_capture(vault, task_id: str, lease: str, strict: bool) -> tuple:
+    """Capture lock (control's CDP guard for the approved lease only) on a managed browser: ``(refusal, surface)``."""
+    if not vault._is_managed():
+        return None, None
+    from tools.browser_use_cli import vault_route
+
+    route = vault_route(task_id) or {}
+    # dlz: the guard protects the approved lease only: a route replaced meanwhile (another browser
+    # operation during the freshness pass) is not the browser this approval was for.
+    if str(route.get("lease") or "") != lease:
+        return {"success": False, "error_type": "payment_browser_changed", "error": _BROWSER_CHANGED}, None
+    refused = _set_control_capture_guard(route, strict=strict)
+    if refused:
+        return refused, None
+    return None, {"slot_id": route.get("slot_id", ""), "browser_generation": route.get("browser_generation", ""),
+                  "wipe_count": route.get("wipe_count", ""), "profile_kind": route.get("profile_kind", "")}
+
+
+def _claim_and_readmit(vault, task_id: str, supervisor, inspected, lease: str) -> dict | None:
+    """The last steps before the card is read. None = may proceed."""
+    # dlz: A9: browser-control must confirm this supervisor's claim on the card documents before
+    # any value exists in the page; another connection holding them refuses the fill.
+    if vault._is_managed():
+        from tools.browser_payment_surface import claim_payment_surface
+
+        refused = claim_payment_surface(supervisor, inspected)
+        if refused:
+            return refused
+        # dlz (Codex A3 r1 #7): the claim's verification can take seconds; the approval window is
+        # checked again right after it, before the re-admission and any secret is resolved.
+        if time.monotonic() >= inspected.expires_at:
+            return _expired()
+    # dlz (Codex A2 r3 #3): re-admit right before the card is read: the lease the guard was set for must
+    # still be the live owner; a route replaced meanwhile refuses here, before any card byte is read.
+    refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
+    if refused:
+        return refused
+    # dlz (Codex A3 r2 #2): the re-admission's status call can outlast the window too.
+    return _expired() if time.monotonic() >= inspected.expires_at else None
+
+
+def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, strict: bool = False,
+                 cart=None, approve_origins=None) -> str:
     """Native card fill after the owner's approval. ``strict`` (the unreviewed-destination feature): a managed
     browser is required, the capture guard's rollout exception does not apply, and each field is hit-tested
-    before its setter. Reviewed fills keep ``strict=False``.
+    before its setter. Reviewed fills keep ``strict=False``; an unreviewed destination always runs strict.
+
+    dlz (Track B, design v2 B8): when the reviewed inspection refuses for coverage and
+    ``vault.payment_destination_consent`` is on, a discovery inspection also admits unreviewed hosted frames by
+    structure. Without a valid ``cart`` and ``approve_origins`` equal to its approval-origin set it returns
+    ``payment_destination_approval_required`` (nothing read, no prompt); with them, the owner's one approval card
+    names every receiving origin (UNREVIEWED marked), the cart as stated by Sera and the page check, and the fill
+    continues with the strict checks, the topology/cart/absence bindings and the switch re-read after the accept,
+    in context, after the page checks, at the commit fence and inside the commit (between documents and on every
+    paced resume).
 
     Order after consent (design v2 A6): backend context -> item revision -> live ownership -> page freshness
     -> capture guard (for the approved lease only) and local mark -> expiry -> live ownership again -> read the
@@ -353,15 +651,32 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                                "error": _REVISION_UNAVAILABLE})
         # dlz: the lease this approval is for, snapshotted before the prompt (managed mode).
         lease = _route_lease(task_id) if vault._is_managed() else ""
-        inspected = supervisor.inspect_payment(
-            merchant_origin,
-            bound_origins=bound,
-            frame_origins=effective_frame_origins(meta.payment_frame_origins),
-        )
+        frame_origins = effective_frame_origins(meta.payment_frame_origins)
+        stated = _stated_cart(cart) if cart is not None else None
+        witness = {"cart": _cents(stated)} if stated is not None else {}
+        policy = None  # (enabled, generation) captured for the discovery inspection (B6)
+        try:
+            inspected = supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
+                                                   **witness)
+        except PaymentPolicyError as exc:
+            found = _discover(supervisor, vault, exc, merchant_origin, bound, frame_origins, witness)
+            if isinstance(found, dict):
+                return json.dumps(found)
+            inspected, policy = found
+        unreviewed = bool(getattr(inspected, "unreviewed_origins", ()))
+        strict = strict or unreviewed
+        if unreviewed:
+            gate = _destination_gate(inspected, stated, approve_origins)
+            if gate is not None:
+                return json.dumps(gate)
+            # dlz: the commit re-reads the switch between documents and on every paced resume.
+            inspected.policy_check = lambda: destination_policy() == policy
+        elif cart is not None and stated is None:
+            return json.dumps({"success": False, "error_type": "payment_cart_invalid", "error": _CART_INVALID})
         prompt = inspected.prompt()
         # dlz: the owner-only payment card (tools.payment_consent_prompt): every fact or no prompt.
         try:
-            facts = facts_for_inspection(inspected, card_label=meta.label)
+            facts = facts_for_inspection(inspected, card_label=meta.label, cart=stated)
         except Exception:  # health: allow BLE001 -- facts out of bounds: no prompt, no fill
             facts = None
         consent = (request_payment_approval(facts, timeout_seconds=_remaining_seconds(inspected)) if facts is not None
@@ -375,6 +690,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             return json.dumps(refusal)
         if time.monotonic() >= inspected.expires_at:
             return json.dumps(_expired())
+        # dlz (B6): the switch and its policy generation, re-read after the accept.
+        if unreviewed and destination_policy() != policy:
+            return json.dumps(_disabled())
         # The card is resolved and written inside the backend's fill_context (a plugin backend's lock /
         # snapshot / manager session), entered only after consent; an item that changed meanwhile is
         # refused before any value is resolved.
@@ -383,58 +701,28 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         with fill_context(backend):
             if not _payment_item_current(backend, meta, bound_revision):
                 return json.dumps({"success": False, "error_type": "payment_item_changed", "error": _ITEM_CHANGED})
+            if unreviewed and destination_policy() != policy:  # B6, A6 step 7
+                return json.dumps(_disabled())
             # dlz: live ownership and page freshness inside the context, right before the card is read.
-            refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
+            refused = (_ownership_refusal(vault, task_id, supervisor, inspected, lease)
+                       or _page_refusal(supervisor, inspected, unreviewed, policy))
             if refused:
                 return json.dumps(refused)
-            if not supervisor.payment_is_current(inspected):
-                return json.dumps({"success": False, "error_type": "payment_page_changed", "error": _PAGE_CHANGED})
             # Capture lock (control's CDP guard, then the local mark) BEFORE the card is read: both are
             # set-only and harmless if the fill stops later, and no card byte is read unless they hold.
             from tools.browser_payment_privacy import mark_payment_session
 
-            surface = None
-            if vault._is_managed():
-                from tools.browser_use_cli import vault_route
-
-                route = vault_route(task_id) or {}
-                # dlz: the guard protects the approved lease only: a route replaced meanwhile (another browser
-                # operation during the freshness pass) is not the browser this approval was for.
-                if str(route.get("lease") or "") != lease:
-                    return json.dumps({"success": False, "error_type": "payment_browser_changed",
-                                       "error": _BROWSER_CHANGED})
-                refused = _set_control_capture_guard(route, strict=strict)
-                if refused:
-                    return json.dumps(refused)
-                surface = {"slot_id": route.get("slot_id", ""),
-                           "browser_generation": route.get("browser_generation", ""),
-                           "wipe_count": route.get("wipe_count", ""),
-                           "profile_kind": route.get("profile_kind", "")}
+            refused, surface = _guard_capture(vault, task_id, lease, strict)
+            if refused:
+                return json.dumps(refused)
             mark_payment_session(task_id, surface)
             # dlz: the freshness pass, the guard and the backend context can outlast the window: last check
             # before any secret is read.
             if time.monotonic() >= inspected.expires_at:
                 return json.dumps(_expired())
-            # dlz: A9: browser-control must confirm this supervisor's claim on the card documents before
-            # any value exists in the page; another connection holding them refuses the fill.
-            if vault._is_managed():
-                from tools.browser_payment_surface import claim_payment_surface
-
-                refused = claim_payment_surface(supervisor, inspected)
-                if refused:
-                    return json.dumps(refused)
-                # dlz (Codex A3 r1 #7): the claim's verification can take seconds; the approval window is
-                # checked again right after it, before the re-admission and any secret is resolved.
-                if time.monotonic() >= inspected.expires_at:
-                    return json.dumps(_expired())
-            # dlz (Codex A2 r3 #3): re-admit right before the card is read: the lease the guard was set for must
-            # still be the live owner; a route replaced meanwhile refuses here, before any card byte is read.
-            refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
+            refused = _claim_and_readmit(vault, task_id, supervisor, inspected, lease)
             if refused:
                 return json.dumps(refused)
-            # dlz (Codex A3 r2 #2): the re-admission's status call can outlast the window too.
-            if time.monotonic() >= inspected.expires_at:
-                return json.dumps(_expired())
             # Never resolve at inspection/list time, on decline or on stale consent.
             raw, verdict = _resolve_card(backend, meta, bound_revision)
             if raw is None:
@@ -467,34 +755,12 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 out = _expired()
                 out["error"] += _READ_NOT_WRITTEN
                 return json.dumps(out)
+            if unreviewed and destination_policy() != policy:  # B6, A6 step 16: the commit fence
+                return json.dumps(_disabled(after_read=True))
             result = supervisor.commit_payment(inspected, fills, strict=strict)
-            if result.get("error_type") == "payment_fields_not_retained":
-                result["error"] = _NOT_RETAINED
-            elif result.get("error_type") in ("payment_page_changed", "payment_fields_changed"):
-                # the commit's own freshness, per-document and per-setter checks
-                result["error"] = _PAGE_CHANGED_PARTIAL if result.get("partially_filled") else _PAGE_CHANGED
-            elif result.get("error_type") == "payment_consent_expired":
-                result["error"] = _CONSENT_EXPIRED_PARTIAL if result.get("partially_filled") else _CONSENT_EXPIRED
-            elif result.get("error_type") == "payment_transport_uncertain":
-                result["error"] = _TRANSPORT_UNCERTAIN
-            elif not result.get("success") and result.get("partially_filled"):
-                result["error"] = _PARTIAL_STOPPED
-            result.update(
-                kind="payment",
-                backend=backend.name,
-                origin=inspected.merchant_origin,
-                target_origin=inspected.frame_origin,
-                target_origins=list(inspected.target_origins),
-                fields=sorted(f["token"] for f in fills),
-                skipped_optional=sorted(set(prompt["fields"]) - {f["token"] for f in fills}),
-                submitted=False,
-                page_checks=prompt["checks"],
-                merchant_reputation="human_review_required",
-                # dlz: how strongly the card read was tied to the approved item (never a value): "version",
-                # "record" (local digest), "updated_at_only" (1Password reported no version: weaker), "none".
-                revision_binding=revision_binding(bound_revision),
-            )
-            return json.dumps(result)
+            _commit_text(result)
+            return json.dumps(_describe_result(result, backend, inspected, fills, prompt, bound_revision,
+                                               unreviewed, stated))
     except BackendError as exc:
         if type(exc) is BackendError:  # unclassified op failure: keep the opaque refusal below
             return json.dumps({
@@ -503,6 +769,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 "error": "Card resolution or page checks failed; nothing was submitted. Inspect the page and request fresh consent.",
             })
         return json.dumps(exc.result())
+    except PaymentDestinationError as exc:
+        # dlz: typed refusals carry fixed text and sanitized detail (origins, field tokens, counts) only.
+        return json.dumps({**exc.detail, "success": False, "error_type": exc.error_type, "error": str(exc)})
     except PaymentPolicyError as exc:
         return json.dumps({
             "success": False,

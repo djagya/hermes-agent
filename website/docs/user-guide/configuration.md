@@ -3168,6 +3168,19 @@ approvals:
 
 The approval card is sent only to that user's private chat, with "Approve fill once" and "Deny" buttons. Every other surface — typed `/approve`, `/approve all`, the CLI/TUI, the API server, other platforms and other group members — can only deny a card fill.
 
+### Card fills on unreviewed payment forms
+
+`vault.payment_destination_consent` (default `false`) lets a saved card be filled into a hosted payment form that is not one of the reviewed payment providers, after the owner approves that one fill. Only a literal `true` turns it on, and turning it on admits nothing by itself:
+
+```yaml
+vault:
+  payment_destination_consent: true
+```
+
+- It is used only when the reviewed providers cannot fill the checkout, and only in the managed browser, where browser-control blocks screen capture. Reviewed providers that are off (`vault.payment_providers`) stay refused.
+- Hermes inspects the form's structure without reading any values, then asks the agent for the cart and the exact set of origins that would receive card fields. The owner's approval card (see "Card-fill approver" above) marks each unreviewed origin, shows the cart as stated by the agent, and says whether the page shows that total: matched, NOT found or ambiguous. That check reads page text only; it does not verify the charge.
+- One approval covers one fill within its 120 s window. Nothing is remembered; the next checkout asks again. Switching the key off, changing `vault.payment_providers`, or a `config.yaml` that cannot be read stops a fill that is still waiting or in progress before its next card field is written; a fill stopped part-way reports which fields it wrote.
+
 ### Custom smart-approval policy
 
 `approvals.smart_policy` lets you append your own rules to the smart-approval reviewer's instructions. When set, the text is added to the guardian LLM's system prompt (the trusted channel — never alongside the untrusted command text), so you can tighten or relax its judgment for your environment without editing code:

@@ -33,7 +33,7 @@ import json
 import secrets
 import logging
 from typing import Any, Dict, Optional
-from agent.vault_payment_policy import PaymentPolicyError, effective_frame_origins
+from agent.vault_payment_policy import PaymentPolicyError, destination_consent_enabled, effective_frame_origins
 
 from tools.browser_vault_context import (fill_context, plugin_errors_as_refusal, saved_origins, snapshot_refusal,
                                          write_backend_code)
@@ -428,7 +428,11 @@ def browser_vault_list() -> str:
                 entry.update(available=True, payment_scope=meta.payment_scope,
                              confirmation_required=True, supported_layout="single_or_split_one_provider",
                              max_card_documents=_MAX_CARD_DOCUMENTS,
-                             hosted_origins=_hosted_origins(meta))
+                             hosted_origins=_hosted_origins(meta),
+                             # dlz (Track B): hosted_origins stays the reviewed set; an unreviewed hosted form can
+                             # only be filled per fill, after the owner's own approval of its exact origins.
+                             destination_consent="per_fill_owner_approval" if destination_consent_enabled()
+                             else "off")
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
@@ -834,7 +838,7 @@ def _register_redactions(values: Any) -> Optional[str]:
 
 @plugin_errors_as_refusal
 def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_origin: str = "",
-                       purpose: str = "login") -> str:
+                       purpose: str = "login", cart: Any = None, approve_origins: Any = None) -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -880,7 +884,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
         # inside the backend's fill_context only after consent.
         from tools.browser_vault_payment import fill_payment
 
-        return fill_payment(backend, meta, effective_task_id, merchant_origin)
+        return fill_payment(backend, meta, effective_task_id, merchant_origin, cart=cart,
+                            approve_origins=approve_origins)
 
     # Origin binding pre-check (the authoritative re-check runs inside the fill script), before the
     # backend's fill_context is entered and before any value is resolved.
@@ -1274,7 +1279,19 @@ BROWSER_VAULT_SCHEMA = {
         "tell the user. payment_fields_not_retained: "
         "fields were written but did not all hold after the page settled; do not submit or retry, tell the user. "
         "payment_surface_unavailable: browser control could not protect the card frames; nothing was read or "
-        "written, stop and tell the user. After a card fill the card frame is protected until it navigates away "
+        "written, stop and tell the user. "
+        "Unreviewed payment forms (list shows destination_consent per_fill_owner_approval): a card fill whose "
+        "fields go to a hosted form outside hosted_origins returns payment_destination_approval_required with "
+        "approval_origins, receiving (each origin's fields) and needs; nothing was read. Tell the user which "
+        "origins would receive the card, then call fill again with cart (items, quantities, total and currency "
+        "exactly as the checkout shows them) and approve_origins equal to approval_origins: the user gets one "
+        "approval card naming them, with your cart marked as stated by you and Hermes' page check. "
+        "payment_destination_changed: the origins on the page differ from approve_origins; nothing written, tell "
+        "the user the current ones. payment_cart_changed: the checkout's total text changed; check the cart and "
+        "fill again. payment_destination_disabled, payment_fields_ambiguous, payment_fields_unsupported, "
+        "payment_page_too_large, payment_page_unverifiable, payment_destination_requires_managed_browser: nothing "
+        "written; stop and tell the "
+        "user. After a card fill the card frame is protected until it navigates away "
         "(browser_exec/browser_cdp reads there return payment_surface_protected): payment_controls lists its "
         "buttons, links and checkboxes ({ref, role, text, disabled}; never inputs, digits masked); payment_click "
         "(ref) makes one trusted click on a listed control. The user's chat go for the purchase covers pressing "
@@ -1305,6 +1322,20 @@ BROWSER_VAULT_SCHEMA = {
                 "letter_login only: true when a sign-in confirmed with letter_signed_in has expired and the login form is back."},
             "merchant_origin": {"type": "string", "description":
                 "fill, card only: exact HTTPS merchant origin to select one open tab. Omit to inspect the supervisor's current tab."},
+            "cart": {"type": "object", "description":
+                     "fill, card only: the purchase exactly as the checkout shows it, shown to the user as stated by "
+                     "you. Required after payment_destination_approval_required; optional otherwise.",
+                     "properties": {
+                         "items": {"type": "array", "minItems": 1, "maxItems": 8, "items": {
+                             "type": "object",
+                             "properties": {"description": {"type": "string", "maxLength": 80},
+                                            "quantity": {"type": "integer", "minimum": 1, "maximum": 99}},
+                             "required": ["description", "quantity"]}},
+                         "total": {"type": "string", "description": "e.g. \"22.66\" (two decimals, no symbol)."},
+                         "currency": {"type": "string", "description": "ISO code, e.g. \"EUR\"."}},
+                     "required": ["items", "total", "currency"]},
+            "approve_origins": {"type": "array", "items": {"type": "string"}, "description":
+                                "fill, card only: exactly the approval_origins of payment_destination_approval_required."},
             "code": {"type": "string", "maxLength": 16,
                      "description": "enter_code only: a one-time code Hermes obtained through its own authorized workflow (e.g. read "
                                     "from the user's mail) or a one-time code the user sent in chat for this page (SMS/2FA/"
@@ -1375,7 +1406,9 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     page_ops = {
         "fill": lambda: browser_vault_fill(handle=handle, task_id=tid,
                                            merchant_origin=str(args.get("merchant_origin") or ""),
-                                           purpose=str(args.get("purpose") or "login")),
+                                           purpose=str(args.get("purpose") or "login"),
+                                           # dlz (Track B): card fills only; passed only when given.
+                                           **{k: args[k] for k in ("cart", "approve_origins") if k in args}),
         "save_login": lambda: browser_vault_save_login(label=label, task_id=tid),
         "enter_code": lambda: browser_vault_enter_code(handle=handle, task_id=tid, code=str(args.get("code") or ""),
                                                        expected_origin=str(args.get("expected_origin") or "")),
