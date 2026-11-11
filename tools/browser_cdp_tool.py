@@ -68,9 +68,11 @@ _ID_METHODS = frozenset({
 _CHROME_ID = re.compile(r"[0-9A-F]{32}|-?\d{1,20}\.\d{1,10}\.\d{1,10}")  # target/frame/loader/session; objectId
 
 
-def _id_value(v: Any) -> bool:
+def _id_value(v: Any, key: str = "") -> bool:
     if isinstance(v, bool):
         return False
+    if isinstance(v, str) and key == "scriptId" and v.isdigit() and len(v) <= 12:  # Chrome's decimal script ids
+        return True
     return isinstance(v, int) or isinstance(v, str) and bool(_CHROME_ID.fullmatch(v))
 
 
@@ -123,7 +125,7 @@ def _redact_cdp_output(
     for key, item in value.items():
         opaque = leaf(always_paths, key) or (leaf(flagged_paths, key) and base64_flagged)
         if ids and not _page and key in _PROTOCOL_ID_KEYS and (
-                _id_value(item) or isinstance(item, list) and all(_id_value(v) for v in item)):
+                _id_value(item, key) or isinstance(item, list) and all(_id_value(v) for v in item)):
             # dlz: Chrome-issued ids (targetId, nodeId, ...) are echoed back; masking them breaks the next call.
             # Inside a RemoteObject's by-value payload (its "value") a key may only imitate one: scrubbed there.
             redacted[key] = item
@@ -134,7 +136,8 @@ def _redact_cdp_output(
             always_paths=descend(always_paths, key),
             flagged_paths=descend(flagged_paths, key),
             _depth=_depth + 1,
-            _page=_page or (key == "value" and "type" in value),  # a RemoteObject's by-value page payload
+            # a RemoteObject's by-value page payload, and the free-form dictionaries pages can fill
+            _page=_page or (key == "value" and "type" in value) or key in ("exceptionMetaData", "embedderData"),
             ids=ids,
         )
     return redacted

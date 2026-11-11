@@ -319,5 +319,20 @@ def test_doctype_ids_and_mixed_separator_card_groups_are_scrubbed():
     out = cdp_tool._redact_cdp_output({"root": {"nodeId": 1, "publicId": "4711" + "A" * 28, "systemId": "4711.1.1"}},
                                       ids=True)
     assert "4711" not in json.dumps(out) and out["root"]["nodeId"] == 1
-    for text in ("4000.0566-5566.5556", "4000.0566 5566.5556"):
-        assert "4000" not in redact.redact_sensitive_text(text, force=True), text
+    import itertools  # r17 Codex P2: every mix of space / dot / dash between the four groups
+
+    for seps in itertools.product(" .-", repeat=3):
+        text = "4000{}0566{}5566{}5556".format(*seps)
+        assert not any(ch.isdigit() for ch in redact.redact_sensitive_text(text, force=True)), text
+    assert redact.redact_sensitive_text("x 87.33334350585938", force=True) == "x 87.33334350585938"
+
+
+def test_script_ids_stay_and_free_form_metadata_is_page_data():
+    # r17 Codex P3/notes: decimal scriptId kept; exceptionMetaData / embedderData are unconstrained page dictionaries
+    redact.register_vault_redaction_value("4711")
+    out = cdp_tool._redact_cdp_output({"exceptionDetails": {"scriptId": "4711", "exceptionMetaData": {"id": "4711"}},
+                                       "frameTree": {"frame": {"id": "0123456789ABCDEF0123456789ABCDEF",
+                                                               "embedderData": {"id": "4711"}}}}, ids=True)
+    assert out["exceptionDetails"]["scriptId"] == "4711"
+    assert out["exceptionDetails"]["exceptionMetaData"]["id"] == "••••"
+    assert out["frameTree"]["frame"]["embedderData"]["id"] == "••••"
