@@ -1172,6 +1172,9 @@ _UNCERTAIN = {"success": False, "partially_filled": True, "write_uncertain": Tru
      {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 0}),
     ([_pending(0), _pending(2), {"success": False, "error_type": "payment_fields_changed", "filled_fields": 1}], True,
      {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 2}),
+    # Codex B r5 #2: an error type that is no string (unhashable) keeps the acknowledged count.
+    ([_pending(0), _pending(1), {"success": False, "error_type": [], "filled_fields": 1}], True,
+     {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 1}),
     # Codex B r3 #2: a focus point that is not two finite numbers stops before any setter, in every document.
     ([{"pending": True, "filled_fields": 0, "x": None, "y": "unknown"}, {"success": True, "filled_fields": 3}], True,
      {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 0}),
@@ -1212,9 +1215,13 @@ def test_a_cancelled_inspection_releases_every_closure_it_pinned():
 
 # ----------------------------------------------------------------------------------------------- Codex B r4
 
-def test_a_line_running_into_the_text_size_cut_is_not_judged():
-    """Codex B r4 #3: the bracket after the cut is unseen, so the amount on the cut line is never matched."""
-    text = "x\n" * 99985 + "Total EUR 22.66" + " " * 30 + ")"
+@pytest.mark.parametrize("text", [
+    "x\n" * 99985 + "Total EUR 22.66" + " " * 30 + ")",  # r4 #3: the bracket after the cut is unseen
+    # r5 #1: a conflicting total whose digits fall after the cut
+    "Total EUR 22.66\n" + "x" * (200000 - len("Total EUR 22.66\n") - len("\nTotal EUR ")) + "\nTotal EUR 100.00",
+], ids=["bracket-after-cut", "total-digits-after-cut"])
+def test_a_text_cut_at_its_size_limit_is_never_matched(text):
+    """Codex B r4 #3, r5 #1: whatever lies past the cut is unseen, so a truncated reading is never matched."""
     values = {"__TEXT__": json.dumps(text), "__LATER__": json.dumps(text), "__WITNESS__": sp._AMOUNT_WITNESS,
               "__CENTS__": "2266", "__CURRENCY__": json.dumps("EUR")}
     out = _node(re.sub("|".join(values), lambda m: values[m.group(0)], _WITNESS_HARNESS))
@@ -1278,3 +1285,35 @@ def test_a_cancelled_release_still_attempts_every_release_and_keeps_the_original
     with pytest.raises(PaymentPolicyError):
         asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True))
     assert {"doc-top", "doc-ad", "doc-kps"} <= set(page.attempts)
+
+
+# ----------------------------------------------------------------------------------------------- Codex B r5
+
+def test_a_cancelled_release_after_a_commit_still_attempts_every_release_once():
+    """Codex B r5 #3: the completed inspection's release pass goes on past a cancelled release, never surfaces that
+    cancellation to the commit, and a second release does not wait on or re-run the finished pass."""
+    class Releasing(sp.PaymentSupervisionMixin):
+        def __init__(self):
+            self.attempts = []
+
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            self.attempts.append(params.get("objectId") or params.get("sessionId"))
+            if len(self.attempts) == 1:
+                raise asyncio.CancelledError
+            return {"result": {}}
+
+    sup = Releasing()
+    i = PaymentInspection(
+        "c" * 32, "page", "target", MERCHANT,
+        (PaymentDocument("top", "page", "o-top", MERCHANT, _controls("cc-name")),
+         PaymentDocument("kps", "s-kps", "o-kps", KPS, _controls("cc-number", "cc-csc", "cc-exp"))),
+        _TREE, time.monotonic() + 60, owner=sup, child_sessions={"kps": "s-kps"},
+        frame_owners={"top": ("page", [("kps", "owner-kps")])}, absence=(("page", "absent-top"),),
+        witnesses=(("page", "w-top"),))
+
+    async def twice():
+        await sup._release_once(i)
+        await sup._release_once(i)
+
+    asyncio.run(twice())
+    assert sup.attempts == ["owner-kps", "o-top", "o-kps", "absent-top", "w-top", "s-kps"]

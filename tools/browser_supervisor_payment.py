@@ -642,12 +642,20 @@ class PaymentSupervisionMixin:
         objects = ([(fsid, obj) for _, fsid, obj, _, _ in found["candidates"]] + found["pending"]
                    + [a[:2] for a in found["absence"]] + found["witnesses"]
                    + [(psid, obj) for psid, items in found["owners"].values() for _fid, obj in items])
-        steps = [self._release_payment_object(fsid, obj) for fsid, obj in objects] + [
-            self._release_payment_sessions({"s": sid}) for sid in dict.fromkeys(child_sessions.values())]
+        await self._release_all(objects, child_sessions)
+
+    async def _release_all(self, objects: list, sessions: dict) -> None:
+        """Release each ``(session, object)`` and detach each session once, every one attempted even when an earlier
+        one is cancelled; a cancellation is re-raised only after the last (Codex B r4 #4, r5 #3)."""
         cancelled = False
-        for step in steps:
+        for sid, obj in objects:
             try:
-                await step
+                await self._release_payment_object(sid, obj)
+            except asyncio.CancelledError:
+                cancelled = True
+        for sid in dict.fromkeys(sessions.values()):
+            try:
+                await self._release_payment_sessions({"s": sid})
             except asyncio.CancelledError:
                 cancelled = True
         if cancelled:
@@ -1368,13 +1376,10 @@ class PaymentSupervisionMixin:
         return states
 
     async def _release_payment_documents(self, i: PaymentInspection) -> None:
-        await self._release_frame_owners(i.frame_owners)
+        objects = [(psid, obj) for psid, items in i.frame_owners.values() for _fid, obj in items]
         i.frame_owners = {}
-        for d in i.documents:
-            await self._release_payment_object(d.frame_session, d.object_id)
-        for sid, obj in tuple(i.absence) + tuple(i.witnesses):
-            await self._release_payment_object(sid, obj)
-        await self._release_payment_sessions(i.child_sessions)
+        objects += [(d.frame_session, d.object_id) for d in i.documents] + list(i.absence) + list(i.witnesses)
+        await self._release_all(objects, i.child_sessions)
 
     async def _release_once(self, i: PaymentInspection) -> None:
         """dlz: release every pinned object and child session once per inspection. The pass runs as its own
@@ -1382,7 +1387,13 @@ class PaymentSupervisionMixin:
         never cuts it short; a later discard awaits the same pass instead of starting another."""
         if i.release_task is None:
             i.release_task = asyncio.ensure_future(self._release_payment_documents(i))
-        await asyncio.shield(i.release_task)
+        try:
+            await asyncio.shield(i.release_task)
+        except asyncio.CancelledError:
+            if not i.release_task.done():
+                raise  # the caller was cancelled; the pass goes on behind the shield
+            # dlz (Codex B r5 #3): the pass itself ended cancelled after attempting every release; nothing is left
+            # to wait for, and a commit's result is never replaced by that cancellation.
 
     def discard_payment(self, i: PaymentInspection) -> None:
         from tools.browser_supervisor import _schedule
@@ -1510,9 +1521,8 @@ _OWNERS_SCOPE_EXPOSED = ("function(href,origin,...els){" + _PARENT_AT + "return 
 # 'US$' are USD, 'CA$'/'C$' CAD, 'A$'/'AU$' AUD, 'NZ$' NZD, '€' EUR, '£' GBP; any other symbol, prefix or 3-capital
 # word is an unknown unit). The 8 characters beyond each unit (spaces trimmed) are its context. dlz (Codex B r4 #2/#3):
 # the token is bracketed when its line holds any bracket (Unicode open/close punctuation) other than balanced ASCII
-# '(...)' pairs wholly left of it; a line longer than 1000 characters on either side, or one that runs into the end of
-# a text cut at 200000 characters, is not judged. A
-# clear amount has every unit equal to the stated currency, is not bracketed and not on an unjudged line, and has a
+# '(...)' pairs wholly left of it; a line longer than 1000 characters on either side is not judged, and (r5 #1) a text
+# cut at 200000 characters is never `matched`. A clear amount has every unit equal to the stated currency, is not bracketed and not on an unjudged line, and has a
 # context with no other 3-capital word, currency symbol, sign or dash, or digit. Anything else, a token without a unit
 # included, is not clear. An occurrence of the stated total is a token in the stated currency with no sign or dash in
 # its context and not bracketed. A total-labelled amount is the first token (with or without a unit) within 40
@@ -1542,13 +1552,12 @@ _AMOUNT_WITNESS = r"""((cents, currency) => {
     return prefix ? '?' : symbol === '€' ? 'EUR' : symbol === '£' ? 'GBP' : '?';
   };
   const codeIn = (s, from, to) => Array.from(s.matchAll(CODE)).some(c => c.index < to && c.index + 3 > from);
-  // The token's line on each side (at most LINE characters), and whether it is unjudged: a side may run on past
-  // LINE, or (dlz, Codex B r4 #3) the right side reaches the end of a text that was cut at its size limit.
-  const sides = (text, cut, start, end) => {
+  // The token's line on each side (at most LINE characters), and whether it is unjudged: a side may run on past LINE.
+  const sides = (text, start, end) => {
     const a = text.slice(Math.max(0, start - LINE), start), b = text.slice(end, end + LINE);
     const nl = Math.max(a.lastIndexOf('\n'), a.lastIndexOf('\r')), nr = b.search(/[\n\r]/);
     return [nl >= 0 ? a.slice(nl + 1) : a, nr >= 0 ? b.slice(0, nr) : b,
-            (nl < 0 && start > LINE) || (nr < 0 && (cut || end + LINE < text.length))];
+            (nl < 0 && start > LINE) || (nr < 0 && end + LINE < text.length)];
   };
   // dlz (Codex B r4 #2): any bracket on the token's line blocks it, except balanced ASCII '(...)' pairs wholly left
   // of it ('Gesamt (inkl. MwSt.) 22,66 €'): another bracket type, a mismatch, an open pair or any bracket right of it.
@@ -1568,7 +1577,7 @@ _AMOUNT_WITNESS = r"""((cents, currency) => {
     const amounts = [];
     for (const m of text.matchAll(AMOUNT)) {
       const start = m.index, end = start + m[0].length;
-      const [left, right, unjudged] = sides(text, cut, start, end);
+      const [left, right, unjudged] = sides(text, start, end);
       let l = left.trimEnd(), r = right.trimStart();
       const lu = UNIT_END.exec(l), ru = UNIT_START.exec(r);
       if (lu) l = l.slice(0, lu.index).trimEnd();
@@ -1583,7 +1592,7 @@ _AMOUNT_WITNESS = r"""((cents, currency) => {
                     clear: units.length > 0 && !marked && units.every(u => u === currency)});
     }
     const labelled = new Set();
-    let unclear = false;
+    let unclear = cut;  // dlz (Codex B r4 #3, r5 #1): a text cut at its size limit is never judged matched
     for (const k of text.matchAll(KEYWORD)) {
       const from = k.index + k[0].length;
       const first = amounts.find(a => a.start >= from);
@@ -1695,7 +1704,8 @@ def _valid_document_result(result: Any, fills: int) -> bool:
         return set(result) == {"success", "filled_fields"} and type(count) is int and count == fills
     # dlz (Codex B r4 #1): one of the closure's own error types, and always an explicit count (0 before any write).
     return (not set(result) - {"success", "filled_fields", "error_type", "partially_filled"}
-            and result.get("error_type") in _DOCUMENT_ERRORS and type(count) is int and 0 <= count <= fills
+            and type(result.get("error_type")) is str and result["error_type"] in _DOCUMENT_ERRORS
+            and type(count) is int and 0 <= count <= fills
             and type(result.get("partially_filled", False)) is bool)
 
 
