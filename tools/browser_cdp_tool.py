@@ -143,6 +143,27 @@ def _redact_cdp_output(
     return redacted
 
 
+def _scrubbed_result(result: Any, method: str) -> Any:
+    """The redacted result, or None when redaction raised (dlz: the registry fallback would quote an exception's
+    text unscrubbed, so the caller returns fixed text instead)."""
+    try:
+        return _redact_cdp_output(result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
+                                  flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()), ids=method in _ID_METHODS)
+    except Exception as exc:  # health: allow BLE001 -- fixed text only; nothing of the result is returned
+        logger.warning("browser_cdp result redaction failed (%s)", type(exc).__name__)
+        return None
+
+
+def _success_payload(result: Any, method: str, target_id: Optional[str]) -> str:
+    scrubbed = _scrubbed_result(result, method)
+    if scrubbed is None:
+        return _err("CDP result could not be redacted; nothing was returned", method=method)
+    payload: dict[str, Any] = {"success": True, "method": method, "result": scrubbed}
+    if target_id:
+        payload["target_id"] = target_id
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _exc_text(exc: BaseException) -> str:
     """An error's text for the result: it can quote the page (a CDP error message), so it is redacted too."""
     from agent.redact import redact_sensitive_text
@@ -571,12 +592,7 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
         logger.exception("browser_cdp unexpected error")
         return _err(f"Unexpected error: {type(exc).__name__}: {_exc_text(exc)}", method=method)
 
-    payload: dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
-        result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
-        flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()), ids=method in _ID_METHODS)}
-    if target_id:
-        payload["target_id"] = target_id
-    return json.dumps(payload, ensure_ascii=False)
+    return _success_payload(result, method, target_id)
 
 
 BROWSER_CDP_SCHEMA: dict[str, Any] = {

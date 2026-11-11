@@ -137,6 +137,18 @@ def _fast(monkeypatch):
     monkeypatch.setattr(done, "_WAIT_S", 0.4)
     monkeypatch.setattr(done, "_RELEASE_WAIT_S", 0.2)
     monkeypatch.setattr(done, "_RELEASE_POLL_S", 0.01)
+    from agent import redact
+
+    from tools import browser_payment_card_values as card_values
+
+    redact.clear_vault_redaction_values()  # no card window or slot dialog values left by an earlier test file
+    stores = (card_values._BY_SLOT, card_values._BY_SUPERVISOR, card_values._WINDOWS, card_values._SUPERVISOR_SLOTS)
+    for store in stores:
+        store.clear()
+    yield
+    redact.clear_vault_redaction_values()
+    for store in stores:
+        store.clear()
 
 
 def _paid(trees, merchant_fields=False, **kw):
@@ -522,7 +534,10 @@ def test_payment_dialog_answers_only_a_confirm_of_the_payment_tab_top_page(dialo
     assert not sup.sent("respond_to_dialog")
 
 
-def test_dialog_text_is_redacted_of_the_card_before_masking():
+def test_dialog_text_is_redacted_of_the_card_before_masking(monkeypatch):
+    from tools import browser_use_cli
+
+    monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: {})  # two slot-less supervisors (test order)
     sup, other = FakeSup([CHECKOUT]), FakeSup([CHECKOUT])
     done.register_dialog_card_values({"card_number": "4000056655665556", "cvc": "737", "exp_month": "3",
                                       "exp_year": "2031", "cardholder_name": "Ada Testperson"}, sup)

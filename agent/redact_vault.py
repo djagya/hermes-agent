@@ -52,7 +52,7 @@ _ALL_DIGITS = re.compile(r"\d+")
 # Digit groups joined by single spaces, dots or dashes, matched whole (greedy): a run whose digits add up to a card
 # number's length is masked, whatever the separators. A long decimal (a box-model coordinate) can be masked too
 # while a card window is open: display only, it fails safe (a narrower rule leaked mixed-separator numbers).
-_GROUPED = re.compile(r"\d+(?:[ .-]\d+)+")
+_GROUPED = re.compile(r"(?<!\d)\d+(?:[ .-]\d+)+")  # lookbehind: linear on a long digit run
 
 
 class _Entry:
