@@ -216,15 +216,14 @@ def redact_registered_vault_values(text: str, *, nondigit_only: bool = False, au
         if not _ALL_DIGITS.fullmatch(value):
             if value in text:
                 text = text.replace(value, PLACEHOLDER)
-        elif exact_digits:
+        elif exact_digits and bucket[value].mask_until <= now:  # in its mask window logs mask by length too
             text = re.sub(rf"(?<!\d){value}(?!\d)", PLACEHOLDER, text)
     for name in sorted({n for _d, names, _r in windows for n in names}, key=len, reverse=True):
         text = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", CARD_PLACEHOLDER, text, flags=re.IGNORECASE)
     if nondigit_only or audience == "authored":
         return text
     lengths = {n for digit_lengths, _names, _r in windows for n in digit_lengths}
-    if audience != "log":
-        lengths |= {len(v) for v, e in bucket.items() if e.mask_until > now and _ALL_DIGITS.fullmatch(v)}
+    lengths |= {len(v) for v, e in bucket.items() if e.mask_until > now and _ALL_DIGITS.fullmatch(v)}
     if lengths:
         text = _mask_runs(text, {n for n in lengths if n < _LONG}, min((n for n in lengths if n >= _LONG), default=0))
     return text

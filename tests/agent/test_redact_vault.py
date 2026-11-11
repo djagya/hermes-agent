@@ -81,7 +81,8 @@ class TestVaultRedactionByAudience:
             redact.clear_vault_redaction_values()
 
     def test_a_login_pin_masks_for_fifteen_minutes_and_logs_keep_the_exact_scrub(self, monkeypatch):
-        # owner decision r9 (peer P2-2): every 4-digit run masked for the whole process; logs masked by length
+        # r9 (peer P2-2): length masking only for 15 minutes; logs mask by length in that window too (no
+        # oracle for a model that can read log files), then keep only the exact scrub
         import logging
 
         from agent import redact, redact_vault
@@ -94,7 +95,7 @@ class TestVaultRedactionByAudience:
             redact.clear_vault_redaction_values()
             redact.register_vault_redaction_value("4711")
             assert redact.redact_sensitive_text("port 8080", force=True) == "port ••••"
-            assert log.format(record).endswith(" pin «redacted-vault-secret» HTTP 404 after 1234 ms")
+            assert log.format(record).endswith(" pin •••• HTTP 404 after •••• ms")
             assert any(ch.isdigit() for ch in log.format(record).split(" pin ")[0])  # the timestamp is kept
             clock[0] += redact_vault.LOGIN_MASK_S + 1
             assert redact.redact_sensitive_text("port 8080 pin 4711", force=True) == "port 8080 pin 4711"
