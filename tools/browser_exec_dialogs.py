@@ -194,6 +194,13 @@ def _withhold(row: dict) -> dict:
     return row
 
 
+def _shown(text: str) -> str:
+    """dlz: a dialog's origin as the model sees it (a host can carry what a page copied there)."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(text, force=True, vault="browser") if text else text
+
+
 def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
     """``{"pending": [...], "handled": [...]}`` for the exec result, or None when no dialog fired."""
     supervisor = _supervisor(task_id)
@@ -207,8 +214,8 @@ def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
     for dialog in snap.pending_dialogs:
         row = dialog.to_dict()
         row.pop("opened_at", None)
-        row["url"] = _origin(getattr(dialog, "url", "")) or ""
-        row["page"] = _origin(getattr(dialog, "top_url", "")) or ""
+        row["url"] = _shown(_origin(getattr(dialog, "url", "")) or "")
+        row["page"] = _shown(_origin(getattr(dialog, "top_url", "")) or "")
         pending.append(_withhold(row) if getattr(dialog, "opened_locked", False) else row)
     handled = []
     for record in snap.recent_dialogs:
@@ -217,6 +224,9 @@ def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
         row = record.to_dict()
         for key in ("opened_at", "closed_at"):
             row.pop(key, None)
+        for key in ("url", "page", "top_url"):
+            if isinstance(row.get(key), str):
+                row[key] = _shown(row[key])
         handled.append(_withhold(row) if getattr(record, "opened_locked", False) else row)
     if not pending and not handled:
         return None

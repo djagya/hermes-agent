@@ -259,10 +259,14 @@ def _scrub_json(value, audience: str, depth: int = 0):
     return value
 
 
+class _DuplicateKey(ValueError):
+    pass
+
+
 def _unique_pairs(pairs: list) -> dict:
     keys = [k for k, _ in pairs]
     if len(set(keys)) != len(keys):
-        raise ValueError("duplicate JSON key")
+        raise _DuplicateKey("duplicate JSON key")
     return dict(pairs)
 
 
@@ -275,7 +279,9 @@ def redact_json_text(text: str, audience: str = "model", then=None) -> str:
         return text
     try:
         parsed = json.loads(text, object_pairs_hook=_unique_pairs)
-    except (ValueError, RecursionError):  # a duplicate key too: parsing would drop the first value unscrubbed
+    except _DuplicateKey:  # parsing would keep only the last value: re-serialize with every value scrubbed
+        out = json.dumps(_scrub_json(json.loads(text), audience), ensure_ascii=False)
+    except (ValueError, RecursionError):
         out = redact_registered_vault_values(text, audience=audience)
     else:
         scrubbed = _scrub_json(parsed, audience)

@@ -211,3 +211,15 @@ class TestVaultRedactionByAudience:
             assert json.loads(redact.redact_json_text('{"a": 1}', "authored")) == {"a": 1}
         finally:
             redact.clear_vault_redaction_values()
+
+    def test_an_escaped_duplicate_key_value_is_scrubbed_too(self):
+        # r11 Codex P3: the duplicate-key fallback scrubbed the raw text, missing a \u-escaped secret
+        from agent import redact
+
+        try:
+            redact.clear_vault_redaction_values()
+            redact.register_vault_redaction_value("hunter-42-pw")
+            out = redact.redact_json_text('{"command":"\\u0068unter-42-pw","command":"safe"}', "authored")
+            assert "unter-42-pw" not in out, out
+        finally:
+            redact.clear_vault_redaction_values()

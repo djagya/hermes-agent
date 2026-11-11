@@ -208,3 +208,39 @@ def test_origins_and_vault_errors_shown_to_the_model_are_scrubbed(monkeypatch):
         {"success": False, "error": "Could not inspect page inputs: hunter-42-pw"}))
     out = json.loads(vault._handle_vault({"action": "fill", "handle": "op:x"}))
     assert "hunter-42-pw" not in out["error"] and out["success"] is False
+
+
+def test_vault_page_fields_and_raised_errors_are_scrubbed(monkeypatch):
+    # r11 Codex P2: receiving_origins / origin returned raw; a raised error was quoted by the registry fallback
+    from tools import browser_vault_tool as vault
+
+    redact.register_card_window("shopping", digits=(CARD["card_number"], CARD["cvc"]))
+    host = "https://4000056655665556.exfil.test"
+    monkeypatch.setattr(vault, "_handle_vault_inner", lambda args, **kw: json.dumps(
+        {"success": False, "error_type": "payment_fields_ambiguous", "receiving_origins": [host],
+         "receiving": {host: ["card_number"]}, "handle": "op:item737"}))
+    out = vault._handle_vault({"action": "fill", "handle": "op:item737"})
+    assert "4000056655665556" not in out and json.loads(out)["handle"] == "op:item737"
+    redact.register_vault_redaction_value("hunter-42-pw")
+
+    def boom(args, **kw):
+        raise ValueError("invalid literal for int(): 'hunter-42-pw'")
+
+    monkeypatch.setattr(vault, "_handle_vault_inner", boom)
+    out = json.loads(vault._handle_vault({"action": "enter_code"}))
+    assert out["success"] is False and "hunter-42-pw" not in out["error"]
+
+
+def test_exec_dialog_origins_are_scrubbed(monkeypatch):
+    # r11 Codex P2: pending dialog url/page at a digit host came back raw after the window narrowed
+    from tools import browser_exec_dialogs as dialogs
+
+    redact.register_card_window("shopping", digits=(CARD["card_number"], CARD["cvc"]))
+    host = "https://4000056655665556.exfil.test/pay"
+    dialog = SimpleNamespace(url=host, top_url=host, opened_locked=False,
+                             to_dict=lambda: {"id": "d-1", "type": "alert", "message": "hi"})
+    sup = SimpleNamespace(snapshot=lambda: SimpleNamespace(pending_dialogs=[dialog], recent_dialogs=[]))
+    monkeypatch.setattr(dialogs, "_supervisor", lambda task_id: sup)
+    monkeypatch.setattr(surface, "slot_locked", lambda s: False)
+    out = dialogs.collect("t1", 0.0)
+    assert "4000056655665556" not in json.dumps(out), out

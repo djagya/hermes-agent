@@ -1587,17 +1587,43 @@ def _payment_done_action(task_id: Optional[str], expected_origin: str) -> str:
 def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     """dlz: a failed result's ``error`` text can quote the page (an inspection error, a CDP message), so it gets
     the browser-audience vault scrub; the rest is left alone (handles and origins must stay usable)."""
-    out = _handle_vault_inner(args, **kwargs)
+    from agent.redact import redact_sensitive_text
+
+    try:
+        out = _handle_vault_inner(args, **kwargs)
+    except Exception as exc:  # health: allow BLE001 -- the registry fallback would quote the page text raw
+        logger.info("browser_vault %s raised %s", args.get("action"), type(exc).__name__)
+        return json.dumps({"success": False, "error_type": "vault_internal_error",
+                           "error": redact_sensitive_text(f"{type(exc).__name__}: {exc}", force=True, vault="browser")[:300]})
     try:
         result = json.loads(out)
     except (TypeError, ValueError):
         return out
-    if not isinstance(result, dict) or result.get("success") is not False or not isinstance(result.get("error"), str):
+    if not isinstance(result, dict):
         return out
-    from agent.redact import redact_sensitive_text
+    scrubbed = _scrub_page_fields(result, redact_sensitive_text)
+    return out if scrubbed == result else json.dumps(scrubbed)
 
-    scrubbed = redact_sensitive_text(result["error"], force=True, vault="browser")
-    return out if scrubbed == result["error"] else json.dumps({**result, "error": scrubbed})
+
+_PAGE_FIELDS = ("error", "url", "title", "page", "origin", "receiving")  # dlz: page-derived text
+
+
+def _page_key(key: Any) -> bool:
+    return isinstance(key, str) and (key in _PAGE_FIELDS or key.endswith(("_origin", "_origins", "_url")))
+
+
+def _scrub_page_fields(value: Any, redact: Any, inside: bool = False) -> Any:
+    """Browser-audience scrub of every page-derived field of a vault result (errors, urls, titles, origins,
+    origin lists and origin-keyed maps, at any depth); handles, refs and ids elsewhere are left as they are so
+    they stay usable."""
+    if isinstance(value, str):
+        return redact(value, force=True, vault="browser") if inside else value
+    if isinstance(value, list):
+        return [_scrub_page_fields(v, redact, inside) for v in value]
+    if isinstance(value, dict):
+        return {(redact(k, force=True, vault="browser") if inside and isinstance(k, str) else k):
+                _scrub_page_fields(v, redact, inside or _page_key(k)) for k, v in value.items()}
+    return value
 
 
 def _handle_vault_inner(args: dict[str, Any], **kwargs) -> str:
