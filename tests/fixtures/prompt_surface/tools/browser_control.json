@@ -28,7 +28,7 @@
         "type": "string"
       },
       "identity": {
-        "description": "Which held lease (the identity used with browser_exec).",
+        "description": "Which held lease (the identity used with browser_exec; research for the research slot).",
         "type": "string"
       },
       "mode": {
