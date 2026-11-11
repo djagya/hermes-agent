@@ -301,6 +301,8 @@ def _dialog(task_id: Optional[str], dialog_action: str, dialog_id: str, prompt_t
     from tools import browser_exec_dialogs
 
     reply = browser_exec_dialogs.respond(task_id, action=dialog_action, dialog_id=dialog_id, prompt_text=prompt_text)
+    if reply.get("error_type"):  # dlz: payment_surface_locked keeps its type
+        return json.dumps({"success": False, "error_type": reply["error_type"], "error": str(reply.get("error"))})
     if not reply.get("ok"):
         return tool_error(str(reply.get("error") or "dialog not answered"))
     return tool_result({"success": True, "answered": dialog_action, "dialog": reply.get("dialog")})

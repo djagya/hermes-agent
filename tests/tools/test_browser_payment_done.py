@@ -23,6 +23,7 @@ PSP_TOP = (("TOP", "L2", "https://pay.datatrans.com/upp/start", "https://pay.dat
 CONFIRM = (("TOP", "L3", SHOP + "/thanks?order=77", SHOP, ""),
            # Stripe.js's hidden controller frame stays on many shop pages: it holds no card field
            ("CTRL", "LX", STRIPE + "/v3/controller-9f.html", STRIPE, "TOP"))
+UNLOCKED = {"locked": False, "native": False, "tabs": [], "unverified": False}
 SNAPSHOT = {"title": "Thank you", "url": SHOP + "/thanks?order=77", "origin": SHOP, "ready": "complete",
             "text": "Order 77 confirmed", "text_truncated": False,
             "links": [{"url": SHOP + "/tickets/77.pdf", "text": "Tickets"}], "links_truncated": False,
@@ -39,7 +40,7 @@ class FakeSup:
         self._page_session_id, self._active = "S-page", True
         self.trees, self.tree = list(trees), None
         self.snapshot = dict(SNAPSHOT)
-        self.status = status if status is not None else {"locked": False, "tabs": []}
+        self.status = status if status is not None else dict(UNLOCKED)
         self.calls, self.fail = [], set()
         self.tab_open = True
 
@@ -172,23 +173,27 @@ def test_no_handover_until_a_safe_confirmation_and_the_lock_stays(tree, snapshot
     assert out["error_type"] == "payment_confirmation_not_reached" and out["success"] is False
     assert out["lock_released"] is False and set(out) == {"success", "error_type", "error", "url", "title",
                                                           "lock_released"}
-    assert out["url"] == tree[0][2] and out["title"] == "Shop"
+    # still locked: the tab's site only, never its title or path (exfil via document.title / location)
+    assert out["url"] == done._url_origin(tree[0][2]) and out["title"] == ""
     assert not sup.sent("Target.createTarget") and not sup.sent("Target.closeTarget")
     if snapshot is None:  # an unsafe document is never read at all
         assert not sup.sent("Runtime.evaluate") and not sup.sent("Page.createIsolatedWorld")
 
 
 @pytest.mark.parametrize("status, released", [
-    ({"locked": False, "tabs": []}, True),
-    ({"locked": False}, True),
-    ({"locked": True, "tabs": ["TAB"]}, False),
-    ({"locked": True, "tabs": ["OTHER"]}, False),   # another payment still holds the slot
-    ({"locked": True, "tabs": []}, False),
-    ({"locked": False, "tabs": ["TAB"]}, False),    # contradictory
-    ({"locked": "false", "tabs": []}, False),
-    ({"locked": 0, "tabs": []}, False),
-    ({"protected": False}, False),                  # today's shape proves nothing about the lock
-    ({"locked": False, "tabs": [{"id": "TAB"}]}, False),
+    (UNLOCKED, True),
+    ({"locked": True, "native": True, "tabs": ["TAB"], "unverified": False}, False),
+    ({"locked": True, "native": True, "tabs": ["OTHER"], "unverified": False}, False),  # another payment holds it
+    ({"locked": True, "native": False, "tabs": [], "unverified": True}, False),  # human clear only
+    ({"locked": False, "native": False, "tabs": ["TAB"], "unverified": False}, False),  # contradictory
+    ({"locked": False, "native": True, "tabs": [], "unverified": False}, False),
+    ({"locked": False, "native": False, "tabs": [], "unverified": True}, False),
+    ({"locked": "false", "native": False, "tabs": [], "unverified": False}, False),
+    ({"locked": 0, "native": False, "tabs": [], "unverified": False}, False),
+    ({"locked": False, "tabs": []}, False),         # a missing key
+    ({**UNLOCKED, "extra": True}, False),           # an unknown key
+    ({"protected": False}, False),                  # the pre-lockdown shape proves nothing
+    ({**UNLOCKED, "tabs": [{"id": "TAB"}]}, False),
     (None, False),
     (RuntimeError("socket reset"), False),
 ])
@@ -321,15 +326,20 @@ def _top_controls(sup):
     return surface.payment_controls(sup)  # the fake serves the next tree to _payment_tree
 
 
+def _top_ref(tree):
+    """The ref the payment tab's top document gets (bound to its loader), as opposed to a card document's."""
+    return surface._ref(f"{tree[0][0]}|{tree[0][1]}", 0, "button", "Pay 22.66 EUR")
+
+
 @pytest.mark.parametrize("tree", [CHECKOUT, ACS])  # the merchant checkout, a 3-D Secure redirect page
 def test_locked_payment_tab_top_document_is_listed_and_clicked_natively(tree):
     sup = _paid([tree])
     out = _top_controls(sup)
-    assert out["success"] is True and out["controls"] == [
-        {"ref": out["controls"][0]["ref"], "role": "button", "text": "Pay 22.66 EUR", "disabled": False}]
-    worlds = sup.sent("Page.createIsolatedWorld")
-    assert [c[1]["frameId"] for c in worlds] == ["TOP"] and {c[2] for c in worlds} == {"S-page"}
-    assert surface.payment_click(sup, out["controls"][0]["ref"])["success"] is True
+    assert out["success"] is True
+    assert {"ref": _top_ref(tree), "role": "button", "text": "Pay 22.66 EUR", "disabled": False} in out["controls"]
+    worlds = [c for c in sup.sent("Page.createIsolatedWorld") if c[1]["frameId"] == "TOP"]
+    assert len(worlds) == 1 and worlds[0][2] == "S-page"
+    assert surface.payment_click(sup, _top_ref(tree))["success"] is True
     assert [c[1]["type"] for c in sup.sent("Input.dispatchMouseEvent")] == [
         "mouseMoved", "mousePressed", "mouseReleased"]
     assert {c[2] for c in sup.sent("Input.dispatchMouseEvent")} == {"S-page"}
@@ -337,19 +347,22 @@ def test_locked_payment_tab_top_document_is_listed_and_clicked_natively(tree):
 
 @pytest.mark.parametrize("tree, merchant_fields, recorded", [
     (PSP_TOP, False, True),            # a payment provider's own page
-    (CHECKOUT, True, True),            # the merchant document that received card fields (and kept its loader)
+    (CHECKOUT, True, True),            # the merchant document that received card fields: a card document only
     (CHECKOUT, False, False),          # no payment recorded for this connection
 ])
 def test_top_document_never_offered_when_it_is_a_card_frame(tree, merchant_fields, recorded):
     sup = _paid([tree], merchant_fields=merchant_fields) if recorded else FakeSup([tree])
     out = _top_controls(sup)
-    assert out.get("controls", []) == []
-    assert not sup.sent("Page.createIsolatedWorld") and not sup.sent("Input.dispatchMouseEvent")
+    assert _top_ref(tree) not in [c["ref"] for c in out.get("controls", [])]
+    if not merchant_fields:  # nothing at all is read on a provider page or without a recorded payment
+        assert not sup.sent("Page.createIsolatedWorld")
+    assert not sup.sent("Input.dispatchMouseEvent")
 
 
 def test_a_top_document_ref_dies_with_its_document():
     sup = _paid([CHECKOUT])
-    ref = _top_controls(sup)["controls"][0]["ref"]
+    ref = _top_ref(CHECKOUT)
+    assert ref in [c["ref"] for c in _top_controls(sup)["controls"]]
     sup.trees = [(("TOP", "L5", SHOP + "/checkout", SHOP, ""),)]  # navigated: same frame and text, new document
     assert surface.payment_click(sup, ref)["error_type"] == "payment_control_unknown"
     assert not sup.sent("Input.dispatchMouseEvent")

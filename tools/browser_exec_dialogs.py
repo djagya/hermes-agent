@@ -203,6 +203,15 @@ def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
         handled.append(row)
     if not pending and not handled:
         return None
+    from tools.browser_payment_surface import slot_locked
+
+    if slot_locked(supervisor):
+        # dlz (payment lockdown): a dialog's text is page content; while a card payment locks the slot it
+        # stays with the user (ids and types only).
+        for row in pending + handled:
+            for key in ("message", "default_prompt", "url", "page"):
+                row.pop(key, None)
+            row["withheld"] = "payment_surface_locked"
     out: dict[str, Any] = {"pending": pending, "handled": handled}
     if pending:
         out["hint"] = (
@@ -218,4 +227,9 @@ def respond(task_id: Optional[str], *, action: str, dialog_id: str = "", prompt_
     supervisor = _supervisor(task_id)
     if supervisor is None:
         return {"ok": False, "error": "no browser session is attached for this task; run browser_exec first"}
+    from tools.browser_payment_surface import locked_refusal
+
+    refused = locked_refusal(supervisor)  # dlz (payment lockdown): no answer goes to a locked slot's pages
+    if refused:
+        return {"ok": False, "error_type": refused["error_type"], "error": refused["error"]}
     return supervisor.respond_to_dialog(action, prompt_text=prompt_text, dialog_id=dialog_id or None)

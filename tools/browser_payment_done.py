@@ -38,7 +38,8 @@ from agent.vault_payment_policy import (
     https_origin,
     provider_for_origin,
 )
-from tools.browser_payment_surface import STATUS_METHOD, _wait
+# parse_lock_status is re-exported: the one lock-state reader lives in browser_payment_surface.
+from tools.browser_payment_surface import _wait, lock_status, parse_lock_status
 
 logger = logging.getLogger(__name__)
 
@@ -286,25 +287,16 @@ def _valid_snapshot(value: Any, expected: str) -> Optional[dict]:
             "links": clean, "links_truncated": value["links_truncated"]}
 
 
-def parse_lock_status(result: Any) -> tuple[str, frozenset]:
-    """browser-control's ``Hermes.paymentSurfaceStatus`` result as ``("locked", owning tabs)``,
-    ``("unlocked", ∅)`` or ``("unknown", ∅)``. The ONE place that reads the lock state: adapt it to
-    the final control-v1 contract at merge. Coded to the lockdown design's intent: ``locked`` (bool)
-    and ``tabs`` (the owning page target ids). Only an explicit ``locked: false`` with no owning tab
-    proves the slot unlocked; any other shape, type or combination is unknown, never unlocked."""
-    if not isinstance(result, dict) or type(result.get("locked")) is not bool:
-        return "unknown", frozenset()
-    tabs = result.get("tabs", [] if result["locked"] is False else None)
-    if not isinstance(tabs, list) or len(tabs) > 64 or not all(_valid_id(t) for t in tabs):
-        return "unknown", frozenset()
-    if result["locked"]:
-        return ("locked", frozenset(tabs)) if tabs else ("unknown", frozenset())
-    return ("unlocked", frozenset()) if not tabs else ("unknown", frozenset())
-
-
 def has_payment(supervisor: Any) -> bool:
     with _LOCK:
         return bool(_PAYMENTS.get(supervisor))
+
+
+def card_frame_ids(supervisor: Any) -> frozenset:
+    """Frame ids of the card documents of every payment this supervisor claimed and has not handed over."""
+    with _LOCK:
+        tabs = list((_PAYMENTS.get(supervisor) or {}).values())
+    return frozenset(fid for payment in tabs for fid in payment.frame_ids)
 
 
 async def top_document(sup: Any, page_sid: str, tree: tuple) -> Optional[tuple]:
@@ -349,7 +341,7 @@ _ORIGIN_REQUIRED = ("This checkout ran on a payment provider's own page, so the 
 _NOT_REACHED = ("No order confirmation was reached on the payment tab within the wait: it still shows a checkout, "
                 "payment provider or bank (3-D Secure) page, a page on another site, or a page that is still "
                 "loading. The browser stays locked; nothing was clicked, closed or retried. Do not press Pay again. "
-                "url and title show where the tab is. If a bank check is waiting, ask the user to finish it, then "
+                "url shows the site the tab is on (origin only while locked). If a bank check is waiting, ask the user to finish it, then "
                 "call payment_done again; if the confirmation is on another site, call payment_done with "
                 "expected_origin set to that site's origin; otherwise ask the user.")
 _TAB_GONE = ("The payment tab is no longer open, so there is no confirmation page to read. Nothing was done. "
@@ -484,20 +476,11 @@ async def _follow(sup: Any, new_tab: str) -> None:
             sup._page_session_id = sid
 
 
-async def _status(sup: Any) -> tuple[str, frozenset]:
-    reply = await sup._cdp(STATUS_METHOD, {}, timeout=5)
-    return parse_lock_status(reply.get("result") if isinstance(reply, dict) else None)
-
-
 def _released(supervisor: Any) -> bool:
     """Poll control's status (bounded) until it proves the slot unlocked."""
     deadline = time.monotonic() + _RELEASE_WAIT_S
     while True:
-        try:
-            state, _tabs = _wait(_status(supervisor), supervisor._loop, timeout=7)
-        except Exception:  # health: allow BLE001 -- an unanswered status proves nothing
-            state = "unknown"
-        if state == "unlocked":
+        if lock_status(supervisor) == "unlocked":
             return True
         left = deadline - time.monotonic()
         if left <= 0:
@@ -540,8 +523,10 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
         previous = key if state == "settling" else None
         time.sleep(max(0.0, min(_POLL_S, deadline - time.monotonic())))
     if page is None:
-        return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=seen.get("url", ""),
-                        title=seen.get("title", ""), lock_released=False)
+        # The tab is still locked: like browser-control for every agent connection, report its site only
+        # (a locked page's title and path could carry what a planted script copied there).
+        return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=_url_origin(seen.get("url", "")),
+                        title="", lock_released=False)
     context = page.pop("browser_context", None)
     result = {"success": True, **page, "new_tab": None, "payment_tab_closed": False, "lock_released": False}
     try:  # the new tab first: the payment tab is closed only once the confirmation has somewhere to go

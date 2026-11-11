@@ -80,6 +80,11 @@ def browser_dialog(
                 "/browser connect first."
             ),
         })
+    from tools.browser_payment_surface import locked_refusal
+
+    refused = locked_refusal(supervisor)  # dlz (payment lockdown): no answer goes to a locked slot's pages
+    if refused:
+        return json.dumps(refused)
     result = supervisor.respond_to_dialog(action=action, prompt_text=prompt_text, dialog_id=dialog_id)
     if result.get("ok"):
         return json.dumps({"success": True, "action": action, "dialog": result.get("dialog", {})})
