@@ -393,6 +393,10 @@ process.stdout.write(JSON.stringify({pin, before, after: w.valid()}));
     ("Total 22.66\nTotal EUR 22.66", 2266, "EUR", "ambiguous"),  # a total without a unit is unclear
     ("Total: EUR 22.66 inkl. MwSt.", 2266, "EUR", "matched"),
     ("Gesamt (inkl. MwSt.) 22,66 €", 2266, "EUR", "matched"),  # a bracket that cannot mark a negative
+    # Codex B r3 #3: a later total in a format not read, and a bracket opened far from the amount.
+    ("Total EUR 22.66\nTotal EUR 100", 2266, "EUR", "ambiguous"),
+    ("Total EUR 22.66\nTotal EUR 100.000", 2266, "EUR", "ambiguous"),
+    ("Total (amount payable in EUR 22.66 including all applicable taxes)", 2266, "EUR", "not_found"),
 ])
 def test_amount_witness_states(text, cents, currency, state):
     values = {"__TEXT__": json.dumps(text), "__LATER__": json.dumps(text), "__WITNESS__": sp._AMOUNT_WITNESS,
@@ -1140,3 +1144,63 @@ def test_clock_anchors_are_kept_per_frame_session(monkeypatch):
     top, kps = i.documents
     assert (top.frame_session, kps.frame_session) == ("page", "s-kps") and top.object_id == kps.object_id
     assert top.clock_anchor < kps.clock_anchor
+
+
+# ----------------------------------------------------------------------------------------------- Codex B r3
+
+_UNCERTAIN = {"success": False, "partially_filled": True, "write_uncertain": True}
+
+
+@pytest.mark.parametrize("replies, paced, expected", [
+    # An answer that counts a write but does not flag it partial is normalised: never "no card field was written".
+    ([{"success": False, "error_type": "payment_fields_changed", "filled_fields": 1}], False,
+     {"success": False, "error_type": "payment_fields_changed", "filled_fields": 1, "partially_filled": True}),
+    ([{"success": False, "error_type": "payment_fields_changed", "filled_fields": 1, "partially_filled": False}], False,
+     {"success": False, "error_type": "payment_fields_changed", "filled_fields": 1, "partially_filled": True}),
+    # A success that does not count every field, a count past the fills, a failure without its type, a count that
+    # went backwards: invalid, with what may have been written.
+    ([_pending(0), _pending(1), {"success": True, "filled_fields": 0}], True,
+     {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 1}),
+    ([{"success": True}], False, {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 0}),
+    ([{"success": False, "filled_fields": 9}], False,
+     {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 0}),
+    ([{"success": False, "filled_fields": 0}], False,
+     {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 0}),
+    ([_pending(0), _pending(2), {"success": False, "error_type": "payment_fields_changed", "filled_fields": 1}], True,
+     {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 2}),
+    # Codex B r3 #2: a focus point that is not two finite numbers stops before any setter, in every document.
+    ([{"pending": True, "filled_fields": 0, "x": None, "y": "unknown"}, {"success": True, "filled_fields": 3}], True,
+     {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 0}),
+    ([{"pending": True, "filled_fields": 0, "x": True, "y": 1}, {"success": True, "filled_fields": 3}], True,
+     {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 0}),
+])
+def test_final_answers_are_checked_strictly_and_never_report_a_write_away(replies, paced, expected):
+    """Codex B r3 #1/#2."""
+    tokens = ("cc-csc", "cc-exp", "cc-number")
+    doc = PaymentDocument("top", "page", "o-top", MERCHANT, _controls(*tokens))
+    fills = [{"index": n, "token": t, "value": "x"} for n, t in enumerate(tokens)]
+
+    async def check(point):
+        return True
+
+    out = asyncio.run(_Replies(replies)._commit_payment_document(doc, fills, 1000.0, strict=True,
+                                                                 paced=check if paced else None))
+    assert out == expected
+    bvp._commit_text(out)
+    assert "no card field was written" not in out["error"]
+
+
+def test_a_cancelled_inspection_releases_every_closure_it_pinned():
+    """Codex B r3 #4: cancelled while a document's describe() is in flight, the inspection releases that closure and
+    the earlier ones, then propagates the cancellation."""
+    class Cancelled(_DiscoveryPage):
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if method == "Runtime.callFunctionOn" and params["objectId"] == "doc-kps" \
+                    and "describe()" in params["functionDeclaration"]:
+                raise asyncio.CancelledError
+            return await super()._cdp(method, params, session_id, timeout)
+
+    page = Cancelled(_PAGE, exposed={"kps", "ad"}, controls={"kps": _CARD_FORM})
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True))
+    assert {"doc-top", "doc-ad", "doc-kps"} <= set(page.released)

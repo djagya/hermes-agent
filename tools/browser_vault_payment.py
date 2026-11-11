@@ -485,6 +485,12 @@ _COMMIT_TEXTS = {
 }
 
 
+def _wrote(result: dict) -> bool:
+    """dlz (Codex B r3 #1): whether a stopped commit wrote anything: its partial flag or any counted field."""
+    count = result.get("filled_fields")
+    return bool(result.get("partially_filled")) or (type(count) is int and count > 0)
+
+
 def _commit_text(result: dict) -> None:
     """Set the fixed text for a stopped commit; a partial stop always says that fields were written. dlz (Codex B r2
     #2): a write whose outcome is unknown (lost, failed or malformed answer) always says fields may hold values."""
@@ -494,8 +500,8 @@ def _commit_text(result: dict) -> None:
     elif error_type == "payment_fields_not_retained":
         result["error"] = _NOT_RETAINED
     elif error_type in _COMMIT_TEXTS:
-        result["error"] = _COMMIT_TEXTS[error_type][1 if result.get("partially_filled") else 0]
-    elif not result.get("success") and result.get("partially_filled"):
+        result["error"] = _COMMIT_TEXTS[error_type][1 if _wrote(result) else 0]
+    elif not result.get("success") and _wrote(result):
         result["error"] = _PARTIAL_STOPPED
 
 

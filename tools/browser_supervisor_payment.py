@@ -568,7 +568,8 @@ class PaymentSupervisionMixin:
         child_sessions = {}
         operation = secrets.token_hex(16)
         # dlz: what this inspection pins; released on any refusal below.
-        found = {"candidates": [], "anchors": {}, "absence": [], "witnesses": [], "owners": {}}
+        # dlz (Codex B r3 #4): "pending" holds each closure from the moment it exists until it is classified.
+        found = {"candidates": [], "anchors": {}, "absence": [], "witnesses": [], "owners": {}, "pending": []}
         try:
             tree = await self._payment_tree(sid, child_sessions)
             merchant = https_origin(tree[0][3])
@@ -597,7 +598,7 @@ class PaymentSupervisionMixin:
                 d.clock_anchor = found["anchors"].get((d.frame_session, d.object_id))
             if await self._payment_tree(sid, child_sessions) != tree:
                 raise PaymentPolicyError("Payment page changed during inspection")
-            found["owners"] = await self._pin_frame_owners(documents, tree, sid, child_sessions)
+            found["owners"] = await self._pin_frame_owners(documents, tree, sid, child_sessions, found["owners"])
             hosted = tuple(dict.fromkeys(d.origin for d in documents if d.origin != merchant))
             inspection = PaymentInspection(
                 operation,
@@ -623,14 +624,23 @@ class PaymentSupervisionMixin:
             if cart is not None:
                 await self._bind_amount_witnesses(inspection, cart, found["witnesses"])
             return inspection
-        except Exception:
-            for _, fsid, obj, _, _ in found["candidates"]:
-                await self._release_payment_object(fsid, obj)
-            for fsid, obj in [a[:2] for a in found["absence"]] + found["witnesses"]:
-                await self._release_payment_object(fsid, obj)
-            await self._release_frame_owners(found["owners"])
-            await self._release_payment_sessions(child_sessions)
+        except BaseException:  # health: allow BLE001 -- released, then re-raised unchanged (cancellation too)
+            # dlz (Codex B r3 #4): one release pass of everything pinned so far, as its own task: a cancellation
+            # (the caller's timeout) cannot cut it short, and is re-raised once the pass is under way.
+            cleanup = asyncio.ensure_future(self._release_found(found, child_sessions))
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                pass  # a second cancellation: the pass keeps running; the first exception is raised below
             raise
+
+    async def _release_found(self, found: dict, child_sessions: dict) -> None:
+        for _, fsid, obj, _, _ in found["candidates"]:
+            await self._release_payment_object(fsid, obj)
+        for fsid, obj in found["pending"] + [a[:2] for a in found["absence"]] + found["witnesses"]:
+            await self._release_payment_object(fsid, obj)
+        await self._release_frame_owners(found["owners"])
+        await self._release_payment_sessions(child_sessions)
 
     async def _merchant_tab_session(self, origin: str, sid: str) -> str:
         """The page session on the one tab at ``origin``, attaching to it (and making it the supervised page) when
@@ -733,32 +743,30 @@ class PaymentSupervisionMixin:
                 raise PaymentPolicyError("Payment document unavailable")
             # dlz (Codex B r2 #7): object ids are session-scoped; two frame sessions can hand out the same one.
             found["anchors"][(fsid, obj)] = anchor
-            try:
-                raw = _value(
-                    await self._cdp(
-                        "Runtime.callFunctionOn",
-                        {
-                            "objectId": obj,
-                            "functionDeclaration": "function(){return this.describe()}",
-                            "returnByValue": True,
-                        },
-                        session_id=fsid,
-                    )
-                )
-                controls = _card_controls(_bounded_description(raw) if unreviewed else raw)
-            except Exception:  # health: allow BLE001 -- released, then re-raised unchanged
-                # dlz (Codex B r2 #6): not yet a candidate or witness, so the outer cleanup cannot see it.
-                await self._release_payment_object(fsid, obj)
-                raise
-            if controls:
-                found["candidates"].append((fid, fsid, obj, frame_origin, controls))
-            elif unreviewed:
-                # dlz (B4): a card-free document; it may become an absence witness.
-                found["absence"].append((fsid, obj, frame_origin, fid))
-            else:
+            # dlz (Codex B r2 #6, r3 #4): the outer cleanup releases it from here on, on any exception or cancellation.
+            found["pending"].append((fsid, obj))
+            raw = _value(
                 await self._cdp(
-                    "Runtime.releaseObject", {"objectId": obj}, session_id=fsid
+                    "Runtime.callFunctionOn",
+                    {
+                        "objectId": obj,
+                        "functionDeclaration": "function(){return this.describe()}",
+                        "returnByValue": True,
+                    },
+                    session_id=fsid,
                 )
+            )
+            controls = _card_controls(_bounded_description(raw) if unreviewed else raw)
+            if controls or unreviewed:
+                found["pending"].remove((fsid, obj))  # no await between: it is always in exactly one list
+                if controls:
+                    found["candidates"].append((fid, fsid, obj, frame_origin, controls))
+                else:
+                    # dlz (B4): a card-free document; it may become an absence witness.
+                    found["absence"].append((fsid, obj, frame_origin, fid))
+            else:
+                await self._release_payment_object(fsid, obj)
+                found["pending"].remove((fsid, obj))
         return unreviewed_frames
 
     async def _bind_amount_witnesses(self, inspection: PaymentInspection, cart: tuple, witnesses: list) -> None:
@@ -769,15 +777,15 @@ class PaymentSupervisionMixin:
             if d.origin in inspection.unreviewed_origins]
         pins = []
         for place, wfid, wsid in places:
-            wobj, pin = await self._amount_witness(wfid, wsid, inspection.operation_id, cart)
-            witnesses.append((wsid, wobj))
-            pins.append((place, pin))
+            pins.append((place, await self._amount_witness(wfid, wsid, inspection.operation_id, cart, witnesses)))
         inspection.witnesses = tuple(witnesses)
         inspection.page_match = _page_match(pins, cart[0])
 
-    async def _pin_frame_owners(self, documents: tuple, tree: tuple, page_sid: str, child_sessions: dict) -> dict:
+    async def _pin_frame_owners(self, documents: tuple, tree: tuple, page_sid: str, child_sessions: dict,
+                                groups: dict | None = None) -> dict:
         """dlz: pin the owner <iframe> of every frame between a card document and the page, grouped by parent
-        document (one isolated world each). Unresolvable: the inspection is refused."""
+        document (one isolated world each), into ``groups`` as each is pinned (the caller's cleanup sees them on a
+        cancellation: Codex B r3 #4). Unresolvable: the inspection is refused."""
         by_id = {f[0]: f for f in tree}
         frames: list = []
         for d in documents:
@@ -785,7 +793,7 @@ class PaymentSupervisionMixin:
             while fid in by_id and by_id[fid][4] and fid not in frames:
                 frames.append(fid)
                 fid = by_id[fid][4]
-        groups: dict = {}
+        groups = {} if groups is None else groups
         contexts: dict = {}
         try:
             for fid in frames:
@@ -801,6 +809,7 @@ class PaymentSupervisionMixin:
                 groups.setdefault(parent, (psid, []))[1].append((fid, obj))
         except Exception:  # health: allow BLE001 -- no pinned owner, no verifiable card frame; fail closed
             await self._release_frame_owners(groups)
+            groups.clear()
             raise PaymentPolicyError("Payment document unavailable") from None
         return groups
 
@@ -860,9 +869,10 @@ class PaymentSupervisionMixin:
             fid = parent
         return fid in by_id
 
-    async def _amount_witness(self, fid: str, sid: str, operation: str, cart: tuple) -> tuple:
-        """dlz (B5): a pinned ``_AMOUNT_WITNESS`` in this document's isolated world, and its pin. Only numbers and a
-        state word leave the world; the inputs are digits and three capitals, validated before they get here."""
+    async def _amount_witness(self, fid: str, sid: str, operation: str, cart: tuple, pinned: list) -> dict:
+        """dlz (B5): pin an ``_AMOUNT_WITNESS`` in this document's isolated world (added to ``pinned`` as soon as it
+        exists, for the inspection's cleanup: Codex B r3 #4) and return its pin. Only numbers and a state word leave
+        the world; the inputs are digits and three capitals, validated before they get here."""
         cents, currency = cart
         if type(cents) is not int or not 0 <= cents < 10**9 or not (isinstance(currency, str) and len(currency) == 3
                                                                    and currency.isascii() and currency.isupper()):
@@ -875,16 +885,13 @@ class PaymentSupervisionMixin:
         obj = reply.get("result", {}).get("result", {}).get("objectId")
         if not obj:
             raise PaymentPolicyError("Payment document unavailable")
-        try:
-            pin = _value(await self._cdp("Runtime.callFunctionOn", {
-                "objectId": obj, "functionDeclaration": "function(){return this.pin()}", "returnByValue": True},
-                session_id=sid))
-            if not _valid_pin(pin):
-                raise PaymentPolicyError("Payment document unavailable")
-        except Exception:
-            await self._release_payment_object(sid, obj)
-            raise
-        return obj, pin
+        pinned.append((sid, obj))
+        pin = _value(await self._cdp("Runtime.callFunctionOn", {
+            "objectId": obj, "functionDeclaration": "function(){return this.pin()}", "returnByValue": True},
+            session_id=sid))
+        if not _valid_pin(pin):
+            raise PaymentPolicyError("Payment document unavailable")
+        return pin
 
     async def _owner_check(self, fid: str, parent: str, parent_sid: str, function: str, strict: bool = False) -> bool:
         """Evaluate ``function`` on the iframe element hosting ``fid``, in an isolated world of its parent; only
@@ -1306,8 +1313,11 @@ class PaymentSupervisionMixin:
                 if paced is None or not isinstance(result, dict) or result.get("pending") is not True:
                     break
                 attempted = result.get("filled_fields")
+                # dlz (Codex B r3 #2): the focus point is checked here for every document, the top one included
+                # (its paced check reads no point): a finite number each, never a bool or a missing value.
                 if set(result) != {"pending", "filled_fields", "x", "y"} or type(attempted) is not int \
-                        or not acknowledged <= attempted < len(fills):
+                        or not acknowledged <= attempted < len(fills) \
+                        or not all(type(result[k]) in (int, float) and math.isfinite(result[k]) for k in ("x", "y")):
                     return uncertain("payment_result_invalid")
                 acknowledged = attempted
                 verdict = await paced((result["x"], result["y"]))
@@ -1322,10 +1332,10 @@ class PaymentSupervisionMixin:
                 }, session_id=d.frame_session))
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; typed, never retried
             return uncertain("payment_transport_uncertain")
-        if not _valid_document_result(result):
-            return uncertain("payment_result_invalid")
-        if result["success"] is not True and acknowledged:
-            # An acknowledged write is never reported away by a later answer.
+        if not _valid_document_result(result, len(fills)) or result.get("filled_fields", 0) < acknowledged:
+            return uncertain("payment_result_invalid")  # dlz (Codex B r3 #1): a count never goes backwards
+        if result["success"] is not True and (acknowledged or result.get("filled_fields", 0)):
+            # An acknowledged write is never reported away by a later answer, nor by its own partial flag.
             result = {**result, "filled_fields": max(result.get("filled_fields", 0), acknowledged),
                       "partially_filled": True}
         return result
@@ -1483,17 +1493,20 @@ _OWNERS_SCOPE_EXPOSED = ("function(href,origin,...els){" + _PARENT_AT + "return 
                          + _EXPOSED + ")(e))}")
 
 # dlz (design v2 B5): a transcription sanity check of the stated total against the document's visible text, never a
-# verification. A token is an amount with two decimals, not part of a longer number. dlz (Codex B r2 #3): no grammar is
-# parsed. On the token's own line, at most ONE unit may sit right beside it on each side (spaces between allowed): an
-# ISO 4217 code (a whole word of 3 capitals) or a currency symbol with up to 3 letters before it ('$' and 'US$' are
-# USD, 'CA$'/'C$' CAD, 'A$'/'AU$' AUD, 'NZ$' NZD, '€' EUR, '£' GBP; any other symbol, prefix or 3-capital word is an
-# unknown unit). The 8 characters beyond each unit (spaces trimmed) are its context. A clear amount has every unit
-# equal to the stated currency and a context with no other 3-capital word, currency symbol, sign or dash, or digit,
-# and no bracket that can mark a negative ('(' before the amount, ')' after it). Anything else, a token without a
-# unit included, is not clear. An occurrence of the stated total is a token in
-# the stated currency with no sign or dash, opening bracket before or closing bracket after it in its context. A
-# total-labelled amount is the first token (with or without a unit) within 40 characters after a total keyword on the
-# same line; one that is not clear makes the page `unclear`, never `matched`.
+# verification. A token is an amount with two decimals, not part of a longer number. dlz (Codex B r2 #3, r3 #3): no
+# grammar is parsed. On the token's own line, at most ONE unit may sit right beside it on each side (spaces between
+# allowed): an ISO 4217 code (a whole word of 3 capitals) or a currency symbol with up to 3 letters before it ('$' and
+# 'US$' are USD, 'CA$'/'C$' CAD, 'A$'/'AU$' AUD, 'NZ$' NZD, '€' EUR, '£' GBP; any other symbol, prefix or 3-capital
+# word is an unknown unit). The 8 characters beyond each unit (spaces trimmed) are its context. The token is enclosed
+# when its line, left of it, leaves a bracket open, or, right of it, closes one it did not open (an accounting
+# negative, however long the bracketed text); a line longer than 1000 characters on either side is not judged. A
+# clear amount has every unit equal to the stated currency, is not enclosed and not on an unjudged line, and has a
+# context with no other 3-capital word, currency symbol, sign or dash, or digit. Anything else, a token without a unit
+# included, is not clear. An occurrence of the stated total is a token in the stated currency with no sign or dash in
+# its context and not enclosed. A total-labelled amount is the first token (with or without a unit) within 40
+# characters after a total keyword on the same line; one that is not clear, a digit between the keyword and it, or
+# (no token in reach) any digit in reach after the keyword (a total in a format not read, 'EUR 100', 'EUR 100.000')
+# makes the page `unclear`, never `matched`.
 # matched: some labelled amount, all of them clear and the stated total; ambiguous: the stated total appears, but
 # unlabelled, unclear or beside a different labelled total; not_found: otherwise. pin() returns the state, the
 # distinct clear labelled amounts (cents), the stated total's occurrences and `unclear`; valid() is the same
@@ -1506,9 +1519,9 @@ _AMOUNT_WITNESS = r"""((cents, currency) => {
   const UNIT_END = /(?<![\p{L}\p{N}])(?:[A-Z]{3}|\p{L}{0,3}\p{Sc})$/u;
   const UNIT_START = /^(?:[A-Z]{3}(?![\p{L}\p{N}])|\p{L}{0,3}\p{Sc})/u;
   const CODE = /(?<![\p{L}\p{N}])[A-Z]{3}(?![\p{L}\p{N}])/gu;
-  const MARK = /[\p{Sc}\p{N}\p{Pd}−+±]/u;
-  const SIGN_BEFORE = /[\p{Pd}−+±\p{Ps}]/u, SIGN_AFTER = /[\p{Pd}−+±\p{Pe}]/u;
-  const SPAN = 64, WINDOW = 8;
+  const MARK = /[\p{Sc}\p{N}\p{Pd}−+±]/u, SIGN = /[\p{Pd}−+±]/u;
+  const BRACKETS = /[^()[\]{}（）［］｛｝]/gu, OPENS = '([{（［｛';
+  const LINE = 1000, WINDOW = 8;
   const DOLLARS = {'': 'USD', US: 'USD', CA: 'CAD', C: 'CAD', A: 'AUD', AU: 'AUD', NZ: 'NZD'};
   const unit = m => {
     if (/^[A-Z]{3}$/.test(m)) return CODES.has(m) ? m : '?';
@@ -1517,27 +1530,37 @@ _AMOUNT_WITNESS = r"""((cents, currency) => {
     return prefix ? '?' : symbol === '€' ? 'EUR' : symbol === '£' ? 'GBP' : '?';
   };
   const codeIn = (s, from, to) => Array.from(s.matchAll(CODE)).some(c => c.index < to && c.index + 3 > from);
+  // The token's line on each side (at most LINE characters), and whether a side may run on past that.
+  const sides = (text, start, end) => {
+    const a = text.slice(Math.max(0, start - LINE), start), b = text.slice(end, end + LINE);
+    const nl = Math.max(a.lastIndexOf('\n'), a.lastIndexOf('\r')), nr = b.search(/[\n\r]/);
+    return [nl >= 0 ? a.slice(nl + 1) : a, nr >= 0 ? b.slice(0, nr) : b,
+            (nl < 0 && start > LINE) || (nr < 0 && end + LINE < text.length)];
+  };
+  const enclosed = (left, right) => {
+    let depth = 0;
+    for (const c of left.replace(BRACKETS, '')) depth = OPENS.includes(c) ? depth + 1 : Math.max(0, depth - 1);
+    if (depth) return true;
+    for (const c of right.replace(BRACKETS, '')) {
+      if (OPENS.includes(c)) depth += 1; else if (depth) depth -= 1; else return true;
+    }
+    return false;
+  };
   const read = () => {
     const text = String((doc.body && doc.body.innerText) || '').slice(0, 200000);
     const amounts = [];
     for (const m of text.matchAll(AMOUNT)) {
       const start = m.index, end = start + m[0].length;
-      let l = text.slice(Math.max(0, start - SPAN), start), r = text.slice(end, end + SPAN);
-      const nl = Math.max(l.lastIndexOf('\n'), l.lastIndexOf('\r')), nr = r.search(/[\n\r]/);
-      // A side that may continue past SPAN (no line break in reach) and leaves less than WINDOW to judge: unclear.
-      const openL = nl < 0 && start > SPAN, openR = nr < 0 && end + SPAN < text.length;
-      l = (nl >= 0 ? l.slice(nl + 1) : l).trimEnd();
-      r = (nr >= 0 ? r.slice(0, nr) : r).trimStart();
+      const [left, right, unjudged] = sides(text, start, end);
+      let l = left.trimEnd(), r = right.trimStart();
       const lu = UNIT_END.exec(l), ru = UNIT_START.exec(r);
       if (lu) l = l.slice(0, lu.index).trimEnd();
       if (ru) r = r.slice(ru[0].length).trimStart();
       const lw = l.slice(-WINDOW), rw = r.slice(0, WINDOW);
       const units = [lu && unit(lu[0]), ru && unit(ru[0])].filter(Boolean);
       const codes = codeIn(l, l.length - WINDOW, l.length) || codeIn(r, 0, WINDOW);
-      // A bracket counts only where it can mark a negative: opening before the amount, closing after it.
-      const signed = SIGN_BEFORE.test(lw) || SIGN_AFTER.test(rw);
-      const marked = codes || signed || MARK.test(lw) || MARK.test(rw) || (openL && lw.length < WINDOW) ||
-        (openR && rw.length < WINDOW);
+      const signed = SIGN.test(lw) || SIGN.test(rw) || enclosed(left, right);
+      const marked = unjudged || codes || signed || MARK.test(lw) || MARK.test(rw);
       // A bare token (no unit) is never clear: first after a keyword, it makes the page unclear.
       amounts.push({start, value: Number(m[1].replace(/\D/g, '') + m[2]), stated: units.includes(currency) && !signed,
                     clear: units.length > 0 && !marked && units.every(u => u === currency)});
@@ -1548,7 +1571,10 @@ _AMOUNT_WITNESS = r"""((cents, currency) => {
       const from = k.index + k[0].length;
       const first = amounts.find(a => a.start >= from);
       if (first && first.start - from <= 40 && !/[\n\r]/.test(text.slice(from, first.start))) {
-        if (first.clear) labelled.add(first.value); else unclear = true;
+        if (first.clear && !/\p{N}/u.test(text.slice(from, first.start))) labelled.add(first.value);
+        else unclear = true;
+      } else if (/\p{N}/u.test(text.slice(from, from + 40).split(/[\n\r]/)[0])) {
+        unclear = true;  // a total in a format this check does not read
       }
     }
     const stated = amounts.filter(a => a.stated && a.value === cents).length;
@@ -1636,13 +1662,18 @@ def _retention_result(documents: list) -> dict:
     }
 
 
-def _valid_document_result(result: Any) -> bool:
-    """dlz (Codex B r2 #2): one document's final commit answer: only its own keys, with exact types."""
-    return (isinstance(result, dict) and type(result.get("success")) is bool
-            and not set(result) - {"success", "filled_fields", "error_type", "partially_filled"}
-            and ("filled_fields" not in result or (type(result["filled_fields"]) is int and result["filled_fields"] >= 0))
-            and ("partially_filled" not in result or type(result["partially_filled"]) is bool)
-            and ("error_type" not in result or type(result["error_type"]) is str))
+def _valid_document_result(result: Any, fills: int) -> bool:
+    """dlz (Codex B r2 #2, r3 #1): one document's final commit answer, exact keys and types. A success is exactly
+    ``{success, filled_fields}`` with every one of the ``fills`` written; a failure names its error type and counts
+    at most ``fills``."""
+    if not isinstance(result, dict) or type(result.get("success")) is not bool:
+        return False
+    count = result.get("filled_fields", 0)
+    if result["success"]:
+        return set(result) == {"success", "filled_fields"} and type(count) is int and count == fills
+    return (not set(result) - {"success", "filled_fields", "error_type", "partially_filled"}
+            and type(result.get("error_type")) is str and type(count) is int and 0 <= count <= fills
+            and type(result.get("partially_filled", False)) is bool)
 
 
 def _partial(result: dict, filled_before: int) -> dict:
