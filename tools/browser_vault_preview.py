@@ -97,7 +97,7 @@ def _redact(value: Any, depth: int = 0) -> Any:
     if depth >= REDACT_WALK_MAX_DEPTH:
         return REDACT_WALK_DEPTH_MARKER
     if isinstance(value, str):
-        return redact_registered_vault_values(value)
+        return redact_registered_vault_values(value, audience="browser")
     if isinstance(value, list):
         return [_redact(v, depth + 1) for v in value]
     if isinstance(value, dict):
@@ -112,5 +112,5 @@ def redact_preview_result(raw: str) -> str:
         value = json.loads(raw)
     except (ValueError, TypeError):
         from agent.redact import redact_registered_vault_values
-        return redact_registered_vault_values(str(raw))
+        return redact_registered_vault_values(str(raw), audience="browser")
     return json.dumps(_redact(value), ensure_ascii=False)

@@ -68,12 +68,17 @@ def _redact_cdp_output(
     from agent.redact import (
         REDACT_WALK_DEPTH_MARKER,
         REDACT_WALK_MAX_DEPTH,
+        redact_registered_vault_values,
         redact_sensitive_text,
     )
     if _depth >= REDACT_WALK_MAX_DEPTH:
         return REDACT_WALK_DEPTH_MARKER
     if isinstance(value, str):
-        return redact_sensitive_text(value, force=True)
+        return redact_sensitive_text(value, force=True, vault="browser")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # dlz: a number is page data too (``value: 4711``): masked by length like text, returned as the mask
+        masked = redact_registered_vault_values(str(value), audience="browser")
+        return value if masked == str(value) else masked
     if isinstance(value, (list, tuple)):
         return type(value)(
             _redact_cdp_output(item, _depth=_depth + 1) for item in value
@@ -88,7 +93,7 @@ def _redact_cdp_output(
     redacted: dict[str, Any] = {}
     for key, item in value.items():
         opaque = leaf(always_paths, key) or (leaf(flagged_paths, key) and base64_flagged)
-        out_key = redact_sensitive_text(key, force=True) if isinstance(key, str) else key  # by-value objects can carry a secret as a KEY
+        out_key = redact_sensitive_text(key, force=True, vault="browser") if isinstance(key, str) else key  # by-value objects can carry a secret as a KEY
         redacted[out_key] = item if isinstance(item, str) and opaque else _redact_cdp_output(
             item,
             always_paths=descend(always_paths, key),
@@ -96,6 +101,13 @@ def _redact_cdp_output(
             _depth=_depth + 1,
         )
     return redacted
+
+
+def _exc_text(exc: BaseException) -> str:
+    """An error's text for the result: it can quote the page (a CDP error message), so it is redacted too."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(str(exc), force=True, vault="browser")
 
 
 # ``websockets`` is a direct dependency; wrap so a stale env yields a clean error.
@@ -381,13 +393,16 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
     except Exception as exc:
         if pay.epoch(supervisor) != before:  # the error text may quote the page too
             return json.dumps(pay.locked_withheld())
-        return tool_error(f"CDP call via supervisor failed: {type(exc).__name__}: {exc}", cdp_docs=CDP_DOCS_URL)
+        return tool_error(f"CDP call via supervisor failed: {type(exc).__name__}: {_exc_text(exc)}",
+                          cdp_docs=CDP_DOCS_URL)
     if result_msg is None or pay.epoch(supervisor) != before:
         # A card payment claimed the slot while this call was in flight: its result may hold card data.
         return json.dumps(pay.locked_withheld())
 
+    result = _redact_cdp_output(result_msg.get("result", {}), always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
+                                flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()))
     return json.dumps({"success": True, "method": method, "frame_id": frame_id, "session_id": child_sid,
-                       "result": result_msg.get("result", {})}, ensure_ascii=False)
+                       "result": result}, ensure_ascii=False)
 
 
 def _payment_answer(task_id: str, method: str, params: Any, *, routed: bool) -> Optional[str]:
@@ -488,7 +503,7 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     try:
         result = _run_async(_cdp_call(endpoint, method, call_params, target_id, safe_timeout))
     except TimeoutError as exc:
-        return tool_error(f"CDP call timed out after {safe_timeout}s: {exc}", method=method)
+        return tool_error(f"CDP call timed out after {safe_timeout}s: {_exc_text(exc)}", method=method)
     except RuntimeError as exc:
         if "payment_screenshot_blocked" in str(exc):
             # browser-control's capture guard refused the method on a card-filled slot.
@@ -500,13 +515,13 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
             from tools.browser_payment_surface import LOCKED, LOCKED_TEXT
 
             return json.dumps({"success": False, "error_type": LOCKED, "error": LOCKED_TEXT})
-        return tool_error(str(exc), method=method)
+        return tool_error(_exc_text(exc), method=method)
     except WebSocketException as exc:
-        return tool_error(f"WebSocket error talking to CDP at {endpoint}: {exc}. The browser may have "
+        return tool_error(f"WebSocket error talking to CDP at {endpoint}: {_exc_text(exc)}. The browser may have "
                           "disconnected — try '/browser connect' again.", method=method)
     except Exception as exc:  # pragma: no cover — unexpected
         logger.exception("browser_cdp unexpected error")
-        return tool_error(f"Unexpected error: {type(exc).__name__}: {exc}", method=method)
+        return tool_error(f"Unexpected error: {type(exc).__name__}: {_exc_text(exc)}", method=method)
 
     payload: dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
         result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),

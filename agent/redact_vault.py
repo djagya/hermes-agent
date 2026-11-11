@@ -8,14 +8,26 @@ gateway never scrubs profile B's output with profile A's passwords (which would 
 bytes exist), and bounded per profile: a fill-heavy session evicts its oldest entries rather than growing
 forever.
 
-dlz: a value made only of digits is never replaced where it matches. A placeholder on the one run that
-equals it would answer "is it 737?" for a model that prints candidates (a CVC has 1000), so while a
-pure-digit value of length L is registered, EVERY digit run of exactly L digits is masked digit for digit
-(L >= 12, a card number: every run of L or more, spaced or dashed groups counted together), and the output
-is the same whatever the value is. A value the model itself supplied (``known_to_model``: a one-time code
-it typed) has nothing to reveal and is replaced exactly. Card values live in payment windows
-(:func:`register_card_window`), dropped once the payment lock release is confirmed, so the length masking
-lasts only for the payment.
+dlz: the scrub depends on who reads the text (``audience``, :func:`redact_registered_vault_values`):
+
+* ``model`` (the default: a tool result the model reads that it did not write) and ``browser`` (a browser
+  tool result): a value made only of digits is never replaced where it matches. A placeholder on the one
+  run that equals it would answer "is it 4711?" for a model that prints candidates, so while a pure-digit
+  value of length L masks, EVERY digit run of exactly L digits is masked digit for digit (L >= 12, a card
+  number: every run of L or more, spaced or dashed groups counted together), and the output is the same
+  whatever the value is. A pure-digit login secret masks for ``LOGIN_MASK_S`` after its registration (a
+  one-time code for its TTL), then leaves the length classes. A pure-digit value the model supplied itself
+  is never registered (it knows it; masking it would answer "does my guess equal the PIN?").
+* ``log`` (log files, not model-visible): every live value is replaced exactly (a pure-digit one only as a
+  whole digit run), and the card windows still mask by length.
+* ``authored`` (persisted text the model wrote: tool-call arguments): only values with a non-digit
+  character, so the JSON stays valid and a reload marks nothing.
+
+Values with a non-digit character are replaced exactly for every audience. Card values live in payment
+windows (:func:`register_card_window`, lengths and holder only, never the values), fenced by a per-window
+generation: a claim or an open bumps it, and a release that observed an older generation changes nothing.
+A confirmed lock release keeps the window for browser results only (the page may still show card text);
+the window goes when the slot's mark is cleared.
 """
 
 import re
@@ -23,16 +35,32 @@ import threading
 import time
 
 _VAULT_REDACTION_MAX_PER_PROFILE = 64
-_VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: known_to_model}
-_CARD_WINDOWS: dict = {}  # profile home → ordered {window key: (digit lengths, holder words)}
+_VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: _Entry}
+_CARD_WINDOWS: dict = {}  # profile home → ordered {window key: [digit lengths, holder words, released]}
+_CARD_GENERATIONS: dict = {}  # profile home → {window key: generation}
 _MAX_CARD_WINDOWS = 16
-_VAULT_REDACTION_EXPIRY: dict = {}  # profile home → {value: monotonic deadline} for short-lived values (one-time codes)
+_MAX_GENERATIONS = 256
 _VAULT_REDACTION_LOCK = threading.Lock()
 PLACEHOLDER = "«redacted-vault-secret»"
 CARD_PLACEHOLDER = "«redacted-card»"
+LOGIN_MASK_S = 900.0  # a pure-digit login secret masks digit runs of its length for 15 minutes
+AUDIENCES = ("model", "browser", "log", "authored")
 _LONG = 12  # shortest card number: a pure-digit value this long also masks longer runs and spaced groups
 _ALL_DIGITS = re.compile(r"\d+")
 _GROUPED = re.compile(r"\d+(?:[ -]\d+)+")
+
+
+class _Entry:
+    """One registered value: permanent and expiring registrations kept apart (a TTL never shortens a
+    permanent one), and how long a pure-digit value masks by length."""
+
+    __slots__ = ("known", "mask_until", "permanent", "until")
+
+    def __init__(self):
+        self.permanent, self.until, self.mask_until, self.known = False, 0.0, 0.0, True
+
+    def alive(self, now: float) -> bool:
+        return self.permanent or self.until > now
 
 
 def _vault_scope() -> str:
@@ -40,72 +68,119 @@ def _vault_scope() -> str:
     return str(get_hermes_home())
 
 
-def register_vault_redaction_value(value, *, known_to_model: bool = False, ttl_s: float | None = None) -> None:
-    """Register an exact vault secret value for model-facing redaction.
+def register_vault_redaction_value(value, *, known_to_model: bool = False, ttl_s: float | None = None,
+                                   length_mask: bool = True) -> None:
+    """Register an exact vault secret value for redaction.
 
     Called by the vault fill path BEFORE the injection happens, so no later browser tool result
     can echo the value back into model context. Also registers the form a text input normalizes
-    it to (CR/LF stripped), since that is what the page holds. A value registered once without
-    ``known_to_model`` stays oracle-free. ``ttl_s`` (one-time codes, worthless once expired) drops the value
-    after that many seconds, so its length masking does not outlive the code; re-registering without it
-    makes the value permanent again.
+    it to (CR/LF stripped), since that is what the page holds. ``ttl_s`` (one-time codes) lets the value
+    lapse after that many seconds; a permanent registration of the same bytes is kept regardless.
+    A pure-digit value masks by length for ``LOGIN_MASK_S`` (or its TTL, if shorter); with
+    ``length_mask=False`` (an identifier such as a numeric username) it is scrubbed in logs only. A
+    pure-digit ``known_to_model`` value (a code the model typed) is not registered at all.
     """
     if not isinstance(value, str) or not value:
         return
     normalized = value.replace("\r", "").replace("\n", "")
+    now = time.monotonic()
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
-        for v in (value, normalized):
-            if v:
-                known = bucket.pop(v, True) and known_to_model  # re-registering refreshes recency
-                bucket[v] = known
-                expiry = _VAULT_REDACTION_EXPIRY.setdefault(_vault_scope(), {})
-                if ttl_s is None:
-                    expiry.pop(v, None)
-                else:
-                    expiry[v] = time.monotonic() + max(0.0, float(ttl_s))
-        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
-            _VAULT_REDACTION_EXPIRY.get(_vault_scope(), {}).pop(next(iter(bucket)), None)
-            del bucket[next(iter(bucket))]
+        for v in dict.fromkeys((value, normalized)):
+            digits = bool(_ALL_DIGITS.fullmatch(v))
+            if not v or (digits and known_to_model):
+                continue
+            entry = bucket.pop(v, None) or _Entry()  # re-registering refreshes recency
+            entry.known = entry.known and known_to_model
+            if ttl_s is None:
+                entry.permanent = True
+            else:
+                entry.until = max(entry.until, now + max(0.0, float(ttl_s)))
+            if digits and length_mask:
+                life = LOGIN_MASK_S if ttl_s is None else min(LOGIN_MASK_S, max(0.0, float(ttl_s)))
+                entry.mask_until = max(entry.mask_until, now + life)
+            bucket[v] = entry
+        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:  # model-typed values go first, then the oldest
+            del bucket[next((v for v, e in bucket.items() if e.known), next(iter(bucket)))]
 
 
-def _drop_expired(scope: str) -> None:
-    """Under the lock: forget this profile's short-lived values whose deadline passed."""
-    expiry = _VAULT_REDACTION_EXPIRY.get(scope)
-    if not expiry:
-        return
+def _live(scope: str) -> dict:
+    """Under the lock: forget this profile's lapsed values; the live ones."""
     now = time.monotonic()
     bucket = _VAULT_REDACTION_VALUES.get(scope) or {}
-    for v in [v for v, deadline in expiry.items() if deadline <= now]:
-        expiry.pop(v, None)
-        bucket.pop(v, None)
+    for v in [v for v, e in bucket.items() if not e.alive(now)]:
+        del bucket[v]
+    return dict(bucket)
 
 
 def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values and payment windows (profile teardown / explicit lock)."""
     with _VAULT_REDACTION_LOCK:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
-        _VAULT_REDACTION_EXPIRY.pop(_vault_scope(), None)
         _CARD_WINDOWS.pop(_vault_scope(), None)
 
 
-def register_card_window(window: str, digits=(), words=()) -> None:
-    """Open (or extend) the payment window ``window`` of this profile: the card's pure-digit values
-    (number, CVC; only their lengths are kept) and its holder (scrubbed as a whole word, any case)."""
+def _bump(scope: str, key: str) -> int:
+    gens = _CARD_GENERATIONS.setdefault(scope, {})
+    gens[key] = gens.pop(key, 0) + 1
+    windows = _CARD_WINDOWS.get(scope) or {}
+    while len(gens) > _MAX_GENERATIONS:  # forget the oldest counter with no window (it restarts above 0 anyway)
+        stale = next((k for k in gens if k not in windows and k != key), None)
+        if stale is None:
+            break
+        del gens[stale]
+    return gens[key]
+
+
+def bump_card_window(window: str) -> int:
+    """A claim on ``window`` started: a release that observed an older generation must change nothing."""
+    with _VAULT_REDACTION_LOCK:
+        return _bump(_vault_scope(), str(window or ""))
+
+
+def card_window_generations() -> dict:
+    """This profile's window generations, observed before a status read, a prune or a clear."""
+    with _VAULT_REDACTION_LOCK:
+        return dict(_CARD_GENERATIONS.get(_vault_scope()) or {})
+
+
+def card_window_keys() -> list:
+    with _VAULT_REDACTION_LOCK:
+        return list(_CARD_WINDOWS.get(_vault_scope()) or {})
+
+
+def register_card_window(window: str, digits=(), words=()) -> int:
+    """Open (or extend, reopening it for every output) the payment window ``window`` of this profile: the
+    card's pure-digit values (number, CVC; only their lengths are kept) and its holder (scrubbed as a whole
+    word, any case). Returns the window's new generation."""
     lengths = frozenset(len(d) for d in digits if isinstance(d, str) and _ALL_DIGITS.fullmatch(d))
     names = frozenset(w.strip() for w in words if isinstance(w, str) and w.strip())
+    key = str(window or "")
     with _VAULT_REDACTION_LOCK:
-        windows = _CARD_WINDOWS.setdefault(_vault_scope(), {})
-        old = windows.pop(str(window or ""), (frozenset(), frozenset()))
-        windows[str(window or "")] = (old[0] | lengths, old[1] | names)
+        scope = _vault_scope()
+        windows = _CARD_WINDOWS.setdefault(scope, {})
+        old = windows.pop(key, (frozenset(), frozenset(), False))
+        windows[key] = (old[0] | lengths, old[1] | names, False)
         while len(windows) > _MAX_CARD_WINDOWS:
             del windows[next(iter(windows))]
+        return _bump(scope, key)
 
 
-def release_card_window(window: str) -> bool:
-    """Close this profile's payment window ``window`` (the lock release was confirmed). Whether one was open."""
+def release_card_window(window: str, observed: int | None = None, *, keep_for_browser: bool = False) -> bool:
+    """Close this profile's payment window ``window``; with ``keep_for_browser`` (a confirmed lock release)
+    it keeps masking browser tool results only. ``observed`` is the generation the caller saw before it
+    decided: a newer claim or open since then refuses the release. Whether the release was accepted."""
+    key = str(window or "")
     with _VAULT_REDACTION_LOCK:
-        return (_CARD_WINDOWS.get(_vault_scope()) or {}).pop(str(window or ""), None) is not None
+        scope = _vault_scope()
+        if observed is not None and (_CARD_GENERATIONS.get(scope) or {}).get(key, 0) != observed:
+            return False
+        windows = _CARD_WINDOWS.get(scope) or {}
+        if key in windows and keep_for_browser:
+            windows[key] = (windows[key][0], windows[key][1], True)
+        else:
+            windows.pop(key, None)
+        return True
 
 
 def _mask_runs(text: str, exact: set, at_least: int) -> str:
@@ -124,25 +199,32 @@ def _mask_runs(text: str, exact: set, at_least: int) -> str:
     return _ALL_DIGITS.sub(run, text)
 
 
-def redact_registered_vault_values(text: str, *, nondigit_only: bool = False) -> str:
-    """Scrub of the profile's registered vault values: values with a non-digit character (and pure-digit
-    values the model supplied) exactly, pure-digit ones by length (module docstring). ``nondigit_only``
-    skips everything digit-only (the dialog pre-mask pass, which masks digits itself)."""
+def redact_registered_vault_values(text: str, *, nondigit_only: bool = False, audience: str = "model") -> str:
+    """Scrub of the profile's registered vault values for ``audience`` (module docstring; an unknown one is
+    ``model``). ``nondigit_only`` skips everything digit-only (the dialog pre-mask pass, which masks digits
+    itself)."""
     if not isinstance(text, str) or not text:
         return text
-    scope = _vault_scope()
+    audience = audience if audience in AUDIENCES else "model"
+    scope, now = _vault_scope(), time.monotonic()
     with _VAULT_REDACTION_LOCK:
-        _drop_expired(scope)
-        bucket = dict(_VAULT_REDACTION_VALUES.get(scope) or {})
-        windows = list((_CARD_WINDOWS.get(scope) or {}).values())
-    lengths = {len(v) for v, known in bucket.items() if not known and _ALL_DIGITS.fullmatch(v)}
-    for digit_lengths, _names in windows:
-        lengths |= digit_lengths
+        bucket = _live(scope)
+        windows = [w for w in (_CARD_WINDOWS.get(scope) or {}).values()
+                   if not w[2] or audience in ("browser", "log")]
+    exact_digits = audience == "log" and not nondigit_only
     for value in sorted(bucket, key=len, reverse=True):  # longest first: a substring never shadows its superstring
-        if value in text and not (_ALL_DIGITS.fullmatch(value) and (nondigit_only or not bucket[value])):
-            text = text.replace(value, PLACEHOLDER)
-    for name in sorted({n for _d, names in windows for n in names}, key=len, reverse=True):
+        if not _ALL_DIGITS.fullmatch(value):
+            if value in text:
+                text = text.replace(value, PLACEHOLDER)
+        elif exact_digits:
+            text = re.sub(rf"(?<!\d){value}(?!\d)", PLACEHOLDER, text)
+    for name in sorted({n for _d, names, _r in windows for n in names}, key=len, reverse=True):
         text = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", CARD_PLACEHOLDER, text, flags=re.IGNORECASE)
-    if lengths and not nondigit_only:
+    if nondigit_only or audience == "authored":
+        return text
+    lengths = {n for digit_lengths, _names, _r in windows for n in digit_lengths}
+    if audience != "log":
+        lengths |= {len(v) for v, e in bucket.items() if e.mask_until > now and _ALL_DIGITS.fullmatch(v)}
+    if lengths:
         text = _mask_runs(text, {n for n in lengths if n < _LONG}, min((n for n in lengths if n >= _LONG), default=0))
     return text

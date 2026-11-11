@@ -173,7 +173,7 @@ class _RedactingStdio:
 
     def write(self, text):
         from agent.redact import redact_sensitive_text
-        return self._stream.write(redact_sensitive_text(text) if isinstance(text, str) else text)
+        return self._stream.write(redact_sensitive_text(text, vault="log") if isinstance(text, str) else text)
 
     def __getattr__(self, name):
         return getattr(self._stream, name)

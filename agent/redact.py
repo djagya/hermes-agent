@@ -33,8 +33,9 @@ REDACT_WALK_DEPTH_MARKER = "[redacted: nesting limit]"
 
 # Vault-value redaction registry (profile-scoped, bounded; oracle-free for pure-digit values): agent/redact_vault.py
 from agent.redact_vault import (  # re-exported: callers and tests patch agent.redact.*
-    _VAULT_REDACTION_LOCK, _VAULT_REDACTION_VALUES, _vault_scope, clear_vault_redaction_values,
-    redact_registered_vault_values, register_card_window, register_vault_redaction_value, release_card_window,
+    _VAULT_REDACTION_LOCK, _VAULT_REDACTION_VALUES, _vault_scope, bump_card_window, card_window_generations,
+    card_window_keys, clear_vault_redaction_values, redact_registered_vault_values, register_card_window,
+    register_vault_redaction_value, release_card_window,
 )
 
 
@@ -1443,8 +1444,12 @@ def _redact_phone(m):
 
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
                           file_read: bool = False, secret_file: bool = False,
-                          redact_url_credentials: bool = False) -> str:
+                          redact_url_credentials: bool = False, vault: str = "model") -> str:
     """Apply all redaction patterns to a block of text.
+
+    ``vault`` names who reads the result, for the vault-value registry (agent/redact_vault.py): ``model``
+    (default: a tool result the model did not write), ``browser`` (a browser tool result), ``log`` (a log
+    file: exact replacement) or ``authored`` (persisted model-authored text: non-digit values only).
 
     Safe on any string. Enabled by default (``security.redact_secrets: false``
     disables); ``force=True`` is for safety boundaries that must never return
@@ -1487,7 +1492,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if not text:
         return text
     # Vault secrets are a hard model-egress boundary: scrubbed regardless of the redact_secrets preference.
-    text = redact_registered_vault_values(text)
+    text = redact_registered_vault_values(text, audience=vault)
     if not (force or _redact_enabled()):
         return text
     # ``secret_file`` is authoritative: a caller that classified the source as secret-bearing must not
@@ -1950,4 +1955,8 @@ class RedactingFormatter(logging.Formatter):
     """Log formatter that redacts secrets from all log messages."""
 
     def format(self, record: logging.LogRecord) -> str:
-        return redact_sensitive_text(super().format(record))
+        line = super().format(record)  # logs are not model-visible: exact vault scrub; the timestamp is kept
+        head = getattr(record, "asctime", "") if self.usesTime() else ""
+        if head and line.startswith(head):
+            return head + redact_sensitive_text(line[len(head):], vault="log")
+        return redact_sensitive_text(line, vault="log")

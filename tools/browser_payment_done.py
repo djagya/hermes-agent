@@ -567,6 +567,20 @@ async def _follow(sup: Any, new_tab: str) -> None:
             sup._page_session_id = sid
 
 
+def _redacted_page(page: dict) -> dict:
+    """The confirmation snapshot as a browser tool result (agent.redact, ``vault="browser"``): the card's
+    lengths and holder, and every registered value, scrubbed from its text, title, URL and links."""
+    from agent.redact import redact_sensitive_text
+
+    def scrub(value: Any) -> Any:
+        return redact_sensitive_text(value, force=True, vault="browser") if isinstance(value, str) else value
+
+    out = {k: scrub(v) for k, v in page.items() if k != "links"}
+    if "links" in page:
+        out["links"] = [{k: scrub(v) for k, v in link.items()} for link in page["links"]]
+    return out
+
+
 def _released(supervisor: Any) -> bool:
     """Poll control's status (bounded) until it proves the slot unlocked."""
     deadline = time.monotonic() + _RELEASE_WAIT_S
@@ -650,10 +664,10 @@ def redact_dialog_text(text: Any, supervisor: Any = None) -> str:
     from agent.redact import redact_registered_vault_values, redact_sensitive_text
 
     raw = redact_registered_vault_values(
-        str(text or "").replace("\ue000", "").replace("\ue001", ""), nondigit_only=True
+        str(text or "").replace("\ue000", "").replace("\ue001", ""), nondigit_only=True, audience="browser"
     )
     text, kept = _mask_amounts(raw, supervisor)
-    text = redact_sensitive_text(_mask_digits(text), force=True)
+    text = redact_sensitive_text(_mask_digits(text), force=True, vault="browser")
     for value in sorted(dialog_card_values(supervisor), key=len, reverse=True):
         # a value shorter than 3 (a holder "Li") only as a whole word: inside words it would blank every caption
         pattern = re.escape(value) if len(value) >= 3 else rf"(?<!\w){re.escape(value)}(?!\w)"
@@ -864,6 +878,7 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
         return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=_url_origin(seen.get("url", "")),
                         title="", lock_released=False, **told, **_dialog_report(supervisor))
     context = page.pop("browser_context", None)
+    page = _redacted_page(page)  # dlz: while the payment window is still open, before the release below
     result = {"success": True, **page, "new_tab": None, "payment_tab_closed": False, "lock_released": False, **told}
     try:  # the new tab first: the payment tab is closed only once the confirmation has somewhere to go
         result["new_tab"] = _wait(_open_tab(supervisor, page["url"], context), loop, timeout=15)

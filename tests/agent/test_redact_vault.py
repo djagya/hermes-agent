@@ -21,7 +21,7 @@ class TestVaultDigitValuesLeaveNoOracle:
                              redact.redact_terminal_output("x 737 y 4000 0566 5566 5556 z Li", force=True)))
             assert outs[0] == outs[1], outs
             assert not any(ch.isdigit() for ch in outs[0][0].split(";")[0]), outs[0]
-            assert "4711" not in outs[0][0] and "«redacted-vault-secret»" in outs[0][0]  # 042172: exact
+            assert "4711" not in outs[0][0] and "code 042172" in outs[0][0]  # r9: a model-typed code: not registered
             assert outs[0][1] == "x ••• y •••• •••• •••• •••• z «redacted-card»"
             assert redact.release_card_window("shopping")
             assert redact.redact_sensitive_text("printed 737, Li", force=True) == "printed 737, Li"
@@ -39,5 +39,85 @@ class TestVaultDigitValuesLeaveNoOracle:
             assert redact.redact_sensitive_text("order 123456", force=True) == "order ••••••"
             clock[0] += 301
             assert redact.redact_sensitive_text("order 123456", force=True) == "order 123456"
+        finally:
+            redact.clear_vault_redaction_values()
+
+
+class TestVaultRedactionByAudience:
+    """r9: length masking only where the model reads text it did not write, for a bounded time; exact scrub in
+    logs; persisted model-authored arguments keep their digits; TTLs never shorten permanent values."""
+
+    def test_a_pin_and_a_model_typed_guess_print_the_same(self):
+        # Codex P1 / peer P2-1: a known (model-typed) guess equal to the PIN used to print dots, any other
+        # guess the placeholder
+        from agent import redact
+
+        try:
+            outs = []
+            for guess in ("4711", "4712"):
+                redact.clear_vault_redaction_values()
+                redact.register_vault_redaction_value("4711")  # a login PIN the vault filled
+                redact.register_vault_redaction_value(guess, known_to_model=True)
+                outs.append(redact.redact_sensitive_text(f"echo {guess}", force=True))
+            assert outs == ["echo ••••", "echo ••••"], outs
+        finally:
+            redact.clear_vault_redaction_values()
+
+    def test_an_expiring_registration_never_shortens_a_permanent_one(self, monkeypatch):
+        # Codex P2 / peer probe3: the same bytes as a one-time code (ttl 300) dropped the permanent password
+        from agent import redact, redact_vault
+
+        clock = [1000.0]
+        monkeypatch.setattr(redact_vault.time, "monotonic", lambda: clock[0])
+        try:
+            redact.clear_vault_redaction_values()
+            for value in ("hunter-42", "4711"):
+                redact.register_vault_redaction_value(value)
+                redact.register_vault_redaction_value(value, ttl_s=300)
+            clock[0] += 301
+            assert redact.redact_sensitive_text("pw hunter-42 pin 4711", force=True) == \
+                "pw «redacted-vault-secret» pin ••••"
+        finally:
+            redact.clear_vault_redaction_values()
+
+    def test_a_login_pin_masks_for_fifteen_minutes_and_logs_keep_the_exact_scrub(self, monkeypatch):
+        # owner decision r9 (peer P2-2): every 4-digit run masked for the whole process; logs masked by length
+        import logging
+
+        from agent import redact, redact_vault
+
+        clock = [1000.0]
+        monkeypatch.setattr(redact_vault.time, "monotonic", lambda: clock[0])
+        record = logging.LogRecord("x", logging.INFO, __file__, 1, "pin 4711 HTTP 404 after 1234 ms", None, None)
+        log = redact.RedactingFormatter("%(asctime)s %(message)s")
+        try:
+            redact.clear_vault_redaction_values()
+            redact.register_vault_redaction_value("4711")
+            assert redact.redact_sensitive_text("port 8080", force=True) == "port ••••"
+            assert log.format(record).endswith(" pin «redacted-vault-secret» HTTP 404 after 1234 ms")
+            assert any(ch.isdigit() for ch in log.format(record).split(" pin ")[0])  # the timestamp is kept
+            clock[0] += redact_vault.LOGIN_MASK_S + 1
+            assert redact.redact_sensitive_text("port 8080 pin 4711", force=True) == "port 8080 pin 4711"
+            assert log.format(record).endswith(" pin «redacted-vault-secret» HTTP 404 after 1234 ms")
+            redact.register_vault_redaction_value("1234567890", length_mask=False)  # a numeric username
+            assert redact.redact_sensitive_text("ts 1762862047", force=True) == "ts 1762862047"
+        finally:
+            redact.clear_vault_redaction_values()
+
+    def test_persisted_tool_calls_keep_the_digits_the_model_wrote(self):
+        # peer P2-2: length masking turned JSON numbers into dots; the reload then dropped the arguments
+        import json
+
+        from agent import redact
+        from agent.session_persistence import _durable_tool_calls
+
+        args = json.dumps({"timeout": 1200, "x": 737, "ref": "e123", "command": "echo 4711"})
+        try:
+            redact.clear_vault_redaction_values()
+            redact.register_vault_redaction_value("4711")
+            redact.register_card_window("shopping", digits=("4000056655665556", "737"), words=("Li",))
+            out = _durable_tool_calls([{"id": "c", "type": "function",
+                                        "function": {"name": "terminal", "arguments": args}}])
+            assert json.loads(out[0]["function"]["arguments"]) == json.loads(args)
         finally:
             redact.clear_vault_redaction_values()

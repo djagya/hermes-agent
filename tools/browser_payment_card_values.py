@@ -4,19 +4,22 @@ Two places hold them, both filled by the card fill before any field is written:
 
 * the profile-wide payment window (:func:`agent.redact_vault.register_card_window`): the number and CVC by
   length (every model-facing output masks every digit run of their lengths, so nothing marks which run
-  was the card) and the holder name, keyed by the slot (``""`` without a slot route). It closes when the
-  payment lock release is confirmed (:func:`release_payment_window`: control proves the slot unlocked
-  after this process saw it locked, which ``payment_done``'s ``lock_released``, a recovery close of the
-  payment tab and any later status read all go through) or the slot's exposure ends
-  (:func:`release_slot`: a wipe, a human clear or an operator clear of its mark);
+  was the card) and the holder name, keyed by the slot (by the supervisor's own identity without a slot
+  route, :func:`window_key`). A confirmed payment lock release (:func:`release_payment_window`: control
+  proves the slot unlocked after this process saw it locked, which ``payment_done``'s ``lock_released``, a
+  recovery close of the payment tab and any later status read all go through) narrows it to browser tool
+  results (the page may still show card text); it closes when the slot's exposure ends
+  (:func:`release_slot`: a wipe, a human clear or an operator clear of its mark). Every release is fenced
+  by the window generation it observed first: a claim (:func:`note_claim`) or an open since then wins;
 * the dialog values (number, CVC, holder, expiry forms): per supervisor AND per slot, so a fresh supervisor
-  for the same slot still scrubs them from dialog text while the slot's mark keeps it exposed. Dropped only
-  when the slot's exposure ends; they are used for dialog and caption text only, where every digit run is
-  masked first.
+  for the same slot still scrubs them from dialog text while the slot's mark keeps it exposed. Dropped,
+  every supervisor's on the slot included, only when the slot's exposure ends; they are used for dialog and
+  caption text only, where every digit run is masked first.
 """
 
 from __future__ import annotations
 
+import itertools
 import threading
 import weakref
 from typing import Any
@@ -25,6 +28,10 @@ _LOCK = threading.Lock()
 _BY_SUPERVISOR: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # supervisor → dialog values
 _BY_SLOT: dict = {}  # (profile home, slot id) → dialog values
 _WINDOWS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # supervisor → payment window keys it opened
+_SUPERVISOR_SLOTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # supervisor → slot of its dialog values
+_SUPERVISOR_KEYS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # slot-less supervisor → its window key
+_KEY_COUNTER = itertools.count(1)
+SUPERVISOR_KEY_PREFIX = "supervisor:"
 MAX_VALUES = 64
 
 
@@ -65,6 +72,7 @@ def register_dialog_card_values(secret: dict, supervisor: Any) -> None:
         targets = []
         try:
             targets.append(_BY_SUPERVISOR.setdefault(supervisor, []))
+            _SUPERVISOR_SLOTS[supervisor] = slot
         except TypeError:  # nothing to scope by: the slot (if any) and the digit mask still cover it
             pass
         if slot:
@@ -100,12 +108,49 @@ def dialog_card_values(supervisor: Any) -> list:
     return list(dict.fromkeys(own + extra))
 
 
+def window_key(supervisor: Any) -> str:
+    """The payment window ``supervisor`` opens: its slot id, or (no slot route) its own identity, never ``""``,
+    so one slot-less supervisor's release never closes another's window."""
+    slot = slot_of(supervisor)
+    if slot:
+        return slot
+    with _LOCK:
+        try:
+            key = _SUPERVISOR_KEYS.get(supervisor)
+            if key is None:
+                _SUPERVISOR_KEYS[supervisor] = key = f"{SUPERVISOR_KEY_PREFIX}{next(_KEY_COUNTER)}"
+            return key
+        except TypeError:
+            return f"{SUPERVISOR_KEY_PREFIX}id-{id(supervisor)}"
+
+
+def note_claim(supervisor: Any) -> None:
+    """A payment claim on ``supervisor``'s slot started: a release that read its status before is stale."""
+    from agent.redact import bump_card_window
+
+    bump_card_window(window_key(supervisor))
+
+
+def observe_windows(supervisor: Any) -> dict:
+    """The generations of ``supervisor``'s windows, read before the status read that may release them."""
+    from agent.redact import card_window_generations
+
+    with _LOCK:
+        try:
+            keys = set(_WINDOWS.get(supervisor, ()))
+        except TypeError:
+            keys = set()
+    keys.add(window_key(supervisor))
+    gens = card_window_generations()
+    return {key: gens.get(key, 0) for key in keys}
+
+
 def open_payment_window(secret: dict, supervisor: Any) -> None:
     """Register the card for every model-facing output of this profile until the release is confirmed.
     Raises when it cannot (the fill must then stop)."""
     from agent.redact import register_card_window
 
-    key = slot_of(supervisor)
+    key = window_key(supervisor)
     register_card_window(key, digits=(str(secret.get("card_number") or ""), str(secret.get("cvc") or "")),
                          words=(str(secret.get("cardholder_name") or ""),))
     with _LOCK:
@@ -115,26 +160,38 @@ def open_payment_window(secret: dict, supervisor: Any) -> None:
             pass
 
 
-def release_payment_window(supervisor: Any) -> None:
-    """Control proved ``supervisor``'s slot unlocked after a lock this process saw: close its windows."""
+def release_payment_window(supervisor: Any, observed: dict) -> None:
+    """Control proved ``supervisor``'s slot unlocked after a lock this process saw: each window it observed
+    (``observe_windows``) and no claim touched since keeps masking browser tool results only (the page may
+    still show card text) until its slot's mark is cleared; terminal and every other output stop masking."""
     from agent.redact import release_card_window
 
+    for key, generation in observed.items():
+        if release_card_window(key, generation, keep_for_browser=True):
+            with _LOCK:
+                try:
+                    _WINDOWS.get(supervisor, set()).discard(key)
+                except TypeError:
+                    pass
+
+
+def release_slot(slot_id: str, observed: dict | None = None) -> None:
+    """The slot's payment exposure ended (its mark was cleared): its window and dialog values go, those of
+    every supervisor on it included. ``""`` (a profile-wide mark) is every slot-less supervisor's window.
+    ``observed`` (window generations read before the marks were) fences it: a window claimed or opened since
+    stays, and so do its dialog values."""
+    from agent.redact import card_window_keys, release_card_window
+
+    slot = str(slot_id or "")
+    keys = [slot] if slot else [k for k in card_window_keys() if k.startswith(SUPERVISOR_KEY_PREFIX)]
+    released = {k for k in keys if release_card_window(k, None if observed is None else observed.get(k, 0))}
+    if slot and slot not in released and observed is not None:
+        return
     with _LOCK:
-        try:
-            keys = set(_WINDOWS.pop(supervisor, ()))
-        except TypeError:
-            keys = set()
-    slot = slot_of(supervisor)
-    if slot:
-        keys.add(slot)
-    for key in keys:
-        release_card_window(key)
-
-
-def release_slot(slot_id: str) -> None:
-    """The slot's payment exposure ended (its mark was cleared): its window and dialog values go."""
-    from agent.redact import release_card_window
-
-    release_card_window(str(slot_id or ""))
-    with _LOCK:
-        _BY_SLOT.pop((_scope(), str(slot_id or "")), None)
+        if slot:
+            _BY_SLOT.pop((_scope(), slot), None)
+        for sup in [s for s, held_slot in list(_SUPERVISOR_SLOTS.items()) if held_slot == slot]:
+            if not slot and observed is not None and _SUPERVISOR_KEYS.get(sup) not in released:
+                continue  # its window was claimed again since: its values stay with it
+            _BY_SUPERVISOR.pop(sup, None)
+            _SUPERVISOR_SLOTS.pop(sup, None)

@@ -1204,7 +1204,7 @@ def _bridge_or_usage_error(code: str, **bridge_args) -> Optional[str]:
 
     bridge_result = dispatch_browser_exec(code=code, default_timeout_s=_DEFAULT_TIMEOUT_S, **bridge_args)
     if bridge_result is not None:
-        return redact_sensitive_text(tool_result(bridge_result), force=True)
+        return redact_sensitive_text(tool_result(bridge_result), force=True, vault="browser")
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
     return None
@@ -1398,7 +1398,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     result = {
         "success": proc.returncode == 0,
         "exit_code": proc.returncode,
-        "output": redact_sensitive_text(proc.stdout, force=True),
+        "output": redact_sensitive_text(proc.stdout, force=True, vault="browser"),
     }
     if workspace:
         result["workspace"] = workspace
@@ -1406,7 +1406,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         result["session"] = session
     result.update(_take_real_profile_note(route_key))
     result.update({"dialogs": dialogs} if dialogs else {})
-    stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
+    stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True, vault="browser")
     failure = _managed_connect_failure(stderr) if managed and never_started else ""
     if failure == "gate":
         stderr = _GATE_REFUSED_HINT + "\n" + stderr

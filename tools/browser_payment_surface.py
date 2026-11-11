@@ -189,6 +189,7 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
         _HELD.add(supervisor)
         _CLAIMING[supervisor] = _CLAIMING.get(supervisor, 0) + 1
         _EPOCHS[supervisor] = _EPOCHS.get(supervisor, 0) + 1
+    _note_claim(supervisor)
     ws = getattr(supervisor, "_ws", None)
     try:
         reply = _wait(supervisor._cdp(CLAIM_METHOD, {"tabs": [tab]}, timeout=_CLAIM_TIMEOUT_S), loop,
@@ -219,10 +220,31 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
     return None
 
 
+def _note_claim(supervisor: Any) -> None:
+    """dlz: a claim fences every payment-window release that observed the slot before it (any supervisor)."""
+    try:
+        from tools.browser_payment_card_values import note_claim
+
+        note_claim(supervisor)
+    except Exception as exc:  # health: allow BLE001 -- unfenced: a stale release can only narrow masking it reopens at fill
+        logger.info("payment window generation not bumped (%s)", type(exc).__name__)
+
+
+def _observed_windows(supervisor: Any) -> dict:
+    try:
+        from tools.browser_payment_card_values import observe_windows
+
+        return observe_windows(supervisor)
+    except Exception:  # health: allow BLE001 -- nothing observed: nothing is released
+        return {}
+
+
 def lock_status(supervisor: Any) -> str:
     """Control's answer for this supervisor's slot: ``locked`` | ``unlocked`` | ``unknown``. A read that
     straddles a claim (one on the wire at its start or end, or started meanwhile) is ``locked``: only a
-    clean unlock clears the local lock or counts as a release."""
+    clean unlock clears the local lock or counts as a release, and it releases only the payment windows
+    whose generation it observed before the read (a claim by any supervisor on the slot since then wins)."""
+    observed = _observed_windows(supervisor)
     with _LOCK:
         start, busy = _EPOCHS.get(supervisor, 0), _claiming(supervisor)
     try:
@@ -240,11 +262,11 @@ def lock_status(supervisor: Any) -> str:
             _KNOWN_LOCKED.discard(supervisor)
         elif state == "locked":
             _KNOWN_LOCKED.add(supervisor)
-    if released:  # dlz: the confirmed release ends the payment window (card values leave the redaction registry)
+    if released:  # dlz: the confirmed release narrows the payment window to browser results (card_values)
         try:
             from tools.browser_payment_card_values import release_payment_window
 
-            release_payment_window(supervisor)
+            release_payment_window(supervisor, observed)
         except Exception as exc:  # health: allow BLE001 -- window kept: more masking, never less
             logger.info("payment window not closed (%s)", type(exc).__name__)
     return state

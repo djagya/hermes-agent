@@ -39,7 +39,7 @@ def _redact_supervisor_text(value: str, owner: Any = None) -> str:
     from tools.browser_payment_done import payment_text_exposed
 
     raw = redact_registered_vault_values(
-        str(value or "").replace("\ue000", "").replace("\ue001", ""), nondigit_only=True
+        str(value or "").replace("\ue000", "").replace("\ue001", ""), nondigit_only=True, audience="browser"
     )
     if payment_text_exposed(owner):
         from tools.browser_payment_done import dialog_card_values, redact_dialog_text
@@ -47,7 +47,7 @@ def _redact_supervisor_text(value: str, owner: Any = None) -> str:
         if raw and not dialog_card_values(owner):
             return DIALOG_TEXT_WITHHELD
         return redact_dialog_text(raw, owner)
-    return redact_sensitive_text(raw, force=True)
+    return redact_sensitive_text(raw, force=True, vault="browser")
 
 
 def _trim_ring(events: list, keep: int) -> list:

@@ -168,7 +168,7 @@ def _resolve_credentials(binding: dict[str, Any]) -> dict[str, str]:
         raise
     except Exception as exc:
         raise _BridgeError("credential_resolution_failed") from exc
-    register_vault_redaction_value(username)
+    register_vault_redaction_value(username, length_mask=False)  # an identifier: a numeric one is scrubbed in logs only
     register_vault_redaction_value(password)
     return {"username": username, "password": password}
 

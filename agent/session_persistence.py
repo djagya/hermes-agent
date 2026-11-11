@@ -123,7 +123,8 @@ def _summary_display_kind(msg: dict) -> Any:
 def _durable_tool_calls(tool_calls: Any) -> Any:
     """Persisted projection of an assistant's tool_calls: vault-registered values (a supplied one-time code
     among them) are scrubbed, so an OTP passed to browser_vault_enter_code lands in the transcript as the
-    redaction sentinel, not as live credential bytes. Exact-value scrub only: the generic credential regexes
+    redaction sentinel, not as live credential bytes. dlz: model-authored text, so pure-digit values are left as
+    written (the JSON stays valid and a reload marks no guess; agent/redact_vault.py). Exact-value scrub only: the generic credential regexes
     can cut a serialized ``arguments`` string mid-escape. Tool-call structure is preserved for replay: only
     the offending substring inside each ``arguments`` string is replaced."""
     if not isinstance(tool_calls, list) or not tool_calls:
@@ -133,7 +134,7 @@ def _durable_tool_calls(tool_calls: Any) -> Any:
         function = tc.get("function") if isinstance(tc, dict) else None
         args = function.get("arguments") if isinstance(function, dict) else None
         if isinstance(args, str) and args:
-            redacted = redact_registered_vault_values(args)
+            redacted = redact_registered_vault_values(args, audience="authored")
             if redacted != args:
                 tc = {**tc, "function": {**function, "arguments": redacted}}
         out.append(tc)
