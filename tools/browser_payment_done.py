@@ -607,6 +607,45 @@ def register_dialog_card_values(secret: dict, supervisor: Any) -> None:
         del held[:-_MAX_CARD_DIALOG_VALUES]
 
 
+def has_dialog_card_values(supervisor: Any) -> bool:
+    """Whether a card fill registered dialog values for ``supervisor`` (its slot's own card)."""
+    with _LOCK:
+        try:
+            return supervisor in _CARD_DIALOG_VALUES
+        except TypeError:  # nothing to scope by: no values were registered for it either
+            return False
+
+
+def payment_text_exposed(supervisor: Any) -> bool:
+    """Whether page-originated text seen through ``supervisor`` needs the payment masking (every 3+ digit
+    run, date-like group and amount, plus its registered card values). True while its slot is locked for a
+    card payment (the local lock state only — no status read), once a card fill registered values for it, or
+    while the persistent capture-guard mark still covers its slot (a mark without a slot id, and every mark
+    on a browser without control, is profile-wide). An unreadable answer masks (fail closed)."""
+    try:
+        from tools.browser_payment_surface import locally_locked
+
+        if locally_locked(supervisor):
+            return True
+    except Exception:  # health: allow BLE001 -- unknown lock state: mask
+        return True
+    if has_dialog_card_values(supervisor):
+        return True
+    try:
+        from tools.browser_payment_privacy import slot_has_mark
+
+        slot_id = ""
+        try:
+            from tools.browser_use_cli import vault_route
+
+            slot_id = str((vault_route(getattr(supervisor, "task_id", None)) or {}).get("slot_id") or "")
+        except Exception:  # health: allow BLE001 -- no route to name a slot: the profile-wide answer applies
+            slot_id = ""
+        return slot_has_mark(slot_id)
+    except Exception:  # health: allow BLE001 -- marks unreadable: mask
+        return True
+
+
 def _mask_digits(text: str) -> str:
     return _DIGITS_MASKED.sub(lambda m: re.sub(r"\d", "•", m.group(0)), text)
 

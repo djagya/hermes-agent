@@ -392,6 +392,8 @@ def _top_ref(sup, tree):
 @pytest.mark.parametrize("tree", [CHECKOUT, ACS])  # the merchant checkout, a 3-D Secure redirect page
 def test_locked_payment_tab_top_document_is_listed_and_clicked_natively(tree):
     sup = _paid([tree])
+    # r7 P1: captions run through the dialog redactor; the one amount they may show is the approved total
+    done.record_approved_amount(sup, "TAB", "22.66", "EUR")
     out = _top_controls(sup)
     assert out["success"] is True
     ref = _top_ref(sup, tree)
@@ -402,6 +404,12 @@ def test_locked_payment_tab_top_document_is_listed_and_clicked_natively(tree):
     assert [c[1]["type"] for c in sup.sent("Input.dispatchMouseEvent")] == [
         "mouseMoved", "mousePressed", "mouseReleased"]
     assert {c[2] for c in sup.sent("Input.dispatchMouseEvent")} == {"S-page"}
+
+
+def test_a_caption_amount_stays_masked_without_an_approved_total():
+    # r7 P1: every amount but an owner-approved total is masked in a caption, like in dialog text
+    sup = _paid([CHECKOUT])
+    assert _top_controls(sup)["controls"][0]["text"] == "Pay ••.•• EUR"
 
 
 @pytest.mark.parametrize("tree, merchant_fields, recorded", [
