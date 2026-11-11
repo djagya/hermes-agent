@@ -153,7 +153,8 @@ def _run_compression_failure_turn(runner, source, *, run_generation=None):
                 session_key=SESSION_KEY,
                 run_generation=run_generation,
             ),
-            timeout=2,
+            # Hang guard only: the first turn in the file pays cold imports, which overran 2s on a loaded CI runner.
+            timeout=30,
         )
     )
 

@@ -36,7 +36,7 @@ class CompactingModel(BaseHTTPRequestHandler):
         text = next((m.get('content', '') for m in reversed(messages) if m['role'] == 'user'), '')
         if messages:
             self.server.requests.append({'model': body.get('model'), 'text': str(text), 'wire': wire})
-        if body.get('model') == 'original' and len(wire) > 50000:
+        if body.get('model') == 'original' and len(wire) > 60000:  # above the trigger, below uncompacted PRESSURE_4
             payload = json.dumps({'error': {'message': "This model's maximum context length is 64000 tokens. "
                                                        'However, your messages resulted in 70000 tokens.',
                                             'type': 'invalid_request_error', 'code': 'context_length_exceeded'}}).encode()
@@ -82,12 +82,16 @@ def test_followers_survive_compression_and_restart_in_order_exactly_once(tmp_pat
     thread = threading.Thread(target=peer.serve_forever, daemon=True)
     thread.start()
     url = f'http://127.0.0.1:{peer.server_port}/v1'
+    # The trigger sits midway between the PRESSURE_3 (~11.9K) and PRESSURE_4 (~15.5K) request estimates:
+    # at 12000 a system prompt ~120 tokens longer (its length varies with the host, tmp path and date line)
+    # compacted at PRESSURE_3 instead, and that tail kept PRESSURE_1 verbatim. The model's overflow guard
+    # stays above the trigger.
     (home / 'config.yaml').write_text(json.dumps({
         'gateway': {'multiplex_profiles': False},
         'model': {'provider': 'custom', 'default': 'original', 'base_url': url, 'context_length': 64000},
         'auxiliary': {'title_generation': {'enabled': False},
                       'compression': {'provider': 'custom', 'model': 'summary', 'base_url': url}},
-        'compression': {'protect_first_n': 1, 'protect_last_n': 2, 'threshold_tokens': 12000,
+        'compression': {'protect_first_n': 1, 'protect_last_n': 2, 'threshold_tokens': 13700,
                         'threshold': 0.5, 'in_place': False},
         'platform_toolsets': {'cli': []}}))
     (home / 'models_dev_cache.json').write_text(json.dumps({'custom': {'id': 'custom', 'models': {
