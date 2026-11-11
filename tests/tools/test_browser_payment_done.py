@@ -655,3 +655,32 @@ def test_other_amounts_stay_masked_and_only_the_approved_total_shows():
         done._dialog_text(text, sup)
         == "Pay 22.66? Add premium for •.••/month, was ••.•• (•,••)"
     )
+
+
+def test_the_card_window_lasts_until_the_lock_release_is_confirmed(monkeypatch):
+    # r8 (owner decision): the length masking of card digits holds only for the payment window. An unlocked
+    # answer without a lock this process saw closes nothing; a locked-then-unlocked one (payment_done's
+    # lock_released, a recovery close followed by any status read) does, and a mark clear ends a slot's.
+    from agent import redact
+    from tools import browser_use_cli
+    from tools import browser_vault_payment as bvp
+    from tools.browser_payment_privacy import clear_payment_surface, mark_payment_session
+
+    monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: {"slot_id": "shopping"})
+    sup = FakeSup([CHECKOUT])
+    card = {"card_number": "4000056655665556", "cvc": "737", "cardholder_name": "Li"}
+    try:
+        bvp._register_card_redaction(card, sup)
+        assert surface.lock_status(sup) == "unlocked"  # never locked here: the window stays
+        assert redact.redact_sensitive_text("printed 737 by Li", force=True) == "printed ••• by «redacted-card»"
+        sup.status = {"locked": True, "native": True, "tabs": ["TAB"], "unverified": False}
+        assert surface.lock_status(sup) == "locked"
+        sup.status = dict(UNLOCKED)
+        assert done._released(sup)
+        assert redact.redact_sensitive_text("printed 737 by Li", force=True) == "printed 737 by Li"
+        bvp._register_card_redaction(card, FakeSup([CHECKOUT]))  # a second payment on the slot, then its clear
+        mark_payment_session("checkout", {"slot_id": "shopping", "browser_generation": "g1"})
+        assert clear_payment_surface("shopping", confirmed_by="test") == 1
+        assert redact.redact_sensitive_text("printed 737", force=True) == "printed 737"
+    finally:
+        redact.clear_vault_redaction_values()

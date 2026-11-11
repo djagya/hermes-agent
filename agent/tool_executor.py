@@ -702,8 +702,8 @@ def _register_supplied_otp_for_redaction(function_name: str, function_args: dict
         # Only a value the handler would accept: a malformed or 1-3 character one is refused
         # before any fill, and registering it would scrub that text from every later output.
         code, _error = _validate_supplied_otp(function_args.get(name))
-        if code:
-            register_vault_redaction_value(code)
+        if code:  # the model typed it: an exact scrub reveals nothing (agent.redact_vault)
+            register_vault_redaction_value(code, known_to_model=True)
 
 
 def register_supplied_otps(tool_calls) -> None:

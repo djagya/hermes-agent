@@ -23,23 +23,14 @@ from tools.browser_supervisor_payment import _COVERAGE_REFUSALS, OPTIONAL_CARD_T
 logger = logging.getLogger(__name__)
 
 
-def _register_card_redaction(secret: dict) -> None:
-    """Register the card secrets for redaction: the number (also grouped with spaces or dashes, as
-    card inputs reformat it) and CVC. Holder name, expiry and billing postcode are not secrets on
-    their own; the scrub is an exact-substring replace over every later tool result, so registering
-    them would scrub common names, dates and postcodes from model-facing output."""
-    from agent.redact import register_vault_redaction_value
+def _register_card_redaction(secret: dict, supervisor=None) -> None:
+    """Open the card's payment window for redaction (tools.browser_payment_card_values): every digit run as
+    long as the number or the CVC is masked in every later model-facing output (spaced or dashed groups of
+    the number too), and the holder name is scrubbed as a whole word, until the lock release is confirmed.
+    The expiry and billing postcode are not secrets on their own and stay out of it."""
+    from tools.browser_payment_card_values import open_payment_window
 
-    number = str(secret.get("card_number") or "")
-    digits = "".join(ch for ch in number if ch.isdigit())
-    groupings = [[digits[i : i + 4] for i in range(0, len(digits), 4)]]
-    if len(digits) in (14, 15):  # Diners Club prints 4-6-4, American Express 4-6-5
-        groupings.append([digits[:4], digits[4:10], digits[10:]])
-    values = [number, digits, str(secret.get("cvc") or "")]
-    values += [sep.join(groups) for groups in groupings for sep in (" ", "-")]
-    for value in dict.fromkeys(values):
-        if value:
-            register_vault_redaction_value(value)
+    open_payment_window(secret, supervisor)
 
 
 class ExpiryOptionUnmatched(Exception):
@@ -742,7 +733,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 return json.dumps({"success": False, "error_type": "payment_item_revision_unavailable",
                                    "error": _REVISION_UNAVAILABLE_ON_READ})
             secret = validate_card(raw)
-            _register_card_redaction(secret)
+            _register_card_redaction(secret, supervisor)
             from tools.browser_payment_done import register_dialog_card_values
 
             register_dialog_card_values(secret, supervisor)  # dlz: this slot's dialog texts are scrubbed of it

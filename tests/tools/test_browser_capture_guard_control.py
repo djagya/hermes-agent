@@ -61,7 +61,7 @@ def fill(monkeypatch):
         "wipe_count": "3"})
     monkeypatch.setattr(bvp, "validate_card", lambda secret: secret)
     monkeypatch.setattr(bvp, "effective_frame_origins", lambda origins: origins)
-    monkeypatch.setattr(bvp, "_register_card_redaction", lambda secret: None)
+    monkeypatch.setattr(bvp, "_register_card_redaction", lambda secret, supervisor=None: None)
     monkeypatch.setattr(bvp, "_document_fills", lambda i, s: [{"index": 0, "token": "cc-number", "document": 0}])
     monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session",
                         lambda task_id, surface=None: events.append("local-mark"))
@@ -251,7 +251,7 @@ def test_a_takeover_between_prompt_and_write_never_writes_the_card(fill, at, err
         return SimpleNamespace() if at == "supervisor_replaced" else run.supervisor
 
     routes = iter([{"lease": "lease-shop"}] + [{"lease": "lease-new" if at == "route_lease_changed" else "lease-shop",
-                                                "token": "tok-shop", "slot_id": "shopping"}] * 4)
+                                                "token": "tok-shop", "slot_id": "shopping"}] * 6)
     monkeypatch.setattr(vault, "_managed_supervisor", admit)
     monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: next(routes))
     if at == "human_took_desktop":

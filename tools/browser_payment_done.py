@@ -38,6 +38,13 @@ from agent.vault_payment_policy import (
     https_origin,
     provider_for_origin,
 )
+# Re-exported for the card fill and tests: the card's dialog values live in browser_payment_card_values.
+from tools.browser_payment_card_values import (
+    dialog_card_values,
+    has_dialog_card_values,
+    register_dialog_card_values,
+    slot_of,
+)
 # parse_lock_status is re-exported: the one lock-state reader lives in browser_payment_surface.
 from tools.browser_payment_surface import _wait, lock_status, parse_lock_status
 
@@ -574,46 +581,12 @@ def _released(supervisor: Any) -> bool:
 
 _DIALOG_TYPES_HELD = ("confirm", "beforeunload")
 MAX_DIALOG_TEXT = 200
-# dlz: the saved card's values a dialog text may quote, per supervisor (its slot and profile): the number, CVC,
-# holder name and expiry forms, kept in memory for dialog text only (an exact-substring scrub of every tool
-# result would blank common names and dates). A dialog is scrubbed only of its own supervisor's card; every
-# digit run of 3+ and every date-like group is masked anyway, so no scrub difference tells a value apart.
-_CARD_DIALOG_VALUES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-_MAX_CARD_DIALOG_VALUES = 64
+# dlz: the saved card's values a dialog text may quote (number, CVC, holder name, expiry forms) are kept per
+# supervisor and per slot by tools.browser_payment_card_values, in memory and for dialog text only (an exact
+# scrub of every tool result would blank common names and dates). Every digit run of 3+ and every date-like
+# group is masked first, so no scrub difference tells a value apart.
+
 _DIGITS_MASKED = re.compile(r"\d{1,2}\s*[/\-]\s*\d{2,}|\d{3,}")
-
-
-def register_dialog_card_values(secret: dict, supervisor: Any) -> None:
-    """Called by the card fill with the validated card and the supervisor it fills on, before any field is
-    written."""
-    values = [str(secret.get("card_number") or ""), str(secret.get("cvc") or "")]
-    holder = str(secret.get("cardholder_name") or "").strip()
-    if len(holder) >= 3:
-        values.append(holder)
-    month, year = str(secret.get("exp_month") or ""), str(secret.get("exp_year") or "")
-    if month.isdigit() and year.isdigit() and len(year) == 4:
-        mm, yy = month.zfill(2), year[2:]
-        for m in dict.fromkeys((mm, str(int(mm)))):
-            for y in (yy, year):
-                values += [f"{m}/{y}", f"{m} / {y}", f"{m}-{y}"]
-    with _LOCK:
-        try:
-            held = _CARD_DIALOG_VALUES.setdefault(supervisor, [])
-        except TypeError:  # no supervisor object to scope by: the digit mask still covers number, CVC, expiry
-            return
-        for value in values:
-            if value and value not in held:
-                held.append(value)
-        del held[:-_MAX_CARD_DIALOG_VALUES]
-
-
-def has_dialog_card_values(supervisor: Any) -> bool:
-    """Whether a card fill registered dialog values for ``supervisor`` (its slot's own card)."""
-    with _LOCK:
-        try:
-            return supervisor in _CARD_DIALOG_VALUES
-        except TypeError:  # nothing to scope by: no values were registered for it either
-            return False
 
 
 def payment_text_exposed(supervisor: Any) -> bool:
@@ -621,11 +594,12 @@ def payment_text_exposed(supervisor: Any) -> bool:
     run, date-like group and amount, plus its registered card values). True while its slot is locked for a
     card payment (the local lock state only — no status read), once a card fill registered values for it, or
     while the persistent capture-guard mark still covers its slot (a mark without a slot id, and every mark
-    on a browser without control, is profile-wide). An unreadable answer masks (fail closed)."""
+    on a browser without control, is profile-wide; a supervisor without a slot route is exposed while any
+    mark of this profile exists). An unreadable answer masks (fail closed)."""
     try:
         from tools.browser_payment_surface import locally_locked
 
-        if locally_locked(supervisor):
+        if supervisor is not None and locally_locked(supervisor):  # no supervisor: no lock of its own, marks decide
             return True
     except Exception:  # health: allow BLE001 -- unknown lock state: mask
         return True
@@ -634,14 +608,7 @@ def payment_text_exposed(supervisor: Any) -> bool:
     try:
         from tools.browser_payment_privacy import slot_has_mark
 
-        slot_id = ""
-        try:
-            from tools.browser_use_cli import vault_route
-
-            slot_id = str((vault_route(getattr(supervisor, "task_id", None)) or {}).get("slot_id") or "")
-        except Exception:  # health: allow BLE001 -- no route to name a slot: the profile-wide answer applies
-            slot_id = ""
-        return slot_has_mark(slot_id)
+        return slot_has_mark(slot_of(supervisor))  # no slot route: any mark of this profile
     except Exception:  # health: allow BLE001 -- marks unreadable: mask
         return True
 
@@ -677,8 +644,8 @@ def redact_dialog_text(text: Any, supervisor: Any = None) -> str:
     would mark which digit run was the secret). Then every amount token but an approved total is masked and
     set aside, every run of 3+ digits and every date-like group (``03/31``, ``3 - 2031``) is masked, so no
     exact-value scrub after it can mark which number was the CVC, the card number or the expiry; then the
-    forced secret redactor, then the card values registered for ``supervisor`` (the dialog's own;
-    case-insensitive), and the mask once more over what those left. The one exception: a token exactly
+    forced secret redactor, then the card values registered for ``supervisor`` (its own and its slot's;
+    case-insensitive; one shorter than 3 characters as a whole word), and the mask once more over what those left. The one exception: a token exactly
     equal to the cart total the owner approved for this supervisor's payment stays readable."""
     from agent.redact import redact_registered_vault_values, redact_sensitive_text
 
@@ -687,11 +654,10 @@ def redact_dialog_text(text: Any, supervisor: Any = None) -> str:
     )
     text, kept = _mask_amounts(raw, supervisor)
     text = redact_sensitive_text(_mask_digits(text), force=True)
-    with _LOCK:
-        values = sorted(_CARD_DIALOG_VALUES.get(supervisor, ()) if supervisor is not None else (), key=len,
-                        reverse=True)
-    for value in values:
-        text = re.sub(re.escape(value), "«redacted-card»", text, flags=re.IGNORECASE)
+    for value in sorted(dialog_card_values(supervisor), key=len, reverse=True):
+        # a value shorter than 3 (a holder "Li") only as a whole word: inside words it would blank every caption
+        pattern = re.escape(value) if len(value) >= 3 else rf"(?<!\w){re.escape(value)}(?!\w)"
+        text = re.sub(pattern, "«redacted-card»", text, flags=re.IGNORECASE)
     text = _mask_digits(text)
     for i, token in enumerate(kept):
         text = text.replace(_KEPT.format(i), token)

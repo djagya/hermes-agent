@@ -260,7 +260,7 @@ def fill(monkeypatch):
     monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: {"lease": "l", "token": "t"})
     monkeypatch.setattr(bvp, "validate_card", lambda secret: secret)
     monkeypatch.setattr(bvp, "effective_frame_origins", lambda origins: origins)
-    monkeypatch.setattr(bvp, "_register_card_redaction", lambda secret: None)
+    monkeypatch.setattr(bvp, "_register_card_redaction", lambda secret, supervisor=None: None)
     monkeypatch.setattr(bvp, "_document_fills", lambda i, s: [{"index": 0, "token": "cc-number", "document": 0}])
     monkeypatch.setattr("tools.browser_control_route.set_capture_guard", lambda l, t: events.append("guard") or (True, ""))
     monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session", lambda *a, **k: None)
@@ -1147,15 +1147,85 @@ def test_a_dialog_on_a_slot_that_filled_a_card_is_masked_as_today(monkeypatch):
     assert out["pending"][0]["message"] == "Delete invoice ••••-••• dated ••/••••?"
 
 
-def test_a_capture_guard_mark_on_this_slot_masks_its_dialogs(monkeypatch):
-    # the persistent mark outlives the payment: the slot's dialogs stay masked until an operator clears it
+def test_a_capture_guard_mark_on_this_slot_masks_its_dialogs_and_a_fresh_supervisor_keeps_the_holder(
+        monkeypatch):
+    # the persistent mark outlives the payment: the slot's dialogs stay masked until an operator clears it.
+    # r8 (Codex P2): the holder values live per slot, so a replacement supervisor still scrubs them; with
+    # none in memory (a restart) the text is withheld, since the holder could not be scrubbed.
+    from tools import browser_payment_card_values as card_values
     from tools import browser_use_cli
     from tools.browser_payment_privacy import mark_payment_session
 
     mark_payment_session("checkout", {"slot_id": "shopping", "browser_generation": "g1"})
     monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: {"slot_id": "shopping"})
     _sup, out = _plain_dialog(monkeypatch, "marked-dialogs", "Delete invoice 2024-118 dated 12/2025?")
-    assert out["pending"][0]["message"] == "Delete invoice ••••-••• dated ••/••••?"
+    assert out["pending"][0]["message"] == "[dialog text withheld: payment exposure]"
+    old = _dialog_sup("old-supervisor")
+    card_values.register_dialog_card_values({"card_number": "4000056655665556", "cvc": "737",
+                                             "cardholder_name": "Ada Testperson"}, old)
+    try:
+        _sup, out = _plain_dialog(monkeypatch, "fresh-supervisor", "Holder Ada Testperson, invoice 2024-118?")
+        assert out["pending"][0]["message"] == "Holder «redacted-card», invoice ••••-•••?"
+    finally:
+        card_values.release_slot("shopping")
+
+
+@pytest.mark.parametrize("probe", ["Delete invoice 737 or 738?", "Pick 736 737 738"])
+def test_card_digits_leave_no_oracle_in_tool_output_or_another_slots_dialogs(monkeypatch, probe):
+    # r8 (Codex P1, peer P2): a profile-wide exact scrub of the CVC answered "is it 737?" in any output
+    # and in an ordinary dialog on an unmarked slot. Registered 737 and 738 now give the same text.
+    from agent import redact
+    from tools import browser_use_cli
+    from tools import browser_vault_payment as bvp
+
+    monkeypatch.setattr(browser_use_cli, "vault_route",
+                        lambda task_id: {"slot_id": "shopping" if task_id == "checkout" else "research"})
+    outs = []
+    try:
+        for cvc in ("737", "738"):
+            redact.clear_vault_redaction_values()
+            bvp._register_card_redaction({"card_number": "4000056655665556", "cvc": cvc,
+                                          "cardholder_name": "Ada Testperson"}, _dialog_sup("checkout"))
+            _sup, out = _plain_dialog(monkeypatch, f"research-{cvc}", probe)
+            outs.append((out["pending"][0]["message"], redact.redact_terminal_output(probe, force=True),
+                         redact.redact_sensitive_text(probe, code_file=True)))
+    finally:
+        redact.clear_vault_redaction_values()
+    assert outs[0] == outs[1] and "737" not in str(outs[0]), outs
+
+
+def test_a_short_holder_is_scrubbed_from_captions_and_dialogs():
+    # r8 (Codex P2): a two-letter holder ("Li") was never registered, so "Pay with Li" reached the model
+    from tools import browser_payment_done as done
+
+    sup = _dialog_sup("short-holder")
+    done.register_dialog_card_values({"card_number": "4000056655665556", "cvc": "737", "cardholder_name": "Li"}, sup)
+    assert surface._caption("Pay with Li", sup) == "Pay with «redacted-card»"
+    assert done._dialog_text("LI, pay now?", sup) == "«redacted-card», pay now?"
+
+
+def test_a_caption_is_withheld_when_the_redactor_cannot_run(monkeypatch):
+    # r8 (peer P3-2): the old fallback masked only runs of 4+ digits, so a CVC, expiry and holder passed
+    from tools import browser_payment_done as done
+
+    def boom(text, sup=None):
+        raise RuntimeError("no redactor")
+
+    monkeypatch.setattr(done, "redact_dialog_text", boom)
+    assert surface._caption("Pay with CVC 737; expiry 03/31; Ada Testperson", object()) == "[caption withheld]"
+
+
+def test_a_supervisor_without_a_slot_is_exposed_only_while_a_payment_mark_exists(monkeypatch):
+    # r8 (Codex P2, peer P3-3): an empty route made every dialog look exposed even with no mark at all
+    from tools import browser_use_cli
+    from tools.browser_payment_done import payment_text_exposed
+    from tools.browser_payment_privacy import mark_payment_session
+
+    monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: {})
+    _sup, out = _plain_dialog(monkeypatch, "unrouted", "Delete invoice 2024-118 dated 12/2025?")
+    assert out["pending"][0]["message"] == "Delete invoice 2024-118 dated 12/2025?"
+    mark_payment_session("checkout", {"slot_id": "shopping", "browser_generation": "g1"})
+    assert payment_text_exposed(_dialog_sup("unrouted-2"))
 
 
 def test_timed_out_supervisor_work_is_cancelled_and_drained_before_the_caller_moves_on():

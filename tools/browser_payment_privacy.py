@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -60,6 +61,8 @@ from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
+
+logger = logging.getLogger(__name__)
 
 # The file is the only state, so an operator clear reaches a running gateway.
 _LOCK = threading.Lock()
@@ -278,7 +281,19 @@ def _prune_wiped(marks: list[dict[str, Any]] | None) -> list[dict[str, Any]] | N
                 if slot_id in views and isinstance(views[slot_id].get("human_clear"), dict):
                     entry["human_clear_at"] = views[slot_id]["human_clear"].get("at")
                 log.write(json.dumps(entry, sort_keys=True) + "\n")
-        return kept
+    _released_slots({str(m.get("slot_id")) for m in removed})
+    return kept
+
+
+def _released_slots(slot_ids: set) -> None:
+    """dlz: a cleared mark ends its slot's payment exposure: the card values kept for it go too."""
+    try:
+        from tools.browser_payment_card_values import release_slot
+
+        for slot_id in slot_ids:
+            release_slot(slot_id)
+    except Exception as exc:  # health: allow BLE001 -- values kept: more masking, never less
+        logger.info("payment card values not released (%s)", type(exc).__name__)
 
 
 def payment_session_sensitive(task_id: str | None) -> bool:
@@ -291,11 +306,13 @@ def payment_session_sensitive(task_id: str | None) -> bool:
 
 def slot_has_mark(slot_id: str) -> bool:
     """Raw, local answer (no control lookup): any mark that covers ``slot_id``.
-    An unreadable file, a profile-wide mark or a missing slot id answer True."""
+    An unreadable file or a profile-wide mark answer True; a missing slot id, any mark at all."""
     with _LOCK:
         marks = _all_marks()
-    if marks is None or not str(slot_id or "").strip():
+    if marks is None:
         return True
+    if not str(slot_id or "").strip():
+        return bool(marks)
     return any(m.get("scope") != SLOT_SCOPE or m.get("slot_id") in (None, "", slot_id) for m in marks)
 
 
@@ -340,7 +357,8 @@ def clear_payment_surface(slot_id: str, *, confirmed_by: str) -> int:
         with path.with_suffix(".log").open("a", encoding="utf-8") as log:
             log.write(json.dumps({"cleared_at": _now(), "slot_id": slot_id,
                                   "confirmed_by": confirmed_by, "marks": removed}, sort_keys=True) + "\n")
-        return len(removed)
+    _released_slots({str(m.get("slot_id") or "") for m in removed} | ({slot_id} if slot_id != PROFILE_SCOPE else set()))
+    return len(removed)
 
 
 def reset_guard(*, confirmed_by: str) -> None:

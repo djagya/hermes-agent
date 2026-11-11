@@ -722,7 +722,7 @@ def browser_vault_enter_code(
                                      "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
 
     def write(code_value: str, source: str) -> str:
-        register_vault_redaction_value(code_value)
+        register_vault_redaction_value(code_value, known_to_model=source == "supplied")
         fills = build_otp_fills(otp_controls, code_value)
         result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
         del code_value

@@ -230,14 +230,23 @@ def lock_status(supervisor: Any) -> str:
         state, _tabs = parse_lock_status(reply.get("result") if isinstance(reply, dict) else None)
     except Exception:  # health: allow BLE001 -- an unanswered status proves nothing
         state = "unknown"
+    released = False
     with _LOCK:
         if busy or _claiming(supervisor) or _EPOCHS.get(supervisor, 0) != start:
             return "locked"
         if state == "unlocked":
+            released = supervisor in _HELD or supervisor in _KNOWN_LOCKED
             _HELD.discard(supervisor)
             _KNOWN_LOCKED.discard(supervisor)
         elif state == "locked":
             _KNOWN_LOCKED.add(supervisor)
+    if released:  # dlz: the confirmed release ends the payment window (card values leave the redaction registry)
+        try:
+            from tools.browser_payment_card_values import release_payment_window
+
+            release_payment_window(supervisor)
+        except Exception as exc:  # health: allow BLE001 -- window kept: more masking, never less
+            logger.info("payment window not closed (%s)", type(exc).__name__)
     return state
 
 
@@ -434,20 +443,23 @@ def _mask(text: str) -> str:
     return re.sub(r"\d{4,}", lambda m: "•" * len(m.group(0)), text)[:_MAX_TEXT]
 
 
+CAPTION_WITHHELD = "[caption withheld]"
+
+
 def _caption(text: str, sup: Any) -> str:
     """A control caption (text/aria-label/title — anything ``_DESCRIBE`` reads) for the model: the
     supervisor-scoped dialog redactor first, so every 3+ digit run, date-like group and amount but an
     owner-approved total is masked and this slot's registered card values (holder included) are scrubbed —
     a page that echoes the card into a caption cannot pass it on. Applied BEFORE the ref is built, so refs
     bind the masked text. The redactor's own digit mask already covers what ``_mask`` would; re-masking
-    would only hide an approved total it deliberately kept, so just the ``_MAX_TEXT`` bound remains, with
-    ``_mask`` as the fallback when the redactor cannot run."""
-    from tools.browser_payment_done import redact_dialog_text
-
+    would only hide an approved total it deliberately kept, so just the ``_MAX_TEXT`` bound remains. When
+    the redactor cannot run, the caption is withheld (a fixed text: no digit, letter or name passes)."""
     try:
+        from tools.browser_payment_done import redact_dialog_text
+
         return redact_dialog_text(text, sup)[:_MAX_TEXT]
-    except Exception:  # health: allow BLE001 -- redactor unavailable: the plain digit mask still holds
-        return _mask(text)
+    except Exception:  # health: allow BLE001 -- redactor unavailable: withhold, never a weaker mask
+        return CAPTION_WITHHELD
 
 
 def _ref(key: str, index: int, role: str, text: str, nonce: str = "") -> str:

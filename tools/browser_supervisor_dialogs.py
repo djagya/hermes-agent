@@ -24,13 +24,17 @@ from urllib.parse import parse_qs, urlparse
 logger = logging.getLogger("tools.browser_supervisor")
 
 
+DIALOG_TEXT_WITHHELD = "[dialog text withheld: payment exposure]"
+
+
 def _redact_supervisor_text(value: str, owner: Any = None) -> str:
     """Redact page-originated text before exposing supervisor snapshots. dlz: the forced secret redactor and
     the raw registered-vault-value scrub always; the payment masking (every 3+ digit run, date-like group and
     amount, and the card values registered for the dialog's own supervisor ``owner``) only while that
     supervisor's slot has payment exposure (:func:`payment_text_exposed` — owner decision 2026-11-11), so an
     ordinary confirmation keeps its invoice number and date while a page that echoes card values in a dialog
-    on an exposed slot still cannot pass them on."""
+    on an exposed slot still cannot pass them on. An exposed slot whose card values this process no longer
+    holds (a restart while its mark stays) gets no text at all: the holder name could not be scrubbed."""
     from agent.redact import redact_registered_vault_values, redact_sensitive_text
     from tools.browser_payment_done import payment_text_exposed
 
@@ -38,8 +42,10 @@ def _redact_supervisor_text(value: str, owner: Any = None) -> str:
         str(value or "").replace("\ue000", "").replace("\ue001", ""), nondigit_only=True
     )
     if payment_text_exposed(owner):
-        from tools.browser_payment_done import redact_dialog_text
+        from tools.browser_payment_done import dialog_card_values, redact_dialog_text
 
+        if raw and not dialog_card_values(owner):
+            return DIALOG_TEXT_WITHHELD
         return redact_dialog_text(raw, owner)
     return redact_sensitive_text(raw, force=True)
 

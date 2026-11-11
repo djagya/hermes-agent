@@ -202,6 +202,9 @@ def test_fill_payment_names_every_target_tags_fills_and_redacts_only_card_secret
     monkeypatch.setattr("tools.browser_vault_tool._bot_desktop_browser_session", lambda task_id: False)
     monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session", lambda task_id, surface=None: None)
     monkeypatch.setattr("agent.redact.register_vault_redaction_value", registered.append)
+    windows = []
+    monkeypatch.setattr("agent.redact.register_card_window", lambda key, digits=(), words=(): windows.append(
+        (digits, words)))
     monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent",
                         lambda *args, **k: consent_text.append(args[1]) or "accept")
     meta = SimpleNamespace(id="h", kind="payment", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
@@ -213,8 +216,9 @@ def test_fill_payment_names_every_target_tags_fills_and_redacts_only_card_secret
     assert f"{MERCHANT}, {DATATRANS}" in consent_text[0]
     assert sorted((f["document"], f["token"]) for f in committed) == [
         (0, "cc-exp-month"), (0, "cc-exp-year"), (0, "cc-name"), (1, "cc-number"), (2, "cc-csc")]
-    assert {"4242424242424242", "4242 4242 4242 4242", "4242-4242-4242-4242", "837"} <= set(registered)
-    assert not {"07", "2035", "35", "Ada Lovelace"} & set(registered), registered
+    # r8: no card value goes to the exact-match registry; the payment window takes the number and CVC (masked
+    # by length until the release) and the holder, never the expiry
+    assert windows == [(("4242424242424242", "837"), ("Ada Lovelace",))] and not registered, (windows, registered)
 
 
 def test_supervisor_attach_errors_never_reach_the_result(monkeypatch):
