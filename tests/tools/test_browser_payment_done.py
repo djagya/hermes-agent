@@ -66,7 +66,7 @@ class FakeSup:
             return {"targetInfos": tabs + self.extra_tabs + [{"targetId": "OTHER", "type": "page",
                                                               "url": "https://x.test/"}]}
         if method == "Target.getTargetInfo":
-            return {"targetInfo": {"targetId": "TAB"}}
+            return {"targetInfo": {"targetId": "TAB", "url": (self.tree or CHECKOUT)[0][2]}}
         if method == "Page.createIsolatedWorld":
             return {"executionContextId": 7}
         if method == "Runtime.evaluate":
@@ -460,32 +460,65 @@ def test_card_scan_reaches_open_shadow_roots_and_refuses_past_its_bound(bound, e
     assert done._valid_snapshot(out, "https://shop.test") is None  # either way: never a safe document
 
 
-def _confirm(text, opened=1.0, kind="confirm", did="d-1"):
-    return SimpleNamespace(id=did, type=kind, message=text, opened_at=opened)
+def _confirm(text, opened=1.0, kind="confirm", did="d-1", url=SHOP + "/checkout", session="S-page", frame=None):
+    return SimpleNamespace(id=did, type=kind, message=text, opened_at=opened, url=url, cdp_session_id=session,
+                           frame_id=frame)
 
 
 def test_a_held_confirm_is_reported_masked_and_answered_once():
-    sup = _paid([ACS])
+    sup = _paid([CHECKOUT])
     sup.dialogs = [_confirm("Place  order 4111111111111111 for 22.66 EUR? " + "x" * 300),
                    _confirm("Leave?", opened=0.5, kind="alert", did="d-0")]  # an alert is never held
     out = done.payment_done(sup)
     held = out["dialog_pending"]
-    assert out["error_type"] == "payment_confirmation_not_reached" and held["type"] == "confirm"
+    # returned at once (no 120 s wait), nothing read or closed
+    assert out["error_type"] == "payment_dialog_pending" and out["lock_released"] is False
+    assert not sup.sent("Runtime.evaluate") and not sup.sent("Target.closeTarget")
+    assert (held["id"], held["type"], held["origin"], held["on_payment_tab_top"]) == ("d-1", "confirm", SHOP, True)
     assert held["text"].startswith("Place order •••••••••••••••• for 22.66 EUR?") and len(held["text"]) == 200
     assert "4111" not in json.dumps(out)
     assert surface.payment_controls(sup)["dialog_pending"] == held
-    assert done.payment_dialog(sup, "true")["error_type"] == "payment_dialog_invalid"
-    assert done.payment_dialog(sup, True) == {"success": True, "answered": "accept", "type": "confirm"}
+    assert done.payment_dialog(sup, "d-1", "true")["error_type"] == "payment_dialog_invalid"
+    assert done.payment_dialog(sup, "", True)["error_type"] == "payment_dialog_invalid"  # the id is required
+    assert done.payment_dialog(sup, "d-9", True)["error_type"] == "payment_dialog_none"  # not that dialog
+    assert done.payment_dialog(sup, "d-1", True) == {"success": True, "answered": "accept", "type": "confirm",
+                                                     "id": "d-1"}
     assert [c[1] for c in sup.sent("respond_to_dialog")] == [{"action": "accept", "dialog_id": "d-1"}]
-    assert done.payment_dialog(sup, True)["error_type"] == "payment_dialog_none"  # one answer per dialog
+    assert done.payment_dialog(sup, "d-1", True)["error_type"] == "payment_dialog_none"  # one answer per dialog
     assert "dialog_pending" not in surface.payment_controls(sup)
-    assert done.payment_dialog(FakeSup([CONFIRM]), False)["error_type"] == "payment_dialog_none"  # no payment
+    assert done.payment_dialog(FakeSup([CONFIRM]), "d-1", False)["error_type"] == "payment_dialog_none"  # no payment
+
+
+@pytest.mark.parametrize("dialog, error", [
+    (_confirm("Pay?", url=STRIPE + "/v3/frame", frame="CARD"), "payment_dialog_not_payment_tab"),  # a card frame
+    (_confirm("Pay?", url=STRIPE + "/v3/frame"), "payment_dialog_not_payment_tab"),  # a card origin, no frame named
+    (_confirm("Pay?", session="S-other"), "payment_dialog_not_payment_tab"),  # another tab
+    (_confirm("Pay?", url=""), "payment_dialog_not_payment_tab"),  # an unknown source
+    (_confirm("Pay?", frame="MSUB"), "payment_dialog_not_payment_tab"),  # a child frame of the shop page
+    (_confirm("Leave?", kind="beforeunload"), "payment_dialog_not_confirm"),  # confirms only
+])
+def test_payment_dialog_answers_only_a_confirm_of_the_payment_tab_top_page(dialog, error):
+    sup = _paid([CHECKOUT])
+    sup.dialogs = [dialog]
+    assert done.payment_done(sup)["dialog_pending"]["on_payment_tab_top"] is (dialog.type == "beforeunload")
+    assert done.payment_dialog(sup, "d-1", True)["error_type"] == error
+    assert not sup.sent("respond_to_dialog")
+
+
+def test_dialog_text_is_redacted_of_the_card_before_masking(monkeypatch):
+    monkeypatch.setattr(done, "_CARD_DIALOG_VALUES", [])
+    done.register_dialog_card_values({"card_number": "4000056655665556", "cvc": "737", "exp_month": "3",
+                                      "exp_year": "2031", "cardholder_name": "Ada Testperson"})
+    text = done._dialog_text("Card 4000056655665556 / 3/31 / 03 / 2031, CVC 737, ADA TESTPERSON: place order?")
+    assert "737" not in text and "3/31" not in text and "03 / 2031" not in text
+    assert "testperson" not in text.lower() and "5556" not in text
 
 
 def test_a_beforeunload_is_allowed_only_while_payment_done_closes_the_tab():
     sup = _paid([CONFIRM])
     assert done.payment_done(sup)["payment_tab_closed"] is True
-    assert sup.closing == [True] and sup._payment_handover_closing is False
+    # bound to the page session of the tab being closed, only while it closes
+    assert sup.closing == ["S-page"] and sup._payment_handover_closing is None
 
 
 def test_a_closed_recorded_tab_never_makes_payment_done_ambiguous():

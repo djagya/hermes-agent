@@ -855,7 +855,11 @@ def test_a_beforeunload_is_accepted_only_during_a_handover_close():
         sup._admit_dialog(type="beforeunload", message="", default_prompt="", session_id="S1", frame_id=None)
         await asyncio.sleep(0)
         assert sent == [] and len(sup._pending_dialogs) == 1  # outside a handover: held like a confirm
-        sup._payment_handover_closing = True
+        sup._payment_handover_closing = "S2"  # another tab is being closed: still held
+        sup._admit_dialog(type="beforeunload", message="", default_prompt="", session_id="S1", frame_id=None)
+        await asyncio.sleep(0)
+        assert sent == [] and len(sup._pending_dialogs) == 2
+        sup._payment_handover_closing = "S1"
         sup._admit_dialog(type="beforeunload", message="", default_prompt="", session_id="S1", frame_id=None)
         await asyncio.sleep(0)
         await asyncio.sleep(0)
@@ -959,3 +963,156 @@ def test_a_claim_during_a_dialog_tab_attach_stops_the_session_work():
     sup._cdp = cdp
     asyncio.run(sup._watch_tab("T9"))
     assert sent == ["Target.attachToTarget", "Target.detachFromTarget"] and "T9" not in sup._dialog_tabs()
+
+
+def _dialog_sup(task_id, fail=None):
+    from tools import browser_supervisor as bs
+
+    sup = bs.CDPSupervisor(task_id=task_id, cdp_url="ws://127.0.0.1:9222")
+    sup.sent, sup.gate = [], None
+
+    async def cdp(method, params=None, *, session_id=None, timeout=10.0):
+        sup.sent.append((method, (params or {}).get("accept")))
+        if sup.gate is not None:
+            await sup.gate.wait()
+        if fail:
+            raise RuntimeError("CDP error")
+        return {"result": {}}
+
+    sup._cdp = cdp
+    return sup
+
+
+def test_a_dialog_is_answered_once_by_the_agent_or_the_watchdog():
+    sup = _dialog_sup("one-answer")
+
+    async def scenario():
+        sup.gate = asyncio.Event()
+        sup._admit_dialog(type="confirm", message="Place order?", default_prompt="", session_id="S1", frame_id=None)
+        (dialog,) = sup._pending_dialogs.values()
+        agent = asyncio.create_task(sup._handle_dialog_cdp(dialog, accept=True, prompt_text=""))
+        await asyncio.sleep(0)  # the agent's answer is on the wire
+        watchdog = asyncio.create_task(sup._dialog_timeout_expired(dialog.id))  # the watchdog fires meanwhile
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        sup.gate.set()
+        await asyncio.wait_for(asyncio.gather(agent, watchdog), 5)
+        with pytest.raises(RuntimeError):  # a second answer is refused, nothing sent
+            await sup._handle_dialog_cdp(dialog, accept=False, prompt_text="")
+        assert sup.sent == [("Page.handleJavaScriptDialog", True)] and not sup._dialog_watchdogs
+
+    asyncio.run(scenario())
+    failing = _dialog_sup("one-answer-fail", fail=True)
+
+    async def failed_send():
+        failing._admit_dialog(type="confirm", message="Pay?", default_prompt="", session_id="S1", frame_id=None)
+        (dialog,) = failing._pending_dialogs.values()
+        with pytest.raises(RuntimeError):
+            await failing._handle_dialog_cdp(dialog, accept=True, prompt_text="")
+        assert not failing._pending_dialogs and not failing._dialog_watchdogs  # consumed although it failed
+
+    asyncio.run(failed_send())
+
+
+def test_a_closed_tab_drops_its_held_dialogs():
+    sup = _dialog_sup("closed-tab")
+    sup._dialog_tab_sessions = {"T2": "S2"}
+
+    async def scenario():
+        for sid in ("S1", "S2", "S3"):
+            sup._admit_dialog(type="confirm", message="Pay?", default_prompt="", session_id=sid, frame_id=None)
+        sup._on_target_detached({"sessionId": "S1"}, None)
+        assert sup._dialog_tab_event_ignored("Target.detachedFromTarget", {"sessionId": "S2"}, None)
+        assert [d.cdp_session_id for d in sup._pending_dialogs.values()] == ["S3"]
+        assert len(sup._dialog_watchdogs) == 1 and sup.sent == []  # dropped, never answered
+        for handle in sup._dialog_watchdogs.values():
+            handle.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_dialog_text_from_the_lock_is_never_shown_after_it_and_card_values_are_redacted(monkeypatch):
+    from tools import browser_exec_dialogs
+    from tools import browser_payment_done as done
+
+    monkeypatch.setattr(done, "_CARD_DIALOG_VALUES", [])
+    done.register_dialog_card_values({"card_number": "4000056655665556", "cvc": "737", "exp_month": "03",
+                                      "exp_year": "2031", "cardholder_name": "Ada Testperson"})
+    sup = _dialog_sup("after-lock")
+    monkeypatch.setattr(browser_exec_dialogs, "_supervisor", lambda task_id: sup)
+
+    async def scenario():
+        with surface._LOCK:
+            surface._HELD.add(sup)
+        sup._admit_dialog(type="confirm", message="Echo 4000056655665556 ok?", default_prompt="", session_id="S1",
+                          frame_id=None)
+        with surface._LOCK:
+            surface._HELD.discard(sup)
+        sup._admit_dialog(type="confirm", message="Ada Testperson, 03/31, CVC 737?", default_prompt="",
+                          session_id="S1", frame_id=None)
+        for handle in sup._dialog_watchdogs.values():
+            handle.cancel()
+
+    asyncio.run(scenario())
+    out = browser_exec_dialogs.collect("after-lock", 0)
+    locked, unlocked = out["pending"]
+    assert locked["withheld"] == "payment_surface_locked" and "message" not in locked
+    assert unlocked["message"].count("«redacted-card»") == 3 and "737" not in unlocked["message"]
+    blob = json.dumps(sup.snapshot().to_dict())
+    assert "4000056655665556" not in blob and "Echo" not in blob and "Testperson" not in blob
+
+
+def test_timed_out_supervisor_work_is_cancelled_and_drained_before_the_caller_moves_on():
+    from tools import browser_supervisor as bs
+
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    events = []
+
+    async def work():
+        try:
+            await asyncio.Event().wait()  # a CDP reply that never comes
+            events.append("sent")
+        finally:
+            for _ in range(3):  # cleanup that itself awaits
+                await asyncio.sleep(0)
+            events.append("finished")
+
+    with pytest.raises(Exception):  # health: allow BLE001 -- the timeout type is concurrent.futures'
+        bs._schedule(work(), loop, timeout=0.05)
+    # drained: nothing of it still runs once the caller (and any fence it held) moved on
+    assert events == ["finished"]
+    loop.call_soon_threadsafe(loop.stop)
+
+
+def test_focus_page_sends_nothing_more_once_the_slot_locks():
+    sup = _dialog_sup("focus-locked")
+    probes = []
+
+    async def attach(target_id, *, timeout, deadline=None, refuse_locked=False):
+        assert refuse_locked
+        probes.append(target_id)
+        with surface._LOCK:
+            surface._HELD.add(sup)  # a claim landed while this tab was being attached
+        return "S-" + target_id
+
+    async def cdp(method, params=None, *, session_id=None, timeout=10.0):
+        sup.sent.append((method, session_id))
+        if method == "Target.getTargets":
+            return {"result": {"targetInfos": [{"targetId": t, "type": "page", "url": "https://shop.test/"}
+                                               for t in ("A", "B")]}}
+        return {"result": {}}
+
+    sup._cdp, sup._attach_page = cdp, attach
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    sup._loop = loop
+    try:
+        out = sup.focus_page("https://shop.test", timeout=30)
+    finally:
+        with surface._LOCK:
+            surface._HELD.discard(sup)
+        loop.call_soon_threadsafe(loop.stop)
+    assert out["ok"] is False and "payment_surface_locked" in out["error"]
+    assert probes == ["A"] and [m for m, _s in sup.sent] == ["Target.getTargets", "Target.detachFromTarget"]
+    assert sup._page_session_id != "S-A"

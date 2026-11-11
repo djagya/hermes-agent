@@ -1313,9 +1313,12 @@ BROWSER_VAULT_SCHEMA = {
         "go for the purchase covers pressing Pay once; never click Pay without it, never click it again when "
         "payment_click_uncertain says a press may have landed. Page dialogs while locked: alerts are accepted and "
         "prompts dismissed by Hermes; a confirm waits and payment_controls / payment_click / payment_done report "
-        "dialog_pending {type, text} (text bounded, digit runs masked); answer it once with payment_dialog "
-        "(accept true or false; never retried). The chat go for Pay covers accepting the shop's own 'place this "
-        "order?' confirm right after Pay; any other confirm: ask the user first. An unanswered confirm is "
+        "dialog_pending {id, type, origin, on_payment_tab_top, text} (text redacted, bounded, digit runs "
+        "masked; payment_done returns at once with payment_dialog_pending). payment_dialog (dialog_id, accept "
+        "true or false) answers that confirm once, never retried, and only a confirm on the payment tab's own "
+        "page (on_payment_tab_top true); card frames, other tabs and unknown sources are refused. Accept only a "
+        "confirm on the shop page that matches the Pay you were told to make (e.g. 'Place order for "
+        "<amount>?'); for anything else (upsells, subscriptions, unknown) ask the user. An unanswered confirm is "
         "dismissed after the dialog timeout. On 3-D Secure or redirect pages, normally just "
         "wait and call payment_done; click a bank page only when it asks for a button and the user agreed. "
         "After pressing Pay, call payment_done once; it is what ends the lock: it waits up to 120 s (through 3-D Secure and payment-provider pages) for the order "
@@ -1338,6 +1341,8 @@ BROWSER_VAULT_SCHEMA = {
             "ref": {"type": "string", "description": "payment_click only: a ref from payment_controls."},
             "accept": {"type": "boolean", "description": "payment_dialog only: true accepts, false dismisses the "
                                                          "dialog_pending confirm."},
+            "dialog_id": {"type": "string", "description": "payment_dialog only: dialog_pending.id of the confirm "
+                                                           "to answer."},
             "handle": {"type": "string", "description": "fill / enter_code / letter_*: a handle from list or a letter note."},
             "purpose": {"type": "string", "enum": ["login", "signup"], "default": "login",
                         "description": "fill only: login preserves current-password behavior; signup requires fresh "
@@ -1495,14 +1500,14 @@ def _payment_surface_action(task_id: Optional[str], ref: Optional[str]) -> str:
     return json.dumps(surface.payment_click(supervisor, ref))
 
 
-def _payment_dialog_action(task_id: Optional[str], accept: Any) -> str:
+def _payment_dialog_action(task_id: Optional[str], dialog_id: Any, accept: Any) -> str:
     """dlz (lockdown, owner decision 2026-11-11): one native answer to a confirm the payment lock holds."""
     from tools.browser_payment_done import payment_dialog
 
     if not _is_managed():
         return json.dumps({"success": False, "error_type": "payment_surface_none",
                            "error": "Only the managed browser locks a card payment; use the browser tools as usual."})
-    return json.dumps(payment_dialog(_managed_supervisor(task_id or "default"), accept))
+    return json.dumps(payment_dialog(_managed_supervisor(task_id or "default"), dialog_id, accept))
 
 
 def _payment_done_action(task_id: Optional[str], expected_origin: str) -> str:
@@ -1546,7 +1551,7 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
         "payment_controls": lambda: _payment_surface_action(tid, None),
         "payment_click": lambda: _payment_surface_action(tid, str(args.get("ref") or "")),
         "payment_done": lambda: _payment_done_action(tid, str(args.get("expected_origin") or "")),
-        "payment_dialog": lambda: _payment_dialog_action(tid, args.get("accept")),
+        "payment_dialog": lambda: _payment_dialog_action(tid, args.get("dialog_id"), args.get("accept")),
     }
     if action not in page_ops:
         return json.dumps({"success": False, "error": f"Unknown action {action!r}; use list, fill, save_login, "

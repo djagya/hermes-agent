@@ -185,6 +185,15 @@ def disarm(task_id: Optional[str], env: dict, *, identity: str, dispatched: bool
                                                  after_handoff=_take_handoff_flag(task_id))
 
 
+def _withhold(row: dict) -> dict:
+    """dlz: ids and types only. Used while the slot is locked and, after it, for every dialog that opened
+    while it was locked (its text may echo what the card form held)."""
+    for key in ("message", "default_prompt", "url", "page"):
+        row.pop(key, None)
+    row["withheld"] = "payment_surface_locked"
+    return row
+
+
 def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
     """``{"pending": [...], "handled": [...]}`` for the exec result, or None when no dialog fired."""
     supervisor = _supervisor(task_id)
@@ -200,7 +209,7 @@ def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
         row.pop("opened_at", None)
         row["url"] = _origin(getattr(dialog, "url", "")) or ""
         row["page"] = _origin(getattr(dialog, "top_url", "")) or ""
-        pending.append(row)
+        pending.append(_withhold(row) if getattr(dialog, "opened_locked", False) else row)
     handled = []
     for record in snap.recent_dialogs:
         if record.opened_at < since - 1:
@@ -208,7 +217,7 @@ def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
         row = record.to_dict()
         for key in ("opened_at", "closed_at"):
             row.pop(key, None)
-        handled.append(row)
+        handled.append(_withhold(row) if getattr(record, "opened_locked", False) else row)
     if not pending and not handled:
         return None
     from tools.browser_payment_surface import slot_locked
@@ -216,10 +225,7 @@ def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
     if slot_locked(supervisor):
         # dlz (payment lockdown): a dialog's text is page content; while a card payment locks the slot it
         # stays with the user (ids and types only).
-        for row in pending + handled:
-            for key in ("message", "default_prompt", "url", "page"):
-                row.pop(key, None)
-            row["withheld"] = "payment_surface_locked"
+        pending, handled = [_withhold(r) for r in pending], [_withhold(r) for r in handled]
     out: dict[str, Any] = {"pending": pending, "handled": handled}
     if pending:
         out["hint"] = (

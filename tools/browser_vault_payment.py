@@ -733,6 +733,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                                    "error": _REVISION_UNAVAILABLE_ON_READ})
             secret = validate_card(raw)
             _register_card_redaction(secret)
+            from tools.browser_payment_done import register_dialog_card_values
+
+            register_dialog_card_values(secret)  # dlz: dialog texts are scrubbed of holder and expiry too
             try:
                 fills = _document_fills(inspected, secret)
             except ExpiryOptionUnmatched:

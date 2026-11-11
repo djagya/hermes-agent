@@ -24,10 +24,12 @@ logger = logging.getLogger("tools.browser_supervisor")
 
 
 def _redact_supervisor_text(value: str) -> str:
-    """Redact page-originated text before exposing supervisor snapshots."""
-    from agent.redact import redact_sensitive_text
+    """Redact page-originated text before exposing supervisor snapshots. dlz: the forced secret redactor plus
+    the card values of the current payment (number, CVC, expiry, holder), so a page that echoes them in a
+    dialog cannot pass them on."""
+    from tools.browser_payment_done import redact_dialog_text
 
-    return redact_sensitive_text(value, force=True)
+    return redact_dialog_text(value)
 
 
 def _trim_ring(events: list, keep: int) -> list:
@@ -39,7 +41,12 @@ _REDACTED_FIELDS = frozenset({"message", "default_prompt"})
 
 
 def _dialog_dict(obj: Any, keys: tuple) -> dict[str, Any]:
-    """Snapshot dict of ``keys`` with page-originated text fields redacted."""
+    """Snapshot dict of ``keys`` with page-originated text fields redacted. dlz: a dialog that opened while a
+    card payment locked the slot never shows its text here (payment_done reports a held confirm itself)."""
+    if getattr(obj, "opened_locked", False):
+        out = {k: "" if k in _REDACTED_FIELDS else getattr(obj, k) for k in keys}
+        out["withheld"] = "payment_surface_locked"
+        return out
     return {k: _redact_supervisor_text(getattr(obj, k)) if k in _REDACTED_FIELDS else getattr(obj, k) for k in keys}
 
 
@@ -124,6 +131,8 @@ class PendingDialog:
     url: str = ""
     # The tab's top-level URL: a cross-origin widget on /checkout raises dialogs from its own URL.
     top_url: str = ""
+    # dlz: opened while a card payment locked the slot; its text is never shown to browser_exec.
+    opened_locked: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return _dialog_dict(self, ("id", "type", "message", "default_prompt", "opened_at", "frame_id"))
@@ -143,6 +152,7 @@ class DialogRecord:
     # "accept" / "dismiss" when this side answered it; "" when the page or browser closed it.
     action: str = ""
     url: str = ""
+    opened_locked: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         out = _dialog_dict(self, ("id", "type", "message", "opened_at", "closed_at", "closed_by", "frame_id"))
@@ -183,8 +193,9 @@ class DialogSupervisionMixin:
             return True, ""
         if dialog.type == "prompt":
             return False, ""
-        if dialog.type == "beforeunload" and getattr(self, "_payment_handover_closing", False):
-            return True, ""
+        closing = getattr(self, "_payment_handover_closing", None)
+        if dialog.type == "beforeunload" and closing and dialog.cdp_session_id == closing:
+            return True, ""  # only the payment tab payment_done is closing, only during that close
         return None
 
     async def _install_dialog_bridge(self, session_id: str) -> None:
@@ -287,7 +298,9 @@ class DialogSupervisionMixin:
             frame_id=frame_id, bridge_request_id=bridge_request_id, url=self._dialog_page_url(frame_id, url),
             top_url=self._dialog_top_url(session_id),
         )
-        auto = self._lock_answer(dialog) if self._payment_locked() else self._decide_dialog(dialog)
+        locked = self._payment_locked()
+        dialog.opened_locked = locked
+        auto = self._lock_answer(dialog) if locked else self._decide_dialog(dialog)
         if auto is not None:
             with self._state_lock:
                 self._archive_dialog_locked(dialog, "auto_policy", action="accept" if auto[0] else "dismiss")
@@ -347,12 +360,12 @@ class DialogSupervisionMixin:
             logger.debug("auto response failed for %s: %s", dialog.id, e)
 
     async def _handle_dialog_cdp(self, dialog: PendingDialog, *, accept: bool, prompt_text: str) -> None:
-        """Agent response path. The dialog is retired regardless of outcome — a CDP
-        error usually means it already closed (browser auto-dismissed after navigation)."""
-        try:
-            await self._respond(dialog, accept=accept, prompt_text=prompt_text)
-        finally:
-            self._retire_dialog(dialog.id, "agent", action="accept" if accept else "dismiss")
+        """Agent response path. dlz: the dialog is consumed (and its watchdog cancelled) BEFORE the answer is
+        sent, and stays consumed if sending fails (a CDP error usually means it already closed). Only the
+        caller that consumed it answers: the agent and the watchdog never both do."""
+        if not self._retire_dialog(dialog.id, "agent", action="accept" if accept else "dismiss"):
+            raise RuntimeError(f"dialog {dialog.id} is no longer pending (already answered or closed)")
+        await self._respond(dialog, accept=accept, prompt_text=prompt_text)
 
     async def _dialog_timeout_expired(self, dialog_id: str) -> None:
         with self._state_lock:
@@ -363,14 +376,16 @@ class DialogSupervisionMixin:
         # dialog may stall the page for good.
         logger.warning("CDP supervisor %s: dialog %s (%s) auto-dismissed after %ss timeout",
                        self.task_id, dialog_id, dialog.type, self.dialog_timeout_s)
-        # Archive with watchdog tag BEFORE unblocking the page.
-        self._retire_dialog(dialog_id, "watchdog", action="dismiss")
+        # Archive with watchdog tag BEFORE unblocking the page; answer only if this side consumed it.
+        if not self._retire_dialog(dialog_id, "watchdog", action="dismiss"):
+            return
         await self._respond_quiet(dialog, accept=False, prompt_text=None, watchdog=True)
 
     # ── Bookkeeping ──────────────────────────────────────────────────────────
 
-    def _retire_dialog(self, dialog_id: str, closed_by: str, *, action: str = "") -> None:
-        """Remove a pending dialog (archiving it with ``closed_by``) and cancel its watchdog."""
+    def _retire_dialog(self, dialog_id: str, closed_by: str, *, action: str = "") -> bool:
+        """Remove a pending dialog (archiving it with ``closed_by``) and cancel its watchdog. True only for
+        the one caller that removed it."""
         with self._state_lock:
             dialog = self._pending_dialogs.pop(dialog_id, None)
             if dialog is not None:
@@ -378,12 +393,22 @@ class DialogSupervisionMixin:
         handle = self._dialog_watchdogs.pop(dialog_id, None)
         if handle is not None:
             handle.cancel()
+        return dialog is not None
+
+    def _retire_session_dialogs(self, session_id: Optional[str]) -> None:
+        """dlz: a closed tab's held dialogs go with it (nobody may answer a dialog of a page that is gone)."""
+        if not session_id:
+            return
+        with self._state_lock:
+            gone = [d.id for d in self._pending_dialogs.values() if d.cdp_session_id == session_id]
+        for dialog_id in gone:
+            self._retire_dialog(dialog_id, "remote")
 
     def _archive_dialog_locked(self, dialog: PendingDialog, closed_by: str, *, action: str = "") -> None:
         """Move a pending dialog to the recent_dialogs ring buffer. Must hold state_lock."""
         record = DialogRecord(id=dialog.id, type=dialog.type, message=dialog.message, opened_at=dialog.opened_at,
                               closed_at=time.time(), closed_by=closed_by, frame_id=dialog.frame_id,
-                              action=action, url=dialog.url)
+                              action=action, url=dialog.url, opened_locked=dialog.opened_locked)
         self._recent_dialogs = _trim_ring([*self._recent_dialogs, record], RECENT_DIALOGS_MAX)
 
     async def _on_dialog_closed(self, params: dict[str, Any], session_id: Optional[str]) -> None:
@@ -437,6 +462,7 @@ class DialogSupervisionMixin:
                 if tab_sid and tab_sid == sid:
                     tabs.pop(target, None)
                     self._dialog_tab_urls().pop(target, None)
+                    self._retire_session_dialogs(sid)
                     return True
             return False
         if method == "Target.targetInfoChanged":

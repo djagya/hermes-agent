@@ -105,17 +105,11 @@ def _valid_id(value: Any) -> bool:
 
 def _wait(coro, loop, *, timeout: float):
     """Run ``coro`` on the supervisor loop from a sync caller; on a timeout (or any failure to wait)
-    the coroutine is cancelled, so a late CDP reply can never let it act after the caller reported."""
-    from agent.async_utils import safe_schedule_threadsafe
+    the coroutine is cancelled and drained, so a late CDP reply can never let it act after the caller
+    reported (or released a fence)."""
+    from tools.browser_supervisor import run_bounded
 
-    fut = safe_schedule_threadsafe(coro, loop)
-    if fut is None:
-        raise SurfaceRefused("supervisor loop unavailable")
-    try:
-        return fut.result(timeout=timeout)
-    except BaseException:
-        fut.cancel()
-        raise
+    return run_bounded(coro, loop, timeout=timeout, unavailable=SurfaceRefused("supervisor loop unavailable"))
 
 
 def _control_refused(exc: BaseException) -> bool:
