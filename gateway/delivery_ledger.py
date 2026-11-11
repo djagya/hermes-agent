@@ -620,3 +620,15 @@ def ledger_enabled(config: Optional[dict[str, Any]] = None) -> bool:
         return value.strip().lower() not in {"false", "0", "no", "off"} if isinstance(value, str) else bool(value)
     except Exception:
         return True
+
+
+def settle_cancelled_runtime_claims(owned: list, dispatched: set) -> None:
+    """dlz: settle a cancelled reconnect sweep's claims. Later sweeps only claim 'failed', so an undispatched
+    claim still 'attempting' is released (the guard skips sent and released rows); a claim already handed to
+    ``adapter.send`` may have been posted, so it is closed as uncertain and never released for redelivery
+    (no-uncertain-redelivery contract, e3548f99c5d)."""
+    for row in owned:
+        if row["obligation_id"] in dispatched:
+            close_uncertain_claim(row["obligation_id"])
+        else:
+            release_runtime_claim(row["obligation_id"], row.get("last_error") or "send_path_degraded")

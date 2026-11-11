@@ -475,8 +475,8 @@ class GatewayStartupMixin:
     async def _redeliver_claimed_obligations(self, claimed: list, dispatched: Optional[set] = None) -> int:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
         bounded boot-send task, so a flood-limited send can be abandoned by the restore gate without
-        reopening the turn-replay window. Returns the redelivered count. dlz: ``dispatched`` collects the
-        ids handed to ``adapter.send`` so a cancelled caller can tell possibly-posted rows from unsent ones."""
+        reopening the turn-replay window. Returns the redelivered count. dlz: ``dispatched`` gets each id
+        handed to ``adapter.send``."""
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
@@ -585,22 +585,11 @@ class GatewayStartupMixin:
                     )
             return await self._redeliver_claimed_obligations(sendable, dispatched=dispatched)
         except asyncio.CancelledError:
-            # Cancelled while owning claims (profile stop, adapter replacement): later sweeps only claim
-            # 'failed', so release every undispatched claim still 'attempting' (the guard skips sent and
-            # released rows) in one thread hop that a second cancel cannot cut short. dlz: a claim already
-            # handed to adapter.send may have been posted; it is closed as uncertain, never released for
-            # redelivery (no-uncertain-redelivery contract, e3548f99c5d).
-            from gateway.delivery_ledger import close_uncertain_claim, release_runtime_claim
+            # Cancelled while owning claims: settle them in one thread hop a second cancel cannot cut short.
+            from gateway.delivery_ledger import settle_cancelled_runtime_claims
             with suppress(Exception):
                 owned = await claim if claim is not None else []
-
-            def _settle() -> None:
-                for row in owned:
-                    if row["obligation_id"] in dispatched:
-                        close_uncertain_claim(row["obligation_id"])
-                    else:
-                        release_runtime_claim(row["obligation_id"], row.get("last_error") or "send_path_degraded")
-            await asyncio.to_thread(_settle)
+            await asyncio.to_thread(settle_cancelled_runtime_claims, owned, dispatched)
             raise
 
     def _resume_pending_candidates(self, platform=None) -> Optional[list]:
