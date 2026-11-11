@@ -48,6 +48,7 @@ _CLAIM_TIMEOUT_S = 10.0
 _ACTION_TIMEOUT_S = 25.0
 _PRESS_MARGIN_S = 5.0
 _MAX_CONTROLS = 40
+_MAX_TOP_CONTROLS = 150  # a merchant page's header and footer links come before its Pay button
 _MAX_TEXT = 60
 _REF_RE = re.compile(r"c\d{1,3}-[0-9a-f]{10}")
 
@@ -206,6 +207,10 @@ def claim_payment_surface(supervisor: Any, inspected: Any) -> Optional[dict]:
     except Exception as exc:  # health: allow BLE001 -- CDP/transport text is not surfaced; fixed type only
         logger.warning("card fill refused: payment surface claim failed (%s)", type(exc).__name__)
         return _refusal(UNAVAILABLE, _UNAVAILABLE_TEXT)
+    # dlz (lockdown §2): the payment tab and its card documents, for browser_vault payment_done.
+    from tools.browser_payment_done import record_payment
+
+    record_payment(supervisor, inspected)
     return None
 
 
@@ -346,7 +351,7 @@ def supervisor_route_refusal(supervisor: Any, frame_id: str, method: str, params
 # editable field: text inputs, selects, textareas and contenteditable are skipped, and so is any
 # control that contains one or labels one. Returns the elements array (by reference) so the caller
 # describes or clicks by index without the page seeing the call.
-_LISTER = r"""(() => {
+_LISTER_SRC = r"""(() => {
   const EDIT = 'input:not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]),select,textarea,[contenteditable=""],[contenteditable=true]';
   const SEL = 'button,a[href],[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],summary,'
     + 'input[type=checkbox],input[type=radio],input[type=submit],input[type=button]';
@@ -360,7 +365,9 @@ _LISTER = r"""(() => {
     if (out.length >= %d) break;
   }
   return out;
-})()""".replace("%d", str(_MAX_CONTROLS))
+})()"""
+_LISTER = _LISTER_SRC.replace("%d", str(_MAX_CONTROLS))
+_TOP_LISTER = _LISTER_SRC.replace("%d", str(_MAX_TOP_CONTROLS))
 
 _DESCRIBE = r"""function(){ return this.map((el, i) => {
   const t = (el.type || '').toLowerCase(); const role = (el.getAttribute('role') || '').toLowerCase();
@@ -393,15 +400,23 @@ async def _documents(sup: Any, surface: _Surface) -> tuple:
         raise SurfaceRefused("supervised browser required")
     child_sessions: dict = {}
     tree = await sup._payment_tree(page_sid, child_sessions)
-    docs = [(f[0], child_sessions.get(f[0], page_sid)) for f in tree if f[0] in surface.frames]
+    docs = [(f[0], child_sessions.get(f[0], page_sid), f[0]) for f in tree if f[0] in surface.frames]
+    # dlz (lockdown §2): under the slot lock agent CDP cannot click anything, so the payment tab's own top
+    # document (merchant page, 3-D Secure redirect) is listed too unless it is a card frame.
+    from tools.browser_payment_done import top_document
+
+    top = await top_document(sup, page_sid, tree)
+    if top is not None and top[0] not in {d[0] for d in docs}:
+        docs.append(top)
     return page_sid, tree, child_sessions, docs
 
 
-async def _listing(sup: Any, fid: str, sid: str) -> tuple:
-    """(array object id, [control dicts]) for one protected document."""
+async def _listing(sup: Any, fid: str, sid: str, key: str) -> tuple:
+    """(array object id, [control dicts]) for one listed document; ``key`` binds its refs."""
     ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": fid, "worldName": "hermes-payment-controls"},
                           session_id=sid))["result"]["executionContextId"]
-    arr = (await sup._cdp("Runtime.evaluate", {"expression": _LISTER, "contextId": ctx, "returnByValue": False},
+    lister = _LISTER if key == fid else _TOP_LISTER  # a payment tab's top document has its own ref key
+    arr = (await sup._cdp("Runtime.evaluate", {"expression": lister, "contextId": ctx, "returnByValue": False},
                           session_id=sid))["result"]["result"].get("objectId")
     if not arr:
         raise SurfaceRefused("payment document unavailable")
@@ -412,7 +427,7 @@ async def _listing(sup: Any, fid: str, sid: str) -> tuple:
         text = _mask(str(row.get("text") or ""))
         role = row.get("role") if row.get("role") in {"button", "link", "checkbox", "radio"} else "button"
         index = int(row.get("i") or 0)
-        controls.append({"ref": _ref(fid, index, role, text), "role": role, "text": text,
+        controls.append({"ref": _ref(key, index, role, text), "role": role, "text": text,
                          "disabled": row.get("disabled") is True, "_i": index})
     return arr, controls
 
@@ -420,8 +435,8 @@ async def _listing(sup: Any, fid: str, sid: str) -> tuple:
 async def _list_all(sup: Any, surface: _Surface) -> tuple:
     page_sid, tree, child_sessions, docs = await _documents(sup, surface)
     listed = []
-    for fid, sid in docs:
-        arr, controls = await _listing(sup, fid, sid)
+    for fid, sid, key in docs:
+        arr, controls = await _listing(sup, fid, sid, key)
         listed.append((fid, sid, arr, controls))
     return page_sid, tree, child_sessions, listed
 
@@ -528,7 +543,12 @@ async def _click(sup: Any, surface: _Surface, ref: str, progress: list, deadline
 
 
 def _run(supervisor: Any, coro_factory, progress: list | None = None) -> dict:
+    from tools.browser_payment_done import has_payment
+
     surface = _surface(supervisor)
+    if surface is None and has_payment(supervisor):
+        # dlz (lockdown §2): no protected frame left, but the slot stays locked until the payment tab closes.
+        surface = _Surface(frozenset(), frozenset(), False, getattr(supervisor, "_ws", None))
     if surface is None:
         return _refusal("payment_surface_none", "No protected card frame on this page: use browser_exec as usual.")
     # Taken before the wait starts, so the press deadline always falls before the caller's timeout.

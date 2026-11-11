@@ -1294,8 +1294,21 @@ BROWSER_VAULT_SCHEMA = {
         "user. After a card fill the card frame is protected until it navigates away "
         "(browser_exec/browser_cdp reads there return payment_surface_protected): payment_controls lists its "
         "buttons, links and checkboxes ({ref, role, text, disabled}; never inputs, digits masked); payment_click "
-        "(ref) makes one trusted click on a listed control. The user's chat go for the purchase covers pressing "
-        "Pay there; never click Pay without it. "
+        "(ref) makes one trusted click on a listed control. While the browser is locked for a card payment "
+        "(browser_exec/browser_cdp refused), payment_controls also lists the payment tab's own page (the merchant "
+        "checkout, or a bank's 3-D Secure page it was redirected to) unless that page is a card form, so the Pay "
+        "button is clicked there with payment_click; refs die when the page changes, list again. The user's chat "
+        "go for the purchase covers pressing Pay once; never click Pay without it, never click it again when "
+        "payment_click_uncertain says a press may have landed. On 3-D Secure or redirect pages, normally just "
+        "wait and call payment_done; click a bank page only when it asks for a button and the user agreed. "
+        "After pressing Pay, call payment_done once: the browser stays locked during a card payment, and "
+        "payment_done waits up to 120 s (through 3-D Secure and payment-provider pages) for the order "
+        "confirmation on the shop's origin (expected_origin when the confirmation shows on another site), then "
+        "returns its url, title, visible text and http(s) links (never field values or screenshots), opens it in a "
+        "new tab (new_tab) and closes the payment tab; lock_released true means browser control confirmed the "
+        "unlock, false (with note) means it did not, so follow the note. payment_confirmation_not_reached: no "
+        "confirmation within the wait, the lock stays, nothing was clicked or closed; never press Pay again; "
+        "follow the error (call payment_done again after the user finishes a bank check, or ask the user). "
         "fill_result_unverified: the page's answer to a fill could not be verified and a field may hold the "
         "password; do not submit or retry, tell the user."
     ),
@@ -1304,7 +1317,7 @@ BROWSER_VAULT_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock", "letter_login",
                                                   "letter_signed_in", "letter_done", "payment_controls",
-                                                  "payment_click"]},
+                                                  "payment_click", "payment_done"]},
             "ref": {"type": "string", "description": "payment_click only: a ref from payment_controls."},
             "handle": {"type": "string", "description": "fill / enter_code / letter_*: a handle from list or a letter note."},
             "purpose": {"type": "string", "enum": ["login", "signup"], "default": "login",
@@ -1342,7 +1355,8 @@ BROWSER_VAULT_SCHEMA = {
                                     "verification code), exactly as issued including hyphens and leading zeros. Requires expected_origin. "
                                     "Never put a password or other long-lived secret here."},
             "expected_origin": {"type": "string",
-                                "description": "Mandatory with code: the page's origin (scheme://host[:port]). The fill is refused unless it matches exactly."},
+                                "description": "Mandatory with code: the page's origin (scheme://host[:port]). The fill is refused unless it matches exactly. "
+                                               "payment_done only (optional): the shop's HTTPS origin where the order confirmation shows, when it is not the checkout's origin."},
             "backend": {"type": "string", "enum": ["onepassword", "bitwarden"], "description": "unlock only."},
             "label": {"type": "string", "description": "save_login only: short site name (default: the host)."},
         },
@@ -1393,6 +1407,16 @@ def _payment_surface_action(task_id: Optional[str], ref: Optional[str]) -> str:
     return json.dumps(surface.payment_click(supervisor, ref))
 
 
+def _payment_done_action(task_id: Optional[str], expected_origin: str) -> str:
+    """dlz (lockdown §2): the native confirmation handover after Pay (managed browser only)."""
+    from tools.browser_payment_done import payment_done
+
+    if not _is_managed():
+        return json.dumps({"success": False, "error_type": "payment_surface_none",
+                           "error": "Only the managed browser locks a card payment; use the browser tools as usual."})
+    return json.dumps(payment_done(_managed_supervisor(task_id or "default"), expected_origin))
+
+
 def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
     action = str(args.get("action") or "")
@@ -1421,11 +1445,12 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
         "letter_signed_in": lambda: browser_vault_letter_signed_in(handle, task_id=tid),
         "payment_controls": lambda: _payment_surface_action(tid, None),
         "payment_click": lambda: _payment_surface_action(tid, str(args.get("ref") or "")),
+        "payment_done": lambda: _payment_done_action(tid, str(args.get("expected_origin") or "")),
     }
     if action not in page_ops:
         return json.dumps({"success": False, "error": f"Unknown action {action!r}; use list, fill, save_login, "
                                                        "enter_code, unlock, letter_login, letter_signed_in, "
-                                                       "letter_done, payment_controls or payment_click."})
+                                                       "letter_done, payment_controls, payment_click or payment_done."})
     return _fenced_page_op(tid, page_ops[action])
 
 

@@ -3181,6 +3181,19 @@ vault:
 - Hermes inspects the form's structure without reading any values, then asks the agent for the cart and the exact set of origins that would receive card fields. The owner's approval card (see "Card-fill approver" above) marks each unreviewed origin, shows the cart as stated by the agent, and says whether the page shows that total: matched, NOT found or ambiguous. That check reads page text only; it does not verify the charge.
 - One approval covers one fill within its 120 s window. Nothing is remembered; the next checkout asks again. Switching the key off, changing `vault.payment_providers`, or a `config.yaml` that cannot be read stops a fill that is still waiting or in progress before its next card field is written; a fill stopped part-way reports which fields it wrote.
 
+### After the payment: confirmation handover
+
+In the managed browser, a card fill locks the browser slot for the agent's own browser connections until the payment tab is closed. While it is locked, the agent clicks only through `browser_vault`'s native `payment_controls` / `payment_click`. These list the card frames' buttons and also the payment tab's own page: the merchant checkout with its Pay button, or a bank's 3-D Secure page after a redirect. The payment tab's page is not listed while it is a card form (on a payment provider's origin, or one of the payment's card documents). Controls show labels only, never input values. A ref stops working when the page changes. The owner's chat go covers one press of Pay. After an uncertain click the agent never clicks again.
+
+After pressing Pay, the agent calls `browser_vault` with `action: payment_done`. Hermes then works over its own supervised connection:
+
+1. It waits up to 120 s for the payment tab to show a new page on the shop's origin (the checkout's origin, or `expected_origin` when the confirmation is on another site). On a shop that shows the confirmation without loading a new page, the checkout page itself counts once all of the payment's card frames are gone, but only if the merchant page never received a card field itself. Payment-provider pages and bank (3-D Secure) pages in between are waited through. Hermes reads nothing from a page while its top document is on a payment provider's origin, or while one of the payment's card frames, or another card-field frame, is still in the page. The page must also be fully loaded and stay the same for two checks in a row.
+2. It reads the page's title, URL, visible text (up to 20,000 characters) and its http(s) links (up to 200), never the values of inputs, text areas or selects, and never a screenshot. The text may include a masked card number or the holder name if the shop prints them.
+3. It opens a new tab at that URL, and only then closes the payment tab. Closing the payment tab is what ends the lock.
+4. It reports `lock_released: true` only after browser-control's status confirms that the slot is unlocked. Otherwise the result is `false` with a note.
+
+If no safe confirmation page appears in time, the result is `payment_confirmation_not_reached` with the tab's current URL and title. The lock stays, and nothing is clicked, closed or retried. Hermes never presses Pay again on its own.
+
 ### Custom smart-approval policy
 
 `approvals.smart_policy` lets you append your own rules to the smart-approval reviewer's instructions. When set, the text is added to the guardian LLM's system prompt (the trusted channel — never alongside the untrusted command text), so you can tighten or relax its judgment for your environment without editing code:
