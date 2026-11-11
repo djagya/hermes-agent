@@ -473,8 +473,29 @@ def _discover(supervisor, vault, reviewed: PaymentPolicyError, merchant_origin: 
     return inspected, policy
 
 
+# dlz (Codex B r4 #1): every stop commit_payment can answer has fixed text.
+_FIELDS_INVALID = (
+    "The checkout refused the card fill before any write (the fields Hermes was to fill no longer matched the "
+    "approved form), so no card field was written and nothing was submitted. Do not retry; tell the user. Another "
+    "fill needs a new approval."
+)
+_CONSENT_CONSUMED = (
+    "This approval was already used for one fill, so nothing was written now and nothing was submitted. Do not "
+    "retry; another fill needs a new approval."
+)
+_VALIDATION_FAILED = (
+    "Card fields were written, but right after the writes not every field held its value or the page moved. "
+    + _SUBMITTED_NOTHING + " Do not submit the checkout and do not retry the fill; tell the user. Another fill "
+    "needs a new approval."
+)
+
+
 # dlz: the model-facing text for each commit stop: (nothing written, something written).
 _COMMIT_TEXTS = {
+    "payment_fields_invalid": (_FIELDS_INVALID, _PARTIAL_STOPPED),
+    "payment_expiry_option_unmatched": (_EXPIRY_UNMATCHED, _PARTIAL_STOPPED),
+    "payment_consent_consumed": (_CONSENT_CONSUMED, _CONSENT_CONSUMED),
+    "payment_validation_failed": (_VALIDATION_FAILED, _VALIDATION_FAILED),
     "payment_page_changed": (_PAGE_CHANGED, _PAGE_CHANGED_PARTIAL),
     "payment_fields_changed": (_PAGE_CHANGED, _PAGE_CHANGED_PARTIAL),
     "payment_consent_expired": (_CONSENT_EXPIRED, _CONSENT_EXPIRED_PARTIAL),

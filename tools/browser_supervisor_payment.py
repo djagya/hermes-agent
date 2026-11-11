@@ -631,16 +631,27 @@ class PaymentSupervisionMixin:
             try:
                 await asyncio.shield(cleanup)
             except asyncio.CancelledError:
-                pass  # a second cancellation: the pass keeps running; the first exception is raised below
+                if not cleanup.done():
+                    raise  # dlz (Codex B r4 #4): the caller cancelled; the pass finishes behind the shield
+                # The pass itself was cancelled (after attempting every release): the original exception stands.
             raise
 
     async def _release_found(self, found: dict, child_sessions: dict) -> None:
-        for _, fsid, obj, _, _ in found["candidates"]:
-            await self._release_payment_object(fsid, obj)
-        for fsid, obj in found["pending"] + [a[:2] for a in found["absence"]] + found["witnesses"]:
-            await self._release_payment_object(fsid, obj)
-        await self._release_frame_owners(found["owners"])
-        await self._release_payment_sessions(child_sessions)
+        """dlz (Codex B r4 #4): every release is attempted, a cancelled one included; a cancellation of this pass is
+        re-raised only after the last."""
+        objects = ([(fsid, obj) for _, fsid, obj, _, _ in found["candidates"]] + found["pending"]
+                   + [a[:2] for a in found["absence"]] + found["witnesses"]
+                   + [(psid, obj) for psid, items in found["owners"].values() for _fid, obj in items])
+        steps = [self._release_payment_object(fsid, obj) for fsid, obj in objects] + [
+            self._release_payment_sessions({"s": sid}) for sid in dict.fromkeys(child_sessions.values())]
+        cancelled = False
+        for step in steps:
+            try:
+                await step
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _merchant_tab_session(self, origin: str, sid: str) -> str:
         """The page session on the one tab at ``origin``, attaching to it (and making it the supervised page) when
@@ -1332,7 +1343,7 @@ class PaymentSupervisionMixin:
                 }, session_id=d.frame_session))
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; typed, never retried
             return uncertain("payment_transport_uncertain")
-        if not _valid_document_result(result, len(fills)) or result.get("filled_fields", 0) < acknowledged:
+        if not _valid_document_result(result, len(fills)) or result["filled_fields"] < acknowledged:
             return uncertain("payment_result_invalid")  # dlz (Codex B r3 #1): a count never goes backwards
         if result["success"] is not True and (acknowledged or result.get("filled_fields", 0)):
             # An acknowledged write is never reported away by a later answer, nor by its own partial flag.
@@ -1497,13 +1508,14 @@ _OWNERS_SCOPE_EXPOSED = ("function(href,origin,...els){" + _PARENT_AT + "return 
 # grammar is parsed. On the token's own line, at most ONE unit may sit right beside it on each side (spaces between
 # allowed): an ISO 4217 code (a whole word of 3 capitals) or a currency symbol with up to 3 letters before it ('$' and
 # 'US$' are USD, 'CA$'/'C$' CAD, 'A$'/'AU$' AUD, 'NZ$' NZD, '€' EUR, '£' GBP; any other symbol, prefix or 3-capital
-# word is an unknown unit). The 8 characters beyond each unit (spaces trimmed) are its context. The token is enclosed
-# when its line, left of it, leaves a bracket open, or, right of it, closes one it did not open (an accounting
-# negative, however long the bracketed text); a line longer than 1000 characters on either side is not judged. A
-# clear amount has every unit equal to the stated currency, is not enclosed and not on an unjudged line, and has a
+# word is an unknown unit). The 8 characters beyond each unit (spaces trimmed) are its context. dlz (Codex B r4 #2/#3):
+# the token is bracketed when its line holds any bracket (Unicode open/close punctuation) other than balanced ASCII
+# '(...)' pairs wholly left of it; a line longer than 1000 characters on either side, or one that runs into the end of
+# a text cut at 200000 characters, is not judged. A
+# clear amount has every unit equal to the stated currency, is not bracketed and not on an unjudged line, and has a
 # context with no other 3-capital word, currency symbol, sign or dash, or digit. Anything else, a token without a unit
 # included, is not clear. An occurrence of the stated total is a token in the stated currency with no sign or dash in
-# its context and not enclosed. A total-labelled amount is the first token (with or without a unit) within 40
+# its context and not bracketed. A total-labelled amount is the first token (with or without a unit) within 40
 # characters after a total keyword on the same line; one that is not clear, a digit between the keyword and it, or
 # (no token in reach) any digit in reach after the keyword (a total in a format not read, 'EUR 100', 'EUR 100.000')
 # makes the page `unclear`, never `matched`.
@@ -1520,7 +1532,7 @@ _AMOUNT_WITNESS = r"""((cents, currency) => {
   const UNIT_START = /^(?:[A-Z]{3}(?![\p{L}\p{N}])|\p{L}{0,3}\p{Sc})/u;
   const CODE = /(?<![\p{L}\p{N}])[A-Z]{3}(?![\p{L}\p{N}])/gu;
   const MARK = /[\p{Sc}\p{N}\p{Pd}−+±]/u, SIGN = /[\p{Pd}−+±]/u;
-  const BRACKETS = /[^()[\]{}（）［］｛｝]/gu, OPENS = '([{（［｛';
+  const BRACKET = /[\p{Ps}\p{Pe}]/gu;
   const LINE = 1000, WINDOW = 8;
   const DOLLARS = {'': 'USD', US: 'USD', CA: 'CAD', C: 'CAD', A: 'AUD', AU: 'AUD', NZ: 'NZD'};
   const unit = m => {
@@ -1530,28 +1542,33 @@ _AMOUNT_WITNESS = r"""((cents, currency) => {
     return prefix ? '?' : symbol === '€' ? 'EUR' : symbol === '£' ? 'GBP' : '?';
   };
   const codeIn = (s, from, to) => Array.from(s.matchAll(CODE)).some(c => c.index < to && c.index + 3 > from);
-  // The token's line on each side (at most LINE characters), and whether a side may run on past that.
-  const sides = (text, start, end) => {
+  // The token's line on each side (at most LINE characters), and whether it is unjudged: a side may run on past
+  // LINE, or (dlz, Codex B r4 #3) the right side reaches the end of a text that was cut at its size limit.
+  const sides = (text, cut, start, end) => {
     const a = text.slice(Math.max(0, start - LINE), start), b = text.slice(end, end + LINE);
     const nl = Math.max(a.lastIndexOf('\n'), a.lastIndexOf('\r')), nr = b.search(/[\n\r]/);
     return [nl >= 0 ? a.slice(nl + 1) : a, nr >= 0 ? b.slice(0, nr) : b,
-            (nl < 0 && start > LINE) || (nr < 0 && end + LINE < text.length)];
+            (nl < 0 && start > LINE) || (nr < 0 && (cut || end + LINE < text.length))];
   };
-  const enclosed = (left, right) => {
+  // dlz (Codex B r4 #2): any bracket on the token's line blocks it, except balanced ASCII '(...)' pairs wholly left
+  // of it ('Gesamt (inkl. MwSt.) 22,66 €'): another bracket type, a mismatch, an open pair or any bracket right of it.
+  const bracketed = (left, right) => {
+    BRACKET.lastIndex = 0;
+    if (BRACKET.test(right)) return true;
     let depth = 0;
-    for (const c of left.replace(BRACKETS, '')) depth = OPENS.includes(c) ? depth + 1 : Math.max(0, depth - 1);
-    if (depth) return true;
-    for (const c of right.replace(BRACKETS, '')) {
-      if (OPENS.includes(c)) depth += 1; else if (depth) depth -= 1; else return true;
+    for (const m of left.matchAll(BRACKET)) {
+      if (m[0] === '(') depth += 1;
+      else if (m[0] === ')' && depth) depth -= 1;
+      else return true;
     }
-    return false;
+    return depth > 0;
   };
   const read = () => {
-    const text = String((doc.body && doc.body.innerText) || '').slice(0, 200000);
+    const all = String((doc.body && doc.body.innerText) || ''), text = all.slice(0, 200000), cut = all.length > 200000;
     const amounts = [];
     for (const m of text.matchAll(AMOUNT)) {
       const start = m.index, end = start + m[0].length;
-      const [left, right, unjudged] = sides(text, start, end);
+      const [left, right, unjudged] = sides(text, cut, start, end);
       let l = left.trimEnd(), r = right.trimStart();
       const lu = UNIT_END.exec(l), ru = UNIT_START.exec(r);
       if (lu) l = l.slice(0, lu.index).trimEnd();
@@ -1559,7 +1576,7 @@ _AMOUNT_WITNESS = r"""((cents, currency) => {
       const lw = l.slice(-WINDOW), rw = r.slice(0, WINDOW);
       const units = [lu && unit(lu[0]), ru && unit(ru[0])].filter(Boolean);
       const codes = codeIn(l, l.length - WINDOW, l.length) || codeIn(r, 0, WINDOW);
-      const signed = SIGN.test(lw) || SIGN.test(rw) || enclosed(left, right);
+      const signed = SIGN.test(lw) || SIGN.test(rw) || bracketed(left, right);
       const marked = unjudged || codes || signed || MARK.test(lw) || MARK.test(rw);
       // A bare token (no unit) is never clear: first after a keyword, it makes the page unclear.
       amounts.push({start, value: Number(m[1].replace(/\D/g, '') + m[2]), stated: units.includes(currency) && !signed,
@@ -1662,17 +1679,23 @@ def _retention_result(documents: list) -> dict:
     }
 
 
+# The error types a document's commit closure answers with (_INSPECT_TEMPLATE's commit and steps).
+_DOCUMENT_ERRORS = frozenset({"payment_fields_changed", "payment_consent_expired", "payment_fields_invalid",
+                              "payment_expiry_option_unmatched", "payment_validation_failed"})
+
+
 def _valid_document_result(result: Any, fills: int) -> bool:
     """dlz (Codex B r2 #2, r3 #1): one document's final commit answer, exact keys and types. A success is exactly
     ``{success, filled_fields}`` with every one of the ``fills`` written; a failure names its error type and counts
     at most ``fills``."""
     if not isinstance(result, dict) or type(result.get("success")) is not bool:
         return False
-    count = result.get("filled_fields", 0)
+    count = result.get("filled_fields")
     if result["success"]:
         return set(result) == {"success", "filled_fields"} and type(count) is int and count == fills
+    # dlz (Codex B r4 #1): one of the closure's own error types, and always an explicit count (0 before any write).
     return (not set(result) - {"success", "filled_fields", "error_type", "partially_filled"}
-            and type(result.get("error_type")) is str and type(count) is int and 0 <= count <= fills
+            and result.get("error_type") in _DOCUMENT_ERRORS and type(count) is int and 0 <= count <= fills
             and type(result.get("partially_filled", False)) is bool)
 
 
@@ -1804,7 +1827,7 @@ _INSPECT_TEMPLATE = r"""(() => {
   let used = false, written = null, paused = null;
   // One step of the commit; a finished (or never started) commit answers changed, never a second run.
   const advance = () => {
-    const step = paused ? paused.next() : {done: true, value: {success:false,error_type:'payment_fields_changed'}};
+    const step = paused ? paused.next() : {done: true, value: {success:false,error_type:'payment_fields_changed',filled_fields:0}};
     if (step.done) paused = null;
     return step.value;
   };
@@ -1837,24 +1860,24 @@ _INSPECT_TEMPLATE = r"""(() => {
       });
     },
     commit: (fills, deadline, strict, paced) => {
-      if (used || !valid()) return {success:false,error_type:'payment_fields_changed'};
+      if (used || !valid()) return {success:false,error_type:'payment_fields_changed',filled_fields:0};
       used = true;
       // dlz: `deadline` is ms after `born` on this document's monotonic clock (never Date.now(): a wall-clock
       // step must not reopen the window); checked here and again before every setter. Not a number: late.
       const late = () => !(typeof deadline === 'number' && performance.now() - born < deadline &&
                            Date.now() - bornWall < deadline);
-      if (late()) return {success:false,error_type:'payment_consent_expired'};
+      if (late()) return {success:false,error_type:'payment_consent_expired',filled_fields:0};
       if (!Array.isArray(fills) || !fills.length ||
           fills.some(f=>!selected.has(f.index) || typeof f.value !== 'string' || !f.value) ||
           new Set(fills.map(f=>f.index)).size !== fills.length)
-        return {success:false,error_type:'payment_fields_invalid'};
+        return {success:false,error_type:'payment_fields_invalid',filled_fields:0};
       // Every select target is checked before ANY write in this document: zero or several matching
       // options leave the whole document untouched.
       const selects = fills.filter(f=>isSelect(elements[f.index]));
       if (selects.some(f=>!['cc-exp-month','cc-exp-year'].includes(f.token)))
-        return {success:false,error_type:'payment_fields_invalid'};
+        return {success:false,error_type:'payment_fields_invalid',filled_fields:0};
       if (selects.some(f=>!oneOption(elements[f.index],f.value)))
-        return {success:false,error_type:'payment_expiry_option_unmatched'};
+        return {success:false,error_type:'payment_expiry_option_unmatched',filled_fields:0};
       // Native setters in an isolated world, one field at a time with its own events, the card number
       // last: a controlled form (Stripe Card/Payment Element) re-renders on each input event and would
       // reset sibling fields written before the event they never saw; brand detection on the number

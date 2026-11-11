@@ -384,7 +384,7 @@ process.stdout.write(JSON.stringify({pin, before, after: w.valid()}));
     # Codex B r2 #3: no grammar. One unit per side, then 8 characters free of any other currency, sign, digit or
     # negative-marking bracket; anything else beside a total is unclear, never matched (a second amount right
     # after the total too, by its digits).
-    ("Total 22,66 € (25,00 CHF)", 2266, "EUR", "ambiguous"),
+    ("Total 22,66 € (25,00 CHF)", 2266, "EUR", "not_found"),  # any bracket right of it (r4: no grammar)
     ("Total CAD $22.66", 2266, "USD", "ambiguous"),
     ("Total -EUR $22.66", 2266, "USD", "not_found"),
     ("Total 22.66 USD CAD", 2266, "USD", "ambiguous"),
@@ -397,6 +397,10 @@ process.stdout.write(JSON.stringify({pin, before, after: w.valid()}));
     ("Total EUR 22.66\nTotal EUR 100", 2266, "EUR", "ambiguous"),
     ("Total EUR 22.66\nTotal EUR 100.000", 2266, "EUR", "ambiguous"),
     ("Total (amount payable in EUR 22.66 including all applicable taxes)", 2266, "EUR", "not_found"),
+    # Codex B r4 #2: only balanced ASCII '(...)' left of the amount is allowed; a mismatch or another bracket is not.
+    ("Total (includes taxes] EUR 22.66", 2266, "EUR", "not_found"),
+    ("Total 【EUR 22.66】", 2266, "EUR", "not_found"),
+    ("Total [incl. VAT] EUR 22.66", 2266, "EUR", "not_found"),
 ])
 def test_amount_witness_states(text, cents, currency, state):
     values = {"__TEXT__": json.dumps(text), "__LATER__": json.dumps(text), "__WITNESS__": sp._AMOUNT_WITNESS,
@@ -1204,3 +1208,73 @@ def test_a_cancelled_inspection_releases_every_closure_it_pinned():
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True))
     assert {"doc-top", "doc-ad", "doc-kps"} <= set(page.released)
+
+
+# ----------------------------------------------------------------------------------------------- Codex B r4
+
+def test_a_line_running_into_the_text_size_cut_is_not_judged():
+    """Codex B r4 #3: the bracket after the cut is unseen, so the amount on the cut line is never matched."""
+    text = "x\n" * 99985 + "Total EUR 22.66" + " " * 30 + ")"
+    values = {"__TEXT__": json.dumps(text), "__LATER__": json.dumps(text), "__WITNESS__": sp._AMOUNT_WITNESS,
+              "__CENTS__": "2266", "__CURRENCY__": json.dumps("EUR")}
+    out = _node(re.sub("|".join(values), lambda m: values[m.group(0)], _WITNESS_HARNESS))
+    assert out["pin"]["state"] != "matched" and out["pin"]["unclear"] is True
+
+
+@pytest.mark.parametrize("replies, paced", [
+    ([_pending(0), {"success": False, "error_type": "payment_fields_changed"}], True),  # a failure without its count
+    ([{"success": False, "error_type": "payment_unexpected", "filled_fields": 0}], False),  # not the closure's type
+])
+def test_a_failure_needs_its_count_and_one_of_the_closures_error_types(replies, paced):
+    """Codex B r4 #1: anything else may have followed a write: invalid, with write uncertainty."""
+    doc = PaymentDocument("top", "page", "o-top", MERCHANT, _controls("cc-name"))
+
+    async def check(point):
+        return True
+
+    out = asyncio.run(_Replies(replies)._commit_payment_document(
+        doc, [{"index": 0, "token": "cc-name", "value": "x"}], 1000.0, strict=True, paced=check if paced else None))
+    assert out == {**_UNCERTAIN, "error_type": "payment_result_invalid", "filled_fields": 0}
+
+
+def test_every_pre_write_refusal_of_the_closure_counts_zero_and_every_stop_has_text():
+    """Codex B r4 #1: the closure sends an explicit zero before any write, and each stop commit_payment can return
+    has fixed text, in both its nothing-written and its partial form."""
+    harness = _INSPECT_HARNESS.split("const d = api.describe();")[0] + (
+        "process.stdout.write(JSON.stringify([api.commit([], 1e9, false, false), api.commit([], 1e9, false, false)]));")
+    script = harness.replace("__INSPECT__", sp._INSPECT_DISCOVERY).replace(
+        "__CASE__", json.dumps({"inputs": [["cc-number", False]]}))
+    invalid, used = _node(script)
+    assert invalid == {"success": False, "error_type": "payment_fields_invalid", "filled_fields": 0}
+    assert used == {"success": False, "error_type": "payment_fields_changed", "filled_fields": 0}
+    assert sp._valid_document_result(invalid, 1) and sp._valid_document_result(used, 1)
+    stops = sp._DOCUMENT_ERRORS | sp._PACED_STOPS | {"payment_transport_uncertain", "payment_result_invalid",
+                                                     "payment_consent_consumed", "payment_fields_not_retained"}
+    for error_type in stops:
+        for filled in (0, 1):
+            out = {"success": False, "error_type": error_type, "filled_fields": filled, "partially_filled": filled > 0}
+            bvp._commit_text(out)
+            assert out.get("error"), error_type
+            assert not (filled and "no card field was written" in out["error"]), error_type
+
+
+def test_a_cancelled_release_still_attempts_every_release_and_keeps_the_original_error():
+    """Codex B r4 #4: the release pass goes on past a cancelled release; the inspection's own refusal is raised."""
+    class CancelledRelease(_DiscoveryPage):
+        attempts = None  # the cleanup's release calls, once the refusal happened
+
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if method == "Runtime.callFunctionOn" and params["objectId"] == "doc-kps" \
+                    and "describe()" in params["functionDeclaration"]:
+                self.attempts = []
+                return {"result": {"exceptionDetails": {"text": "page threw"}}}
+            if self.attempts is not None and method in ("Runtime.releaseObject", "Target.detachFromTarget"):
+                self.attempts.append(params.get("objectId") or params.get("sessionId"))
+                if len(self.attempts) == 1:
+                    raise asyncio.CancelledError  # the first release of the cleanup pass is cancelled
+            return await super()._cdp(method, params, session_id, timeout)
+
+    page = CancelledRelease(_PAGE, exposed={"kps", "ad"}, controls={"kps": _CARD_FORM})
+    with pytest.raises(PaymentPolicyError):
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True))
+    assert {"doc-top", "doc-ad", "doc-kps"} <= set(page.attempts)
