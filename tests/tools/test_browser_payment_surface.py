@@ -16,6 +16,7 @@ from tools import browser_cdp_tool as cdp_tool
 from tools import browser_payment_surface as surface
 from tools import browser_use_cli
 from tools import browser_vault_payment as bvp
+from tests.waiting import async_wait_until, wait_until
 
 TREE = (("PAGE", "LP", "https://shop.test/", "https://shop.test", ""),
         ("CARD", "L1", "https://psp.test/f", "https://psp.test", "PAGE"))
@@ -495,8 +496,8 @@ def test_a_malformed_status_never_lifts_protection(routed, status):
 
 
 def _slow_stale_status(sup):
-    """Status answers 'unprotected' at once, but the reply reaches _refresh only after a pause."""
-    asked = threading.Event()
+    """Status answers 'unprotected' at once, but the reply reaches _refresh only once `go` is set."""
+    asked, go = threading.Event(), threading.Event()
     real = sup._cdp
 
     async def cdp(method, params=None, *, session_id=None, timeout=10.0):
@@ -504,24 +505,25 @@ def _slow_stale_status(sup):
             return await real(method, params, session_id=session_id, timeout=timeout)
         reply = {"id": 0, "result": dict(_GOOD)}
         asked.set()
-        await asyncio.sleep(0.6)
+        await async_wait_until(go.is_set, timeout=5)
         return reply
 
     sup._cdp = cdp
-    return asked
+    return asked, go
 
 
 def test_a_stale_refresh_racing_a_newer_claim_keeps_the_newer_scope(routed):
     # Codex A3 r3 P1 repro: an "unprotected" status is received, another claim completes, then the old
     # reply is processed. It must not admit the read: the read is decided against the newest scope.
     sup, _call = routed
-    asked = _slow_stale_status(sup)
+    asked, go = _slow_stale_status(sup)
     out = {}
     worker = threading.Thread(target=lambda: out.update(r=surface.supervisor_route_refusal(
         sup, "CARD", "Runtime.evaluate", {"expression": "1"}, "S-card")))
     worker.start()
     assert asked.wait(2)
     assert surface.claim_payment_surface(sup, _inspected()) is None
+    go.set()
     worker.join(3)
     assert out["r"] and out["r"]["error_type"] == "payment_surface_protected"
     with surface._LOCK:
@@ -541,7 +543,7 @@ def test_a_browser_cdp_call_overlapping_a_claim_is_withheld(monkeypatch):
     worker = threading.Thread(target=lambda: out.update(r=json.loads(cdp_tool._browser_cdp_via_supervisor(
         "t", "CARD", "Runtime.evaluate", {"expression": "card()", "awaitPromise": True}, 5))))
     worker.start()
-    time.sleep(0.1)
+    wait_until(lambda: sup.sent("Runtime.evaluate"), timeout=2)
     assert surface.claim_payment_surface(sup, _inspected()) is None
     worker.join(3)
     assert out["r"]["error_type"] == "payment_surface_protected" and "result" not in out["r"]
