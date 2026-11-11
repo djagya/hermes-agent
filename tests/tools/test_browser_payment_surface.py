@@ -1035,10 +1035,9 @@ def test_dialog_text_from_the_lock_is_never_shown_after_it_and_card_values_are_r
     from tools import browser_exec_dialogs
     from tools import browser_payment_done as done
 
-    monkeypatch.setattr(done, "_CARD_DIALOG_VALUES", [])
-    done.register_dialog_card_values({"card_number": "4000056655665556", "cvc": "737", "exp_month": "03",
-                                      "exp_year": "2031", "cardholder_name": "Ada Testperson"})
     sup = _dialog_sup("after-lock")
+    done.register_dialog_card_values({"card_number": "4000056655665556", "cvc": "737", "exp_month": "03",
+                                      "exp_year": "2031", "cardholder_name": "Ada Testperson"}, sup)
     monkeypatch.setattr(browser_exec_dialogs, "_supervisor", lambda task_id: sup)
 
     async def scenario():
@@ -1057,7 +1056,7 @@ def test_dialog_text_from_the_lock_is_never_shown_after_it_and_card_values_are_r
     out = browser_exec_dialogs.collect("after-lock", 0)
     locked, unlocked = out["pending"]
     assert locked["withheld"] == "payment_surface_locked" and "message" not in locked
-    assert unlocked["message"].count("«redacted-card»") == 3 and "737" not in unlocked["message"]
+    assert unlocked["message"] == "«redacted-card», ••/••, CVC •••?"
     blob = json.dumps(sup.snapshot().to_dict())
     assert "4000056655665556" not in blob and "Echo" not in blob and "Testperson" not in blob
 
@@ -1116,3 +1115,47 @@ def test_focus_page_sends_nothing_more_once_the_slot_locks():
     assert out["ok"] is False and "payment_surface_locked" in out["error"]
     assert probes == ["A"] and [m for m, _s in sup.sent] == ["Target.getTargets", "Target.detachFromTarget"]
     assert sup._page_session_id != "S-A"
+
+
+def test_the_dialog_bridge_intercepts_first_and_falls_back_to_native_dialogs():
+    from tools import browser_supervisor_dialogs as bsd
+
+    # interception first; without it no override is installed
+    for fail in (False, True):
+        sup = _dialog_sup("bridge-order")
+        calls = []
+
+        async def cdp(method, params=None, *, session_id=None, timeout=10.0, fail=fail):
+            calls.append(method)
+            if fail and method == "Fetch.enable":
+                raise RuntimeError("CDP error")
+            return {"result": {}}
+
+        sup._cdp = cdp
+        asyncio.run(sup._install_dialog_bridge("S1"))
+        assert calls == (["Fetch.enable"] if fail else
+                         ["Fetch.enable", "Page.addScriptToEvaluateOnNewDocument", "Runtime.evaluate"])
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for the bridge script")
+    # an unanswered bridge request (no interception, failed fulfil) opens the browser's own dialog, never "false"
+    harness = """
+const calls = [];
+let mode = 'fail';
+global.window = {confirm: (m) => { calls.push('native:' + m); return 'NATIVE'; },
+                 alert: (m) => { calls.push('native-alert:' + m); }, prompt: () => 'NATIVE-P'};
+global.XMLHttpRequest = class { open() {} send() { if (mode === 'fail') throw new Error('net');
+  this.status = 200; this.responseText = JSON.stringify({accept: true}); } };
+global.URLSearchParams = class { constructor(o) { this.o = o; } toString() { return ''; } };
+BRIDGE
+const out = {failed: window.confirm('Place order?')};
+window.alert('Saved');
+mode = 'ok';
+out.answered = window.confirm('Place order?');
+out.calls = calls;
+console.log(JSON.stringify(out));
+""".replace("BRIDGE", bsd._DIALOG_BRIDGE_SCRIPT)
+    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout) == {"failed": "NATIVE", "answered": True,
+                                      "calls": ["native:Place order?", "native-alert:Saved"]}

@@ -76,8 +76,10 @@ _CLAIM_LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 # counts as a release. Another task's claim (another supervisor) changes nothing here.
 _EPOCHS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 # A fenced native op (dialog answer, vault dispatch, recovery call) waits this long for the claim lock and holds
-# it at most ~20 s (status read + one bounded CDP op); a claim waits longer, so a card fill is never refused
-# only because such an op was running.
+# it for about 29 s at worst (status read 7 s, one evaluate 11 s, its reference-chain retry 11 s; a timed-out
+# call adds its drain, up to 5 s, only when the work ignores cancellation). A claim waits _CLAIM_WAIT_S for it,
+# so a card fill is normally not refused because such an op was running; if the wait does run out, the fill is
+# refused (payment_surface_unavailable), never sent unlocked.
 _FENCE_WAIT_S = 15.0
 _CLAIM_WAIT_S = 30.0
 

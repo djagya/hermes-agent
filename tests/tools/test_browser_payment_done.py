@@ -460,7 +460,7 @@ def test_card_scan_reaches_open_shadow_roots_and_refuses_past_its_bound(bound, e
     assert done._valid_snapshot(out, "https://shop.test") is None  # either way: never a safe document
 
 
-def _confirm(text, opened=1.0, kind="confirm", did="d-1", url=SHOP + "/checkout", session="S-page", frame=None):
+def _confirm(text, opened=1.0, kind="confirm", did="d-1", url=SHOP + "/checkout", session="S-page", frame="TOP"):
     return SimpleNamespace(id=did, type=kind, message=text, opened_at=opened, url=url, cdp_session_id=session,
                            frame_id=frame)
 
@@ -474,7 +474,8 @@ def test_a_held_confirm_is_reported_masked_and_answered_once():
     # returned at once (no 120 s wait), nothing read or closed
     assert out["error_type"] == "payment_dialog_pending" and out["lock_released"] is False
     assert not sup.sent("Runtime.evaluate") and not sup.sent("Target.closeTarget")
-    assert (held["id"], held["type"], held["origin"], held["on_payment_tab_top"]) == ("d-1", "confirm", SHOP, True)
+    assert (held["id"], held["type"], held["origin"], held["on_payment_tab_top"], held["on_shop_page"]) == (
+        "d-1", "confirm", SHOP, True, True)
     assert held["text"].startswith("Place order •••••••••••••••• for 22.66 EUR?") and len(held["text"]) == 200
     assert "4111" not in json.dumps(out)
     assert surface.payment_controls(sup)["dialog_pending"] == held
@@ -495,23 +496,52 @@ def test_a_held_confirm_is_reported_masked_and_answered_once():
     (_confirm("Pay?", session="S-other"), "payment_dialog_not_payment_tab"),  # another tab
     (_confirm("Pay?", url=""), "payment_dialog_not_payment_tab"),  # an unknown source
     (_confirm("Pay?", frame="MSUB"), "payment_dialog_not_payment_tab"),  # a child frame of the shop page
+    (_confirm("Pay?", frame=None), "payment_dialog_not_payment_tab"),  # no frame id: top identity unproven
     (_confirm("Leave?", kind="beforeunload"), "payment_dialog_not_confirm"),  # confirms only
 ])
 def test_payment_dialog_answers_only_a_confirm_of_the_payment_tab_top_page(dialog, error):
     sup = _paid([CHECKOUT])
     sup.dialogs = [dialog]
-    assert done.payment_done(sup)["dialog_pending"]["on_payment_tab_top"] is (dialog.type == "beforeunload")
+    reported = done.payment_done(sup).get("dialog_pending") or {}  # another tab's dialog: a count only
+    assert reported.get("on_payment_tab_top", False) is (dialog.type == "beforeunload")
     assert done.payment_dialog(sup, "d-1", True)["error_type"] == error
     assert not sup.sent("respond_to_dialog")
 
 
-def test_dialog_text_is_redacted_of_the_card_before_masking(monkeypatch):
-    monkeypatch.setattr(done, "_CARD_DIALOG_VALUES", [])
+def test_dialog_text_is_redacted_of_the_card_before_masking():
+    sup, other = FakeSup([CHECKOUT]), FakeSup([CHECKOUT])
     done.register_dialog_card_values({"card_number": "4000056655665556", "cvc": "737", "exp_month": "3",
-                                      "exp_year": "2031", "cardholder_name": "Ada Testperson"})
-    text = done._dialog_text("Card 4000056655665556 / 3/31 / 03 / 2031, CVC 737, ADA TESTPERSON: place order?")
+                                      "exp_year": "2031", "cardholder_name": "Ada Testperson"}, sup)
+    text = done._dialog_text("Card 4000056655665556 / 3/31 / 03 / 2031, CVC 737, ADA TESTPERSON: place order?", sup)
     assert "737" not in text and "3/31" not in text and "03 / 2031" not in text
     assert "testperson" not in text.lower() and "5556" not in text
+    # no oracle: every 3+ digit run is masked alike, and another slot's dialogs never see this card's values
+    probe = "CVC 735 736 737 738? Ada Testperson?"
+    assert done._dialog_text(probe, other) == "CVC ••• ••• ••• •••? Ada Testperson?"
+    assert done._dialog_text(probe, sup) == "CVC ••• ••• ••• •••? «redacted-card»?"
+
+
+def test_only_the_shop_page_confirm_can_be_accepted():
+    # peer r4 P3-A: a confirm on a bank (3-D Secure) page at the top of the payment tab may only be dismissed
+    sup = _paid([ACS])
+    sup.dialogs = [_confirm("Approve 922.66 EUR to Other Merchant?", url="https://acs.bank.test/challenge")]
+    held = done.payment_done(sup)["dialog_pending"]
+    assert (held["on_payment_tab_top"], held["on_shop_page"]) == (True, False)
+    assert done.payment_dialog(sup, "d-1", True)["error_type"] == "payment_dialog_not_shop_page"
+    assert not sup.sent("respond_to_dialog")
+    assert done.payment_dialog(sup, "d-1", False)["answered"] == "dismiss"
+
+
+def test_dialogs_on_other_tabs_never_hold_up_the_handover():
+    # peer r4 P3-B: an older confirm on another tab is counted only; the payment tab's own dialog is reported
+    sup = _paid([CHECKOUT])
+    sup.dialogs = [_confirm("Other?", opened=0.5, did="d-0", url="https://x.test/", session="S-other"),
+                   _confirm("Place order?", did="d-1")]
+    out = done.payment_done(sup)
+    assert out["dialog_pending"]["id"] == "d-1" and out["dialogs_pending"] == 1 and out["other_dialogs_pending"] == 1
+    sup = _paid([CONFIRM])
+    sup.dialogs = [_confirm("Other?", did="d-0", url="https://x.test/", session="S-other")]
+    assert done.payment_done(sup)["success"] is True  # handed over, not stalled by the other tab
 
 
 def test_a_beforeunload_is_allowed_only_while_payment_done_closes_the_tab():
@@ -531,3 +561,14 @@ def test_a_closed_recorded_tab_never_makes_payment_done_ambiguous():
     assert done.payment_done(sup)["error_type"] == "payment_done_ambiguous"  # both still open: ambiguous
     sup.extra_tabs = []  # TABA was closed
     assert done.payment_done(sup)["success"] is True
+
+
+def test_only_the_owner_approved_total_is_shown_in_a_dialog():
+    text = "Place order for 122.66 EUR (122,66)? Not 122.67, 922.66, 1.122,66 or 122.665."
+    sup = _paid([CHECKOUT])
+    unrecorded = done._dialog_text(text, sup)  # no approved amount: every amount stays masked
+    assert "122" not in unrecorded and "922" not in unrecorded
+    done.record_approved_amount(sup, "TAB", "122.66", "EUR")
+    shown = done._dialog_text(text, sup)
+    assert shown == "Place order for 122.66 EUR (122,66)? Not •••.67, •••.66, 1.•••,66 or •••.•••."
+    assert "122.66" not in done._dialog_text(text, _paid([CHECKOUT]))  # another slot's payment: masked

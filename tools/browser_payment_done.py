@@ -27,7 +27,7 @@ import re
 import threading
 import time
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
@@ -69,6 +69,10 @@ class _Payment:
     documents: frozenset  # (frame id, loader) of each card document
     receiving: frozenset  # non-merchant origins that received card fields (reviewed or owner-approved)
     merchant_fields: bool = False  # the merchant document itself received card fields
+    # The cart total and currency the owner approved for this payment ("122.66", "EUR"), "" when none: the one
+    # amount a dialog's text may show unmasked.
+    amount: str = ""
+    currency: str = ""
 
     @property
     def frame_ids(self) -> frozenset:
@@ -130,6 +134,34 @@ def record_payment(supervisor: Any, inspected: Any) -> None:
             payment = _Payment(payment.tab, payment.merchant, payment.loader, old.documents | payment.documents,
                                old.receiving | payment.receiving, old.merchant_fields or payment.merchant_fields)
         tabs[payment.tab] = payment
+
+
+_APPROVED_TOTAL = re.compile(r"(0|[1-9][0-9]{0,6})\.[0-9]{2}")
+
+
+def record_approved_amount(supervisor: Any, tab: Any, total: Any, currency: Any) -> None:
+    """Called by the card fill after a confirmed claim, with the cart total and currency the owner approved.
+    Anything malformed records nothing (every amount then stays masked)."""
+    if not (isinstance(total, str) and _APPROVED_TOTAL.fullmatch(total) and isinstance(currency, str)
+            and re.fullmatch(r"[A-Z]{3}", currency)):
+        return
+    with _LOCK:
+        tabs = _PAYMENTS.get(supervisor)
+        payment = tabs.get(tab) if tabs is not None else None
+        if payment is not None:
+            tabs[tab] = replace(payment, amount=total, currency=currency)
+
+
+def _approved_amounts(supervisor: Any) -> frozenset:
+    """``(integer part, cents)`` of each owner-approved total recorded for ``supervisor``'s payments."""
+    if supervisor is None:
+        return frozenset()
+    with _LOCK:
+        try:
+            payments = list((_PAYMENTS.get(supervisor) or {}).values())
+        except TypeError:
+            return frozenset()
+    return frozenset(tuple(p.amount.split(".")) for p in payments if p.amount)
 
 
 def _forget(supervisor: Any, tab: str) -> None:
@@ -542,15 +574,18 @@ def _released(supervisor: Any) -> bool:
 
 _DIALOG_TYPES_HELD = ("confirm", "beforeunload")
 MAX_DIALOG_TEXT = 200
-# dlz: the saved card's values a dialog text may quote that the global redactor does not hold (holder name,
-# expiry forms), kept in memory for dialog text only: an exact-substring scrub of every tool result would
-# blank common names and dates. The number and CVC are in the global registry (agent.redact).
-_CARD_DIALOG_VALUES: list = []
+# dlz: the saved card's values a dialog text may quote, per supervisor (its slot and profile): the number, CVC,
+# holder name and expiry forms, kept in memory for dialog text only (an exact-substring scrub of every tool
+# result would blank common names and dates). A dialog is scrubbed only of its own supervisor's card; every
+# digit run of 3+ and every date-like group is masked anyway, so no scrub difference tells a value apart.
+_CARD_DIALOG_VALUES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _MAX_CARD_DIALOG_VALUES = 64
+_DIGITS_MASKED = re.compile(r"\d{1,2}\s*[/\-]\s*\d{2,4}|\d{3,}")
 
 
-def register_dialog_card_values(secret: dict) -> None:
-    """Called by the card fill with the validated card, before any field is written."""
+def register_dialog_card_values(secret: dict, supervisor: Any) -> None:
+    """Called by the card fill with the validated card and the supervisor it fills on, before any field is
+    written."""
     values = [str(secret.get("card_number") or ""), str(secret.get("cvc") or "")]
     holder = str(secret.get("cardholder_name") or "").strip()
     if len(holder) >= 3:
@@ -562,30 +597,66 @@ def register_dialog_card_values(secret: dict) -> None:
             for y in (yy, year):
                 values += [f"{m}/{y}", f"{m} / {y}", f"{m}-{y}"]
     with _LOCK:
+        try:
+            held = _CARD_DIALOG_VALUES.setdefault(supervisor, [])
+        except TypeError:  # no supervisor object to scope by: the digit mask still covers number, CVC, expiry
+            return
         for value in values:
-            if value and value not in _CARD_DIALOG_VALUES:
-                _CARD_DIALOG_VALUES.append(value)
-        del _CARD_DIALOG_VALUES[:-_MAX_CARD_DIALOG_VALUES]
+            if value and value not in held:
+                held.append(value)
+        del held[:-_MAX_CARD_DIALOG_VALUES]
 
 
-def redact_dialog_text(text: Any) -> str:
-    """Any dialog text the model can see: the forced secret redactor (registered card number and CVC, tokens)
-    and then this card's holder name and expiry forms (case-insensitive)."""
+def _mask_digits(text: str) -> str:
+    return _DIGITS_MASKED.sub(lambda m: re.sub(r"\d", "•", m.group(0)), text)
+
+
+# A whole amount token: digits, one decimal separator ("." or ","), two digits, with no digit, "." or "," on
+# either side (so "1.122,66" or "122.665" never count as "122.66").
+_AMOUNT_TOKEN = re.compile(r"(?<![\d.,])(\d{1,7})([.,])(\d{2})(?![\d.,]?\d)")
+_KEPT = "\ue000{}\ue001"  # private-use marks: no redactor or scrub touches them
+
+
+def _keep_approved_amount(text: str, supervisor: Any) -> tuple:
+    """Set aside each token that exactly equals an owner-approved total of ``supervisor`` (either separator)."""
+    approved, kept = _approved_amounts(supervisor), []
+    if not approved:
+        return text, kept
+
+    def keep(m):
+        if (m.group(1), m.group(3)) not in approved:
+            return m.group(0)
+        kept.append(m.group(0))
+        return _KEPT.format(len(kept) - 1)
+
+    return _AMOUNT_TOKEN.sub(keep, text), kept
+
+
+def redact_dialog_text(text: Any, supervisor: Any = None) -> str:
+    """Any dialog text the model can see. Every run of 3+ digits and every date-like group (``03/31``,
+    ``3 - 2031``) is masked FIRST, so no exact-value scrub after it can mark which number was the CVC, the card
+    number or the expiry; then the forced secret redactor, then the card values registered for ``supervisor``
+    (the dialog's own; case-insensitive), and the mask once more over what those left. The one exception: a
+    token exactly equal to the cart total the owner approved for this supervisor's payment stays readable."""
     from agent.redact import redact_sensitive_text
 
-    text = redact_sensitive_text(str(text or ""), force=True)
+    text, kept = _keep_approved_amount(str(text or "").replace("\ue000", "").replace("\ue001", ""), supervisor)
+    text = redact_sensitive_text(_mask_digits(text), force=True)
     with _LOCK:
-        values = sorted(_CARD_DIALOG_VALUES, key=len, reverse=True)
+        values = sorted(_CARD_DIALOG_VALUES.get(supervisor, ()) if supervisor is not None else (), key=len,
+                        reverse=True)
     for value in values:
         text = re.sub(re.escape(value), "«redacted-card»", text, flags=re.IGNORECASE)
+    text = _mask_digits(text)
+    for i, token in enumerate(kept):
+        text = text.replace(_KEPT.format(i), token)
     return text
 
 
-def _dialog_text(message: Any) -> str:
-    """A held dialog's text for the model: redacted (``redact_dialog_text``), then whitespace collapsed, every
-    run of 4+ digits masked, and 200 characters at most."""
-    text = re.sub(r"\s+", " ", redact_dialog_text(message)).strip()
-    return re.sub(r"\d{4,}", lambda m: "•" * len(m.group(0)), text)[:MAX_DIALOG_TEXT]
+def _dialog_text(message: Any, supervisor: Any) -> str:
+    """A held dialog's text for the model: redacted and masked (``redact_dialog_text``), whitespace collapsed,
+    200 characters at most."""
+    return re.sub(r"\s+", " ", redact_dialog_text(message, supervisor)).strip()[:MAX_DIALOG_TEXT]
 
 
 def _held_dialogs(supervisor: Any) -> list:
@@ -597,8 +668,9 @@ def _held_dialogs(supervisor: Any) -> list:
     return sorted((d for d in dialogs if getattr(d, "type", "") in _DIALOG_TYPES_HELD), key=lambda d: d.opened_at)
 
 
-async def _payment_tab_top(sup: Any) -> Optional[tuple]:
-    """``(session, tab id, top origin)`` of the supervised page when it is a recorded payment tab, else None."""
+async def _payment_tab_top(sup: Any) -> Optional[dict]:
+    """The supervised page when it is a recorded payment tab: ``{sid, tab, frame, origin, sessions}`` (its top
+    frame's id and origin, and the page session plus the tab's frame sessions), else None."""
     with sup._state_lock:
         sid = sup._page_session_id if sup._active else None
     if not sid:
@@ -607,49 +679,72 @@ async def _payment_tab_top(sup: Any) -> Optional[tuple]:
     tab = info.get("targetId")
     with _LOCK:
         recorded = tab in (_PAYMENTS.get(sup) or {})
-    return (sid, tab, _url_origin(info.get("url"))) if recorded else None
+    if not recorded:
+        return None
+    frame = (await sup._cdp("Page.getFrameTree", session_id=sid))["result"]["frameTree"]["frame"]
+    with sup._state_lock:
+        children = {f.cdp_session_id for f in getattr(sup, "_frames", {}).values() if f.cdp_session_id}
+    return {"sid": sid, "tab": tab, "frame": str(frame.get("id") or ""), "origin": _url_origin(frame.get("url")),
+            "sessions": {sid} | children}
 
 
-def _on_payment_tab_top(sup: Any, dialog: Any, top: Optional[tuple]) -> bool:
-    """The dialog was raised by the recorded payment tab's top document: on its page session, by its top frame
-    (or no frame named), on the top document's origin, which is not a card origin."""
+def _dialog_place(sup: Any, dialog: Any, top: Optional[dict]) -> tuple:
+    """``(on_payment_tab_top, on_shop_page)``. On the top: raised by the recorded payment tab's top document,
+    proven by its page session and its top frame's id (a dialog without a frame id is not), on that document's
+    origin, which is not a card origin. On the shop page: that, and the origin is the payment's merchant."""
     if top is None:
-        return False
-    sid, tab, origin = top
+        return False, False
     with _LOCK:
-        payment = (_PAYMENTS.get(sup) or {}).get(tab)
-    dialog_origin = _url_origin(getattr(dialog, "url", ""))
-    return (payment is not None and getattr(dialog, "cdp_session_id", None) == sid
-            and getattr(dialog, "frame_id", None) in (None, "", tab) and bool(origin) and dialog_origin == origin
-            and origin not in _card_origins(payment))
+        payment = (_PAYMENTS.get(sup) or {}).get(top["tab"])
+    origin = _url_origin(getattr(dialog, "url", ""))
+    frame = getattr(dialog, "frame_id", None)
+    on_top = (payment is not None and getattr(dialog, "cdp_session_id", None) == top["sid"]
+              and bool(top["frame"]) and frame == top["frame"] and bool(origin) and origin == top["origin"]
+              and origin not in _card_origins(payment))
+    return on_top, on_top and origin == payment.merchant
+
+
+def _top_or_none(supervisor: Any) -> Optional[dict]:
+    try:
+        return _wait(_payment_tab_top(supervisor), supervisor._loop, timeout=7)
+    except Exception:  # health: allow BLE001 -- unknown source: reported, never answerable
+        return None
 
 
 def _dialog_report(supervisor: Any) -> dict:
-    """``{"dialog_pending": {id, type, origin, on_payment_tab_top, text}, "dialogs_pending": n}`` while a held
-    dialog waits, else {}. Only a confirm on the payment tab's own top document can be answered."""
+    """While held dialogs wait: ``dialog_pending {id, type, origin, on_payment_tab_top, on_shop_page, text}`` for
+    the oldest one on the payment tab's sessions with ``dialogs_pending`` (how many there), and
+    ``other_dialogs_pending`` (a count only) for those on other tabs or unknown sessions; else {}."""
     held = _held_dialogs(supervisor)
     if not held:
         return {}
-    dialog = held[0]
-    try:
-        top = _wait(_payment_tab_top(supervisor), supervisor._loop, timeout=7)
-    except Exception:  # health: allow BLE001 -- unknown source: reported, never answerable
-        top = None
-    return {"dialog_pending": {"id": dialog.id, "type": dialog.type, "origin": _url_origin(getattr(dialog, "url", "")),
-                               "on_payment_tab_top": _on_payment_tab_top(supervisor, dialog, top),
-                               "text": _dialog_text(dialog.message)}, "dialogs_pending": len(held)}
+    top = _top_or_none(supervisor)
+    mine = [d for d in held if top is not None and getattr(d, "cdp_session_id", None) in top["sessions"]]
+    out: dict = {}
+    if mine:
+        dialog = mine[0]
+        on_top, on_shop = _dialog_place(supervisor, dialog, top)
+        out = {"dialog_pending": {"id": dialog.id, "type": dialog.type,
+                                  "origin": _url_origin(getattr(dialog, "url", "")), "on_payment_tab_top": on_top,
+                                  "on_shop_page": on_shop, "text": _dialog_text(dialog.message, supervisor)},
+               "dialogs_pending": len(mine)}
+    if len(held) > len(mine):
+        out["other_dialogs_pending"] = len(held) - len(mine)
+    return out
 
 
-_DIALOG_PENDING = ("A page dialog waits for an answer on the payment, so the page is blocked (dialog_pending). Nothing "
-                   "was clicked or closed and the browser stays locked. Answer it once with payment_dialog only if it "
-                   "is a confirm on the shop page (on_payment_tab_top true) that matches the Pay you were told to "
-                   "make (e.g. 'Place order for <amount>?'); for anything else (upsells, subscriptions, unknown) ask "
-                   "the user. Then call payment_done again.")
+_DIALOG_PENDING = ("A page dialog waits for an answer on the payment tab, so the page is blocked (dialog_pending). "
+                   "Nothing was clicked or closed and the browser stays locked. Accept it once with payment_dialog "
+                   "only if it is a confirm on the shop page (on_shop_page true) that matches the Pay you were told "
+                   "to make (e.g. 'Place order for <amount>?'); for anything else (upsells, subscriptions, unknown) "
+                   "ask the user. Then call payment_done again.")
 _DIALOG_NONE = ("That dialog is not waiting for an answer (answered, dismissed or closed). Nothing was done. Call "
                 "payment_controls or payment_done to see the page now.")
 _DIALOG_NOT_CONFIRM = "payment_dialog answers only a confirm. Nothing was done; ask the user."
 _DIALOG_NOT_PAYMENT_TAB = ("That confirm does not come from the payment tab's own page (a card or bank frame, another "
                            "tab, or an unknown source), so Hermes does not answer it. Nothing was done; ask the user.")
+_DIALOG_NOT_SHOP = ("That confirm is not on the shop's own page (e.g. a bank or payment-provider page), so Hermes "
+                    "does not accept it; it can only be dismissed (accept false). Nothing was done; ask the user.")
 _DIALOG_FAILED = ("The dialog could not be answered (it may have closed already); it is not retried. Call "
                   "payment_controls or payment_done to see where the payment tab is.")
 
@@ -657,7 +752,8 @@ _DIALOG_FAILED = ("The dialog could not be answered (it may have closed already)
 def payment_dialog(supervisor: Any, dialog_id: Any, accept: Any) -> dict:
     """``browser_vault action=payment_dialog dialog_id=… accept=true|false``: one native answer to the confirm
     ``dialog_pending`` showed, only while that exact dialog is still pending, is a confirm, and belongs to the
-    recorded payment tab's top document. One answer per dialog (consumed before it is sent), never retried."""
+    recorded payment tab's top document; accepting also needs the shop's own page. One answer per dialog
+    (consumed before it is sent), never retried."""
     if type(accept) is not bool or not isinstance(dialog_id, str) or not dialog_id:
         return _refusal("payment_dialog_invalid", "dialog_id (from dialog_pending) and accept (true or false) are "
                                                   "required. Nothing was done.")
@@ -668,12 +764,11 @@ def payment_dialog(supervisor: Any, dialog_id: Any, accept: Any) -> dict:
         return _refusal("payment_dialog_none", _DIALOG_NONE)
     if dialog.type != "confirm":
         return _refusal("payment_dialog_not_confirm", _DIALOG_NOT_CONFIRM)
-    try:
-        top = _wait(_payment_tab_top(supervisor), supervisor._loop, timeout=7)
-    except Exception:  # health: allow BLE001 -- unknown source: never answered
-        top = None
-    if not _on_payment_tab_top(supervisor, dialog, top):
+    on_top, on_shop = _dialog_place(supervisor, dialog, _top_or_none(supervisor))
+    if not on_top:
         return _refusal("payment_dialog_not_payment_tab", _DIALOG_NOT_PAYMENT_TAB)
+    if accept and not on_shop:
+        return _refusal("payment_dialog_not_shop_page", _DIALOG_NOT_SHOP)
     try:
         out = supervisor.respond_to_dialog("accept" if accept else "dismiss", dialog_id=dialog.id)
     except Exception as exc:  # health: allow BLE001 -- CDP text can quote the page; fixed type only
@@ -716,7 +811,7 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
             return _refusal("payment_tab_gone", _TAB_GONE, lock_released=_released(supervisor))
         seen = {k: info[k] for k in ("url", "title") if k in info} or seen
         report = _dialog_report(supervisor)
-        if report:  # a held dialog blocks the page: hand it over now, not after the whole wait
+        if "dialog_pending" in report:  # a held dialog blocks the payment tab: hand it over now, not after the wait
             return _refusal("payment_dialog_pending", _DIALOG_PENDING, url=_url_origin(seen.get("url", "")),
                             title="", lock_released=False, **told, **report)
         if state == "ready":
