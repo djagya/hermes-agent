@@ -197,6 +197,14 @@ def _browser_profile_enabled() -> bool:
     return use_real_profile()
 
 
+def managed_browser_mode() -> bool:
+    """dlz: monolith browser-control owns every browser (``tools.browser_control_route``). The real-profile
+    source would launch or attach a local Chromium over direct CDP, outside control leases and handoff
+    admission, so it never runs then. ``managed_browser`` fails closed (a broken probe counts as managed)."""
+    from tools.browser_session_cdp import managed_browser
+    return managed_browser()
+
+
 def enabled_backends() -> list[LoginBackend]:
     """Local first (always on), then every detected external manager the user has not turned off,
     then the read-only real-profile browser source when ``browser.use_real_profile`` is on."""
@@ -208,7 +216,7 @@ def enabled_backends() -> list[LoginBackend]:
         if is_enabled(cls.name):
             section = cfg.get(cls.name) or {}
             out.append(cls(section if isinstance(section, dict) else {}))
-    if _browser_profile_enabled():
+    if _browser_profile_enabled() and not managed_browser_mode():  # dlz: never in managed mode
         from agent.vault_backends.browser import BrowserProfileLoginBackend
         out.append(BrowserProfileLoginBackend())
     from agent.vault_backend_registry import enabled_plugin_backends

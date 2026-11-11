@@ -74,13 +74,20 @@ def standalone(monkeypatch: pytest.MonkeyPatch, tmp_path):
 
 
 def test_notifications_mode_reaches_every_standalone_send(standalone) -> None:
-    """``important`` (default) sends silently, text and media alike; ``notify`` rings (cron's
-    ``cron.delivery.notify``); ``display.platforms.telegram.notifications: all`` in config.yaml rings."""
+    """dlz: a standalone send (the ``send_message`` tool, ``hermes send``, cron's standalone lane) is a
+    deliverable like the gateway's final reply, so under ``important`` (default) it rings unless the
+    caller passes ``notify=False`` (cron's ``cron.delivery.notify: false``), text and media alike; the
+    fork's standalone sender always rang. ``notifications: all`` in config.yaml rings regardless."""
     doc = standalone.home / "report.txt"
     doc.write_text("x", encoding="utf-8")
     assert standalone.run("status: still syncing")["success"] is True
-    assert standalone.bot.send_message.await_args.kwargs["disable_notification"] is True
+    assert "disable_notification" not in standalone.bot.send_message.await_args.kwargs
     assert standalone.run("report attached", media_files=[(str(doc), False)])["success"] is True
+    assert "disable_notification" not in standalone.bot.send_document.await_args.kwargs
+
+    standalone.run("quiet status", notify=False)
+    assert standalone.bot.send_message.await_args.kwargs["disable_notification"] is True
+    assert standalone.run("quiet report", notify=False, media_files=[(str(doc), False)])["success"] is True
     assert standalone.bot.send_document.await_args.kwargs["disable_notification"] is True
 
     standalone.run("daily brief", notify=True)
@@ -102,8 +109,9 @@ def test_rich_messages_opt_in_sends_tables_through_send_rich_message(standalone)
     assert result == {"success": True, "platform": "telegram", "chat_id": "123", "message_id": "9"}
     method, = standalone.bot.do_api_request.await_args.args
     payload = standalone.bot.do_api_request.await_args.kwargs["api_kwargs"]
-    assert (method, payload["rich_message"]["markdown"], payload["disable_notification"]) == (
-        "sendRichMessage", table, True)
+    # dlz: an unmarked standalone send rings (see test_notifications_mode_reaches_every_standalone_send).
+    assert (method, payload["rich_message"]["markdown"], payload.get("disable_notification")) == (
+        "sendRichMessage", table, None)
     standalone.bot.send_message.assert_not_awaited()
 
     standalone.run(table)  # rich_messages off (the default): legacy MarkdownV2, table flattened
@@ -141,7 +149,7 @@ def test_photo_batches_go_as_albums_and_mixed_batches_stay_per_file(standalone) 
     assert standalone.run("", media_files=photos)["success"] is True
     albums = [call.kwargs for call in standalone.bot.send_media_group.await_args_list]
     assert [len(kw["media"]) for kw in albums] == [10, 2]
-    assert all(kw["disable_notification"] is True for kw in albums)
+    assert all("disable_notification" not in kw for kw in albums)  # dlz: an unmarked standalone send rings
     standalone.bot.send_photo.assert_not_awaited()
 
     doc = standalone.home / "notes.txt"
@@ -149,6 +157,11 @@ def test_photo_batches_go_as_albums_and_mixed_batches_stay_per_file(standalone) 
     assert standalone.run("", media_files=photos[:2] + [(str(doc), False)])["success"] is True
     assert standalone.bot.send_media_group.await_count == 2
     assert standalone.bot.send_photo.await_count == 2
+
+
+def _receipts(kwargs):
+    """dlz: Telegram's confirmed album answer: one Message per photo, one shared ``media_group_id``."""
+    return [SimpleNamespace(message_id=11 + i, media_group_id="g") for i in range(len(kwargs["media"]))]
 
 
 def _photos(home, n):
@@ -222,7 +235,7 @@ def test_album_to_a_stale_topic_retries_once_without_the_thread(standalone) -> N
         calls.append(kwargs)
         if kwargs.get("message_thread_id") or kwargs.get("direct_messages_topic_id"):
             raise BadRequest("Bad Request: message thread not found")
-        return [SimpleNamespace(message_id=11)]
+        return _receipts(kwargs)
     standalone.bot.send_media_group = AsyncMock(side_effect=send_media_group)
     standalone.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=12))
 
@@ -279,7 +292,7 @@ def test_album_on_telegrams_json_5xx_resends_the_same_album(standalone, monkeypa
         uploads.append([item.media.read() for item in kwargs["media"]])
         if len(uploads) == 1:
             raise NetworkError("Bad Gateway")
-        return [SimpleNamespace(message_id=11)]
+        return _receipts(kwargs)
     standalone.bot.send_media_group = AsyncMock(side_effect=send_media_group)
     standalone.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=12))
 
@@ -358,3 +371,57 @@ def test_an_unhashable_callable_sender_still_delivers(standalone, monkeypatch) -
     monkeypatch.setattr(platform_registry.get("telegram"), "standalone_sender_fn", sender)
     assert standalone.run("daily brief", notify=True) == {"success": True, "message_id": "obj"}
     assert sender.calls == [("daily brief", True)]
+
+
+@pytest.mark.parametrize("answer", [[], [SimpleNamespace(message_id=11)],
+                                    [SimpleNamespace(message_id=11, media_group_id=None),
+                                     SimpleNamespace(message_id=12, media_group_id=None)]],
+                         ids=["empty", "short", "no-group-id"])
+def test_album_with_a_malformed_receipt_is_uncertain_and_never_resent(standalone, answer) -> None:
+    """dlz: the fork's receipt check (exact count, one shared non-null ``media_group_id``) survives the
+    move into the plugin's album sender: a malformed ack is a possibly-posted album, never a per-photo copy."""
+    standalone.bot.send_media_group = AsyncMock(return_value=answer)
+    standalone.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=13))
+
+    result = standalone.run("", media_files=_photos(standalone.home, 2))
+
+    assert result["success"] is True
+    assert "not resent" in " ".join(result["warnings"])
+    assert "message_id" not in result
+    assert standalone.bot.send_media_group.await_count == 1
+    standalone.bot.send_photo.assert_not_awaited()
+
+
+def test_confirmed_album_reports_its_receipt_id(standalone) -> None:
+    standalone.bot.send_media_group = AsyncMock(return_value=[
+        SimpleNamespace(message_id=21, media_group_id="g"), SimpleNamespace(message_id=22, media_group_id="g")])
+    result = standalone.run("", media_files=_photos(standalone.home, 2))
+    assert result["success"] is True and result["message_id"] == "22"
+    assert not result.get("warnings")
+
+
+@pytest.mark.parametrize("fence", ["~~~", "~~~~", "  ~~~"])
+def test_tag_inside_a_tilde_fence_is_an_example_not_html(standalone, fence) -> None:
+    """dlz (fork ``_telegram_has_html``): a tilde-fenced block is Markdown code like a backtick one, so
+    ``<b>literal</b>`` inside it never opts the whole message into HTML parse mode."""
+    standalone.run(f"Example:\n{fence}html\n<b>literal</b>\n{fence.strip()}\n")
+    assert standalone.bot.send_message.await_args.kwargs["parse_mode"] == "MarkdownV2"
+    standalone.run("<b>real</b> bold")  # control: a tag outside code is still HTML
+    assert standalone.bot.send_message.await_args.kwargs["parse_mode"] == "HTML"
+
+
+def test_html_rejected_as_html_and_markdown_falls_back_to_readable_plain_text(standalone) -> None:
+    """dlz (fork ``_telegram_html_to_plain``): the last-resort plain send carries no tags or entities;
+    a link keeps its target, an unsupported angle literal stays readable."""
+    async def send_message(**kwargs):
+        if kwargs.get("parse_mode"):
+            raise BadRequest("Bad Request: can't parse entities: unsupported start tag")
+        return SimpleNamespace(message_id=7)
+    standalone.bot.send_message = AsyncMock(side_effect=send_message)
+
+    result = standalone.run('<b>Bold</b> &amp; <a href="https://x.example/p">docs</a> for List<int>')
+
+    assert result["success"] is True
+    last = standalone.bot.send_message.await_args.kwargs
+    assert last["parse_mode"] is None
+    assert last["text"] == "Bold & docs (https://x.example/p) for List<int>"

@@ -377,6 +377,27 @@ def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
     return bool(cursor.rowcount)
 
 
+def close_uncertain_claim(obligation_id: str) -> bool:
+    """dlz: close a runtime claim whose resend was already handed to ``adapter.send`` when the task was
+    cancelled. The platform may have posted it, so it must never go back to ``failed`` (redelivery would
+    duplicate it): it is closed like ``terminalize_send``'s uncertain outcome. Same owner/state guard as
+    ``release_runtime_claim``: a row the send already terminalized is left alone."""
+    pid, started = _owner_stamp()
+    if started is None:
+        return False
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='delivered', updated_at=?, last_error=?
+               WHERE obligation_id=? AND state='attempting'
+                 AND owner_pid IS ? AND owner_started_at IS ?""",
+            (time.time(), "delivery_uncertain: cancelled during send", obligation_id, pid, started))
+    if cursor.rowcount:
+        logger.warning("obligation %s: cancelled during send; outcome uncertain, closed without redelivery",
+                       obligation_id)
+    return bool(cursor.rowcount)
+
+
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(

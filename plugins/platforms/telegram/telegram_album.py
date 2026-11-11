@@ -7,6 +7,11 @@ reset after the write, an HTML 5xx page, or a 5xx JSON answer once that budget i
 ``telegram_send_errors``) is reported ambiguous and never resent. Any other failure (a Bot API
 refusal, a flood wait, a connect/pool failure whose request never left, a local error) falls back
 photo by photo. A stale forum topic ("thread not found") retries once without the topic.
+
+dlz: a chunk counts as confirmed only by Telegram's exact receipts (one per photo, one shared non-null
+``media_group_id``: the fork's ``_send_telegram_photo_album`` check). A short, empty, split or id-less
+answer is ambiguous like a lost reply (it may be posted, so it is never resent); ``message_id`` is the
+last CONFIRMED receipt's id.
 """
 
 from __future__ import annotations
@@ -32,6 +37,18 @@ def reply_lost(error: Exception) -> bool:
     photo by photo."""
     from plugins.platforms.telegram.telegram_send_errors import may_have_delivered
     return may_have_delivered(error)
+
+
+def confirmed_receipt_ids(receipts: Any, count: int) -> Optional[list[str]]:
+    """dlz: the message ids of a ``sendMediaGroup`` answer that confirms exactly ``count`` photos in one
+    album, else ``None`` (the chunk's outcome is unknown)."""
+    if not isinstance(receipts, (list, tuple)) or len(receipts) != count:
+        return None
+    groups = {getattr(receipt, "media_group_id", None) for receipt in receipts}
+    ids = [getattr(receipt, "message_id", None) for receipt in receipts]
+    if None in groups or len(groups) != 1 or any(mid is None for mid in ids):
+        return None
+    return [str(mid) for mid in ids]
 
 
 def _stale_topic(adapter: Any, error: Exception, metadata: Optional[dict]) -> bool:
@@ -102,10 +119,11 @@ def _open_chunk(adapter: Any, stack: contextlib.ExitStack, chunk: list[tuple], i
     return media, opened, sent
 
 
-async def _send_chunk(adapter: Any, chat_id: str, media: list, opened: list, metadata: Optional[dict]) -> Optional[dict]:
+async def _send_chunk(adapter: Any, chat_id: str, media: list, opened: list,
+                      metadata: Optional[dict]) -> tuple[Optional[dict], Any]:
     """``sendMediaGroup``, the same request again on Telegram's 5xx JSON answer (the text lane's
     budget), plus one retry without a stale forum topic. Returns the metadata the rest of the batch
-    should use; raises the send's error."""
+    should use and Telegram's answer (dlz: the receipts the caller verifies); raises the send's error."""
     from plugins.platforms.telegram import telegram_send_errors as kinds
     from plugins.platforms.telegram.adapter import _redact_telegram_error_text as redact
 
@@ -114,13 +132,12 @@ async def _send_chunk(adapter: Any, chat_id: str, media: list, opened: list, met
             with contextlib.suppress(Exception):
                 fh.seek(0)
 
-    async def send(meta: Optional[dict]) -> None:
+    async def send(meta: Optional[dict]) -> Any:
         _, kwargs = adapter._media_send_kwargs(chat_id, None, meta)
         for attempt in range(kinds.SAME_REQUEST_ATTEMPTS):
             try:
-                await adapter._send_with_dm_topic_reply_anchor_retry(
+                return await adapter._send_with_dm_topic_reply_anchor_retry(
                     adapter._bot.send_media_group, {**kwargs, "media": media}, meta, "media group", reset_media=reset)
-                return
             except Exception as err:
                 if (kinds.send_error_kind(err) != kinds.SERVER_ERROR
                         or attempt >= kinds.SAME_REQUEST_ATTEMPTS - 1):
@@ -132,8 +149,7 @@ async def _send_chunk(adapter: Any, chat_id: str, media: list, opened: list, met
                 reset()
 
     try:
-        await send(metadata)
-        return metadata
+        return metadata, await send(metadata)
     except Exception as err:
         if not _stale_topic(adapter, err, metadata):
             raise
@@ -142,8 +158,7 @@ async def _send_chunk(adapter: Any, chat_id: str, media: list, opened: list, met
     adapter._prune_stale_dm_topic_binding(chat_id, stale, metadata=metadata)
     metadata = _without_thread(metadata)
     reset()
-    await send(metadata)
-    return metadata
+    return metadata, await send(metadata)
 
 
 async def send_photo_album(
@@ -158,6 +173,7 @@ async def send_photo_album(
     from plugins.platforms.telegram.adapter import _redact_telegram_error_text as redact
     failed: list[tuple[str, str]] = []
     refused: list[tuple] = []
+    confirmed: list[str] = []
     ambiguous = False
     try:
         from telegram import InputMediaPhoto
@@ -175,7 +191,15 @@ async def send_photo_album(
             logger.info("[%s] Sending media group of %d photo(s) (chunk %d/%d)",
                         adapter.name, len(media), chunk_idx + 1, len(chunks))
             try:
-                metadata = await _send_chunk(adapter, chat_id, media, opened, metadata)
+                metadata, receipts = await _send_chunk(adapter, chat_id, media, opened, metadata)
+                if (ids := confirmed_receipt_ids(receipts, len(media))) is None:
+                    # dlz: an answer that does not confirm this album: it may be posted, never resent.
+                    logger.warning(
+                        "[%s] send_media_group answer did not confirm %d photo(s) in one album (chunk %d/%d); "
+                        "not resending, it may have been posted", adapter.name, len(media), chunk_idx + 1, len(chunks))
+                    ambiguous = True
+                else:
+                    confirmed += ids
                 delivered = True
                 continue
             except Exception as err:
@@ -201,4 +225,5 @@ async def send_photo_album(
             refused = list(photos)
     detail = {"failed": failed, "refused": refused, "ambiguous": ambiguous} if failed or refused or ambiguous else None
     error = None if delivered or refused else "all images failed to send" + (f": {failed[0][1]}" if failed else "")
-    return SendResult(success=delivered, error=error, raw_response=detail)
+    return SendResult(success=delivered, error=error, raw_response=detail,
+                      message_id=confirmed[-1] if confirmed else None)

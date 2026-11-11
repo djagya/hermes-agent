@@ -984,7 +984,7 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault action=unlock."})
     except BackendError:
-        raise  # typed manager failures carry advice and no secret; _fenced_page_op turns them into results
+        raise  # typed manager failures carry advice and no secret; typed_page_op turns them into results
     except Exception:  # health: allow BLE001 -- untyped backend errors can carry secret bytes: refuse without echoing them
         return json.dumps({"success": False, "error_type": "secret_resolution_failed",
                            "error": "Could not resolve the saved item. Nothing was written."})
@@ -1407,6 +1407,18 @@ def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
     return shares_bot_desktop_browser(session_for_task(task_id))
 
 
+def typed_page_op(fn) -> str:
+    """dlz: ``fn()`` with the vault's typed failures as results: ``_PageUnavailable`` and a typed manager
+    failure (``BackendError``: rate budget, expired token, network, missing item; model-facing advice and
+    no secret) come back as their JSON result. The preview paths (``target=preview``, the Desktop key
+    button) skip ``_fenced_page_op`` and use this directly."""
+    from agent.vault_backends import BackendError
+    try:
+        return fn()
+    except (_PageUnavailable, BackendError) as exc:
+        return json.dumps(exc.result())
+
+
 def _fenced_page_op(task_id: Optional[str], fn) -> str:
     """Vault operations focus, inspect and fill the page over the supervisor socket, bypassing
     browser_exec; they must honour the Bot Desktop lease like every other page access, or a human
@@ -1414,18 +1426,13 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     from tools.browser_session import run_fenced, session_for_task
 
     def op() -> dict[str, Any]:
-        from agent.vault_backends import BackendError
         try:
             if _is_managed():
                 # dlz: control must confirm the agent still holds the slot lease before any page read.
                 _managed_supervisor(task_id or "default", admit=True)
-            return {"raw": fn()}
         except _PageUnavailable as exc:
             return {"raw": json.dumps(exc.result())}
-        except BackendError as exc:
-            # Typed manager failures (rate budget, expired token, network, missing item) carry
-            # model-facing advice and no secret material.
-            return {"raw": json.dumps(exc.result())}
+        return {"raw": typed_page_op(fn)}
 
     res = run_fenced(session_for_task(task_id), op)
     return res["raw"] if "raw" in res else json.dumps(res)
@@ -1488,7 +1495,7 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
         # The in-app browser is not the Bot Desktop browser; its window owns the page and refuses a
         # changed tab or document itself. Never retried on another browser.
         from tools.browser_vault_preview import run_preview_vault
-        return run_preview_vault(kwargs.get("preview_callback"), page_ops[action])
+        return run_preview_vault(kwargs.get("preview_callback"), lambda: typed_page_op(page_ops[action]))
     if target != "browser":
         return json.dumps({"success": False, "error_type": "invalid_target",
                            "error": "target must be 'browser' or 'preview'."})

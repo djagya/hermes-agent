@@ -160,8 +160,11 @@ async def test_stopping_a_profile_mid_recovery_leaves_no_reply_stranded(tmp_path
             stop_point.set()
             await asyncio.Event().wait()
 
+    blocked = []
+
     async def _send(*, chat_id, content, metadata=None):
         if stop_during == "send" and not stopped.is_set():
+            blocked.append(content)
             stop_point.set()
             await asyncio.Event().wait()  # the first resend never completes before the stop
         sent.append(content)
@@ -184,8 +187,13 @@ async def test_stopping_a_profile_mid_recovery_leaves_no_reply_stranded(tmp_path
     assert sent == []
 
     # The profile starts again and its next sweep runs.
-    assert await runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile="work") == 3
+    # dlz: a resend already handed to adapter.send may have been posted (no-uncertain-redelivery,
+    # e3548f99c5d): the cancel closes it as uncertain, so only the undispatched rows are replayed.
+    expected = 2 if stop_during == "send" else 3
+    assert await runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile="work") == expected
     states = {oid: ledger._connect().execute(
         "SELECT state FROM delivery_obligations WHERE obligation_id=?", (oid,)).fetchone()[0]
         for oid in ("ob-1", "ob-2", "ob-3")}
     assert states == {"ob-1": "delivered", "ob-2": "delivered", "ob-3": "delivered"}
+    if stop_during == "send":
+        assert len(blocked) == 1 and blocked[0] not in sent  # the possibly-posted reply is never re-sent

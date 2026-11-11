@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.platforms.base import utf16_len
-from tools.send_message_senders import _send_telegram, _telegram_format
+# dlz: upstream 471537ae3a moved the standalone sender out of tools/send_message_senders.py.
+from plugins.platforms.telegram.standalone import _send_telegram, _telegram_format
 
 
 @pytest.fixture(autouse=True)
@@ -58,7 +59,7 @@ def test_standalone_telegram_payloads_use_readable_fallbacks_and_utf16_chunks(
 ) -> None:
     from telegram.constants import ParseMode
 
-    import tools.send_message_senders as senders
+    import plugins.platforms.telegram.standalone as senders
 
     html = (
         '<b>Report &amp; details</b> — '
@@ -67,18 +68,25 @@ def test_standalone_telegram_payloads_use_readable_fallbacks_and_utf16_chunks(
 
     text_bot = MagicMock()
     text_bot.send_message = AsyncMock(
-        side_effect=[Exception("Can't parse entities: unsupported start tag keys"), SimpleNamespace(message_id=1)]
+        # dlz: upstream retries a rejected HTML chunk as MarkdownV2 first; the fork's readable plain
+        # text is the last resort when that is rejected too.
+        side_effect=[
+            Exception("Can't parse entities: unsupported start tag keys"),
+            Exception("Can't parse entities: character '<' is reserved"),
+            SimpleNamespace(message_id=1),
+        ]
     )
-    monkeypatch.setattr(senders, "_telegram_bot", lambda _token: text_bot)
+    monkeypatch.setattr(senders, "_telegram_bot", lambda _token, _extra=None: text_bot)
 
     result = asyncio.run(_send_telegram("token", "123", html))
 
     assert result["success"] is True
     assert [call.kwargs["parse_mode"] for call in text_bot.send_message.await_args_list] == [
         ParseMode.HTML,
+        ParseMode.MARKDOWN_V2,
         None,
     ]
-    assert text_bot.send_message.await_args_list[1].kwargs["text"] == (
+    assert text_bot.send_message.await_args_list[-1].kwargs["text"] == (
         "Report & details — Docs (https://example.com/report) approve <KEYS>"
     )
 
@@ -89,7 +97,7 @@ def test_standalone_telegram_payloads_use_readable_fallbacks_and_utf16_chunks(
     caption_bot.send_photo = AsyncMock(
         side_effect=[Exception("Can't parse caption entities"), SimpleNamespace(message_id=2)]
     )
-    monkeypatch.setattr(senders, "_telegram_bot", lambda _token: caption_bot)
+    monkeypatch.setattr(senders, "_telegram_bot", lambda _token, _extra=None: caption_bot)
 
     result = asyncio.run(_send_telegram("token", "123", html, media_files=[(str(image), False)]))
 
@@ -106,7 +114,7 @@ def test_standalone_telegram_payloads_use_readable_fallbacks_and_utf16_chunks(
     chunks_bot.send_message = AsyncMock(
         side_effect=lambda **_kwargs: SimpleNamespace(message_id=3)
     )
-    monkeypatch.setattr(senders, "_telegram_bot", lambda _token: chunks_bot)
+    monkeypatch.setattr(senders, "_telegram_bot", lambda _token, _extra=None: chunks_bot)
     financial_markdown = "**Bank check passed**\nReply `approve <KEYS>` 🚀\n" * 120
 
     result = asyncio.run(_send_telegram("token", "123", financial_markdown))

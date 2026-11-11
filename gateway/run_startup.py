@@ -472,10 +472,11 @@ class GatewayStartupMixin:
         for row in await asyncio.to_thread(pending_retries):
             self._schedule_flood_redelivery(row["platform"], profile=row["profile"])
 
-    async def _redeliver_claimed_obligations(self, claimed: list) -> int:
+    async def _redeliver_claimed_obligations(self, claimed: list, dispatched: Optional[set] = None) -> int:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
         bounded boot-send task, so a flood-limited send can be abandoned by the restore gate without
-        reopening the turn-replay window. Returns the redelivered count."""
+        reopening the turn-replay window. Returns the redelivered count. dlz: ``dispatched`` collects the
+        ids handed to ``adapter.send`` so a cancelled caller can tell possibly-posted rows from unsent ones."""
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
@@ -496,6 +497,8 @@ class GatewayStartupMixin:
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+            if dispatched is not None:
+                dispatched.add(row["obligation_id"])
             try:
                 result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
             except Exception as send_err:
@@ -556,7 +559,7 @@ class GatewayStartupMixin:
         """Replay one adapter identity's transient failures after reconnect: the startup sweep cannot
         claim live-owner rows, so ``send_path_degraded`` responses would otherwise stay failed until
         the next restart. Best-effort; reuses the startup redelivery contract."""
-        claim, owned = None, []
+        claim, owned, dispatched = None, [], set()
         try:
             try:
                 from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
@@ -580,16 +583,24 @@ class GatewayStartupMixin:
                         row["obligation_id"], "failed to release runtime delivery claim %s",
                         error=row.get("last_error") or "send_path_degraded",
                     )
-            return await self._redeliver_claimed_obligations(sendable)
+            return await self._redeliver_claimed_obligations(sendable, dispatched=dispatched)
         except asyncio.CancelledError:
             # Cancelled while owning claims (profile stop, adapter replacement): later sweeps only claim
-            # 'failed', so release every claim still 'attempting' (the guard skips sent and released
-            # rows) in one thread hop that a second cancel cannot cut short.
-            from gateway.delivery_ledger import release_runtime_claim
+            # 'failed', so release every undispatched claim still 'attempting' (the guard skips sent and
+            # released rows) in one thread hop that a second cancel cannot cut short. dlz: a claim already
+            # handed to adapter.send may have been posted; it is closed as uncertain, never released for
+            # redelivery (no-uncertain-redelivery contract, e3548f99c5d).
+            from gateway.delivery_ledger import close_uncertain_claim, release_runtime_claim
             with suppress(Exception):
                 owned = await claim if claim is not None else []
-            await asyncio.to_thread(lambda: [release_runtime_claim(
-                row["obligation_id"], row.get("last_error") or "send_path_degraded") for row in owned])
+
+            def _settle() -> None:
+                for row in owned:
+                    if row["obligation_id"] in dispatched:
+                        close_uncertain_claim(row["obligation_id"])
+                    else:
+                        release_runtime_claim(row["obligation_id"], row.get("last_error") or "send_path_degraded")
+            await asyncio.to_thread(_settle)
             raise
 
     def _resume_pending_candidates(self, platform=None) -> Optional[list]:

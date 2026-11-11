@@ -193,7 +193,7 @@ def _(rid, params: dict) -> dict:
     import json as _json
 
     from tools.browser_vault_preview import run_preview_vault
-    from tools.browser_vault_tool import browser_vault_fill
+    from tools.browser_vault_tool import browser_vault_fill, typed_page_op
     from tui_gateway import server_requests
     from tui_gateway.transport import current_transport
 
@@ -218,8 +218,9 @@ def _(rid, params: dict) -> dict:
         answer = server_requests.send("preview.act", "", dict(payload), timeout=30, transport=caller)
         return (answer or {}).get("value", "")
 
-    raw = run_preview_vault(ask, lambda: browser_vault_fill(handle, task_id="desktop-browser-bar", with_identifier=True),
-                            target=target)
+    # dlz: typed_page_op returns a typed manager failure as its result (this path skips _fenced_page_op).
+    raw = run_preview_vault(ask, lambda: typed_page_op(
+        lambda: browser_vault_fill(handle, task_id="desktop-browser-bar", with_identifier=True)), target=target)
     out = _json.loads(raw)
     return _ok(rid, {key: out[key] for key in ("success", "filled_fields", "origin", "error", "error_type") if key in out})
 

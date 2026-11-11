@@ -14,8 +14,11 @@ import hermes_cli.left_core_migration as lcm
 
 
 @pytest.fixture(autouse=True)
-def _fresh(monkeypatch):
+def _fresh(monkeypatch, tmp_path):
     monkeypatch.setattr(lcm, "_attempted", set())
+    # dlz: the fork image bundles plugins/homeassistant (plugin_present counts it), so these tests
+    # model an install that does not, as test_left_core_migration.py does.
+    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(tmp_path / "no-bundled-plugins"))
     for name in ("YUANBAO_APP_ID", "YUANBAO_APP_KEY", "YUANBAO_APP_SECRET"):
         monkeypatch.delenv(name, raising=False)
     import hermes_cli.memory_provider_migration as mpm

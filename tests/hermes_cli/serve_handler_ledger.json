@@ -2,7 +2,7 @@
  "counts": {
   "http": {
    "keep-host-wide": 1,
-   "undecided": 343
+   "undecided": 346
   },
   "rpc": {
    "authority": 108,
@@ -189,6 +189,7 @@
   {"current_path": "hermes_cli.dashboard_auth.routes:auth_callback", "decision": "undecided", "handler": "GET /auth/callback", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.dashboard_auth.routes:auth_login", "decision": "undecided", "handler": "GET /auth/login", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.dashboard_auth.routes:auth_native_authorize", "decision": "undecided", "handler": "GET /auth/native/authorize", "kind": "http", "ref": ""},
+  {"current_path": "hermes_cli.web_routers.claude_setup_token:setup_token_page", "decision": "undecided", "handler": "GET /claude-code/setup-token", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.dashboard_ui:serve_profile_plugin_asset", "decision": "undecided", "handler": "GET /dashboard-plugins/@{profile}/{plugin_name}/{file_path:path}", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.dashboard_ui:serve_plugin_asset", "decision": "undecided", "handler": "GET /dashboard-plugins/{plugin_name}/{file_path:path}", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.dashboard_auth.routes:login_page", "decision": "undecided", "handler": "GET /login", "kind": "http", "ref": ""},
@@ -309,6 +310,8 @@
   {"current_path": "hermes_cli.web_routers.config_env:upsert_custom_endpoint", "decision": "undecided", "handler": "POST /api/providers/custom-endpoints", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.config_env:validate_custom_endpoint", "decision": "undecided", "handler": "POST /api/providers/custom-endpoints/validate", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.config_env:activate_custom_endpoint", "decision": "undecided", "handler": "POST /api/providers/custom-endpoints/{endpoint_id}/activate", "kind": "http", "ref": ""},
+  {"current_path": "hermes_cli.web_routers.claude_setup_token:setup_token_submit", "decision": "undecided", "handler": "POST /api/providers/oauth/claude-code/setup-token/submit", "kind": "http", "ref": ""},
+  {"current_path": "hermes_cli.web_routers.claude_setup_token:setup_token_view", "decision": "undecided", "handler": "POST /api/providers/oauth/claude-code/setup-token/view", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.oauth:start_oauth_login", "decision": "undecided", "handler": "POST /api/providers/oauth/{provider_id}/start", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.oauth:submit_oauth_code", "decision": "undecided", "handler": "POST /api/providers/oauth/{provider_id}/submit", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.config_env:validate_provider_credential", "decision": "undecided", "handler": "POST /api/providers/validate", "kind": "http", "ref": ""},

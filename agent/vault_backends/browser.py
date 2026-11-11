@@ -27,10 +27,14 @@ import logging
 import os
 from typing import Optional
 
-from agent.vault_backends.base import LoginBackend
+from agent.vault_backends.base import LoginBackend, managed_browser_mode
 from agent.vault_store import VaultItemMeta, normalize_origin
 
 logger = logging.getLogger(__name__)
+
+# dlz: refusal for a direct use in monolith managed mode (``enabled_backends`` already drops the source).
+_MANAGED_REFUSAL = ("scope_denied: managed browser mode refuses the real-profile browser login source; "
+                    "use a Hermes vault, 1Password or Bitwarden login")
 
 
 class BrowserProfileLoginBackend(LoginBackend):
@@ -162,6 +166,8 @@ class BrowserProfileLoginBackend(LoginBackend):
     # ── LoginBackend contract ──────────────────────────────────────────────────────────────────────
 
     def list_items(self) -> list[VaultItemMeta]:
+        if managed_browser_mode():  # dlz: no local real-profile browser beside the leased slots
+            return []
         copy_dir = self._ensure_snapshot()
         if not copy_dir:
             return []
@@ -202,6 +208,8 @@ class BrowserProfileLoginBackend(LoginBackend):
         return next((m for m in self.list_items() if m.id == handle), None)
 
     def resolve_password(self, handle: str) -> str:
+        if managed_browser_mode():  # dlz: fail closed before any real-profile launch or CDP read
+            raise RuntimeError(_MANAGED_REFUSAL)
         nav_url, username = self._split(handle)
         from agent.vault_store import VaultError
         try:

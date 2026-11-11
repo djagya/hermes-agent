@@ -172,3 +172,33 @@ def test_non_preview_relayed_reply_is_forwarded_untouched(monkeypatch):
         clear_vault_redaction_values()
     srv._sessions.pop("preview-read-isolation", None)
     assert forwarded == value
+
+
+def test_key_button_reports_a_typed_backend_failure(login, window, monkeypatch):
+    """dlz: the preview path skips ``_fenced_page_op``, so a typed manager failure (rate budget, expired
+    token) must still come back as its result, never a raw exception out of the RPC."""
+    from agent.vault_backends.base import BackendRateLimited
+    from agent.vault_backends.local import LocalLoginBackend
+
+    def limited(*_a, **_k):
+        raise BackendRateLimited("Hermes vault")
+
+    monkeypatch.setattr(LocalLoginBackend, "resolve_password", limited)
+    out = srv._methods["vault.preview.fill"](9, {"handle": login, "target": "pinned-by-renderer"})
+    assert out["result"]["success"] is False and out["result"]["error_type"] == "vault_rate_limited"
+    assert "fill" not in window
+
+
+def test_agent_preview_fill_reports_a_typed_backend_failure(monkeypatch):
+    from agent.vault_backends.base import BackendAuthExpired
+    from tools import browser_vault_preview, browser_vault_tool
+
+    def expired(**_kw):
+        raise BackendAuthExpired("1Password")
+
+    monkeypatch.setattr(browser_vault_tool, "_is_managed", lambda: False)
+    monkeypatch.setattr(browser_vault_tool, "browser_vault_fill", expired)
+    monkeypatch.setattr(browser_vault_preview, "run_preview_vault", lambda cb, op, target="": op())
+    out = json.loads(browser_vault_tool._handle_vault(
+        {"action": "fill", "handle": "op:x", "target": "preview"}, preview_callback=object()))
+    assert out["success"] is False and out["error_type"] == "vault_auth_expired"

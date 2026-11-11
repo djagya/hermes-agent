@@ -137,3 +137,45 @@ def test_syntax_dispatch_uses_shebang_not_suffix(tmp_path):
     assert preflight.syntax_command(str(shell_script), "locked-python") == ["bash", "-n", str(shell_script)]
     assert preflight.focused_test_command("windows-paths", "locked-python", ["tests/x.py"], "win32") == [
         "locked-python", "scripts/run_tests_parallel.py", "tests/x.py"]
+
+
+def _cheap_identity_lane(tmp_path, monkeypatch, found_pnpm):
+    """dlz: run the identity lane's cheap phase with every external command captured, not executed."""
+    candidate = "d" * 40
+    calls = []
+    monkeypatch.setattr(preflight, "git", lambda *argv: candidate if argv == ("rev-parse", "HEAD") else "")
+    monkeypatch.setattr(preflight, "parent_evidence", lambda *a, **k: {})
+    monkeypatch.setattr(preflight.Report, "command",
+                        lambda self, name, command, **kw: calls.append((name, command)))
+    monkeypatch.setattr(preflight.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, stdout=found_pnpm + "\n", stderr=""))
+    args = Namespace(candidate=candidate, baseline="a" * 40, upstream="b" * 40, merge="c" * 40,
+                     lane="identity-and-contracts", phase="cheap", python="py", actionlint="actionlint",
+                     output=str(tmp_path / "out"), run_id="1", run_attempt="1")
+    assert preflight.lane(args) == 0
+    receipt = json.loads((tmp_path / "out" / "identity-and-contracts.json").read_text(encoding="utf-8-sig"))
+    return dict(calls), {c["name"]: c for c in receipt["checks"]}
+
+
+def test_identity_lane_validates_the_pnpm_workspace_lock_with_the_pinned_pnpm(tmp_path, monkeypatch):
+    """dlz: upstream v0.23.1 deleted package-lock.json for pnpm-lock.yaml; ``npm ci`` on the missing lock
+    failed the lane. The lock is checked by the pm/lock.json pnpm, frozen, and must stay as committed."""
+    pinned = json.loads(open("pm/lock.json", encoding="utf-8-sig").read())["packages"]["pnpm"]["version"]
+    commands, checks = _cheap_identity_lane(tmp_path, monkeypatch, pinned)
+    assert not any(command[0] == "npm" for command in commands.values())
+    assert commands["pnpm-lock"] == ["pnpm", "install", "--frozen-lockfile", "--lockfile-only", "--ignore-scripts"]
+    assert commands["pnpm-lock-unchanged"] == [
+        "git", "diff", "--exit-code", "--", "pnpm-lock.yaml", "pnpm-workspace.yaml"]
+    assert checks["pnpm-pin"]["status"] == "passed"
+
+    _, checks = _cheap_identity_lane(tmp_path, monkeypatch, "9.0.0")
+    assert checks["pnpm-pin"]["status"] == "failed"
+    assert checks["pnpm-pin"]["pinned"] == pinned and checks["pnpm-pin"]["found"] == "9.0.0"
+
+
+def test_source_inventory_names_the_pnpm_locks(monkeypatch):
+    seen = []
+    monkeypatch.setattr(preflight, "git", lambda *argv: seen.extend(argv) or "")
+    preflight.source_inventory()
+    assert "pnpm-lock.yaml" in seen and "pnpm-workspace.yaml" in seen
+    assert "package-lock.json" not in seen

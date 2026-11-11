@@ -147,7 +147,9 @@ class TestTelegramMultiImage:
             except TelegramError as invalid:
                 first = NetworkError("Bad Gateway (502). Parsing the server response b'<html>' failed")
                 first.__cause__ = invalid
-        adapter._bot.send_media_group = AsyncMock(side_effect=[first, [MagicMock(message_id=1)]])
+        # dlz: a confirmed album answer (one receipt per photo, one media_group_id); a malformed one is ambiguous.
+        receipts = [MagicMock(message_id=i, media_group_id="g") for i in (1, 2)]
+        adapter._bot.send_media_group = AsyncMock(side_effect=[first, receipts])
         adapter.send_image = AsyncMock()
 
         with patch("asyncio.sleep", new=AsyncMock()):

@@ -56,6 +56,10 @@ def _tick(job_id, tmp_path, deliveries, *, error=None):
             agent.run_conversation.return_value = {"final_response": "ok"}
         agent_cls.return_value = agent
         sched.run_one_job(dict(job))
+        # dlz: since v0.23.0 a run with an execution id queues its result and failure notice
+        # (cron/delivery_queue.py); the gateway housekeeping tick drains it through
+        # _deliver_result. Drain here like that tick, so the notice reaches the patched sender.
+        sched.drain_delivery_queue(adapters={}, loop=None)
 
 
 @pytest.fixture

@@ -8,9 +8,11 @@ copies of ``tools.send_message_senders``' (private core names a plugin may not i
 
 import asyncio
 import contextlib
+import html
 import logging
 import os
 import re
+from html.parser import HTMLParser
 from types import SimpleNamespace
 
 from agent.redact import redact_sensitive_text
@@ -203,7 +205,7 @@ async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, t
             except Exception as mdv2_error:
                 if not _is_telegram_parse_error(mdv2_error):
                     raise
-        return await send(chunk if has_html else _strip_mdv2_safe(chunk), None)
+        return await send(_telegram_html_to_plain(chunk) if has_html else _strip_mdv2_safe(chunk), None)
 
 
 async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, caption, parse_mode, has_html,
@@ -248,8 +250,9 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
                     logger.warning("Caption parse failed for media send, retrying plain: %s",
                                    _sanitize_error_text(media_err))
                     media_kwargs.pop("parse_mode", None)
-                    if not has_html and media_kwargs.get("caption"):
-                        media_kwargs["caption"] = _strip_mdv2_safe(media_kwargs["caption"])
+                    if media_kwargs.get("caption"):  # dlz: an HTML caption goes plain without its tags
+                        fallback = _telegram_html_to_plain if has_html else _strip_mdv2_safe
+                        media_kwargs["caption"] = fallback(media_kwargs["caption"])
                 else:
                     raise
                 f.seek(0)
@@ -270,6 +273,60 @@ _TELEGRAM_HTML_TAGS = ("b", "strong", "i", "em", "u", "ins", "s", "strike", "del
 _TELEGRAM_HTML_TAG_ALT = "|".join(sorted(_TELEGRAM_HTML_TAGS, key=len, reverse=True))
 _TELEGRAM_HTML_TAG_RE = re.compile(
     rf"""</?(?:{_TELEGRAM_HTML_TAG_ALT})(?:\s(?:[^>"']++|"[^"]*+"|'[^']*+')*+)?>""", re.IGNORECASE)
+
+
+# dlz: a tilde fence (``~~~``/``~~~~``, optionally indented) is Markdown code too; a tag inside it is an
+# example, so it is masked with backtick code before the HTML check (fork ``_telegram_has_html``).
+_MD_TILDE_FENCE_RE = re.compile(r"(?ms)^[ \t]*(~{3,})[^\n]*\n.*?^[ \t]*\1[ \t]*(?:\n|$)")
+
+
+def _outside_markdown_code(message):
+    return _MD_TILDE_FENCE_RE.sub("", _MD_CODE_RE.sub("", message))
+
+
+class _TelegramHTMLPlainTextParser(HTMLParser):
+    """dlz (fork): drop Telegram's supported markup, keep unsupported angle literals and link targets."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.parts: list[str] = []
+        self.links: list[tuple[int, str | None]] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in _TELEGRAM_HTML_TAGS:
+            self.parts.append(self.get_starttag_text() or f"<{tag}>")
+        elif tag == "a":
+            self.links.append((len(self.parts), dict(attrs).get("href")))
+
+    def handle_startendtag(self, tag, attrs):
+        if tag not in _TELEGRAM_HTML_TAGS:
+            self.parts.append(self.get_starttag_text() or f"<{tag}/>")
+
+    def handle_endtag(self, tag):
+        if tag not in _TELEGRAM_HTML_TAGS:
+            self.parts.append(f"</{tag}>")
+        elif tag == "a" and self.links:
+            start, href = self.links.pop()
+            if href and href not in "".join(self.parts[start:]).strip():
+                self.parts.append(f" ({href})")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def handle_entityref(self, name):
+        self.parts.append(html.unescape(f"&{name};"))
+
+    def handle_charref(self, name):
+        self.parts.append(html.unescape(f"&#{name};"))
+
+
+def _telegram_html_to_plain(text):
+    """dlz (fork): the plain-text last resort for an HTML chunk: no tags, no entities, links keep their
+    target, so the reader never sees raw ``<b>``/``&lt;``."""
+    parser = _TelegramHTMLPlainTextParser()
+    parser.feed(text)
+    parser.close()
+    return _strip_mdv2_safe("".join(parser.parts))
 
 
 def _telegram_album_paths(media_files, force_document, caption):
@@ -307,7 +364,8 @@ def _telegram_format(message):
     ``format_message``."""
     from telegram.constants import ParseMode
     # A tag shown as Markdown code (any backtick width, as the MarkdownV2 path reads it) is an example.
-    if _TELEGRAM_HTML_TAG_RE.search(_MD_CODE_RE.sub("", message)):
+    # dlz: so is one inside a tilde fence.
+    if _TELEGRAM_HTML_TAG_RE.search(_outside_markdown_code(message)):
         return _escape_non_telegram_markup(message), ParseMode.HTML, True
     mdv2 = _telegram_mdv2(message)
     return (message if mdv2 is None else mdv2), ParseMode.MARKDOWN_V2, False  # None: send as-is
@@ -389,6 +447,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 warnings.append(_sanitize_error_text(f"Failed to send Telegram photo album: {result.error}"))
             # A refused album goes photo by photo below (topic fallback, a warning per failure).
             media_files = [(path, False) for path in detail.get("refused", ())]
+            if result.message_id is not None:  # dlz: a confirmed album receipt (the last one sent)
+                last_msg = SimpleNamespace(message_id=result.message_id)
             last_msg = last_msg or (SimpleNamespace(message_id=None) if result.success else None)
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
@@ -426,7 +486,14 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None, media_fi
                           notify=None, **_ignored):
     """``standalone_sender_fn``: the target profile's token (``pconfig.token``, else its scoped
     ``TELEGRAM_BOT_TOKEN``) and ``extra`` (base_url, proxy, fallback IPs, rich_messages, link
-    previews); ``notify`` rings under the ``important`` notification mode (cron.delivery.notify)."""
+    previews); ``notify`` rings under the ``important`` notification mode (cron.delivery.notify).
+
+    dlz: an unmarked send (``notify=None``: the ``send_message`` tool, ``hermes send``) rings. A
+    standalone send is a deliverable like the gateway's final reply (``notify=True``), and the fork's
+    standalone sender always rang; only an explicit ``notify=False`` (``cron.delivery.notify: false``)
+    is silent under ``important``. ``notifications: all`` still rings every send."""
+    if notify is None:
+        notify = True
     token = getattr(pconfig, "token", None)
     if not token:
         from agent.secret_scope import get_secret  # profile-scoped: never borrow another profile's token
