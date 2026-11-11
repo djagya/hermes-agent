@@ -50,6 +50,17 @@ _CDP_FLAGGED_BINARY_PATHS: dict[str, tuple] = {
 # Protocol identifiers in CDP results (targetId, sessionId, frameId, nodeId, backendNodeIds, id, ...) keep their
 # value only when it has the shape Chrome issues: a key name alone is page-controllable (a header named "id").
 _PROTOCOL_ID = re.compile(r"(?:id|[a-z][A-Za-z]*Ids?)")
+# Methods whose results carry no page-authored data under an id-like key outside a RemoteObject's "value"
+# (checked against the CDP schema); every other method (Network.*, Storage, ...) keeps the full scrub.
+_ID_METHODS = frozenset({
+    "Target.getTargets", "Target.getTargetInfo", "Target.createTarget", "Target.attachToTarget",
+    "Target.createBrowserContext", "Target.getBrowserContexts",
+    "DOM.getDocument", "DOM.querySelector", "DOM.querySelectorAll", "DOM.describeNode", "DOM.requestNode",
+    "DOM.resolveNode", "DOM.getBoxModel", "DOM.getNodeForLocation", "DOM.pushNodesByBackendIdsToFrontend",
+    "DOM.getFlattenedDocument", "DOM.getContentQuads",
+    "Page.getFrameTree", "Page.navigate", "Page.createIsolatedWorld", "Page.getNavigationHistory",
+    "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.getProperties",
+})
 _CHROME_ID = re.compile(r"[0-9A-F]{32}|-?\d{1,20}\.\d{1,10}\.\d{1,10}")  # target/frame/loader/session; objectId
 
 
@@ -66,6 +77,7 @@ def _redact_cdp_output(
     flagged_paths: tuple = (),
     _depth: int = 0,
     _page: bool = False,
+    ids: bool = False,
 ) -> Any:
     """Redact browser-originated CDP result text; opaque bytes stay byte-identical.
 
@@ -94,7 +106,7 @@ def _redact_cdp_output(
         return redact_number(value, "browser")
     if isinstance(value, (list, tuple)):
         return type(value)(
-            _redact_cdp_output(item, _depth=_depth + 1, _page=_page) for item in value
+            _redact_cdp_output(item, _depth=_depth + 1, _page=_page, ids=ids) for item in value
         )
     if not isinstance(value, dict):
         return value
@@ -106,7 +118,7 @@ def _redact_cdp_output(
     redacted: dict[str, Any] = {}
     for key, item in value.items():
         opaque = leaf(always_paths, key) or (leaf(flagged_paths, key) and base64_flagged)
-        if not _page and isinstance(key, str) and _PROTOCOL_ID.fullmatch(key) and (
+        if ids and not _page and isinstance(key, str) and _PROTOCOL_ID.fullmatch(key) and (
                 _id_value(item) or isinstance(item, list) and all(_id_value(v) for v in item)):
             # dlz: Chrome-issued ids (targetId, nodeId, ...) are echoed back; masking them breaks the next call.
             # Inside a RemoteObject's by-value payload (its "value") a key may only imitate one: scrubbed there.
@@ -119,6 +131,7 @@ def _redact_cdp_output(
             flagged_paths=descend(flagged_paths, key),
             _depth=_depth + 1,
             _page=_page or (key == "value" and "type" in value),  # a RemoteObject's by-value page payload
+            ids=ids,
         )
     return redacted
 
@@ -428,7 +441,7 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
         return json.dumps(pay.locked_withheld())
 
     result = _redact_cdp_output(result_msg.get("result", {}), always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
-                                flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()))
+                                flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()), ids=method in _ID_METHODS)
     return json.dumps({"success": True, "method": method, "frame_id": frame_id, "session_id": child_sid,
                        "result": result}, ensure_ascii=False)
 
@@ -553,7 +566,7 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
 
     payload: dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
         result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
-        flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()))}
+        flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()), ids=method in _ID_METHODS)}
     if target_id:
         payload["target_id"] = target_id
     return json.dumps(payload, ensure_ascii=False)

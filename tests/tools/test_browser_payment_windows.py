@@ -282,7 +282,7 @@ def test_cdp_protocol_ids_survive_a_mask_window_but_page_values_do_not():
     tid = "A1234" + "B" * 27
     out = cdp_tool._redact_cdp_output({"targetInfos": [{"targetId": tid, "title": "pin 4711"}], "nodeId": 1234,
                                        "backendNodeIds": [1234, 5678],
-                                       "result": {"type": "object", "value": {"targetId": "4711", "n": 4711}}})
+                                       "result": {"type": "object", "value": {"targetId": "4711", "n": 4711}}}, ids=True)
     assert out["targetInfos"][0]["targetId"] == tid and out["nodeId"] == 1234 and out["backendNodeIds"] == [1234, 5678]
     assert out["targetInfos"][0]["title"] == "pin ••••"
     assert out["result"]["value"] == {"targetId": "••••", "n": "••••"}
@@ -303,6 +303,10 @@ def test_cdp_ids_are_exempt_only_with_chrome_shapes():
     out = cdp_tool._redact_cdp_output({
         "resource": {"headers": {"id": "4711"}}, "appId": "https://shop.example/4711",
         "result": [{"name": "x", "value": {"type": "object", "objectId": oid}}],
-        "targetId": "0123456789ABCDEF0123456789ABCDEF"})
+        "targetId": "0123456789ABCDEF0123456789ABCDEF"}, ids=True)
     assert out["resource"]["headers"]["id"] == "••••" and "4711" not in out["appId"]
+    # r15 Codex P2: server headers in Network.loadNetworkResource are id-shaped at will: no exemption there
+    net = cdp_tool._redact_cdp_output({"resource": {"headers": {"id": "4711" + "A" * 28, "x": "4711.1.1"}}},
+                                      ids="Network.loadNetworkResource" in cdp_tool._ID_METHODS)
+    assert "4711" not in json.dumps(net), net
     assert out["result"][0]["value"]["objectId"] == oid and out["targetId"] == "0123456789ABCDEF0123456789ABCDEF"
