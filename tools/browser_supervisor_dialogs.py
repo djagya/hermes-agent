@@ -15,7 +15,8 @@ import base64
 import json
 import logging
 import time
-from dataclasses import dataclass
+import weakref
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -23,11 +24,13 @@ from urllib.parse import parse_qs, urlparse
 logger = logging.getLogger("tools.browser_supervisor")
 
 
-def _redact_supervisor_text(value: str) -> str:
-    """Redact page-originated text before exposing supervisor snapshots."""
-    from agent.redact import redact_sensitive_text
+def _redact_supervisor_text(value: str, owner: Any = None) -> str:
+    """Redact page-originated text before exposing supervisor snapshots. dlz: the forced secret redactor plus
+    the card values registered for the dialog's own supervisor (``owner``), and every 3+ digit run and
+    date-like group masked, so a page that echoes card values in a dialog cannot pass them on."""
+    from tools.browser_payment_done import redact_dialog_text
 
-    return redact_sensitive_text(value, force=True)
+    return redact_dialog_text(value, owner)
 
 
 def _trim_ring(events: list, keep: int) -> list:
@@ -39,8 +42,16 @@ _REDACTED_FIELDS = frozenset({"message", "default_prompt"})
 
 
 def _dialog_dict(obj: Any, keys: tuple) -> dict[str, Any]:
-    """Snapshot dict of ``keys`` with page-originated text fields redacted."""
-    return {k: _redact_supervisor_text(getattr(obj, k)) if k in _REDACTED_FIELDS else getattr(obj, k) for k in keys}
+    """Snapshot dict of ``keys`` with page-originated text fields redacted. dlz: a dialog that opened while a
+    card payment locked the slot never shows its text here (payment_done reports a held confirm itself)."""
+    if getattr(obj, "opened_locked", False):
+        out = {k: "" if k in _REDACTED_FIELDS else getattr(obj, k) for k in keys}
+        out["withheld"] = "payment_surface_locked"
+        return out
+    ref = getattr(obj, "owner", None)
+    owner = ref() if callable(ref) else None
+    return {k: _redact_supervisor_text(getattr(obj, k), owner) if k in _REDACTED_FIELDS else getattr(obj, k)
+            for k in keys}
 
 
 DIALOG_POLICY_MUST_RESPOND = "must_respond"
@@ -70,6 +81,10 @@ _DIALOG_BRIDGE_SCRIPT = r"""
   if (window.__hermesDialogBridgeInstalled) return;
   window.__hermesDialogBridgeInstalled = true;
   const ENDPOINT = "http://hermes-dialog-bridge.invalid/";
+  // dlz: an unanswered bridge request (no interception yet, a failed fulfil) falls back to the browser's own
+  // dialog, never to a silent "false": the native path still captures it.
+  const nativeAlert = window.alert, nativeConfirm = window.confirm, nativePrompt = window.prompt;
+  const FAILED = {};
   function ask(kind, message, defaultPrompt) {
     try {
       const xhr = new XMLHttpRequest();
@@ -80,27 +95,31 @@ _DIALOG_BRIDGE_SCRIPT = r"""
       });
       xhr.open("GET", ENDPOINT + "?" + params.toString(), false);  // sync
       xhr.send(null);
-      if (xhr.status !== 200) return null;
+      if (xhr.status !== 200) return FAILED;
       let parsed;
-      try { parsed = JSON.parse(xhr.responseText || ""); } catch (e) { return null; }
+      try { parsed = JSON.parse(xhr.responseText || ""); } catch (e) { return FAILED; }
+      if (!parsed || typeof parsed !== "object") return FAILED;
       if (kind === "alert") return undefined;
-      if (kind === "confirm") return Boolean(parsed && parsed.accept);
+      if (kind === "confirm") return Boolean(parsed.accept);
       if (kind === "prompt") {
-        if (!parsed || !parsed.accept) return null;
+        if (!parsed.accept) return null;
         return parsed.prompt_text == null ? "" : String(parsed.prompt_text);
       }
-      return null;
+      return FAILED;
     } catch (e) {
-      return null;
+      return FAILED;
     }
   }
-  window.alert   = function(message) { ask("alert",   message, ""); };
+  window.alert   = function(message) {
+    if (ask("alert", message, "") === FAILED) return nativeAlert.call(window, message);
+  };
   window.confirm = function(message) {
     const r = ask("confirm", message, "");
-    return r === null ? false : Boolean(r);
+    return r === FAILED ? nativeConfirm.call(window, message) : Boolean(r);
   };
   window.prompt  = function(message, def) {
     const r = ask("prompt", message, def == null ? "" : def);
+    if (r === FAILED) return nativePrompt.call(window, message, def);
     return r === null ? null : String(r);
   };
 })();
@@ -124,6 +143,10 @@ class PendingDialog:
     url: str = ""
     # The tab's top-level URL: a cross-origin widget on /checkout raises dialogs from its own URL.
     top_url: str = ""
+    # dlz: opened while a card payment locked the slot; its text is never shown to browser_exec.
+    opened_locked: bool = False
+    # dlz: weak reference to the supervisor that saw it: its text is scrubbed of that slot's card only.
+    owner: Any = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return _dialog_dict(self, ("id", "type", "message", "default_prompt", "opened_at", "frame_id"))
@@ -143,6 +166,8 @@ class DialogRecord:
     # "accept" / "dismiss" when this side answered it; "" when the page or browser closed it.
     action: str = ""
     url: str = ""
+    opened_locked: bool = False
+    owner: Any = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         out = _dialog_dict(self, ("id", "type", "message", "opened_at", "closed_at", "closed_by", "frame_id"))
@@ -162,21 +187,58 @@ class DialogSupervisionMixin:
         except Exception as e:
             logger.debug("%s failed (%s): %s", method, what, e)
 
+    def _payment_locked(self) -> bool:
+        """dlz (payment lockdown): while a card payment locks the slot, dialog automation stands down (no tab
+        watching, no bridge install, no policy answer) and only :meth:`_lock_answer`'s rules apply. Local
+        state only: this runs on the loop and cannot wait for control's status."""
+        try:
+            from tools.browser_payment_surface import locally_locked
+
+            return locally_locked(self)
+        except Exception:  # health: allow BLE001 -- unknown lock state: stand down (fail closed)
+            return True
+
+    def _lock_answer(self, dialog: PendingDialog) -> Optional[tuple[bool, str]]:
+        """dlz (owner decision 2026-11-11): the answer while a card payment locks the slot, or None to hold it.
+        An alert is accepted (OK is its only answer), a prompt dismissed (no text is ever typed), a
+        beforeunload accepted only while payment_done closes the payment tab. A confirm (or another
+        beforeunload) is held for browser_vault payment_dialog; the watchdog dismisses it if nobody answers,
+        so no dialog stalls the page for good."""
+        if dialog.type == "alert":
+            return True, ""
+        if dialog.type == "prompt":
+            return False, ""
+        closing = getattr(self, "_payment_handover_closing", None)
+        if dialog.type == "beforeunload" and closing and dialog.cdp_session_id == closing:
+            return True, ""  # only the payment tab payment_done is closing, only during that close
+        return None
+
     async def _install_dialog_bridge(self, session_id: str) -> None:
-        """Install the dialog-bridge init script + Fetch interceptor on a session. Idempotent at
-        the CDP level (Chromium de-dupes identical add-script calls; Fetch.enable replaces prior
-        patterns); the final Runtime.evaluate injects into the already-loaded document so
-        existing pages pick up the override on reconnect."""
+        """Install the Fetch interceptor and then the dialog-bridge init script on a session. Idempotent at
+        the CDP level (Chromium de-dupes identical add-script calls; Fetch.enable replaces prior patterns);
+        the final Runtime.evaluate injects into the already-loaded document so existing pages pick up the
+        override on reconnect. dlz: interception first, and the overrides only once it is on; cut short at
+        any step (cancelled, timed out, locked) a page keeps a consistent state, because an override whose
+        request is not answered falls back to the browser's own dialog (see the script)."""
         sid = (session_id or "")[:16]
+        if self._payment_locked():  # checked before every step: a claim can land during any await
+            return
+        try:
+            await self._cdp("Fetch.enable", {"patterns": [{"urlPattern": DIALOG_BRIDGE_URL_PATTERN,
+                                                           "requestStage": "Request"}],
+                                             "handleAuthRequests": False}, session_id=session_id, timeout=5.0)
+        except Exception as e:  # health: allow BLE001 -- no interception: leave the native dialogs alone
+            logger.debug("Fetch.enable failed (dialog bridge sid=%s): %s", sid, e)
+            return
         steps = (
             ("Page.addScriptToEvaluateOnNewDocument", {"source": _DIALOG_BRIDGE_SCRIPT, "runImmediately": True},
              5.0, f"dialog bridge sid={sid}"),
-            ("Fetch.enable", {"patterns": [{"urlPattern": DIALOG_BRIDGE_URL_PATTERN, "requestStage": "Request"}],
-                              "handleAuthRequests": False}, 5.0, f"dialog bridge sid={sid}"),
             ("Runtime.evaluate", {"expression": _DIALOG_BRIDGE_SCRIPT, "returnByValue": True},
              3.0, f"dialog bridge inject sid={sid}"),
         )
         for method, params, timeout, what in steps:
+            if self._payment_locked():
+                return
             await self._cdp_quiet(method, params, session_id=session_id, timeout=timeout, what=what)
 
     # ── Capture ──────────────────────────────────────────────────────────────
@@ -258,9 +320,11 @@ class DialogSupervisionMixin:
             id=f"d-{self._dialog_seq}", type=type, message=message, default_prompt=default_prompt,
             opened_at=time.time(), cdp_session_id=session_id or self._page_session_id or "",
             frame_id=frame_id, bridge_request_id=bridge_request_id, url=self._dialog_page_url(frame_id, url),
-            top_url=self._dialog_top_url(session_id),
+            top_url=self._dialog_top_url(session_id), owner=weakref.ref(self),
         )
-        auto = self._decide_dialog(dialog)
+        locked = self._payment_locked()
+        dialog.opened_locked = locked
+        auto = self._lock_answer(dialog) if locked else self._decide_dialog(dialog)
         if auto is not None:
             with self._state_lock:
                 self._archive_dialog_locked(dialog, "auto_policy", action="accept" if auto[0] else "dismiss")
@@ -268,9 +332,12 @@ class DialogSupervisionMixin:
             return
         with self._state_lock:
             self._pending_dialogs[dialog.id] = dialog
-        self._dialog_watchdogs[dialog.id] = asyncio.get_running_loop().call_later(
+        self._arm_dialog_watchdog(dialog.id)
+
+    def _arm_dialog_watchdog(self, dialog_id: str) -> None:
+        self._dialog_watchdogs[dialog_id] = asyncio.get_running_loop().call_later(
             self.dialog_timeout_s,
-            lambda: asyncio.create_task(self._dialog_timeout_expired(dialog.id)),
+            lambda: asyncio.create_task(self._dialog_timeout_expired(dialog_id)),
         )
 
     # ── Responding ───────────────────────────────────────────────────────────
@@ -297,36 +364,52 @@ class DialogSupervisionMixin:
             params["promptText"] = prompt_text
         await self._cdp("Page.handleJavaScriptDialog", params, session_id=session_id, timeout=5.0)
 
-    async def _respond_quiet(self, dialog: PendingDialog, *, accept: bool, prompt_text: Optional[str]) -> None:
-        """Auto-policy / watchdog response (already archived by the caller); failures logged only."""
+    async def _respond_quiet(self, dialog: PendingDialog, *, accept: bool, prompt_text: Optional[str],
+                             watchdog: bool = False) -> None:
+        """Auto-policy / watchdog response (already archived by the caller); failures logged only. dlz: the
+        lock's rules are applied again here, at dispatch: a slot locked since the answer was decided gets the
+        lock's answer, or the dialog goes back to pending (a watchdog dismiss always goes through)."""
+        if not watchdog and self._payment_locked():
+            locked_answer = self._lock_answer(dialog)
+            if locked_answer is None:
+                with self._state_lock:
+                    self._recent_dialogs = [r for r in self._recent_dialogs if r.id != dialog.id]
+                    self._pending_dialogs[dialog.id] = dialog
+                self._arm_dialog_watchdog(dialog.id)
+                return
+            accept, prompt_text = locked_answer
         try:
             await self._respond(dialog, accept=accept, prompt_text=prompt_text)
         except Exception as e:
             logger.debug("auto response failed for %s: %s", dialog.id, e)
 
     async def _handle_dialog_cdp(self, dialog: PendingDialog, *, accept: bool, prompt_text: str) -> None:
-        """Agent response path. The dialog is retired regardless of outcome — a CDP
-        error usually means it already closed (browser auto-dismissed after navigation)."""
-        try:
-            await self._respond(dialog, accept=accept, prompt_text=prompt_text)
-        finally:
-            self._retire_dialog(dialog.id, "agent", action="accept" if accept else "dismiss")
+        """Agent response path. dlz: the dialog is consumed (and its watchdog cancelled) BEFORE the answer is
+        sent, and stays consumed if sending fails (a CDP error usually means it already closed). Only the
+        caller that consumed it answers: the agent and the watchdog never both do."""
+        if not self._retire_dialog(dialog.id, "agent", action="accept" if accept else "dismiss"):
+            raise RuntimeError(f"dialog {dialog.id} is no longer pending (already answered or closed)")
+        await self._respond(dialog, accept=accept, prompt_text=prompt_text)
 
     async def _dialog_timeout_expired(self, dialog_id: str) -> None:
         with self._state_lock:
             dialog = self._pending_dialogs.get(dialog_id)
         if dialog is None:
             return
+        # dlz: also while a card payment locks the slot: a dismiss reveals nothing and cancels safely, and no
+        # dialog may stall the page for good.
         logger.warning("CDP supervisor %s: dialog %s (%s) auto-dismissed after %ss timeout",
                        self.task_id, dialog_id, dialog.type, self.dialog_timeout_s)
-        # Archive with watchdog tag BEFORE unblocking the page.
-        self._retire_dialog(dialog_id, "watchdog", action="dismiss")
-        await self._respond_quiet(dialog, accept=False, prompt_text=None)
+        # Archive with watchdog tag BEFORE unblocking the page; answer only if this side consumed it.
+        if not self._retire_dialog(dialog_id, "watchdog", action="dismiss"):
+            return
+        await self._respond_quiet(dialog, accept=False, prompt_text=None, watchdog=True)
 
     # ── Bookkeeping ──────────────────────────────────────────────────────────
 
-    def _retire_dialog(self, dialog_id: str, closed_by: str, *, action: str = "") -> None:
-        """Remove a pending dialog (archiving it with ``closed_by``) and cancel its watchdog."""
+    def _retire_dialog(self, dialog_id: str, closed_by: str, *, action: str = "") -> bool:
+        """Remove a pending dialog (archiving it with ``closed_by``) and cancel its watchdog. True only for
+        the one caller that removed it."""
         with self._state_lock:
             dialog = self._pending_dialogs.pop(dialog_id, None)
             if dialog is not None:
@@ -334,12 +417,23 @@ class DialogSupervisionMixin:
         handle = self._dialog_watchdogs.pop(dialog_id, None)
         if handle is not None:
             handle.cancel()
+        return dialog is not None
+
+    def _retire_session_dialogs(self, session_id: Optional[str]) -> None:
+        """dlz: a closed tab's held dialogs go with it (nobody may answer a dialog of a page that is gone)."""
+        if not session_id:
+            return
+        with self._state_lock:
+            gone = [d.id for d in self._pending_dialogs.values() if d.cdp_session_id == session_id]
+        for dialog_id in gone:
+            self._retire_dialog(dialog_id, "remote")
 
     def _archive_dialog_locked(self, dialog: PendingDialog, closed_by: str, *, action: str = "") -> None:
         """Move a pending dialog to the recent_dialogs ring buffer. Must hold state_lock."""
         record = DialogRecord(id=dialog.id, type=dialog.type, message=dialog.message, opened_at=dialog.opened_at,
                               closed_at=time.time(), closed_by=closed_by, frame_id=dialog.frame_id,
-                              action=action, url=dialog.url)
+                              action=action, url=dialog.url, opened_locked=dialog.opened_locked,
+                              owner=dialog.owner)
         self._recent_dialogs = _trim_ring([*self._recent_dialogs, record], RECENT_DIALOGS_MAX)
 
     async def _on_dialog_closed(self, params: dict[str, Any], session_id: Optional[str]) -> None:
@@ -393,6 +487,7 @@ class DialogSupervisionMixin:
                 if tab_sid and tab_sid == sid:
                     tabs.pop(target, None)
                     self._dialog_tab_urls().pop(target, None)
+                    self._retire_session_dialogs(sid)
                     return True
             return False
         if method == "Target.targetInfoChanged":
@@ -411,6 +506,8 @@ class DialogSupervisionMixin:
         tabs = self._dialog_tabs()
         if not target_id or target_id in tabs or target_id == getattr(self, "_main_page_target", None):
             return
+        if self._payment_locked():  # no attach (a session-scoped native connection) on a locked slot
+            return
         tabs[target_id] = ""  # reserved before the await: a concurrent caller sees it and returns
         if url:
             self._dialog_tab_urls()[target_id] = url
@@ -422,11 +519,18 @@ class DialogSupervisionMixin:
             if not tabs.get(target_id):
                 tabs.pop(target_id, None)
             return
+        if self._payment_locked():  # locked while the attach was in flight: no session work, let it go
+            tabs.pop(target_id, None)
+            await self._cdp_quiet("Target.detachFromTarget", {"sessionId": sid}, session_id=None, timeout=3.0,
+                                  what="dialog tab")
+            return
         tabs[target_id] = sid
         await self._cdp_quiet("Page.enable", {}, session_id=sid, timeout=3.0, what="dialog tab")
         await self._install_dialog_bridge(sid)
 
     async def _watch_dialog_tabs(self) -> int:
+        if self._payment_locked():
+            return len(self._dialog_tabs())
         await self._cdp_quiet("Target.setDiscoverTargets", {"discover": True}, session_id=None,
                               timeout=3.0, what="dialog tab discovery")
         self._watch_new_tabs = True

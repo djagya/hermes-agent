@@ -356,21 +356,76 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
     if loop is None or not loop.is_running():
         return tool_error("CDP supervisor loop is not running. Try reconnecting with /browser connect.")
 
-    # dlz: A9: this socket is the runtime's native one, which browser-control cannot tell apart from
-    # the payment code; refuse here what control refuses on every other connection after a card fill,
-    # serialized with claims (a call that overlaps a card fill's claim is not sent or its reply withheld).
-    from tools.browser_payment_surface import supervisor_route_call
+    # dlz (payment lockdown): this socket is the runtime's native one, which browser-control does not
+    # filter; while the slot is locked for a card payment, refuse here what control refuses on every other
+    # connection. The epoch is read first: a reply that straddles a claim is withheld below.
+    from tools import browser_payment_surface as pay
+
+    before = pay.epoch(supervisor)
+    refused = pay.supervisor_route_refusal(supervisor, frame_id, method, params or {}, child_sid)
+    if refused:
+        return json.dumps(refused)
+
+    async def send() -> Optional[dict]:
+        # dlz: checked again on the supervisor loop right before the send: a claim that registered after the
+        # lock check above means the call is never sent (not only its reply withheld).
+        if pay.epoch(supervisor) != before:
+            return None
+        return await supervisor._cdp(method, params or {}, session_id=child_sid, timeout=timeout)  # type: ignore[attr-defined]
 
     try:
-        routed = supervisor_route_call(supervisor, frame_id, method, params, child_sid, timeout)
+        from tools.browser_supervisor import run_bounded
+
+        # run_bounded cancels (and drains) the send on a timeout, so a call reported as failed is never sent later.
+        result_msg = run_bounded(send(), loop, timeout=timeout + 2, unavailable=RuntimeError("loop unavailable"))
     except Exception as exc:
+        if pay.epoch(supervisor) != before:  # the error text may quote the page too
+            return json.dumps(pay.locked_withheld())
         return tool_error(f"CDP call via supervisor failed: {type(exc).__name__}: {exc}", cdp_docs=CDP_DOCS_URL)
-    if "refusal" in routed:
-        return json.dumps(routed["refusal"])
-    result_msg = routed["reply"]
+    if result_msg is None or pay.epoch(supervisor) != before:
+        # A card payment claimed the slot while this call was in flight: its result may hold card data.
+        return json.dumps(pay.locked_withheld())
 
     return json.dumps({"success": True, "method": method, "frame_id": frame_id, "session_id": child_sid,
                        "result": result_msg.get("result", {})}, ensure_ascii=False)
+
+
+def _payment_answer(task_id: str, method: str, params: Any, *, routed: bool) -> Optional[str]:
+    """dlz: what a card payment decides before any route: capture methods refused while a payment mark exists
+    (raw CDP cannot name an authoritative slot; tools/browser_payment_privacy.py), and on a locked managed
+    slot the lease-bound recovery calls. None = continue on the usual path."""
+    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
+
+    if method in _CAPTURE_METHODS and payment_session_sensitive(task_id):
+        return json.dumps(screenshot_refusal())
+    return None if routed else _locked_recovery(task_id, method, params)
+
+
+_CAPTURE_METHODS = frozenset({"Page.captureScreenshot", "Page.printToPDF", "Page.startScreencast",
+                              "Page.captureSnapshot"})
+
+
+def _locked_recovery(task_id: str, method: str, params: Any) -> Optional[str]:
+    """dlz (payment lockdown): on a managed browser whose slot is locked for a card payment, the lease-bound
+    recovery calls (list tabs by site, close a tab) go over the native supervisor; None = the usual path
+    (which refuses raw CDP on a managed browser)."""
+    from tools import browser_payment_surface as pay
+
+    if method not in pay.RECOVERY_METHODS:
+        return None
+    from tools.browser_session_cdp import managed_browser
+
+    if not managed_browser():
+        return None
+    from tools import browser_vault_tool as vault
+
+    try:
+        supervisor = vault._managed_supervisor(task_id, admit=True)  # control confirms this task's lease
+    except Exception:  # health: allow BLE001 -- no lease, no supervisor: the usual refusal applies
+        return None
+    if supervisor is None or not pay.slot_locked(supervisor):
+        return None
+    return json.dumps(pay.recovery_call(supervisor, method, params), ensure_ascii=False)
 
 
 def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id: Optional[str] = None,
@@ -382,13 +437,9 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     ``{"success": True, "method", "result"}`` or ``{"error": ...}``."""
     effective_task_id = task_id or "default"
 
-    # dlz: after a card fill, capture methods are refused while any payment mark exists (raw CDP cannot
-    # name an authoritative slot; tools/browser_payment_privacy.py).
-    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
-
-    if payment_session_sensitive(effective_task_id) and method in {
-            "Page.captureScreenshot", "Page.printToPDF", "Page.startScreencast", "Page.captureSnapshot"}:
-        return json.dumps(screenshot_refusal())
+    answered = _payment_answer(effective_task_id, method, params, routed=bool(frame_id or target_id))
+    if answered is not None:
+        return answered
 
     from tools.browser_control_route import ManagedBrowserError
 
@@ -441,13 +492,14 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     except RuntimeError as exc:
         if "payment_screenshot_blocked" in str(exc):
             # browser-control's capture guard refused the method on a card-filled slot.
+            from tools.browser_payment_privacy import screenshot_refusal
+
             return json.dumps(screenshot_refusal())
-        if "payment_surface_protected" in str(exc):
-            # dlz: A9: browser-control refused a read of a protected card frame on this connection.
-            return json.dumps({"success": False, "error_type": "payment_surface_protected",
-                               "error": "The card frame is protected after a card fill until it navigates away. "
-                                        "Use browser_vault payment_controls / payment_click inside it, or the "
-                                        "merchant page."})
+        if "payment_surface_locked" in str(exc):
+            # dlz: browser-control refused the command: the slot is locked for a card payment.
+            from tools.browser_payment_surface import LOCKED, LOCKED_TEXT
+
+            return json.dumps({"success": False, "error_type": LOCKED, "error": LOCKED_TEXT})
         return tool_error(str(exc), method=method)
     except WebSocketException as exc:
         return tool_error(f"WebSocket error talking to CDP at {endpoint}: {exc}. The browser may have "

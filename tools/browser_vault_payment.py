@@ -582,6 +582,15 @@ def _guard_capture(vault, task_id: str, lease: str, strict: bool) -> tuple:
                   "wipe_count": route.get("wipe_count", ""), "profile_kind": route.get("profile_kind", "")}
 
 
+def _record_approved_amount(supervisor, inspected, stated) -> None:
+    """dlz: the cart total and currency the owner approved: the one amount payment dialogs may show unmasked."""
+    if stated is None:
+        return
+    from tools.browser_payment_done import record_approved_amount
+
+    record_approved_amount(supervisor, getattr(inspected, "page_id", None), stated.total, stated.currency)
+
+
 def _claim_and_readmit(vault, task_id: str, supervisor, inspected, lease: str) -> dict | None:
     """The last steps before the card is read. None = may proceed."""
     # dlz: A9: browser-control must confirm this supervisor's claim on the card documents before
@@ -723,6 +732,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             refused = _claim_and_readmit(vault, task_id, supervisor, inspected, lease)
             if refused:
                 return json.dumps(refused)
+            _record_approved_amount(supervisor, inspected, stated)
             # Never resolve at inspection/list time, on decline or on stale consent.
             raw, verdict = _resolve_card(backend, meta, bound_revision)
             if raw is None:
@@ -733,6 +743,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                                    "error": _REVISION_UNAVAILABLE_ON_READ})
             secret = validate_card(raw)
             _register_card_redaction(secret)
+            from tools.browser_payment_done import register_dialog_card_values
+
+            register_dialog_card_values(secret, supervisor)  # dlz: this slot's dialog texts are scrubbed of it
             try:
                 fills = _document_fills(inspected, secret)
             except ExpiryOptionUnmatched:

@@ -236,7 +236,7 @@
       "body": [
         "?slot="
       ],
-      "reply": "slot_id, capture_blocked, capture_blocked_at, wipe_count, human_clear {at, principal}|null, payment_surface {frames, targets, native_connected, claimed_at}, history",
+      "reply": "slot_id, capture_blocked, capture_blocked_at, wipe_count, human_clear {at, principal}|null, payment_surface {locked, tabs, unverified, native_connected, claimed_at}, history",
       "errors": [
         "unknown_slot"
       ],
@@ -488,7 +488,7 @@
         "slot_id",
         "confirmed_by"
       ],
-      "reply": "slot_id, capture_blocked=false, cleared, cleared_at (also releases the payment surface)",
+      "reply": "slot_id, capture_blocked=false, cleared, cleared_at (also releases the payment lock)",
       "errors": [
         "guard_clear_principal",
         "unknown_slot"
@@ -808,7 +808,7 @@
       "body": [
         "?tok="
       ],
-      "reply": "Chrome /json/list rewritten onto the gate",
+      "reply": "Chrome /json/list rewritten onto the gate, each row only id, type, url, title, webSocketDebuggerUrl (while the payment lock holds: title \"\", url its origin)",
       "errors": [
         "lease_ended",
         "token_not_current",
@@ -826,7 +826,7 @@
       "body": [
         "?tok="
       ],
-      "reply": "CDP WebSocket splice (capture guard, payment surface: cdp_methods)",
+      "reply": "CDP WebSocket splice (capture guard, payment lockdown: cdp_methods)",
       "errors": [
         "lease_ended",
         "token_not_current",
@@ -916,24 +916,40 @@
     "doc": "CDP methods the splice answers itself on every /devtools and /slot/{slot}/json/version WebSocket; never forwarded to Chrome. Errors use the CDP error shape {id, sessionId?, error {code -32000, message '<code>: ...'}}.",
     "methods": {
       "Hermes.claimPaymentSurface": {
-        "params": "frames [frameId, 1..8], targets [targetId, 1..8]: every frame must live in one of the targets (an OOPIF document is its own target; an in-process frame names the target whose frame tree holds it)",
-        "result": "claimed=true, frames, targets (the slot's whole protected set)",
+        "params": "tabs [targetId, 1..8]: the top-level page targets holding the card documents (each must be a live page target); no other key",
+        "result": "claimed=true, locked=true, tabs (the slot's whole owning set: each claimed page target and, when Chrome lists tab-type targets, the tab target holding it)",
         "errors": [
           "payment_surface_unavailable"
         ],
-        "rules": "first connection to claim a slot with an empty set becomes its native connection; only it can extend the set; any other claim, a claim after the native socket closed or after a control restart, and an unverifiable frame are refused; the runtime refuses the card fill unless its own claim succeeded"
+        "rules": "first connection to claim an unlocked slot becomes its native connection; only it can extend the set; any other claim, a claim after the native socket closed or after a control restart, and an unverifiable tab are refused; every other CDP connection to the slot is closed before the reply; the runtime refuses the card fill unless its own claim succeeded"
       },
       "Hermes.paymentSurfaceStatus": {
         "params": "none",
-        "result": "protected, native (this connection is the native one), frames, targets",
+        "result": "locked, native (this connection is the native one), tabs (owning tab ids), unverified (a lock record that did not read back: human clear only)",
         "errors": []
       }
     },
     "errors": {
       "payment_surface_unavailable": "the claim cannot be confirmed or another connection holds the slot",
-      "payment_surface_protected": "a non-native connection asked for a read, interception or copy path on a protected slot, or Chrome's reply on a protected session answers a command sent before the protection",
-      "cdp_method_blocked": "any other Hermes.* method, and Target.exposeDevToolsProtocol"
+      "payment_surface_locked": "the slot is locked for a payment and this non-native connection sent a command outside locked.commands, one carrying a sessionId, or an id still in flight",
+      "cdp_method_blocked": "a malformed command, any other Hermes.* method, and Target.exposeDevToolsProtocol"
     },
-    "clears": "a protected frame's cross-document navigation (new loaderId), detach or target loss seen by control's own CDP watcher; a temporary-profile wipe; a human POST /v1/capture-guard/clear; never a controller-key route"
+    "locked": {
+      "commands": [
+        "Target.getTargets",
+        "Target.getTargetInfo",
+        "Target.setDiscoverTargets",
+        "Target.closeTarget",
+        "Browser.getVersion"
+      ],
+      "events": [
+        "Target.targetCreated",
+        "Target.targetDestroyed",
+        "Target.targetInfoChanged",
+        "Target.targetCrashed"
+      ],
+      "rules": "while a slot is locked every non-native connection may send only these commands (exact names) with no sessionId, and receives only these events (no sessionId) and the replies to its own allowed commands, rebuilt from allowlisted fields (target info: targetId, type, attached, browserContextId, url as scheme://host[:port] or \"\", title \"\"; closeTarget: success; getVersion: its version strings; errors: code, message); a non-native connection opened before the latest claim is closed; the native connection is not filtered (the runtime gates the model commands it relays on it); Hermes.* methods are answered on every connection"
+    },
+    "releases": "every owning tab destroyed: Target.targetDestroyed seen by control's own watcher and the tab absent from a Target.getTargets read after it; a temporary-profile wipe; a human POST /v1/capture-guard/clear; never navigation, reload, a crash or a controller-key route; a restart keeps the lock"
   }
 }

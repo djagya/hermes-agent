@@ -150,12 +150,20 @@ def _supervisor(task_id: Optional[str]):
         return None
 
 
+def _payment_locked(supervisor: Any) -> bool:
+    """dlz (payment lockdown): no policy install and no tab watching while a card payment locks the slot (the
+    supervisor's own automation stands down too: browser_supervisor_dialogs)."""
+    from tools.browser_payment_surface import slot_locked
+
+    return slot_locked(supervisor)
+
+
 def arm(task_id: Optional[str], env: dict, *, on_dialog: str, identity: str) -> float:
     """Install this call's decider on the task's supervisor and watch every tab.
     Returns the call's start stamp for :func:`collect`."""
     started = time.time()
     supervisor = _supervisor(task_id)
-    if supervisor is None:
+    if supervisor is None or _payment_locked(supervisor):
         return started
     supervisor.dialog_decider = make_decider(on_dialog=on_dialog, slot_marked=_slot_marked(env), identity=identity,
                                              after_handoff=_take_handoff_flag(task_id))
@@ -172,9 +180,18 @@ def disarm(task_id: Optional[str], env: dict, *, identity: str, dispatched: bool
         with _after_handoff_lock:
             _after_handoff.discard(task_id or "default")
     supervisor = _supervisor(task_id)
-    if supervisor is not None:
+    if supervisor is not None and not _payment_locked(supervisor):
         supervisor.dialog_decider = make_decider(on_dialog="auto", slot_marked=_slot_marked(env), identity=identity,
                                                  after_handoff=_take_handoff_flag(task_id))
+
+
+def _withhold(row: dict) -> dict:
+    """dlz: ids and types only. Used while the slot is locked and, after it, for every dialog that opened
+    while it was locked (its text may echo what the card form held)."""
+    for key in ("message", "default_prompt", "url", "page"):
+        row.pop(key, None)
+    row["withheld"] = "payment_surface_locked"
+    return row
 
 
 def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
@@ -192,7 +209,7 @@ def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
         row.pop("opened_at", None)
         row["url"] = _origin(getattr(dialog, "url", "")) or ""
         row["page"] = _origin(getattr(dialog, "top_url", "")) or ""
-        pending.append(row)
+        pending.append(_withhold(row) if getattr(dialog, "opened_locked", False) else row)
     handled = []
     for record in snap.recent_dialogs:
         if record.opened_at < since - 1:
@@ -200,9 +217,15 @@ def collect(task_id: Optional[str], since: float) -> Optional[dict[str, Any]]:
         row = record.to_dict()
         for key in ("opened_at", "closed_at"):
             row.pop(key, None)
-        handled.append(row)
+        handled.append(_withhold(row) if getattr(record, "opened_locked", False) else row)
     if not pending and not handled:
         return None
+    from tools.browser_payment_surface import slot_locked
+
+    if slot_locked(supervisor):
+        # dlz (payment lockdown): a dialog's text is page content; while a card payment locks the slot it
+        # stays with the user (ids and types only).
+        pending, handled = [_withhold(r) for r in pending], [_withhold(r) for r in handled]
     out: dict[str, Any] = {"pending": pending, "handled": handled}
     if pending:
         out["hint"] = (
@@ -218,4 +241,11 @@ def respond(task_id: Optional[str], *, action: str, dialog_id: str = "", prompt_
     supervisor = _supervisor(task_id)
     if supervisor is None:
         return {"ok": False, "error": "no browser session is attached for this task; run browser_exec first"}
-    return supervisor.respond_to_dialog(action, prompt_text=prompt_text, dialog_id=dialog_id or None)
+    from tools.browser_payment_surface import fenced_native
+
+    # dlz (payment lockdown): never answered on a locked slot, never across a claim (payload withheld then).
+    out = fenced_native(supervisor, lambda: supervisor.respond_to_dialog(action, prompt_text=prompt_text,
+                                                                        dialog_id=dialog_id or None))
+    if out.get("error_type"):
+        return {"ok": False, "error_type": out["error_type"], "error": out["error"]}
+    return out

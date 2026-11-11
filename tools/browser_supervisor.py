@@ -92,14 +92,51 @@ class _LoopUnavailable(RuntimeError):
     """The supervisor loop refused new work (closed / shutting down)."""
 
 
-def _schedule(coro, loop, *, timeout: float):
-    """Run ``coro`` on the supervisor loop from a sync caller and wait for its result."""
+# dlz (payment lockdown): how long a timed-out call waits for its cancelled coroutine to stop.
+_DRAIN_S = 5.0
+
+
+def run_bounded(coro, loop, *, timeout: float, unavailable=None):
+    """Run ``coro`` on ``loop`` from a sync caller and wait at most ``timeout`` for its result. dlz: on a
+    timeout (or any failure to wait) the coroutine is cancelled AND drained (bounded) before this returns,
+    so no abandoned work keeps sending CDP after the caller (and any fence it holds) moved on."""
     from agent.async_utils import safe_schedule_threadsafe
 
-    fut = safe_schedule_threadsafe(coro, loop)
+    gate, done = threading.Lock(), threading.Event()
+    state = {"started": False, "abandoned": False}
+
+    async def bounded():
+        with gate:  # a caller that already gave up never lets the work start
+            if state["abandoned"]:
+                raise asyncio.CancelledError
+            state["started"] = True
+        try:
+            return await coro
+        finally:
+            done.set()
+
+    fut = safe_schedule_threadsafe(bounded(), loop)
     if fut is None:
-        raise _LoopUnavailable("Browser supervisor loop unavailable")
-    return fut.result(timeout=timeout)
+        coro.close()
+        raise (unavailable or _LoopUnavailable("Browser supervisor loop unavailable"))
+    try:
+        return fut.result(timeout=timeout)
+    except BaseException:
+        with gate:
+            state["abandoned"] = True
+            started = state["started"]
+        fut.cancel()
+        if started:
+            done.wait(_DRAIN_S)
+        else:
+            coro.close()
+        raise
+
+
+def _schedule(coro, loop, *, timeout: float):
+    """Run ``coro`` on the supervisor loop from a sync caller and wait for its result (cancelled and drained
+    on a timeout: :func:`run_bounded`)."""
+    return run_bounded(coro, loop, timeout=timeout)
 
 
 def _fail(error: str) -> dict[str, Any]:
@@ -322,8 +359,10 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                 await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=2.0)
 
         async def _probe(target_id: str) -> tuple[str, bool, bool]:
-            sid = await self._attach_page(target_id, timeout=PAGE_ATTACH_TIMEOUT_S)
+            sid = await self._attach_page(target_id, timeout=PAGE_ATTACH_TIMEOUT_S, refuse_locked=True)
             try:
+                if self._payment_locked():  # dlz: locked during the attach: no page is read
+                    raise RuntimeError("payment_surface_locked: a card payment locks this browser")
                 probe = await self._cdp("Runtime.evaluate", {"expression": probe_js, "returnByValue": True},
                                         session_id=sid, timeout=PAGE_ATTACH_TIMEOUT_S)
             except Exception:
@@ -350,6 +389,10 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             for target_id, url in candidates:
                 if deadline - loop.time() < PAGE_ATTACH_TIMEOUT_S:
                     break
+                if self._payment_locked():  # dlz: a card payment locked the slot meanwhile: nothing more is sent
+                    if chosen:
+                        await _detach(chosen[0])
+                    return _fail("payment_surface_locked: a card payment locks this browser")
                 try:
                     sid, passed, visible = await _probe(target_id)
                 except Exception as e:  # health: allow BLE001 -- a dead tab is skipped; a traceback would leak the CDP endpoint
@@ -367,6 +410,9 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             if chosen is None:
                 return _fail(f"no open page on {origin or 'any site'}"
                              + (" with the expected form" if accept and candidates else ""))
+            if self._payment_locked():  # dlz: never swap the page session on a locked slot
+                await _detach(chosen[0])
+                return _fail("payment_surface_locked: a card payment locks this browser")
             with self._state_lock:
                 self._page_session_id = chosen[0]
             return {"ok": True, "url": chosen[1]}
@@ -514,15 +560,28 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 10.0)
 
-    async def _attach_page(self, target_id: str, *, timeout: float, deadline: Optional[float] = None) -> str:
+    async def _attach_page(self, target_id: str, *, timeout: float, deadline: Optional[float] = None,
+                           refuse_locked: bool = False) -> str:
         """Attach flattened, enable domains, install the dialog bridge; returns the session id. A target
         that does not answer (crashed renderer, hung tab) is detached again and the error re-raised.
-        dlz: with ``deadline`` (monotonic) the attach and all enables together finish by then (B15)."""
+        dlz: with ``deadline`` (monotonic) the attach and all enables together finish by then (B15). With
+        ``refuse_locked`` (an agent-initiated attach: focus_page) nothing is attached on a locked slot; the
+        supervisor's own reattach after a reconnect still attaches, its page session is what payment_done
+        reads the confirmation over."""
         def left() -> float:
             return timeout if deadline is None else max(0.05, min(timeout, deadline - time.monotonic()))
 
+        if refuse_locked and self._payment_locked():  # dlz: no agent-initiated attach on a locked slot
+            raise RuntimeError("payment_surface_locked: a card payment locks this browser")
         attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=left())
         sid = attach["result"]["sessionId"]
+        try:
+            if refuse_locked and self._payment_locked():  # locked while the attach was on the wire: let it go
+                raise RuntimeError("payment_surface_locked: a card payment locks this browser")
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=min(2.0, left()))
+            raise
         self._main_page_target = target_id
         try:
             enable = self._enable_page_domains(sid, timeout=timeout)
