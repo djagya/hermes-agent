@@ -580,7 +580,7 @@ MAX_DIALOG_TEXT = 200
 # digit run of 3+ and every date-like group is masked anyway, so no scrub difference tells a value apart.
 _CARD_DIALOG_VALUES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _MAX_CARD_DIALOG_VALUES = 64
-_DIGITS_MASKED = re.compile(r"\d{1,2}\s*[/\-]\s*\d{2,4}|\d{3,}")
+_DIGITS_MASKED = re.compile(r"\d{1,2}\s*[/\-]\s*\d{2,}|\d{3,}")
 
 
 def register_dialog_card_values(secret: dict, supervisor: Any) -> None:

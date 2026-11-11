@@ -519,6 +519,9 @@ def test_dialog_text_is_redacted_of_the_card_before_masking():
     probe = "CVC 735 736 737 738? Ada Testperson?"
     assert done._dialog_text(probe, other) == "CVC ••• ••• ••• •••? Ada Testperson?"
     assert done._dialog_text(probe, sup) == "CVC ••• ••• ••• •••? «redacted-card»?"
+    # Codex r5 P3: a date-like prefix never leaves the tail of a longer run visible
+    masked = done._dialog_text("Order 03/12345, ref 03/123456", other)
+    assert not any(ch.isdigit() for ch in masked), masked
 
 
 def test_only_the_shop_page_confirm_can_be_accepted():
