@@ -288,11 +288,13 @@ def test_cdp_protocol_ids_survive_a_mask_window_but_page_values_do_not():
     assert out["result"]["value"] == {"targetId": "••••", "n": "••••"}
 
 
-def test_dotted_groups_mask_cards_not_decimals():
-    # r13 peer P3: a 16-digit decimal (box-model coordinate) was masked as a dotted card group
+def test_dotted_card_groups_are_masked():
+    # r13 peer P3 was a display-only cost (long decimals); r17/r18 showed narrower rules leak card numbers
     redact.register_card_window("shopping", digits=(CARD["card_number"], CARD["cvc"]))
     assert "4000" not in redact.redact_sensitive_text("4000.0566.5566.5556", force=True)
-    assert redact.redact_sensitive_text("x 87.33334350585938", force=True) == "x 87.33334350585938"
+    assert redact.redact_sensitive_text("x 87.1234", force=True) == "x 87.1234"
+    for text in ("4000 0566 55665556", "4000-0566-55665556", "40 00 056655665556", "40000566.55665556"):  # r18
+        assert not any(ch.isdigit() for ch in redact.redact_sensitive_text(text, force=True)), text
 
 
 def test_cdp_ids_are_exempt_only_with_chrome_shapes():
@@ -324,7 +326,8 @@ def test_doctype_ids_and_mixed_separator_card_groups_are_scrubbed():
     for seps in itertools.product(" .-", repeat=3):
         text = "4000{}0566{}5566{}5556".format(*seps)
         assert not any(ch.isdigit() for ch in redact.redact_sensitive_text(text, force=True)), text
-    assert redact.redact_sensitive_text("x 87.33334350585938", force=True) == "x 87.33334350585938"
+    for text in ("4000 0566 55665556", "4000-0566-55665556", "40 00 056655665556", "40000566.55665556"):  # r18
+        assert not any(ch.isdigit() for ch in redact.redact_sensitive_text(text, force=True)), text
 
 
 def test_script_ids_stay_and_free_form_metadata_is_page_data():
