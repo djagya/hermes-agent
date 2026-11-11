@@ -52,21 +52,26 @@ class FakeSup:
         self.calls, self.fail = [], set()
         self.tab_open = True
         self.dialogs, self.extra_tabs, self.closing = [], [], []
+        self.targets = {}  # session id → target id; the page session is "TAB", others "OTHER"
 
     async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
         self.calls.append((method, params or {}, session_id, self.tree))
         if method in self.fail:
             raise RuntimeError(f"CDP error on id=1: {method} failed")
-        return {"id": len(self.calls), "result": self.answer(method, params or {})}
+        return {"id": len(self.calls), "result": self.answer(method, params or {}, session_id)}
 
-    def answer(self, method, params):
+    def answer(self, method, params, session_id=None):
         if method == "Target.getTargets":
             tabs = [{"targetId": "TAB", "type": "page", "url": (self.tree or CHECKOUT)[0][2], "title": "Shop",
                      "browserContextId": "CTX"}] if self.tab_open else []
             return {"targetInfos": tabs + self.extra_tabs + [{"targetId": "OTHER", "type": "page",
                                                               "url": "https://x.test/"}]}
         if method == "Target.getTargetInfo":
-            return {"targetInfo": {"targetId": "TAB", "url": (self.tree or CHECKOUT)[0][2]}}
+            target = self.targets.get(session_id or "",
+                                      "TAB" if session_id == self._page_session_id else "OTHER")
+            return {"targetInfo": {"targetId": target, "url": (self.tree or CHECKOUT)[0][2]}}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "S-temp"}
         if method == "Page.createIsolatedWorld":
             return {"executionContextId": 7}
         if method == "Runtime.evaluate":
@@ -476,7 +481,8 @@ def test_a_held_confirm_is_reported_masked_and_answered_once():
     assert not sup.sent("Runtime.evaluate") and not sup.sent("Target.closeTarget")
     assert (held["id"], held["type"], held["origin"], held["on_payment_tab_top"], held["on_shop_page"]) == (
         "d-1", "confirm", SHOP, True, True)
-    assert held["text"].startswith("Place order •••••••••••••••• for 22.66 EUR?") and len(held["text"]) == 200
+    assert (held["text"].startswith("Place order •••••••••••••••• for ••.•• EUR?")
+            and len(held["text"]) == 200)
     assert "4111" not in json.dumps(out)
     assert surface.payment_controls(sup)["dialog_pending"] == held
     assert done.payment_dialog(sup, "d-1", "true")["error_type"] == "payment_dialog_invalid"
@@ -522,6 +528,60 @@ def test_dialog_text_is_redacted_of_the_card_before_masking():
     # Codex r5 P3: a date-like prefix never leaves the tail of a longer run visible
     masked = done._dialog_text("Order 03/12345, ref 03/123456", other)
     assert not any(ch.isdigit() for ch in masked), masked
+
+
+def test_a_registered_vault_secret_with_digits_is_scrubbed_whole_and_pure_digits_leave_no_oracle():
+    # r5 P2: the digit mask ran before the exact-value scrub, so a registered secret
+    # with a digit run inside it reached the model with only its digits masked
+    from agent import redact
+
+    sup = FakeSup([CHECKOUT])
+    redact.register_vault_redaction_value("correcthorse947battery")
+    redact.register_vault_redaction_value("947")
+    try:
+        out = done.redact_dialog_text("Your password correcthorse947battery is wrong", sup)
+        assert out == "Your password «redacted-vault-secret» is wrong"
+        assert "correcthorse" not in out and "battery" not in out and "947" not in out
+        # no oracle: a registered pure-digit value is masked exactly like an unregistered one
+        assert done.redact_dialog_text("code 947 ok", sup) == done.redact_dialog_text(
+            "code 947 ok", FakeSup([CHECKOUT])) == "code ••• ok"
+    finally:
+        redact.clear_vault_redaction_values()
+
+
+def test_a_confirm_on_the_payment_tab_is_reported_while_the_page_session_is_elsewhere():
+    # r5 P3: a reconnect re-attached the supervisor's page session to another tab, so the
+    # payment tab's own held confirm showed only as other_dialogs_pending, and payment_dialog
+    # refused it
+    sup = _paid([CHECKOUT])
+    sup.targets["S-page"] = "OTHER"  # the supervisor's page session sits on another tab
+    sup.targets["S-pay"] = "TAB"  # a live session of the payment tab
+    sup.dialogs = [
+        _confirm(
+            "Other tab?", opened=0.5, did="d-0", url="https://x.test/", session="S-x"
+        ),
+        _confirm("Place order for 22.66 EUR?", session="S-pay"),
+        _confirm(
+            "Card?",
+            opened=1.5,
+            did="d-2",
+            url=STRIPE + "/v3/frame",
+            frame="CARD",
+            session="S-pay",
+        ),
+    ]
+    out = done.payment_done(sup)
+    assert out["error_type"] == "payment_dialog_pending"
+    assert out["other_dialogs_pending"] == 1 and out["dialogs_pending"] == 2
+    held = out["dialog_pending"]
+    assert (held["id"], held["type"], held["origin"]) == ("d-1", "confirm", SHOP)
+    assert (held["on_payment_tab_top"], held["on_shop_page"]) == (True, True)
+    # no approved total recorded: the amount stays masked (r5 P3)
+    assert held["text"] == "Place order for ••.•• EUR?"
+    assert done.payment_dialog(sup, "d-1", True)["answered"] == "accept"
+    # the refusals stand here too: a card-frame confirm is never accepted
+    assert done.payment_dialog(sup, "d-2", True)["error_type"] == "payment_dialog_not_payment_tab"
+    assert not [c for c in sup.sent("respond_to_dialog") if c[1]["dialog_id"] == "d-2"]
 
 
 def test_only_the_shop_page_confirm_can_be_accepted():
@@ -573,5 +633,17 @@ def test_only_the_owner_approved_total_is_shown_in_a_dialog():
     assert "122" not in unrecorded and "922" not in unrecorded
     done.record_approved_amount(sup, "TAB", "122.66", "EUR")
     shown = done._dialog_text(text, sup)
-    assert shown == "Place order for 122.66 EUR (122,66)? Not •••.67, •••.66, 1.•••,66 or •••.•••."
+    assert shown == "Place order for 122.66 EUR (122,66)? Not •••.••, •••.••, 1.•••,66 or •••.•••."
     assert "122.66" not in done._dialog_text(text, _paid([CHECKOUT]))  # another slot's payment: masked
+
+
+def test_other_amounts_stay_masked_and_only_the_approved_total_shows():
+    # r5 P3: "9.99", "12.34" and "9,99" carried no 3+ digit run and passed verbatim,
+    # while the shipped schema text promises every amount but the total stays masked
+    sup = _paid([CHECKOUT])
+    done.record_approved_amount(sup, "TAB", "22.66", "EUR")
+    text = "Pay 22.66? Add premium for 9.99/month, was 12.34 (9,99)"
+    assert (
+        done._dialog_text(text, sup)
+        == "Pay 22.66? Add premium for •.••/month, was ••.•• (•,••)"
+    )
