@@ -274,3 +274,15 @@ def test_bridge_kinds_echo_fields_and_dotted_card_groups(monkeypatch):
     out = json.loads(vault._handle_vault({"action": "fill", "handle": "op:x"}))
     assert out["approval_origins"] == ["https://shop365.example"] and out["merchant_origin"] == "https://shop365.example"
     assert "4000" not in redact.redact_sensitive_text("https://4000.0566.5566.5556.host/", force=True)
+
+
+def test_cdp_protocol_ids_survive_a_mask_window_but_page_values_do_not():
+    # r13 Codex P2: targetId "A1234…" / nodeId 1234 were masked during a PIN window, breaking the next call
+    redact.register_vault_redaction_value("4711")
+    tid = "A1234" + "B" * 27
+    out = cdp_tool._redact_cdp_output({"targetInfos": [{"targetId": tid, "title": "pin 4711"}], "nodeId": 1234,
+                                       "backendNodeIds": [1234, 5678],
+                                       "result": {"type": "object", "value": {"targetId": "4711", "n": 4711}}})
+    assert out["targetInfos"][0]["targetId"] == tid and out["nodeId"] == 1234 and out["backendNodeIds"] == [1234, 5678]
+    assert out["targetInfos"][0]["title"] == "pin ••••"
+    assert out["result"]["value"] == {"targetId": "••••", "n": "••••"}

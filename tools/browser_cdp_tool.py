@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import logging
 from typing import Any, Callable, Dict, Optional
 
@@ -46,12 +47,21 @@ _CDP_FLAGGED_BINARY_PATHS: dict[str, tuple] = {
 }
 
 
+# Protocol identifiers in CDP results (targetId, sessionId, frameId, nodeId, backendNodeIds, id, ...).
+_PROTOCOL_ID = re.compile(r"(?:id|[a-z][A-Za-z]*Ids?)")
+
+
+def _id_value(v: Any) -> bool:
+    return isinstance(v, (str, int)) and not isinstance(v, bool)
+
+
 def _redact_cdp_output(
     value: Any,
     *,
     always_paths: tuple = (),
     flagged_paths: tuple = (),
     _depth: int = 0,
+    _page: bool = False,
 ) -> Any:
     """Redact browser-originated CDP result text; opaque bytes stay byte-identical.
 
@@ -80,7 +90,7 @@ def _redact_cdp_output(
         return redact_number(value, "browser")
     if isinstance(value, (list, tuple)):
         return type(value)(
-            _redact_cdp_output(item, _depth=_depth + 1) for item in value
+            _redact_cdp_output(item, _depth=_depth + 1, _page=_page) for item in value
         )
     if not isinstance(value, dict):
         return value
@@ -92,12 +102,19 @@ def _redact_cdp_output(
     redacted: dict[str, Any] = {}
     for key, item in value.items():
         opaque = leaf(always_paths, key) or (leaf(flagged_paths, key) and base64_flagged)
+        if not _page and isinstance(key, str) and _PROTOCOL_ID.fullmatch(key) and (
+                _id_value(item) or isinstance(item, list) and all(_id_value(v) for v in item)):
+            # dlz: Chrome-issued ids (targetId, nodeId, ...) are echoed back; masking them breaks the next call.
+            # Inside a by-value page object (under "value") a key may only imitate one, so it is scrubbed there.
+            redacted[key] = item
+            continue
         out_key = redact_sensitive_text(key, force=True, vault="browser") if isinstance(key, str) else key  # by-value objects can carry a secret as a KEY
         redacted[out_key] = item if isinstance(item, str) and opaque else _redact_cdp_output(
             item,
             always_paths=descend(always_paths, key),
             flagged_paths=descend(flagged_paths, key),
             _depth=_depth + 1,
+            _page=_page or key == "value",
         )
     return redacted
 
