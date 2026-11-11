@@ -607,6 +607,45 @@ def register_dialog_card_values(secret: dict, supervisor: Any) -> None:
         del held[:-_MAX_CARD_DIALOG_VALUES]
 
 
+def has_dialog_card_values(supervisor: Any) -> bool:
+    """Whether a card fill registered dialog values for ``supervisor`` (its slot's own card)."""
+    with _LOCK:
+        try:
+            return supervisor in _CARD_DIALOG_VALUES
+        except TypeError:  # nothing to scope by: no values were registered for it either
+            return False
+
+
+def payment_text_exposed(supervisor: Any) -> bool:
+    """Whether page-originated text seen through ``supervisor`` needs the payment masking (every 3+ digit
+    run, date-like group and amount, plus its registered card values). True while its slot is locked for a
+    card payment (the local lock state only — no status read), once a card fill registered values for it, or
+    while the persistent capture-guard mark still covers its slot (a mark without a slot id, and every mark
+    on a browser without control, is profile-wide). An unreadable answer masks (fail closed)."""
+    try:
+        from tools.browser_payment_surface import locally_locked
+
+        if locally_locked(supervisor):
+            return True
+    except Exception:  # health: allow BLE001 -- unknown lock state: mask
+        return True
+    if has_dialog_card_values(supervisor):
+        return True
+    try:
+        from tools.browser_payment_privacy import slot_has_mark
+
+        slot_id = ""
+        try:
+            from tools.browser_use_cli import vault_route
+
+            slot_id = str((vault_route(getattr(supervisor, "task_id", None)) or {}).get("slot_id") or "")
+        except Exception:  # health: allow BLE001 -- no route to name a slot: the profile-wide answer applies
+            slot_id = ""
+        return slot_has_mark(slot_id)
+    except Exception:  # health: allow BLE001 -- marks unreadable: mask
+        return True
+
+
 def _mask_digits(text: str) -> str:
     return _DIGITS_MASKED.sub(lambda m: re.sub(r"\d", "•", m.group(0)), text)
 
@@ -617,30 +656,36 @@ _AMOUNT_TOKEN = re.compile(r"(?<![\d.,])(\d{1,7})([.,])(\d{2})(?![\d.,]?\d)")
 _KEPT = "\ue000{}\ue001"  # private-use marks: no redactor or scrub touches them
 
 
-def _keep_approved_amount(text: str, supervisor: Any) -> tuple:
-    """Set aside each token that exactly equals an owner-approved total of ``supervisor`` (either separator)."""
+def _mask_amounts(text: str, supervisor: Any) -> tuple:
+    """One pass over every amount token: one that exactly equals an owner-approved total of ``supervisor``
+    (either separator) is set aside behind a keep-mark, every other one is masked digit-for-digit (the
+    separator stays, like the date mask), so no amount but an approved total is readable in a dialog."""
     approved, kept = _approved_amounts(supervisor), []
-    if not approved:
-        return text, kept
 
-    def keep(m):
-        if (m.group(1), m.group(3)) not in approved:
-            return m.group(0)
-        kept.append(m.group(0))
-        return _KEPT.format(len(kept) - 1)
+    def repl(m):
+        if approved and (m.group(1), m.group(3)) in approved:
+            kept.append(m.group(0))
+            return _KEPT.format(len(kept) - 1)
+        return re.sub(r"\d", "\u2022", m.group(0))
 
-    return _AMOUNT_TOKEN.sub(keep, text), kept
+    return _AMOUNT_TOKEN.sub(repl, text), kept
 
 
 def redact_dialog_text(text: Any, supervisor: Any = None) -> str:
-    """Any dialog text the model can see. Every run of 3+ digits and every date-like group (``03/31``,
-    ``3 - 2031``) is masked FIRST, so no exact-value scrub after it can mark which number was the CVC, the card
-    number or the expiry; then the forced secret redactor, then the card values registered for ``supervisor``
-    (the dialog's own; case-insensitive), and the mask once more over what those left. The one exception: a
-    token exactly equal to the cart total the owner approved for this supervisor's payment stays readable."""
-    from agent.redact import redact_sensitive_text
+    """Any dialog text the model can see. Registered vault values with a non-digit character are scrubbed
+    whole from the RAW text first (pure-digit values, like a card number or CVC, are not: a placeholder
+    would mark which digit run was the secret). Then every amount token but an approved total is masked and
+    set aside, every run of 3+ digits and every date-like group (``03/31``, ``3 - 2031``) is masked, so no
+    exact-value scrub after it can mark which number was the CVC, the card number or the expiry; then the
+    forced secret redactor, then the card values registered for ``supervisor`` (the dialog's own;
+    case-insensitive), and the mask once more over what those left. The one exception: a token exactly
+    equal to the cart total the owner approved for this supervisor's payment stays readable."""
+    from agent.redact import redact_registered_vault_values, redact_sensitive_text
 
-    text, kept = _keep_approved_amount(str(text or "").replace("\ue000", "").replace("\ue001", ""), supervisor)
+    raw = redact_registered_vault_values(
+        str(text or "").replace("\ue000", "").replace("\ue001", ""), nondigit_only=True
+    )
+    text, kept = _mask_amounts(raw, supervisor)
     text = redact_sensitive_text(_mask_digits(text), force=True)
     with _LOCK:
         values = sorted(_CARD_DIALOG_VALUES.get(supervisor, ()) if supervisor is not None else (), key=len,
@@ -669,29 +714,57 @@ def _held_dialogs(supervisor: Any) -> list:
 
 
 async def _payment_tab_top(sup: Any) -> Optional[dict]:
-    """The supervised page when it is a recorded payment tab: ``{sid, tab, frame, origin, sessions}`` (its top
-    frame's id and origin, and the page session plus the tab's frame sessions), else None."""
+    """The payment tab's own top document: ``{sid, tab, frame, origin, sessions}`` (its top frame's id and
+    origin, and the sessions its dialogs may sit on). The supervisor's page session when it is a recorded
+    payment tab, plus that tab's frame sessions. When the page session is not the payment tab (a reconnect
+    re-attached it elsewhere), the tab's own session is resolved by the rule ``_tab_session`` applies — a
+    live session on that tab — taken from the held dialogs' sessions (``Target.getTargetInfo`` names each
+    one's target; a session that died with an old socket names none), never a fresh attach: its id could
+    not be the held dialog's, so the confirm would stay unanswerable. Only those sessions count there:
+    the supervisor's frame sessions belong to its main page, another tab. None when no recorded payment
+    tab answers, or payments are ambiguous."""
     with sup._state_lock:
-        sid = sup._page_session_id if sup._active else None
-    if not sid:
-        return None
-    info = (await sup._cdp("Target.getTargetInfo", session_id=sid))["result"]["targetInfo"]
-    tab = info.get("targetId")
+        page_sid = sup._page_session_id if sup._active else None
     with _LOCK:
-        recorded = tab in (_PAYMENTS.get(sup) or {})
-    if not recorded:
-        return None
+        payments = _PAYMENTS.get(sup) or {}
+    tab = sid = None
+    sessions: set = set()
+    children: set = set()
+    if page_sid:
+        info = (await sup._cdp("Target.getTargetInfo", session_id=page_sid))["result"]["targetInfo"]
+        if info.get("targetId") in payments:
+            tab, sid = info.get("targetId"), page_sid
+    if sid is None:
+        if len(payments) != 1:
+            return None
+        tab = next(iter(payments))
+        for dialog in _held_dialogs(sup):
+            d_sid = getattr(dialog, "cdp_session_id", None)
+            if not d_sid or d_sid in sessions:
+                continue
+            try:
+                info = (await sup._cdp("Target.getTargetInfo", session_id=d_sid))["result"]["targetInfo"]
+            except Exception:  # health: allow BLE001 -- a dead session names no target
+                continue
+            if info.get("targetId") == tab:
+                sessions.add(d_sid)
+                if sid is None:  # the oldest held dialog on the tab: the one dialog_pending reports
+                    sid = d_sid
+        if sid is None:
+            return None
+    else:
+        with sup._state_lock:
+            children = {f.cdp_session_id for f in getattr(sup, "_frames", {}).values() if f.cdp_session_id}
     frame = (await sup._cdp("Page.getFrameTree", session_id=sid))["result"]["frameTree"]["frame"]
-    with sup._state_lock:
-        children = {f.cdp_session_id for f in getattr(sup, "_frames", {}).values() if f.cdp_session_id}
     return {"sid": sid, "tab": tab, "frame": str(frame.get("id") or ""), "origin": _url_origin(frame.get("url")),
-            "sessions": {sid} | children}
+            "sessions": {sid} | sessions | children}
 
 
 def _dialog_place(sup: Any, dialog: Any, top: Optional[dict]) -> tuple:
     """``(on_payment_tab_top, on_shop_page)``. On the top: raised by the recorded payment tab's top document,
-    proven by its page session and its top frame's id (a dialog without a frame id is not), on that document's
-    origin, which is not a card origin. On the shop page: that, and the origin is the payment's merchant."""
+    proven by a session of that tab's page (the page session, or the tab's own resolved session) and its top
+    frame's id (a dialog without a frame id is not), on that document's origin, which is not a card origin.
+    On the shop page: that, and the origin is the payment's merchant."""
     if top is None:
         return False, False
     with _LOCK:

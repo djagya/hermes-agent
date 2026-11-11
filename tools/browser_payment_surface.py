@@ -16,8 +16,9 @@ everything the model can relay over that socket:
   has its result withheld.
 - :func:`payment_controls` / :func:`payment_click` — the native actions that let a checkout continue
   under the lock: list the buttons, links and checkboxes of the payment's card documents and of the
-  payment tab's own top document (never inputs or selects; digit runs masked), and make one trusted
-  click on a listed control at its hit-tested centre.
+  payment tab's own top document (never inputs or selects; captions run through the supervisor-scoped
+  payment text redactor before their refs are built), and make one trusted click on a listed control at
+  its hit-tested centre.
 
 The lock lifts only when control's status proves the slot unlocked (the payment tab destroyed, a
 wipe or a human clear); a failed or malformed status keeps it.
@@ -433,6 +434,22 @@ def _mask(text: str) -> str:
     return re.sub(r"\d{4,}", lambda m: "•" * len(m.group(0)), text)[:_MAX_TEXT]
 
 
+def _caption(text: str, sup: Any) -> str:
+    """A control caption (text/aria-label/title — anything ``_DESCRIBE`` reads) for the model: the
+    supervisor-scoped dialog redactor first, so every 3+ digit run, date-like group and amount but an
+    owner-approved total is masked and this slot's registered card values (holder included) are scrubbed —
+    a page that echoes the card into a caption cannot pass it on. Applied BEFORE the ref is built, so refs
+    bind the masked text. The redactor's own digit mask already covers what ``_mask`` would; re-masking
+    would only hide an approved total it deliberately kept, so just the ``_MAX_TEXT`` bound remains, with
+    ``_mask`` as the fallback when the redactor cannot run."""
+    from tools.browser_payment_done import redact_dialog_text
+
+    try:
+        return redact_dialog_text(text, sup)[:_MAX_TEXT]
+    except Exception:  # health: allow BLE001 -- redactor unavailable: the plain digit mask still holds
+        return _mask(text)
+
+
 def _ref(key: str, index: int, role: str, text: str, nonce: str = "") -> str:
     """A control's ref: bound to its document (``key`` = frame id + loader) and to the listing (``nonce``)."""
     digest = hashlib.sha256(f"{key}|{index}|{role}|{text}|{nonce}".encode()).hexdigest()[:10]
@@ -503,7 +520,7 @@ async def _listing(sup: Any, fid: str, sid: str, key: str, loader: str, top: boo
         raise
     controls = []
     for row in rows.get("value") or []:
-        text = _mask(str(row.get("text") or ""))
+        text = _caption(str(row.get("text") or ""), sup)
         role = row.get("role") if row.get("role") in {"button", "link", "checkbox", "radio"} else "button"
         index = int(row.get("i") or 0)
         controls.append({"ref": _ref(key, index, role, text, nonce), "role": role, "text": text,
@@ -643,7 +660,7 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float) -> dict
                 progress.append(True)
             await sup._cdp("Input.dispatchMouseEvent", {"type": kind, "x": x2, "y": y2, "button": "left",
                                                         "clickCount": 1}, session_id=page_sid)
-        return {"success": True, "role": control["role"], "text": control["text"]}
+        return {"success": True, "role": control["role"], "text": _caption(control["text"], sup)}
     finally:
         if element:
             await sup._release_payment_object(sid, element)

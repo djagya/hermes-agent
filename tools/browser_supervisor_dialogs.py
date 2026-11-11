@@ -25,12 +25,23 @@ logger = logging.getLogger("tools.browser_supervisor")
 
 
 def _redact_supervisor_text(value: str, owner: Any = None) -> str:
-    """Redact page-originated text before exposing supervisor snapshots. dlz: the forced secret redactor plus
-    the card values registered for the dialog's own supervisor (``owner``), and every 3+ digit run and
-    date-like group masked, so a page that echoes card values in a dialog cannot pass them on."""
-    from tools.browser_payment_done import redact_dialog_text
+    """Redact page-originated text before exposing supervisor snapshots. dlz: the forced secret redactor and
+    the raw registered-vault-value scrub always; the payment masking (every 3+ digit run, date-like group and
+    amount, and the card values registered for the dialog's own supervisor ``owner``) only while that
+    supervisor's slot has payment exposure (:func:`payment_text_exposed` — owner decision 2026-11-11), so an
+    ordinary confirmation keeps its invoice number and date while a page that echoes card values in a dialog
+    on an exposed slot still cannot pass them on."""
+    from agent.redact import redact_registered_vault_values, redact_sensitive_text
+    from tools.browser_payment_done import payment_text_exposed
 
-    return redact_dialog_text(value, owner)
+    raw = redact_registered_vault_values(
+        str(value or "").replace("\ue000", "").replace("\ue001", ""), nondigit_only=True
+    )
+    if payment_text_exposed(owner):
+        from tools.browser_payment_done import redact_dialog_text
+
+        return redact_dialog_text(raw, owner)
+    return redact_sensitive_text(raw, force=True)
 
 
 def _trim_ring(events: list, keep: int) -> list:

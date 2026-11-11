@@ -77,14 +77,21 @@ def clear_vault_redaction_values() -> None:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
 
 
-def redact_registered_vault_values(text: str) -> str:
-    """Exact-substring scrub of every vault secret value registered for the current profile."""
+def redact_registered_vault_values(text: str, *, nondigit_only: bool = False) -> str:
+    """Exact-substring scrub of every vault secret value registered for the current profile.
+
+    ``nondigit_only=True`` scrubs only values that contain at least one non-digit character: the
+    payment-dialog text redactor calls this on its RAW input, before its digit mask, and a pure-digit
+    value (a card number or CVC) must not be replaced early — the placeholder would mark which digit
+    run was the secret. The digit mask covers those; the full scrub here still runs later."""
     if not isinstance(text, str) or not text:
         return text
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
         values = sorted(bucket, key=len, reverse=True) if bucket else ()  # longest first: a substring never shadows its superstring
     for value in values:
+        if nondigit_only and value.isdigit():
+            continue
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
     return text

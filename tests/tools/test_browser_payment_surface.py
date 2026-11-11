@@ -535,6 +535,35 @@ def test_a_change_during_the_move_never_gets_the_press(change):
     assert surface.payment_click(sup, ref)["success"] is True
 
 
+def test_payment_control_captions_never_carry_card_values():
+    # r7 P1: _DESCRIBE folds aria-label / value / innerText / title into one caption, so one redaction
+    # point covers them all. A page echoing the card into a caption must not pass it on through
+    # payment_controls or payment_click, and the ref binds the masked text, never the raw echo.
+    from tools import browser_payment_done as done
+
+    sup = _claimed()
+    done.register_dialog_card_values({"card_number": "4000056655665556", "cvc": "737", "exp_month": "03",
+                                      "exp_year": "2031", "cardholder_name": "Ada Testperson"}, sup)
+    rows = [{"i": 0, "role": "button", "text": "Pay with CVC 737; expiry 03/31; Ada Testperson",
+             "disabled": False}]
+    base = sup.on
+
+    def on(method, params, session):
+        if method == "Runtime.callFunctionOn" and params.get("functionDeclaration") == surface._DESCRIBE:
+            return {"result": {"value": rows}}
+        return base(method, params, session)
+
+    sup.on = on
+    secrets = ("737", "03/31", "Ada Testperson")
+    out = surface.payment_controls(sup)
+    assert out["success"] is True and not any(s in json.dumps(out) for s in secrets)
+    ref, text = out["controls"][0]["ref"], out["controls"][0]["text"]
+    assert surface._ISSUED[sup][ref][3] == text  # the spec (what a click matches) holds the masked caption
+    clicked = surface.payment_click(sup, ref)
+    assert clicked["success"] is True and clicked["text"] == text
+    assert not any(s in json.dumps(clicked) for s in secrets)
+
+
 def test_payment_click_is_one_trusted_click_at_the_hit_tested_centre():
     sup = _claimed()
     ref = surface.payment_controls(sup)["controls"][0]["ref"]
@@ -1076,6 +1105,57 @@ def test_dialog_text_from_the_lock_is_never_shown_after_it_and_card_values_are_r
     assert unlocked["message"] == "«redacted-card», ••/••, CVC •••?"
     blob = json.dumps(sup.snapshot().to_dict())
     assert "4000056655665556" not in blob and "Echo" not in blob and "Testperson" not in blob
+
+
+def _plain_dialog(monkeypatch, task, message, card=None):
+    """A held confirm on a supervisor with no lock state, admitted and collected through browser_exec."""
+    from tools import browser_exec_dialogs
+    from tools import browser_payment_done as done
+
+    sup = _dialog_sup(task)
+    if card:
+        done.register_dialog_card_values(card, sup)
+    monkeypatch.setattr(browser_exec_dialogs, "_supervisor", lambda task_id: sup)
+
+    async def scenario():
+        sup._admit_dialog(type="confirm", message=message, default_prompt="", session_id="S1", frame_id=None)
+        for handle in sup._dialog_watchdogs.values():
+            handle.cancel()
+
+    asyncio.run(scenario())
+    return sup, browser_exec_dialogs.collect(task, 0)
+
+
+def test_ordinary_dialog_text_keeps_its_numbers_and_dates_without_payment_exposure(monkeypatch):
+    # r7 P2 (owner decision): the digit/date/amount mask rides on payment exposure, not on every dialog.
+    # A fresh supervisor's confirm stays verifiable, and a capture-guard mark on ANOTHER slot does not
+    # reach into this one.
+    from tools import browser_use_cli
+    from tools.browser_payment_privacy import mark_payment_session
+
+    mark_payment_session("checkout", {"slot_id": "shopping", "browser_generation": "g1"})
+    monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: {"slot_id": "research-1"})
+    _sup, out = _plain_dialog(monkeypatch, "plain-dialogs", "Delete invoice 2024-118 dated 12/2025?")
+    assert out["pending"][0]["message"] == "Delete invoice 2024-118 dated 12/2025?"
+
+
+def test_a_dialog_on_a_slot_that_filled_a_card_is_masked_as_today(monkeypatch):
+    # the other half of the owner decision: a registered card keeps the blanket mask on that slot
+    _sup, out = _plain_dialog(monkeypatch, "card-dialogs", "Delete invoice 2024-118 dated 12/2025?",
+                              card={"card_number": "4000056655665556", "cvc": "737", "exp_month": "03",
+                                    "exp_year": "2031", "cardholder_name": "Ada Testperson"})
+    assert out["pending"][0]["message"] == "Delete invoice ••••-••• dated ••/••••?"
+
+
+def test_a_capture_guard_mark_on_this_slot_masks_its_dialogs(monkeypatch):
+    # the persistent mark outlives the payment: the slot's dialogs stay masked until an operator clears it
+    from tools import browser_use_cli
+    from tools.browser_payment_privacy import mark_payment_session
+
+    mark_payment_session("checkout", {"slot_id": "shopping", "browser_generation": "g1"})
+    monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: {"slot_id": "shopping"})
+    _sup, out = _plain_dialog(monkeypatch, "marked-dialogs", "Delete invoice 2024-118 dated 12/2025?")
+    assert out["pending"][0]["message"] == "Delete invoice ••••-••• dated ••/••••?"
 
 
 def test_timed_out_supervisor_work_is_cancelled_and_drained_before_the_caller_moves_on():
