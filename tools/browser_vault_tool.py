@@ -81,6 +81,20 @@ def _is_managed() -> bool:
         return True
 
 
+_PREVIEW_MANAGED_ERROR = ("The in-app browser is not used while Hermes drives the managed browser: open the page "
+                          "with browser_exec and call browser_vault with target=browser. Nothing was read or written.")
+# dlz: the in-app browser runs only the upstream preview operations; card, letter and protected-frame
+# actions stay on the managed browser's fences.
+_PREVIEW_ACTIONS = ("fill", "save_login", "enter_code")
+
+
+def _preview_refusal() -> Optional[str]:
+    """dlz: managed mode refuses every in-app (preview) vault operation before any page access."""
+    if not _is_managed():
+        return None
+    return json.dumps({"success": False, "error_type": "preview_unavailable", "error": _PREVIEW_MANAGED_ERROR})
+
+
 def _managed_supervisor(task_id: str, *, admit: bool = False):
     """Managed mode: the supervisor on the browser browser_exec last drove for this task.
 
@@ -88,6 +102,10 @@ def _managed_supervisor(task_id: str, *, admit: bool = False):
     path acquires without the exec's identity. A dropped socket is re-attached to the same lease after
     control confirms the agent still holds it; ``admit`` asks control even when the socket looks live
     (start of every vault page operation, and again right before a secret is written)."""
+    from tools.browser_vault_preview import active_page
+    if active_page() is not None:
+        # dlz: a vault operation pinned to the Desktop in-app page must never land on the leased slot.
+        raise _PageUnavailable("preview_unavailable", _PREVIEW_MANAGED_ERROR)
     try:
         from tools.browser_control_route import _lease_alive, control_url
     except ImportError:
@@ -146,14 +164,18 @@ def _secret_wrapped(expression: str) -> str:
 
 
 def _page_backend(task_id: str):
-    """The plugin browser holding this task's live page (e.g. Camofox), or None for the CDP session.
+    """The page this operation runs on when it is not the task's CDP session: the Desktop in-app browser
+    page pinned for a ``target='preview'`` operation, else the plugin browser holding this task's live page
+    (e.g. Camofox), else None.
 
-    dlz: never in managed mode: the leased slot is the only browser, and a plugin page backend is
-    outside control's fence (capture guard, lease admission)."""
+    dlz: never in managed mode: the leased slot is the only browser, and a plugin or in-app page is
+    outside control's fence (capture guard, lease admission). A pinned preview page is refused there
+    (:func:`_preview_refusal`, :func:`_managed_supervisor`), never silently swapped for the slot."""
     if _is_managed():
         return None
     from agent.browser_page_registry import backend_for_task
-    return backend_for_task(task_id)
+    from tools.browser_vault_preview import active_page
+    return active_page() or backend_for_task(task_id)
 
 
 def _page_eval(backend: Any, task_id: str, expression: str, *, secret: bool) -> dict[str, Any]:
@@ -259,7 +281,8 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     # human-length prompt (enter_code waits for the user's code); a takeover during that wait must
     # refuse here, before the credential lands in a page the human is now typing into. The outer
     # epoch check only discards the result, and a fill is a side effect, not a result.
-    if _bot_desktop_browser_session(task_id):
+    from tools.browser_vault_preview import active_page
+    if active_page() is None and _bot_desktop_browser_session(task_id):
         from tools.bot_desktop import lease as _bd_lease
         try:
             _bd_lease.assert_agent_may_act()
@@ -838,7 +861,8 @@ def _register_redactions(values: Any) -> Optional[str]:
 
 @plugin_errors_as_refusal
 def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_origin: str = "",
-                       purpose: str = "login", cart: Any = None, approve_origins: Any = None) -> str:
+                       purpose: str = "login", cart: Any = None, approve_origins: Any = None, *,
+                       with_identifier: bool = False) -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -847,12 +871,15 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
     the supervisor CDP WebSocket; the result reports only counts/metadata.
     """
     from tools import browser_vault_signup as signup
+    from tools.browser_vault_preview import active_page
     from agent.vault_backends import UnlockRequired, backend_for_handle
 
     effective_task_id = task_id or "default"
     if purpose not in ("login", "signup"):
         return json.dumps({"success": False, "error_type": "invalid_purpose",
                            "error": "Use purpose=login (default) or signup. Nothing was written."})
+    if active_page() is not None and (refusal := _preview_refusal()) is not None:
+        return refusal  # dlz: the Desktop key button (vault.preview.fill) reaches here without _handle_vault
     backend = backend_for_handle(handle)
     if backend is not None and backend.needs_unlock and not backend.is_unlocked():
         unlocked = json.loads(browser_vault_unlock(backend.name))
@@ -878,6 +905,11 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
     refusal = signup.kind_refusal(purpose, meta.kind)
     if refusal:
         return refusal
+    if meta.kind == "payment" and active_page() is not None:
+        # dlz: card fills run only under the managed browser's consent and capture fences.
+        return json.dumps({"success": False, "error_type": "payment_destination_requires_managed_browser",
+                           "error": "Cards are filled only in the managed browser, never in the in-app browser. "
+                                    "Nothing was written."})
     if meta.kind == "payment":
         # dlz: native card fill (tools/browser_vault_payment.py): the supervisor checks the merchant against the
         # card's bound and hosted origins before consent, re-checks before the write, and resolves the card
@@ -897,13 +929,27 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
         refusal = snapshot_refusal(backend, handle, meta, page_origin)
         if refusal is not None:
             return json.dumps(refusal)
-        return _fill_bound_page(backend, handle, meta, page_origin, effective_task_id, purpose)
+        return _fill_bound_page(backend, handle, meta, page_origin, effective_task_id, purpose, with_identifier)
+
+
+def _identifier_fill(classified: list, password_fill: list[dict[str, Any]], identifier: str) -> list[dict[str, Any]]:
+    """The username/email/phone control for a user-chosen login (the Desktop key button fills both fields;
+    the agent types the identifier itself). Prefers a control in the password field's form; on an
+    identifier-only step (no password field yet) it is the whole fill."""
+    fields = [c for c in classified if c.token in ("username", "email", "tel")]
+    if not identifier or not fields:
+        return []
+    anchor = password_fill[0]["index"] if password_fill else None
+    form = next((c.control.form_index for c in classified if c.control.index == anchor), None)
+    best = min(fields, key=lambda c: (c.control.form_index != form, -c.score, c.control.index))
+    return [{"index": best.control.index, "token": best.token, "value": identifier}]
 
 
 def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, effective_task_id: str,
-                     purpose: str = "login") -> str:
+                     purpose: str = "login", with_identifier: bool = False) -> str:
     """Inspect the page, resolve the item's secret and write it; runs inside the backend's fill_context
-    after the origin guard passed."""
+    after the origin guard passed. ``with_identifier`` also writes the login's (non-secret) identifier
+    (login purpose only: a signup write targets the new-password controls alone)."""
     from agent.vault_login_classifier import select_checkout_fills
     from tools import browser_vault_signup as signup
     from agent.vault_backends import BackendError, UnlockRequired
@@ -929,6 +975,8 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
         if meta.kind == "login":
             secret = {"password": backend.resolve_password(handle)}
             fills = signup.password_fills(signup_target, classified, secret["password"])
+            if with_identifier and signup_target is None:
+                fills += _identifier_fill(classified, fills, str(meta.identifier or ""))
         else:
             secret = backend.resolve_secret(handle)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
@@ -1345,6 +1393,9 @@ BROWSER_VAULT_SCHEMA = {
                                 "description": "Mandatory with code: the page's origin (scheme://host[:port]). The fill is refused unless it matches exactly."},
             "backend": {"type": "string", "enum": ["onepassword", "bitwarden"], "description": "unlock only."},
             "label": {"type": "string", "description": "save_login only: short site name (default: the host)."},
+            "target": {"type": "string", "enum": ["browser", "preview"],
+                       "description": "fill / save_login / enter_code: 'preview' = the Desktop in-app browser "
+                                      "page beside the chat, 'browser' = the managed automation browser."},
         },
         "required": ["action"],
     },
@@ -1426,6 +1477,21 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
         return json.dumps({"success": False, "error": f"Unknown action {action!r}; use list, fill, save_login, "
                                                        "enter_code, unlock, letter_login, letter_signed_in, "
                                                        "letter_done, payment_controls or payment_click."})
+    target = args.get("target") or "browser"
+    if target == "preview":
+        if action not in _PREVIEW_ACTIONS:
+            return json.dumps({"success": False, "error_type": "invalid_target",
+                               "error": f"target=preview supports fill, save_login and enter_code, not {action}. "
+                                        "Nothing was read or written."})
+        if (refusal := _preview_refusal()) is not None:
+            return refusal
+        # The in-app browser is not the Bot Desktop browser; its window owns the page and refuses a
+        # changed tab or document itself. Never retried on another browser.
+        from tools.browser_vault_preview import run_preview_vault
+        return run_preview_vault(kwargs.get("preview_callback"), page_ops[action])
+    if target != "browser":
+        return json.dumps({"success": False, "error_type": "invalid_target",
+                           "error": "target must be 'browser' or 'preview'."})
     return _fenced_page_op(tid, page_ops[action])
 
 

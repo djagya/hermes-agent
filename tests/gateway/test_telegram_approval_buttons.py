@@ -219,7 +219,7 @@ class TestTelegramApprovalCallback:
         rest of a long-running turn after a button click.
         """
         adapter = _make_adapter()
-        _arm_card(adapter, "n5", "agent:main:telegram:group:12345:99")
+        _arm_card(adapter, "n5", "agent:main:telegram:group:12345:99", request_id="req-5")
         adapter.pause_typing_for_chat("12345")
         assert "12345" in adapter._typing_paused
 
@@ -248,7 +248,7 @@ class TestTelegramApprovalCallback:
     @pytest.mark.asyncio
     async def test_approval_callback_escapes_dynamic_user_name(self):
         adapter = _make_adapter()
-        _arm_card(adapter, "n3", "agent:main:telegram:group:12345:99")
+        _arm_card(adapter, "n3", "agent:main:telegram:group:12345:99", request_id="req-3")
 
         query = AsyncMock()
         query.data = "ea:once:n3"
@@ -375,7 +375,7 @@ async def test_resolved_approval_keeps_the_request_and_appends_the_decision():
     from telegram.error import BadRequest
     for edit_fails in (False, True):
         adapter = _make_adapter()
-        _arm_card(adapter, "n7", "agent:main:telegram:group:12345:99")
+        _arm_card(adapter, "n7", "agent:main:telegram:group:12345:99", request_id="req-7")
         query = AsyncMock()
         query.data = "ea:once:n7"
         query.message = MagicMock()
@@ -404,7 +404,7 @@ async def test_resolved_approval_network_error_does_not_overwrite_the_prompt():
     have landed must not replace the kept prompt."""
     from telegram.error import TimedOut
     adapter = _make_adapter()
-    _arm_card(adapter, "n7", "agent:main:telegram:group:12345:99")
+    _arm_card(adapter, "n7", "agent:main:telegram:group:12345:99", request_id="req-7")
     query = AsyncMock()
     query.data = "ea:once:n7"
     query.message = MagicMock(chat_id=12345, message_id=7, text_html="<b>Dangerous command</b>\n<pre>rm -rf ./build</pre>")

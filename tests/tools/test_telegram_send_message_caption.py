@@ -81,7 +81,7 @@ def _tmpfile(suffix: str) -> str:
 
 
 def test_image_caption_rides_bubble_no_separate_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tools.send_message_tool import _send_telegram
+    from plugins.platforms.telegram.standalone import _send_telegram
 
     _no_proxy(monkeypatch)
     bot = _make_bot()
@@ -101,7 +101,7 @@ def test_image_caption_rides_bubble_no_separate_text(monkeypatch: pytest.MonkeyP
 
 
 def test_multi_file_keeps_separate_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tools.send_message_tool import _send_telegram
+    from plugins.platforms.telegram.standalone import _send_telegram
 
     _no_proxy(monkeypatch)
     bot = _make_bot()

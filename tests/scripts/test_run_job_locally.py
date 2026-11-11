@@ -451,14 +451,17 @@ runs:
 
 
 def test_lint_workflow_blocking_jobs_are_supported():
-    """The jobs PRs into fork main require must run locally, setup-pm included."""
+    """The job PRs into fork main require must run locally, setup-pm included.
+
+    dlz: upstream v0.23.1 merged windows-footguns and ruff-blocking into one `lint` job."""
     yaml = pytest.importorskip("yaml")
 
     wf = yaml.safe_load((ROOT / ".github/workflows/lint.yml").read_text(encoding="utf-8"))
-    for job in ("windows-footguns", "ruff-blocking"):
-        steps = wf["jobs"][job]["steps"]
-        assert rjl.unsupported_steps(steps, ROOT) == [], job
-        assert "./.github/actions/setup-pm" in [s.get("uses") for s in steps], job
+    steps = wf["jobs"]["lint"]["steps"]
+    assert rjl.unsupported_steps(steps, ROOT) == []
+    assert "./.github/actions/setup-pm" in [s.get("uses") for s in steps]
+    names = [s.get("name") for s in steps]
+    assert "Run footgun checker" in names and "ruff check  ." in names
 
 
 def test_setup_pm_under_lint_inputs_runs_the_pinned_toolchain_steps(repo, monkeypatch):
@@ -479,7 +482,7 @@ def test_setup_pm_under_lint_inputs_runs_the_pinned_toolchain_steps(repo, monkey
 
     monkeypatch.setattr(rjl, "run_shell", fake_shell)
     ctx = rjl.Context(wf, "release/test", repo, inputs={"event_name": "push"})
-    results = rjl.run_job(wf, "windows-footguns", ctx, ROOT, repo / ".tools")
+    results = rjl.run_job(wf, "lint", ctx, ROOT, repo / ".tools")
     outcomes = {n: o for n, o, _ in results}
     pm = "./.github/actions/setup-pm > "
     assert outcomes[pm + "Read PM pins with the runner bootstrap Python"] == "success"
@@ -492,20 +495,22 @@ def test_setup_pm_under_lint_inputs_runs_the_pinned_toolchain_steps(repo, monkey
         "Preserve and retrieve the pinned toolchain",
         "Cache uv dependency downloads and builds",
         "Register uv cache pruning",
-        "Require an npm dependency lock for caching",
+        "Require a dependency lock for caching",
         "Install the requested Python dependencies through PM",
     ):
         assert outcomes[pm + off] == "skipped", off
     assert outcomes["Profile-scope patterns on added lines (advisory)"] == "skipped"
     assert outcomes["Public-surface diff vs base (advisory)"] == "skipped"
     assert outcomes["Run footgun checker"] == "success"
+    assert outcomes["ruff check  ."] == "success"
+    assert outcomes["Ratchet the PR against the base branch tip"] == "skipped"  # PR-only
     assert not ctx.failed
     prepare, install = ran[0], ran[1]
     assert prepare[0] == "prepare" and prepare[2]["_PM_TOOLCHAIN"] == "python"
     assert prepare[2]["_PM_ACTION"] == str(ROOT / ".github/actions/setup-pm")
     assert install[0] == "install" and install[2]["_PM_BOOTSTRAP"] == "/usr/bin/python3"
     assert "pm_cache_log.py" in ran[2][1]  # the cache log step, then the job's own steps
-    assert next(s for _, s, _ in ran[3:]) == "python scripts/check-windows-footguns.py --all"
+    assert next(s for _, s, _ in ran[3:]) == "just check --only footguns"
 
 
 def test_a_jobs_untracked_outputs_do_not_reach_the_next_job(repo, monkeypatch):
@@ -540,7 +545,11 @@ def test_tojson_renders_whole_contexts_for_the_setup_pm_cache_log(repo, capsys):
     # dlz: v0.23.0's setup-pm logs its caches from toJSON(inputs)/toJSON(steps); the box gate
     # failed that step with "unsupported function: toJSON()".
     ctx = ctx_for(repo)
-    ctx.inputs = {"save-tools-cache": "true", "cache": "true"}
+    # Every declared setup-pm input, as run_composite fills them (defaults + with:).
+    yaml = pytest.importorskip("yaml")
+    action = yaml.safe_load((ROOT / ".github/actions/setup-pm/action.yml").read_text(encoding="utf-8"))
+    ctx.inputs = {k: rjl._input_str((spec or {}).get("default", "")) for k, spec in action["inputs"].items()}
+    ctx.inputs.update({"save-tools-cache": "true", "cache": "true"})
     ctx.steps["tools-cache-restore"] = {"outputs": {"cache-hit": "true"}, "outcome": "success",
                                         "conclusion": "success"}
     inputs = json.loads(ctx.render("${{ toJSON(inputs) }}"))

@@ -9,6 +9,8 @@ restart (an empty map) resolves nothing.
 
 ``ea:`` is the exec-approval card; ``pa:`` the card-fill approval card (``send_payment_approval``),
 sent only to the approver's private chat and answered only by the approver's own Telegram user.
+Every tap is answered through ``callback_answer.answer_callback``: Telegram refusing the answer of an
+expired query never escapes the handler, so a settled card still loses its buttons.
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ import logging
 import secrets
 import time
 from typing import Any, Optional
+
+from plugins.platforms.telegram.callback_answer import answer_callback
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +78,7 @@ class TelegramApprovalCardsMixin:
         (the tap was answered with a toast and nothing was resolved)."""
         parts = data.split(":", 2)
         if len(parts) != 3:
-            await query.answer(text=invalid)
+            await answer_callback(query, invalid)
             return None
         _, choice, nonce = parts
         if not await self._callback_authorized(query, cb, unauthorized):
@@ -82,7 +86,7 @@ class TelegramApprovalCardsMixin:
         cards = self._approval_card_map()
         record = cards.get(nonce)
         if record is None or record["kind"] != kind:
-            await query.answer(text=already)
+            await answer_callback(query, already)
             return None
         message = getattr(query, "message", None)
         if (record["message_id"] is None
@@ -90,12 +94,12 @@ class TelegramApprovalCardsMixin:
                 or _scalar(getattr(message, "message_id", None)) != record["message_id"]
                 or _scalar(getattr(message, "message_thread_id", None)) != record["thread_id"]
                 or choice not in record["choices"]):
-            await query.answer(text=invalid)
+            await answer_callback(query, invalid)
             return None
         presser = f"telegram:{_scalar(getattr(query.from_user, 'id', None)) or ''}"
         if record["approver"] and presser != record["approver"]:
             # Not popped: the owner's own tap on this card still counts.
-            await query.answer(text=_OWNER_ONLY)
+            await answer_callback(query, _OWNER_ONLY)
             return None
         cards.pop(nonce, None)
         return record, choice, presser
@@ -166,5 +170,5 @@ class TelegramApprovalCardsMixin:
             label = "Expired or already answered: nothing was approved."
         else:
             label = "Approved: fill once." if choice == "once" else "Denied: nothing will be filled."
-        await query.answer(text=label)
+        await answer_callback(query, label)
         await edit_keeping_prompt(self, query, label)
