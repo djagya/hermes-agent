@@ -40,6 +40,7 @@ from tools.browser_vault_context import (fill_context, plugin_errors_as_refusal,
                                          write_backend_code)
 
 logger = logging.getLogger(__name__)
+_OTP_REDACTION_TTL_S = 300.0  # dlz: a one-time code is worthless after minutes; its length masking ends with it
 
 
 # ---------------------------------------------------------------------------
@@ -722,7 +723,7 @@ def browser_vault_enter_code(
                                      "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
 
     def write(code_value: str, source: str) -> str:
-        register_vault_redaction_value(code_value, known_to_model=source == "supplied")
+        register_vault_redaction_value(code_value, known_to_model=source == "supplied", ttl_s=_OTP_REDACTION_TTL_S)
         fills = build_otp_fills(otp_controls, code_value)
         result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
         del code_value

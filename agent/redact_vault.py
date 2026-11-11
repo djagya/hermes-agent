@@ -20,11 +20,13 @@ lasts only for the payment.
 
 import re
 import threading
+import time
 
 _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: known_to_model}
 _CARD_WINDOWS: dict = {}  # profile home → ordered {window key: (digit lengths, holder words)}
 _MAX_CARD_WINDOWS = 16
+_VAULT_REDACTION_EXPIRY: dict = {}  # profile home → {value: monotonic deadline} for short-lived values (one-time codes)
 _VAULT_REDACTION_LOCK = threading.Lock()
 PLACEHOLDER = "«redacted-vault-secret»"
 CARD_PLACEHOLDER = "«redacted-card»"
@@ -38,13 +40,15 @@ def _vault_scope() -> str:
     return str(get_hermes_home())
 
 
-def register_vault_redaction_value(value, *, known_to_model: bool = False) -> None:
+def register_vault_redaction_value(value, *, known_to_model: bool = False, ttl_s: float | None = None) -> None:
     """Register an exact vault secret value for model-facing redaction.
 
     Called by the vault fill path BEFORE the injection happens, so no later browser tool result
     can echo the value back into model context. Also registers the form a text input normalizes
     it to (CR/LF stripped), since that is what the page holds. A value registered once without
-    ``known_to_model`` stays oracle-free.
+    ``known_to_model`` stays oracle-free. ``ttl_s`` (one-time codes, worthless once expired) drops the value
+    after that many seconds, so its length masking does not outlive the code; re-registering without it
+    makes the value permanent again.
     """
     if not isinstance(value, str) or not value:
         return
@@ -55,14 +59,33 @@ def register_vault_redaction_value(value, *, known_to_model: bool = False) -> No
             if v:
                 known = bucket.pop(v, True) and known_to_model  # re-registering refreshes recency
                 bucket[v] = known
+                expiry = _VAULT_REDACTION_EXPIRY.setdefault(_vault_scope(), {})
+                if ttl_s is None:
+                    expiry.pop(v, None)
+                else:
+                    expiry[v] = time.monotonic() + max(0.0, float(ttl_s))
         while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
+            _VAULT_REDACTION_EXPIRY.get(_vault_scope(), {}).pop(next(iter(bucket)), None)
             del bucket[next(iter(bucket))]
+
+
+def _drop_expired(scope: str) -> None:
+    """Under the lock: forget this profile's short-lived values whose deadline passed."""
+    expiry = _VAULT_REDACTION_EXPIRY.get(scope)
+    if not expiry:
+        return
+    now = time.monotonic()
+    bucket = _VAULT_REDACTION_VALUES.get(scope) or {}
+    for v in [v for v, deadline in expiry.items() if deadline <= now]:
+        expiry.pop(v, None)
+        bucket.pop(v, None)
 
 
 def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values and payment windows (profile teardown / explicit lock)."""
     with _VAULT_REDACTION_LOCK:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
+        _VAULT_REDACTION_EXPIRY.pop(_vault_scope(), None)
         _CARD_WINDOWS.pop(_vault_scope(), None)
 
 
@@ -109,6 +132,7 @@ def redact_registered_vault_values(text: str, *, nondigit_only: bool = False) ->
         return text
     scope = _vault_scope()
     with _VAULT_REDACTION_LOCK:
+        _drop_expired(scope)
         bucket = dict(_VAULT_REDACTION_VALUES.get(scope) or {})
         windows = list((_CARD_WINDOWS.get(scope) or {}).values())
     lengths = {len(v) for v, known in bucket.items() if not known and _ALL_DIGITS.fullmatch(v)}
