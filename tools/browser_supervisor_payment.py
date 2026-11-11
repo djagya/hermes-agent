@@ -34,6 +34,10 @@ _MAX_CARD_DOCUMENTS = 4
 _MAX_FRAMES = 64
 _MAX_FRAME_DEPTH = 8
 _MAX_OOPIF_TARGETS = 32
+# dlz (Codex B r1 #9): iframe targets browser-wide that the ownership search may consider, and DOM.getFrameOwner
+# probes per tree walk: both bounded before traversal, so unrelated or unresolvable targets cannot stall a checkout.
+_MAX_IFRAME_TARGETS = 128
+_MAX_OWNER_PROBES = 512
 # dlz (v1 §3.3, v2 B1-B4): the unreviewed-destination discovery. Frames on unreviewed origins that pass admission
 # and exposure and get the inspect closure; card documents on the ONE unreviewed origin (the PAYONE shape: number,
 # CVC, month, year, holder); nesting below the top for an unreviewed frame; pinned card-free admissible frames.
@@ -43,6 +47,9 @@ _MAX_UNREVIEWED_DEPTH = 3
 _MAX_ABSENCE_WITNESSES = 8
 _MAX_DESCRIBE_BYTES = 256 * 1024
 _DISCOVERY_LIMITS = {"inputs": 300, "shadow": 16, "text": 200, "bytes": _MAX_DESCRIBE_BYTES}
+# dlz (Codex B r1 #5): the exact shape of one discovery descriptor (describeOne in _INSPECT_TEMPLATE).
+_DESCRIPTOR_KEYS = frozenset({"index", "autocomplete", "name", "label", "type", "formIndex", "maxLength"})
+_SELECT_TYPES = ("select", "select-multiple")
 
 PAGE_TOO_LARGE = ("This checkout page has more frames, frame nesting or form fields than Hermes inspects for a card "
                   "fill, so nothing was read or written. Tell the user; the card has to be entered by hand here.")
@@ -55,8 +62,18 @@ FIELDS_AMBIGUOUS = ("The card fields on this checkout are ambiguous (a field app
                     "not retry.")
 
 
+PAGE_UNVERIFIABLE = ("Hermes could not verify part of this checkout (a frame or form it checks answered in an "
+                     "unexpected shape, did not answer, or uses a clipping it cannot judge), so nothing was read or "
+                     "written. Tell the user; the card has to be entered by hand here. Do not retry.")
+
+
 def _page_too_large() -> PaymentDestinationError:
     return PaymentDestinationError("payment_page_too_large", PAGE_TOO_LARGE)
+
+
+def _unverifiable() -> PaymentDestinationError:
+    """dlz (Codex B r1 #4/#5/#7): unknown, malformed or unjudgeable page data never counts as a safe negative."""
+    return PaymentDestinationError("payment_page_unverifiable", PAGE_UNVERIFIABLE)
 # Refusals that mean "no complete reviewed card document": these get coverage_hint's reason.
 _COVERAGE_REFUSALS = frozenset({
     "Missing, ambiguous or split payment documents",
@@ -112,6 +129,12 @@ class PaymentInspection:
     allowed_frames: tuple = ()
     # (session, object id) of each pinned card-free admissible document: it must stay card-free (B4).
     absence: tuple = field(default=(), repr=False)
+    # dlz (Codex B r1 #2): their frame ids. With the card chains these are the frames bound by pinned objects; any
+    # other admissible frame on an approved origin, new or present but hidden at inspection, must stay unexposed.
+    absence_frames: tuple = ()
+    # dlz (Codex B r1, switch/write race): a callable answering whether the destination policy still holds (set by
+    # fill_payment for an unreviewed fill); re-read between documents and on every paced resume.
+    policy_check: Any = field(default=None, repr=False, compare=False)
     # (session, object id) of each pinned amount witness (B5), and the page-check result shown to the owner.
     witnesses: tuple = field(default=(), repr=False)
     page_match: tuple = ("not_checked", "")
@@ -186,7 +209,10 @@ def _explained_card_documents(candidates: list, merchant: str, tree: tuple, allo
     except PaymentPolicyError as exc:
         hint = coverage_hint(tree, merchant, allowed) if str(exc) in _COVERAGE_REFUSALS else ""
         if hint:
-            raise PaymentPolicyError(f"{exc} ({hint})") from None
+            explained = PaymentPolicyError(f"{exc} ({hint})")
+            # dlz (Codex B r1 #8): the same cause without page-controlled paths, for typed results.
+            explained.coverage = f"{exc} ({coverage_hint(tree, merchant, allowed, paths=False)})"
+            raise explained from None
         raise
 
 
@@ -286,14 +312,56 @@ def _discovery_documents(candidates: list, merchant: str, allowed: tuple, inspec
 
 def _bounded_description(raw: Any) -> list:
     """dlz (B3): the discovery closure's description, or ``payment_page_too_large`` when it overflowed its element
-    or shadow-depth limit or exceeds the payload limit."""
-    if isinstance(raw, dict) and raw.get("overflow") is True:
+    or shadow-depth limit, exceeds the payload limit or has more than ``inputs`` rows. dlz (Codex B r1 #5): every
+    row must be a complete descriptor of the exact shape (``_valid_descriptor``) with strictly increasing indexes;
+    anything else, and the closure's ``unknown`` marker (a field whose exposure it cannot judge), is
+    ``payment_page_unverifiable``: a malformed reading never becomes a card-free document."""
+    if isinstance(raw, dict) and raw == {"overflow": True}:
         raise _page_too_large()
     if not isinstance(raw, list):
-        raise PaymentPolicyError("Payment document unavailable")
-    if len(json.dumps(raw)) > _MAX_DESCRIBE_BYTES:
+        raise _unverifiable()
+    if len(raw) > _DISCOVERY_LIMITS["inputs"] or len(json.dumps(raw)) > _MAX_DESCRIBE_BYTES:
         raise _page_too_large()
+    previous = -1
+    for row in raw:
+        if not _valid_descriptor(row, previous):
+            raise _unverifiable()
+        previous = row["index"]
     return raw
+
+
+def _valid_descriptor(row: Any, previous: int) -> bool:
+    """One ``describeOne`` row: exactly its keys (``options`` only on a select), exact types, the text limit, and an
+    index above ``previous`` and inside the element limit."""
+    if not isinstance(row, dict) or not isinstance(row.get("type"), str) or len(row["type"]) > 32:
+        return False
+    select = row["type"] in _SELECT_TYPES
+    if set(row) != (_DESCRIPTOR_KEYS | {"options"} if select else _DESCRIPTOR_KEYS):
+        return False
+    index, form, length = row["index"], row["formIndex"], row["maxLength"]
+    text = _DISCOVERY_LIMITS["text"]
+    return (type(index) is int and previous < index < _DISCOVERY_LIMITS["inputs"]
+            and all(type(row[k]) is str and len(row[k]) <= text for k in ("autocomplete", "name", "label"))
+            and (form is None or (type(form) is int and form >= -1))
+            and (length is None or (type(length) is int and length > 0))
+            and (not select or _valid_options(row["options"])))
+
+
+def _valid_options(options: Any) -> bool:
+    return isinstance(options, list) and len(options) <= 400 and all(
+        isinstance(o, list) and len(o) == 3 and type(o[0]) is str and type(o[1]) is str and len(o[1]) <= 64
+        and type(o[2]) is bool for o in options)
+
+
+def _take_probe(owner_nodes: dict, key: tuple) -> bool:
+    """dlz (Codex B r1 #9): whether ``(target, session)`` may be asked (False: it already answered that it does not
+    own the target); a new key spends one probe of ``_MAX_OWNER_PROBES`` and is held at None until it answers."""
+    if key in owner_nodes:
+        return owner_nodes[key] is not None
+    if len(owner_nodes) >= _MAX_OWNER_PROBES:
+        raise _page_too_large()
+    owner_nodes[key] = None
+    return True
 
 
 def _card_controls(raw: list) -> tuple:
@@ -387,6 +455,11 @@ class PaymentSupervisionMixin:
         # read from their own sessions, then anchored with DOM.getFrameOwner.
         targets = (await self._cdp("Target.getTargets"))["result"]["targetInfos"]
         pending = [t for t in targets if t.get("type") == "iframe"]
+        if len(pending) > _MAX_IFRAME_TARGETS:
+            raise _page_too_large()
+        # dlz (Codex B r1 #9): one DOM.getFrameOwner per (target, session), at most _MAX_OWNER_PROBES per walk; a
+        # session that does not own the target is not asked again for its other frames or in a later round.
+        owner_nodes: dict = {}
         while pending:
             progress = False
             for target in list(pending):
@@ -396,15 +469,15 @@ class PaymentSupervisionMixin:
                 # existed before this supervisor attached. Event history is not proof.
                 for record in frames:
                     parent_sid = child_sessions.get(record[0], sid)
+                    key = (fid, parent_sid)
+                    if not _take_probe(owner_nodes, key):
+                        continue
                     obj = None
                     try:
-                        owner = (
-                            await self._cdp(
-                                "DOM.getFrameOwner",
-                                {"frameId": fid},
-                                session_id=parent_sid,
-                            )
-                        )["result"]
+                        if owner_nodes[key] is None:
+                            owner_nodes[key] = (await self._cdp(
+                                "DOM.getFrameOwner", {"frameId": fid}, session_id=parent_sid))["result"]
+                        owner = owner_nodes[key]
                         context = (
                             await self._cdp(
                                 "Page.createIsolatedWorld",
@@ -487,49 +560,15 @@ class PaymentSupervisionMixin:
             sid = self._page_session_id if self._active else None
         if not sid:
             raise PaymentPolicyError("Supervised browser required")
-        targets = (await self._cdp("Target.getTargets"))["result"]["targetInfos"]
         if origin:
-            from agent.vault_store import normalize_origin
-
-            pages = [
-                t
-                for t in targets
-                if t["type"] == "page"
-                and t.get("url", "").startswith("https://")
-                and normalize_origin(t["url"]) == origin
-            ]
-            if len(pages) != 1:
-                raise PaymentPolicyError("Merchant tab missing or ambiguous")
-            current = (await self._cdp("Target.getTargetInfo", session_id=sid))[
-                "result"
-            ]["targetInfo"]
-            if current["targetId"] != pages[0]["targetId"]:
-                old_sid = sid
-                sid = (
-                    await self._cdp(
-                        "Target.attachToTarget",
-                        {"targetId": pages[0]["targetId"], "flatten": True},
-                    )
-                )["result"]["sessionId"]
-                try:
-                    await self._enable_page_domains(sid, timeout=5)
-                    await self._install_dialog_bridge(sid)
-                except Exception:
-                    await self._release_payment_sessions({"new": sid})
-                    raise
-                with self._state_lock:
-                    self._page_session_id = sid
-                await self._release_payment_sessions({"old": old_sid})
+            sid = await self._merchant_tab_session(origin, sid)
         page = (await self._cdp("Target.getTargetInfo", session_id=sid))["result"][
             "targetInfo"
         ]
         child_sessions = {}
         operation = secrets.token_hex(16)
-        candidates = []
-        anchors: dict = {}
-        absence: list = []
-        witnesses: list = []
-        owners: dict = {}
+        # dlz: what this inspection pins; released on any refusal below.
+        found = {"candidates": [], "anchors": {}, "absence": [], "witnesses": [], "owners": {}}
         try:
             tree = await self._payment_tree(sid, child_sessions)
             merchant = https_origin(tree[0][3])
@@ -539,90 +578,26 @@ class PaymentSupervisionMixin:
             if on_provider is not None and not on_provider.admits(tree[0][2]):
                 # The tab itself is a provider's non-card page (PayPal wallet or login), not a checkout.
                 raise PaymentPolicyError("Merchant origin mismatch")
-            by_id = {f[0]: f for f in tree}
-            exposed: dict = {}
-            unreviewed_frames = 0
-            script = _INSPECT_DISCOVERY if unreviewed else _INSPECT
-            for fid, _loader, _url, frame_origin, parent in tree:
-                if not _frame_admitted(by_id[fid], by_id, merchant, allowed_frames):
-                    if not (unreviewed and _unreviewed_admitted(by_id[fid], by_id, merchant, allowed_frames)):
-                        continue
-                    # dlz (B2): only an exposed frame counts against the bound, so hidden copies cannot exhaust it.
-                    if not await self._chain_exposed(fid, by_id, child_sessions, sid, exposed):
-                        continue
-                    unreviewed_frames += 1
-                    if unreviewed_frames > _MAX_UNREVIEWED_FRAMES:
-                        raise PaymentDestinationError("payment_fields_ambiguous", FIELDS_AMBIGUOUS,
-                                                      {"unreviewed_frames": f"more than {_MAX_UNREVIEWED_FRAMES}"})
-                elif unreviewed:
-                    # dlz (B2): discovery judges every owner <iframe> up to the page with the strict exposure test
-                    # before the frame can hold a candidate: a clipped, covered or transparent copy is no candidate.
-                    if parent and not await self._chain_exposed(fid, by_id, child_sessions, sid, exposed):
-                        continue
-                # A PSP field frame the page keeps hidden (Shopify's Maestro-only issue date and
-                # number) looks visible from inside its own document; judge its iframe element.
-                elif parent and not await self._frame_rendered(fid, parent, child_sessions.get(parent, sid)):
-                    continue
-                fsid = child_sessions.get(fid, sid)
-                context = (
-                    await self._cdp(
-                        "Page.createIsolatedWorld",
-                        {"frameId": fid, "worldName": "hermes-payment-" + operation},
-                        session_id=fsid,
-                    )
-                )["result"]["executionContextId"]
-                reply = await self._cdp(
-                    "Runtime.evaluate",
-                    {
-                        "expression": script,
-                        "contextId": context,
-                        "returnByValue": False,
-                    },
-                    session_id=fsid,
-                )
-                anchor = time.monotonic()  # after the closure read its clock: see _renderer_deadline_ms
-                obj = reply.get("result", {}).get("result", {}).get("objectId")
-                if not obj:
-                    raise PaymentPolicyError("Payment document unavailable")
-                anchors[obj] = anchor
-                raw = _value(
-                    await self._cdp(
-                        "Runtime.callFunctionOn",
-                        {
-                            "objectId": obj,
-                            "functionDeclaration": "function(){return this.describe()}",
-                            "returnByValue": True,
-                        },
-                        session_id=fsid,
-                    )
-                )
-                controls = _card_controls(_bounded_description(raw) if unreviewed else raw)
-                if controls:
-                    candidates.append((fid, fsid, obj, frame_origin, controls))
-                elif unreviewed:
-                    # dlz (B4): a card-free document; it may become an absence witness (below).
-                    absence.append((fsid, obj, frame_origin))
-                else:
-                    await self._cdp(
-                        "Runtime.releaseObject", {"objectId": obj}, session_id=fsid
-                    )
+            unreviewed_frames = await self._inspect_frames(tree, merchant, allowed_frames, unreviewed, sid,
+                                                           child_sessions, operation, found)
+            candidates, absence = found["candidates"], found["absence"]
             if unreviewed:
                 documents = _discovery_documents(candidates, merchant, allowed_frames, unreviewed_frames)
                 # dlz (B4): card-free documents on the merchant or a receiving origin stay pinned as absence
                 # witnesses; those on other origins (ads, widgets) are released: they may churn freely.
                 receiving = {merchant, *(d.origin for d in documents)}
-                for fsid, obj, frame_origin in [a for a in absence if a[2] not in receiving]:
+                for fsid, obj, _origin, _fid in [a for a in absence if a[2] not in receiving]:
                     await self._release_payment_object(fsid, obj)
-                absence = [a for a in absence if a[2] in receiving]
+                absence[:] = [a for a in absence if a[2] in receiving]
                 if len(absence) > _MAX_ABSENCE_WITNESSES:
                     raise _page_too_large()
             else:
                 documents = _explained_card_documents(candidates, merchant, tree, allowed_frames)
             for d in documents:
-                d.clock_anchor = anchors.get(d.object_id)
+                d.clock_anchor = found["anchors"].get(d.object_id)
             if await self._payment_tree(sid, child_sessions) != tree:
                 raise PaymentPolicyError("Payment page changed during inspection")
-            owners = await self._pin_frame_owners(documents, tree, sid, child_sessions)
+            found["owners"] = await self._pin_frame_owners(documents, tree, sid, child_sessions)
             hosted = tuple(dict.fromkeys(d.origin for d in documents if d.origin != merchant))
             inspection = PaymentInspection(
                 operation,
@@ -634,10 +609,11 @@ class PaymentSupervisionMixin:
                 time.monotonic() + 120,
                 owner=self,
                 child_sessions=child_sessions,
-                frame_owners=owners,
+                frame_owners=found["owners"],
                 unreviewed_origins=tuple(o for o in hosted if o not in allowed_frames) if unreviewed else (),
                 allowed_frames=tuple(allowed_frames),
-                absence=tuple((fsid, obj) for fsid, obj, _origin in absence),
+                absence=tuple((fsid, obj) for fsid, obj, _origin, _fid in absence),
+                absence_frames=tuple(fid for _fsid, _obj, _origin, fid in absence),
             )
             if inspection.unreviewed_origins and \
                     await self._shown_documents(inspection) != {d.frame_id for d in documents}:
@@ -645,26 +621,157 @@ class PaymentSupervisionMixin:
                 raise PaymentDestinationError("payment_fields_ambiguous", FIELDS_AMBIGUOUS,
                                               {"receiving_origins": _receiving(candidates, merchant, allowed_frames)})
             if cart is not None:
-                # B5: the top document and each unreviewed receiving document; a transcription check only.
-                places = [("merchant page", tree[0][0], sid)] + [
-                    ("payment form", d.frame_id, d.frame_session) for d in documents
-                    if d.origin in inspection.unreviewed_origins]
-                pins = []
-                for place, wfid, wsid in places:
-                    wobj, pin = await self._amount_witness(wfid, wsid, operation, cart)
-                    witnesses.append((wsid, wobj))
-                    pins.append((place, pin))
-                inspection.witnesses = tuple(witnesses)
-                inspection.page_match = _page_match(pins, cart[0])
+                await self._bind_amount_witnesses(inspection, cart, found["witnesses"])
             return inspection
         except Exception:
-            for _, fsid, obj, _, _ in candidates:
+            for _, fsid, obj, _, _ in found["candidates"]:
                 await self._release_payment_object(fsid, obj)
-            for fsid, obj in [a[:2] for a in absence] + witnesses:
+            for fsid, obj in [a[:2] for a in found["absence"]] + found["witnesses"]:
                 await self._release_payment_object(fsid, obj)
-            await self._release_frame_owners(owners)
+            await self._release_frame_owners(found["owners"])
             await self._release_payment_sessions(child_sessions)
             raise
+
+    async def _merchant_tab_session(self, origin: str, sid: str) -> str:
+        """The page session on the one tab at ``origin``, attaching to it (and making it the supervised page) when
+        the supervisor is on another tab."""
+        from agent.vault_store import normalize_origin
+
+        targets = (await self._cdp("Target.getTargets"))["result"]["targetInfos"]
+        pages = [
+            t
+            for t in targets
+            if t["type"] == "page"
+            and t.get("url", "").startswith("https://")
+            and normalize_origin(t["url"]) == origin
+        ]
+        if len(pages) != 1:
+            raise PaymentPolicyError("Merchant tab missing or ambiguous")
+        current = (await self._cdp("Target.getTargetInfo", session_id=sid))[
+            "result"
+        ]["targetInfo"]
+        if current["targetId"] == pages[0]["targetId"]:
+            return sid
+        old_sid = sid
+        sid = (
+            await self._cdp(
+                "Target.attachToTarget",
+                {"targetId": pages[0]["targetId"], "flatten": True},
+            )
+        )["result"]["sessionId"]
+        try:
+            await self._enable_page_domains(sid, timeout=5)
+            await self._install_dialog_bridge(sid)
+        except Exception:
+            await self._release_payment_sessions({"new": sid})
+            raise
+        with self._state_lock:
+            self._page_session_id = sid
+        await self._release_payment_sessions({"old": old_sid})
+        return sid
+
+    async def _frame_inspectable(self, record: tuple, by_id: dict, merchant: str, allowed_frames: tuple,
+                                 unreviewed: bool, child_sessions: dict, sid: str, exposed: dict) -> str:
+        """Whether a frame gets the inspect closure: "reviewed" (admitted by the reviewed rules), "unreviewed"
+        (discovery: an exposed unreviewed hosted frame) or "" (skipped)."""
+        fid, parent = record[0], record[4]
+        if not _frame_admitted(record, by_id, merchant, allowed_frames):
+            if not (unreviewed and _unreviewed_admitted(record, by_id, merchant, allowed_frames)):
+                return ""
+            # dlz (B2): only an exposed frame counts against the bound, so hidden copies cannot exhaust it.
+            return "unreviewed" if await self._chain_exposed(fid, by_id, child_sessions, sid, exposed) else ""
+        if unreviewed:
+            # dlz (B2): discovery judges every owner <iframe> up to the page with the strict exposure test
+            # before the frame can hold a candidate: a clipped, covered or transparent copy is no candidate.
+            if parent and not await self._chain_exposed(fid, by_id, child_sessions, sid, exposed):
+                return ""
+        # A PSP field frame the page keeps hidden (Shopify's Maestro-only issue date and
+        # number) looks visible from inside its own document; judge its iframe element.
+        elif parent and not await self._frame_rendered(fid, parent, child_sessions.get(parent, sid)):
+            return ""
+        return "reviewed"
+
+    async def _inspect_frames(self, tree: tuple, merchant: str, allowed_frames: tuple, unreviewed: bool, sid: str,
+                              child_sessions: dict, operation: str, found: dict) -> int:
+        """Pin the inspect closure in every inspectable frame: ``found["candidates"]`` gets each document with card
+        controls, ``found["absence"]`` (discovery) each card-free one. Returns the unreviewed frames inspected."""
+        by_id = {f[0]: f for f in tree}
+        exposed: dict = {}
+        unreviewed_frames = 0
+        script = _INSPECT_DISCOVERY if unreviewed else _INSPECT
+        for record in tree:
+            fid, frame_origin = record[0], record[3]
+            kind = await self._frame_inspectable(record, by_id, merchant, allowed_frames, unreviewed,
+                                                 child_sessions, sid, exposed)
+            if not kind:
+                continue
+            if kind == "unreviewed":
+                unreviewed_frames += 1
+                if unreviewed_frames > _MAX_UNREVIEWED_FRAMES:
+                    raise PaymentDestinationError("payment_fields_ambiguous", FIELDS_AMBIGUOUS,
+                                                  {"unreviewed_frames": f"more than {_MAX_UNREVIEWED_FRAMES}"})
+            fsid = child_sessions.get(fid, sid)
+            context = (
+                await self._cdp(
+                    "Page.createIsolatedWorld",
+                    {"frameId": fid, "worldName": "hermes-payment-" + operation},
+                    session_id=fsid,
+                )
+            )["result"]["executionContextId"]
+            reply = await self._cdp(
+                "Runtime.evaluate",
+                {
+                    "expression": script,
+                    "contextId": context,
+                    "returnByValue": False,
+                },
+                session_id=fsid,
+            )
+            anchor = time.monotonic()  # after the closure read its clock: see _renderer_deadline_ms
+            obj = reply.get("result", {}).get("result", {}).get("objectId")
+            if not obj:
+                raise PaymentPolicyError("Payment document unavailable")
+            found["anchors"][obj] = anchor
+            raw = _value(
+                await self._cdp(
+                    "Runtime.callFunctionOn",
+                    {
+                        "objectId": obj,
+                        "functionDeclaration": "function(){return this.describe()}",
+                        "returnByValue": True,
+                    },
+                    session_id=fsid,
+                )
+            )
+            try:
+                controls = _card_controls(_bounded_description(raw) if unreviewed else raw)
+            except PaymentPolicyError:
+                await self._release_payment_object(fsid, obj)
+                raise
+            if controls:
+                found["candidates"].append((fid, fsid, obj, frame_origin, controls))
+            elif unreviewed:
+                # dlz (B4): a card-free document; it may become an absence witness.
+                found["absence"].append((fsid, obj, frame_origin, fid))
+            else:
+                await self._cdp(
+                    "Runtime.releaseObject", {"objectId": obj}, session_id=fsid
+                )
+        return unreviewed_frames
+
+    async def _bind_amount_witnesses(self, inspection: PaymentInspection, cart: tuple, witnesses: list) -> None:
+        """B5: pin an amount witness in the top document and each unreviewed receiving document (a transcription
+        check only) and record the page-check result shown to the owner."""
+        places = [("merchant page", inspection.tree[0][0], inspection.page_session)] + [
+            ("payment form", d.frame_id, d.frame_session) for d in inspection.documents
+            if d.origin in inspection.unreviewed_origins]
+        pins = []
+        for place, wfid, wsid in places:
+            wobj, pin = await self._amount_witness(wfid, wsid, inspection.operation_id, cart)
+            witnesses.append((wsid, wobj))
+            pins.append((place, pin))
+        inspection.witnesses = tuple(witnesses)
+        inspection.page_match = _page_match(pins, cart[0])
 
     async def _pin_frame_owners(self, documents: tuple, tree: tuple, page_sid: str, child_sessions: dict) -> dict:
         """dlz: pin the owner <iframe> of every frame between a card document and the page, grouped by parent
@@ -735,7 +842,8 @@ class PaymentSupervisionMixin:
 
     async def _chain_exposed(self, fid: str, by_id: dict, child_sessions: dict, page_sid: str, cache: dict) -> bool:
         """dlz (B2): every owner <iframe> from ``fid`` up to the page passes ``_EXPOSED`` in its parent document
-        (``cache`` keeps each owner's answer for one pass). An unknown or unreadable link is not exposed."""
+        (``cache`` keeps each owner's answer for one pass). A chain that does not reach the top is not exposed; an
+        owner whose exposure cannot be read or judged raises ``payment_page_unverifiable`` (Codex B r1 #4)."""
         hops = 0
         while fid in by_id and by_id[fid][4]:
             parent = by_id[fid][4]
@@ -744,7 +852,7 @@ class PaymentSupervisionMixin:
                 return False
             if fid not in cache:
                 cache[fid] = await self._owner_check(fid, parent, child_sessions.get(parent, page_sid),
-                                                     "function(){return (" + _EXPOSED + ")(this)}")
+                                                     "function(){return (" + _EXPOSED + ")(this)}", strict=True)
             if cache[fid] is not True:
                 return False
             fid = parent
@@ -776,9 +884,10 @@ class PaymentSupervisionMixin:
             raise
         return obj, pin
 
-    async def _owner_check(self, fid: str, parent: str, parent_sid: str, function: str) -> bool:
+    async def _owner_check(self, fid: str, parent: str, parent_sid: str, function: str, strict: bool = False) -> bool:
         """Evaluate ``function`` on the iframe element hosting ``fid``, in an isolated world of its parent; only
-        a literal true counts."""
+        a literal true counts. dlz: ``strict`` (discovery): only a literal false is a negative; no owner, a failed
+        call or any other answer raises ``payment_page_unverifiable`` instead of reading as hidden."""
         obj = None
         try:
             owner = (await self._cdp("DOM.getFrameOwner", {"frameId": fid}, session_id=parent_sid))["result"]
@@ -788,17 +897,22 @@ class PaymentSupervisionMixin:
             obj = (await self._cdp(
                 "DOM.resolveNode", {"backendNodeId": owner["backendNodeId"], "executionContextId": context},
                 session_id=parent_sid))["result"]["object"]["objectId"]
-            return _value(await self._cdp("Runtime.callFunctionOn", {
+            answer = _value(await self._cdp("Runtime.callFunctionOn", {
                 "objectId": obj,
                 "functionDeclaration": function,
                 "returnByValue": True,
-            }, session_id=parent_sid)) is True
+            }, session_id=parent_sid))
         except (KeyError, TypeError, PaymentPolicyError):
+            if strict:
+                raise _unverifiable() from None
             # No resolvable owner element: not a frame the user can see or type into.
             return False
         finally:
             if obj:
                 await self._release_payment_object(parent_sid, obj)
+        if strict and type(answer) is not bool:
+            raise _unverifiable()
+        return answer is True
 
     async def _release_payment_sessions(self, sessions: dict) -> None:
         # In-process child frames share their OOPIF's session: detach each session once.
@@ -821,13 +935,16 @@ class PaymentSupervisionMixin:
 
         return _schedule(self._payment_is_current(inspected), self._loop, timeout=15)
 
-    async def _payment_is_current(self, i: PaymentInspection) -> bool:
+    async def _payment_is_current(self, i: PaymentInspection, during_fill: bool = False) -> bool:
+        """The approved page is still the inspected one. dlz (Codex B r1 #1): ``during_fill`` (an unreviewed fill,
+        between documents and after each focus) runs the same topology, absence and exposure bindings on the
+        consumed inspection, without the card documents' own ``valid()`` (each document's commit runs its own)."""
         with self._state_lock:
             active = self._active and self._page_session_id == i.page_session
         if (
             not active
             or i.owner is not self
-            or i.consumed
+            or (i.consumed and not during_fill)
             or time.monotonic() >= i.expires_at
         ):
             return False
@@ -839,7 +956,7 @@ class PaymentSupervisionMixin:
                     return False
             elif current != i.tree:
                 return False
-            for d in i.documents:
+            for d in () if during_fill else i.documents:
                 valid = _value(
                     await self._cdp(
                         "Runtime.callFunctionOn",
@@ -864,9 +981,11 @@ class PaymentSupervisionMixin:
 
     async def _relevant_unchanged(self, i: PaymentInspection, current: tuple) -> bool:
         """dlz (B4): (1) the top frame and every card document's whole chain have their inspected records; (2) no
-        frame on the merchant or an approved origin that is new (or changed) since inspection is admissible and
-        exposed; (3, in ``_absence_holds``) every pinned card-free document stays card-free. Frames on other
-        origins (ads, widgets) may appear, navigate or disappear."""
+        frame on the merchant or an approved origin is admissible and exposed unless it is bound by a pinned object
+        (a card chain or an absence witness, unchanged): a new or changed frame, and (Codex B r1 #2) one that was
+        present but hidden at inspection and is revealed now, withdraw the approval; (3, in ``_absence_holds``)
+        every pinned card-free document stays card-free. Frames on other origins (ads, widgets) may appear,
+        navigate or disappear."""
         if not current or not i.tree or current[0] != i.tree[0]:
             return False
         old = {f[0]: f for f in i.tree}
@@ -874,10 +993,10 @@ class PaymentSupervisionMixin:
         if any(now.get(fid) != old.get(fid) for fid in _relevant_frames(i)):
             return False
         approved = {i.merchant_origin, *i.target_origins}
-        pinned = set(i.tree)
+        bound = _relevant_frames(i) | set(i.absence_frames)
         cache: dict = {}
         for record in current[1:]:
-            if record in pinned or record[3] not in approved:
+            if (record[0] in bound and old.get(record[0]) == record) or record[3] not in approved:
                 continue
             try:
                 admissible = (_frame_admitted(record, now, i.merchant_origin, i.allowed_frames)
@@ -889,12 +1008,13 @@ class PaymentSupervisionMixin:
         return True
 
     async def _absence_holds(self, i: PaymentInspection) -> bool:
-        """dlz (B4): each pinned card-free admissible document still classifies to zero exposed card controls."""
+        """dlz (B4): each pinned card-free admissible document still classifies to zero exposed card controls; its
+        reading is validated like the inspection's (Codex B r1 #5): a malformed or unknown one raises."""
         for sid, obj in i.absence:
             raw = _value(await self._cdp("Runtime.callFunctionOn", {
                 "objectId": obj, "functionDeclaration": "function(){return this.scan()}", "returnByValue": True},
                 session_id=sid))
-            if not isinstance(raw, list) or len(json.dumps(raw)) > _MAX_DESCRIBE_BYTES or _card_controls(raw):
+            if _card_controls(_bounded_description(raw)):
                 return False
         return True
 
@@ -965,6 +1085,9 @@ class PaymentSupervisionMixin:
         if i.witnesses and not await self._cart_current(i):
             i.consumed = True
             return {"success": False, "error_type": "payment_cart_changed"}
+        if not _policy_holds(i):  # dlz: re-read after the asynchronous freshness pass
+            i.consumed = True
+            return {"success": False, "error_type": "payment_destination_disabled"}
         if time.monotonic() >= i.expires_at:  # dlz: the freshness pass itself can outlast the window
             i.consumed = True
             return {"success": False, "error_type": "payment_consent_expired"}
@@ -989,10 +1112,16 @@ class PaymentSupervisionMixin:
                 # each document written so far must still be the one that received its fields.
                 if written and not await self._payment_scope_current(i, [d for d, _f in written] + [document]):
                     return _partial({"success": False, "error_type": "payment_page_changed"}, filled)
+                # dlz (Codex B r1 #1): an unreviewed fill also re-binds the cart, the absence witnesses, the candidate
+                # topology and the policy before each later document, on the consumed inspection.
+                verdict = await self._fill_scope_verdict(i) if written and i.unreviewed_origins else None
+                if verdict:
+                    return _partial({"success": False, "error_type": verdict}, filled)
                 # dlz: strict fills in a frame pause after each focus for the owner-chain check from the parents
-                # (a cross-origin parent's blur handler is out of the frame's reach).
-                paced = (lambda point, d=document: self._owner_chain_current(i, d, point)) \
-                    if strict and _has_parent(i, document) else None
+                # (a cross-origin parent's blur handler is out of the frame's reach); an unreviewed fill pauses in
+                # every document, for the same bindings after the focus handlers ran.
+                paced = (lambda point, d=document: self._paced_check(i, d, point)) \
+                    if strict and (_has_parent(i, document) or i.unreviewed_origins) else None
                 result = await self._commit_payment_document(
                     document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop), strict=strict,
                     paced=paced)
@@ -1073,6 +1202,24 @@ class PaymentSupervisionMixin:
         except Exception:  # health: allow BLE001 -- an unreadable page is not the approved page; fail closed
             return False
 
+    async def _fill_scope_verdict(self, i: PaymentInspection) -> str | None:
+        """dlz (Codex B r1 #1): during an unreviewed fill, the error type that stops it, or None: the window, the
+        topology/absence/exposure bindings, the cart witnesses, and last (after the asynchronous checks) the
+        destination policy."""
+        if time.monotonic() >= i.expires_at:
+            return "payment_consent_expired"
+        if not await self._payment_is_current(i, during_fill=True):
+            return "payment_page_changed"
+        if i.witnesses and not await self._cart_current(i):
+            return "payment_cart_changed"
+        return None if _policy_holds(i) else "payment_destination_disabled"
+
+    async def _paced_check(self, i: PaymentInspection, d: PaymentDocument, point) -> bool | str:
+        """After a strict fill's focus, before the setter: True, or the error type that stops the document."""
+        if _has_parent(i, d) and not await self._owner_chain_current(i, d, point):
+            return "payment_page_changed"
+        return (await self._fill_scope_verdict(i) or True) if i.unreviewed_origins else True
+
     async def _owner_chain_current(self, i: PaymentInspection, d: PaymentDocument, point) -> bool:
         """dlz: strict fills, after the focus and before each setter (Codex A2 r3 #1): from the card document up
         to the page, each parent document is still at its inspected URL and origin, the pinned owner <iframe>
@@ -1119,8 +1266,9 @@ class PaymentSupervisionMixin:
 
     async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None,
                                        strict: bool = False, paced=None) -> dict:
-        """One document's commit. ``paced`` (strict fills in a frame): an async ``check(point)`` run after each
-        focus, before that field's setter; False stops the document with nothing more written."""
+        """One document's commit. ``paced`` (strict fills in a frame, and every document of an unreviewed fill): an
+        async ``check(point)`` run after each focus, before that field's setter; anything but True (False or an error
+        type from ``_PACED_STOPS``) stops the document with nothing more written."""
         result = _value(
             await self._cdp(
                 "Runtime.callFunctionOn",
@@ -1142,10 +1290,11 @@ class PaymentSupervisionMixin:
             if set(result) != {"pending", "filled_fields", "x", "y"} or type(attempted) is not int \
                     or not 0 <= attempted < len(fills):
                 return {"success": False, "error_type": "payment_result_invalid"}
-            if not await paced((result["x"], result["y"])):
+            verdict = await paced((result["x"], result["y"]))
+            if verdict is not True:
                 # dlz: the focused field is never written; earlier fields of this document are reported.
-                return {"success": False, "error_type": "payment_page_changed", "filled_fields": attempted,
-                        "partially_filled": attempted > 0}
+                return {"success": False, "error_type": verdict if verdict in _PACED_STOPS else "payment_page_changed",
+                        "filled_fields": attempted, "partially_filled": attempted > 0}
             result = _value(await self._cdp("Runtime.callFunctionOn", {
                 "objectId": d.object_id, "functionDeclaration": "function(){return this.resume()}",
                 "returnByValue": True,
@@ -1239,10 +1388,14 @@ _OWNER_RENDERED = ("function(){const r=this.getBoundingClientRect();return this.
 # dlz (design v2 B2): what the user is actually shown, for a field or an owner <iframe> in its own document:
 # 1. connected, laid out, larger than 2 px each way; 2. checkVisibility (opacity, visibility, content-visibility),
 # own visibility visible and no legacy `clip`, and a non-zero opacity on it and every flat-tree ancestor;
-# 3. its rectangle cut by every ancestor that clips (overflow, clip, clip-path; not the root or body, whose overflow
-# is the viewport's) keeps 4x4 px; 4. that rectangle lies on the page (document coordinates inside the scroll
-# size: a fixed-position offscreen copy fails); 5. when its centre is in the viewport, the hit test there returns
-# the element itself (an overlay fails); a centre outside the viewport is left to the per-setter hit test.
+# 3. its rectangle cut by every ancestor that clips by overflow (not the root or body, whose overflow is the
+# viewport's) and by every clip-path inset() on it or an ancestor keeps 4x4 px; 4. that rectangle lies on the page
+# (document coordinates inside the scroll size: a fixed-position offscreen copy fails); 5. when its centre is in the
+# viewport, the hit test there returns the element itself (an overlay fails; hit testing honours every clip);
+# a centre outside the viewport is left to the per-setter hit test.
+# dlz (Codex B r1 #4/#7): true, false or null. null = unknown: a clip-path other than inset() or a legacy clip on an
+# ancestor (it can only hide more, so a rectangle already too small stays false) with the centre outside the
+# viewport, a tree deeper than 256 or any exception. Callers never read null as hidden.
 _EXPOSED = r"""(e => {
   try {
     if (!e || !e.isConnected) return false;
@@ -1254,19 +1407,40 @@ _EXPOSED = r"""(e => {
         visibilityProperty: true, contentVisibilityAuto: true})) return false;
     const own = win.getComputedStyle(e);
     if (own.visibility !== 'visible' || (own.clip && own.clip !== 'auto')) return false;
+    // The rectangle a computed `inset(t r b l [round ...])` keeps of box a (px or % of the box), or null.
+    const inset = (path, a) => {
+      const m = /^inset\(([^()]*)\)$/.exec(path);
+      const parts = m ? m[1].split(' round ')[0].trim().split(/\s+/) : [];
+      if (!parts.length || parts.length > 4) return null;
+      const v = [];
+      for (const p of parts) {
+        const q = /^(-?\d+(?:\.\d+)?)(px|%)?$/.exec(p);
+        if (!q || (!q[2] && Number(q[1]) !== 0)) return null;
+        v.push(q);
+      }
+      const [t, rr, b, l] = [v[0], v[1] || v[0], v[2] || v[0], v[3] || v[1] || v[0]];
+      const len = (q, size) => q[2] === '%' ? Number(q[1]) * size / 100 : Number(q[1]);
+      return [a.left + len(l, a.width), a.top + len(t, a.height), a.right - len(rr, a.width),
+              a.bottom - len(b, a.height)];
+    };
     const top = doc.documentElement, body = doc.body;
-    let x0 = r.left, y0 = r.top, x1 = r.right, y1 = r.bottom, n = e, k = 0;
+    let x0 = r.left, y0 = r.top, x1 = r.right, y1 = r.bottom, n = e, k = 0, unknown = false;
+    const cut = c => { x0 = Math.max(x0, c[0]); y0 = Math.max(y0, c[1]); x1 = Math.min(x1, c[2]); y1 = Math.min(y1, c[3]); };
     for (; n && k < 256; k++) {
       const st = n === e ? own : win.getComputedStyle(n);
       if (!(Number(st.opacity) > 0)) return false;
-      if (n !== e && n !== top && n !== body && (st.overflowX !== 'visible' || st.overflowY !== 'visible' ||
-          (st.clipPath && st.clipPath !== 'none') || (st.clip && st.clip !== 'auto'))) {
-        const a = n.getBoundingClientRect();
-        x0 = Math.max(x0, a.left); y0 = Math.max(y0, a.top); x1 = Math.min(x1, a.right); y1 = Math.min(y1, a.bottom);
+      const a = n.getBoundingClientRect();
+      if (n !== e && n !== top && n !== body && (st.overflowX !== 'visible' || st.overflowY !== 'visible'))
+        cut([a.left, a.top, a.right, a.bottom]);
+      if (st.clipPath && st.clipPath !== 'none') {
+        const c = inset(String(st.clipPath), a);
+        if (c) cut(c); else unknown = true;
       }
+      if (n !== e && st.clip && st.clip !== 'auto') unknown = true;
       n = n.assignedSlot || n.parentElement || (n.parentNode && n.parentNode.host) || null;
     }
-    if (n || !(x1 - x0 >= 4 && y1 - y0 >= 4)) return false;
+    if (n) return null;
+    if (!(x1 - x0 >= 4 && y1 - y0 >= 4)) return false;
     const sx = win.scrollX || 0, sy = win.scrollY || 0;
     const w = Math.max(top ? top.scrollWidth : 0, body ? body.scrollWidth : 0);
     const h = Math.max(top ? top.scrollHeight : 0, body ? body.scrollHeight : 0);
@@ -1274,70 +1448,81 @@ _EXPOSED = r"""(e => {
     const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
     if (cx >= 0 && cy >= 0 && cx < win.innerWidth && cy < win.innerHeight) {
       const root = e.getRootNode ? e.getRootNode() : doc;
-      if ((root && typeof root.elementFromPoint === 'function' ? root : doc).elementFromPoint(cx, cy) !== e)
-        return false;
+      return (root && typeof root.elementFromPoint === 'function' ? root : doc).elementFromPoint(cx, cy) === e;
     }
-    return true;
-  } catch (_) { return false; }
+    return unknown ? null : true;
+  } catch (_) { return null; }
 })"""
 _OWNERS_EXPOSED = "function(...els){return els.map(" + _EXPOSED + ")}"
 _OWNERS_SCOPE_EXPOSED = ("function(href,origin,...els){" + _PARENT_AT + "return els.map(e=>!!e&&e.ownerDocument===document&&("
                          + _EXPOSED + ")(e))}")
 
 # dlz (design v2 B5): a transcription sanity check of the stated total against the document's visible text, never a
-# verification. A token is an amount with two decimals, not part of a longer number and not negative (no '-' or
-# U+2212 in the 3 characters before it). It is in the stated currency when the ISO code (a whole word) or the
-# currency's symbol is within 3 spaces of it; '$' is USD only, and not after a letter (CA$, A$, NZ$; US$ is USD).
-# A total-labelled amount is the first such amount within 40 characters after a total keyword on the same line.
-# matched: some labelled amount, all of them the stated total; ambiguous: the stated total appears, but unlabelled
-# or beside a different labelled total; not_found: otherwise. pin() returns the state, the distinct labelled
-# amounts (cents) and the stated total's occurrences; valid() is the same document and URL reading the same pin.
+# verification. A token is an amount with two decimals, not part of a longer number. dlz (Codex B r1 #6): its whole
+# expression is read: [sign] [unit] [sign] AMOUNT [sign][unit], each gap at most 3 spaces; a unit is an ISO 4217 code
+# (a whole word) or a currency symbol with up to 3 letters before it ('$' and 'US$' are USD, 'CA$'/'C$' CAD, 'A$'/
+# 'AU$' AUD, 'NZ$' NZD, '€' EUR, '£' GBP; any other symbol or prefix is an unknown unit). A token without a unit is
+# not an amount. A clear amount has the stated currency as its only unit and no '-' or U+2212 sign; a negative
+# amount never counts; one with the stated currency beside a conflicting unit counts as an occurrence, not a total.
+# A total-labelled amount is the first amount within 40 characters after a total keyword on the same line; one that
+# is not clear makes the page `unclear`.
+# matched: some labelled amount, all of them clear and the stated total; ambiguous: the stated total appears, but
+# unlabelled, unclear or beside a different labelled total; not_found: otherwise. pin() returns the state, the
+# distinct clear labelled amounts (cents), the stated total's occurrences and `unclear`; valid() is the same
+# document and URL reading the same pin.
 _AMOUNT_WITNESS = r"""((cents, currency) => {
   const doc = document, href = location.href;
-  // Each currency's symbol as a regex source; '$' only for USD and never after a letter, except US$.
-  const SYMBOLS = {EUR: '€', GBP: '£', USD: '(?:(?<!\\p{L})|(?<=(?<!\\p{L})US))\\$'};
-  const symbol = SYMBOLS[currency] || null;
-  const AMOUNT = /(?<![\d.,])(\d{1,3}(?:[.,   ]\d{3})+|\d{1,7})[.,](\d{2})(?![\d.,]?\d)/g;
+  const CODES = new Set('__CODES__'.split(' '));
+  const AMOUNT = /(?<![\d.,])(\d{1,3}(?:[.,   ]\d{3})+|\d{1,7})[.,](\d{2})(?![\d.,]?\d)/g;
   const KEYWORD = /(?<![\p{L}\p{N}])(gesamtbetrag|amount due|order total|zu zahlen|endpreis|gesamt|summe|betrag|total)/giu;
-  const GAP = '[\\s\\u00a0\\u202f]{0,3}';
-  const codeBefore = new RegExp('(?<![\\p{L}\\p{N}])' + currency + GAP + '$', 'u');
-  const codeAfter = new RegExp('^' + GAP + currency + '(?![\\p{L}\\p{N}])', 'u');
-  const symBefore = symbol && new RegExp(symbol + GAP + '$', 'u');
-  const symAfter = symbol && new RegExp('^' + GAP + symbol, 'u');
-  const marked = (text, start, end) => {
-    const before = text.slice(Math.max(0, start - 8), start), after = text.slice(end, end + 8);
-    return codeBefore.test(before) || codeAfter.test(after) ||
-      (!!symbol && (symBefore.test(before) || symAfter.test(after)));
+  const PRE = /([-−]?)[\s  ]{0,3}((?<![\p{L}\p{N}])[A-Z]{3}|\p{L}{0,3}\p{Sc})?[\s  ]{0,3}([-−]?)[\s  ]{0,3}$/u;
+  const POST = /^([-−]?)[\s  ]{0,3}([A-Z]{3}(?![\p{L}\p{N}])|\p{L}{0,3}\p{Sc})?/u;
+  const DOLLARS = {'': 'USD', US: 'USD', CA: 'CAD', C: 'CAD', A: 'AUD', AU: 'AUD', NZ: 'NZD'};
+  const unit = m => {
+    if (!m) return null;
+    if (/^[A-Z]{3}$/.test(m)) return CODES.has(m) ? m : null;
+    const cs = Array.from(m), symbol = cs.pop(), prefix = cs.join('');
+    if (symbol === '$') return DOLLARS[prefix] || '?';
+    return prefix ? '?' : symbol === '€' ? 'EUR' : symbol === '£' ? 'GBP' : '?';
   };
   const read = () => {
     const text = String((doc.body && doc.body.innerText) || '').slice(0, 200000);
     const amounts = [];
     for (const m of text.matchAll(AMOUNT)) {
       const start = m.index, end = start + m[0].length;
-      if (/[-−]/.test(text.slice(Math.max(0, start - 3), start))) continue;
-      if (!marked(text, start, end)) continue;
-      amounts.push({start, value: Number(m[1].replace(/\D/g, '') + m[2])});
+      const pre = PRE.exec(text.slice(Math.max(0, start - 12), start)) || [];
+      const post = POST.exec(text.slice(end, end + 12)) || [];
+      const units = [unit(pre[2]), unit(post[2])].filter(Boolean);
+      if (!units.length) continue;
+      const negative = !!(pre[1] || pre[3] || post[1]), stated = units.includes(currency) && !negative;
+      amounts.push({start, value: Number(m[1].replace(/\D/g, '') + m[2]), stated,
+                    clear: stated && units.every(u => u === currency)});
     }
     const labelled = new Set();
+    let unclear = false;
     for (const k of text.matchAll(KEYWORD)) {
       const from = k.index + k[0].length;
       const first = amounts.find(a => a.start >= from);
-      if (first && first.start - from <= 40 && !/[\n\r]/.test(text.slice(from, first.start))) labelled.add(first.value);
+      if (first && first.start - from <= 40 && !/[\n\r]/.test(text.slice(from, first.start))) {
+        if (first.clear) labelled.add(first.value); else unclear = true;
+      }
     }
-    const stated = amounts.filter(a => a.value === cents).length;
+    const stated = amounts.filter(a => a.stated && a.value === cents).length;
     const distinct = Array.from(labelled).sort((a, b) => a - b);
-    const state = distinct.length && distinct.every(v => v === cents) ? 'matched' : stated ? 'ambiguous' : 'not_found';
-    return {state, labelled: distinct.slice(0, 64), stated: Math.min(stated, 9999)};
+    const state = !unclear && distinct.length && distinct.every(v => v === cents) ? 'matched' :
+      stated ? 'ambiguous' : 'not_found';
+    return {state, labelled: distinct.slice(0, 64), stated: Math.min(stated, 9999), unclear};
   };
   const pinned = JSON.stringify(read());
   return {pin: () => JSON.parse(pinned),
           valid: () => document === doc && location.href === href && JSON.stringify(read()) === pinned};
-})"""
+})""".replace("__CODES__", "AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB BRL BSD BTN BWP BYN BZD CAD CDF CHF CLP CNY COP CRC CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF GTQ GYD HKD HNL HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MYR MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK SGD SHP SLE SOS SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD UYU UZS VES VND VUV WST XAF XCD XOF XPF YER ZAR ZMW ZWL")
 _PAGE_MATCH_STATES = ("matched", "ambiguous", "not_found")
 
 
 def _valid_pin(pin: Any) -> bool:
-    return (isinstance(pin, dict) and set(pin) == {"state", "labelled", "stated"} and pin["state"] in _PAGE_MATCH_STATES
+    return (isinstance(pin, dict) and set(pin) == {"state", "labelled", "stated", "unclear"}
+            and pin["state"] in _PAGE_MATCH_STATES and type(pin["unclear"]) is bool
             and isinstance(pin["labelled"], list) and len(pin["labelled"]) <= 64
             and all(type(v) is int and v >= 0 for v in pin["labelled"])
             and type(pin["stated"]) is int and pin["stated"] >= 0)
@@ -1348,9 +1533,19 @@ def _page_match(pins: list, cents: int) -> tuple:
     totals and the stated total's occurrences. ``where`` names the documents checked, in fixed words only."""
     labelled = {v for _place, pin in pins for v in pin["labelled"]}
     stated = sum(pin["stated"] for _place, pin in pins)
-    state = "matched" if labelled and labelled == {cents} else "ambiguous" if stated else "not_found"
+    unclear = any(pin["unclear"] for _place, pin in pins)
+    state = "matched" if labelled == {cents} and not unclear else "ambiguous" if stated else "not_found"
     places = list(dict.fromkeys(place for place, _pin in pins))
     return state, " and ".join("the " + p for p in places)
+
+
+_PACED_STOPS = frozenset({"payment_page_changed", "payment_cart_changed", "payment_destination_disabled",
+                          "payment_consent_expired"})
+
+
+def _policy_holds(i: PaymentInspection) -> bool:
+    """dlz: the destination policy captured for this unreviewed fill still holds (always, without a check)."""
+    return i.policy_check is None or i.policy_check() is True
 
 
 def _has_parent(i: PaymentInspection, d: PaymentDocument) -> bool:
@@ -1465,10 +1660,16 @@ _INSPECT_TEMPLATE = r"""(() => {
   };
   const skipped = ['hidden','submit','button','reset','file','image','checkbox','radio','select-multiple'];
   // dlz (B2): discovery also drops a field the user is not actually shown (clipped, covered, offscreen,
-  // transparent), so a hidden copy is no candidate and cannot make the real form ambiguous.
-  const eligible = e => visible(e) && (!exposedFn || exposedFn(e)) && !skipped.includes(e.type);
-  const entries = elements.map((e,index)=>({e,index})).filter(x=>eligible(x.e));
+  // transparent), so a hidden copy is no candidate and cannot make the real form ambiguous. dlz (Codex B r1 #7):
+  // true, false or null; a fillable-looking field whose exposure is unknown makes the reading unknown, never hidden.
+  const exposure = e => skipped.includes(e.type) || !visible(e) ? false : exposedFn ? exposedFn(e) : true;
+  const judged = elements.map((e,index)=>({e,index,x:exposure(e)}));
+  const unknown = judged.some(x => x.x !== true && x.x !== false);
+  const entries = judged.filter(x=>x.x === true);
   const selected = new Set(entries.map(x=>x.index));
+  // dlz (Codex B r1 #2): discovery binds the exposed set: a field hidden at inspection and shown now (a revealed
+  // duplicate) or one whose exposure became unknown changes the document.
+  const unexposed = () => !LIM || elements.every((e,n)=>selected.has(n) || exposure(e) === false);
   const signature = JSON.stringify(describe());
   // dlz: the owner chain this document can reach synchronously (same-origin ancestors, pinned now) and the
   // top URL when readable: page code run by focus can hide a parent iframe or rewrite the top URL
@@ -1499,7 +1700,7 @@ _INSPECT_TEMPLATE = r"""(() => {
   const valid = () => document === doc && location.href === href && scope() &&
     JSON.stringify(describe()) === signature &&
     (now => now.length === elements.length && now.every((e,n)=>e === elements[n]))(allInputs()) &&
-    entries.every(x=>visible(x.e));
+    entries.every(x=>visible(x.e)) && unexposed();
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
   const selectSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;
   // A select fill names the value of exactly one enabled option, chosen on the inspected options.
@@ -1523,16 +1724,19 @@ _INSPECT_TEMPLATE = r"""(() => {
     if (step.done) paused = null;
     return step.value;
   };
-  // dlz (B3): the description, or the overflow marker (too many fields, nested shadow roots, or too large).
-  const bounded = d => overflow || (LIM && JSON.stringify(d).length > LIM.bytes) ? {overflow:true} : d;
+  // dlz (B3): the description, or the overflow marker (too many fields, nested shadow roots, or too large), or
+  // the unknown marker (a field whose exposure cannot be judged).
+  const bounded = (d, unsure) => overflow || (LIM && JSON.stringify(d).length > LIM.bytes) ? {overflow:true} :
+    unsure ? {unknown:true} : d;
   return {
-    describe:()=>bounded(describe().filter(x=>selected.has(x.index))), valid,
+    describe:()=>bounded(describe().filter(x=>selected.has(x.index)), unknown), valid,
     // dlz (B4, discovery only): the fields shown now, for a card-free document's absence check; null once the
     // document or its URL changed.
     scan: () => {
       if (!LIM || document !== doc || location.href !== href) return null;
-      const now = allInputs();
-      return bounded(now.map((e,index)=>({e,index})).filter(x=>eligible(x.e)).map(x=>describeOne(x.e,x.index)));
+      const now = allInputs().map((e,index)=>({e,index,x:exposure(e)}));
+      return bounded(now.filter(x=>x.x === true).map(x=>describeOne(x.e,x.index)),
+                     now.some(x => x.x !== true && x.x !== false));
     },
     // After every document was written and the page had time to settle: does each written field still
     // hold its value? States and lengths only; a value never leaves this world. Answers once.

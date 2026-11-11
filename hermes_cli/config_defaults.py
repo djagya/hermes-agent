@@ -1686,9 +1686,8 @@ DEFAULT_CONFIG = {
         # / Cancel via tools.slash_confirm; native buttons on Telegram/ Discord/Slack). "Always
         # Approve" → false. HERMES_TUI_NO_CONFIRM=1 skips the TUI modal.
         "destructive_slash_confirm": True,
-        # dlz: the one principal whose own Telegram button approves a card fill: "telegram:<numeric
-        # user id>", also listed in TELEGRAM_ALLOWED_USERS. Every other surface can only deny. Unset
-        # (default) = card-fill approvals are unavailable.
+        # dlz: the one principal whose own Telegram button approves a card fill: "telegram:<numeric user id>", also
+        # in TELEGRAM_ALLOWED_USERS. Every other surface can only deny. Unset (default) = no card-fill approvals.
         "payment_approver": "",
     },
     # Permanently allowed dangerous command patterns (added via "always" approval).
@@ -2462,10 +2461,7 @@ DEFAULT_CONFIG = {
             "enabled": True,        # `bw` CLI (Password Manager, not Secrets Manager); run `bw login` once first.
             "binary_path": "",      # absolute path to bw; empty = PATH.
         },
-        # dlz: owner-approved card fills on hosted payment forms Hermes has not reviewed. Only a literal true
-        # turns it on; it admits no origin itself: every such fill shows the owner one approval card naming each
-        # receiving origin, and switching it off withdraws a fill still in progress.
-        "payment_destination_consent": False,
+        "payment_destination_consent": False,  # dlz: owner-approved card fills on unreviewed hosted payment forms (literal true only; each fill = one owner approval card)
     },
     "secrets": {
         # Optional ordering of enabled sources (e.g. [onepassword, bitwarden]); default registration

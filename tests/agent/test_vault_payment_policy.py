@@ -102,3 +102,41 @@ def test_coverage_hint_names_the_provider_level_cause(frame, allowed, expected):
     hint = coverage_hint(_tree(frame), _SHOP, allowed)
     assert (expected in hint) if expected else hint == ""
     assert "<" not in hint and "?" not in hint and "ads.example" not in hint
+
+
+def test_an_unreadable_config_turns_destination_consent_off_through_the_real_loader(tmp_path, monkeypatch):
+    """Codex B r1 #3: the loader serves last-known-good for a broken config.yaml; that is not the current choice."""
+    import os
+
+    from agent.vault_payment_policy import destination_policy
+    from hermes_cli import config as config_mod
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    path = tmp_path / "config.yaml"
+    path.write_text("vault:\n  payment_destination_consent: true\n", encoding="utf-8")
+    enabled, generation = destination_policy()
+    assert enabled is True and generation
+    broken = tmp_path / ".config.yaml.new"
+    broken.write_text("vault: [unclosed\n", encoding="utf-8")
+    os.replace(broken, path)  # a new inode: the cache sees a changed file
+    assert destination_policy() == (False, "")
+
+
+def test_an_unreadable_config_drops_opt_in_providers_through_the_real_loader(tmp_path, monkeypatch):
+    """A broken config.yaml served as last-known-good never keeps an opt-in provider enabled."""
+    import os
+
+    from agent.vault_payment_policy import OPT_IN_PROVIDERS, enabled_providers
+    from hermes_cli import config as config_mod
+
+    name = OPT_IN_PROVIDERS[0].name
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    path = tmp_path / "config.yaml"
+    path.write_text(f"vault:\n  payment_providers: [{name}]\n", encoding="utf-8")
+    assert name in {p.name for p in enabled_providers()}
+    broken = tmp_path / ".config.yaml.new"
+    broken.write_text("vault: [unclosed\n", encoding="utf-8")
+    os.replace(broken, path)
+    assert name not in {p.name for p in enabled_providers()}

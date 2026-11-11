@@ -3179,7 +3179,7 @@ vault:
 
 - It is used only when the reviewed providers cannot fill the checkout, and only in the managed browser, where browser-control blocks screen capture. Reviewed providers that are off (`vault.payment_providers`) stay refused.
 - Hermes inspects the form's structure without reading any values, then asks the agent for the cart and the exact set of origins that would receive card fields. The owner's approval card (see "Card-fill approver" above) marks each unreviewed origin, shows the cart as stated by the agent, and says whether the page shows that total: matched, NOT found or ambiguous. That check reads page text only; it does not verify the charge.
-- One approval covers one fill within its 120 s window. Nothing is remembered; the next checkout asks again. Switching the key off, or changing `vault.payment_providers`, stops a fill that is still waiting or in progress, before any card field is written.
+- One approval covers one fill within its 120 s window. Nothing is remembered; the next checkout asks again. Switching the key off, changing `vault.payment_providers`, or a `config.yaml` that cannot be read stops a fill that is still waiting or in progress before its next card field is written; a fill stopped part-way reports which fields it wrote.
 
 ### Custom smart-approval policy
 

@@ -44,6 +44,12 @@ def _candidate(origin, *tokens, frame="f"):
     return (f"{frame}-{origin}", f"s-{frame}", f"o-{frame}", origin, _controls(*tokens))
 
 
+def _desc(index, autocomplete, **extra):
+    """A complete discovery descriptor (describeOne's exact shape)."""
+    return {"index": index, "autocomplete": autocomplete, "name": f"f{index} ", "label": " ", "type": "text",
+            "formIndex": None, "maxLength": None, **extra}
+
+
 def _rows(*frames):
     return {r[0]: r for r in (("m", "", MERCHANT + "/checkout", MERCHANT, ""), *frames)}
 
@@ -117,14 +123,17 @@ def test_discovery_refusals_are_typed_and_carry_origins_and_tokens_only(candidat
 # ------------------------------------------------------------------------------------- B3 traversal bounds
 
 class _TreePage(sp.PaymentSupervisionMixin):
-    def __init__(self, tree):
-        self.tree = tree
+    def __init__(self, tree, targets=0):
+        self.tree, self.targets, self.owner_probes = tree, targets, 0
 
     async def _cdp(self, method, params=None, session_id=None, timeout=None):
         if method == "Page.getFrameTree":
             return {"result": {"frameTree": self.tree}}
         if method == "Target.getTargets":
-            return {"result": {"targetInfos": []}}
+            return {"result": {"targetInfos": [{"type": "iframe", "targetId": f"t{n}"} for n in range(self.targets)]}}
+        if method == "DOM.getFrameOwner":  # an unrelated target (another tab): no owner in this page
+            self.owner_probes += 1
+            return {"error": {"message": "Frame with the given id was not found."}}
         raise AssertionError(method)
 
 
@@ -156,12 +165,49 @@ def test_the_frame_walk_is_bounded_while_it_walks(tree, too_large):
         assert asyncio.run(page._payment_tree("page"))[0][0] in ("top", "d0")
 
 
+def test_the_oopif_owner_search_is_bounded_before_it_walks():
+    """Codex B r1 #9: too many iframe targets refuse before any probe; unrelated targets cost one probe per
+    (target, session), not one per frame and round."""
+    with pytest.raises(PaymentDestinationError) as caught:
+        asyncio.run(_TreePage(_frame("top"), targets=sp._MAX_IFRAME_TARGETS + 1)._payment_tree("page"))
+    assert caught.value.error_type == "payment_page_too_large"
+    page = _TreePage(_frame("top", [_frame(f"c{n}") for n in range(20)]), targets=100)
+    assert len(asyncio.run(page._payment_tree("page"))) == 21
+    assert page.owner_probes == 100
+
+
 def test_an_overflowing_or_oversized_description_is_page_too_large():
     for raw in ({"overflow": True}, [{"index": n, "label": "x" * 200} for n in range(2000)]):
         with pytest.raises(PaymentDestinationError) as caught:
             sp._bounded_description(raw)
         assert caught.value.error_type == "payment_page_too_large"
-    assert sp._bounded_description([{"index": 0}]) == [{"index": 0}]
+    assert sp._bounded_description([_desc(0, "cc-number")]) == [_desc(0, "cc-number")]
+
+
+_MONTHS = {"type": "select", "options": [["07", "07", False]]}
+
+
+@pytest.mark.parametrize("raw, error_type", [
+    ([{}], "payment_page_unverifiable"),  # an empty row is no card-free document
+    ([{k: v for k, v in _desc(0, "cc-number").items() if k != "index"}], "payment_page_unverifiable"),
+    ([_desc(True, "cc-number")], "payment_page_unverifiable"),  # a bool is not an index
+    ([_desc(3, "email"), _desc(3, "cc-number")], "payment_page_unverifiable"),  # duplicate index
+    ([_desc(4, "email"), _desc(2, "cc-number")], "payment_page_unverifiable"),  # out of document order
+    ([_desc(300, "cc-number")], "payment_page_unverifiable"),  # outside the element limit
+    ([_desc(0, "cc-number", rendered=True)], "payment_page_unverifiable"),  # an extra key
+    ([_desc(0, "cc-number", options=[])], "payment_page_unverifiable"),  # options on a text input
+    ([_desc(0, "cc-exp-month", type="select")], "payment_page_unverifiable"),  # a select without its options
+    ([_desc(0, "cc-number", maxLength="19")], "payment_page_unverifiable"),
+    ({"unknown": True}, "payment_page_unverifiable"),  # a field whose exposure the closure cannot judge
+    (None, "payment_page_unverifiable"),
+    ([_desc(n, "off") for n in range(301)], "payment_page_too_large"),  # more rows than the closure may return
+])
+def test_a_malformed_discovery_description_is_refused_typed(raw, error_type):
+    """Codex B r1 #5: validated before classification, absence scans included."""
+    with pytest.raises(PaymentDestinationError) as caught:
+        sp._bounded_description(raw)
+    assert caught.value.error_type == error_type
+    assert sp._bounded_description([_desc(0, "cc-exp-month", **_MONTHS)])  # a complete select row passes
 
 
 # ---------------------------------------------------------------------------- page-side closures under Node
@@ -215,6 +261,18 @@ process.stdout.write(JSON.stringify({exposed: EXPOSED(el)}));
     ({"rect": [100, 100, 200, 30], "wrap": [0, 0, 1000, 600], "css": {"clip": "rect(0px, 0px, 0px, 0px)"}}, False),
     ({"rect": [100, 1500, 200, 30], "wrap": [0, 0, 1000, 2000], "covered": True}, True),  # below the fold: deferred
     ({"rect": [100, 9500, 200, 30], "wrap": [0, 0, 1000, 9900]}, False),  # below the end of the page
+    # Codex B r1 #7: clip paths. A fully inset copy below the fold is hidden; a shape Hermes cannot judge is
+    # unknown (null) there, and in the viewport the hit test (which honours clipping) decides.
+    ({"rect": [100, 1500, 200, 30], "wrap": [0, 0, 1000, 2000], "css": {"clipPath": "inset(100%)"}}, False),
+    ({"rect": [100, 1500, 200, 30], "wrap": [0, 0, 1000, 2000], "wrapCss": {"clipPath": "inset(0px 0px 100% 0px)"}},
+     False),
+    ({"rect": [100, 1500, 200, 30], "wrap": [0, 0, 1000, 2000], "css": {"clipPath": "polygon(0 0, 0 0, 0 0)"}},
+     None),
+    ({"rect": [100, 1500, 200, 30], "wrap": [0, 0, 1000, 2000], "wrapCss": {"clip": "rect(0px, 0px, 0px, 0px)"}},
+     None),
+    ({"rect": [100, 100, 200, 30], "wrap": [0, 0, 1000, 600], "css": {"clipPath": "polygon(0 0, 0 0, 0 0)"},
+      "covered": True}, False),
+    ({"rect": [100, 100, 200, 30], "wrap": [0, 0, 1000, 600], "css": {"clipPath": "inset(0px round 8px)"}}, True),
 ])
 def test_exposure_predicate_table(case, exposed):
     case = {"wrapCss": {}, "css": {}, "covered": False, **case}
@@ -231,10 +289,10 @@ class Event {} class InputEvent extends Event {} class FocusEvent extends Event 
 const location = {href: 'https://kps.example/customer/wallet/pc/WalletInput.jsp'};
 const spec = __CASE__;
 const shown = node(R(0, 0, 1000, 9000), {}, body);
-const transparent = node(R(0, 0, 1000, 9000), {opacity: '0'}, body);
+const transparent = node(R(0, 0, 1000, 9000), spec.altCss || {opacity: '0'}, body);
 const inputs = [];
 spec.inputs.forEach(([token, alternate], n) => {
-  const rect = R(10, 10 + n * 25, 300, 20);
+  const rect = R(10, (alternate && spec.altTop || 10) + n * 25, 300, 20);
   const el = node(rect, {}, alternate ? transparent : shown, {tagName: 'INPUT', autocomplete: token, name: 'f' + n,
     id: 'f' + n, labels: null, placeholder: '', type: 'text', form: null, maxLength: 0, disabled: false,
     readOnly: false, tabIndex: 0, shadowRoot: null, getAttribute: () => null, hasAttribute: () => false,
@@ -248,13 +306,18 @@ document.elementFromPoint = (x, y) => inputs.find(e => !spec.inputs[inputs.index
   e.getBoundingClientRect().top <= y && y <= e.getBoundingClientRect().bottom) || body;
 const api = __INSPECT__;
 const d = api.describe();
-process.stdout.write(JSON.stringify({describe: Array.isArray(d) ? d.map(x => x.index) : d}));
+const before = api.valid();
+if (spec.reveal) transparent.css = {};  // page code shows the alternate form after inspection
+process.stdout.write(JSON.stringify({describe: Array.isArray(d) ? d.map(x => x.index) : d, before,
+                                     valid: api.valid()}));
 """
 
 
-def _inspect(script_src, inputs):
-    script = _INSPECT_HARNESS.replace("__INSPECT__", script_src).replace("__CASE__", json.dumps({"inputs": inputs}))
-    return _node(script)["describe"]
+def _inspect(script_src, inputs, full=False, **spec):
+    script = _INSPECT_HARNESS.replace("__INSPECT__", script_src).replace(
+        "__CASE__", json.dumps({"inputs": inputs, **spec}))
+    out = _node(script)
+    return out if full else out["describe"]
 
 
 def test_a_transparent_alternate_form_is_no_candidate_in_discovery():
@@ -264,6 +327,22 @@ def test_a_transparent_alternate_form_is_no_candidate_in_discovery():
               ["cc-number", True], ["cc-csc", True], ["cc-exp", True]]
     assert _inspect(sp._INSPECT_DISCOVERY, inputs) == [0, 1, 2]
     assert _inspect(sp._INSPECT, inputs) == [0, 1, 2, 3, 4, 5]
+
+
+def test_revealing_a_hidden_duplicate_in_a_receiving_document_changes_it():
+    """Codex B r1 #2: discovery binds the exposed set; the reviewed closure keeps today's valid()."""
+    inputs = [["cc-number", False], ["cc-csc", False], ["cc-exp", False], ["cc-number", True]]
+    out = _inspect(sp._INSPECT_DISCOVERY, inputs, full=True, reveal=True, altTop=1500)  # shown below the fold
+    assert out["describe"] == [0, 1, 2] and out["before"] is True and out["valid"] is False
+    assert _inspect(sp._INSPECT, inputs, full=True, reveal=True, altTop=1500)["valid"] is True
+
+
+def test_a_field_with_an_unjudgeable_clip_makes_the_description_unknown():
+    """Codex B r1 #7: a polygon-clipped copy below the fold is neither a candidate nor proven hidden."""
+    inputs = [["cc-number", False], ["cc-csc", False], ["cc-exp", False], ["cc-number", True]]
+    out = _inspect(sp._INSPECT_DISCOVERY, inputs, altCss={"clipPath": "polygon(0 0, 0 0, 0 0)"}, altTop=1500)
+    assert out == {"unknown": True}
+    assert _inspect(sp._INSPECT_DISCOVERY, inputs, altCss={"clipPath": "inset(100%)"}, altTop=1500) == [0, 1, 2]
 
 
 def test_discovery_stops_at_300_fields():
@@ -294,12 +373,25 @@ process.stdout.write(JSON.stringify({pin, before, after: w.valid()}));
     ("2 Tickets 22,66\nSumme 23,00 €", 2266, "EUR", "not_found"),  # no currency next to the stated total
     ("122,66 €", 2266, "EUR", "not_found"),
     ("Gesamt 1.022,66 EUR", 102266, "EUR", "matched"),
+    # Codex B r1 #6: the whole expression, sign and every unit, is read.
+    ("Total -EUR 22.66", 2266, "EUR", "not_found"),
+    ("Total € -22,66", 2266, "EUR", "not_found"),
+    ("Total $22.66 CAD", 2266, "USD", "ambiguous"),
+    ("Total 22,66 € (25,00 CHF)", 2266, "EUR", "matched"),  # a second amount after the labelled one
+    ("VAT 22,66 €\nTotal 22,66 €", 2266, "EUR", "matched"),  # a word that is no currency code
 ])
 def test_amount_witness_states(text, cents, currency, state):
     values = {"__TEXT__": json.dumps(text), "__LATER__": json.dumps(text), "__WITNESS__": sp._AMOUNT_WITNESS,
               "__CENTS__": str(cents), "__CURRENCY__": json.dumps(currency)}
     out = _node(re.sub("|".join(values), lambda m: values[m.group(0)], _WITNESS_HARNESS))
     assert out["pin"]["state"] == state and out["before"] is True and out["after"] is True
+
+
+def test_an_unclear_labelled_total_on_any_document_blocks_matched():
+    pins = [("merchant page", {"state": "matched", "labelled": [2266], "stated": 1, "unclear": False}),
+            ("payment form", {"state": "ambiguous", "labelled": [], "stated": 1, "unclear": True})]
+    assert sp._page_match(pins, 2266)[0] == "ambiguous"
+    assert not sp._valid_pin({"state": "matched", "labelled": [2266], "stated": 1})  # unclear is required
 
 
 def test_a_total_changed_after_inspection_invalidates_the_witness():
@@ -367,8 +459,9 @@ def _fresh(sup, **kwargs):
     (_TREE + (("m2", "L5", "about:blank", MERCHANT, "top"),), {"m2"}, (), False),  # a new merchant frame, shown
     (_with(_TREE, "kps", loader="L7"), (), (), False),  # the card iframe swapped
     (_with(_TREE, "top", url=MERCHANT + "/other"), (), (), False),  # the top document navigated
-    (_TREE, (), [{"index": 3, "autocomplete": "cc-number"}], False),  # cc-number injected into the top document
-    (_TREE, (), [{"index": 3, "autocomplete": "email"}], True),  # an unrelated field: still card-free
+    (_TREE, (), [_desc(3, "cc-number")], False),  # cc-number injected into the top document
+    (_TREE, (), [_desc(3, "email")], True),  # an unrelated field: still card-free
+    (_TREE, (), [{}], False),  # Codex B r1 #5: a malformed scan is not a card-free document
 ])
 def test_unreviewed_freshness_binds_the_relevant_topology_only(current, exposed, scan, fresh):
     assert _fresh(_Fresh(current, exposed, scan)) is fresh
@@ -406,6 +499,8 @@ def flow(monkeypatch):
                 if state["reviewed"] is not None:
                     raise state["reviewed"]
                 raise PaymentPolicyError("Missing, ambiguous or split payment documents")
+            if state.get("discovery") is not None:
+                raise state["discovery"]
             state["inspection"].owner = self
             return state["inspection"]
 
@@ -539,7 +634,8 @@ def test_the_owner_card_names_the_unreviewed_destination_and_the_fill_runs_stric
                      "commit"]
     commit = next(e for e in events if isinstance(e, tuple) and e[0] == "commit")
     assert commit[1] is True  # strict: per-setter hit tests, guard without the rollout exception
-    assert events.count("policy") == 4  # captured at inspection, after accept, in context, at the commit fence
+    # captured at inspection, after accept, in context, after the page checks, at the commit fence
+    assert events.count("policy") == 5
 
 
 def test_amount_not_found_still_prompts_with_the_warning(flow):
@@ -567,9 +663,10 @@ def test_no_approval_means_no_read_and_no_write(flow, verdict, reason, error_typ
     assert "resolve" not in events and not any(isinstance(e, tuple) and e[0] == "commit" for e in events)
 
 
-@pytest.mark.parametrize("off_at, read", [(1, False), (2, False), (3, True)])
+@pytest.mark.parametrize("off_at, read", [(1, False), (2, False), (3, False), (4, True)])
 def test_switching_off_withdraws_a_fill_in_progress(flow, off_at, read):
-    """B6: off (or a changed policy generation) after the accept, before the card is read, or at the commit fence."""
+    """B6: off (or a changed policy generation) after the accept, in context, after the page checks (Codex B r1:
+    those are asynchronous), or at the commit fence."""
     run, events = flow
     run.state["policy"] = [(True, "g1")] * off_at + [(False, "g2")]
     out = run(cart=CART, approve_origins=[KPS])
@@ -635,7 +732,7 @@ def test_no_card_value_reaches_a_result_or_the_log(flow, caplog):
     run, _events = flow
     caplog.set_level(logging.DEBUG)
     outs = [run(cart=CART, approve_origins=[KPS])]
-    run.state["policy"] = [(True, "g1")] * 3 + [(False, "g2")]  # read, then withdrawn at the commit fence
+    run.state["policy"] = [(True, "g1")] * 4 + [(False, "g2")]  # read, then withdrawn at the commit fence
     outs.append(run(cart=CART, approve_origins=[KPS]))
     assert outs[0]["success"] is True and outs[1]["error_type"] == "payment_destination_disabled"
     blob = json.dumps(outs) + caplog.text
@@ -697,14 +794,15 @@ class _DiscoveryPage(sp.PaymentSupervisionMixin):
             if "describe()" in fn:
                 return {"result": {"result": {"value": self.controls.get(obj[4:], [])}}}
             if "pin()" in fn:
-                return {"result": {"result": {"value": {"state": "matched", "labelled": [2266], "stated": 1}}}}
+                return {"result": {"result": {"value": {"state": "matched", "labelled": [2266], "stated": 1,
+                                                        "unclear": False}}}}
         if method in ("Runtime.releaseObject", "Target.detachFromTarget"):
             self.released = getattr(self, "released", []) + [params.get("objectId")]
             return {"result": {}}
         raise AssertionError((method, params))
 
 
-_CARD_FORM = [{"index": n, "autocomplete": t} for n, t in enumerate(_KPS_SET)]
+_CARD_FORM = [_desc(n, t) for n, t in enumerate(_KPS_SET)]
 _PAGE = (("top", "L0", MERCHANT + "/checkout", MERCHANT, ""),
          ("ad", "L1", AD + "/slot", AD, "top"),
          ("kps", "L2", _KPS_URL, KPS, "top"),
@@ -742,3 +840,150 @@ def test_two_exposed_copies_are_ambiguous_and_nine_unreviewed_frames_exceed_the_
     with pytest.raises(PaymentDestinationError) as caught:
         asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True))
     assert caught.value.error_type == "payment_fields_ambiguous"
+
+
+def test_a_hidden_frame_revealed_after_inspection_withdraws_the_approval():
+    """Codex B r1 #2: a frame present but hidden at inspection is not exempt from the exposure check; a bound
+    absence witness (unchanged) is."""
+    tree = _TREE + (("copy", "L3", KPS + "/copy", KPS, "top"), ("m1", "L4", MERCHANT + "/m1", MERCHANT, "top"))
+    sup = _Fresh(tree, exposed={"copy"})
+    assert _fresh(sup, tree=tree) is False
+    i = _unreviewed_inspection(tree=tree)
+    i.owner, i.absence_frames = _Fresh(tree, exposed={"m1"}), ("m1",)
+    assert asyncio.run(i.owner._payment_is_current(i)) is True
+
+
+def test_discovery_with_an_unknown_owner_exposure_refuses_typed():
+    """Codex B r1 #4: a malformed DOM.getFrameOwner answer is unknown, never hidden: discovery refuses."""
+    class Unknown(_DiscoveryPage):
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if method == "DOM.getFrameOwner" and params["frameId"] == "copy":
+                return {"result": {}}
+            return await super()._cdp(method, params, session_id, timeout)
+
+    page = Unknown(_PAGE, exposed={"kps", "ad"}, controls={"kps": _CARD_FORM, "copy": _CARD_FORM})
+    with pytest.raises(PaymentDestinationError) as caught:
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True))
+    assert caught.value.error_type == "payment_page_unverifiable"
+
+
+@pytest.mark.parametrize("answer, outcome", [(True, True), (False, False), (None, "raises"), ("yes", "raises")])
+def test_strict_owner_check_reads_only_a_literal_boolean(answer, outcome):
+    class Owner(sp.PaymentSupervisionMixin):
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            return {"DOM.getFrameOwner": {"result": {"backendNodeId": 1}},
+                    "Page.createIsolatedWorld": {"result": {"executionContextId": 2}},
+                    "DOM.resolveNode": {"result": {"object": {"objectId": "o"}}},
+                    "Runtime.callFunctionOn": {"result": {"result": {"value": answer}}},
+                    "Runtime.releaseObject": {"result": {}}}[method]
+
+    check = Owner()._owner_check("f", "top", "page", "function(){}", strict=True)
+    if outcome == "raises":
+        with pytest.raises(PaymentDestinationError):
+            asyncio.run(check)
+    else:
+        assert asyncio.run(check) is outcome
+    assert asyncio.run(Owner()._owner_check("f", "top", "page", "function(){}")) is (answer is True)  # reviewed
+
+
+# ------------------------------------------------------------------- Codex B r1 #1: bindings during the fill
+
+class _Filling(sp.PaymentSupervisionMixin):
+    """The real _commit_payment_once over stubbed bindings and a closure that pauses after each focus."""
+
+    def __init__(self, cart_after, policy_after=None):
+        self.cart_calls, self.writes, self.cart_after, self.policy_after = 0, [], cart_after, policy_after
+        self.pending: dict = {}
+
+    async def _payment_is_current(self, i, during_fill=False):
+        return True
+
+    async def _cart_current(self, i):
+        self.cart_calls += 1
+        return self.cart_calls <= self.cart_after  # the first call is the commit's own freshness pass
+
+    async def _payment_scope_current(self, i, receiving):
+        return True
+
+    async def _owner_chain_current(self, i, d, point):
+        return True
+
+    async def _shown_documents(self, i):
+        return {d.frame_id for d in i.documents}
+
+    async def _payment_retention(self, i, d):
+        return [{"token": f["token"], "state": "held", "length": 1} for f in self.pending.pop(d.object_id)]
+
+    async def _top_navigated(self, i):
+        return False
+
+    async def _cdp(self, method, params=None, session_id=None, timeout=None):
+        obj, fn = params["objectId"], params["functionDeclaration"]
+        if "this.commit(" in fn:
+            self.pending[obj] = list(params["arguments"][0]["value"])
+            self.queue = list(self.pending[obj])
+            self.done = 0
+        elif self.queue:  # resume(): the setter of the field focused before the pause
+            self.writes.append(self.queue.pop(0)["token"])
+            self.done += 1
+        if self.queue:
+            return {"result": {"result": {"value": {"pending": True, "filled_fields": self.done, "x": 1, "y": 1}}}}
+        return {"result": {"result": {"value": {"success": True, "filled_fields": self.done}}}}
+
+
+def _two_document_fill(sup, policy=None):
+    docs = (PaymentDocument("top", "page", "o-top", MERCHANT, _controls("cc-name"), clock_anchor=time.monotonic()),
+            PaymentDocument("kps", "s-kps", "o-kps", KPS, _controls("cc-number", "cc-csc", "cc-exp"),
+                            clock_anchor=time.monotonic()))
+    i = PaymentInspection("b" * 32, "page", "target", MERCHANT, docs, _TREE, time.monotonic() + 60, owner=sup,
+                          unreviewed_origins=(KPS,), witnesses=(("page", "w-top"),), policy_check=policy)
+    fills = [{"document": 0, "index": 0, "token": "cc-name", "value": "x"}] + [
+        {"document": 1, "index": n, "token": t, "value": "x"} for n, t in enumerate(("cc-csc", "cc-exp", "cc-number"))]
+    return asyncio.run(sup._commit_payment_once(i, fills, None, strict=True))
+
+
+@pytest.mark.parametrize("cart_after, writes, filled", [
+    (99, ["cc-name", "cc-csc", "cc-exp", "cc-number"], 4),  # the cart holds: every field is written
+    (1, [], 0),  # the total changes on the first focus (merchant holder field): nothing written
+    (2, ["cc-name"], 1),  # ... after the merchant document, before the hosted form: partial, reported
+    (4, ["cc-name", "cc-csc"], 2),  # ... on a later focus inside the hosted form
+])
+def test_an_unreviewed_fill_rebinds_the_cart_between_documents_and_after_each_focus(cart_after, writes, filled):
+    sup = _Filling(cart_after)
+    out = _two_document_fill(sup)
+    assert sup.writes == writes
+    if filled == 4:
+        assert out["success"] is True
+    else:
+        assert out["error_type"] == "payment_cart_changed" and out.get("filled_fields", 0) == filled
+        assert out.get("partially_filled", False) is (filled > 0)
+
+
+def test_switching_off_part_way_stops_the_fill_and_says_what_was_written():
+    reads = iter([True, True, True, False])  # the commit's pass, the first focus, between documents, then off
+    sup = _Filling(99)
+    out = _two_document_fill(sup, policy=lambda: next(reads))
+    assert out["error_type"] == "payment_destination_disabled" and out["filled_fields"] == 1
+    assert sup.writes == ["cc-name"]
+    bvp._commit_text(out)
+    assert "some card fields were written" in out["error"]
+    cart = {"success": False, "error_type": "payment_cart_changed", "filled_fields": 1, "partially_filled": True}
+    bvp._commit_text(cart)
+    assert "some card fields were written" in cart["error"]
+
+
+def test_typed_unsupported_result_carries_no_page_path(flow):
+    """Codex B r1 #8: the reviewed pass's hint keeps registry origins and fixed text in a typed result."""
+    paypal = "https://www.paypal.com"
+    tree = (("top", "", MERCHANT + "/checkout", MERCHANT, ""),
+            ("p", "", paypal + "/payment-ref-ABCsecret", paypal, "top"))
+    with pytest.raises(PaymentPolicyError) as reviewed:
+        sp._explained_card_documents([], MERCHANT, tree, (paypal,))
+    assert "ABCsecret" in str(reviewed.value)  # the untyped reviewed refusal is unchanged
+    run, _events = flow
+    run.state["reviewed"] = reviewed.value
+    run.state["discovery"] = PaymentDestinationError("payment_fields_unsupported", sp.FIELDS_UNSUPPORTED,
+                                                     {"unreviewed_frames_inspected": 0})
+    out = run(cart=CART, approve_origins=[KPS])
+    assert out["error_type"] == "payment_fields_unsupported"
+    assert paypal in out["reviewed_refusal"] and "ABCsecret" not in json.dumps(out)

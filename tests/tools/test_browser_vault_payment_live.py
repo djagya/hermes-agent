@@ -21,6 +21,8 @@ from urllib.request import urlopen
 
 import pytest
 
+from tests.waiting import wait_until
+
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
@@ -1137,7 +1139,14 @@ def test_kps_like_form_navigated_during_consent_writes_nothing(payment_browser, 
             "expression": f"document.getElementById('kps').src={json.dumps(origins['psp'])}"
                           "+'/customer/wallet/pc/WalletInput.jsp?ref=x2'"}, session_id=sup._page_session_id),
             sup._loop, timeout=10)
-        time.sleep(1.0)
+
+        def navigated():  # the approved iframe's new document is live (in the page's tree or as its own target)
+            tree = json.dumps(_schedule(sup._cdp("Page.getFrameTree", session_id=sup._page_session_id), sup._loop,
+                                        timeout=10))
+            return "ref=x2" in tree or "ref=x2" in json.dumps(_schedule(sup._cdp("Target.getTargets"), sup._loop,
+                                                                        timeout=10))
+
+        wait_until(navigated, what="the approved iframe navigated")
 
     _first, raw, _asked, state, _sup = _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=swap)
     out = json.loads(raw)
