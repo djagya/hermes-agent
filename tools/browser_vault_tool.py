@@ -1585,8 +1585,9 @@ def _payment_done_action(task_id: Optional[str], expected_origin: str) -> str:
 
 
 def _handle_vault(args: dict[str, Any], **kwargs) -> str:
-    """dlz: a failed result's ``error`` text can quote the page (an inspection error, a CDP message), so it gets
-    the browser-audience vault scrub; the rest is left alone (handles and origins must stay usable)."""
+    """dlz: every page-derived field of the result (errors, urls, titles, origins: :func:`_scrub_page_fields`)
+    and any raised error get the browser-audience vault scrub; handles, refs and the echoed approval fields
+    stay as they are so they remain usable."""
     from agent.redact import redact_sensitive_text
 
     try:
@@ -1606,10 +1607,14 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
 
 
 _PAGE_FIELDS = ("error", "url", "title", "page", "origin", "receiving")  # dlz: page-derived text
+# Fields the model must echo back exactly (approve_origins = approval_origins, merchant_origin): masking them
+# would refuse every fill on a slot whose card window is still open; they are origins the page already chose.
+_ECHO_FIELDS = ("approval_origins", "merchant_origin")
 
 
 def _page_key(key: Any) -> bool:
-    return isinstance(key, str) and (key in _PAGE_FIELDS or key.endswith(("_origin", "_origins", "_url")))
+    return isinstance(key, str) and key not in _ECHO_FIELDS and (
+        key in _PAGE_FIELDS or key.endswith(("_origin", "_origins", "_url")))
 
 
 def _scrub_page_fields(value: Any, redact: Any, inside: bool = False) -> Any:

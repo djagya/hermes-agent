@@ -143,6 +143,9 @@ _DIALOG_BRIDGE_SCRIPT = r"""
 """
 
 
+_BRIDGE_KINDS = frozenset({"alert", "confirm", "prompt", "beforeunload"})
+
+
 @dataclass
 class PendingDialog:
     """A JS dialog currently open on some frame's session."""
@@ -280,10 +283,15 @@ class DialogSupervisionMixin:
                                   session_id=session_id, timeout=3.0, what="passthrough")
             return
         q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+        kind = q.get("kind") or "alert"
+        if kind not in _BRIDGE_KINDS:  # dlz: page-controlled; only the dialog types the bridge script sends
+            await self._cdp_quiet("Fetch.failRequest", {"requestId": request_id, "errorReason": "BlockedByClient"},
+                                  session_id=session_id, timeout=3.0, what="bridge kind refused")
+            return
         headers = params.get("request", {}).get("headers") or {}
         referer = next((str(v) for k, v in headers.items() if str(k).lower() in {"referer", "origin"}), "")
         self._admit_dialog(
-            type=q.get("kind") or "alert", message=q.get("message", ""), default_prompt=q.get("default_prompt", ""),
+            type=kind, message=q.get("message", ""), default_prompt=q.get("default_prompt", ""),
             session_id=session_id, frame_id=params.get("frameId"), bridge_request_id=str(request_id), url=referer,
         )
 

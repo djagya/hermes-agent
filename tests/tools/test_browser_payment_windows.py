@@ -244,3 +244,33 @@ def test_exec_dialog_origins_are_scrubbed(monkeypatch):
     monkeypatch.setattr(surface, "slot_locked", lambda s: False)
     out = dialogs.collect("t1", 0.0)
     assert "4000056655665556" not in json.dumps(out), out
+
+
+def test_bridge_kinds_echo_fields_and_dotted_card_groups(monkeypatch):
+    # r12 Codex P2: a page-chosen bridge `kind` became the dialog type verbatim; r11 peer: masking the echoed
+    # approval fields refused every fill on a slot with an open window; dotted card groups were not masked
+    import asyncio
+
+    from tools import browser_supervisor_dialogs as bsd
+    from tools import browser_vault_tool as vault
+
+    calls, admitted = [], []
+
+    class Sup(bsd.DialogSupervisionMixin):
+        async def _cdp_quiet(self, method, params, **kw):
+            calls.append(method)
+
+        def _admit_dialog(self, **kw):
+            admitted.append(kw)
+
+    url = f"https://{bsd.DIALOG_BRIDGE_HOST}/x?kind=4000056655665556&message=hi"
+    asyncio.run(Sup()._on_fetch_paused({"requestId": "r1", "request": {"url": url}}, "s1"))
+    assert calls == ["Fetch.failRequest"] and not admitted
+    asyncio.run(Sup()._on_fetch_paused({"requestId": "r2", "request": {"url": url.replace("4000056655665556", "confirm")}}, "s1"))
+    assert admitted and admitted[0]["type"] == "confirm"
+    redact.register_card_window("shopping", digits=(CARD["card_number"], CARD["cvc"]))
+    monkeypatch.setattr(vault, "_handle_vault_inner", lambda args, **kw: json.dumps(
+        {"success": False, "approval_origins": ["https://shop365.example"], "merchant_origin": "https://shop365.example"}))
+    out = json.loads(vault._handle_vault({"action": "fill", "handle": "op:x"}))
+    assert out["approval_origins"] == ["https://shop365.example"] and out["merchant_origin"] == "https://shop365.example"
+    assert "4000" not in redact.redact_sensitive_text("https://4000.0566.5566.5556.host/", force=True)
