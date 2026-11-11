@@ -30,6 +30,14 @@ SNAPSHOT = {"title": "Thank you", "url": SHOP + "/thanks?order=77", "origin": SH
             "card_fields": 0}
 
 
+def frame_tree(rows):
+    """``Page.getFrameTree``'s result for tree rows ``(id, loader, url, origin, parent)``."""
+    def node(row):
+        return {"frame": {"id": row[0], "loaderId": row[1], "url": row[2]},
+                "childFrames": [node(r) for r in rows if r[4] == row[0]]}
+    return {"frameTree": node(rows[0])}
+
+
 class FakeSup:
     """The supervisor surface payment_done touches, on a real loop thread; trees served in order."""
 
@@ -70,6 +78,8 @@ class FakeSup:
             return {"result": {"value": True}} if fn == surface._HIT else {"result": {"objectId": "el"}}
         if method == "DOM.getContentQuads":
             return {"quads": [[10, 10, 30, 10, 30, 30, 10, 30]]}
+        if method == "Page.getFrameTree":
+            return frame_tree(self.tree)
         if method == "Target.createTarget":
             return {"targetId": "NEWTAB"}
         if method == "Hermes.paymentSurfaceStatus":
@@ -91,6 +101,7 @@ class FakeSup:
         pass
 
     async def _attach_page(self, target_id, *, timeout, deadline=None):
+        self.calls.append(("attach_page", {"targetId": target_id}, None, self.tree))
         return "S-new"
 
     def sent(self, method):
@@ -156,6 +167,10 @@ SAME_DOC_CARD = (SAME_DOC[0], ("CARD", "LC2", STRIPE + "/v3/loading.html", STRIP
     (ACS, None),                         # 3-D Secure never finishes
     (PSP_TOP, None),                     # top document on a payment provider
     (CARD_AGAIN, None),
+    # Codex P2: a replacement card frame on a default provider at another path, and any other provider frame
+    ((CONFIRM[0], ("CARD2", "LZ", STRIPE + "/v3/elements-inner-cvc-77.html", STRIPE, "TOP")), None),
+    ((CONFIRM[0], ("DT", "LD", "https://pay.datatrans.com/upp/payment/x", "https://pay.datatrans.com", "TOP")), None),
+    ((CONFIRM[0], ("FAKE", "LF", STRIPE + "/v3/controller-x.html/../card.html", STRIPE, "TOP")), None),
     (OLD_CARD, None),
     (SAME_DOC_CARD, None),
     (CONFIRM, {"card_fields": 1}),       # card inputs on the page
@@ -206,6 +221,8 @@ def test_lock_released_only_when_status_proves_it(status, released):
     out = done.payment_done(sup)
     assert out["success"] is True and out["payment_tab_closed"] is True and out["lock_released"] is released
     assert ("note" in out) is (not released)
+    # following the new tab installs the dialog bridge: only once the slot is proven unlocked
+    assert bool(sup.sent("attach_page")) is released
 
 
 def test_single_page_shop_confirmation_once_the_card_frames_are_gone():
@@ -231,23 +248,41 @@ def test_new_tab_failure_never_closes_the_payment_tab():
     assert not sup.sent("Target.closeTarget")
 
 
-@pytest.mark.parametrize("origin", ["http://shop.test", "https://shop.test/", STRIPE, "https://pay.datatrans.com",
-                                    "shop.test"])
-def test_expected_origin_must_be_a_canonical_shop_origin(origin):
-    sup = _paid([CONFIRM])
+HPP = "https://payments.worldpay.com"  # a provider's own hosted payment page as the checkout tab
+TICKETS = "https://tickets.example.test"
+TICKET_PAGE = (("TOP", "L3", TICKETS + "/order/77", TICKETS, ""),)
+
+
+def _paid_on_provider_page(trees):
+    sup = FakeSup(trees)
+    tree = (("TOP", "L0", HPP + "/app/hpp/pay", HPP, ""),)
+    done.record_payment(sup, SimpleNamespace(page_id="TAB", merchant_origin=HPP, tree=tree, unreviewed_origins=(),
+                                             documents=(SimpleNamespace(frame_id="TOP", origin=HPP),)))
+    sup.snapshot.update(url=TICKETS + "/order/77", origin=TICKETS)
+    return sup
+
+
+@pytest.mark.parametrize("origin", ["", "http://tickets.example.test", "https://tickets.example.test/", STRIPE,
+                                    "https://pay.datatrans.com", HPP, "tickets.example.test"])
+def test_expected_origin_is_required_and_strict_on_a_provider_page_checkout(origin):
+    sup = _paid_on_provider_page([TICKET_PAGE])
     assert done.payment_done(sup, origin)["error_type"] == "payment_done_origin_invalid"
     assert not sup.calls
+    sup = _paid_on_provider_page([TICKET_PAGE])
+    assert done.payment_done(sup, TICKETS)["success"] is True
 
 
-def test_confirmation_on_the_named_origin():
-    other = "https://tickets.example.test"
-    page = ((("TOP", "L3", other + "/order/77", other, ""),))
-    sup = _paid([page])
-    sup.snapshot.update(url=other + "/order/77", origin=other)
-    assert done.payment_done(sup)["error_type"] == "payment_confirmation_not_reached"
-    sup = _paid([page])
-    sup.snapshot.update(url=other + "/order/77", origin=other)
-    assert done.payment_done(sup, other)["success"] is True
+@pytest.mark.parametrize("origin", [TICKETS, "https://acs.bank.test", "not an origin"])
+def test_expected_origin_is_ignored_on_a_shop_checkout_and_says_so(origin):
+    # a stable bank (3-D Secure) page must never qualify because the agent named its origin
+    sup = _paid([ACS])
+    out = done.payment_done(sup, origin)
+    assert out["error_type"] == "payment_confirmation_not_reached" and out["expected_origin_ignored"] is True
+    assert not sup.sent("Runtime.evaluate")
+    sup = _paid([CONFIRM])
+    out = done.payment_done(sup, origin)
+    assert out["success"] is True and out["expected_origin_ignored"] is True and "ignored" in out["expected_origin_note"]
+    assert "expected_origin_ignored" not in done.payment_done(_paid([CONFIRM]))
 
 
 def test_tab_gone_is_typed_and_checks_the_lock():
@@ -326,9 +361,12 @@ def _top_controls(sup):
     return surface.payment_controls(sup)  # the fake serves the next tree to _payment_tree
 
 
-def _top_ref(tree):
-    """The ref the payment tab's top document gets (bound to its loader), as opposed to a card document's."""
-    return surface._ref(f"{tree[0][0]}|{tree[0][1]}", 0, "button", "Pay 22.66 EUR")
+def _top_ref(sup, tree):
+    """The ref the latest listing gave the payment tab's top document (its key: frame id + loader), or None."""
+    with surface._LOCK:
+        issued = dict(surface._ISSUED.get(sup) or {})
+    refs = [ref for ref, spec in issued.items() if spec[0] == f"{tree[0][0]}|{tree[0][1]}"]
+    return refs[0] if refs else None
 
 
 @pytest.mark.parametrize("tree", [CHECKOUT, ACS])  # the merchant checkout, a 3-D Secure redirect page
@@ -336,10 +374,11 @@ def test_locked_payment_tab_top_document_is_listed_and_clicked_natively(tree):
     sup = _paid([tree])
     out = _top_controls(sup)
     assert out["success"] is True
-    assert {"ref": _top_ref(tree), "role": "button", "text": "Pay 22.66 EUR", "disabled": False} in out["controls"]
+    ref = _top_ref(sup, tree)
+    assert {"ref": ref, "role": "button", "text": "Pay 22.66 EUR", "disabled": False} in out["controls"]
     worlds = [c for c in sup.sent("Page.createIsolatedWorld") if c[1]["frameId"] == "TOP"]
     assert len(worlds) == 1 and worlds[0][2] == "S-page"
-    assert surface.payment_click(sup, _top_ref(tree))["success"] is True
+    assert surface.payment_click(sup, ref)["success"] is True
     assert [c[1]["type"] for c in sup.sent("Input.dispatchMouseEvent")] == [
         "mouseMoved", "mousePressed", "mouseReleased"]
     assert {c[2] for c in sup.sent("Input.dispatchMouseEvent")} == {"S-page"}
@@ -352,8 +391,11 @@ def test_locked_payment_tab_top_document_is_listed_and_clicked_natively(tree):
 ])
 def test_top_document_never_offered_when_it_is_a_card_frame(tree, merchant_fields, recorded):
     sup = _paid([tree], merchant_fields=merchant_fields) if recorded else FakeSup([tree])
-    out = _top_controls(sup)
-    assert _top_ref(tree) not in [c["ref"] for c in out.get("controls", [])]
+    _top_controls(sup)
+    # never listed as the payment tab's own page (the wide lister); a card document stays a card document
+    assert not [c for c in sup.sent("Runtime.evaluate") if c[1]["expression"] == surface._TOP_LISTER]
+    if not merchant_fields:
+        assert _top_ref(sup, tree) is None
     if not merchant_fields:  # nothing at all is read on a provider page or without a recorded payment
         assert not sup.sent("Page.createIsolatedWorld")
     assert not sup.sent("Input.dispatchMouseEvent")
@@ -361,8 +403,42 @@ def test_top_document_never_offered_when_it_is_a_card_frame(tree, merchant_field
 
 def test_a_top_document_ref_dies_with_its_document():
     sup = _paid([CHECKOUT])
-    ref = _top_ref(CHECKOUT)
-    assert ref in [c["ref"] for c in _top_controls(sup)["controls"]]
+    _top_controls(sup)
+    ref = _top_ref(sup, CHECKOUT)
+    assert ref is not None
     sup.trees = [(("TOP", "L5", SHOP + "/checkout", SHOP, ""),)]  # navigated: same frame and text, new document
     assert surface.payment_click(sup, ref)["error_type"] == "payment_control_unknown"
     assert not sup.sent("Input.dispatchMouseEvent")
+
+
+_SCAN_HARNESS = r"""
+const T = (data) => ({nodeType: 3, data});
+const E = (tag, kids = [], o = {}) => Object.assign({nodeType: 1, tagName: tag, childNodes: kids, attrs: {},
+  style: {display: 'block', visibility: 'visible'}, getAttribute(n) { return this.attrs[n] ?? null; }}, o);
+const all = (root) => root.childNodes.flatMap((n) => n.nodeType === 1 ? [n, ...all(n)] : []);
+const shadow = (kids) => { const r = {nodeType: 11, childNodes: kids}; r.querySelectorAll = () => all(r); return r; };
+const card = E('INPUT', [], {attrs: {autocomplete: 'cc-number'}});
+const inner = E('DIV', [], {shadowRoot: shadow([E('SPAN', [T('Card')]), card])});
+const host = E('PAYMENT-ELEMENT', [], {shadowRoot: shadow([inner])});  // nested open shadow roots
+const body = E('BODY', [E('H1', [T('Thanks')]), host]);
+const document = {title: 'x', readyState: 'complete', body,
+  querySelectorAll: (sel) => sel.includes('a[href]') ? [] : all(body)};
+const location = {href: 'https://shop.test/thanks', origin: 'https://shop.test'};
+const getComputedStyle = (el) => el.style;
+process.stdout.write(JSON.stringify(SNAPSHOT));
+"""
+
+
+@pytest.mark.parametrize("bound, expected", [(None, 1), (3, -1)])
+def test_card_scan_reaches_open_shadow_roots_and_refuses_past_its_bound(bound, expected):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for the synthetic page")
+    script = done.SNAPSHOT_JS if bound is None else done.SNAPSHOT_JS.replace(f"> {done.MAX_SCAN})", f"> {bound})")
+    assert bound is None or script != done.SNAPSHOT_JS
+    run = subprocess.run([node], input=_SCAN_HARNESS.replace("SNAPSHOT", script), text=True, capture_output=True,
+                         timeout=10, check=False)
+    assert run.returncode == 0, run.stderr
+    out = json.loads(run.stdout)
+    assert out["card_fields"] == expected  # 1: found inside two shadow roots; -1: scan bound hit
+    assert done._valid_snapshot(out, "https://shop.test") is None  # either way: never a safe document

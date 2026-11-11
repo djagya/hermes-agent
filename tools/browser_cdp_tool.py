@@ -385,6 +385,44 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
                        "result": result_msg.get("result", {})}, ensure_ascii=False)
 
 
+def _payment_answer(task_id: str, method: str, params: Any, *, routed: bool) -> Optional[str]:
+    """dlz: what a card payment decides before any route: capture methods refused while a payment mark exists
+    (raw CDP cannot name an authoritative slot; tools/browser_payment_privacy.py), and on a locked managed
+    slot the lease-bound recovery calls. None = continue on the usual path."""
+    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
+
+    if method in _CAPTURE_METHODS and payment_session_sensitive(task_id):
+        return json.dumps(screenshot_refusal())
+    return None if routed else _locked_recovery(task_id, method, params)
+
+
+_CAPTURE_METHODS = frozenset({"Page.captureScreenshot", "Page.printToPDF", "Page.startScreencast",
+                              "Page.captureSnapshot"})
+
+
+def _locked_recovery(task_id: str, method: str, params: Any) -> Optional[str]:
+    """dlz (payment lockdown): on a managed browser whose slot is locked for a card payment, the lease-bound
+    recovery calls (list tabs by site, close a tab) go over the native supervisor; None = the usual path
+    (which refuses raw CDP on a managed browser)."""
+    from tools import browser_payment_surface as pay
+
+    if method not in pay.RECOVERY_METHODS:
+        return None
+    from tools.browser_session_cdp import managed_browser
+
+    if not managed_browser():
+        return None
+    from tools import browser_vault_tool as vault
+
+    try:
+        supervisor = vault._managed_supervisor(task_id, admit=True)  # control confirms this task's lease
+    except Exception:  # health: allow BLE001 -- no lease, no supervisor: the usual refusal applies
+        return None
+    if supervisor is None or not pay.slot_locked(supervisor):
+        return None
+    return json.dumps(pay.recovery_call(supervisor, method, params), ensure_ascii=False)
+
+
 def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id: Optional[str] = None,
                 frame_id: Optional[str] = None, timeout: float = 30.0, task_id: Optional[str] = None) -> str:
     """Send a raw CDP command (see ``CDP_DOCS_URL``). ``target_id`` attaches a fresh stateless connection
@@ -394,13 +432,9 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     ``{"success": True, "method", "result"}`` or ``{"error": ...}``."""
     effective_task_id = task_id or "default"
 
-    # dlz: after a card fill, capture methods are refused while any payment mark exists (raw CDP cannot
-    # name an authoritative slot; tools/browser_payment_privacy.py).
-    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
-
-    if payment_session_sensitive(effective_task_id) and method in {
-            "Page.captureScreenshot", "Page.printToPDF", "Page.startScreencast", "Page.captureSnapshot"}:
-        return json.dumps(screenshot_refusal())
+    answered = _payment_answer(effective_task_id, method, params, routed=bool(frame_id or target_id))
+    if answered is not None:
+        return answered
 
     from tools.browser_control_route import ManagedBrowserError
 
@@ -453,6 +487,8 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     except RuntimeError as exc:
         if "payment_screenshot_blocked" in str(exc):
             # browser-control's capture guard refused the method on a card-filled slot.
+            from tools.browser_payment_privacy import screenshot_refusal
+
             return json.dumps(screenshot_refusal())
         if "payment_surface_locked" in str(exc):
             # dlz: browser-control refused the command: the slot is locked for a card payment.

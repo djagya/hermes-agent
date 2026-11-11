@@ -886,10 +886,12 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
 
         return fill_payment(backend, meta, effective_task_id, merchant_origin, cart=cart,
                             approve_origins=approve_origins)
-    locked = _payment_lock_refusal(effective_task_id)  # dlz: a login/address fill reads and writes the page
-    if locked:
-        return locked
+    # dlz (payment lockdown): a login/address fill reads and writes the page.
+    return _outside_payment_lock(effective_task_id, lambda: _fill_non_card(backend, handle, meta, effective_task_id,
+                                                                           purpose))
 
+
+def _fill_non_card(backend: Any, handle: str, meta: Any, effective_task_id: str, purpose: str) -> str:
     # Origin binding pre-check (the authoritative re-check runs inside the fill script), before the
     # backend's fill_context is entered and before any value is resolved.
     page_origin = _bound_page_origin(effective_task_id, meta, meta.kind)
@@ -1296,19 +1298,22 @@ BROWSER_VAULT_SCHEMA = {
         "written; stop and tell the "
         "user. A card fill locks the whole browser until the payment tab is closed: every other browser "
         "action, page read, script, screenshot, dialog answer and login fill returns payment_surface_locked; "
-        "you can still list tabs (browser_cdp Target.getTargets / Target.getTargetInfo, no frame_id: each tab's "
-        "site (origin) only, no title) and close one (Target.closeTarget); payment_done waits for and reads the "
+        "you can still list tabs (browser_cdp Target.getTargets, no params: each tab's site (origin) only, no "
+        "title) and close one (browser_cdp Target.closeTarget {targetId}; closing the payment tab ends the lock "
+        "without a confirmation snapshot); payment_done waits for and reads the "
         "confirmation natively. Continue with the native actions: payment_controls lists "
         "the buttons, links and checkboxes ({ref, role, text, disabled}; never inputs, digits masked) of the "
         "card frames and of the payment tab's own page (the merchant checkout, or a bank's 3-D Secure page it "
         "was redirected to) unless that page is a card form; payment_click (ref) makes one trusted click on a "
-        "listed control, so the Pay button is clicked there; refs die when the page changes, list again. "
+        "listed control, so the Pay button is clicked there; refs die when the page changes, when you list again, and after one press (successful or uncertain): "
+        "a second press needs a new payment_controls. "
         "The user's chat "
         "go for the purchase covers pressing Pay once; never click Pay without it, never click it again when "
         "payment_click_uncertain says a press may have landed. On 3-D Secure or redirect pages, normally just "
         "wait and call payment_done; click a bank page only when it asks for a button and the user agreed. "
         "After pressing Pay, call payment_done once; it is what ends the lock: it waits up to 120 s (through 3-D Secure and payment-provider pages) for the order "
-        "confirmation on the shop's origin (expected_origin when the confirmation shows on another site), then "
+        "confirmation on the checkout's origin (expected_origin only when the checkout ran on a payment provider's own "
+        "page), then "
         "returns its url, title, visible text and http(s) links (never field values or screenshots), opens it in a "
         "new tab (new_tab) and closes the payment tab; lock_released true means browser control confirmed the "
         "unlock, false (with note) means it did not, so follow the note. payment_confirmation_not_reached: no "
@@ -1361,7 +1366,7 @@ BROWSER_VAULT_SCHEMA = {
                                     "Never put a password or other long-lived secret here."},
             "expected_origin": {"type": "string",
                                 "description": "Mandatory with code: the page's origin (scheme://host[:port]). The fill is refused unless it matches exactly. "
-                                               "payment_done only (optional): the shop's HTTPS origin where the order confirmation shows, when it is not the checkout's origin."},
+                                               "payment_done only: the shop's HTTPS origin, needed (and honoured) only when the checkout ran on a payment provider's own page; otherwise ignored (the result says so)."},
             "backend": {"type": "string", "enum": ["onepassword", "bitwarden"], "description": "unlock only."},
             "label": {"type": "string", "description": "save_login only: short site name (default: the host)."},
         },
@@ -1411,6 +1416,19 @@ def _payment_lock_refusal(task_id: Optional[str]) -> Optional[str]:
     return json.dumps(refused) if refused else None
 
 
+def _outside_payment_lock(task_id: Optional[str], op) -> str:
+    """dlz (payment lockdown): run a non-card page operation only while no card payment locks the slot; its
+    whole payload (success or error) is withheld when a claim started while it ran (the epoch moved)."""
+    from tools import browser_payment_surface as pay
+
+    before = pay.epoch()
+    refused = _payment_lock_refusal(task_id)
+    if refused:
+        return refused
+    out = op()
+    return json.dumps(pay.locked_withheld()) if pay.epoch() != before else out
+
+
 def _payment_surface_action(task_id: Optional[str], ref: Optional[str]) -> str:
     """dlz: native actions on a locked payment tab (managed browser only)."""
     from tools import browser_payment_surface as surface
@@ -1450,17 +1468,18 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
                                            purpose=str(args.get("purpose") or "login"),
                                            # dlz (Track B): card fills only; passed only when given.
                                            **{k: args[k] for k in ("cart", "approve_origins") if k in args}),
-        "save_login": lambda: _payment_lock_refusal(tid) or browser_vault_save_login(label=label, task_id=tid),
-        "enter_code": lambda: _payment_lock_refusal(tid) or browser_vault_enter_code(
+        "save_login": lambda: _outside_payment_lock(tid, lambda: browser_vault_save_login(label=label, task_id=tid)),
+        "enter_code": lambda: _outside_payment_lock(tid, lambda: browser_vault_enter_code(
             handle=handle, task_id=tid, code=str(args.get("code") or ""),
-            expected_origin=str(args.get("expected_origin") or "")),
-        "letter_login": lambda: _payment_lock_refusal(tid) or browser_vault_letter_login(
+            expected_origin=str(args.get("expected_origin") or ""))),
+        "letter_login": lambda: _outside_payment_lock(tid, lambda: browser_vault_letter_login(
             handle, task_id=tid, secret_field=str(args.get("secret_field") or ""),
             identifier_field=str(args.get("identifier_field") or ""),
             expected_origin=str(args.get("expected_origin") or ""),
             after_failed_login=args.get("after_failed_login") is True,
-            session_expired=args.get("session_expired") is True),
-        "letter_signed_in": lambda: _payment_lock_refusal(tid) or browser_vault_letter_signed_in(handle, task_id=tid),
+            session_expired=args.get("session_expired") is True)),
+        "letter_signed_in": lambda: _outside_payment_lock(
+            tid, lambda: browser_vault_letter_signed_in(handle, task_id=tid)),
         "payment_controls": lambda: _payment_surface_action(tid, None),
         "payment_click": lambda: _payment_surface_action(tid, str(args.get("ref") or "")),
         "payment_done": lambda: _payment_done_action(tid, str(args.get("expected_origin") or "")),

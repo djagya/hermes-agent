@@ -162,6 +162,17 @@ class DialogSupervisionMixin:
         except Exception as e:
             logger.debug("%s failed (%s): %s", method, what, e)
 
+    def _payment_locked(self) -> bool:
+        """dlz (payment lockdown): while a card payment locks the slot, dialog automation stands down: no tab
+        watching, no automatic or watchdog answer (a held dialog waits for the user). Local state only: this
+        runs on the loop and cannot wait for control's status."""
+        try:
+            from tools.browser_payment_surface import locally_locked
+
+            return locally_locked(self)
+        except Exception:  # health: allow BLE001 -- unknown lock state: stand down (fail closed)
+            return True
+
     async def _install_dialog_bridge(self, session_id: str) -> None:
         """Install the dialog-bridge init script + Fetch interceptor on a session. Idempotent at
         the CDP level (Chromium de-dupes identical add-script calls; Fetch.enable replaces prior
@@ -260,7 +271,8 @@ class DialogSupervisionMixin:
             frame_id=frame_id, bridge_request_id=bridge_request_id, url=self._dialog_page_url(frame_id, url),
             top_url=self._dialog_top_url(session_id),
         )
-        auto = self._decide_dialog(dialog)
+        locked = self._payment_locked()
+        auto = None if locked else self._decide_dialog(dialog)
         if auto is not None:
             with self._state_lock:
                 self._archive_dialog_locked(dialog, "auto_policy", action="accept" if auto[0] else "dismiss")
@@ -268,9 +280,12 @@ class DialogSupervisionMixin:
             return
         with self._state_lock:
             self._pending_dialogs[dialog.id] = dialog
-        self._dialog_watchdogs[dialog.id] = asyncio.get_running_loop().call_later(
+        self._arm_dialog_watchdog(dialog.id)
+
+    def _arm_dialog_watchdog(self, dialog_id: str) -> None:
+        self._dialog_watchdogs[dialog_id] = asyncio.get_running_loop().call_later(
             self.dialog_timeout_s,
-            lambda: asyncio.create_task(self._dialog_timeout_expired(dialog.id)),
+            lambda: asyncio.create_task(self._dialog_timeout_expired(dialog_id)),
         )
 
     # ── Responding ───────────────────────────────────────────────────────────
@@ -316,6 +331,9 @@ class DialogSupervisionMixin:
         with self._state_lock:
             dialog = self._pending_dialogs.get(dialog_id)
         if dialog is None:
+            return
+        if self._payment_locked():  # no watchdog answer on a locked slot: look again after another period
+            self._arm_dialog_watchdog(dialog_id)
             return
         logger.warning("CDP supervisor %s: dialog %s (%s) auto-dismissed after %ss timeout",
                        self.task_id, dialog_id, dialog.type, self.dialog_timeout_s)
@@ -411,6 +429,8 @@ class DialogSupervisionMixin:
         tabs = self._dialog_tabs()
         if not target_id or target_id in tabs or target_id == getattr(self, "_main_page_target", None):
             return
+        if self._payment_locked():  # no attach (a session-scoped native connection) on a locked slot
+            return
         tabs[target_id] = ""  # reserved before the await: a concurrent caller sees it and returns
         if url:
             self._dialog_tab_urls()[target_id] = url
@@ -427,6 +447,8 @@ class DialogSupervisionMixin:
         await self._install_dialog_bridge(sid)
 
     async def _watch_dialog_tabs(self) -> int:
+        if self._payment_locked():
+            return len(self._dialog_tabs())
         await self._cdp_quiet("Target.setDiscoverTargets", {"discover": True}, session_id=None,
                               timeout=3.0, what="dialog tab discovery")
         self._watch_new_tabs = True

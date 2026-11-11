@@ -21,8 +21,9 @@ CONTRACT_PATH = ROOT / "tests/fixtures/browser_control/control-v1.json"
 # monolith chore/v0230-phaseb-mono-20261109 after merging fix-handback (durable handback event_id,
 # /v1/handback/pending per wake, handback_not_saved) and pay-a3-surface (A9 cdp_methods,
 # capture-guard view payment_surface), 2026-11-10; feat/pay-lockdown-20261111 @ 2f9f1f8031 (slot lockdown:
-# claim {tabs}, status {locked, native, tabs, unverified}, locked.commands), 2026-11-11
-CONTRACT_SHA256 = "0bd9136988f27525f059c1e12ad1f0400fbd0c2713e0066e678bb1c11fff1e07"
+# claim {tabs}, status {locked, native, tabs, unverified}, locked.commands; dbcfa2a404: origin-only target
+# info for locked clients), 2026-11-11
+CONTRACT_SHA256 = "28d501257c43fc7061aa632c3bc17d5dd6d3a84e63fc302044f1a32079fc830b"
 # The body the fork's handback route reads for B10, as declared by control-v1.
 HANDOFF_ENDED_BODY = ["event", "session_id", "slot_id", "lease_id", "reason_code", "event_id"]
 

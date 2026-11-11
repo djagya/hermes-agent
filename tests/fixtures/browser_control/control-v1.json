@@ -808,7 +808,7 @@
       "body": [
         "?tok="
       ],
-      "reply": "Chrome /json/list rewritten onto the gate",
+      "reply": "Chrome /json/list rewritten onto the gate, each row only id, type, url, title, webSocketDebuggerUrl (while the payment lock holds: title \"\", url its origin)",
       "errors": [
         "lease_ended",
         "token_not_current",
@@ -917,7 +917,7 @@
     "methods": {
       "Hermes.claimPaymentSurface": {
         "params": "tabs [targetId, 1..8]: the top-level page targets holding the card documents (each must be a live page target); no other key",
-        "result": "claimed=true, locked=true, tabs (the slot's whole owning-tab set)",
+        "result": "claimed=true, locked=true, tabs (the slot's whole owning set: each claimed page target and, when Chrome lists tab-type targets, the tab target holding it)",
         "errors": [
           "payment_surface_unavailable"
         ],
@@ -948,7 +948,7 @@
         "Target.targetInfoChanged",
         "Target.targetCrashed"
       ],
-      "rules": "while a slot is locked every non-native connection may send only these commands (exact names) with no sessionId, and receives only these events (no sessionId) and the replies to its own allowed commands; a non-native connection opened before the latest claim is closed; the native connection is not filtered (the runtime gates the model commands it relays on it); Hermes.* methods are answered on every connection"
+      "rules": "while a slot is locked every non-native connection may send only these commands (exact names) with no sessionId, and receives only these events (no sessionId) and the replies to its own allowed commands, rebuilt from allowlisted fields (target info: targetId, type, attached, browserContextId, url as scheme://host[:port] or \"\", title \"\"; closeTarget: success; getVersion: its version strings; errors: code, message); a non-native connection opened before the latest claim is closed; the native connection is not filtered (the runtime gates the model commands it relays on it); Hermes.* methods are answered on every connection"
     },
     "releases": "every owning tab destroyed: Target.targetDestroyed seen by control's own watcher and the tab absent from a Target.getTargets read after it; a temporary-profile wipe; a human POST /v1/capture-guard/clear; never navigation, reload, a crash or a controller-key route; a restart keeps the lock"
   }

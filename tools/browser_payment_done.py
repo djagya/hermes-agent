@@ -5,7 +5,7 @@ connection until each owning payment tab is destroyed. ``browser_vault action=pa
 runtime's way out after the Pay click, on the supervisor's own (native) socket:
 
 1. Wait, bounded, for the payment tab's top document to be a new document on the shop's origin
-   (the checkout's merchant, or ``expected_origin``) that is not a payment-provider or approved
+   (the checkout's merchant; ``expected_origin`` only when the checkout ran on a provider's own page) that is not a payment-provider or approved
    card origin, with none of this payment's card documents and no card-field frame in its tree,
    fully loaded and unchanged over two polls. Payment-provider and 3-D Secure pages in between are
    waited through. A single-page shop's checkout document counts too once it never held a card
@@ -54,6 +54,8 @@ MAX_LINK_TEXT = 200
 MAX_TITLE = 300
 MAX_URL = 8192
 MAX_LINK_URL = 2048
+MAX_SCAN = 50_000  # elements the card-input scan visits (shadow roots included) before it refuses
+MAX_SHADOW_DEPTH = 16
 _ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 
@@ -66,7 +68,6 @@ class _Payment:
     loader: str  # the top document's loader when the card was claimed
     documents: frozenset  # (frame id, loader) of each card document
     receiving: frozenset  # non-merchant origins that received card fields (reviewed or owner-approved)
-    paths: frozenset  # (origin, path) of those card documents
     merchant_fields: bool = False  # the merchant document itself received card fields
 
     @property
@@ -105,7 +106,6 @@ def record_payment(supervisor: Any, inspected: Any) -> None:
     refuses with ``payment_done_no_payment``)."""
     try:
         tree, merchant = tuple(inspected.tree), inspected.merchant_origin
-        urls = {row[0]: row[2] for row in tree}
         loaders = {row[0]: row[1] for row in tree}
         docs = tuple(inspected.documents)
         hosted = [d for d in docs if d.origin != merchant]
@@ -116,7 +116,6 @@ def record_payment(supervisor: Any, inspected: Any) -> None:
             documents=frozenset((d.frame_id, loaders.get(d.frame_id, "")) for d in docs),
             receiving=frozenset(d.origin for d in hosted)
             | frozenset(getattr(inspected, "unreviewed_origins", ()) or ()),
-            paths=frozenset((d.origin, urlsplit(urls.get(d.frame_id, "")).path) for d in hosted),
             merchant_fields=len(hosted) != len(docs),
         )
         if not (_valid_id(payment.tab) and isinstance(payment.loader, str) and payment.loader):
@@ -129,8 +128,7 @@ def record_payment(supervisor: Any, inspected: Any) -> None:
         old = tabs.get(payment.tab)
         if old is not None:  # a second fill on the same tab: every card document of both counts
             payment = _Payment(payment.tab, payment.merchant, payment.loader, old.documents | payment.documents,
-                               old.receiving | payment.receiving, old.paths | payment.paths,
-                               old.merchant_fields or payment.merchant_fields)
+                               old.receiving | payment.receiving, old.merchant_fields or payment.merchant_fields)
         tabs[payment.tab] = payment
 
 
@@ -148,21 +146,30 @@ def _card_origins(payment: _Payment) -> frozenset:
     return frozenset(registry) | payment.receiving
 
 
+# Provider frames known to hold no card field (exact origin, full path match). Any other frame on a card
+# origin counts as a card frame: an unknown provider frame fails closed.
+_HARMLESS_FRAMES = {
+    # Stripe.js's hidden controller and metrics frames, present on many shop pages that load Stripe.js
+    "https://js.stripe.com": re.compile(r"/v3/(controller|controller-with-preconnect|m-outer)-[A-Za-z0-9]{1,64}\.html"),
+}
+
+
+def _harmless(origin: str, url: Any) -> bool:
+    pattern = _HARMLESS_FRAMES.get(origin)
+    if pattern is None or _url_origin(url) != origin:
+        return False
+    return bool(pattern.fullmatch(urlsplit(url).path))
+
+
 def _card_frame(row: tuple, payment: _Payment) -> bool:
-    """A frame that is (or can be) a card document: one of this payment's own card documents, a
-    document at the same origin and path as one of them, or a provider's declared card-field path.
-    A provider's other frames (Stripe.js's hidden controller, for one) hold no card field."""
+    """A frame that is (or can be) a card document: one of this payment's own card documents, or any frame
+    on a card origin (every reviewed or unsupported provider, and the origins that received card fields in
+    this payment) unless it is a known harmless provider frame (``_HARMLESS_FRAMES``)."""
     fid, loader, url, origin = row[0], row[1], row[2], row[3]
     if (fid, loader) in payment.documents:
         return True
-    path = urlsplit(url).path if isinstance(url, str) else ""
-    for o in {origin, _url_origin(url)} - {""}:
-        if (o, path) in payment.paths:
-            return True
-        provider = provider_for_origin(o)
-        if provider is not None and provider.paths and provider.admits(url):
-            return True
-    return False
+    card = _card_origins(payment)
+    return any(o in card and not _harmless(o, url) for o in {origin, _url_origin(url)} - {""})
 
 
 def _safe_top(tree: tuple, payment: _Payment, expected: str) -> bool:
@@ -226,12 +233,23 @@ SNAPSHOT_JS = r"""(() => {
   };
   const CARD_AC = /(^|\s)cc-(number|csc|exp|exp-month|exp-year)(\s|$)/i;
   const CARD_NAME = /card[-_ ]?number|cc[-_ ]?num|(^|[^a-z])(cvc|cvv|csc)([^a-z]|$)/i;
-  let cardFields = 0;
-  for (const el of document.querySelectorAll('input, select')) {
-    const ac = String(el.getAttribute('autocomplete') || '');
-    const named = String(el.getAttribute('name') || '') + ' ' + String(el.getAttribute('id') || '');
-    if (CARD_AC.test(ac) || CARD_NAME.test(named)) cardFields++;
-  }
+  // Card-like inputs anywhere in the document, open shadow roots included; past the bound -1 (refused).
+  let cardFields = 0, scanned = 0;
+  const scan = (root, depth) => {
+    if (depth > %MAX_SHADOW_DEPTH%) { cardFields = -1; return; }
+    for (const el of root.querySelectorAll('*')) {
+      if (cardFields < 0) return;
+      if (++scanned > %MAX_SCAN%) { cardFields = -1; return; }
+      const tag = String(el.tagName).toUpperCase();
+      if (tag === 'INPUT' || tag === 'SELECT') {
+        const ac = String(el.getAttribute('autocomplete') || '');
+        const named = String(el.getAttribute('name') || '') + ' ' + String(el.getAttribute('id') || '');
+        if (CARD_AC.test(ac) || CARD_NAME.test(named)) cardFields++;
+      }
+      if (el.shadowRoot) scan(el.shadowRoot, depth + 1);
+    }
+  };
+  scan(document, 0);
   const links = []; const seen = new Set(); let linksCut = false;
   for (const a of document.querySelectorAll('a[href], area[href]')) {
     if (links.length >= MAX_LINKS) { linksCut = true; break; }
@@ -254,7 +272,8 @@ SNAPSHOT_JS = r"""(() => {
           text: page.text, text_truncated: page.cut, links, links_truncated: linksCut, card_fields: cardFields};
 })()"""
 for _name, _value in (("MAX_TEXT", MAX_TEXT), ("MAX_LINKS", MAX_LINKS), ("MAX_LINK_TEXT", MAX_LINK_TEXT),
-                      ("MAX_TITLE", MAX_TITLE), ("MAX_LINK_URL", MAX_LINK_URL)):
+                      ("MAX_TITLE", MAX_TITLE), ("MAX_LINK_URL", MAX_LINK_URL), ("MAX_SCAN", MAX_SCAN),
+                      ("MAX_SHADOW_DEPTH", MAX_SHADOW_DEPTH)):
     SNAPSHOT_JS = SNAPSHOT_JS.replace(f"%{_name}%", str(_value))
 
 _SNAPSHOT_KEYS = frozenset({"title", "url", "origin", "ready", "text", "text_truncated", "links",
@@ -341,12 +360,14 @@ _ORIGIN_REQUIRED = ("This checkout ran on a payment provider's own page, so the 
 _NOT_REACHED = ("No order confirmation was reached on the payment tab within the wait: it still shows a checkout, "
                 "payment provider or bank (3-D Secure) page, a page on another site, or a page that is still "
                 "loading. The browser stays locked; nothing was clicked, closed or retried. Do not press Pay again. "
-                "url shows the site the tab is on (origin only while locked). If a bank check is waiting, ask the user to finish it, then "
-                "call payment_done again; if the confirmation is on another site, call payment_done with "
-                "expected_origin set to that site's origin; otherwise ask the user.")
+                "url shows the site the tab is on (origin only while locked). If a bank check is waiting, ask the "
+                "user to finish it, then call payment_done again; otherwise ask the user (closing the payment tab "
+                "with browser_cdp Target.closeTarget also ends the lock, without a snapshot).")
 _TAB_GONE = ("The payment tab is no longer open, so there is no confirmation page to read. Nothing was done. "
              "lock_released says whether browser control has unlocked the browser; check the order with the "
              "shop or the user's email.")
+_IGNORED = ("expected_origin was ignored: it applies only when the checkout ran on a payment provider's own page. "
+            "The confirmation was looked for on the checkout's own origin.")
 _NO_NEW_TAB = ("The confirmation was read, but a new tab could not be opened, so the payment tab was left open and "
                "the browser stays locked. Use text and links; close the payment tab or ask the user to end the lock.")
 _CLOSE_FAILED = ("The confirmation was read and a new tab opened, but closing the payment tab failed, and browser "
@@ -365,18 +386,21 @@ def _payment_for(supervisor: Any) -> tuple[Optional[_Payment], Optional[dict]]:
     return next(iter(tabs.values())), None
 
 
-def _expected(payment: _Payment, expected_origin: str) -> tuple[str, Optional[dict]]:
-    if expected_origin:
-        try:
-            expected = https_origin(expected_origin)
-        except PaymentPolicyError:
-            return "", _refusal("payment_done_origin_invalid", _ORIGIN_INVALID)
-        if expected in _card_origins(payment):
-            return "", _refusal("payment_done_origin_invalid", _ORIGIN_INVALID)
-        return expected, None
-    if payment.merchant in _card_origins(payment):
-        return "", _refusal("payment_done_origin_invalid", _ORIGIN_REQUIRED)
-    return payment.merchant, None
+def _expected(payment: _Payment, expected_origin: str) -> tuple[str, Optional[dict], bool]:
+    """``(origin the confirmation must be on, refusal, expected_origin ignored)``. ``expected_origin`` is
+    honoured only when the checkout itself ran on a payment provider's page (its merchant origin is a card
+    origin), the one case where the shop's origin is unknown; otherwise the merchant's origin stands."""
+    if payment.merchant not in _card_origins(payment):
+        return payment.merchant, None, bool(expected_origin)
+    if not expected_origin:
+        return "", _refusal("payment_done_origin_invalid", _ORIGIN_REQUIRED), False
+    try:
+        expected = https_origin(expected_origin)
+    except PaymentPolicyError:
+        return "", _refusal("payment_done_origin_invalid", _ORIGIN_INVALID), False
+    if expected in _card_origins(payment):
+        return "", _refusal("payment_done_origin_invalid", _ORIGIN_INVALID), False
+    return expected, None, False
 
 
 def _bounded(value: Any, limit: int) -> str:
@@ -496,9 +520,11 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     payment, refused = _payment_for(supervisor)
     if refused:
         return refused
-    expected, refused = _expected(payment, expected_origin)
+    expected, refused, ignored = _expected(payment, expected_origin)
     if refused:
         return refused
+    # Said in every result below: the checkout's own origin decided, not expected_origin.
+    told = {"expected_origin_ignored": True, "expected_origin_note": _IGNORED} if ignored else {}
     deadline = time.monotonic() + _WAIT_S
     previous: Optional[tuple] = None
     seen: dict = {}
@@ -526,9 +552,9 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
         # The tab is still locked: like browser-control for every agent connection, report its site only
         # (a locked page's title and path could carry what a planted script copied there).
         return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=_url_origin(seen.get("url", "")),
-                        title="", lock_released=False)
+                        title="", lock_released=False, **told)
     context = page.pop("browser_context", None)
-    result = {"success": True, **page, "new_tab": None, "payment_tab_closed": False, "lock_released": False}
+    result = {"success": True, **page, "new_tab": None, "payment_tab_closed": False, "lock_released": False, **told}
     try:  # the new tab first: the payment tab is closed only once the confirmation has somewhere to go
         result["new_tab"] = _wait(_open_tab(supervisor, page["url"], context), loop, timeout=15)
     except Exception as exc:  # health: allow BLE001 -- fixed text; the payment tab stays open and locked
@@ -542,7 +568,7 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     except Exception as exc:  # health: allow BLE001 -- the status below decides what is reported
         logger.info("payment_done: closing the payment tab failed (%s)", type(exc).__name__)
     result["lock_released"] = _released(supervisor)
-    if on_tab:
+    if on_tab and result["lock_released"]:  # attaching installs the dialog bridge: never on a locked slot
         try:
             _wait(_follow(supervisor, result["new_tab"]), loop, timeout=10)
         except Exception as exc:  # health: allow BLE001 -- the next browser action re-attaches

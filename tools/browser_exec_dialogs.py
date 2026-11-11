@@ -150,12 +150,20 @@ def _supervisor(task_id: Optional[str]):
         return None
 
 
+def _payment_locked(supervisor: Any) -> bool:
+    """dlz (payment lockdown): no policy install and no tab watching while a card payment locks the slot (the
+    supervisor's own automation stands down too: browser_supervisor_dialogs)."""
+    from tools.browser_payment_surface import slot_locked
+
+    return slot_locked(supervisor)
+
+
 def arm(task_id: Optional[str], env: dict, *, on_dialog: str, identity: str) -> float:
     """Install this call's decider on the task's supervisor and watch every tab.
     Returns the call's start stamp for :func:`collect`."""
     started = time.time()
     supervisor = _supervisor(task_id)
-    if supervisor is None:
+    if supervisor is None or _payment_locked(supervisor):
         return started
     supervisor.dialog_decider = make_decider(on_dialog=on_dialog, slot_marked=_slot_marked(env), identity=identity,
                                              after_handoff=_take_handoff_flag(task_id))
@@ -172,7 +180,7 @@ def disarm(task_id: Optional[str], env: dict, *, identity: str, dispatched: bool
         with _after_handoff_lock:
             _after_handoff.discard(task_id or "default")
     supervisor = _supervisor(task_id)
-    if supervisor is not None:
+    if supervisor is not None and not _payment_locked(supervisor):
         supervisor.dialog_decider = make_decider(on_dialog="auto", slot_marked=_slot_marked(env), identity=identity,
                                                  after_handoff=_take_handoff_flag(task_id))
 
@@ -227,9 +235,11 @@ def respond(task_id: Optional[str], *, action: str, dialog_id: str = "", prompt_
     supervisor = _supervisor(task_id)
     if supervisor is None:
         return {"ok": False, "error": "no browser session is attached for this task; run browser_exec first"}
-    from tools.browser_payment_surface import locked_refusal
+    from tools.browser_payment_surface import fenced_native
 
-    refused = locked_refusal(supervisor)  # dlz (payment lockdown): no answer goes to a locked slot's pages
-    if refused:
-        return {"ok": False, "error_type": refused["error_type"], "error": refused["error"]}
-    return supervisor.respond_to_dialog(action, prompt_text=prompt_text, dialog_id=dialog_id or None)
+    # dlz (payment lockdown): never answered on a locked slot, never across a claim (payload withheld then).
+    out = fenced_native(supervisor, lambda: supervisor.respond_to_dialog(action, prompt_text=prompt_text,
+                                                                        dialog_id=dialog_id or None))
+    if out.get("error_type"):
+        return {"ok": False, "error_type": out["error_type"], "error": out["error"]}
+    return out

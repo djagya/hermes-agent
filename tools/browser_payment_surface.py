@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import secrets
 import threading
 import time
 import weakref
@@ -64,11 +65,16 @@ class SurfaceRefused(RuntimeError):
 _LOCK = threading.Lock()
 # Supervisors whose claim was sent and not proven released (fail closed between claim and status).
 _HELD: weakref.WeakSet = weakref.WeakSet()
-# Supervisors with a claim on the wire: locked whatever a status read says meanwhile.
-_CLAIMING: weakref.WeakSet = weakref.WeakSet()
+# Supervisors control last reported locked (read by loop-side checks that cannot wait for a status).
+_KNOWN_LOCKED: weakref.WeakSet = weakref.WeakSet()
+# Claims on the wire per supervisor (a count, so no completion clears another claim's mark).
+_CLAIMING: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# One claim, dialog answer or recovery call at a time per supervisor (claims are serialized).
+_CLAIM_LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 # Bumped before every claim is sent: a relayed call whose reply straddles a claim is withheld, and a
-# status read that started before a claim never clears the lock.
+# status read that started before a claim never clears the lock or counts as a release.
 _EPOCH = [0]
+_FENCE_WAIT_S = 15.0  # how long a claim or a fenced native op waits for the supervisor's claim lock
 
 
 def _refusal(error_type: str, message: str) -> dict:
@@ -81,9 +87,8 @@ _UNAVAILABLE_TEXT = (
 )
 LOCKED_TEXT = (
     "The browser is locked for a card payment: page reads, scripts, input, screenshots and attaching to tabs "
-    "are refused until the payment tab is closed. Tabs can still be listed (browser_cdp Target.getTargets / "
-    "Target.getTargetInfo without frame_id; each tab's site (origin) only, no title) and closed "
-    "(Target.closeTarget). Continue with "
+    "are refused until the payment tab is closed. Tabs can still be listed (browser_cdp Target.getTargets, no "
+    "params: each tab's site (origin) only, no title) and closed (browser_cdp Target.closeTarget {targetId}). Continue with "
     "browser_vault payment_controls / payment_click on the payment tab, and call payment_done after Pay: it "
     "hands the confirmation over and ends the lock."
 )
@@ -141,6 +146,19 @@ def parse_lock_status(result: Any) -> tuple[str, frozenset]:
     return ("locked", frozenset(tabs)) if locked else ("unlocked", frozenset())
 
 
+def _claim_lock(supervisor: Any) -> threading.Lock:
+    with _LOCK:
+        lock = _CLAIM_LOCKS.get(supervisor)
+        if lock is None:
+            lock = _CLAIM_LOCKS[supervisor] = threading.Lock()
+        return lock
+
+
+def _claiming(supervisor: Any) -> bool:
+    """Must hold ``_LOCK``."""
+    return _CLAIMING.get(supervisor, 0) > 0
+
+
 def claim_payment_surface(supervisor: Any, inspected: Any) -> Optional[dict]:
     """The fill path's hook (managed mode, after consent, BEFORE ``resolve_secret``).
 
@@ -154,10 +172,20 @@ def claim_payment_surface(supervisor: Any, inspected: Any) -> Optional[dict]:
     tab = getattr(inspected, "page_id", None)
     if loop is None or not loop.is_running() or not _valid_id(tab):
         return _refusal(UNAVAILABLE, _UNAVAILABLE_TEXT)
+    lock = _claim_lock(supervisor)
+    if not lock.acquire(timeout=_FENCE_WAIT_S):  # another claim or a fenced native op is running
+        return _refusal(UNAVAILABLE, _UNAVAILABLE_TEXT)
+    try:
+        return _claim_serialized(supervisor, inspected, loop, tab)
+    finally:
+        lock.release()
+
+
+def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> Optional[dict]:
     with _LOCK:
         held_before = supervisor in _HELD
         _HELD.add(supervisor)
-        _CLAIMING.add(supervisor)
+        _CLAIMING[supervisor] = _CLAIMING.get(supervisor, 0) + 1
         _EPOCH[0] += 1
     ws = getattr(supervisor, "_ws", None)
     try:
@@ -168,14 +196,20 @@ def claim_payment_surface(supervisor: Any, inspected: Any) -> Optional[dict]:
             raise SurfaceRefused("claim not confirmed")
     except Exception as exc:  # health: allow BLE001 -- CDP/transport text is not surfaced; fixed type only
         if _control_refused(exc) and not held_before:
-            # Only control's own refusal proves nothing changed; any other failure keeps the lock here.
+            # Only control's own refusal proves nothing changed; any other failure keeps the lock here,
+            # and so does another claim still on the wire.
             with _LOCK:
-                _HELD.discard(supervisor)
+                if _CLAIMING.get(supervisor, 0) <= 1:
+                    _HELD.discard(supervisor)
         logger.warning("card fill refused: payment surface claim failed (%s)", type(exc).__name__)
         return _refusal(UNAVAILABLE, _UNAVAILABLE_TEXT)
     finally:
         with _LOCK:
-            _CLAIMING.discard(supervisor)
+            left = _CLAIMING.get(supervisor, 0) - 1
+            if left > 0:
+                _CLAIMING[supervisor] = left
+            else:
+                _CLAIMING.pop(supervisor, None)
     # dlz (lockdown §2): the payment tab and its card documents, for browser_vault payment_done.
     from tools.browser_payment_done import record_payment
 
@@ -184,18 +218,24 @@ def claim_payment_surface(supervisor: Any, inspected: Any) -> Optional[dict]:
 
 
 def lock_status(supervisor: Any) -> str:
-    """Control's answer for this supervisor's slot: ``locked`` | ``unlocked`` | ``unknown``. A proven
-    unlock also clears the local lock, unless a claim started meanwhile."""
-    start = epoch()
+    """Control's answer for this supervisor's slot: ``locked`` | ``unlocked`` | ``unknown``. A read that
+    straddles a claim (one on the wire at its start or end, or started meanwhile) is ``locked``: only a
+    clean unlock clears the local lock or counts as a release."""
+    with _LOCK:
+        start, busy = _EPOCH[0], _claiming(supervisor)
     try:
         reply = _wait(supervisor._cdp(STATUS_METHOD, {}, timeout=5), supervisor._loop, timeout=7)
         state, _tabs = parse_lock_status(reply.get("result") if isinstance(reply, dict) else None)
     except Exception:  # health: allow BLE001 -- an unanswered status proves nothing
         state = "unknown"
-    if state == "unlocked":
-        with _LOCK:
-            if _EPOCH[0] == start and supervisor not in _CLAIMING:
-                _HELD.discard(supervisor)
+    with _LOCK:
+        if busy or _claiming(supervisor) or _EPOCH[0] != start:
+            return "locked"
+        if state == "unlocked":
+            _HELD.discard(supervisor)
+            _KNOWN_LOCKED.discard(supervisor)
+        elif state == "locked":
+            _KNOWN_LOCKED.add(supervisor)
     return state
 
 
@@ -216,12 +256,37 @@ def slot_locked(supervisor: Any) -> bool:
     start = epoch()
     state = lock_status(supervisor)
     with _LOCK:
-        if supervisor in _CLAIMING or _EPOCH[0] != start:
+        if _claiming(supervisor) or _EPOCH[0] != start:
             return True
         held = supervisor in _HELD
     if state == "unknown":
         return held or _managed()
     return state == "locked"
+
+
+def locally_locked(supervisor: Any) -> bool:
+    """For loop-side code that must not wait for a status read (dialog automation): a claim on the wire,
+    a claim not proven released, or control's last answer locked."""
+    with _LOCK:
+        return _claiming(supervisor) or supervisor in _HELD or supervisor in _KNOWN_LOCKED
+
+
+def fenced_native(supervisor: Any, op) -> dict:
+    """Run a model-initiated native operation (a dialog answer) outside any claim: under the supervisor's
+    claim lock (a claim waits for it), refused while the slot is locked, and its payload withheld if a claim
+    started anyway (the epoch moved)."""
+    lock = _claim_lock(supervisor)
+    if not lock.acquire(timeout=_FENCE_WAIT_S):
+        return _refusal(LOCKED, LOCKED_TEXT)
+    try:
+        before = epoch()
+        refused = locked_refusal(supervisor)
+        if refused:
+            return refused
+        out = op()
+        return locked_withheld() if epoch() != before else out
+    finally:
+        lock.release()
 
 
 def epoch() -> int:
@@ -242,6 +307,54 @@ def locked_withheld() -> dict:
     """A relayed call whose reply arrived after a card payment claimed the slot: never returned."""
     return _refusal(LOCKED, "A card payment locked this browser while the call was running, so its result was "
                             "withheld. " + LOCKED_TEXT)
+
+
+RECOVERY_METHODS = ("Target.getTargets", "Target.closeTarget")
+
+
+def _origin_only(url: Any) -> str:
+    from tools.browser_payment_done import _url_origin
+
+    return _url_origin(url)
+
+
+async def _page_tabs(sup: Any) -> list:
+    infos = (await sup._cdp("Target.getTargets"))["result"]["targetInfos"]
+    return [t for t in infos if isinstance(t, dict) and t.get("type") == "page" and _valid_id(t.get("targetId"))]
+
+
+def recovery_call(supervisor: Any, method: str, params: Any) -> dict:
+    """While the slot is locked, the managed, lease-bound way out for the model: ``Target.getTargets`` lists
+    this slot's tabs with their site only (origin, empty title), ``Target.closeTarget {targetId}`` closes one
+    of them (closing the payment tab is what ends the lock). Native, under the claim lock; anything else,
+    or other parameters, is refused."""
+    params = params if params is not None else {}
+    if method == "Target.getTargets" and params != {}:
+        return _refusal(LOCKED, "While locked, Target.getTargets takes no parameters.")
+    if method == "Target.closeTarget" and not (isinstance(params, dict) and set(params) == {"targetId"}
+                                               and _valid_id(params["targetId"])):
+        return _refusal(LOCKED, "While locked, Target.closeTarget takes exactly {targetId} of a tab from "
+                                "Target.getTargets.")
+    if method not in RECOVERY_METHODS:
+        return _refusal(LOCKED, LOCKED_TEXT)
+    lock = _claim_lock(supervisor)
+    if not lock.acquire(timeout=_FENCE_WAIT_S):
+        return _refusal(LOCKED, LOCKED_TEXT)
+    try:
+        tabs = _wait(_page_tabs(supervisor), supervisor._loop, timeout=10)
+        if method == "Target.getTargets":
+            return {"success": True, "method": method, "result": {"targetInfos": [
+                {"targetId": t["targetId"], "type": "page", "url": _origin_only(t.get("url")), "title": ""}
+                for t in tabs]}}
+        if params["targetId"] not in {t["targetId"] for t in tabs}:
+            return _refusal(LOCKED, "That is not a tab of this browser; list them with Target.getTargets.")
+        _wait(supervisor._cdp("Target.closeTarget", {"targetId": params["targetId"]}), supervisor._loop, timeout=10)
+        return {"success": True, "method": method, "result": {}}
+    except Exception as exc:  # health: allow BLE001 -- CDP text is not surfaced; fixed type only
+        logger.info("locked recovery call failed (%s)", type(exc).__name__)
+        return _refusal(LOCKED, "The browser could not answer; nothing else was done. Ask the user.")
+    finally:
+        lock.release()
 
 
 def supervisor_route_refusal(supervisor: Any, frame_id: str, method: str, params: Any,
@@ -296,9 +409,33 @@ def _mask(text: str) -> str:
     return re.sub(r"\d{4,}", lambda m: "•" * len(m.group(0)), text)[:_MAX_TEXT]
 
 
-def _ref(frame_id: str, index: int, role: str, text: str) -> str:
-    digest = hashlib.sha256(f"{frame_id}|{index}|{role}|{text}".encode()).hexdigest()[:10]
+def _ref(key: str, index: int, role: str, text: str, nonce: str = "") -> str:
+    """A control's ref: bound to its document (``key`` = frame id + loader) and to the listing (``nonce``)."""
+    digest = hashlib.sha256(f"{key}|{index}|{role}|{text}|{nonce}".encode()).hexdigest()[:10]
     return f"c{index}-{digest}"
+
+
+# The refs of each supervisor's latest payment_controls listing: ref -> (document key, index, role, text).
+# A new listing replaces them; a press (successful or uncertain) consumes its ref.
+_ISSUED: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+async def _loader_of(sup: Any, sid: str, fid: str) -> Optional[str]:
+    """The loader of frame ``fid``'s current document, read from its session's frame tree (None: gone)."""
+    stack = [(await sup._cdp("Page.getFrameTree", session_id=sid))["result"]["frameTree"]]
+    while stack:
+        node = stack.pop()
+        frame = node.get("frame") or {}
+        if frame.get("id") == fid:
+            loader = frame.get("loaderId")
+            return loader if isinstance(loader, str) and loader else None
+        stack.extend(node.get("childFrames") or [])
+    return None
+
+
+async def _same_document(sup: Any, sid: str, fid: str, loader: str) -> None:
+    if await _loader_of(sup, sid, fid) != loader:
+        raise SurfaceRefused("the page changed")
 
 
 async def _documents(sup: Any) -> tuple:
@@ -314,45 +451,57 @@ async def _documents(sup: Any) -> tuple:
     # cannot click anything, the payment tab's own top document (merchant page, 3-D Secure redirect) unless
     # it is a card frame.
     frames = card_frame_ids(sup)
-    docs = [(f[0], child_sessions.get(f[0], page_sid), f[0]) for f in tree if f[0] in frames]
+    # (frame id, session, document key = frame id + loader, loader, top document?)
+    docs = [(f[0], child_sessions.get(f[0], page_sid), f"{f[0]}|{f[1]}", f[1], False)
+            for f in tree if f[0] in frames and isinstance(f[1], str) and f[1]]
     top = await top_document(sup, page_sid, tree)
     if top is not None and top[0] not in {d[0] for d in docs}:
-        docs.append(top)
+        docs.append((*top, tree[0][1], True))
     return page_sid, tree, child_sessions, docs
 
 
-async def _listing(sup: Any, fid: str, sid: str, key: str) -> tuple:
-    """(array object id, [control dicts]) for one listed document; ``key`` binds its refs."""
+async def _listing(sup: Any, fid: str, sid: str, key: str, loader: str, top: bool, nonce: str) -> tuple:
+    """(array object id, [control dicts]) for one listed document. The isolated world is checked to belong
+    to the document that was judged (its loader read again after the listing)."""
     ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": fid, "worldName": "hermes-payment-controls"},
                           session_id=sid))["result"]["executionContextId"]
-    lister = _LISTER if key == fid else _TOP_LISTER  # a payment tab's top document has its own ref key
-    arr = (await sup._cdp("Runtime.evaluate", {"expression": lister, "contextId": ctx, "returnByValue": False},
-                          session_id=sid))["result"]["result"].get("objectId")
+    arr = (await sup._cdp("Runtime.evaluate", {"expression": _TOP_LISTER if top else _LISTER, "contextId": ctx,
+                                               "returnByValue": False}, session_id=sid))["result"]["result"].get(
+                                                   "objectId")
     if not arr:
         raise SurfaceRefused("payment document unavailable")
-    rows = (await sup._cdp("Runtime.callFunctionOn", {"objectId": arr, "functionDeclaration": _DESCRIBE,
-                                                      "returnByValue": True}, session_id=sid))["result"]["result"]
+    try:
+        rows = (await sup._cdp("Runtime.callFunctionOn", {"objectId": arr, "functionDeclaration": _DESCRIBE,
+                                                          "returnByValue": True}, session_id=sid))["result"]["result"]
+        await _same_document(sup, sid, fid, loader)
+    except BaseException:
+        await sup._release_payment_object(sid, arr)
+        raise
     controls = []
     for row in rows.get("value") or []:
         text = _mask(str(row.get("text") or ""))
         role = row.get("role") if row.get("role") in {"button", "link", "checkbox", "radio"} else "button"
         index = int(row.get("i") or 0)
-        controls.append({"ref": _ref(key, index, role, text), "role": role, "text": text,
-                         "disabled": row.get("disabled") is True, "_i": index})
+        controls.append({"ref": _ref(key, index, role, text, nonce), "role": role, "text": text,
+                         "disabled": row.get("disabled") is True, "_i": index, "_spec": (key, index, role, text)})
     return arr, controls
 
 
-async def _list_all(sup: Any) -> tuple:
+async def _list_all(sup: Any, nonce: str = "") -> tuple:
     page_sid, tree, child_sessions, docs = await _documents(sup)
     listed = []
-    for fid, sid, key in docs:
-        arr, controls = await _listing(sup, fid, sid, key)
-        listed.append((fid, sid, arr, controls))
+    try:
+        for fid, sid, key, loader, top in docs:
+            arr, controls = await _listing(sup, fid, sid, key, loader, top, nonce)
+            listed.append((fid, sid, arr, controls, loader))
+    except BaseException:
+        await _release(sup, child_sessions, listed)
+        raise
     return page_sid, tree, child_sessions, listed
 
 
 async def _release(sup: Any, child_sessions: dict, listed: list) -> None:
-    for _fid, sid, arr, _c in listed:
+    for _fid, sid, arr, _c, _loader in listed:
         await sup._release_payment_object(sid, arr)
     await sup._release_payment_sessions(child_sessions)
 
@@ -362,9 +511,12 @@ def _public(controls: list) -> list:
 
 
 async def _controls(sup: Any) -> dict:
-    _page_sid, _tree, child_sessions, listed = await _list_all(sup)
+    nonce = secrets.token_hex(8)
+    _page_sid, _tree, child_sessions, listed = await _list_all(sup, nonce)
     try:
-        controls = [c for _f, _s, _a, cs in listed for c in cs]
+        controls = [c for _f, _s, _a, cs, _l in listed for c in cs]
+        with _LOCK:
+            _ISSUED[sup] = {c["ref"]: c["_spec"] for c in controls}
         return {"success": True, "documents": len(listed), "controls": _public(controls)}
     finally:
         await _release(sup, child_sessions, listed)
@@ -407,14 +559,15 @@ async def _page_point(sup: Any, sid: str, element: str, page_sid: str, tree: tup
     return x, y, outer
 
 
-async def _click(sup: Any, ref: str, progress: list, deadline: float) -> dict:
+async def _click(sup: Any, spec: tuple, progress: list, deadline: float) -> dict:
     page_sid, tree, child_sessions, listed = await _list_all(sup)
     element = None
+    sid = ""
     try:
-        found = [(fid, sid, arr, c) for fid, sid, arr, cs in listed for c in cs if c["ref"] == ref]
+        found = [(fid, sid, arr, c, loader) for fid, sid, arr, cs, loader in listed for c in cs if c["_spec"] == spec]
         if len(found) != 1:
             return _refusal("payment_control_unknown", "That control is not listed now; call payment_controls again.")
-        _fid, sid, arr, control = found[0]
+        fid, sid, arr, control, loader = found[0]
         if control["disabled"]:
             return _refusal("payment_control_disabled", "That control is disabled; nothing was clicked.")
         element = (await sup._cdp("Runtime.callFunctionOn", {
@@ -433,6 +586,12 @@ async def _click(sup: Any, ref: str, progress: list, deadline: float) -> dict:
                                  session_id=page_sid))["result"].get("backendNodeId")
             if at != outer:
                 return _refusal("payment_control_covered", "Another element covers that control; nothing was clicked.")
+        # Immediately before the press: still the same document, and the control still the hit target.
+        await _same_document(sup, sid, fid, loader)
+        hit = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _HIT,
+                                                         "returnByValue": True}, session_id=sid))["result"]["result"]
+        if hit.get("value") is not True:
+            return _refusal("payment_control_covered", "Another element covers that control; nothing was clicked.")
         for kind in ("mouseMoved", "mousePressed", "mouseReleased"):
             params = {"type": kind, "x": x, "y": y}
             if kind != "mouseMoved":
@@ -445,7 +604,7 @@ async def _click(sup: Any, ref: str, progress: list, deadline: float) -> dict:
                 # From here a failure cannot promise the click did not land (duplicate-submit risk).
                 progress.append(True)
             await sup._cdp("Input.dispatchMouseEvent", params, session_id=page_sid)
-        return {"success": True, "clicked": ref, "role": control["role"], "text": control["text"]}
+        return {"success": True, "role": control["role"], "text": control["text"]}
     finally:
         if element:
             await sup._release_payment_object(sid, element)
@@ -488,8 +647,21 @@ def payment_controls(supervisor: Any) -> dict:
 
 
 def payment_click(supervisor: Any, ref: str) -> dict:
-    """``browser_vault action=payment_click ref=…``: one trusted click on a listed control."""
-    if not isinstance(ref, str) or not _REF_RE.fullmatch(ref):
-        return _refusal("payment_control_unknown", "ref must be one returned by payment_controls.")
+    """``browser_vault action=payment_click ref=…``: one trusted click on a control of the latest listing.
+    Refs are single-use: the ref is taken out of the listing for the click and stays dead once a press
+    started (successful or uncertain); a second press needs a fresh payment_controls."""
+    with _LOCK:
+        issued = _ISSUED.get(supervisor)
+        spec = issued.pop(ref, None) if isinstance(ref, str) and _REF_RE.fullmatch(ref) and issued else None
+    if spec is None:
+        return _refusal("payment_control_unknown", "ref must be one returned by the latest payment_controls and "
+                                                   "not used for a press yet; call payment_controls again.")
     progress: list = []
-    return _run(supervisor, lambda deadline: _click(supervisor, ref, progress, deadline), progress)
+    out = _run(supervisor, lambda deadline: _click(supervisor, spec, progress, deadline), progress)
+    if out.get("success"):
+        out["clicked"] = ref
+    elif not progress:  # nothing was pressed: the ref stays usable, if its listing is still the latest
+        with _LOCK:
+            if _ISSUED.get(supervisor) is issued:
+                issued[ref] = spec
+    return out

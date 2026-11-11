@@ -28,6 +28,14 @@ ROWS = [
 ]
 
 
+def frame_tree(rows):
+    """``Page.getFrameTree``'s result for tree rows ``(id, loader, url, origin, parent)``."""
+    def node(row):
+        return {"frame": {"id": row[0], "loaderId": row[1], "url": row[2]},
+                "childFrames": [node(r) for r in rows if r[4] == row[0]]}
+    return {"frameTree": node(rows[0])}
+
+
 class FakeSup:
     """The supervisor surface the module touches, on a real loop thread; CDP answered by ``on``."""
 
@@ -40,6 +48,7 @@ class FakeSup:
         self.hit, self.at_point = True, 77
         self.on = on or self.default
         self.delays = {}  # method -> seconds before its reply (a slow Chrome)
+        self.tree = TREE  # what Page.getFrameTree answers (the document check before a listing and a press)
 
     def default(self, method, params, session):
         if method == "Hermes.claimPaymentSurface":
@@ -70,6 +79,8 @@ class FakeSup:
             return {"model": {"content": [100, 200, 400, 200, 400, 300, 100, 300]}}
         if method == "DOM.getNodeForLocation":
             return {"backendNodeId": self.at_point}
+        if method == "Page.getFrameTree":
+            return frame_tree(self.tree)
         return {}
 
     async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
@@ -119,6 +130,17 @@ def test_claim_names_the_payment_tab_only():
     (_, params, session), = sup.sent("Hermes.claimPaymentSurface")
     assert params == {"tabs": ["PAGE"]} and session is None
     assert surface.slot_locked(sup) is True
+
+
+def test_a_claim_reply_with_tab_type_targets_confirms_and_is_never_sent_back():
+    # control 8fe2e9fe69: the owning set also holds the tab-type target of each claimed page
+    sup = FakeSup()
+    base = sup.on
+    sup.on = lambda m, p, s: ({"claimed": True, "locked": True, "tabs": sorted(["PAGE", "TABTARGET-PAGE"])}
+                              if m == "Hermes.claimPaymentSurface" else base(m, p, s))
+    assert surface.claim_payment_surface(sup, _inspected()) is None
+    assert surface.claim_payment_surface(sup, _inspected()) is None  # an extension
+    assert [c[1] for c in sup.sent("Hermes.claimPaymentSurface")] == [{"tabs": ["PAGE"]}, {"tabs": ["PAGE"]}]
 
 
 @pytest.mark.parametrize("answer, kept", [
@@ -381,7 +403,7 @@ def test_dialogs_and_vault_page_ops_refused_while_locked(monkeypatch):
     assert vault._payment_lock_refusal("t") is None
 
 
-def test_payment_controls_mask_digit_runs_and_refs_are_stable():
+def test_payment_controls_mask_digit_runs_and_each_listing_issues_new_refs():
     sup = _claimed()
     out = surface.payment_controls(sup)
     assert out["success"] is True and out["documents"] == 1
@@ -389,10 +411,77 @@ def test_payment_controls_mask_digit_runs_and_refs_are_stable():
     assert out["controls"][0]["text"] == "Pay with card •••• •••• •••• ••••"
     assert not any(re.search(r"\d{4}", c["text"]) for c in out["controls"])
     assert all(set(c) == {"ref", "role", "text", "disabled"} for c in out["controls"])
-    assert surface.payment_controls(sup)["controls"] == out["controls"]
+    again = surface.payment_controls(sup)["controls"]
+    assert [c["text"] for c in again] == [c["text"] for c in out["controls"]]
+    assert not {c["ref"] for c in again} & {c["ref"] for c in out["controls"]}
+    # a newer listing kills the older refs
+    assert surface.payment_click(sup, out["controls"][0]["ref"])["error_type"] == "payment_control_unknown"
+    assert not sup.sent("Input.dispatchMouseEvent")
     # The lister ran in an isolated world of the protected frame, never the page's own world.
     (_, world, session), = sup.sent("Page.createIsolatedWorld")[:1]
     assert world["frameId"] == "CARD" and session == "S-card"
+
+
+@pytest.mark.parametrize("outcome", ["pressed", "uncertain"])
+def test_a_ref_is_single_use_once_a_press_started(outcome):
+    sup = _claimed()
+    ref = surface.payment_controls(sup)["controls"][0]["ref"]
+    if outcome == "uncertain":
+        base = sup.on
+
+        def on(method, params, session):
+            if method == "Input.dispatchMouseEvent" and params.get("type") == "mouseReleased":
+                raise TimeoutError("lost reply")
+            return base(method, params, session)
+
+        sup.on = on
+    first = surface.payment_click(sup, ref)
+    assert first.get("success") is True if outcome == "pressed" else first["error_type"] == "payment_click_uncertain"
+    presses = len([c for c in sup.sent("Input.dispatchMouseEvent") if c[1]["type"] == "mousePressed"])
+    assert surface.payment_click(sup, ref)["error_type"] == "payment_control_unknown"
+    assert len([c for c in sup.sent("Input.dispatchMouseEvent") if c[1]["type"] == "mousePressed"]) == presses == 1
+
+
+def test_a_ref_survives_a_click_refused_before_any_press():
+    sup = _claimed()
+    ref = surface.payment_controls(sup)["controls"][0]["ref"]
+    sup.hit = False
+    assert surface.payment_click(sup, ref)["error_type"] == "payment_control_covered"
+    sup.hit = True
+    assert surface.payment_click(sup, ref)["success"] is True
+
+
+@pytest.mark.parametrize("when", ["listing", "press"])
+def test_refs_never_act_on_a_replacement_document(when):
+    # Codex P1: navigating while the isolated world is created (or before the press) must not let a ref of the
+    # old document act on the new one.
+    sup = _claimed()
+    replaced = (("PAGE", "LP", "https://shop.test/", "https://shop.test", ""),
+                ("CARD", "L2", "https://bank.test/acs", "https://bank.test", "PAGE"))
+    if when == "listing":
+        base = sup.on
+
+        def on(method, params, session):
+            if method == "Page.createIsolatedWorld":
+                sup.tree = replaced  # the frame now holds another document
+            return base(method, params, session)
+
+        sup.on = on
+        out = surface.payment_controls(sup)
+        assert out["error_type"] == "payment_surface_unavailable" and "controls" not in out
+        return
+    ref = surface.payment_controls(sup)["controls"][0]["ref"]
+    base = sup.on
+
+    def on(method, params, session):
+        if method == "DOM.getContentQuads":
+            sup.tree = replaced  # navigates after the listing matched, before the press
+        return base(method, params, session)
+
+    sup.on = on
+    out = surface.payment_click(sup, ref)
+    assert out["error_type"] == "payment_surface_unavailable" and "nothing was clicked" in out["error"]
+    assert not sup.sent("Input.dispatchMouseEvent")
 
 
 def test_payment_click_is_one_trusted_click_at_the_hit_tested_centre():
@@ -504,3 +593,191 @@ def test_lister_never_lists_inputs_selects_or_controls_holding_them():
         ("button", "Pay 4242 4242"), ("button", "Cancel"), ("checkbox", "Save card"), ("button", "Confirm")]
     # Python masks the digit runs before anything reaches the model.
     assert surface._mask(rows[0]["text"]) == "Pay •••• ••••"
+
+
+def test_claims_are_serialized_and_a_refusal_never_clears_another_claims_hold():
+    # Codex P1: a second claim must never run beside the first, and a refused claim must not reopen the gate
+    # while another claim is still outstanding.
+    sup = FakeSup()
+    sup.delays = {"Hermes.claimPaymentSurface": 0.1}  # a slow claim on the wire (awaited: the loop stays free)
+    seen = {"now": 0, "max": 0}
+    real = sup._cdp
+
+    async def cdp(method, params=None, *, session_id=None, timeout=10.0):
+        if method != "Hermes.claimPaymentSurface":
+            return await real(method, params, session_id=session_id, timeout=timeout)
+        seen["now"] += 1
+        seen["max"] = max(seen["max"], seen["now"])
+        try:
+            return await real(method, params, session_id=session_id, timeout=timeout)
+        finally:
+            seen["now"] -= 1
+
+    sup._cdp = cdp
+    outs = []
+    threads = [threading.Thread(target=lambda: outs.append(surface.claim_payment_surface(sup, _inspected())))
+               for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert outs == [None, None, None] and seen["max"] == 1
+    # an outstanding claim (counted) survives control's refusal of another one
+    fresh = FakeSup()
+    fresh.on = lambda method, params, session: (_ for _ in ()).throw(RuntimeError(
+        "CDP error on id=3: payment_surface_unavailable: held")) if method == "Hermes.claimPaymentSurface" \
+        else fresh.default(method, params, session)
+    with surface._LOCK:
+        surface._CLAIMING[fresh] = 1
+    try:
+        assert surface.claim_payment_surface(fresh, _inspected())["error_type"] == "payment_surface_unavailable"
+        with surface._LOCK:
+            assert fresh in surface._HELD and surface._CLAIMING.get(fresh) == 1
+        assert surface.slot_locked(fresh) is True
+    finally:
+        with surface._LOCK:
+            surface._CLAIMING.pop(fresh, None)
+
+
+def test_a_status_read_straddling_a_claim_is_never_a_release(monkeypatch):
+    # Codex P2: an "unlocked" answer to a read that a claim overlapped proves nothing.
+    from tools import browser_payment_done as done
+
+    sup = FakeSup()
+
+    def on(method, params, session):
+        if method == "Hermes.paymentSurfaceStatus":
+            with surface._LOCK:
+                surface._EPOCH[0] += 1  # a claim started while the read was on the wire
+            return dict(UNLOCKED)
+        return sup.default(method, params, session)
+
+    sup.on = on
+    assert surface.lock_status(sup) == "locked"
+    monkeypatch.setattr(done, "_RELEASE_WAIT_S", 0.05)
+    monkeypatch.setattr(done, "_RELEASE_POLL_S", 0.01)
+    assert done._released(sup) is False
+    sup.on = sup.default  # a clean read
+    assert surface.lock_status(sup) == "unlocked" and done._released(sup) is True
+
+
+def test_dialog_answers_wait_for_claims_and_withhold_across_one(monkeypatch):
+    from tools import browser_dialog_tool, browser_exec_dialogs
+
+    sup = FakeSup()
+    monkeypatch.setattr("tools.browser_supervisor.SUPERVISOR_REGISTRY.get", lambda task_id: sup)
+    order = []
+
+    def respond(*a, **k):
+        order.append("answer")
+        if k.get("prompt_text") == "claim":
+            with surface._LOCK:
+                surface._EPOCH[0] += 1  # another claim started while this answer ran
+        return {"ok": True, "dialog": {"id": "d1", "message": "Order 4242 total"}}
+
+    sup.respond_to_dialog = respond
+    # a claim started while an answer runs waits for it (the claim lock), then proceeds
+    lock = surface._claim_lock(sup)
+    with lock:
+        claimer = threading.Thread(target=lambda: order.append(("claim", surface.claim_payment_surface(sup, _inspected()))))
+        claimer.start()
+        order.append("answer")  # stands in for the answer that holds the lock
+    claimer.join(10)
+    assert order == ["answer", ("claim", None)]
+    # across a claim the payload never reaches the model
+    sup.status = dict(UNLOCKED)
+    with surface._LOCK:
+        surface._HELD.discard(sup)
+    out = json.loads(browser_dialog_tool.browser_dialog("accept", prompt_text="claim"))
+    assert out["error_type"] == "payment_surface_locked" and "4242" not in json.dumps(out)
+    out = browser_exec_dialogs.respond("t", action="accept", prompt_text="claim")
+    assert out["error_type"] == "payment_surface_locked" and "dialog" not in out
+
+
+def test_vault_page_ops_withhold_their_payload_across_a_claim(monkeypatch):
+    from tools import browser_vault_tool as vault
+
+    sup = FakeSup()
+    monkeypatch.setattr("tools.browser_supervisor.SUPERVISOR_REGISTRY.get", lambda task_id: sup)
+
+    def op():
+        with surface._LOCK:
+            surface._EPOCH[0] += 1
+        return json.dumps({"success": True, "page": "Order 4242"})
+
+    out = json.loads(vault._outside_payment_lock("t", op))
+    assert out["error_type"] == "payment_surface_locked" and "4242" not in json.dumps(out)
+    assert json.loads(vault._outside_payment_lock("t", lambda: json.dumps({"success": True})))["success"] is True
+
+
+def test_dialog_automation_stands_down_while_locked(monkeypatch):
+    from tools import browser_exec_dialogs
+    from tools import browser_supervisor as bs
+    from tools.browser_supervisor_dialogs import DIALOG_POLICY_AUTO_ACCEPT
+
+    sup = bs.CDPSupervisor(task_id="locked-dialogs", cdp_url="ws://127.0.0.1:9222", dialog_policy=DIALOG_POLICY_AUTO_ACCEPT)
+    sent = []
+
+    async def cdp(method, params=None, *, session_id=None, timeout=10.0):
+        sent.append((method, session_id))
+        return {"result": {"targetInfos": [{"targetId": "T2", "type": "page"}], "sessionId": "S2"}}
+
+    sup._cdp = cdp
+    with surface._LOCK:
+        surface._HELD.add(sup)
+
+    async def scenario():
+        sup._admit_dialog(type="confirm", message="Leave?", default_prompt="", session_id="S1", frame_id=None)
+        await asyncio.sleep(0)
+        (dialog_id,) = list(sup._pending_dialogs)
+        await sup._dialog_timeout_expired(dialog_id)  # the watchdog fires: no answer, looks again later
+        assert dialog_id in sup._pending_dialogs and dialog_id in sup._dialog_watchdogs
+        assert await sup._watch_dialog_tabs() == 0
+        await sup._watch_tab("T3")
+        assert sent == []  # no attach, no Page.handleJavaScriptDialog, no Fetch on a locked slot
+        with surface._LOCK:
+            surface._HELD.discard(sup)
+        sup._admit_dialog(type="alert", message="Saved", default_prompt="", session_id="S1", frame_id=None)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert ("Page.handleJavaScriptDialog", "S1") in sent  # unlocked: the policy answers again
+        for handle in sup._dialog_watchdogs.values():
+            handle.cancel()
+
+    asyncio.run(scenario())
+    # browser_exec installs no policy and watches no tab while locked
+    locked = FakeSup()
+    locked.watch_dialog_tabs = lambda: pytest.fail("tabs watched on a locked slot")
+    monkeypatch.setattr("tools.browser_supervisor.SUPERVISOR_REGISTRY.get", lambda task_id: locked)
+    assert surface.claim_payment_surface(locked, _inspected()) is None
+    browser_exec_dialogs.arm("t", {}, on_dialog="accept", identity="")
+    browser_exec_dialogs.disarm("t", {}, identity="")
+    assert getattr(locked, "dialog_decider", None) is None
+
+
+def test_locked_recovery_lists_sites_and_closes_only_this_slots_tabs(monkeypatch):
+    from tools import browser_vault_tool as vault
+
+    sup = _claimed()
+    pages = [{"targetId": "PAGE", "type": "page", "url": "https://shop.test/checkout?order=1#x", "title": "4242"},
+             {"targetId": "OTHER", "type": "page", "url": "https://bank.test/acs/abc", "title": "Card 4242"},
+             {"targetId": "CARD", "type": "iframe", "url": "https://psp.test/f", "title": ""}]
+    base = sup.on
+    sup.on = lambda m, p, s: {"targetInfos": pages} if m == "Target.getTargets" else base(m, p, s)
+    monkeypatch.setattr("tools.browser_session_cdp.managed_browser", lambda: True)
+    monkeypatch.setattr(vault, "_managed_supervisor", lambda task_id, admit=False: sup)
+    listed = json.loads(cdp_tool.browser_cdp("Target.getTargets"))
+    assert listed["result"]["targetInfos"] == [
+        {"targetId": "PAGE", "type": "page", "url": "https://shop.test", "title": ""},
+        {"targetId": "OTHER", "type": "page", "url": "https://bank.test", "title": ""}]
+    for params in ({"targetId": "CARD"}, {"targetId": "GONE"}, {"targetId": "PAGE", "x": 1}, None):
+        assert json.loads(cdp_tool.browser_cdp("Target.closeTarget", params))["error_type"] == "payment_surface_locked"
+    assert not sup.sent("Target.closeTarget")
+    assert json.loads(cdp_tool.browser_cdp("Target.closeTarget", {"targetId": "PAGE"}))["success"] is True
+    assert [c[1] for c in sup.sent("Target.closeTarget")] == [{"targetId": "PAGE"}]
+    # anything else, and every call once the slot is unlocked, keeps the managed refusal
+    assert "scope_denied" in cdp_tool.browser_cdp("Runtime.evaluate", {"expression": "1"})
+    sup.status = dict(UNLOCKED)
+    with surface._LOCK:
+        surface._HELD.discard(sup)
+    assert "scope_denied" in cdp_tool.browser_cdp("Target.getTargets")
