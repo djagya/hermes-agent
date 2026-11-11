@@ -1,0 +1,17 @@
+# Upstream v0.23.1 test placeholders flagged by generic-api-key in the release range (checked 2026-11-11:
+# mixed-key-123456, pck_ cache keys in a wire fixture, AT-/RT-/tok- test tokens, synthetic-…-pw, test-key-…, a
+# passkey HKDF info label). Exact fingerprints only: a new finding still fails the gate.
+44fff7e17b44cfb2d8ecffff7602b4e84ebe9199:tests/hermes_cli/test_gateway_connections.py:generic-api-key:57
+58ebcf3007ac66ba185d30b9b61b983e2c31cfbd:scripts/whatsapp-bridge/passkey_flow.js:generic-api-key:6
+88f0d3919480f2a3bea94b6e048df2aa1dd276f8:tests/hermes_cli/test_profile_gateway_connection_stores.py:generic-api-key:37
+9d6f94f682214dfcd607797b2ccf9feadcea0585:tests/tui_gateway/test_vault_preview_fill.py:generic-api-key:149
+9d6f94f682214dfcd607797b2ccf9feadcea0585:tests/tui_gateway/test_vault_preview_fill.py:generic-api-key:166
+ce120ede6a9cf13fc073427401dc702dd5e5633c:tests/fixtures/provider_wire_snapshot_variants.json:generic-api-key:7433
+ce120ede6a9cf13fc073427401dc702dd5e5633c:tests/fixtures/provider_wire_snapshot_variants.json:generic-api-key:7492
+ce120ede6a9cf13fc073427401dc702dd5e5633c:tests/fixtures/provider_wire_snapshot_variants.json:generic-api-key:7551
+ce120ede6a9cf13fc073427401dc702dd5e5633c:tests/fixtures/provider_wire_snapshot_variants.json:generic-api-key:7611
+ce120ede6a9cf13fc073427401dc702dd5e5633c:tests/fixtures/provider_wire_snapshot_variants.json:generic-api-key:7668
+ce120ede6a9cf13fc073427401dc702dd5e5633c:tests/fixtures/provider_wire_snapshot_variants.json:generic-api-key:7727
+ce120ede6a9cf13fc073427401dc702dd5e5633c:tests/fixtures/provider_wire_snapshot_variants.json:generic-api-key:7786
+da0b4467c86d9f5911f1dc796bdc205d48e8e69a:tests/hermes_cli/test_user_provider_mixed_case_key.py:generic-api-key:45
+f02ba87b8cea274117a91842f95c3a3c185dffd2:tests/agent/test_fork_memory_under_checkpoint_gate.py:generic-api-key:166
