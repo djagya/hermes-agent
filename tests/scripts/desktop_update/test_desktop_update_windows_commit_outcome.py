@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -74,6 +75,21 @@ if __name__ == '__main__':
 """
 
 
+def _kill_survivors(calls: Path) -> list[str]:
+    """Kill and name every process still carrying this hand-off's HANDOFF_CALLS (its descendants)."""
+    import psutil
+
+    found = []
+    for process in psutil.process_iter(['pid', 'name']):
+        try:
+            if process.environ().get('HANDOFF_CALLS') == str(calls):
+                found.append(f"{process.info['pid']} {' '.join(process.cmdline())}")
+                process.kill()
+        except (psutil.Error, OSError):
+            continue
+    return found
+
+
 def _handoff(tmp_path: Path, *args: str, verify: str = 'pass\n', timeout: int = 150, prepare=None, **env: str):
     install = tmp_path / 'checkout'
     publish_fixture_launcher(install, CLI)
@@ -89,12 +105,26 @@ def _handoff(tmp_path: Path, *args: str, verify: str = 'pass\n', timeout: int = 
         env={**os.environ, 'HERMES_HOME': str(home), 'HERMES_RUNTIME_DIR': str(tmp_path / 'empty-store'),
              'HANDOFF_CALLS': str(calls), 'PYTHONIOENCODING': 'utf-8', **env},
     )
+    # Read lines on a thread and wait on the hand-off itself: a process it started that outlives it
+    # (a probe the timeout kill missed) inherits the output pipe, and communicate() would wait for
+    # that process instead, past the per-file budget, with no output to show for it.
+    lines: list[str] = []
+    reader = threading.Thread(target=lambda: lines.extend(proc.stdout), daemon=True)
+    reader.start()
     try:
-        out, _ = proc.communicate(timeout=timeout)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)], capture_output=True, check=False)
-        out, _ = proc.communicate()
-        pytest.fail(f'hand-off did not finish within {timeout}s: {out}')
+        proc.wait(timeout=30)
+        reader.join(10)
+        survivors = _kill_survivors(calls)
+        pytest.fail(f'hand-off did not finish within {timeout}s (survivors: {survivors}): {"".join(lines)}')
+    reader.join(15)
+    if reader.is_alive():
+        survivors = _kill_survivors(calls)
+        pytest.fail(f'hand-off exited {proc.returncode}, but processes it started still hold its output '
+                    f'15s later (a probe outlived its timeout kill): {survivors}\n{"".join(lines)}')
+    out = ''.join(lines)
     argv = [json.loads(line) for line in calls.read_text(encoding='utf-8-sig').splitlines()] if calls.exists() else []
     result_path = home / '.hermes-update-result.json'
     result = json.loads(result_path.read_text(encoding='utf-8-sig')) if result_path.is_file() else None
