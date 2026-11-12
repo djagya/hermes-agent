@@ -26,6 +26,8 @@ from agent.vault_payment_policy import (
     https_origin,
     provider_for_origin,
 )
+from tools.browser_supervisor_payment_closure import _INSPECT_TEMPLATE
+from tools.browser_supervisor_payment_repin import MAX_REPINS, located, repin_pins, valid_check, valid_pause
 
 
 _MAX_CARD_DOCUMENTS = 4
@@ -676,10 +678,13 @@ class PaymentSupervisionMixin:
         ]
         if len(pages) != 1:
             raise PaymentPolicyError("Merchant tab missing or ambiguous")
-        current = (await self._cdp("Target.getTargetInfo", session_id=sid))[
-            "result"
-        ]["targetInfo"]
-        if current["targetId"] == pages[0]["targetId"]:
+        try:
+            current = (await self._cdp("Target.getTargetInfo", session_id=sid))["result"]["targetInfo"]["targetId"]
+        except Exception:  # health: allow BLE001 -- dlz (Codex r2 P2-5): a page session that does not answer
+            # The supervised tab was closed (payment_close, the user): its session is dead ("Session with given id
+            # not found"). That is "on another tab": the one tab at ``origin`` is attached below, as from any other.
+            current = None
+        if current == pages[0]["targetId"]:
             return sid
         old_sid = sid
         sid = (
@@ -1069,16 +1074,19 @@ class PaymentSupervisionMixin:
         except Exception:  # health: allow BLE001 -- an unreadable witness is not the page the owner approved
             return False
 
-    def commit_payment(self, inspected: PaymentInspection, fills: list[dict], strict: bool = False) -> dict:
+    def commit_payment(self, inspected: PaymentInspection, fills: list[dict], strict: bool = False,
+                       repin: bool = False) -> dict:
         """Write the fills. ``strict`` (unreviewed destinations) adds a hit test at each field's centre
-        before its setter; reviewed provider shapes keep ``False`` so they cannot regress."""
+        before its setter; reviewed provider shapes keep ``False`` so they cannot regress. ``repin`` (config
+        ``vault.payment_repin``, off by default; a literal True only): a re-rendered reviewed card document may be
+        re-pinned inside this commit; without it any change of the pinned fields stops the commit."""
         import concurrent.futures
 
         from agent.async_utils import safe_schedule_threadsafe
         from tools.browser_supervisor import _LoopUnavailable
 
         until = time.monotonic() + _COMMIT_BUDGET_SECONDS
-        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills, until, strict), self._loop)
+        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills, until, strict, repin), self._loop)
         if future is None:
             raise _LoopUnavailable("Browser supervisor loop unavailable")
         try:
@@ -1097,17 +1105,17 @@ class PaymentSupervisionMixin:
                     "write_uncertain": True}
 
     async def _commit_payment(self, i: PaymentInspection, fills: list[dict], until: float | None = None,
-                              strict: bool = False) -> dict:
+                              strict: bool = False, repin: bool = False) -> dict:
         if i.consumed:
             return {"success": False, "error_type": "payment_consent_consumed"}
         try:
-            return await self._commit_payment_once(i, fills, until, strict)
+            return await self._commit_payment_once(i, fills, until, strict, repin)
         finally:
             # dlz: one cleanup for the whole lifecycle (freshness included) that a cancellation cannot cut short.
             await self._release_once(i)
 
     async def _commit_payment_once(self, i: PaymentInspection, fills: list[dict], until: float | None,
-                                   strict: bool = False) -> dict:
+                                   strict: bool = False, repin: bool = False) -> dict:
         if time.monotonic() >= i.expires_at:
             # dlz: the inspection window closed (late approval, slow card lookup): nothing is written, and
             # the result says so instead of reading as a changed page.
@@ -1130,39 +1138,40 @@ class PaymentSupervisionMixin:
         # dlz: the renderer's write deadline: the consent window or the commit budget, whichever ends first.
         stop = i.expires_at if until is None else min(i.expires_at, until)
         filled = 0
+        state = {"number": False, "repins": 0, "repin": repin is True}
         try:
             # Every document was re-validated just above. A split checkout is written one
             # document at a time: no cross-document transaction exists, so a later failure
             # reports what an earlier document already received instead of retrying.
             written = []
             order = _commit_order(i, _fills_by_document(i, fills))
-            for document, document_fills in order:
-                if time.monotonic() >= i.expires_at:
-                    # dlz: no write after the window closes; earlier documents' values are reported, not
-                    # completed.
-                    return _partial({"success": False, "error_type": "payment_consent_expired"}, filled)
-                # dlz: an earlier document's page handlers ran after its writes: before the next document, every
-                # approved chain is checked again against the pinned state (bounded: no OOPIF rediscovery), and
-                # each document written so far must still be the one that received its fields.
-                if written and not await self._payment_scope_current(i, [d for d, _f in written] + [document]):
-                    return _partial({"success": False, "error_type": "payment_page_changed"}, filled)
-                # dlz (Codex B r1 #1): an unreviewed fill also re-binds the cart, the absence witnesses, the candidate
-                # topology and the policy before each later document, on the consumed inspection.
-                verdict = await self._fill_scope_verdict(i) if written and i.unreviewed_origins else None
-                if verdict:
-                    return _partial({"success": False, "error_type": verdict}, filled)
-                # dlz: strict fills in a frame pause after each focus for the owner-chain check from the parents
-                # (a cross-origin parent's blur handler is out of the frame's reach); an unreviewed fill pauses in
-                # every document, for the same bindings after the focus handlers ran.
-                paced = (lambda point, d=document: self._paced_check(i, d, point)) \
-                    if strict and (_has_parent(i, document) or i.unreviewed_origins) else None
-                result = await self._commit_payment_document(
-                    document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop), strict=strict,
-                    paced=paced)
+            # dlz (re-pin): a document whose remaining fields wait for the card number in a later document is
+            # suspended (its commit paused) and resumed once, after the documents that follow it. Without ``repin``
+            # no document defers: each is committed once, in order, and the first stop ends the commit.
+            suspended: list = []
+            steps = [(n, d, f, None) for n, (d, f) in enumerate(order, 1)]
+            while steps:
+                position, document, document_fills, resumed = steps.pop(0)
+                result = await self._commit_step(i, position, len(order), document, document_fills, resumed,
+                                                 written, stop, strict, state)
+                if result.get("deferred") is True and resumed is None:
+                    suspended.append((position, document, document_fills, result["filled_fields"]))
+                    filled += result["filled_fields"]
+                    written.append((document, document_fills))
+                    continue
+                if result.get("deferred") is True:  # deferred again after the number: never a second wait
+                    count = result["filled_fields"]
+                    result = {"success": False, "error_type": "payment_fields_changed", "filled_fields": count,
+                              "partially_filled": count > 0}
                 if not result.get("success"):
-                    return _partial(result, filled)
-                filled += result.get("filled_fields", 0)
-                written.append((document, document_fills))
+                    # a resumed document's answer counts its own earlier writes
+                    return _repins(_partial(result, filled - (resumed or 0)), state)
+                filled += result.get("filled_fields", 0) - (resumed or 0)
+                if resumed is None:
+                    written.append((document, document_fills))
+                state["number"] = state["number"] or any(f.get("token") == "cc-number" for f in document_fills)
+                if not steps and suspended:
+                    steps, suspended = [(n, d, f, k) for n, d, f, k in suspended], []
             # A document's own check runs right after its writes. Providers reset controlled inputs
             # later, and a later document (brand detection on the number, a blur) can clear an
             # earlier one, so success is only reported once EVERY document still holds its values.
@@ -1176,11 +1185,76 @@ class PaymentSupervisionMixin:
                                         for d, f, a in answers])
             if await self._top_navigated(i):
                 result["navigated_after_fill"] = True
-            return result
+            return _repins(result, state)
         except PaymentPolicyError:
-            return _partial({"success": False, "error_type": "payment_fields_invalid"}, filled)
+            return _repins(_partial({"success": False, "error_type": "payment_fields_invalid"}, filled), state)
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
-            return _partial({"success": False, "error_type": "payment_transport_uncertain"}, filled)
+            return _repins(_partial({"success": False, "error_type": "payment_transport_uncertain"}, filled), state)
+
+    async def _commit_step(self, i: PaymentInspection, position: int, total: int, document: PaymentDocument,
+                           document_fills: list, resumed: int | None, written: list, stop: float, strict: bool,
+                           state: dict) -> dict:
+        """One document's turn in the commit (``resumed``: the count a suspended document already wrote): the
+        window, the approved chains, an unreviewed fill's bindings, then its commit. A stop names the document."""
+        if time.monotonic() >= i.expires_at:
+            # dlz: no write after the window closes; earlier documents' values are reported, not completed.
+            return {"success": False, "error_type": "payment_consent_expired"}
+        # dlz: an earlier document's page handlers ran after its writes: before the next document, every
+        # approved chain is checked again against the pinned state (bounded: no OOPIF rediscovery), and
+        # each document written so far must still be the one that received its fields.
+        if written and not await self._payment_scope_current(i, [d for d, _f in written] + [document]):
+            return {"success": False, "error_type": "payment_page_changed"}
+        # dlz (Codex B r1 #1): an unreviewed fill also re-binds the cart, the absence witnesses, the candidate
+        # topology and the policy before each later document, on the consumed inspection.
+        verdict = await self._fill_scope_verdict(i) if written and i.unreviewed_origins else None
+        if verdict:
+            return {"success": False, "error_type": verdict}
+        # dlz: strict fills in a frame pause after each focus for the owner-chain check from the parents
+        # (a cross-origin parent's blur handler is out of the frame's reach); an unreviewed fill pauses in
+        # every document, for the same bindings after the focus handlers ran.
+        paced = (lambda point, d=document: self._paced_check(i, d, point)) \
+            if strict and (_has_parent(i, document) or i.unreviewed_origins) else None
+        # dlz (re-pin): only when switched on, and reviewed destinations only; otherwise the fill stops on any
+        # change, as before, and the document's commit gets no re-pin hook at all.
+        repin = None if not state["repin"] or i.unreviewed_origins else \
+            (lambda request, d=document, f=document_fills: self._repin(i, d, f, request, stop, state))
+        # dlz (Codex r1 P1-1): a re-pinned field pauses after its focus, whatever ``strict`` is, for the owner-chain
+        # hit test from the parents (the closure itself requires it fully exposed in its own document).
+        exposed = None if repin is None else (lambda point, d=document: self._paced_check(i, d, point))
+        state["refused"] = None
+        result = await self._commit_payment_document(
+            document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop), strict=strict,
+            paced=paced, **({"repin": repin, "exposed": exposed} if repin else {}),
+            **({"resumed": resumed} if resumed is not None else {}))
+        return located(result, position, total, state["refused"])
+
+    async def _repin(self, i: PaymentInspection, d: PaymentDocument, fills: list, request: dict, stop: float,
+                     state: dict) -> dict | None:
+        """dlz (re-pin): the answer to one re-pin request of ``d``'s paused commit: the new pin of each of its
+        fill tokens, or None (the closure then stops with its record). Inside the window only; the rule is
+        ``repin_pins``'; the frame's loader, URL, origin and owner <iframe>s are re-proved after it accepted, right
+        before the closure resumes (Opus r1 P3-1: a cross-origin parent can hide or move the frame meanwhile)."""
+        if time.monotonic() >= stop:
+            state["refused"] = "too_late"
+            return None
+        try:
+            answer = _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": d.object_id, "functionDeclaration": "function(){return this.rebind()}",
+                "returnByValue": True,
+            }, session_id=d.frame_session))
+        except Exception:  # health: allow BLE001 -- an unreadable document is not re-pinned; the closure stops
+            answer = None
+        written = request.get("written") or []
+        tokens = [str(f.get("token") or "") for f in fills]
+        pins, state["refused"] = repin_pins(d.controls, tokens, answer, written, state["number"] or "cc-number" in written,
+                                            planned={t: f.get("index") for t, f in zip(tokens, fills)})
+        if pins is not None and not await self._payment_scope_current(i, [d]):
+            pins, state["refused"] = None, "frame_changed"
+        if pins is not None and time.monotonic() >= stop:
+            pins, state["refused"] = None, "too_late"
+        if pins is not None:
+            state["repins"] += 1
+        return pins
 
     async def _payment_scope_current(self, i: PaymentInspection, receiving: list) -> bool:
         """dlz: between the documents of a split fill, bounded and against the pinned state (no OOPIF
@@ -1299,59 +1373,81 @@ class PaymentSupervisionMixin:
         return bool(i.tree) and isinstance(url, str) and url != i.tree[0][2]
 
     async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None,
-                                       strict: bool = False, paced=None) -> dict:
+                                       strict: bool = False, paced=None, repin=None, resumed: int | None = None,
+                                       exposed=None) -> dict:
         """One document's commit. ``paced`` (strict fills in a frame, and every document of an unreviewed fill): an
         async ``check(point)`` run after each focus, before that field's setter; anything but True (False or an error
-        type from ``_PACED_STOPS``) stops the document with nothing more written.
+        type from ``_PACED_STOPS``) stops the document with nothing more written. ``repin`` (reviewed fills): an
+        async ``answer(request)`` for the closure's re-pin requests (``_repin``); without it the closure is not
+        told to re-pin, only its ``pending`` pause is answered, and a re-pin request or deferral is an invalid
+        answer. ``resumed``: the count a suspended document wrote before its deferral; its commit is resumed, not
+        started. A deferral answers ``{deferred: True, filled_fields}``. ``exposed`` (with ``repin``): the same kind of
+        check as ``paced``, for the pause the closure makes after a re-pinned field's focus when ``paced`` is None.
         dlz (Codex B r2 #2): the commit call carries the values, and each resume() runs a setter, so from the first
         call on a lost, failed or malformed reply means a write may have landed: the result then says so
         (``write_uncertain``, ``partially_filled``) with the last acknowledged count of this document's writes,
         never as if nothing was written."""
-        acknowledged = 0
+        acknowledged = resumed or 0
+        tokens = frozenset(str(f.get("token") or "") for f in fills)
+        # dlz: the commit call of a fill without re-pin is the one it always was (four arguments).
+        names = "fills,deadline,strict,paced" + (",repin" if repin is not None else "")
 
         def uncertain(error_type: str) -> dict:
             return {"success": False, "error_type": error_type, "filled_fields": acknowledged,
                     "partially_filled": True, "write_uncertain": True}
 
+        async def answer(pins: Any = None, repinned: bool = False) -> Any:
+            # A re-pin answer (pins, or null to stop) is passed in; any other resume carries nothing.
+            call = {"functionDeclaration": "function(a){return this.resume(a)}", "arguments": [{"value": pins}]} \
+                if repinned else {"functionDeclaration": "function(){return this.resume()}"}
+            return _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": d.object_id, **call, "returnByValue": True}, session_id=d.frame_session))
+
         try:
-            result = _value(
+            result = await answer() if resumed is not None else _value(
                 await self._cdp(
                     "Runtime.callFunctionOn",
                     {
                         "objectId": d.object_id,
-                        "functionDeclaration": "function(fills,deadline,strict,paced){"
-                                               "return this.commit(fills,deadline,strict,paced)}",
+                        "functionDeclaration": f"function({names}){{return this.commit({names})}}",
                         "arguments": [{"value": fills}, {"value": deadline_ms}, {"value": strict is True},
-                                      {"value": paced is not None}],
+                                      {"value": paced is not None}, *([{"value": True}] if repin is not None else [])],
                         "returnByValue": True,
                     },
                     session_id=d.frame_session,
                 )
             )
-            for _ in range(len(fills) + 1):
-                if paced is None or not isinstance(result, dict) or result.get("pending") is not True:
+            for _ in range((len(fills) + 1) * (MAX_REPINS + 2 if repin is not None else 1)):
+                kind = _pause_kind(result, repin is not None)
+                check = paced or (exposed if repin is not None else None)
+                if kind is None or (kind == "pending" and check is None):
                     break
                 attempted = result.get("filled_fields")
-                # dlz (Codex B r3 #2): the focus point is checked here for every document, the top one included
-                # (its paced check reads no point): a finite number each, never a bool or a missing value.
-                if set(result) != {"pending", "filled_fields", "x", "y"} or type(attempted) is not int \
-                        or not acknowledged <= attempted < len(fills) \
-                        or not all(type(result[k]) in (int, float) and math.isfinite(result[k]) for k in ("x", "y")):
+                if kind == "pending":
+                    # dlz (Codex B r3 #2): the focus point is checked here for every document, the top one included
+                    # (its paced check reads no point): a finite number each, never a bool or a missing value.
+                    if set(result) != {"pending", "filled_fields", "x", "y"} or type(attempted) is not int \
+                            or not acknowledged <= attempted < len(fills) \
+                            or not all(type(result[k]) in (int, float) and math.isfinite(result[k]) for k in ("x", "y")):
+                        return uncertain("payment_result_invalid")
+                elif not valid_pause(result, kind, tokens, len(fills), acknowledged):
                     return uncertain("payment_result_invalid")
                 acknowledged = attempted
-                verdict = await paced((result["x"], result["y"]))
+                if kind == "deferred":
+                    return {"deferred": True, "filled_fields": attempted}
+                if kind == "repin":
+                    result = await answer(await repin(result), repinned=True)
+                    continue
+                verdict = await check((result["x"], result["y"]))
                 if verdict is not True:
                     # dlz: the focused field is never written; earlier fields of this document are reported.
                     return {"success": False,
                             "error_type": verdict if verdict in _PACED_STOPS else "payment_page_changed",
                             "filled_fields": attempted, "partially_filled": attempted > 0}
-                result = _value(await self._cdp("Runtime.callFunctionOn", {
-                    "objectId": d.object_id, "functionDeclaration": "function(){return this.resume()}",
-                    "returnByValue": True,
-                }, session_id=d.frame_session))
+                result = await answer()
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; typed, never retried
             return uncertain("payment_transport_uncertain")
-        if not _valid_document_result(result, len(fills)) or result["filled_fields"] < acknowledged:
+        if not _valid_document_result(result, len(fills), tokens) or result["filled_fields"] < acknowledged:
             return uncertain("payment_result_invalid")  # dlz (Codex B r3 #1): a count never goes backwards
         if result["success"] is not True and (acknowledged or result.get("filled_fields", 0)):
             # An acknowledged write is never reported away by a later answer, nor by its own partial flag.
@@ -1693,7 +1789,20 @@ _DOCUMENT_ERRORS = frozenset({"payment_fields_changed", "payment_consent_expired
                               "payment_expiry_option_unmatched", "payment_validation_failed"})
 
 
-def _valid_document_result(result: Any, fills: int) -> bool:
+def _pause_kind(result: Any, repin: bool) -> str | None:
+    """Which pause a closure answer is (``pending``; with ``repin`` also ``repin``, ``deferred``), or None for a
+    final answer."""
+    if not isinstance(result, dict):
+        return None
+    return next((k for k in (("pending", "repin", "deferred") if repin else ("pending",)) if result.get(k) is True), None)
+
+
+def _repins(result: dict, state: dict) -> dict:
+    """dlz (re-pin): the commit's result, with how many re-pins it accepted (a count only) when there were any."""
+    return {**result, "fill_repins": state["repins"]} if state.get("repins") else result
+
+
+def _valid_document_result(result: Any, fills: int, tokens: frozenset = frozenset()) -> bool:
     """dlz (Codex B r2 #2, r3 #1): one document's final commit answer, exact keys and types. A success is exactly
     ``{success, filled_fields}`` with every one of the ``fills`` written; a failure names its error type and counts
     at most ``fills``."""
@@ -1703,7 +1812,8 @@ def _valid_document_result(result: Any, fills: int) -> bool:
     if result["success"]:
         return set(result) == {"success", "filled_fields"} and type(count) is int and count == fills
     # dlz (Codex B r4 #1): one of the closure's own error types, and always an explicit count (0 before any write).
-    return (not set(result) - {"success", "filled_fields", "error_type", "partially_filled"}
+    return (not set(result) - {"success", "filled_fields", "error_type", "partially_filled", "check"}
+            and ("check" not in result or valid_check(result["check"], tokens, fills))
             and type(result.get("error_type")) is str and result["error_type"] in _DOCUMENT_ERRORS
             and type(count) is int and 0 <= count <= fills
             and type(result.get("partially_filled", False)) is bool)
@@ -1715,238 +1825,7 @@ def _partial(result: dict, filled_before: int) -> dict:
         return result
     return {**result, "filled_fields": filled_before + result.get("filled_fields", 0), "partially_filled": True}
 
-_INSPECT_TEMPLATE = r"""(() => {
-  // dlz (B2, B3): null on the reviewed path; the discovery inspection's limits and exposure test otherwise.
-  const LIM = __LIMITS__;
-  const exposedFn = LIM ? __EXPOSED__ : null;
-  // dlz: the document's monotonic clock at creation; commit deadlines count from here (_renderer_deadline_ms).
-  const born = performance.now();
-  // dlz: and its wall clock. Commit requires BOTH elapsed times inside the deadline: the monotonic one
-  // pauses while a remote browser's machine sleeps (macOS ticks exclude sleep), the wall one does not;
-  // a wall-clock step alone cannot reopen the window; a constant browser/host offset cancels out.
-  const bornWall = Date.now();
-  const doc = document, href = location.href;
-  // Inputs and selects in document order, including those inside open shadow roots (Unzer UI v2
-  // renders every card input in one); closed roots stay out of reach and therefore out of scope. A
-  // select is only ever an expiry month or year (PAYONE, Worldline HTP, Computop).
-  // dlz (B3): discovery stops at LIM.inputs fields or LIM.shadow nested shadow roots and marks the overflow.
-  let overflow = false;
-  const allInputs = () => {
-    const out = [];
-    const walk = (root, depth) => {
-      if (LIM && depth > LIM.shadow) { overflow = true; return; }
-      for (const n of root.querySelectorAll('*')) {
-        if (n.tagName === 'INPUT' || n.tagName === 'SELECT') {
-          out.push(n);
-          if (LIM && out.length > LIM.inputs) { overflow = true; return; }
-        }
-        if (n.shadowRoot) walk(n.shadowRoot, depth + 1);
-        if (overflow) return;
-      }
-    };
-    walk(doc, 0);
-    return out;
-  };
-  const cut = v => LIM ? String(v).slice(0, LIM.text) : v;
-  const elements = allInputs();
-  const isSelect = e => e.tagName === 'SELECT';
-  // A select's options (months, years: never a secret) are part of the description, so a list that
-  // is re-populated after consent fails valid() like any other changed field.
-  const describeOne = (e,index) => ({index, autocomplete:cut(e.autocomplete),
-    name:cut(e.name+' '+e.id), label:cut((e.labels?Array.from(e.labels,l=>l.textContent).join(' '):'')+' '+
-      (e.getAttribute('aria-label')||'')+' '+(e.placeholder||'')),
-    type:isSelect(e)?(e.multiple?'select-multiple':'select'):e.type,
-    formIndex:e.form?Array.from(doc.forms).indexOf(e.form):null,
-    maxLength:e.maxLength>0?e.maxLength:null,
-    ...(isSelect(e)?{options:Array.from(e.options,o=>[o.value,o.text.slice(0,64),o.disabled]).slice(0,400)}:{})});
-  const describe = () => elements.map(describeOne);
-  // Honeypots and visually-hidden inputs are never fill targets: Shopify's PCI frames carry one
-  // aria-hidden, tabindex=-1, 1px input per card token around the real field, and filling one
-  // is a fraud signal.
-  const visible = e => !(e.disabled || e.readOnly || !e.isConnected || e.ownerDocument !== doc ||
-      e.getAttribute('aria-hidden') === 'true' || e.tabIndex < 0 || e.hasAttribute('data-honeypot-field')) &&
-    shown(e);
-  // Laid out and visible to the user; also what the settled retention check requires of a written field.
-  const shown = e => {
-    const r = e.getBoundingClientRect(), s = getComputedStyle(e);
-    // Mollie keeps a transparent, click-through focus-trap input beside each real field.
-    return e.getClientRects().length>0 && r.width > 2 && r.height > 2 && s.visibility !== 'hidden' &&
-      Number(s.opacity) > 0 && s.pointerEvents !== 'none' &&
-      (typeof e.checkVisibility !== 'function' ||
-       e.checkVisibility({opacityProperty: true, visibilityProperty: true}));  // a transparent ancestor too
-  };
-  const skipped = ['hidden','submit','button','reset','file','image','checkbox','radio','select-multiple'];
-  // dlz (B2): discovery also drops a field the user is not actually shown (clipped, covered, offscreen,
-  // transparent), so a hidden copy is no candidate and cannot make the real form ambiguous. dlz (Codex B r1 #7):
-  // true, false or null; a fillable-looking field whose exposure is unknown makes the reading unknown, never hidden.
-  const exposure = e => skipped.includes(e.type) || !visible(e) ? false : exposedFn ? exposedFn(e) : true;
-  const judged = elements.map((e,index)=>({e,index,x:exposure(e)}));
-  const unknown = judged.some(x => x.x !== true && x.x !== false);
-  const entries = judged.filter(x=>x.x === true);
-  const selected = new Set(entries.map(x=>x.index));
-  // dlz (Codex B r1 #2): discovery binds the exposed set: a field hidden at inspection and shown now (a revealed
-  // duplicate) or one whose exposure became unknown changes the document.
-  const unexposed = () => !LIM || elements.every((e,n)=>selected.has(n) || exposure(e) === false);
-  const signature = JSON.stringify(describe());
-  // dlz: the owner chain this document can reach synchronously (same-origin ancestors, pinned now) and the
-  // top URL when readable: page code run by focus can hide a parent iframe or rewrite the top URL
-  // (history.replaceState) without touching this document. Cross-origin ancestors are out of reach of
-  // this document's scripts, and out of this check (between documents, control re-checks the owners).
-  const scopeChain = [];
-  for (let w = globalThis, k = 0; k < 8; k++) {
-    let fe = null, pw = null, ph = null;
-    try { fe = w.frameElement; pw = w.parent; ph = fe && pw ? pw.location.href : null; } catch (_) { fe = null; }
-    if (!fe || !pw || pw === w || typeof ph !== 'string') break;
-    scopeChain.push({fe, pw, ph});
-    w = pw;
-  }
-  const readTop = () => { try { const t = globalThis.top; return t && t !== globalThis ? String(t.location.href) : null; }
-                          catch (_) { return null; } };
-  const topHref = readTop();
-  const ownerShown = e => {
-    const v = e.ownerDocument && e.ownerDocument.defaultView;
-    if (!e.isConnected || !v) return false;
-    const r = e.getBoundingClientRect(), s = v.getComputedStyle(e);
-    return e.getClientRects().length > 0 && r.width > 2 && r.height > 2 && s.visibility !== 'hidden' &&
-      Number(s.opacity) > 0 && (typeof e.checkVisibility !== 'function' ||
-        e.checkVisibility({opacityProperty: true, visibilityProperty: true}));
-  };
-  const scope = () => scopeChain.every(c => { try { return c.pw.location.href === c.ph && ownerShown(c.fe); }
-                                             catch (_) { return false; } }) &&
-    (topHref === null || readTop() === topHref);
-  const valid = () => document === doc && location.href === href && scope() &&
-    JSON.stringify(describe()) === signature &&
-    (now => now.length === elements.length && now.every((e,n)=>e === elements[n]))(allInputs()) &&
-    entries.every(x=>visible(x.e)) && unexposed();
-  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
-  const selectSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;
-  // A select fill names the value of exactly one enabled option, chosen on the inspected options.
-  const oneOption = (el,v) => Array.from(el.options).filter(o=>o.value === v && !o.disabled).length === 1 &&
-    Array.from(el.options).filter(o=>o.value === v).length === 1;
-  // One value in two spellings: providers re-format as they mask ("07/35" -> "07 / 35" or "0735",
-  // grouped card numbers, upper-cased names). Anything else is a different value.
-  const same = (a,b) => a.replace(/[\s\/.-]/g,'').toUpperCase() === b.replace(/[\s\/.-]/g,'').toUpperCase();
-  const live = el => el.isConnected && el.ownerDocument === doc && allInputs().includes(el);
-  // dlz: strict mode (unreviewed destinations): the focused field is what the user would hit at its centre.
-  const hits = el => {
-    const r = el.getBoundingClientRect(), root = el.getRootNode ? el.getRootNode() : doc;
-    const at = (root && typeof root.elementFromPoint === 'function' ? root : doc)
-      .elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-    return at === el;
-  };
-  let used = false, written = null, paused = null;
-  // One step of the commit; a finished (or never started) commit answers changed, never a second run.
-  const advance = () => {
-    const step = paused ? paused.next() : {done: true, value: {success:false,error_type:'payment_fields_changed',filled_fields:0}};
-    if (step.done) paused = null;
-    return step.value;
-  };
-  // dlz (B3): the description, or the overflow marker (too many fields, nested shadow roots, or too large), or
-  // the unknown marker (a field whose exposure cannot be judged).
-  const bounded = (d, unsure) => overflow || (LIM && JSON.stringify(d).length > LIM.bytes) ? {overflow:true} :
-    unsure ? {unknown:true} : d;
-  return {
-    describe:()=>bounded(describe().filter(x=>selected.has(x.index)), unknown), valid,
-    // dlz (B4, discovery only): the fields shown now, for a card-free document's absence check; null once the
-    // document or its URL changed.
-    scan: () => {
-      if (!LIM || document !== doc || location.href !== href) return null;
-      const now = allInputs().map((e,index)=>({e,index,x:exposure(e)}));
-      return bounded(now.filter(x=>x.x === true).map(x=>describeOne(x.e,x.index)),
-                     now.some(x => x.x !== true && x.x !== false));
-    },
-    // After every document was written and the page had time to settle: does each written field still
-    // hold its value? States and lengths only; a value never leaves this world. Answers once.
-    retained: () => {
-      const w = written;
-      written = null;
-      if (!w) return null;
-      const page = document === doc && location.href === href;
-      return w.map(f => {
-        const el = elements[f.index];
-        // dlz: a field the provider hid in favour of a fresh input is not the one the user sees.
-        if (!page || !live(el) || !shown(el)) return {token:f.token,state:'replaced',length:0};
-        return {token:f.token,state:same(el.value,f.value)?'held':el.value?'changed':'empty',length:el.value.length};
-      });
-    },
-    commit: (fills, deadline, strict, paced) => {
-      if (used || !valid()) return {success:false,error_type:'payment_fields_changed',filled_fields:0};
-      used = true;
-      // dlz: `deadline` is ms after `born` on this document's monotonic clock (never Date.now(): a wall-clock
-      // step must not reopen the window); checked here and again before every setter. Not a number: late.
-      const late = () => !(typeof deadline === 'number' && performance.now() - born < deadline &&
-                           Date.now() - bornWall < deadline);
-      if (late()) return {success:false,error_type:'payment_consent_expired',filled_fields:0};
-      if (!Array.isArray(fills) || !fills.length ||
-          fills.some(f=>!selected.has(f.index) || typeof f.value !== 'string' || !f.value) ||
-          new Set(fills.map(f=>f.index)).size !== fills.length)
-        return {success:false,error_type:'payment_fields_invalid',filled_fields:0};
-      // Every select target is checked before ANY write in this document: zero or several matching
-      // options leave the whole document untouched.
-      const selects = fills.filter(f=>isSelect(elements[f.index]));
-      if (selects.some(f=>!['cc-exp-month','cc-exp-year'].includes(f.token)))
-        return {success:false,error_type:'payment_fields_invalid',filled_fields:0};
-      if (selects.some(f=>!oneOption(elements[f.index],f.value)))
-        return {success:false,error_type:'payment_expiry_option_unmatched',filled_fields:0};
-      // Native setters in an isolated world, one field at a time with its own events, the card number
-      // last: a controlled form (Stripe Card/Payment Element) re-renders on each input event and would
-      // reset sibling fields written before the event they never saw; brand detection on the number
-      // re-shapes the CVC (Braintree, Mollie). Writes only reach the pinned element references.
-      for (const f of fills) elements[f.index].style.setProperty('-webkit-text-security','disc','important');
-      const ordered = fills.slice().sort((a,b)=>(a.token==='cc-number')-(b.token==='cc-number'));
-      // Page handlers run between these writes, so each target is re-checked first, and success is
-      // judged on the inputs still in the document: a re-render that replaced a node must not let
-      // its detached copy report a value the live form does not hold.
-      written = fills.map(f=>({index:f.index,token:String(f.token||''),value:f.value}));
-      let attempted = 0;
-      const changed = () => ({success:false,error_type:'payment_fields_changed',filled_fields:attempted,
-                              partially_filled:attempted>0});
-      const expired = () => ({success:false,error_type:'payment_consent_expired',filled_fields:attempted,
-                              partially_filled:attempted>0});
-      // dlz: `paced` (strict fills in a frame): after each focus the closure pauses and hands back the field's
-      // centre; the supervisor checks the cross-origin owner chain from the parents (unreachable from here)
-      // and only then calls resume(), which re-runs every local check before the setter. Unpaced, the same
-      // steps run in one go.
-      const steps = function* () {
-        for (const f of ordered) {
-          const el = elements[f.index];
-          if (!valid() || !live(el))
-            return changed();
-          el.focus();
-          if (late())  // focus handlers run page code; never write past the window
-            return expired();
-          if (paced === true) {
-            const r = el.getBoundingClientRect();
-            yield {pending:true,filled_fields:attempted,x:r.left + r.width / 2,y:r.top + r.height / 2};
-          }
-          // dlz: focus handlers can hide, swap, relabel or navigate: the whole pinned set is re-checked
-          // right before this setter, not only before the loop.
-          if (!valid() || !live(el) || !shown(el) || (strict === true && !hits(el)))
-            return changed();
-          if (late())  // the checks above run page-visible code too (layout, style): the window again, last
-            return expired();
-          attempted += 1;
-          if (isSelect(el)) {
-            selectSetter.call(el,f.value);
-            el.dispatchEvent(new Event('input',{bubbles:true}));
-          } else {
-            setter.call(el,f.value);
-            el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
-          }
-          el.dispatchEvent(new Event('change',{bubbles:true}));
-          el.dispatchEvent(new FocusEvent('blur'));
-          el.blur();
-        }
-        const held = fills.filter(f=>live(elements[f.index]) && same(elements[f.index].value,f.value)).length;
-        return held === fills.length && location.href === href ? {success:true,filled_fields:held} :
-          {success:false,error_type:'payment_validation_failed',filled_fields:held,partially_filled:true};
-      };
-      paused = steps();
-      return advance();
-    },
-    resume: () => advance()
-  };
-})()"""
+
 _INSPECT = _INSPECT_TEMPLATE.replace("__LIMITS__", "null").replace("__EXPOSED__", "null")
 _INSPECT_DISCOVERY = (_INSPECT_TEMPLATE.replace("__LIMITS__", json.dumps(_DISCOVERY_LIMITS))
                       .replace("__EXPOSED__", _EXPOSED))

@@ -95,10 +95,10 @@ _UNAVAILABLE_TEXT = (
 )
 LOCKED_TEXT = (
     "The browser is locked for a card payment: page reads, scripts, input, screenshots and attaching to tabs "
-    "are refused until the payment tab is closed. Tabs can still be listed (browser_cdp Target.getTargets, no "
-    "params: each tab's site (origin) only, no title) and closed (browser_cdp Target.closeTarget {targetId}). Continue with "
-    "browser_vault payment_controls / payment_click on the payment tab, and call payment_done after Pay: it "
-    "hands the confirmation over and ends the lock."
+    "are refused until the payment tab is closed. Continue with browser_vault payment_controls / payment_click on "
+    "the payment tab, and call payment_done after Pay: it hands the confirmation over and ends the lock. If the "
+    "payment will not go ahead (a stopped fill, the user cancelled), call browser_vault payment_close: it closes "
+    "the payment tab and ends the lock, without a confirmation."
 )
 
 
@@ -184,8 +184,11 @@ def claim_payment_surface(supervisor: Any, inspected: Any) -> Optional[dict]:
 
 
 def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> Optional[dict]:
+    gen = None
     with _LOCK:
         held_before = supervisor in _HELD
+        if not held_before:  # a new lock of this process (pressed_in_lock)
+            gen = _GENS[supervisor] = _LockGen(known=_PRESSING_N == 0 and supervisor not in _KNOWN_LOCKED)
         _HELD.add(supervisor)
         _CLAIMING[supervisor] = _CLAIMING.get(supervisor, 0) + 1
         _EPOCHS[supervisor] = _EPOCHS.get(supervisor, 0) + 1
@@ -197,6 +200,9 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
         result = reply.get("result") if isinstance(reply, dict) else None
         if not parse_claim_result(result, [tab]) or getattr(supervisor, "_ws", None) is not ws:
             raise SurfaceRefused("claim not confirmed")
+        if gen is not None and set(result["tabs"]) != {tab}:  # control's lock already held other tabs
+            with _LOCK:
+                gen.known = False
     except Exception as exc:  # health: allow BLE001 -- CDP/transport text is not surfaced; fixed type only
         if _control_refused(exc) and not held_before:
             # Only control's own refusal proves nothing changed; any other failure keeps the lock here,
@@ -204,6 +210,8 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
             with _LOCK:
                 if _CLAIMING.get(supervisor, 0) <= 1:
                     _HELD.discard(supervisor)
+                    if gen is not None and _GENS.get(supervisor) is gen:
+                        _GENS.pop(supervisor, None)
         logger.warning("card fill refused: payment surface claim failed (%s)", type(exc).__name__)
         return _refusal(UNAVAILABLE, _UNAVAILABLE_TEXT)
     finally:
@@ -259,6 +267,7 @@ def lock_status(supervisor: Any) -> str:
         if state == "unlocked":
             released = supervisor in _HELD or supervisor in _KNOWN_LOCKED
             _HELD.discard(supervisor)
+            _GENS.pop(supervisor, None)  # the lock ended
             _KNOWN_LOCKED.discard(supervisor)
         elif state == "locked":
             _KNOWN_LOCKED.add(supervisor)
@@ -743,19 +752,90 @@ def payment_controls(supervisor: Any) -> dict:
     return _with_dialog(supervisor, _run(supervisor, lambda _deadline: _controls(supervisor)))
 
 
+# dlz (Codex r3 P1, r4 P1): payment_click / payment_close admission, process-wide under _LOCK (not per supervisor:
+# a supervisor replaced after a reconnect drives the same browser slot). A close is admitted only with no click
+# running anywhere in this process, and a click only with no close admitted anywhere.
+_PRESSING_N = 0  # payment_click calls running (their press may be on the wire)
+_CLOSING_N = 0  # payment_close calls admitted and not yet returned
+
+
+class _LockGen:
+    """dlz (Codex r4 P2, Opus r4 P2-1): one lock this process started (a claim while it held none). ``pressed``: a
+    payment_click admitted during this lock started a press (or may have). ``known``: this process saw the whole
+    lock, so ``pressed`` False means no press. Unknown when the lock began while a click was still running (its
+    press may have landed in it), when control already reported the slot locked, or when control's lock already
+    held other tabs. Read and written under ``_LOCK``."""
+
+    __slots__ = ("known", "pressed")
+
+    def __init__(self, known: bool):
+        self.known, self.pressed = known, False
+
+
+# supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
+_GENS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_CLICK_CLOSING = ("payment_close is closing the payment tab on this browser, so nothing was pressed. Wait for its "
+                  "result; if the payment goes on, call payment_controls again afterwards.")
+
+
+def pressing() -> bool:
+    """Whether a payment_click of this process is still running (its press may be on the wire)."""
+    with _LOCK:
+        return _PRESSING_N > 0
+
+
+def admit_close(supervisor: Any) -> tuple[bool, Optional[bool]]:
+    """payment_close's admission: ``(False, None)`` while any payment_click of this process runs (nothing may be
+    closed). Otherwise the close is marked running, so no click starts until ``end_close``, and the second value
+    is ``pressed_in_lock``: True or False only when this process held this supervisor's lock since it started
+    (and saw it whole); None when that is unknown (a replaced supervisor, a restart, an unlock read in between)."""
+    global _CLOSING_N
+    with _LOCK:
+        if _PRESSING_N > 0:
+            return False, None
+        _CLOSING_N += 1
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        return True, (gen.pressed if gen is not None and gen.known else None)
+
+
+def end_close() -> None:
+    """Once per admitted close, on every exit."""
+    global _CLOSING_N
+    with _LOCK:
+        _CLOSING_N = max(0, _CLOSING_N - 1)
+
+
+def closing() -> bool:
+    with _LOCK:
+        return _CLOSING_N > 0
+
+
 def payment_click(supervisor: Any, ref: str) -> dict:
     """``browser_vault action=payment_click ref=…``: one trusted click on a control of the latest listing.
     Refs are single-use: the ref is taken out of the listing for the click and stays dead once a press
     started (successful or uncertain); a second press needs a fresh payment_controls."""
-    with _LOCK:
+    global _PRESSING_N
+    gen = None
+    with _LOCK:  # dlz (Codex r3/r4 P1): one step admits the click against a payment_close running anywhere
+        if _CLOSING_N > 0:  # the ref stays in its listing
+            return _refusal("payment_close_busy", _CLICK_CLOSING)
         issued = _ISSUED.get(supervisor)
         spec = issued.pop(ref, None) if isinstance(ref, str) and _REF_RE.fullmatch(ref) and issued else None
+        if spec is not None:  # dlz (Opus r2): payment_close does not close the tab under a press still running
+            _PRESSING_N += 1
+            gen = _GENS.get(supervisor) if supervisor in _HELD else None  # the lock this press belongs to
     if spec is None:
         return _refusal("payment_control_unknown", "ref must be one returned by the latest payment_controls and "
                                                    "not used for a press yet; call payment_controls again.")
     progress: list = []
-    out = _with_dialog(supervisor, _run(supervisor, lambda deadline: _click(supervisor, spec, progress, deadline),
-                                        progress))
+    try:
+        out = _with_dialog(supervisor, _run(supervisor, lambda deadline: _click(supervisor, spec, progress, deadline),
+                                            progress))
+    finally:
+        with _LOCK:
+            if progress and gen is not None and _GENS.get(supervisor) is gen:  # never a later lock
+                gen.pressed = True
+            _PRESSING_N = max(0, _PRESSING_N - 1)
     if out.get("success"):
         out["clicked"] = ref
     elif not progress:  # nothing was pressed: the ref stays usable, if its listing is still the latest

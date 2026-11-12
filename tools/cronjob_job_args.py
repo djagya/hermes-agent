@@ -524,6 +524,12 @@ def _format_job(job: dict[str, Any]) -> dict[str, Any]:
         result["context_from"] = external_refs
     if isinstance(job.get("attach_to_session"), bool):
         result["attach_to_session"] = job["attach_to_session"]
+    if job.get("fallback_providers"):
+        # Projection, never the raw rows: a hand-edited jobs.json entry may carry a key the runtime
+        # strips (api_key, key_env); it must not reach an agent-visible result either.
+        result["fallback_providers"] = [
+            {k: e[k] for k in ("provider", "model", "base_url") if isinstance(e.get(k), str)}
+            for e in job["fallback_providers"] if isinstance(e, dict)]
     return result
 
 

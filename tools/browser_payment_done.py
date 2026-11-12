@@ -396,9 +396,9 @@ def _refusal(error_type: str, message: str, **extra) -> dict:
 
 
 _NO_PAYMENT = ("No card payment by Hermes is recorded for this browser connection, so there is no payment tab to "
-               "hand over. Nothing was done. If a checkout is still locked, close its tab or ask the user.")
+               "hand over. Nothing was done. If a checkout is still locked, call payment_close or ask the user.")
 _AMBIGUOUS = ("Card payments ran in more than one tab of this browser, so Hermes cannot tell which one to hand "
-              "over. Nothing was done. Close the payment tabs you no longer need, or ask the user.")
+              "over. Nothing was done. Ask the user; payment_close closes every payment tab (no confirmation).")
 _ORIGIN_INVALID = ("expected_origin must be the shop's exact HTTPS origin (scheme://host[:port]) and not a payment "
                    "provider or card form origin. Nothing was done.")
 _ORIGIN_REQUIRED = ("This checkout ran on a payment provider's own page, so the shop's origin is not known. Nothing "
@@ -408,17 +408,17 @@ _NOT_REACHED = ("No order confirmation was reached on the payment tab within the
                 "payment provider or bank (3-D Secure) page, a page on another site, or a page that is still "
                 "loading. The browser stays locked; nothing was clicked, closed or retried. Do not press Pay again. "
                 "url shows the site the tab is on (origin only while locked). If a bank check is waiting, ask the "
-                "user to finish it, then call payment_done again; otherwise ask the user (closing the payment tab "
-                "with browser_cdp Target.closeTarget also ends the lock, without a snapshot).")
+                "user to finish it, then call payment_done again; otherwise ask the user (payment_close closes the "
+                "payment tab and ends the lock, without a confirmation snapshot).")
 _TAB_GONE = ("The payment tab is no longer open, so there is no confirmation page to read. Nothing was done. "
              "lock_released says whether browser control has unlocked the browser; check the order with the "
              "shop or the user's email.")
 _IGNORED = ("expected_origin was ignored: it applies only when the checkout ran on a payment provider's own page. "
             "The confirmation was looked for on the checkout's own origin.")
 _NO_NEW_TAB = ("The confirmation was read, but a new tab could not be opened, so the payment tab was left open and "
-               "the browser stays locked. Use text and links; close the payment tab or ask the user to end the lock.")
+               "the browser stays locked. Use text and links; call payment_close or ask the user to end the lock.")
 _CLOSE_FAILED = ("The confirmation was read and a new tab opened, but closing the payment tab failed, and browser "
-                 "control has not confirmed the unlock. Close the payment tab or ask the user.")
+                 "control has not confirmed the unlock. Call payment_close or ask the user.")
 _UNPROVEN = ("The confirmation was read, the new tab opened and the payment tab closed, but browser control has not "
              "yet confirmed the unlock. Use text and links; if browser actions are still refused, ask the user.")
 
@@ -573,6 +573,19 @@ async def _follow(sup: Any, new_tab: str) -> None:
     with sup._state_lock:
         if sup._page_session_id == old:
             sup._page_session_id = sid
+
+
+async def _reattach(sup: Any, blank: str) -> bool:
+    """dlz (Codex r2 P2-5, r3 P2): the supervisor's page session died with the payment tab it was on. Attach it to
+    ``blank``, the tab payment_close opened, with its page domains and dialog bridge, as after a reconnect. False:
+    it did not answer; the session stays dead until the next card fill attaches to its checkout tab
+    (``_merchant_tab_session``)."""
+    try:
+        await _follow(sup, blank)
+        return True
+    except Exception as exc:  # health: allow BLE001 -- the next card fill attaches to its checkout tab
+        logger.info("payment_close: supervisor did not follow (%s)", type(exc).__name__)
+        return False
 
 
 def _redacted_page(page: dict) -> dict:
@@ -911,3 +924,138 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     if not result["lock_released"]:
         result["note"] = _UNPROVEN if result["payment_tab_closed"] else _CLOSE_FAILED
     return result
+
+
+_CLOSE_NOT_LOCKED = "The browser is not locked for a card payment and no payment tab is open; nothing was closed."
+_CLOSE_NOTHING = ("No open tab of this browser holds the payment lock (browser control did not name one and Hermes "
+                  "recorded none), so nothing was closed. Ask the user to end the lock.")
+_CLOSE_BUSY = "Another payment step is running on this browser, so nothing was closed. Try payment_close once more."
+_CLOSE_BROWSER = "The browser could not list its tabs, so nothing was closed. Ask the user."
+_CLOSE_PARTIAL = ("Not every payment tab could be closed, and browser control has not confirmed the unlock. Ask the "
+                  "user to end the lock.")
+_CLOSE_UNPROVEN = ("The payment tab was closed, but browser control has not yet confirmed the unlock. If browser "
+                   "actions are still refused, ask the user.")
+# dlz (Opus r2): payment_close cannot know whether Pay was pressed (a 3-D Secure step may still be running).
+_CLOSE_DONE = ("The payment tab was closed without a confirmation. If Pay was already pressed (a 3-D Secure step "
+               "counts), the payment may still go through: tell the user, and do not pay again. After Pay the way "
+               "out is payment_done, not payment_close.")
+
+
+def _owning_tabs(supervisor: Any) -> tuple[str, frozenset]:
+    """Control's lock state and owning tabs; ``("unknown", ∅)`` when it cannot answer."""
+    from tools.browser_payment_surface import STATUS_METHOD
+
+    try:
+        reply = _wait(supervisor._cdp(STATUS_METHOD, {}, timeout=5), supervisor._loop, timeout=7)
+        return parse_lock_status(reply.get("result") if isinstance(reply, dict) else None)
+    except Exception:  # health: allow BLE001 -- an unanswered status names no tab
+        return "unknown", frozenset()
+
+
+def _close_payment_tabs(supervisor: Any, loop: Any, tabs: list, targets: list) -> tuple:
+    """Under the claim lock: a blank tab first when ``targets`` are every open tab, then each target closed once.
+    Returns ``(blank tab or None, tabs closed, whether the supervisor's page was one of them)``."""
+    blank = None
+    if {t["targetId"] for t in tabs} <= set(targets):
+        context = next((t.get("browserContextId") for t in tabs
+                        if t["targetId"] in targets and t.get("browserContextId")), None)
+        try:
+            blank = _wait(_open_tab(supervisor, "about:blank", context), loop, timeout=15)
+        except Exception as exc:  # health: allow BLE001 -- the close goes on; the browser may end up tabless
+            logger.info("payment_close: blank tab failed (%s)", type(exc).__name__)
+    closed, on_tab = 0, False
+    for tab in targets:
+        try:
+            on_tab = _wait(_close_tab(supervisor, tab), loop, timeout=10) or on_tab
+            closed += 1
+            _forget(supervisor, tab)
+        except Exception as exc:  # health: allow BLE001 -- the status read afterwards decides what is reported
+            logger.info("payment_close: close failed (%s)", type(exc).__name__)
+    _drop_closed_tabs(supervisor)  # a close whose answer was lost
+    return blank, closed, on_tab
+
+
+def payment_close(supervisor: Any) -> dict:
+    """``browser_vault action=payment_close`` (dlz, 11-12): the way out of a payment lock without a confirmation
+    (a stopped fill, an abandoned checkout). Closes every open tab of this browser that holds the lock (control's
+    owning tabs, and the payment tabs this process claimed) over the native socket, each with exactly
+    ``Target.closeTarget {targetId}``; control sees the targets destroyed and lifts the lock the normal way, and
+    ``lock_released`` is true only when its status proves it. No snapshot, no page read, nothing clicked; a blank
+    tab is opened first only when the browser would otherwise be left without one. ``pressed_in_lock``: whether a
+    payment_click of this Hermes process started a press during this lock (not whether that press was Pay); null
+    when this process did not hold the lock since it started, so it cannot know (see ``admit_close``)."""
+    from tools.browser_payment_surface import _FENCE_WAIT_S, _claim_lock, admit_close, end_close
+
+    loop = getattr(supervisor, "_loop", None)
+    if loop is None or not loop.is_running():
+        return _refusal("supervisor_required", "The supervised browser is not attached; nothing was done.")
+    lock = _claim_lock(supervisor)  # one claim, dialog answer or recovery call at a time
+    if not lock.acquire(timeout=_FENCE_WAIT_S):
+        return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
+    held = [True]
+
+    def release() -> None:
+        if held[0]:
+            held[0] = False
+            lock.release()
+
+    try:
+        # dlz (Codex r3 P1): admitted only with no payment_click running, and no click starts until end_close
+        admitted, pressed = admit_close(supervisor)
+        if not admitted:  # dlz (Opus r2): never close the tab under a payment_click still on the wire
+            return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
+        try:
+            return {**_close_admitted(supervisor, loop, release), "pressed_in_lock": pressed}
+        finally:
+            end_close()
+    finally:
+        release()
+
+
+def _close_admitted(supervisor: Any, loop: Any, release) -> dict:
+    """payment_close once admitted, the claim lock held until ``release()``."""
+    from tools.browser_payment_surface import _page_tabs
+
+    state, owning = _owning_tabs(supervisor)
+    with _LOCK:
+        recorded = set(_PAYMENTS.get(supervisor) or {})
+    try:
+        tabs = _wait(_page_tabs(supervisor), loop, timeout=10)
+    except Exception as exc:  # health: allow BLE001 -- fixed text; nothing closed
+        logger.info("payment_close: tabs not listed (%s)", type(exc).__name__)
+        return _refusal("payment_close_failed", _CLOSE_BROWSER, closed_tabs=0, lock_released=False)
+    open_ids = {t["targetId"] for t in tabs}
+    targets = sorted(((owning if state == "locked" else frozenset()) | recorded) & open_ids)
+    if not targets:
+        for tab in recorded:
+            _forget(supervisor, tab)
+        if state == "unlocked":
+            return {"success": True, "closed_tabs": 0, "lock_released": True, "note": _CLOSE_NOT_LOCKED}
+        return _refusal("payment_close_nothing", _CLOSE_NOTHING, closed_tabs=0, lock_released=False)
+    blank, closed, followed_from = _close_payment_tabs(supervisor, loop, tabs, targets)
+    release()
+    released = _released(supervisor)
+    logger.info("payment_close: closed %d of %d payment tab(s); lock released %s", closed, len(targets), released)
+    # dlz (Codex r2 P2-5, r3 P2): the supervisor's page session died with the tab it was on. It moves only to a
+    # blank tab this call opened: the one opened before the close, else one opened now. Never to a tab that was
+    # already open (an unclaimed provider or 3-D Secure popup, another checkout). No blank: it attaches to
+    # nothing, and the next card fill attaches to its checkout tab (``_merchant_tab_session``). Left on the dead
+    # session, the next card fill and the dialog bridge would fail with "Session with given id not found".
+    if followed_from and released:  # attaching installs the dialog bridge: never on a locked slot
+        if not blank:
+            context = next((t.get("browserContextId") for t in tabs
+                            if t["targetId"] in targets and t.get("browserContextId")), None)
+            try:
+                blank = _wait(_open_tab(supervisor, "about:blank", context), loop, timeout=15)
+            except Exception as exc:  # health: allow BLE001 -- nothing attached; the next card fill attaches
+                logger.info("payment_close: blank tab failed (%s)", type(exc).__name__)
+        if blank:
+            try:
+                _wait(_reattach(supervisor, blank), loop, timeout=10)
+            except Exception as exc:  # health: allow BLE001 -- the next card fill attaches to its checkout tab
+                logger.info("payment_close: supervisor did not follow (%s)", type(exc).__name__)
+    result = {"success": closed == len(targets), "closed_tabs": closed, "lock_released": released,
+              **({"new_tab": blank} if blank else {})}
+    if closed < len(targets):
+        return {**result, "error_type": "payment_close_failed", "error": _CLOSE_PARTIAL}
+    return {**result, "note": _CLOSE_DONE if released else _CLOSE_UNPROVEN}

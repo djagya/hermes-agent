@@ -187,6 +187,20 @@ def destination_consent_enabled() -> bool:
     return destination_policy()[0]
 
 
+def payment_repin_enabled() -> bool:
+    """dlz: ``vault.payment_repin`` (experimental; not in the defaults, so off; a literal ``True`` only): a reviewed
+    card document that re-renders its fields during the fill may be re-pinned inside the same approval. Off, or
+    config that cannot be read now (also when the loader serves a last-known-good copy): any change of the pinned
+    fields stops the fill."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        from hermes_cli.config_read_errors import FailedConfigRead
+        config = load_config()
+        return not isinstance(config, FailedConfigRead) and cfg_get(config, "vault", "payment_repin", default=None) is True
+    except Exception:  # health: allow BLE001 -- unreadable config means the feature is off
+        return False
+
+
 def https_origin(value: str) -> str:
     """Require a canonical live HTTPS origin, not a URL or inferred origin."""
     if not isinstance(value, str) or not value or any(c.isspace() for c in value):
