@@ -243,7 +243,7 @@ class El {
     this.tagName = tag; this.parentElement = null; this.children = []; this.text = p.text || "";
     this.attrs = {}; this.type = p.type || ""; this.name = p.name || ""; this.id = p.id || "";
     this.autocomplete = p.autocomplete || ""; this.unreadable = !!p.unreadable; this.disabled = false; this.readOnly = false; this.labels = [];
-    this.maxLength = p.maxLength || -1; this.value = ""; this.isConnected = true;
+    this.maxLength = (p.maxLength ?? -1); this.value = ""; this.isConnected = true;
     this.style = Object.assign({ display: "block", visibility: "visible", opacity: "1" }, p.style || {});
     this.rect = p.rect || { left: 10, top: 10, width: 200, height: 30, right: 210 };
     if (p.aria) this.attrs["aria-label"] = p.aria;
@@ -501,3 +501,9 @@ def test_probe_an_unreadable_outer_block_fails_closed():
 def test_probe_a_readable_chain_within_the_cap_still_qualifies():
     res = probe(page(div(div(p("Verify your email address"), div(field())))))
     assert res["written"] == {"real": CODE}
+
+
+def test_probe_a_zero_maxlength_code_field_is_refused_and_nothing_written():
+    # Codex r3 P2: maxlength=0 was serialized as "no limit", so the whole code was written into it.
+    res = probe(page(form(p("Verify your email address"), p("Enter the code we sent to a@b.test"), field(maxLength=0))))
+    assert res["otp"] == [] and res["written"] == {}

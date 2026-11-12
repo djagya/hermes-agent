@@ -673,7 +673,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       pageUrl: document.URL,
       formAction: element.form ? element.form.action : "",
       index,
-      maxLength: element.maxLength > 0 ? element.maxLength : null,
+      maxLength: element.maxLength >= 0 ? element.maxLength : null,  // dlz: 0 is a real limit (nothing fits), not "none"
       label: [
         ...labels,
         element.getAttribute("aria-label") || "",
