@@ -6,14 +6,14 @@ Two places hold them, both filled by the card fill before any field is written:
   length (every model-facing output masks every digit run of their lengths, so nothing marks which run
   was the card) and the holder name (browser and log output only), keyed by the slot (by the supervisor's own identity without a slot
   route, :func:`window_key`). A confirmed payment lock release (:func:`release_payment_window`: control
-  proves the slot unlocked, which ``payment_done``'s ``lock_released``, a recovery close of the payment
-  tab and any later status read all go through, by whichever supervisor is attached to the slot,
+  proves the slot unlocked, which ``payment_done``'s ``lock_released`` and any later status read (after a recovery close of the payment
+  tab too) all go through, by whichever supervisor is attached to the slot,
   :func:`slot_bound`; and :func:`release_unlocked_slot`, control's own view of the slot, when no supervisor
   reads it) narrows it to browser tool results (the page may still show card text); it closes when the
   slot's exposure ends (:func:`release_slot`: a wipe, a human clear or an operator clear of its mark).
   Every release is fenced by the window generation it observed first: a claim (:func:`note_claim`) or an
   open since then wins. A fill that stops before its first write takes its open back
-  (:func:`withdraw_payment_window`, by the key and generation the open returned; sealed by
+  (:func:`withdraw_payment_window`, by the key and identity the open returned; sealed by
   :func:`seal_payment_window` when the commit starts): nothing of the card reached the page;
 * the dialog values (number, CVC, holder, expiry forms): per supervisor AND per slot, so a fresh supervisor
   for the same slot still scrubs them from dialog text while the slot's mark keeps it exposed. Dropped,
