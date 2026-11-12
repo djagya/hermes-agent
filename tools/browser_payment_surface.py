@@ -186,6 +186,8 @@ def claim_payment_surface(supervisor: Any, inspected: Any) -> Optional[dict]:
 def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> Optional[dict]:
     with _LOCK:
         held_before = supervisor in _HELD
+        if not held_before:  # a new lock: no press of it yet (pressed_in_lock)
+            _PRESSED.discard(supervisor)
         _HELD.add(supervisor)
         _CLAIMING[supervisor] = _CLAIMING.get(supervisor, 0) + 1
         _EPOCHS[supervisor] = _EPOCHS.get(supervisor, 0) + 1
@@ -259,6 +261,7 @@ def lock_status(supervisor: Any) -> str:
         if state == "unlocked":
             released = supervisor in _HELD or supervisor in _KNOWN_LOCKED
             _HELD.discard(supervisor)
+            _PRESSED.discard(supervisor)  # the lock ended
             _KNOWN_LOCKED.discard(supervisor)
         elif state == "locked":
             _KNOWN_LOCKED.add(supervisor)
@@ -744,6 +747,14 @@ def payment_controls(supervisor: Any) -> dict:
 
 
 _PRESSING: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # supervisor -> payment_click calls running
+# dlz (Codex r3 P1): payment_close calls admitted per supervisor. Admission is atomic both ways under _LOCK: a
+# close is admitted only with no click running, and a click only with no close admitted.
+_CLOSING: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# dlz (Opus r3 P3-3): supervisors where a payment_click started a press (or may have) during the current lock, as
+# this process saw it. Cleared when a claim starts a new lock and when an unlock is proven.
+_PRESSED: weakref.WeakSet = weakref.WeakSet()
+_CLICK_CLOSING = ("payment_close is closing the payment tab on this browser, so nothing was pressed. Wait for its "
+                  "result; if the payment goes on, call payment_controls again afterwards.")
 
 
 def pressing(supervisor: Any) -> bool:
@@ -752,25 +763,59 @@ def pressing(supervisor: Any) -> bool:
         return _PRESSING.get(supervisor, 0) > 0
 
 
+def admit_close(supervisor: Any) -> Optional[bool]:
+    """payment_close's admission: None while a payment_click runs (nothing may be closed); otherwise the close
+    is marked running, so no click starts until ``end_close``, and the answer is whether a press started during
+    this lock (``pressed_in_lock``)."""
+    with _LOCK:
+        if _PRESSING.get(supervisor, 0) > 0:
+            return None
+        _CLOSING[supervisor] = _CLOSING.get(supervisor, 0) + 1
+        return supervisor in _PRESSED
+
+
+def end_close(supervisor: Any) -> None:
+    """Once per admitted close, on every exit."""
+    with _LOCK:
+        left = _CLOSING.get(supervisor, 0) - 1
+        if left > 0:
+            _CLOSING[supervisor] = left
+        else:
+            _CLOSING.pop(supervisor, None)
+
+
+def closing(supervisor: Any) -> bool:
+    with _LOCK:
+        return _CLOSING.get(supervisor, 0) > 0
+
+
 def payment_click(supervisor: Any, ref: str) -> dict:
     """``browser_vault action=payment_click ref=…``: one trusted click on a control of the latest listing.
     Refs are single-use: the ref is taken out of the listing for the click and stays dead once a press
     started (successful or uncertain); a second press needs a fresh payment_controls."""
-    with _LOCK:
+    with _LOCK:  # dlz (Codex r3 P1): one step admits the click against a running payment_close
+        if _CLOSING.get(supervisor, 0) > 0:  # the ref stays in its listing
+            return _refusal("payment_close_busy", _CLICK_CLOSING)
         issued = _ISSUED.get(supervisor)
         spec = issued.pop(ref, None) if isinstance(ref, str) and _REF_RE.fullmatch(ref) and issued else None
+        if spec is not None:  # dlz (Opus r2): payment_close does not close the tab under a press still running
+            _PRESSING[supervisor] = _PRESSING.get(supervisor, 0) + 1
     if spec is None:
         return _refusal("payment_control_unknown", "ref must be one returned by the latest payment_controls and "
                                                    "not used for a press yet; call payment_controls again.")
     progress: list = []
-    with _LOCK:  # dlz (Opus r2): payment_close does not close the tab under a press that is still running
-        _PRESSING[supervisor] = _PRESSING.get(supervisor, 0) + 1
     try:
         out = _with_dialog(supervisor, _run(supervisor, lambda deadline: _click(supervisor, spec, progress, deadline),
                                             progress))
     finally:
         with _LOCK:
-            _PRESSING[supervisor] = _PRESSING.get(supervisor, 1) - 1
+            if progress:
+                _PRESSED.add(supervisor)
+            left = _PRESSING.get(supervisor, 0) - 1
+            if left > 0:
+                _PRESSING[supervisor] = left
+            else:
+                _PRESSING.pop(supervisor, None)
     if out.get("success"):
         out["clicked"] = ref
     elif not progress:  # nothing was pressed: the ref stays usable, if its listing is still the latest

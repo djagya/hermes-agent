@@ -720,17 +720,18 @@ def test_payment_close_closes_only_the_owning_tab_natively_and_proves_the_unlock
     _paid([CHECKOUT])  # another supervisor's record never widens what this one closes
     out = done.payment_close(sup)
     # the note: payment_close cannot know whether Pay was pressed; after Pay the way out is payment_done
-    assert out == {"success": True, "closed_tabs": 1, "lock_released": True, "note": done._CLOSE_DONE}
+    assert out == {"success": True, "closed_tabs": 1, "lock_released": True, "new_tab": "NEWTAB",
+                   "note": done._CLOSE_DONE, "pressed_in_lock": False}
     assert "payment_done" in out["note"] and "do not pay again" in out["note"]
     assert [c[1] for c in sup.sent("Target.closeTarget")] == [{"targetId": "TAB"}]  # never OTHER
     assert not sup.sent("Runtime.evaluate") and not sup.sent("Runtime.callFunctionOn")
-    assert not sup.sent("Target.createTarget")  # OTHER stays open: no blank tab needed
-    # Codex r2 P2-5: the supervisor was on the closed tab: it moves to the tab that stayed open (page domains and
-    # dialog bridge with the attach), after the unlock, instead of staying on a dead session
-    assert [c[1] for c in sup.sent("attach_page")] == [{"targetId": "OTHER"}] and sup._page_session_id == "S-new"
-    assert sup.index("Hermes.paymentSurfaceStatus") < sup.index("attach_page")
+    # Codex r2 P2-5, r3 P2: the supervisor was on the closed tab. After the unlock it moves to a blank tab this call
+    # opens (page domains and dialog bridge with the attach), never to OTHER, a tab it did not open
+    assert sup.index("Target.closeTarget") < sup.index("Target.createTarget")  # OTHER stayed open: none before
+    assert [c[1] for c in sup.sent("attach_page")] == [{"targetId": "NEWTAB"}] and sup._page_session_id == "S-new"
+    assert sup.index("Hermes.paymentSurfaceStatus") < sup.index("Target.createTarget") < sup.index("attach_page")
     assert done.payment_close(sup) == {"success": True, "closed_tabs": 0, "lock_released": True,
-                                       "note": done._CLOSE_NOT_LOCKED}
+                                       "note": done._CLOSE_NOT_LOCKED, "pressed_in_lock": False}
 
 
 def test_payment_close_uses_the_recorded_payment_tab_when_control_cannot_answer():
@@ -751,6 +752,33 @@ def test_payment_close_opens_a_blank_tab_first_when_it_would_close_the_last_one(
     assert sorted(c[1]["targetId"] for c in sup.sent("Target.closeTarget")) == ["OTHER", "TAB"]
     assert out["new_tab"] == "NEWTAB" and out["closed_tabs"] == 2
     assert [c[1] for c in sup.sent("attach_page")] == [{"targetId": "NEWTAB"}]  # its own blank tab, after the unlock
+    assert len(sup.sent("Target.createTarget")) == 1
+
+
+@pytest.mark.parametrize("popup", [
+    "https://pay.datatrans.com/upp/jsp/upStart.jsp",  # a provider popup the payment tab opened, never claimed
+    "https://acs.bank.test/3ds/challenge",  # a 3-D Secure challenge window
+    "https://shop2.test/checkout",  # another checkout tab of the merchant, unclaimed
+])
+def test_payment_close_follows_only_a_blank_tab_it_opened(popup):
+    """Codex r3 P2, Opus r3 P3-2: a tab that was open before the close is never followed, whatever it shows."""
+    sup = _Unlocking([CHECKOUT], status=dict(LOCKED_TAB))
+    sup.extra_tabs = [{"targetId": "POPUP", "type": "page", "url": popup, "browserContextId": "CTX"}]
+    out = done.payment_close(sup)
+    assert out["success"] is True and out["new_tab"] == "NEWTAB"
+    assert [c[1]["targetId"] for c in sup.sent("Target.closeTarget")] == ["TAB"]
+    (_, created, _, _), = sup.sent("Target.createTarget")
+    assert created == {"url": "about:blank", "browserContextId": "CTX"}  # the closed tab's context
+    assert [c[1] for c in sup.sent("attach_page")] == [{"targetId": "NEWTAB"}]
+
+
+def test_payment_close_attaches_nothing_when_it_cannot_open_a_blank_tab():
+    sup = _Unlocking([CHECKOUT], status=dict(LOCKED_TAB))
+    sup.extra_tabs = [{"targetId": "POPUP", "type": "page", "url": "https://acs.bank.test/3ds"}]
+    sup.fail.add("Target.createTarget")
+    out = done.payment_close(sup)
+    assert out["success"] is True and out["lock_released"] is True and "new_tab" not in out
+    assert not sup.sent("attach_page") and sup._page_session_id == "S-page"  # the next card fill re-attaches
 
 
 class _Stale(_Unlocking):
@@ -765,7 +793,7 @@ class _Stale(_Unlocking):
     def __init__(self, answers):
         super().__init__([CHECKOUT], status=dict(LOCKED_TAB))
         self.answers, self.bridged = answers, []
-        self.targets = {"S-new": "OTHER", "S-temp": "NEW"}
+        self.targets = {"S-new": "NEWTAB", "S-temp": "NEW"}
         self.extra_tabs = [{"targetId": "NEW", "type": "page", "url": "https://shop2.test/checkout"}]
 
     def answer(self, method, params, session_id=None):
@@ -787,7 +815,8 @@ def test_a_card_fill_after_payment_close_does_not_run_on_the_closed_tabs_session
     """Codex r2 P2-5: payment_close closed the tab the supervisor was on while another tab stayed open. The next
     card fill looked for its checkout tab over the dead page session and failed with "Session with given id not
     found". Now the supervisor moves to the open tab at the close; when that tab does not answer, the fill itself
-    treats the dead session as "on another tab" and attaches to its checkout."""
+    treats the dead session as "on another tab" and attaches to its checkout. r3 P2: the tab it moves to is the
+    blank one it opened (``answers``: whether that tab answers the attach), never OTHER."""
     sup = _Stale(answers)
     out = done.payment_close(sup)
     assert out["success"] is True and out["closed_tabs"] == 1 and out["lock_released"] is True
@@ -809,6 +838,15 @@ def test_payment_close_closes_nothing_it_cannot_name(status, error_type):
     assert out["error_type"] == error_type and out["closed_tabs"] == 0 and not sup.sent("Target.closeTarget")
 
 
+def _issue(sup):
+    with surface._LOCK:
+        surface._ISSUED[sup] = {"c1-0123456789": ("spec",)}
+
+
+def _balanced(sup):
+    return not surface.pressing(sup) and not surface.closing(sup)
+
+
 def test_payment_close_waits_for_a_payment_click_that_is_still_running(monkeypatch):
     """Opus r2: the tab is not closed under a press that may be on the wire; once the click returned, it closes."""
     sup = _Unlocking([CHECKOUT], status=dict(LOCKED_TAB))
@@ -816,15 +854,92 @@ def test_payment_close_waits_for_a_payment_click_that_is_still_running(monkeypat
 
     def click_running(supervisor, factory, progress=None):
         seen.append(done.payment_close(sup))  # a parallel payment_close while the click runs
+        progress.append(True)  # the press went out
         return {"success": True}
 
     monkeypatch.setattr(surface, "_run", click_running)
-    with surface._LOCK:
-        surface._ISSUED[sup] = {"c1-0123456789": ("spec",)}
+    _issue(sup)
     assert surface.payment_click(sup, "c1-0123456789")["clicked"] == "c1-0123456789"
     assert seen[0]["error_type"] == "payment_close_busy" and seen[0]["closed_tabs"] == 0
-    assert not sup.sent("Target.closeTarget") and not surface.pressing(sup)
-    assert done.payment_close(sup)["closed_tabs"] == 1
+    assert "pressed_in_lock" not in seen[0]  # not admitted: it says nothing about presses
+    assert not sup.sent("Target.closeTarget") and _balanced(sup)
+    out = done.payment_close(sup)
+    assert out["closed_tabs"] == 1 and out["pressed_in_lock"] is True and _balanced(sup)
+
+
+@pytest.mark.parametrize("order", ["click_first", "close_first"])
+def test_payment_close_and_payment_click_are_admitted_one_at_a_time(monkeypatch, order):
+    """Codex r3 P1, Opus r3 P3-1: a click that arrives while payment_close runs (after its admission, here while it
+    reads control's status) presses nothing and keeps its ref; a close that arrives while a click runs closes
+    nothing. Before, the close checked for a click once and a click admitted later pressed, then lost its tab."""
+    sup = _Unlocking([CHECKOUT], status=dict(LOCKED_TAB))
+    inside, go = threading.Event(), threading.Event()
+    presses, out = [], {}
+
+    def click_run(supervisor, factory, progress=None):
+        if order == "click_first":
+            inside.set()
+            go.wait(5)
+        progress.append(True)
+        presses.append([c[1] for c in sup.sent("Target.closeTarget")])
+        return {"success": True}
+
+    monkeypatch.setattr(surface, "_run", click_run)
+    real = done._owning_tabs
+
+    def slow_owning(s):  # control's status read while the close holds its admission
+        if order == "close_first":
+            inside.set()
+            go.wait(5)
+        return real(s)
+
+    monkeypatch.setattr(done, "_owning_tabs", slow_owning)
+    _issue(sup)
+    first, second = ((lambda: surface.payment_click(sup, "c1-0123456789")), (lambda: done.payment_close(sup)))
+    if order == "close_first":
+        first, second = second, first
+    t = threading.Thread(target=lambda: out.setdefault("first", first()))
+    t.start()
+    assert inside.wait(5)
+    out["second"] = second()
+    go.set()
+    t.join(10)
+    click, close = (out["first"], out["second"]) if order == "click_first" else (out["second"], out["first"])
+    assert _balanced(sup)
+    if order == "click_first":
+        assert click["clicked"] == "c1-0123456789" and presses == [[]]
+        assert close["error_type"] == "payment_close_busy" and close["closed_tabs"] == 0
+        assert not sup.sent("Target.closeTarget")
+    else:
+        assert click["error_type"] == "payment_close_busy" and presses == []  # nothing pressed
+        assert close["closed_tabs"] == 1 and close["pressed_in_lock"] is False
+        with surface._LOCK:
+            assert "c1-0123456789" in surface._ISSUED[sup]  # the ref was kept
+
+
+def test_payment_close_admission_is_released_when_the_close_fails(monkeypatch):
+    sup = _Unlocking([CHECKOUT], status=dict(LOCKED_TAB))
+
+    def broken(s):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(done, "_owning_tabs", broken)
+    with pytest.raises(RuntimeError):
+        done.payment_close(sup)
+    lock = surface._claim_lock(sup)
+    assert _balanced(sup) and lock.acquire(timeout=0)
+    lock.release()
+
+
+def test_pressed_in_lock_is_about_the_current_lock_only(monkeypatch):
+    sup = _Unlocking([CHECKOUT], status=dict(LOCKED_TAB))
+    monkeypatch.setattr(surface, "_run", lambda supervisor, factory, progress=None: progress.append(True) or {
+        "success": True})
+    _issue(sup)
+    surface.payment_click(sup, "c1-0123456789")
+    assert done.payment_close(sup)["pressed_in_lock"] is True  # the unlock is proven: that lock ended
+    sup.status, sup.tab_open = dict(LOCKED_TAB), True
+    assert done.payment_close(sup)["pressed_in_lock"] is False
 
 
 def test_payment_close_reports_a_failed_close():
