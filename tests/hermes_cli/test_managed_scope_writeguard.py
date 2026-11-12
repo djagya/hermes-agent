@@ -129,6 +129,32 @@ def test_save_keeps_a_user_pin_written_under_a_model_alias(homes, user_yaml):
     assert load_config()["model"]["default"] == "vendor/example"
 
 
+def test_a_null_user_leaf_stays_unset_so_the_managed_seed_is_not_pinned(homes):
+    """A YAML null leaf is unset on load (the managed seed fills it); a save must not write the
+    seed into the user file, or later managed changes would no longer apply."""
+    from hermes_cli import managed_scope
+    from hermes_cli.config import save_config, load_config
+    import hermes_cli.config as cfg
+
+    home, managed = homes
+    (managed / "config.yaml").write_text("display:\n  skin: managedskin\n", encoding="utf-8")
+    (home / "config.yaml").write_text("display:\n  skin: null\n", encoding="utf-8")
+    managed_scope.invalidate_managed_cache()
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    loaded = load_config()
+    assert loaded["display"]["skin"] == "managedskin"
+    loaded.setdefault("model", {})
+    save_config(loaded)
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert (cfg.read_raw_config().get("display") or {}).get("skin") != "managedskin"
+    (managed / "config.yaml").write_text("display:\n  skin: nextskin\n", encoding="utf-8")
+    managed_scope.invalidate_managed_cache()
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert load_config()["display"]["skin"] == "nextskin"
+
+
 def test_save_keeps_a_user_root_provider_over_a_managed_model_provider(homes):
     """A legacy root ``provider`` migrates under model.provider on load; it is the user's, not a seed."""
     from hermes_cli import managed_scope
