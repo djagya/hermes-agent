@@ -982,7 +982,8 @@ def payment_close(supervisor: Any) -> dict:
     ``Target.closeTarget {targetId}``; control sees the targets destroyed and lifts the lock the normal way, and
     ``lock_released`` is true only when its status proves it. No snapshot, no page read, nothing clicked; a blank
     tab is opened first only when the browser would otherwise be left without one. ``pressed_in_lock``: whether a
-    payment_click of this process started a press during this lock (not whether that press was Pay)."""
+    payment_click of this Hermes process started a press during this lock (not whether that press was Pay); null
+    when this process did not hold the lock since it started, so it cannot know (see ``admit_close``)."""
     from tools.browser_payment_surface import _FENCE_WAIT_S, _claim_lock, admit_close, end_close
 
     loop = getattr(supervisor, "_loop", None)
@@ -1000,13 +1001,13 @@ def payment_close(supervisor: Any) -> dict:
 
     try:
         # dlz (Codex r3 P1): admitted only with no payment_click running, and no click starts until end_close
-        pressed = admit_close(supervisor)
-        if pressed is None:  # dlz (Opus r2): never close the tab under a payment_click still on the wire
+        admitted, pressed = admit_close(supervisor)
+        if not admitted:  # dlz (Opus r2): never close the tab under a payment_click still on the wire
             return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
         try:
             return {**_close_admitted(supervisor, loop, release), "pressed_in_lock": pressed}
         finally:
-            end_close(supervisor)
+            end_close()
     finally:
         release()
 
