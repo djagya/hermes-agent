@@ -4,7 +4,7 @@ Two places hold them, both filled by the card fill before any field is written:
 
 * the profile-wide payment window (:func:`agent.redact_vault.register_card_window`): the number and CVC by
   length (every model-facing output masks every digit run of their lengths, so nothing marks which run
-  was the card) and the holder name, keyed by the slot (by the supervisor's own identity without a slot
+  was the card) and the holder name (browser and log output only), keyed by the slot (by the supervisor's own identity without a slot
   route, :func:`window_key`). A confirmed payment lock release (:func:`release_payment_window`: control
   proves the slot unlocked, which ``payment_done``'s ``lock_released``, a recovery close of the payment
   tab and any later status read all go through, by whichever supervisor is attached to the slot,
@@ -13,7 +13,8 @@ Two places hold them, both filled by the card fill before any field is written:
   slot's exposure ends (:func:`release_slot`: a wipe, a human clear or an operator clear of its mark).
   Every release is fenced by the window generation it observed first: a claim (:func:`note_claim`) or an
   open since then wins. A fill that stops before its first write takes its open back
-  (:func:`withdraw_payment_window`): nothing of the card reached the page;
+  (:func:`withdraw_payment_window`, by the key and generation the open returned; sealed by
+  :func:`seal_payment_window` when the commit starts): nothing of the card reached the page;
 * the dialog values (number, CVC, holder, expiry forms): per supervisor AND per slot, so a fresh supervisor
   for the same slot still scrubs them from dialog text while the slot's mark keeps it exposed. Dropped,
   every supervisor's on the slot included, only when the slot's exposure ends; they are used for dialog and
@@ -27,8 +28,6 @@ import threading
 import weakref
 from typing import Any
 
-from agent.redact_vault import UNSLOTTED_WINDOW_PREFIX as SUPERVISOR_KEY_PREFIX
-
 _LOCK = threading.Lock()
 _BY_SUPERVISOR: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # supervisor → dialog values
 _BY_SLOT: dict = {}  # (profile home, slot id) → dialog values
@@ -36,6 +35,7 @@ _WINDOWS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # supervisor 
 _SUPERVISOR_SLOTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # supervisor → slot of its dialog values
 _SUPERVISOR_KEYS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # slot-less supervisor → its window key
 _KEY_COUNTER = itertools.count(1)
+SUPERVISOR_KEY_PREFIX = "supervisor:"
 MAX_VALUES = 64
 
 
@@ -136,7 +136,10 @@ def note_claim(supervisor: Any) -> None:
 
 
 def observe_windows(supervisor: Any) -> dict:
-    """The generations of ``supervisor``'s windows, read before the status read that may release them."""
+    """The generations of ``supervisor``'s windows, read before the status read that may release them: those
+    it opened, and its route's slot only while its socket is the one that route names (:func:`slot_bound`).
+    An orphaned supervisor whose route moved to another slot reads its own browser's status, which says
+    nothing about the slot the route names now."""
     from agent.redact import card_window_generations
 
     with _LOCK:
@@ -144,7 +147,8 @@ def observe_windows(supervisor: Any) -> dict:
             keys = set(_WINDOWS.get(supervisor, ()))
         except TypeError:
             keys = set()
-    keys.add(window_key(supervisor))
+    if slot_bound(supervisor):
+        keys.add(window_key(supervisor))
     gens = card_window_generations()
     return {key: gens.get(key, 0) for key in keys}
 
@@ -166,10 +170,11 @@ def slot_bound(supervisor: Any) -> bool:
     return bool(url) and url == str(getattr(supervisor, "cdp_url", "") or "")
 
 
-def open_payment_window(secret: dict, supervisor: Any) -> int:
+def open_payment_window(secret: dict, supervisor: Any) -> tuple:
     """Register the card for every model-facing output of this profile until the release is confirmed.
-    Raises when it cannot (the fill must then stop). Returns the window's generation, for
-    :func:`withdraw_payment_window`."""
+    Raises when it cannot (the fill must then stop). Returns ``(window key, generation)`` of this open, for
+    :func:`withdraw_payment_window` and :func:`seal_payment_window`: the key is fixed here, so a route that
+    moves to another slot before the fill ends never makes it touch that slot's window."""
     from agent.redact import register_card_window
 
     key = window_key(supervisor)
@@ -181,16 +186,24 @@ def open_payment_window(secret: dict, supervisor: Any) -> int:
             _WINDOWS.setdefault(supervisor, set()).add(key)
         except TypeError:  # unscoped: closed only by its slot's release (or never: masking stays)
             pass
-    return generation
+    return key, generation
 
 
-def withdraw_payment_window(supervisor: Any, generation: int) -> bool:
-    """The fill that opened ``supervisor``'s window at ``generation`` stopped before it wrote any card value:
-    the window goes back to what it was before that open (an earlier payment's window stays). Refused, and
-    the window kept, when a claim or another fill touched it since."""
+def withdraw_payment_window(key: str, generation: int) -> bool:
+    """The fill whose open returned ``(key, generation)`` stopped before it wrote any card value: that window
+    goes back to what it was before the open (an earlier payment's window stays). Refused, and the window
+    kept, when a claim or another fill touched it since, or once that open was sealed."""
     from agent.redact import withdraw_card_window
 
-    return withdraw_card_window(window_key(supervisor), generation)
+    return withdraw_card_window(key, generation)
+
+
+def seal_payment_window(key: str, generation: int) -> None:
+    """The fill whose open returned ``(key, generation)`` starts its commit: from here a card value may be in
+    the page, so no withdraw can take that open back; only control's unlock or a mark clear ends it."""
+    from agent.redact import seal_card_window
+
+    seal_card_window(key, generation)
 
 
 def release_payment_window(supervisor: Any, observed: dict) -> None:

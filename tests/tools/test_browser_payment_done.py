@@ -690,7 +690,8 @@ def test_the_card_window_lasts_until_the_lock_release_is_confirmed(monkeypatch):
     try:
         bvp._register_card_redaction(card, sup)
         assert surface.lock_status(sup) == "unlocked"  # never locked here: the window stays
-        assert redact.redact_sensitive_text("printed 737 by Li", force=True) == "printed ••• by «redacted-card»"
+        assert redact.redact_sensitive_text("printed 737 by Li", force=True) == "printed ••• by Li"
+        assert redact.redact_sensitive_text("by Li", force=True, vault="browser") == "by «redacted-card»"
         sup.status = {"locked": True, "native": True, "tabs": ["TAB"], "unverified": False}
         assert surface.lock_status(sup) == "locked"
         sup.status = dict(UNLOCKED)

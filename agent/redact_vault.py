@@ -25,11 +25,14 @@ dlz: the scrub depends on who reads the text (``audience``, :func:`redact_regist
   character, so the JSON stays valid and a reload marks nothing.
 
 Values with a non-digit character are replaced exactly for every audience. Card values live in payment
-windows (:func:`register_card_window`, lengths and holder only, never the values), fenced by a per-window
+windows (:func:`register_card_window`, lengths and holder only, never the values). The digit classes mask
+for ``model``, ``browser`` and ``log``; the holder name only for ``browser`` and ``log`` (owner decision B,
+2026-11-12: where text from the payment slot can be; the holder is usually the owner, and a model, authored
+or other output that names them is not card data). Windows are fenced by a per-window
 generation: a claim or an open bumps it, and a release that observed an older generation changes nothing.
-A confirmed lock release keeps the window for browser results only (the page may still show card text;
-a result control's lease attributes to another slot is not masked by it); the window goes when the slot's
-mark is cleared. An open whose fill stopped before its first write is taken
+A confirmed lock release keeps the window for browser and log output only (the page may still show card
+text; every browser result of the profile, whichever slot it names: a browser_exec workspace outlives its
+slot); the window goes when the slot's mark is cleared. An open whose fill stopped before its first write is taken
 back (:func:`withdraw_card_window`): the card never left the process, so the window is as it was before.
 """
 
@@ -50,7 +53,7 @@ PLACEHOLDER = "«redacted-vault-secret»"
 CARD_PLACEHOLDER = "«redacted-card»"
 LOGIN_MASK_S = 900.0  # a pure-digit login secret masks digit runs of its length for 15 minutes
 AUDIENCES = ("model", "browser", "log", "authored")
-UNSLOTTED_WINDOW_PREFIX = "supervisor:"  # the key of a window whose browser has no slot route: it may be any slot's
+HOLDER_AUDIENCES = ("browser", "log")  # owner decision B, 2026-11-12: the card holder's name is masked only here
 _LONG = 12  # shortest card number: a pure-digit value this long also masks longer runs and spaced groups
 _ALL_DIGITS = re.compile(r"\d+")
 # Digit groups joined by single spaces, dots or dashes, matched whole (greedy): a run whose digits add up to a card
@@ -206,6 +209,17 @@ def withdraw_card_window(window: str, generation: int) -> bool:
         return True
 
 
+def seal_card_window(window: str, generation: int) -> None:
+    """The fill that opened ``window`` at ``generation`` starts writing: that open can no longer be taken back
+    (:func:`withdraw_card_window` refuses it, whoever asks). Only control's unlock or a mark clear ends it. A
+    later open of the same window (a newer generation) keeps its own undo."""
+    key = str(window or "")
+    with _VAULT_REDACTION_LOCK:
+        undo = _CARD_UNDO.get(_vault_scope()) or {}
+        if key in undo and undo[key][0] == generation:
+            del undo[key]
+
+
 def release_card_window(window: str, observed: int | None = None, *, keep_for_browser: bool = False) -> bool:
     """Close this profile's payment window ``window``; with ``keep_for_browser`` (a confirmed lock release)
     it keeps masking browser tool results only. ``observed`` is the generation the caller saw before it
@@ -240,14 +254,10 @@ def _mask_runs(text: str, exact: set, at_least: int) -> str:
     return _ALL_DIGITS.sub(run, text)
 
 
-def redact_registered_vault_values(text: str, *, nondigit_only: bool = False, audience: str = "model",
-                                   slot: str = "") -> str:
+def redact_registered_vault_values(text: str, *, nondigit_only: bool = False, audience: str = "model") -> str:
     """Scrub of the profile's registered vault values for ``audience`` (module docstring; an unknown one is
     ``model``). ``nondigit_only`` skips everything digit-only (the dialog pre-mask pass, which masks digits
-    itself). ``slot`` (a browser result only): the managed slot the result came from, named by control's
-    lease, never by the model. A window narrowed to browser results by a confirmed release then masks its own
-    slot's results only (another slot's Chrome cannot show that page); without a slot, and while a window is
-    open for every output, nothing changes."""
+    itself)."""
     if not isinstance(text, str) or not text:
         return text
     if audience == "none":  # a caller that scrubbed the vault values leaf by leaf and wants only the rest
@@ -256,14 +266,13 @@ def redact_registered_vault_values(text: str, *, nondigit_only: bool = False, au
     scope, now = _vault_scope(), time.monotonic()
     with _VAULT_REDACTION_LOCK:
         bucket = _live(scope)
-        elsewhere = slot if audience == "browser" and slot else None  # a released slot window this result is not from
-        windows = [w for k, w in (_CARD_WINDOWS.get(scope) or {}).items()
-                   if not w[2] or (audience in ("browser", "log")
-                                   and (elsewhere is None or k == elsewhere or k.startswith(UNSLOTTED_WINDOW_PREFIX)))]
+        windows = [w for w in (_CARD_WINDOWS.get(scope) or {}).values()
+                   if not w[2] or audience in ("browser", "log")]
     for value in sorted(bucket, key=len, reverse=True):  # longest first: a substring never shadows its superstring
         if not _ALL_DIGITS.fullmatch(value) and value in text:
             text = text.replace(value, PLACEHOLDER)
-    for name in sorted({n for _d, names, _r in windows for n in names}, key=len, reverse=True):
+    holders = {n for _d, names, _r in windows for n in names} if audience in HOLDER_AUDIENCES else ()
+    for name in sorted(holders, key=len, reverse=True):
         text = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", CARD_PLACEHOLDER, text, flags=re.IGNORECASE)
     if nondigit_only or audience == "authored":
         return text

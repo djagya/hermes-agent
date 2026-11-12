@@ -24,6 +24,7 @@ LOCKED = {"locked": True, "native": True, "tabs": ["TAB"], "unverified": False}
 UNLOCKED = {"locked": False, "native": False, "tabs": [], "unverified": False}
 PROBE = "printed 737 by Ada Testperson"
 MASKED = "printed ••• by «redacted-card»"
+MASKED_FOR_MODEL = "printed ••• by Ada Testperson"  # owner decision B: the holder masks in browser and log output only
 
 
 @pytest.fixture(autouse=True)
@@ -69,7 +70,7 @@ def test_a_stale_unlock_never_closes_a_window_reopened_meanwhile(monkeypatch):
 
     old.on = straddled
     assert surface.lock_status(old) == "unlocked"
-    assert redact.redact_sensitive_text(PROBE, force=True) == MASKED
+    assert redact.redact_sensitive_text(PROBE, force=True) == MASKED_FOR_MODEL
 
 
 def test_an_old_marks_prune_keeps_the_live_payments_window(monkeypatch):
@@ -88,7 +89,7 @@ def test_an_old_marks_prune_keeps_the_live_payments_window(monkeypatch):
     monkeypatch.setattr(control, "capture_guard_view", lambda slot_id: None)
     try:
         assert privacy.capture_blocked_for_surface("shopping", "g2") and len(privacy._all_marks()) == 1
-        assert redact.redact_sensitive_text(PROBE, force=True) == MASKED
+        assert redact.redact_sensitive_text(PROBE, force=True) == MASKED_FOR_MODEL
         assert "Ada Testperson" in card_values.dialog_card_values(sup)
     finally:
         card_values.release_slot("shopping")
@@ -101,7 +102,7 @@ def test_slotless_supervisors_keep_their_own_windows(monkeypatch):
     other = _paying("b", {**CARD, "cvc": "1234", "card_number": "378282246310005", "cardholder_name": "Bo Other"})
     other.status = dict(UNLOCKED)
     assert surface.lock_status(other) == "unlocked"
-    assert redact.redact_sensitive_text(PROBE, force=True) == MASKED
+    assert redact.redact_sensitive_text(PROBE, force=True) == MASKED_FOR_MODEL
 
 
 def test_after_the_release_browser_results_stay_masked_until_the_mark_clears(monkeypatch):

@@ -24,12 +24,12 @@ from tools.browser_supervisor_payment import _COVERAGE_REFUSALS, OPTIONAL_CARD_T
 logger = logging.getLogger(__name__)
 
 
-def _register_card_redaction(secret: dict, supervisor=None) -> int:
+def _register_card_redaction(secret: dict, supervisor=None) -> tuple:
     """Open the card's payment window for redaction (tools.browser_payment_card_values): every digit run as
     long as the number or the CVC is masked in every later model-facing output (spaced or dashed groups of
-    the number too), and the holder name is scrubbed as a whole word, until the lock release is confirmed.
-    The expiry and billing postcode are not secrets on their own and stay out of it. Returns the window's
-    generation."""
+    the number too), and the holder name is scrubbed as a whole word in browser and log output, until the lock
+    release is confirmed. The expiry and billing postcode are not secrets on their own and stay out of it. Returns the open's
+    ``(window key, generation)``."""
     from tools.browser_payment_card_values import open_payment_window
 
     return open_payment_window(secret, supervisor)
@@ -39,25 +39,32 @@ class _UnwrittenWindow:
     """dlz: the payment window of a card that was read but not yet written. Opened on entry (before anything
     else can see the card); a fill that leaves before :meth:`committing` (a refusal, an expiry, an exception)
     wrote no card value, so its open is taken back and no output of the profile stays masked for a card that
-    never reached the page. Once the commit starts the window stays until control confirms the unlock."""
+    never reached the page. Once the commit starts the window stays until control confirms the unlock.
+    The withdraw and the seal name the ``(window key, generation)`` the open returned, never the supervisor's
+    current route: a route moved to another slot meanwhile cannot make it take back that slot's window."""
 
     def __init__(self, secret: dict, supervisor) -> None:
-        self._secret, self._supervisor, self._generation = secret, supervisor, None
+        self._secret, self._supervisor, self._opened = secret, supervisor, None
 
     def __enter__(self) -> _UnwrittenWindow:
-        self._generation = _register_card_redaction(self._secret, self._supervisor)
+        self._opened = _register_card_redaction(self._secret, self._supervisor)
         return self
 
     def committing(self) -> None:
-        self._generation = None
+        if self._opened is None:
+            return
+        from tools.browser_payment_card_values import seal_payment_window
+
+        seal_payment_window(*self._opened)  # if this raises there is no commit, and the exit takes the open back
+        self._opened = None
 
     def __exit__(self, *_exc) -> None:
-        if self._generation is None:
+        if self._opened is None:
             return
         try:
             from tools.browser_payment_card_values import withdraw_payment_window
 
-            withdraw_payment_window(self._supervisor, self._generation)
+            withdraw_payment_window(*self._opened)
         except Exception as exc:  # health: allow BLE001 -- window kept: more masking, never less
             logger.info("payment window not withdrawn (%s)", type(exc).__name__)
 

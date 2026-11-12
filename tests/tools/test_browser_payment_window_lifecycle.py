@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent import redact
+from agent.redact_vault import CARD_PLACEHOLDER
 from tools import browser_payment_card_values as card_values
 from tools import browser_payment_privacy as privacy
 from tools import browser_payment_surface as surface
@@ -240,7 +241,7 @@ def test_a_fill_that_reached_the_commit_keeps_its_window(monkeypatch):
     _routes(monkeypatch, task={"slot_id": "shopping", "supervisor_url": URL})
     out, committed = _fill(monkeypatch, ["34", "35", "36"])
     assert out["success"] and committed
-    assert "Ada Lovelace" not in _model(SPLIT_PUBLIC) and "731" not in _model(SPLIT_PUBLIC)
+    assert "731" not in _model(SPLIT_PUBLIC) and "Ada Lovelace" not in _browser(SPLIT_PUBLIC)
 
 
 def test_an_unwritten_fill_takes_back_only_its_own_open(monkeypatch):
@@ -250,11 +251,11 @@ def test_an_unwritten_fill_takes_back_only_its_own_open(monkeypatch):
     earlier = _paying("t1", {**SPLIT_CARD, "cvc": "1234"})
     out, _committed = _fill(monkeypatch, ["2034", "2036"])
     assert out["error_type"] == "payment_expiry_option_unmatched"
-    assert "Ada Lovelace" not in _model(SPLIT_PUBLIC) and "9876" not in _model("pin 9876")
+    assert "Ada Lovelace" not in _browser(SPLIT_PUBLIC) and "9876" not in _model("pin 9876")
     assert _model("731 items") == "731 items"  # the unwritten card's 3-digit CVC class went with its open
-    generation = bvp._register_card_redaction(CARD, earlier)
+    opened = bvp._register_card_redaction(CARD, earlier)
     card_values.note_claim(earlier)  # another claim on the slot since that open
-    assert card_values.withdraw_payment_window(earlier, generation) is False
+    assert card_values.withdraw_payment_window(*opened) is False
     assert "737" not in _model("cvc 737")
 
 
@@ -263,34 +264,72 @@ def test_a_withdrawn_open_keeps_a_release_confirmed_meanwhile(monkeypatch):
     # take-back must not turn that release back into a profile-wide mask
     _routes(monkeypatch, t1={"slot_id": "shopping", "supervisor_url": URL})
     sup = _paying("t1")
-    generation = bvp._register_card_redaction(CARD, sup)
+    opened = bvp._register_card_redaction(CARD, sup)
     sup.status = dict(UNLOCKED)
     assert surface.lock_status(sup) == "unlocked" and _model() == PUBLIC
-    assert card_values.withdraw_payment_window(sup, generation) is True
+    assert card_values.withdraw_payment_window(*opened) is True
     assert _model() == PUBLIC and "Ada Testperson" not in _browser()
 
 
-def test_a_released_window_masks_its_own_slots_browser_results_only(monkeypatch):
-    # after the confirmed unlock the payment page may still show card text, so its slot's browser results stay
-    # masked until the mark clears; a result control's lease attributes to another slot cannot carry that page
+def test_a_released_window_masks_every_slots_browser_results(monkeypatch):
+    # Codex r1 P1-2: a browser_exec workspace is per task, across slots, so a lease's slot is not provenance:
+    # after the unlock, card text saved under the payment slot can be printed from any other slot
     _routes(monkeypatch, t1={"slot_id": "shopping", "supervisor_url": URL})
-    sup = _paying("t1")
-
-    def browser(slot):
-        return redact.redact_sensitive_text(PUBLIC, force=True, vault="browser", vault_slot=slot)
-
-    assert browser("research") != PUBLIC  # matrix 2, 6: while the lock holds, every output of the profile
-    sup.status = dict(UNLOCKED)
-    assert surface.lock_status(sup) == "unlocked"
-    assert browser("research") == PUBLIC
-    assert browser("shopping") != PUBLIC and browser("") != PUBLIC  # matrix 4, 5: its own slot, and an unknown one
-    assert redact.redact_sensitive_text(PUBLIC, force=True, vault="log", vault_slot="research") != PUBLIC
-
-
-def test_a_released_window_without_a_slot_masks_every_slots_browser_results(monkeypatch):
-    # matrix 4: a supervisor with no slot route could be on any browser, so its released window is not scoped
-    _routes(monkeypatch)
     sup = _paying("t1")
     sup.status = dict(UNLOCKED)
     assert surface.lock_status(sup) == "unlocked" and _model() == PUBLIC
-    assert redact.redact_sensitive_text(PUBLIC, force=True, vault="browser", vault_slot="research") != PUBLIC
+    assert "Ada Testperson" not in _browser() and "737" not in _browser("cvc 737")
+    assert redact.redact_sensitive_text("cvc 737", force=True, vault="log") != "cvc 737"
+
+
+def test_a_route_moved_after_the_open_never_withdraws_the_other_slots_committed_window(monkeypatch):
+    # Opus/Codex r1: t2 committed a card on "research"; t1 opened "shopping", its route then moved to
+    # "research" and the commit fence refused. Both windows had generation 2 (claim 1, open 2): withdrawing by
+    # the route's slot at exit took back research's committed window.
+    routes = {"t1": {"slot_id": "shopping", "supervisor_url": URL},
+              "t2": {"slot_id": "research", "supervisor_url": "ws://control/slot/research"}}
+    monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: routes.get(task_id, {}))
+    payer = _sup("t2", cdp_url="ws://control/slot/research")
+    card_values.note_claim(payer)
+    with bvp._UnwrittenWindow(CARD, payer) as committed:
+        committed.committing()
+    filler = _sup("t1")
+    card_values.note_claim(filler)
+    with bvp._UnwrittenWindow({**CARD, "cvc": "1234"}, filler):
+        assert redact.card_window_generations() == {"shopping": 2, "research": 2}
+        routes["t1"] = routes["t2"]  # a newer exec moved t1 to research, then the fence refused
+    assert redact.card_window_keys() == ["research"]  # shopping's unwritten open went, research's stayed
+    assert "737" not in _model("cvc 737") and "Ada Testperson" not in _browser()
+    assert card_values.withdraw_payment_window("research", 2) is False  # sealed: no withdraw matches it
+
+
+def test_an_orphaned_supervisor_reading_its_own_unlock_leaves_the_new_routes_window(monkeypatch):
+    # Opus r1 P3-1: the supervisor saw the lock on shopping; its task's route then moved to research, where
+    # another fill is live. Its own socket reads shopping unlocked: that says nothing about research.
+    routes = {"t1": {"slot_id": "shopping", "supervisor_url": URL}}
+    monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: routes.get(task_id, {}))
+    orphan = _sup("t1")
+    with surface._LOCK:
+        surface._KNOWN_LOCKED.add(orphan)
+    routes["t1"] = routes["t2"] = {"slot_id": "research", "supervisor_url": "ws://control/slot/research"}
+    _paying("t2")
+    orphan.status = dict(UNLOCKED)
+    assert surface.lock_status(orphan) == "unlocked"
+    assert redact.card_window_keys(unreleased=True) == ["research"] and _model() != PUBLIC
+
+
+def test_the_holder_name_is_masked_only_in_browser_and_log_output(monkeypatch):
+    # owner decision B, 2026-11-12: while a window is open the holder (usually the owner) stays readable in
+    # model and authored output; the card's digit classes still mask there, and browser and log mask both
+    _routes(monkeypatch, t1={"slot_id": "shopping", "supervisor_url": URL})
+    _paying("t1")
+    text = "From: Ada Testperson, ada testperson; cvc 737, card 4111 1111 1111 1111"
+    model = _model(text)
+    assert "Ada Testperson" in model and "ada testperson" in model
+    assert "737" not in model and "1111" not in model
+    authored = redact.redact_json_text(json.dumps({"to": "Ada Testperson"}), audience="authored")
+    assert json.loads(authored) == {"to": "Ada Testperson"}
+    for vault in ("browser", "log"):
+        out = redact.redact_sensitive_text(text, force=True, vault=vault)
+        assert "Testperson" not in out and "testperson" not in out and CARD_PLACEHOLDER in out
+        assert "737" not in out and "1111" not in out

@@ -36,7 +36,7 @@ from agent.redact_vault import (  # re-exported: callers and tests patch agent.r
     _VAULT_REDACTION_LOCK, _VAULT_REDACTION_VALUES, _vault_scope, bump_card_window, card_window_generations,
     card_window_keys, clear_vault_redaction_values, redact_json_text, redact_number, redact_registered_vault_values,
     register_card_window,
-    register_vault_redaction_value, release_card_window, withdraw_card_window,
+    register_vault_redaction_value, release_card_window, seal_card_window, withdraw_card_window,
 )
 
 
@@ -1445,14 +1445,12 @@ def _redact_phone(m):
 
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
                           file_read: bool = False, secret_file: bool = False,
-                          redact_url_credentials: bool = False, vault: str = "model",
-                          vault_slot: str = "") -> str:
+                          redact_url_credentials: bool = False, vault: str = "model") -> str:
     """Apply all redaction patterns to a block of text.
 
     ``vault`` names who reads the result, for the vault-value registry (agent/redact_vault.py): ``model``
     (default: a tool result the model did not write), ``browser`` (a browser tool result), ``log`` (a log
     file: digit values length-masked only in their mask window, never replaced exactly) or ``authored`` (persisted model-authored text: non-digit values only).
-    ``vault_slot`` (with ``browser``): the managed slot control's lease names for the result; "" = unknown.
 
     Safe on any string. Enabled by default (``security.redact_secrets: false``
     disables); ``force=True`` is for safety boundaries that must never return
@@ -1495,7 +1493,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if not text:
         return text
     # Vault secrets are a hard model-egress boundary: scrubbed regardless of the redact_secrets preference.
-    text = redact_registered_vault_values(text, audience=vault, slot=vault_slot)
+    text = redact_registered_vault_values(text, audience=vault)
     if not (force or _redact_enabled()):
         return text
     # ``secret_file`` is authoritative: a caller that classified the source as secret-bearing must not
