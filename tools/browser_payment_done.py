@@ -575,6 +575,22 @@ async def _follow(sup: Any, new_tab: str) -> None:
             sup._page_session_id = sid
 
 
+async def _reattach(sup: Any, tabs: list) -> bool:
+    """dlz (Codex r2 P2-5): the supervisor's page session died with the payment tab it was on. Attach it to the
+    first of ``tabs`` that answers, with its page domains and dialog bridge, as after a reconnect. False: none did;
+    the session stays dead until the next card fill attaches to its checkout tab (``_merchant_tab_session``)."""
+    for tab in tabs[:_REATTACH_TRIES]:
+        try:
+            await _follow(sup, tab)
+            return True
+        except Exception as exc:  # health: allow BLE001 -- a tab that does not answer is skipped
+            logger.info("payment_close: supervisor did not follow (%s)", type(exc).__name__)
+    return False
+
+
+_REATTACH_TRIES = 3
+
+
 def _redacted_page(page: dict) -> dict:
     """The confirmation snapshot as a browser tool result (agent.redact, ``vault="browser"``): the card's
     lengths and holder, and every registered value, scrubbed from its text, title, URL and links."""
@@ -922,6 +938,10 @@ _CLOSE_PARTIAL = ("Not every payment tab could be closed, and browser control ha
                   "user to end the lock.")
 _CLOSE_UNPROVEN = ("The payment tab was closed, but browser control has not yet confirmed the unlock. If browser "
                    "actions are still refused, ask the user.")
+# dlz (Opus r2): payment_close cannot know whether Pay was pressed (a 3-D Secure step may still be running).
+_CLOSE_DONE = ("The payment tab was closed without a confirmation. If Pay was already pressed (a 3-D Secure step "
+               "counts), the payment may still go through: tell the user, and do not pay again. After Pay the way "
+               "out is payment_done, not payment_close.")
 
 
 def _owning_tabs(supervisor: Any) -> tuple[str, frozenset]:
@@ -965,7 +985,7 @@ def payment_close(supervisor: Any) -> dict:
     ``Target.closeTarget {targetId}``; control sees the targets destroyed and lifts the lock the normal way, and
     ``lock_released`` is true only when its status proves it. No snapshot, no page read, nothing clicked; a blank
     tab is opened first only when the browser would otherwise be left without one."""
-    from tools.browser_payment_surface import _FENCE_WAIT_S, _claim_lock, _page_tabs
+    from tools.browser_payment_surface import _FENCE_WAIT_S, _claim_lock, _page_tabs, pressing
 
     loop = getattr(supervisor, "_loop", None)
     if loop is None or not loop.is_running():
@@ -974,6 +994,8 @@ def payment_close(supervisor: Any) -> dict:
     if not lock.acquire(timeout=_FENCE_WAIT_S):
         return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
     try:
+        if pressing(supervisor):  # dlz (Opus r2): never close the tab under a payment_click still on the wire
+            return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
         state, owning = _owning_tabs(supervisor)
         with _LOCK:
             recorded = set(_PAYMENTS.get(supervisor) or {})
@@ -995,15 +1017,18 @@ def payment_close(supervisor: Any) -> dict:
         lock.release()
     released = _released(supervisor)
     logger.info("payment_close: closed %d of %d payment tab(s); lock released %s", closed, len(targets), released)
-    # dlz (Opus r1 P3-2): the supervisor follows only to the blank tab this call opened, never to some other tab
-    # of the user's; without one it stays detached and the next browser action attaches where it is told.
-    if followed_from and released and blank:  # attaching installs the dialog bridge: never on a locked slot
+    # dlz (Codex r2 P2-5): the supervisor's page session died with the tab it was on. It moves to the blank tab
+    # this call opened, else to a tab that stayed open (never a payment tab: those were the targets), in the
+    # browser's own order, as its first attach does. Left on the dead session, the next card fill and the dialog
+    # bridge would fail with "Session with given id not found".
+    if followed_from and released:  # attaching installs the dialog bridge: never on a locked slot
+        stay = [blank] if blank else [t["targetId"] for t in tabs if t["targetId"] not in targets]
         try:
-            _wait(_follow(supervisor, blank), loop, timeout=10)
-        except Exception as exc:  # health: allow BLE001 -- the next browser action re-attaches
+            _wait(_reattach(supervisor, stay), loop, timeout=10 * _REATTACH_TRIES)
+        except Exception as exc:  # health: allow BLE001 -- the next card fill attaches to its checkout tab
             logger.info("payment_close: supervisor did not follow (%s)", type(exc).__name__)
     result = {"success": closed == len(targets), "closed_tabs": closed, "lock_released": released,
               **({"new_tab": blank} if blank else {})}
     if closed < len(targets):
         return {**result, "error_type": "payment_close_failed", "error": _CLOSE_PARTIAL}
-    return result if released else {**result, "note": _CLOSE_UNPROVEN}
+    return {**result, "note": _CLOSE_DONE if released else _CLOSE_UNPROVEN}

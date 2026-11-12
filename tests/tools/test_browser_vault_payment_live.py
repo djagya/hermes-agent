@@ -1265,9 +1265,10 @@ def _dtx_values(sup):
 @pytest.mark.parametrize("layout", ["split", "single"])
 def test_datatrans_shaped_re_render_is_re_pinned_inside_one_approval(payment_browser, tmp_path, monkeypatch, caplog,
                                                                       layout):
-    """dlz (11-12 SBB/Datatrans): a field the hosted form re-renders after the first write (replaced, re-described,
-    or hidden until the card number is in) is re-pinned and written inside the same approval; what must still stop
-    stops with nothing more written, and the stop names its check. Never submitted."""
+    """dlz (11-12 SBB/Datatrans), with re-pin switched on (vault.payment_repin; off by default, see the next test):
+    a field the hosted form re-renders after the first write (replaced, re-described, or hidden until the card number
+    is in) is re-pinned and written inside the same approval; what must still stop stops with nothing more written,
+    and the stop names its check. Never submitted."""
     import logging
     from dataclasses import replace
 
@@ -1284,6 +1285,7 @@ def test_datatrans_shaped_re_render_is_re_pinned_inside_one_approval(payment_bro
     monkeypatch.setattr(store, "get_meta", lambda handle: (
         replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
     monkeypatch.setattr("agent.vault_payment_policy.PAYMENT_PSP_ORIGINS", (origins["psp"],))
+    monkeypatch.setattr("tools.browser_vault_payment.payment_repin_enabled", lambda: True)
     prefix = "/dtx-" if layout == "split" else "/dtx1-"
     full = {"exp": "07/35", "num": CARD["card_number"], "cvv": CARD["cvc"]}
 
@@ -1333,3 +1335,66 @@ def test_datatrans_shaped_re_render_is_re_pinned_inside_one_approval(payment_bro
             assert "card fill stopped" in caplog.text and reason in caplog.text, caplog.text
             assert check.get("repin_refused") == refusals.get(variant), out
         print("RECEIPT datatrans", layout, variant, "=STOPPED", out.get("fill_check", out["error_type"]))
+
+
+# Re-pin switched off: where each Datatrans-shaped variant stops (the failed check of the stop record). A covered
+# replacement stops as a replaced field: nothing is re-pinned, so its exposure is never the question.
+_DTX_OFF = {"replace": "fields_replaced", "relabel": "fields_relabeled", "defer": "field_hidden",
+            "defer_ahead": "field_hidden", "duplicate": "fields_replaced", "swap_role": "fields_replaced",
+            "navigate": "navigated", "cover": "fields_replaced", "holder_swap": "fields_replaced"}
+
+
+@pytest.mark.parametrize("layout", ["split", "single"])
+def test_datatrans_shaped_re_render_stops_the_fill_while_re_pin_is_switched_off(payment_browser, tmp_path, monkeypatch,
+                                                                                caplog, layout):
+    """vault.payment_repin off (the default): every re-render of the hosted form stops the fill at the first changed
+    field, as before re-pinning existed: the one field written before it keeps its value, nothing is written after
+    it, nothing is re-pinned; the stop record and the log line name the check. Never submitted. The RECEIPT lines
+    hold what the base (4ecd5a7afb) reports for the same pages (no stop record there)."""
+    import logging
+    from dataclasses import replace
+
+    from agent.vault_store import VaultStore
+    from tools.browser_vault_tool import browser_vault_fill
+
+    sup, origins = payment_browser
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item("payment", "Synthetic Datatrans card", CARD, origin=origins["merchant"])
+    holder = store.add_item("payment", "Synthetic Datatrans card with holder", {**CARD, "cardholder_name": "JANE DOE"},
+                            origin=origins["merchant"])
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    original = store.get_meta
+    monkeypatch.setattr(store, "get_meta", lambda handle: (
+        replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
+    monkeypatch.setattr("agent.vault_payment_policy.PAYMENT_PSP_ORIGINS", (origins["psp"],))
+    monkeypatch.setattr("tools.browser_vault_payment.payment_repin_enabled", lambda: False, raising=False)
+    full = {"exp": "07/35", "num": CARD["card_number"], "cvv": CARD["cvc"], "name": "JANE DOE"}
+    for variant, reason in _DTX_OFF.items():
+        if layout == "split" and variant in ("defer_ahead", "holder_swap"):
+            continue  # single-document variants
+        navigate(sup, origins["merchant"] + ("/dtx-" if layout == "split" else "/dtx1-") + variant)
+        caplog.clear()
+        with caplog.at_level(logging.INFO), \
+                patch("tools.approval_prompt.request_elicitation_consent", return_value="accept") as consent:
+            item = holder if variant == "defer_ahead" else card
+            out = json.loads(browser_vault_fill(item.id, task_id="payment-live", merchant_origin=origins["merchant"]))
+        assert consent.call_count == 1 and out["submitted"] is False, (variant, out)
+        for secret in (CARD["card_number"], CARD["cvc"], "07/35"):
+            assert secret not in json.dumps(out) and secret not in caplog.text, (variant, secret)
+        assert sup.evaluate_runtime("!!window.submitted")["result"] is False
+        values = _dtx_values(sup)
+        written = sorted(k for k, v in values.items() if v)
+        print("RECEIPT datatrans-off", layout, variant, json.dumps({
+            "success": out.get("success"), "error_type": out.get("error_type"), "filled_fields": out.get("filled_fields"),
+            "partially_filled": out.get("partially_filled"), "written": written}, sort_keys=True))
+        assert not out["success"] and out["filled_fields"] == 1 and out["partially_filled"] is True, (variant, out)
+        assert len(written) == 1 and values[written[0]] == full[written[0]], (variant, values)  # nothing after the stop
+        assert "fill_repins" not in out and "re-pin(s)" not in caplog.text, (variant, out)
+        if layout == "split" and variant == "navigate":
+            assert out["error_type"] == "payment_page_changed", out  # the between-document scope check
+            continue
+        assert out["error_type"] == "payment_fields_changed", (variant, out)
+        check = out["fill_check"]  # the stop record: kept with re-pin off
+        assert check["reason"] == reason and "repin_refused" not in check, (variant, out)
+        assert "card fill stopped" in caplog.text and reason in caplog.text, caplog.text
+        print("RECORD datatrans-off", layout, variant, json.dumps(check, sort_keys=True))

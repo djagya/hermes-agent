@@ -719,11 +719,16 @@ def test_payment_close_closes_only_the_owning_tab_natively_and_proves_the_unlock
     sup = _Unlocking([CHECKOUT], status=dict(LOCKED_TAB))
     _paid([CHECKOUT])  # another supervisor's record never widens what this one closes
     out = done.payment_close(sup)
-    assert out == {"success": True, "closed_tabs": 1, "lock_released": True}
+    # the note: payment_close cannot know whether Pay was pressed; after Pay the way out is payment_done
+    assert out == {"success": True, "closed_tabs": 1, "lock_released": True, "note": done._CLOSE_DONE}
+    assert "payment_done" in out["note"] and "do not pay again" in out["note"]
     assert [c[1] for c in sup.sent("Target.closeTarget")] == [{"targetId": "TAB"}]  # never OTHER
     assert not sup.sent("Runtime.evaluate") and not sup.sent("Runtime.callFunctionOn")
     assert not sup.sent("Target.createTarget")  # OTHER stays open: no blank tab needed
-    assert not sup.sent("attach_page")  # never followed to another of the user's tabs: left detached (P3-2)
+    # Codex r2 P2-5: the supervisor was on the closed tab: it moves to the tab that stayed open (page domains and
+    # dialog bridge with the attach), after the unlock, instead of staying on a dead session
+    assert [c[1] for c in sup.sent("attach_page")] == [{"targetId": "OTHER"}] and sup._page_session_id == "S-new"
+    assert sup.index("Hermes.paymentSurfaceStatus") < sup.index("attach_page")
     assert done.payment_close(sup) == {"success": True, "closed_tabs": 0, "lock_released": True,
                                        "note": done._CLOSE_NOT_LOCKED}
 
@@ -748,6 +753,52 @@ def test_payment_close_opens_a_blank_tab_first_when_it_would_close_the_last_one(
     assert [c[1] for c in sup.sent("attach_page")] == [{"targetId": "NEWTAB"}]  # its own blank tab, after the unlock
 
 
+class _Stale(_Unlocking):
+    """A browser whose page session dies with its tab: once TAB is closed, every call on the session attached to
+    it fails as Chrome's does. A new checkout tab (NEW, on the shop) is open; the real ``_merchant_tab_session``
+    looks for it. ``answers``: whether the tab that stayed open (OTHER) can be attached."""
+
+    from tools.browser_supervisor_payment import PaymentSupervisionMixin as _mixin
+
+    _merchant_tab_session = _mixin._merchant_tab_session
+
+    def __init__(self, answers):
+        super().__init__([CHECKOUT], status=dict(LOCKED_TAB))
+        self.answers, self.bridged = answers, []
+        self.targets = {"S-new": "OTHER", "S-temp": "NEW"}
+        self.extra_tabs = [{"targetId": "NEW", "type": "page", "url": "https://shop2.test/checkout"}]
+
+    def answer(self, method, params, session_id=None):
+        if session_id == "S-page" and not self.tab_open:
+            raise RuntimeError("CDP error on id=1: {'code': -32001, 'message': 'Session with given id not found.'}")
+        return super().answer(method, params, session_id)
+
+    async def _attach_page(self, target_id, *, timeout, deadline=None):
+        if not self.answers:
+            raise RuntimeError("target did not answer")
+        return await super()._attach_page(target_id, timeout=timeout, deadline=deadline)
+
+    async def _install_dialog_bridge(self, sid):
+        self.bridged.append(sid)
+
+
+@pytest.mark.parametrize("answers", [True, False])
+def test_a_card_fill_after_payment_close_does_not_run_on_the_closed_tabs_session(answers):
+    """Codex r2 P2-5: payment_close closed the tab the supervisor was on while another tab stayed open. The next
+    card fill looked for its checkout tab over the dead page session and failed with "Session with given id not
+    found". Now the supervisor moves to the open tab at the close; when that tab does not answer, the fill itself
+    treats the dead session as "on another tab" and attaches to its checkout."""
+    sup = _Stale(answers)
+    out = done.payment_close(sup)
+    assert out["success"] is True and out["closed_tabs"] == 1 and out["lock_released"] is True
+    assert sup._page_session_id == ("S-new" if answers else "S-page")  # S-page is dead when OTHER did not answer
+    before = sup._page_session_id
+    sid = asyncio.run_coroutine_threadsafe(sup._merchant_tab_session("https://shop2.test", before),
+                                           sup._loop).result(timeout=10)
+    assert sid == "S-temp" == sup._page_session_id and sup.bridged == ["S-temp"]  # the new checkout tab, bridged
+    assert [c[1] for c in sup.sent("Target.attachToTarget")] == [{"targetId": "NEW", "flatten": True}]
+
+
 @pytest.mark.parametrize("status, error_type", [
     ({"locked": True, "native": False, "tabs": [], "unverified": True}, "payment_close_nothing"),  # no tab named
     ({"locked": True, "native": True, "tabs": ["GONE"], "unverified": False}, "payment_close_nothing"),  # not open
@@ -756,6 +807,24 @@ def test_payment_close_closes_nothing_it_cannot_name(status, error_type):
     sup = FakeSup([CHECKOUT], status=status)
     out = done.payment_close(sup)
     assert out["error_type"] == error_type and out["closed_tabs"] == 0 and not sup.sent("Target.closeTarget")
+
+
+def test_payment_close_waits_for_a_payment_click_that_is_still_running(monkeypatch):
+    """Opus r2: the tab is not closed under a press that may be on the wire; once the click returned, it closes."""
+    sup = _Unlocking([CHECKOUT], status=dict(LOCKED_TAB))
+    seen = []
+
+    def click_running(supervisor, factory, progress=None):
+        seen.append(done.payment_close(sup))  # a parallel payment_close while the click runs
+        return {"success": True}
+
+    monkeypatch.setattr(surface, "_run", click_running)
+    with surface._LOCK:
+        surface._ISSUED[sup] = {"c1-0123456789": ("spec",)}
+    assert surface.payment_click(sup, "c1-0123456789")["clicked"] == "c1-0123456789"
+    assert seen[0]["error_type"] == "payment_close_busy" and seen[0]["closed_tabs"] == 0
+    assert not sup.sent("Target.closeTarget") and not surface.pressing(sup)
+    assert done.payment_close(sup)["closed_tabs"] == 1
 
 
 def test_payment_close_reports_a_failed_close():

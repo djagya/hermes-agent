@@ -16,6 +16,7 @@ from agent.vault_payment_policy import (
     PaymentPolicyError,
     destination_policy,
     effective_frame_origins,
+    payment_repin_enabled,
 )
 from agent.vault_store import PAYMENT_FIELDS, revision_binding
 from tools.browser_supervisor_payment import _COVERAGE_REFUSALS, OPTIONAL_CARD_TOKENS
@@ -529,6 +530,12 @@ def _log_commit(result: dict) -> None:
                        _code(result.get("filled_fields", 0)), _code(repins))
 
 
+def _repin_argument(unreviewed: bool) -> dict:
+    """dlz: the commit's ``repin`` argument: only with ``vault.payment_repin`` switched on (off by default), and
+    never for an unreviewed destination. Off, the commit call is the one it always was."""
+    return {"repin": True} if not unreviewed and payment_repin_enabled() else {}
+
+
 def _commit_text(result: dict) -> None:
     """Set the fixed text for a stopped commit; a partial stop always says that fields were written. dlz (Codex B r2
     #2): a write whose outcome is unknown (lost, failed or malformed answer) always says fields may hold values."""
@@ -787,7 +794,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 return json.dumps(out)
             if unreviewed and destination_policy() != policy:  # B6, A6 step 16: the commit fence
                 return json.dumps(_disabled(after_read=True))
-            result = supervisor.commit_payment(inspected, fills, strict=strict)
+            result = supervisor.commit_payment(inspected, fills, strict=strict, **_repin_argument(unreviewed))
             _log_commit(result)
             _commit_text(result)
             return json.dumps(_describe_result(result, backend, inspected, fills, prompt, bound_revision,

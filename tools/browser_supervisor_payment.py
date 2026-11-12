@@ -678,10 +678,13 @@ class PaymentSupervisionMixin:
         ]
         if len(pages) != 1:
             raise PaymentPolicyError("Merchant tab missing or ambiguous")
-        current = (await self._cdp("Target.getTargetInfo", session_id=sid))[
-            "result"
-        ]["targetInfo"]
-        if current["targetId"] == pages[0]["targetId"]:
+        try:
+            current = (await self._cdp("Target.getTargetInfo", session_id=sid))["result"]["targetInfo"]["targetId"]
+        except Exception:  # health: allow BLE001 -- dlz (Codex r2 P2-5): a page session that does not answer
+            # The supervised tab was closed (payment_close, the user): its session is dead ("Session with given id
+            # not found"). That is "on another tab": the one tab at ``origin`` is attached below, as from any other.
+            current = None
+        if current == pages[0]["targetId"]:
             return sid
         old_sid = sid
         sid = (
@@ -1071,16 +1074,19 @@ class PaymentSupervisionMixin:
         except Exception:  # health: allow BLE001 -- an unreadable witness is not the page the owner approved
             return False
 
-    def commit_payment(self, inspected: PaymentInspection, fills: list[dict], strict: bool = False) -> dict:
+    def commit_payment(self, inspected: PaymentInspection, fills: list[dict], strict: bool = False,
+                       repin: bool = False) -> dict:
         """Write the fills. ``strict`` (unreviewed destinations) adds a hit test at each field's centre
-        before its setter; reviewed provider shapes keep ``False`` so they cannot regress."""
+        before its setter; reviewed provider shapes keep ``False`` so they cannot regress. ``repin`` (config
+        ``vault.payment_repin``, off by default; a literal True only): a re-rendered reviewed card document may be
+        re-pinned inside this commit; without it any change of the pinned fields stops the commit."""
         import concurrent.futures
 
         from agent.async_utils import safe_schedule_threadsafe
         from tools.browser_supervisor import _LoopUnavailable
 
         until = time.monotonic() + _COMMIT_BUDGET_SECONDS
-        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills, until, strict), self._loop)
+        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills, until, strict, repin), self._loop)
         if future is None:
             raise _LoopUnavailable("Browser supervisor loop unavailable")
         try:
@@ -1099,17 +1105,17 @@ class PaymentSupervisionMixin:
                     "write_uncertain": True}
 
     async def _commit_payment(self, i: PaymentInspection, fills: list[dict], until: float | None = None,
-                              strict: bool = False) -> dict:
+                              strict: bool = False, repin: bool = False) -> dict:
         if i.consumed:
             return {"success": False, "error_type": "payment_consent_consumed"}
         try:
-            return await self._commit_payment_once(i, fills, until, strict)
+            return await self._commit_payment_once(i, fills, until, strict, repin)
         finally:
             # dlz: one cleanup for the whole lifecycle (freshness included) that a cancellation cannot cut short.
             await self._release_once(i)
 
     async def _commit_payment_once(self, i: PaymentInspection, fills: list[dict], until: float | None,
-                                   strict: bool = False) -> dict:
+                                   strict: bool = False, repin: bool = False) -> dict:
         if time.monotonic() >= i.expires_at:
             # dlz: the inspection window closed (late approval, slow card lookup): nothing is written, and
             # the result says so instead of reading as a changed page.
@@ -1132,7 +1138,7 @@ class PaymentSupervisionMixin:
         # dlz: the renderer's write deadline: the consent window or the commit budget, whichever ends first.
         stop = i.expires_at if until is None else min(i.expires_at, until)
         filled = 0
-        state = {"number": False, "repins": 0}
+        state = {"number": False, "repins": 0, "repin": repin is True}
         try:
             # Every document was re-validated just above. A split checkout is written one
             # document at a time: no cross-document transaction exists, so a later failure
@@ -1140,7 +1146,8 @@ class PaymentSupervisionMixin:
             written = []
             order = _commit_order(i, _fills_by_document(i, fills))
             # dlz (re-pin): a document whose remaining fields wait for the card number in a later document is
-            # suspended (its commit paused) and resumed once, after the documents that follow it.
+            # suspended (its commit paused) and resumed once, after the documents that follow it. Without ``repin``
+            # no document defers: each is committed once, in order, and the first stop ends the commit.
             suspended: list = []
             steps = [(n, d, f, None) for n, (d, f) in enumerate(order, 1)]
             while steps:
@@ -1207,8 +1214,9 @@ class PaymentSupervisionMixin:
         # every document, for the same bindings after the focus handlers ran.
         paced = (lambda point, d=document: self._paced_check(i, d, point)) \
             if strict and (_has_parent(i, document) or i.unreviewed_origins) else None
-        # dlz (re-pin): reviewed destinations only; an unreviewed fill stops on any change, as before.
-        repin = None if i.unreviewed_origins else \
+        # dlz (re-pin): only when switched on, and reviewed destinations only; otherwise the fill stops on any
+        # change, as before, and the document's commit gets no re-pin hook at all.
+        repin = None if not state["repin"] or i.unreviewed_origins else \
             (lambda request, d=document, f=document_fills: self._repin(i, d, f, request, stop, state))
         # dlz (Codex r1 P1-1): a re-pinned field pauses after its focus, whatever ``strict`` is, for the owner-chain
         # hit test from the parents (the closure itself requires it fully exposed in its own document).
@@ -1370,8 +1378,9 @@ class PaymentSupervisionMixin:
         """One document's commit. ``paced`` (strict fills in a frame, and every document of an unreviewed fill): an
         async ``check(point)`` run after each focus, before that field's setter; anything but True (False or an error
         type from ``_PACED_STOPS``) stops the document with nothing more written. ``repin`` (reviewed fills): an
-        async ``answer(request)`` for the closure's re-pin requests (``_repin``); without it every request is
-        declined. ``resumed``: the count a suspended document wrote before its deferral; its commit is resumed, not
+        async ``answer(request)`` for the closure's re-pin requests (``_repin``); without it the closure is not
+        told to re-pin, only its ``pending`` pause is answered, and a re-pin request or deferral is an invalid
+        answer. ``resumed``: the count a suspended document wrote before its deferral; its commit is resumed, not
         started. A deferral answers ``{deferred: True, filled_fields}``. ``exposed`` (with ``repin``): the same kind of
         check as ``paced``, for the pause the closure makes after a re-pinned field's focus when ``paced`` is None.
         dlz (Codex B r2 #2): the commit call carries the values, and each resume() runs a setter, so from the first
@@ -1380,6 +1389,8 @@ class PaymentSupervisionMixin:
         never as if nothing was written."""
         acknowledged = resumed or 0
         tokens = frozenset(str(f.get("token") or "") for f in fills)
+        # dlz: the commit call of a fill without re-pin is the one it always was (four arguments).
+        names = "fills,deadline,strict,paced" + (",repin" if repin is not None else "")
 
         def uncertain(error_type: str) -> dict:
             return {"success": False, "error_type": error_type, "filled_fields": acknowledged,
@@ -1398,18 +1409,17 @@ class PaymentSupervisionMixin:
                     "Runtime.callFunctionOn",
                     {
                         "objectId": d.object_id,
-                        "functionDeclaration": "function(fills,deadline,strict,paced){"
-                                               "return this.commit(fills,deadline,strict,paced)}",
+                        "functionDeclaration": f"function({names}){{return this.commit({names})}}",
                         "arguments": [{"value": fills}, {"value": deadline_ms}, {"value": strict is True},
-                                      {"value": paced is not None}],
+                                      {"value": paced is not None}, *([{"value": True}] if repin is not None else [])],
                         "returnByValue": True,
                     },
                     session_id=d.frame_session,
                 )
             )
-            for _ in range((len(fills) + 1) * (MAX_REPINS + 2)):
-                kind = _pause_kind(result)
-                check = paced or exposed
+            for _ in range((len(fills) + 1) * (MAX_REPINS + 2 if repin is not None else 1)):
+                kind = _pause_kind(result, repin is not None)
+                check = paced or (exposed if repin is not None else None)
                 if kind is None or (kind == "pending" and check is None):
                     break
                 attempted = result.get("filled_fields")
@@ -1426,7 +1436,7 @@ class PaymentSupervisionMixin:
                 if kind == "deferred":
                     return {"deferred": True, "filled_fields": attempted}
                 if kind == "repin":
-                    result = await answer(await repin(result) if repin is not None else None, repinned=True)
+                    result = await answer(await repin(result), repinned=True)
                     continue
                 verdict = await check((result["x"], result["y"]))
                 if verdict is not True:
@@ -1779,11 +1789,12 @@ _DOCUMENT_ERRORS = frozenset({"payment_fields_changed", "payment_consent_expired
                               "payment_expiry_option_unmatched", "payment_validation_failed"})
 
 
-def _pause_kind(result: Any) -> str | None:
-    """Which pause a closure answer is (``pending``, ``repin``, ``deferred``), or None for a final answer."""
+def _pause_kind(result: Any, repin: bool) -> str | None:
+    """Which pause a closure answer is (``pending``; with ``repin`` also ``repin``, ``deferred``), or None for a
+    final answer."""
     if not isinstance(result, dict):
         return None
-    return next((k for k in ("pending", "repin", "deferred") if result.get(k) is True), None)
+    return next((k for k in (("pending", "repin", "deferred") if repin else ("pending",)) if result.get(k) is True), None)
 
 
 def _repins(result: dict, state: dict) -> dict:
