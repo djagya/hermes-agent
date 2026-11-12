@@ -207,6 +207,37 @@ def apply_managed_overlay(config: dict, *, user_raw: Optional[dict] = None) -> d
         return config
 
 
+def drop_unwritten_seeds(config: dict, user_raw: dict, keep: set) -> dict:
+    """dlz: *config* without the seed leaves a load put there: a managed leaf the user file does not set
+    (*user_raw*) whose value is still the seed. A load -> save round trip then leaves the seed a seed, so
+    a later managed change still applies; a changed value or a path in *keep* is the user's and stays."""
+    try:
+        managed = load_managed_config()
+        if not managed:
+            return config
+        from hermes_cli.config import _expand_env_vars, _normalize_root_model_keys
+        seeds = _omit_present_leaves(_normalize_root_model_keys(_expand_env_vars(managed)),
+                                     _user_presence(user_raw if isinstance(user_raw, dict) else {}))
+    except Exception:
+        logger.warning("managed scope: failed to read the seeds to leave out of a save", exc_info=True)
+        return config
+
+    def drop(target: dict, seed: dict, path: tuple) -> dict:
+        out = dict(target)
+        for key, value in seed.items():
+            here = path + (key,)
+            if key not in out or here in keep:
+                continue
+            if isinstance(value, dict) and value and isinstance(out[key], dict):
+                out[key] = drop(out[key], value, here)
+                if not out[key]:  # emptied by the drop: the section was the seed's alone
+                    del out[key]
+            elif out[key] == value:
+                del out[key]
+        return out
+    return drop(config, seeds, ())
+
+
 def _flatten_keys(d: dict, prefix: str = "") -> set:
     keys: set = set()
     for k, v in d.items():

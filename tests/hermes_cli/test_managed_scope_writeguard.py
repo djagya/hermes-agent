@@ -64,6 +64,25 @@ def test_save_config_keeps_user_override_of_managed_leaf(homes):
     assert read_raw_config().get("model", {}).get("default") == "user/saved"
 
 
+def test_load_then_save_leaves_a_seed_a_seed(homes):
+    """A bulk save of the loaded config must not copy the seed into the user file: the user leaf would then
+    win over every later managed change."""
+    from hermes_cli.config import save_config, load_config, read_raw_config
+    import hermes_cli.config as cfg
+
+    home, managed = homes
+    cfg_now = load_config()
+    cfg_now.setdefault("display", {})["skin"] = "mono"
+    save_config(cfg_now)
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert "model" not in read_raw_config() and read_raw_config()["display"]["skin"] == "mono"
+    (managed / "config.yaml").write_text("model:\n  default: managed/next\n", encoding="utf-8")
+    from hermes_cli import managed_scope
+    managed_scope.invalidate_managed_cache()
+    cfg._LOAD_CONFIG_CACHE.clear()
+    assert load_config()["model"]["default"] == "managed/next"
+
+
 @pytest.fixture
 def env_homes(tmp_path, monkeypatch):
     home = tmp_path / "home"
