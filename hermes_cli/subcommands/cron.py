@@ -18,6 +18,23 @@ def _catch_up_flag(value: str) -> bool:
     return value == "on"
 
 
+def _fallback_entry(value: str) -> dict:
+    """``PROVIDER:MODEL`` -> ``{provider, model}`` (split at the first ':', so a model id may
+    itself contain ':', e.g. ``openrouter:z-ai/glm-5.2:free``)."""
+    provider, sep, model = value.partition(":")
+    provider, model = provider.strip(), model.strip()
+    if not sep or not provider or not model:
+        raise argparse.ArgumentTypeError(
+            f"invalid fallback {value!r}: use PROVIDER:MODEL (e.g. openrouter:z-ai/glm-5.2)")
+    return {"provider": provider, "model": model}
+
+
+_FALLBACK_HELP = (
+    "Give this job its own fallback provider, tried in order when its (pinned) primary is "
+    "unavailable: PROVIDER:MODEL. Repeatable; the order given is the order tried. Without it a "
+    "pinned job has NO fallback (it never borrows the global fallback_providers).")
+
+
 def _add_catch_up(parser) -> None:
     parser.add_argument(
         "--catch-up", dest="catch_up", type=_catch_up_flag, metavar="{on,off}",
@@ -89,6 +106,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "`hermes model` changes never touch it. Ignored when --model is given.")
     cron_create.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').")
+    cron_create.add_argument("--fallback", dest="fallback", action="append",
+        type=_fallback_entry, metavar="PROVIDER:MODEL", help=_FALLBACK_HELP)
     cron_create.add_argument("--reasoning-effort", dest="reasoning_effort",
         help="Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Overrides agent.reasoning_effort "
@@ -173,6 +192,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Release the job's model pin so it follows the main agent model again.")
     cron_edit.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.")
+    _fb = cron_edit.add_mutually_exclusive_group()
+    _fb.add_argument("--fallback", dest="fallback", action="append",
+        type=_fallback_entry, metavar="PROVIDER:MODEL",
+        help=_FALLBACK_HELP + " Replaces the job's existing list.")
+    _fb.add_argument("--clear-fallback", dest="clear_fallback", action="store_true",
+        help="Remove the job's own fallback list (back to: pinned = none, unpinned = global chain).")
     cron_edit.add_argument("--reasoning-effort", dest="reasoning_effort",
         help="Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "

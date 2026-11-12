@@ -98,6 +98,24 @@ def _job_route_pinned(job: dict) -> bool:
     return any(isinstance(job.get(k), str) and job[k].strip() for k in ("provider", "model", "base_url"))
 
 
+_JOB_FALLBACK_ENTRY_KEYS = ("provider", "model", "base_url")
+
+
+def _job_declared_fallbacks(job: dict) -> Optional[list]:
+    """The job's own opt-in ``fallback_providers`` list, or None when the job has none. Only
+    provider/model/base_url are honoured: a job record is not operator config, so a hand-edited
+    ``api_key``/``key_env`` on an entry must never name a secret to send off-host."""
+    declared = job.get("fallback_providers")
+    if not isinstance(declared, list):
+        return None
+    if not declared:
+        return []  # explicit "no fallback at all"
+    stripped = [
+        {k: entry[k] for k in _JOB_FALLBACK_ENTRY_KEYS if k in entry}
+        for entry in declared if isinstance(entry, dict)]
+    return stripped or None
+
+
 def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
     """The fallback chain this job may walk, at credential resolution AND mid-run (#100437).
 
@@ -105,9 +123,12 @@ def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
     ``delegate_task`` child follows (``scoped_fallback_chain``): a chain entry is a different
     provider and usually a different model, which is exactly what the pin ruled out. Same-provider
     credential-pool rotation is not the chain and still applies. Unpinned jobs inherit the chain.
+    A job's own ``fallback_providers`` list (``hermes cron edit --fallback``) is the explicit opt-in:
+    it is the chain, exactly, pinned or not.
     """
     return scoped_fallback_chain(
-        get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
+        get_fallback_chain(cfg), _job_declared_fallbacks(job),
+        pinned=_job_route_pinned(job), owner="cron job")
 
 
 def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
@@ -115,11 +136,18 @@ def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
     failed too" vs "none configured" (most installs). Fails open to "the backups failed too" if
     config can't be read — never crash delivery.
     """
+    if job is not None and _job_declared_fallbacks(job):
+        return (
+            "This job's own fallback list "
+            f"(`hermes cron edit {job.get('id')} --fallback`) failed too: "
+            "no backup provider succeeded either."
+        )
     if job is not None and _job_route_pinned(job):
         return (
             "This job is pinned to its own provider/model, so it does not fall back to "
             f"`fallback_providers`; `hermes cron edit {job.get('id')} --unpin` lets it follow the "
-            "main model and its fallback chain."
+            "main model and its fallback chain, or `--fallback PROVIDER:MODEL` gives it its own "
+            "backup."
         )
     try:
         cfg = load_config() or {}

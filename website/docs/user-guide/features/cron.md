@@ -1149,6 +1149,15 @@ If the primary API key is rate-limited or the provider returns an error, the cro
 
 A job with its own `provider`, `model` or `base_url` (set with `--provider` / `--model`, `--pin`, the dashboard, or `jobs.json`) never falls back to the global chain. The pin says which route the job runs on, and a fallback entry is a different provider and usually a different model, so when the pinned route fails the run fails and the failure alert says so. This is the same rule [subagent delegation](./delegation.md) applies to a pinned child. To keep fallback for a job, leave it unpinned: it follows `cron.model` / `cron.model_provider` (or the main model) and walks the chain like any other unpinned job.
 
+To give a pinned job a backup anyway, opt in per job with its own fallback list, tried in the order given:
+
+```bash
+hermes cron edit <job_id> --fallback openrouter:z-ai/glm-5.2 --fallback xai:grok-4.5
+hermes cron edit <job_id> --clear-fallback    # back to: pinned = no fallback
+```
+
+`--fallback PROVIDER:MODEL` is repeatable (also on `cron create`) and replaces the job's existing list; the entries are stored as `fallback_providers` in `jobs.json` (`provider`, `model`, optional `base_url`; no credentials). That list is the whole chain for the job at both points above (credential resolution and mid-run); the global `fallback_providers` is not appended. `hermes cron list` shows it as `Fallback:`. Without a list, nothing changes: pinned jobs have no fallback, unpinned jobs use the global chain.
+
 Before this rule, a pinned job whose provider failed could run on the first working `fallback_providers` entry instead, with a one-line notice in its output. If you relied on that, unpin the job (`hermes cron edit <job_id> --unpin`) and set the model through `cron.model` instead.
 
 A single rate-limited key therefore does not fail a run that has another credential for the same provider, and unpinned jobs still survive a provider outage when a chain is configured.

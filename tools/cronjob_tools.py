@@ -703,6 +703,7 @@ def _action_create(a: dict[str, Any]) -> str:
         # A model-supplied base_url must not route a named provider's stored credential
         # to an attacker endpoint.
         or _validate_cron_base_url(a["provider"], a["base_url"])
+        or _validate_fallback_entries(a["fallback_providers"])
         # bot-chat targets are machine-local: fail the CREATE, not the run.
         or _validate_bot_chat_deliver(deliver)
         # failure_deliver shares deliver's grammar and validators.
@@ -738,6 +739,7 @@ def _action_create(a: dict[str, Any]) -> str:
             timezone=_normalize_optional_job_value(a["timezone"]),
             grace_minutes=a["grace_minutes"],
             pinned=bool(a["pinned"]),
+            fallback_providers=a["fallback_providers"],
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             catch_up=a["catch_up"],
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
@@ -923,6 +925,32 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
     return _validate_cron_base_url(_pick(updates, job, "provider"), _pick(updates, job, "base_url"))
 
 
+def _validate_fallback_entries(value: Any) -> Optional[str]:
+    """Shape + base_url check for a job's own fallback list; error string or None. Shape errors
+    come from the jobs layer so create, update and hand edits read the same."""
+    from cron.jobs import _normalize_fallback_providers
+    try:
+        entries = _normalize_fallback_providers(value) or []
+    except ValueError as exc:
+        return str(exc)
+    for entry in entries:
+        err = _validate_cron_base_url(entry["provider"], entry.get("base_url"))
+        if err:
+            return f"fallback_providers {entry['provider']}:{entry['model']}: {err}"
+    return None
+
+
+def _update_fallback_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
+    """fallback_providers (CLI-only lane); [] clears the per-job list."""
+    if a["fallback_providers"] is None:
+        return None
+    error = _validate_fallback_entries(a["fallback_providers"])
+    if error:
+        return error
+    updates["fallback_providers"] = a["fallback_providers"] or None
+    return None
+
+
 def _update_script_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
     """script / monitor_script / monitor_url (empty string clears); returns an error string or None."""
     monitor_script, monitor_url = a["monitor_script"], a["monitor_url"]
@@ -1007,7 +1035,8 @@ def _update_run_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str
 
 
 # Validation order is behavior (first failing field wins): keep this sequence.
-_UPDATE_STEPS = (_update_core_fields, _update_script_fields, _update_context_from, _update_run_fields)
+_UPDATE_STEPS = (_update_core_fields, _update_script_fields, _update_context_from, _update_run_fields,
+                 _update_fallback_fields)
 
 
 def _action_update(job: dict[str, Any], a: dict[str, Any]) -> str:
@@ -1102,8 +1131,13 @@ def cronjob(
     alert_after_consecutive_failures: Optional[int] = None,
     alert_when_stale_minutes: Optional[int] = None,
     timezone: Optional[str] = None,
-    grace_minutes: Optional[int | str] = None) -> str:
-    """Unified cron job management tool."""
+    grace_minutes: Optional[int | str] = None,
+    fallback_providers: Optional[list[dict[str, Any]]] = None) -> str:
+    """Unified cron job management tool.
+
+    ``fallback_providers`` is a CLI-only lane like ``model``/``provider`` (absent from the schema
+    and the model dispatch): the job's own ``[{provider, model[, base_url]}]`` fallback list. On
+    update, ``[]`` clears it."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
     try:

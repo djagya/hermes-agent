@@ -217,3 +217,81 @@ def test_pinned_job_failure_notice_does_not_promise_a_backup(monkeypatch):
     assert "pinned" in phrase and "--unpin" in phrase
     assert "succeeded" not in phrase
     assert scheduler._fallback_chain_phrase(_job()) == "No backup provider succeeded either."
+
+
+# --- Opt-in per-job fallback list (job["fallback_providers"]) ------------------------------------
+
+_OWN = [{"provider": "openrouter", "model": "z-ai/glm-5.2"}]
+_GLM_PIN = {"provider": "zai", "model": "glm-5.3"}
+
+
+def test_pinned_job_with_own_fallback_list_gets_exactly_that_list():
+    cfg = {"fallback_providers": [{"provider": "nous", "model": "other"}]}
+    job = _job(**_GLM_PIN, fallback_providers=list(_OWN) + [{"provider": "xai", "model": "grok-4.5"}])
+    assert scheduler._job_fallback_chain(job, cfg) == _OWN + [{"provider": "xai", "model": "grok-4.5"}]
+
+
+def test_pinned_job_without_own_list_still_gets_none():
+    cfg = {"fallback_providers": list(_CHAIN)}
+    assert scheduler._job_fallback_chain(_job(**_GLM_PIN), cfg) is None
+    assert scheduler._job_fallback_chain(_job(**_GLM_PIN, fallback_providers=None), cfg) is None
+
+
+def test_unpinned_job_without_own_list_inherits_the_global_chain():
+    assert scheduler._job_fallback_chain(_job(), {"fallback_providers": list(_CHAIN)}) == _CHAIN
+
+
+def test_job_fallback_entries_never_carry_credentials():
+    """A job record is not operator config: a hand-edited api_key/key_env is dropped."""
+    job = _job(**_GLM_PIN, fallback_providers=[
+        {**_OWN[0], "api_key": "sk-leak", "key_env": "SECRET", "base_url": "https://x.example/v1"}])
+    assert scheduler._job_fallback_chain(job, {}) == [{**_OWN[0], "base_url": "https://x.example/v1"}]
+
+
+def test_job_with_only_malformed_fallback_entries_falls_back_to_the_pinned_default():
+    cfg = {"fallback_providers": list(_CHAIN)}
+    assert scheduler._job_fallback_chain(_job(**_GLM_PIN, fallback_providers=[{"provider": "x"}]), cfg) is None
+    assert scheduler._job_fallback_chain(_job(**_GLM_PIN, fallback_providers=["nope"]), cfg) is None
+
+
+def test_pinned_job_primary_auth_failure_walks_its_own_fallback_list(tmp_path):
+    job = _job(**_GLM_PIN, fallback_providers=list(_OWN))
+    success, error, requested, agent_kwargs = _run(
+        tmp_path, job, primary_error=AuthError("No credentials stored"))
+    assert (success, error) == (True, None)
+    assert requested[-1] == "openrouter"
+    assert (agent_kwargs["provider"], agent_kwargs["model"]) == ("openrouter", "z-ai/glm-5.2")
+
+
+def test_pinned_job_own_fallback_list_is_not_the_global_chain(tmp_path):
+    """The list replaces the global chain; it does not append to it."""
+    job = _job(**_GLM_PIN, fallback_providers=[{"provider": "xai", "model": "grok-4.5"}])
+    _success, _error, requested, _kwargs = _run(
+        tmp_path, job, primary_error=AuthError("No credentials stored"))
+    assert "openrouter" not in requested
+    assert requested[-1] == "xai"
+
+
+def test_pinned_job_agent_gets_its_own_list_as_the_runtime_ladder(tmp_path):
+    success, error, _requested, agent_kwargs = _run(
+        tmp_path, _job(**_GLM_PIN, fallback_providers=list(_OWN)))
+    assert (success, error) == (True, None)
+    assert agent_kwargs["fallback_model"] == _OWN
+
+
+def test_fallback_phrase_for_pinned_job_with_own_list_says_its_fallbacks_failed(monkeypatch):
+    monkeypatch.setattr(scheduler, "load_config", dict)
+    phrase = scheduler._fallback_chain_phrase(_job(**_GLM_PIN, fallback_providers=list(_OWN)))
+    assert "own fallback list" in phrase and "failed too" in phrase
+    assert "does not fall back" not in phrase
+    # Pinned without a list keeps naming the opt-in.
+    assert "--fallback" in scheduler._fallback_chain_phrase(_job(**_GLM_PIN))
+
+
+def test_job_fallback_base_url_is_checked_at_run_time(tmp_path):
+    """Entries live in the job record, so the exfil backstop covers them."""
+    job = _job(**_GLM_PIN, fallback_providers=[
+        {"provider": "openrouter", "model": "m", "base_url": "https://attacker.example/v1"}])
+    success, _error, _requested, agent_kwargs = _run(tmp_path, job)
+    assert success is False
+    assert agent_kwargs == {}
