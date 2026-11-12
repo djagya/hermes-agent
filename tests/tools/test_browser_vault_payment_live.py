@@ -243,8 +243,14 @@ def _kps_page(path, origins):
 # - replace: the next field is replaced by a fresh, identical input (a re-mounted component);
 # - relabel: the next field's placeholder changes (validation hint);
 # - defer: the next field is hidden until the card number is in (brand detection), then shown again;
+# - defer_ahead (round 2, Opus P2-2; single only, a card with a holder name): as defer, but the holder's write (the
+#   first) hides the expiry while the CVC is next: the hidden field is not the next one in the queue. (A focus
+#   listener cannot stand in: Chrome holds focus events back in a tab without window focus.)
 # - duplicate / swap_role / navigate: what must still stop (a second visible CVC; the old CVC input re-described as
-#   a promo code beside a new CVC; the field's frame changes its URL).
+#   a promo code beside a new CVC; the field's frame changes its URL);
+# - cover (round 2, Codex P1-1): the next field replaced by a fresh input under an overlay of the same document;
+# - holder_swap (round 2, Codex P1-2; single only): the number input removed and the unfilled holder input (the
+#   synthetic card has no holder name) relabelled as the card number.
 _DTX_BRANDS = ('<div role="group" aria-label="Payment method"><button type="button" aria-pressed="true">Mastercard'
                '</button><button type="button" aria-pressed="false">Visa</button></div>')
 _DTX_CVC = '<label for="cvv">Security code</label><input id="cvv" autocomplete="cc-csc" placeholder="CVC" maxlength="4">'
@@ -259,7 +265,15 @@ _DTX_MUTATIONS = {
     "swap_role": "const n=el.cloneNode(true);el.autocomplete='off';el.placeholder='Promo code';el.id='promo';"
                  "if(el.labels)for(const l of el.labels)l.textContent='Promo code';el.after(n);",
     "navigate": "history.pushState({},'',location.pathname+'?step=2');",
+    "defer_ahead": "el.style.display='none';",
+    "cover": "const n=el.cloneNode(true);n.value='';el.replaceWith(n);const r=n.getBoundingClientRect(),"
+             "o=document.createElement('div');o.style.cssText='position:fixed;background:#fff;left:'+r.left+'px;top:'"
+             "+r.top+'px;width:'+r.width+'px;height:'+r.height+'px';document.body.appendChild(o);",
+    "holder_swap": "document.getElementById('num').remove();document.getElementById('name').autocomplete='cc-number';",
 }
+_DTX_NAME = '<label for="name">Name on card</label><input id="name" autocomplete="cc-name">'
+# The field whose write touches the expiry in the single layout (the CVC's, first in the fill order without a holder).
+_DTX_TOUCHED_BY = {"defer_ahead": "name"}
 
 
 def _dtx_script(target: str, variant: str) -> str:
@@ -298,8 +312,10 @@ def _datatrans_page(path, origins):
         return (_DTX_CVC + _dtx_script("cvv", variant) + "<script>" + send
                 + "document.getElementById('cvv').addEventListener('input',()=>send(parent,'touch'))</script>")
     if kind == "single":  # one document: writing the CVC (first in the fill order) touches the expiry
-        return (_DTX_BRANDS + _DTX_NUMBER + _DTX_CVC + _DTX_EXP + _dtx_script("exp", variant)
-                + "<script>" + send + "document.getElementById('cvv').addEventListener('input',()=>send(window,'touch'));"
+        toucher = _DTX_TOUCHED_BY.get(variant, "cvv")
+        return (_DTX_BRANDS + (_DTX_NAME if variant in ("holder_swap", "defer_ahead") else "") + _DTX_NUMBER + _DTX_CVC
+                + _DTX_EXP + _dtx_script("exp", variant) + "<script>" + send
+                + f"document.getElementById('{toucher}').addEventListener('input',()=>send(window,'touch'));"
                 "document.getElementById('num').addEventListener('input',()=>send(window,'number'))</script>")
     return None
 
@@ -1261,6 +1277,8 @@ def test_datatrans_shaped_re_render_is_re_pinned_inside_one_approval(payment_bro
     sup, origins = payment_browser
     store = VaultStore(base_dir=tmp_path / "vault")
     card = store.add_item("payment", "Synthetic Datatrans card", CARD, origin=origins["merchant"])
+    holder = store.add_item("payment", "Synthetic Datatrans card with holder", {**CARD, "cardholder_name": "JANE DOE"},
+                            origin=origins["merchant"])
     monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
     original = store.get_meta
     monkeypatch.setattr(store, "get_meta", lambda handle: (
@@ -1269,12 +1287,12 @@ def test_datatrans_shaped_re_render_is_re_pinned_inside_one_approval(payment_bro
     prefix = "/dtx-" if layout == "split" else "/dtx1-"
     full = {"exp": "07/35", "num": CARD["card_number"], "cvv": CARD["cvc"]}
 
-    def fill(variant):
+    def fill(variant, item=card):
         navigate(sup, origins["merchant"] + prefix + variant)
         caplog.clear()
         with caplog.at_level(logging.INFO), \
                 patch("tools.approval_prompt.request_elicitation_consent", return_value="accept") as consent:
-            out = json.loads(browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"]))
+            out = json.loads(browser_vault_fill(item.id, task_id="payment-live", merchant_origin=origins["merchant"]))
         assert consent.call_count == 1 and out["submitted"] is False, (variant, out)
         for secret in (CARD["card_number"], CARD["cvc"], "07/35"):
             assert secret not in json.dumps(out) and secret not in caplog.text, (variant, secret)
@@ -1283,14 +1301,19 @@ def test_datatrans_shaped_re_render_is_re_pinned_inside_one_approval(payment_bro
             "success", "error_type", "filled_fields", "fill_repins", "fill_check", "field_retention")}))
         return out
 
-    for variant in ("replace", "relabel", "defer"):
-        out = fill(variant)
-        assert out["success"] and out["filled_fields"] == 3 and out["fill_repins"] >= 1, (variant, out)
+    for variant in ("replace", "relabel", "defer") + (("defer_ahead",) if layout == "single" else ()):
+        ahead = variant == "defer_ahead"
+        out = fill(variant, holder if ahead else card)
+        assert out["success"] and out["filled_fields"] == 3 + ahead and out.get("fill_repins", 0) >= 1 + ahead, \
+            (variant, out)  # defer_ahead: re-pinned when the expiry is hidden, and again once the number is in
         values = _dtx_values(sup)
-        assert {k: values.get(k) for k in full} == full, (variant, values)
+        expected = {**full, **({"name": "JANE DOE"} if ahead else {})}
+        assert {k: values.get(k) for k in expected} == expected, (variant, values)
         print("RECEIPT datatrans", layout, variant, "=FILLED repins", out["fill_repins"])
 
-    stops = {"duplicate": "fields_replaced", "swap_role": "fields_replaced", "navigate": "navigated"}
+    stops = {"duplicate": "fields_replaced", "swap_role": "fields_replaced", "navigate": "navigated",
+             "cover": "hit_test", **({"holder_swap": "fields_replaced"} if layout == "single" else {})}
+    refusals = {"duplicate": "token_twice", "swap_role": "role_changed", "holder_swap": "role_changed"}
     for variant, reason in stops.items():
         out = fill(variant)
         assert not out["success"] and out["filled_fields"] == 1 and out["partially_filled"] is True, (variant, out)
@@ -1308,4 +1331,5 @@ def test_datatrans_shaped_re_render_is_re_pinned_inside_one_approval(payment_bro
             assert check["token"] == {"exp": "cc-csc", "cvv": "cc-exp"}[written[0]], out
             assert check["documents"] == (3 if layout == "split" else 1), out
             assert "card fill stopped" in caplog.text and reason in caplog.text, caplog.text
+            assert check.get("repin_refused") == refusals.get(variant), out
         print("RECEIPT datatrans", layout, variant, "=STOPPED", out.get("fill_check", out["error_type"]))

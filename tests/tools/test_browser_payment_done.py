@@ -723,7 +723,7 @@ def test_payment_close_closes_only_the_owning_tab_natively_and_proves_the_unlock
     assert [c[1] for c in sup.sent("Target.closeTarget")] == [{"targetId": "TAB"}]  # never OTHER
     assert not sup.sent("Runtime.evaluate") and not sup.sent("Runtime.callFunctionOn")
     assert not sup.sent("Target.createTarget")  # OTHER stays open: no blank tab needed
-    assert [c[1] for c in sup.sent("attach_page")] == [{"targetId": "OTHER"}]  # followed, after the unlock
+    assert not sup.sent("attach_page")  # never followed to another of the user's tabs: left detached (P3-2)
     assert done.payment_close(sup) == {"success": True, "closed_tabs": 0, "lock_released": True,
                                        "note": done._CLOSE_NOT_LOCKED}
 
@@ -745,6 +745,7 @@ def test_payment_close_opens_a_blank_tab_first_when_it_would_close_the_last_one(
     assert sup.index("Target.createTarget") < sup.index("Target.closeTarget")
     assert sorted(c[1]["targetId"] for c in sup.sent("Target.closeTarget")) == ["OTHER", "TAB"]
     assert out["new_tab"] == "NEWTAB" and out["closed_tabs"] == 2
+    assert [c[1] for c in sup.sent("attach_page")] == [{"targetId": "NEWTAB"}]  # its own blank tab, after the unlock
 
 
 @pytest.mark.parametrize("status, error_type", [

@@ -600,6 +600,7 @@ def test_renderer_writes_only_while_both_its_monotonic_and_wall_clocks_are_insid
 _SETTER_HARNESS = r"""
 let writes = [], els, cover = null, mono = 1000;
 const performance = {now: () => mono};
+Object.assign(globalThis, {innerWidth: 1000, innerHeight: 1000});
 // The receiving frame's same-origin parent iframe and the top page (frameElement / parent / top).
 const parentWin = {location: {href: 'https://shop.example/checkout'}};
 const owner = {isConnected: true, op: '1', ownerDocument: {defaultView: {getComputedStyle: e => ({visibility: 'visible',
@@ -617,7 +618,7 @@ const mk = (id, token, top) => Object.assign(new HTMLInputElement(), {tagName: '
   getAttribute(n) { return n === 'aria-label' ? (this.aria || null) : null; },
   getBoundingClientRect() { if (this.slow) mono += 1000;
     return this.hidden ? {width: 0, height: 0, left: 0, top: 0} : {width: 100, height: 20, left: 0, top: this.top}; },
-  getClientRects() { return this.hidden ? [] : [1]; }, getRootNode: () => document,
+  getClientRects() { return this.hidden ? [] : [1]; }, getRootNode: () => document, contains(o) { return o === this; },
   focus() { if (this.onfocus) this.onfocus(); }});
 els = [mk('c', 'cc-csc', 0), mk('n', 'cc-number', 40)];
 document.querySelectorAll = () => els;
@@ -707,9 +708,11 @@ def test_a_focus_handler_that_changes_the_pinned_set_stops_the_next_setter(focus
     ("hide", ["c"], ["field_hidden"]),  # the number is never deferred (the closure refuses it too): stop
 ])
 def test_a_re_render_is_written_only_after_an_accepted_re_pin(focus, writes, repins):
-    """dlz (re-pin): the supervisor's answer moves the pins; every check then runs again before the setter."""
+    """dlz (re-pin): the supervisor's answer moves the pins; every check then runs again before the setter, and a
+    re-pinned field pauses after its focus for the owner-chain check though the fill is not strict (Codex r1 P1-1)."""
     out = _setter_harness({"focus": focus, "strict": False, "pins": "auto"})
     assert out["writes"] == writes and [c["reason"] for c in out["repins"]] == repins
+    assert out["paused"] == ([[1, 1]] if len(writes) == 2 else [])
     if len(writes) == 2:
         assert out["result"] == {"success": True, "filled_fields": 2}
     else:
