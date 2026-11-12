@@ -699,3 +699,81 @@ def test_the_card_window_lasts_until_the_lock_release_is_confirmed(monkeypatch):
         assert redact.redact_sensitive_text("printed 737", force=True) == "printed 737"
     finally:
         redact.clear_vault_redaction_values()
+
+
+LOCKED_TAB = {"locked": True, "native": True, "tabs": ["TAB"], "unverified": False}
+
+
+class _Unlocking(FakeSup):
+    """Control reports the slot locked by TAB until TAB was closed (its watcher saw targetDestroyed)."""
+
+    def answer(self, method, params, session_id=None):
+        if method == "Target.closeTarget" and params.get("targetId") == "TAB":
+            self.tab_open = False
+            self.status = dict(UNLOCKED)
+        return super().answer(method, params, session_id)
+
+
+def test_payment_close_closes_only_the_owning_tab_natively_and_proves_the_unlock():
+    """dlz (11-12): the lock exit after a stopped fill, with no snapshot and no page read."""
+    sup = _Unlocking([CHECKOUT], status=dict(LOCKED_TAB))
+    _paid([CHECKOUT])  # another supervisor's record never widens what this one closes
+    out = done.payment_close(sup)
+    assert out == {"success": True, "closed_tabs": 1, "lock_released": True}
+    assert [c[1] for c in sup.sent("Target.closeTarget")] == [{"targetId": "TAB"}]  # never OTHER
+    assert not sup.sent("Runtime.evaluate") and not sup.sent("Runtime.callFunctionOn")
+    assert not sup.sent("Target.createTarget")  # OTHER stays open: no blank tab needed
+    assert not sup.sent("attach_page")  # never followed to another of the user's tabs: left detached (P3-2)
+    assert done.payment_close(sup) == {"success": True, "closed_tabs": 0, "lock_released": True,
+                                       "note": done._CLOSE_NOT_LOCKED}
+
+
+def test_payment_close_uses_the_recorded_payment_tab_when_control_cannot_answer():
+    sup = _paid([CHECKOUT])
+    sup.fail.add("Hermes.paymentSurfaceStatus")
+    out = done.payment_close(sup)
+    assert [c[1] for c in sup.sent("Target.closeTarget")] == [{"targetId": "TAB"}]
+    assert out["closed_tabs"] == 1 and out["lock_released"] is False and out["note"] == done._CLOSE_UNPROVEN
+    assert not sup.sent("attach_page")  # never attach on a slot not proven unlocked
+
+
+def test_payment_close_opens_a_blank_tab_first_when_it_would_close_the_last_one():
+    sup = _Unlocking([CHECKOUT], status={"locked": True, "native": True, "tabs": ["TAB", "OTHER"], "unverified": False})
+    out = done.payment_close(sup)
+    (_, created, _, _), = sup.sent("Target.createTarget")
+    assert created == {"url": "about:blank", "browserContextId": "CTX"}
+    assert sup.index("Target.createTarget") < sup.index("Target.closeTarget")
+    assert sorted(c[1]["targetId"] for c in sup.sent("Target.closeTarget")) == ["OTHER", "TAB"]
+    assert out["new_tab"] == "NEWTAB" and out["closed_tabs"] == 2
+    assert [c[1] for c in sup.sent("attach_page")] == [{"targetId": "NEWTAB"}]  # its own blank tab, after the unlock
+
+
+@pytest.mark.parametrize("status, error_type", [
+    ({"locked": True, "native": False, "tabs": [], "unverified": True}, "payment_close_nothing"),  # no tab named
+    ({"locked": True, "native": True, "tabs": ["GONE"], "unverified": False}, "payment_close_nothing"),  # not open
+])
+def test_payment_close_closes_nothing_it_cannot_name(status, error_type):
+    sup = FakeSup([CHECKOUT], status=status)
+    out = done.payment_close(sup)
+    assert out["error_type"] == error_type and out["closed_tabs"] == 0 and not sup.sent("Target.closeTarget")
+
+
+def test_payment_close_reports_a_failed_close():
+    sup = FakeSup([CHECKOUT], status=dict(LOCKED_TAB))
+    sup.fail.add("Target.closeTarget")
+    out = done.payment_close(sup)
+    assert out["success"] is False and out["error_type"] == "payment_close_failed" and out["closed_tabs"] == 0
+
+
+def test_payment_close_is_a_browser_vault_action_on_the_managed_browser(monkeypatch):
+    from tools import browser_vault_tool as vault
+
+    seen = []
+    monkeypatch.setattr(vault, "_is_managed", lambda: True)
+    monkeypatch.setattr(vault, "_managed_supervisor", lambda task, admit=False: seen.append((task, admit)) or "SUP")
+    monkeypatch.setattr(done, "payment_close", lambda sup: {"success": True, "closed_tabs": 1, "lock_released": True})
+    assert json.loads(vault._payment_close_action("t1"))["closed_tabs"] == 1 and seen == [("t1", True)]
+    monkeypatch.setattr(vault, "_is_managed", lambda: False)
+    assert json.loads(vault._payment_close_action("t1"))["error_type"] == "payment_surface_none"
+    assert "payment_close" in vault.BROWSER_VAULT_SCHEMA["parameters"]["properties"]["action"]["enum"]
+    assert "payment_close" in surface.LOCKED_TEXT and "browser_cdp" not in surface.LOCKED_TEXT

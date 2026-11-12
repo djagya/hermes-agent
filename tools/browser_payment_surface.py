@@ -95,10 +95,10 @@ _UNAVAILABLE_TEXT = (
 )
 LOCKED_TEXT = (
     "The browser is locked for a card payment: page reads, scripts, input, screenshots and attaching to tabs "
-    "are refused until the payment tab is closed. Tabs can still be listed (browser_cdp Target.getTargets, no "
-    "params: each tab's site (origin) only, no title) and closed (browser_cdp Target.closeTarget {targetId}). Continue with "
-    "browser_vault payment_controls / payment_click on the payment tab, and call payment_done after Pay: it "
-    "hands the confirmation over and ends the lock."
+    "are refused until the payment tab is closed. Continue with browser_vault payment_controls / payment_click on "
+    "the payment tab, and call payment_done after Pay: it hands the confirmation over and ends the lock. If the "
+    "payment will not go ahead (a stopped fill, the user cancelled), call browser_vault payment_close: it closes "
+    "the payment tab and ends the lock, without a confirmation."
 )
 
 
