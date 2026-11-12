@@ -156,9 +156,11 @@ _INSPECT_TEMPLATE = r"""(() => {
     candidate = null;
     if (!c || !pins || typeof pins !== 'object' || why() === 'navigated' || !chain()) return false;
     const now = exposedNow();
-    if (!(now.els.length === c.els.length && now.els.every((e,n)=>e === c.els[n])) ||
-        JSON.stringify(now.els.map(describeOne)) !== c.sig) return false;
     const exposed = new Set(now.entries.map(x=>x.index));
+    // the same elements, described the same, and exactly the fields exposed when the supervisor read them
+    if (!(now.els.length === c.els.length && now.els.every((e,n)=>e === c.els[n])) ||
+        JSON.stringify(now.els.map(describeOne)) !== c.sig ||
+        exposed.size !== c.exposed.length || c.exposed.some(n => !exposed.has(n))) return false;
     const indexes = plan.map(f => pins[f.token]);
     if (plan.some(f => !Object.prototype.hasOwnProperty.call(pins, f.token)) ||
         indexes.some(n => typeof n !== 'number' || (n !== -1 && !exposed.has(n))) ||
@@ -195,7 +197,7 @@ _INSPECT_TEMPLATE = r"""(() => {
       const now = exposedNow();
       const fields = bounded(now.entries.map(x=>describeOne(x.e,x.index)), now.unsure);
       if (!Array.isArray(fields)) return fields;
-      candidate = {els: now.els, sig: JSON.stringify(now.els.map(describeOne))};
+      candidate = {els: now.els, sig: JSON.stringify(now.els.map(describeOne)), exposed: now.entries.map(x=>x.index)};
       const kept = {};
       for (const f of written) kept[f.token] = f.index === -1 ? -1 : now.els.indexOf(elements[f.index]);
       return {fields, kept};
