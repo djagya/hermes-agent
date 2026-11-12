@@ -31,7 +31,10 @@ jobs:
   core:
     name: Desktop core E2E (Linux)
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    # dlz: the fork has no 32-core runner. On ubuntu-latest the 42-spec suite alone takes
+    # 23-26 min after ~3.5 min of build and packaging (runs 43064168539, 43106199332: the job
+    # ended at 29m18s / 29m37s of 30). Each spec still has its own 180 s bound.
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 40 }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:

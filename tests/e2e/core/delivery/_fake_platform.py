@@ -732,7 +732,14 @@ def persisted_answers(db_path: Path, aid: str) -> list[str]:
 
 
 def persisted_user_rows(db_path: Path, token: str) -> list[str]:
+    """User rows carrying *token*: the inbound's persisted copies.
+
+    An auto-resume's recovery note is a user row that quotes the interrupted request
+    (gateway/run_resume.py, ``<interrupted_request>``); it is the resume's scaffold, not a second
+    copy of the inbound, so it is not counted. Whether a resume ran is asserted separately."""
     import sqlite3
+
+    from gateway.run_resume import _RESUME_NOTE_PREFIX
 
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
     try:
@@ -740,7 +747,7 @@ def persisted_user_rows(db_path: Path, token: str) -> list[str]:
                             (f"%{token}%",)).fetchall()
     finally:
         conn.close()
-    return [r[0] for r in rows]
+    return [r[0] for r in rows if not str(r[0]).startswith(_RESUME_NOTE_PREFIX)]
 
 
 if __name__ == "__main__":  # pragma: no cover - child process entry

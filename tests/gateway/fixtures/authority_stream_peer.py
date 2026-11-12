@@ -54,7 +54,12 @@ class ModelPeer(BaseHTTPRequestHandler):
             self.wfile.write(('data: ' + json.dumps(frame) + '\n\n').encode())
             self.wfile.flush()
             if delta.get('content', '').startswith('CHUNK_'):
-                assert self.server.acks.get(timeout=15) == delta['content'][:11]
+                waited = time.monotonic()
+                try:
+                    ack = self.server.acks.get(timeout=15)
+                finally:  # read by the probe's failure dump: which chunk stalled, and for how long
+                    self.server.ack_log.append((delta['content'][:11], round(time.monotonic() - waited, 3)))
+                assert ack == delta['content'][:11], (ack, delta['content'][:11])
         self.wfile.write(b'data: [DONE]\n\n')
         self.wfile.flush()
 
@@ -75,7 +80,10 @@ class Observer:
                 self.waiters.pop(frame['id']).set_result(frame)
             elif frame.get('params', {}).get('session_id') == self.sid:
                 self.events.append(frame['params'])
-                text = frame['params'].get('payload', {}).get('text') or ''
+                # The first text delta after a tool round carries the agent's paragraph break
+                # ("\n\n" + CHUNK_0000_...): without the lstrip that chunk was never acked, the model
+                # peer stalled 15 s and cut its stream, and the turn only finished on a retry.
+                text = (frame['params'].get('payload', {}).get('text') or '').lstrip()
                 if self.healthy and frame['params']['type'] == 'message.delta' and text.startswith('CHUNK_'):
                     self.peer.acks.put(text[:11])
                 if frame['params']['type'] == 'message.complete':
@@ -98,6 +106,28 @@ class Observer:
         import websockets.exceptions
         with contextlib.suppress(websockets.exceptions.ConnectionClosed):
             await self.task
+
+
+def _dump_state(peer, authority, ref, *observers):
+    """On a stalled wait, name where the chain stopped (stderr reaches the pytest failure)."""
+    import sys
+    stalls = [entry for entry in peer.ack_log if entry[1] > 1]
+    print(f'DIAG acks={len(peer.ack_log)} slow_acks={stalls[:5]} last_acks={peer.ack_log[-3:]}', file=sys.stderr)
+    for name, observer in zip('ab', observers):
+        types = {}
+        for event in observer.events:
+            types[event['type']] = types.get(event['type'], 0) + 1
+        texts = [e.get('payload', {}).get('text', '')[:11] for e in observer.events if e['type'] == 'message.delta']
+        print(f'DIAG observer {name}: events={len(observer.events)} types={types} '
+              f'last_deltas={texts[-3:]} complete={observer.complete.is_set()} '
+              f'reader_done={observer.task.done()}', file=sys.stderr)
+    try:
+        fanout = authority.sessions[ref.session_id].event_stream.fanout
+        with fanout._lock:
+            peers = [(len(p.pending), p.pending_bytes, p.writing, p.attached, p.generation) for p in fanout._peers]
+        print(f'DIAG fanout peers (pending, bytes, writing, attached, generation)={peers}', file=sys.stderr)
+    except Exception as exc:  # diagnostics only
+        print(f'DIAG fanout unavailable: {exc!r}', file=sys.stderr)
 
 
 async def probe(peer, target):
@@ -183,7 +213,11 @@ async def probe(peer, target):
                     await asyncio.sleep(.005)
             witness = asyncio.create_task(witness_blockage())
         receipt = await b.rpc('prompt.submit', input_id='stream-first', text='Write the owned fixture')
-        await asyncio.wait_for(b.complete.wait(), 45)
+        try:
+            await asyncio.wait_for(b.complete.wait(), 45)
+        except TimeoutError:
+            _dump_state(peer, authority, ref, a, b)
+            raise
         if not peer.blocked:
             await asyncio.wait_for(a.complete.wait(), 10)
         await asyncio.wait_for(authority.sessions[ref.session_id].task, 10)
@@ -212,7 +246,11 @@ async def probe(peer, target):
             assert a.events == b.events, 'observers saw competing event ordering/stamps'
         events = b.events
         if peer.blocked:
-            await async_wait_until(lambda: a.events, timeout=5, what='the resumed slow observer to read a frame')
+            try:
+                await async_wait_until(lambda: a.events, timeout=5, what='the resumed slow observer to read a frame')
+            except AssertionError:
+                _dump_state(peer, authority, ref, a, b)
+                raise
             assert a.events == events[:len(a.events)], 'slow observer prefix has competing stamps'
             with fanout._lock:
                 assert len(fanout._peers) <= 2
@@ -279,6 +317,7 @@ def main():
         from tui_gateway.transport import FanoutTransport
         FanoutTransport._MAX_PENDING_FRAMES = 256
     peer.acks = queue.Queue()
+    peer.ack_log = []
     peer.command = 'printf owned-effect > ' + shlex.quote(str(target))
     threading.Thread(target=peer.serve_forever, daemon=True).start()
     url = f'http://127.0.0.1:{peer.server_port}/v1'
