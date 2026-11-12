@@ -130,9 +130,20 @@ def _retire_daemon(name: str) -> None:
                     _retiring.pop(name, None)
 
     thread = threading.Thread(target=_run, name="bu-daemon-retire", daemon=True)
+    # Registered before start so a fast retire's own cleanup always finds it; a start that fails
+    # must not leave an unstarted thread that every later reuse would join().
     with _retiring_lock:
         _retiring.setdefault(name, []).append(thread)
-    thread.start()
+    try:
+        thread.start()
+    except BaseException:
+        with _retiring_lock:
+            pending = _retiring.get(name, [])
+            if thread in pending:
+                pending.remove(thread)
+            if not pending:
+                _retiring.pop(name, None)
+        raise
 
 
 # Retires in flight per lease name. A revocable deferral puts the lease entry back under the same
