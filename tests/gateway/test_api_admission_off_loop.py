@@ -1,5 +1,6 @@
 """API admission never blocks the shared owner loop on a held SQLite writer (every HTTP door)."""
 import asyncio
+import json
 import sqlite3
 import threading
 import time
@@ -39,6 +40,14 @@ async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, mon
     app.router.add_post(path, getattr(api, {'chat': '_handle_chat_completions', 'responses': '_handle_responses',
                                             'runs': '_handle_runs'}[name]))
     async with TestClient(TestServer(app)) as client:
+        # A running gateway has already imported the door's lazy modules (gateway.run above all);
+        # a first request in a fresh test process pays that one-time load on the loop (0.5-0.8 s
+        # on a CI runner). Warm the door once, on its own session, so the gaps below measure the
+        # admission wait alone.
+        warm_body = json.loads(json.dumps(body).replace('"hi"', '"warm up"'))
+        warm = await client.post(path, json=warm_body,
+                                 headers={**AUTH, **{k: v + '-warm' for k, v in headers.items()}})
+        assert warm.status == expected, await warm.text()
         # Another process holds the profile's state.db writer for HOLD_S (a long transaction).
         holder = sqlite3.connect(owner.db.db_path, timeout=0, isolation_level=None, check_same_thread=False)
         holder.execute('BEGIN IMMEDIATE')
