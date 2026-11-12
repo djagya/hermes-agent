@@ -678,10 +678,13 @@ class PaymentSupervisionMixin:
         ]
         if len(pages) != 1:
             raise PaymentPolicyError("Merchant tab missing or ambiguous")
-        current = (await self._cdp("Target.getTargetInfo", session_id=sid))[
-            "result"
-        ]["targetInfo"]
-        if current["targetId"] == pages[0]["targetId"]:
+        try:
+            current = (await self._cdp("Target.getTargetInfo", session_id=sid))["result"]["targetInfo"]["targetId"]
+        except Exception:  # health: allow BLE001 -- dlz (Codex r2 P2-5): a page session that does not answer
+            # The supervised tab was closed (payment_close, the user): its session is dead ("Session with given id
+            # not found"). That is "on another tab": the one tab at ``origin`` is attached below, as from any other.
+            current = None
+        if current == pages[0]["targetId"]:
             return sid
         old_sid = sid
         sid = (
