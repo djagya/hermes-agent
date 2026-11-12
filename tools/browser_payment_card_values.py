@@ -4,13 +4,17 @@ Two places hold them, both filled by the card fill before any field is written:
 
 * the profile-wide payment window (:func:`agent.redact_vault.register_card_window`): the number and CVC by
   length (every model-facing output masks every digit run of their lengths, so nothing marks which run
-  was the card) and the holder name, keyed by the slot (by the supervisor's own identity without a slot
+  was the card) and the holder name (browser and log output only), keyed by the slot (by the supervisor's own identity without a slot
   route, :func:`window_key`). A confirmed payment lock release (:func:`release_payment_window`: control
-  proves the slot unlocked after this process saw it locked, which ``payment_done``'s ``lock_released``, a
-  recovery close of the payment tab and any later status read all go through) narrows it to browser tool
-  results (the page may still show card text); it closes when the slot's exposure ends
-  (:func:`release_slot`: a wipe, a human clear or an operator clear of its mark). Every release is fenced
-  by the window generation it observed first: a claim (:func:`note_claim`) or an open since then wins;
+  proves the slot unlocked, which ``payment_done``'s ``lock_released`` and any later status read (after a recovery close of the payment
+  tab too) all go through, by whichever supervisor is attached to the slot,
+  :func:`slot_bound`; and :func:`release_unlocked_slot`, control's own view of the slot, when no supervisor
+  reads it) narrows it to browser tool results (the page may still show card text); it closes when the
+  slot's exposure ends (:func:`release_slot`: a wipe, a human clear or an operator clear of its mark).
+  Every release is fenced by the window generation it observed first: a claim (:func:`note_claim`) or an
+  open since then wins. A fill that stops before its first write takes its open back
+  (:func:`withdraw_payment_window`, by the key and identity the open returned; sealed by
+  :func:`seal_payment_window` when the commit starts): nothing of the card reached the page;
 * the dialog values (number, CVC, holder, expiry forms): per supervisor AND per slot, so a fresh supervisor
   for the same slot still scrubs them from dialog text while the slot's mark keeps it exposed. Dropped,
   every supervisor's on the slot included, only when the slot's exposure ends; they are used for dialog and
@@ -41,16 +45,25 @@ def _scope() -> str:
     return str(get_hermes_home())
 
 
-def slot_of(supervisor: Any) -> str:
-    """The managed slot id of ``supervisor``'s browser_exec route; ``""`` when it has none."""
+def route_of(supervisor: Any) -> dict | None:
+    """One snapshot of ``supervisor``'s browser_exec route (a copy), ``None`` when there is no route to read.
+    A caller that needs the slot and the bound check of the same moment derives both from one snapshot."""
     if supervisor is None:
-        return ""
+        return None
     try:
         from tools.browser_use_cli import vault_route
 
-        return str((vault_route(getattr(supervisor, "task_id", None)) or {}).get("slot_id") or "")
-    except Exception:  # health: allow BLE001 -- no route to name a slot
-        return ""
+        return dict(vault_route(getattr(supervisor, "task_id", None)) or {})
+    except Exception:  # health: allow BLE001 -- no route to read
+        return None
+
+
+def slot_of(supervisor: Any, route: dict | None = None) -> str:
+    """The managed slot id of ``supervisor``'s browser_exec route (``route``: a snapshot already taken);
+    ``""`` when it has none."""
+    if route is None:
+        route = route_of(supervisor)
+    return str((route or {}).get("slot_id") or "")
 
 
 def _dialog_values(secret: dict) -> list:
@@ -108,10 +121,10 @@ def dialog_card_values(supervisor: Any) -> list:
     return list(dict.fromkeys(own + extra))
 
 
-def window_key(supervisor: Any) -> str:
+def window_key(supervisor: Any, route: dict | None = None) -> str:
     """The payment window ``supervisor`` opens: its slot id, or (no slot route) its own identity, never ``""``,
-    so one slot-less supervisor's release never closes another's window."""
-    slot = slot_of(supervisor)
+    so one slot-less supervisor's release never closes another's window. ``route``: a snapshot already taken."""
+    slot = slot_of(supervisor, route)
     if slot:
         return slot
     with _LOCK:
@@ -132,7 +145,10 @@ def note_claim(supervisor: Any) -> None:
 
 
 def observe_windows(supervisor: Any) -> dict:
-    """The generations of ``supervisor``'s windows, read before the status read that may release them."""
+    """The generations of ``supervisor``'s windows, read before the status read that may release them: those
+    it opened, and its route's slot only while its socket is the one that route names (:func:`slot_bound`).
+    An orphaned supervisor whose route moved to another slot reads its own browser's status, which says
+    nothing about the slot the route names now."""
     from agent.redact import card_window_generations
 
     with _LOCK:
@@ -140,24 +156,92 @@ def observe_windows(supervisor: Any) -> dict:
             keys = set(_WINDOWS.get(supervisor, ()))
         except TypeError:
             keys = set()
-    keys.add(window_key(supervisor))
+    # dlz: ONE route snapshot for the bind check and the key (as open_payment_window): a route that moves
+    # between two reads would make this supervisor observe, and later release, a slot it does not drive.
+    route = route_of(supervisor)
+    if slot_bound(supervisor, route):
+        keys.add(window_key(supervisor, route))
     gens = card_window_generations()
     return {key: gens.get(key, 0) for key in keys}
 
 
-def open_payment_window(secret: dict, supervisor: Any) -> None:
-    """Register the card for every model-facing output of this profile until the release is confirmed.
-    Raises when it cannot (the fill must then stop)."""
-    from agent.redact import register_card_window
+def slot_bound(supervisor: Any, route: dict | None = None) -> bool:
+    """Whether ``supervisor``'s socket is the one its task's route was attached with, so the route's slot id
+    names the browser its status reads answer for. A supervisor without a slot route has only its own
+    window (:func:`window_key`): bound. A route whose attach failed, or one a newer exec moved to another
+    browser while this socket stayed, is not: its status says nothing about the slot the route names.
+    ``route``: a snapshot already taken (:func:`route_of`); without one the route is read now."""
+    if route is None:
+        route = route_of(supervisor)
+    if route is None:  # no route to compare: only the supervisor's own window
+        return True
+    if not route.get("slot_id"):
+        return True
+    url = str(route.get("supervisor_url") or "")
+    return bool(url) and url == str(getattr(supervisor, "cdp_url", "") or "")
 
-    key = window_key(supervisor)
-    register_card_window(key, digits=(str(secret.get("card_number") or ""), str(secret.get("cvc") or "")),
-                         words=(str(secret.get("cardholder_name") or ""),))
+
+class PaymentWindowRefused(RuntimeError):
+    """The window cannot be opened for this supervisor: the fill stops, nothing is written."""
+
+
+def open_payment_window(secret: dict, supervisor: Any) -> tuple:
+    """Register the card for every model-facing output of this profile until the release is confirmed.
+    Raises when it cannot (the fill must then stop): on a managed browser also when the supervisor's socket
+    is not the one its route names (:func:`slot_bound`), because the key would then name a slot this socket
+    does not drive. Returns ``(window key, open identity, supervisor, recorded)`` of this open, for
+    :func:`withdraw_payment_window` and :func:`seal_payment_window`: the key is fixed here, so a route that
+    moves to another slot before the fill ends never makes it touch that slot's window; ``recorded`` says
+    whether this open added the key to the supervisor's own windows. The bind check and the key come from ONE
+    snapshot of the route: a route that moves between two reads cannot key the open on a slot the check never
+    saw. The refusal is its own fail-closed guard (nothing is written, no window registered)."""
+    from agent.redact import register_card_window
+    from tools.browser_payment_surface import _managed
+
+    route = route_of(supervisor)
+    if _managed() and not slot_bound(supervisor, route):
+        raise PaymentWindowRefused("supervisor is not bound to its route's slot")
+    key = window_key(supervisor, route)
+    opened = register_card_window(
+        key, digits=(str(secret.get("card_number") or ""), str(secret.get("cvc") or "")),
+        words=(str(secret.get("cardholder_name") or ""),))
+    recorded = False
     with _LOCK:
         try:
-            _WINDOWS.setdefault(supervisor, set()).add(key)
+            keys = _WINDOWS.setdefault(supervisor, set())
+            recorded = key not in keys
+            keys.add(key)
         except TypeError:  # unscoped: closed only by its slot's release (or never: masking stays)
             pass
+    return key, opened, supervisor, recorded
+
+
+def withdraw_payment_window(key: str, opened: int, supervisor: Any = None, recorded: bool = False) -> bool:
+    """The fill whose open returned ``(key, opened, ...)`` stopped before it wrote any card value: that
+    window goes back to what it was before the open (an earlier payment's window stays). Refused, and the
+    window kept, when a claim or another fill touched it since, or once that open was sealed. Taken back or
+    not, the supervisor stops owning ``key`` unless it owned it before this open (``recorded`` false): an
+    unwritten open leaves no association for a later status read to release a slot by, even when another
+    fill claimed or opened that slot meanwhile and the window stays for it (its own supervisor owns it)."""
+    from agent.redact import withdraw_card_window
+
+    taken = withdraw_card_window(key, opened)
+    if recorded and supervisor is not None:
+        with _LOCK:
+            try:
+                _WINDOWS.get(supervisor, set()).discard(key)
+            except TypeError:
+                pass
+    return taken
+
+
+def seal_payment_window(key: str, opened: int, *_ignored: Any) -> None:
+    """The fill whose open returned ``(key, opened, ...)`` starts its commit: from here a card value may be in
+    the page, so no withdraw can take that open back; only control's unlock or a mark clear ends it. Raises
+    when that window is gone (the fill must stop before it writes)."""
+    from agent.redact import seal_card_window
+
+    seal_card_window(key, opened)
 
 
 def release_payment_window(supervisor: Any, observed: dict) -> None:
@@ -173,6 +257,24 @@ def release_payment_window(supervisor: Any, observed: dict) -> None:
                     _WINDOWS.get(supervisor, set()).discard(key)
                 except TypeError:
                     pass
+
+
+def unreleased_slots() -> list:
+    """The slots whose payment window still masks every output of this profile (no confirmed release yet)."""
+    from agent.redact import card_window_keys
+
+    return [k for k in card_window_keys(unreleased=True) if k and not k.startswith(SUPERVISOR_KEY_PREFIX)]
+
+
+def release_unlocked_slot(slot_id: str, observed: dict) -> bool:
+    """Control's own view of ``slot_id`` proved its payment lock gone (the tab was closed by someone else, a
+    human clear): its window narrows to browser tool results, as after a supervisor's confirmed release,
+    unless a claim or a card fill touched it since ``observed`` (the generations read before control was
+    asked). Whether it narrowed."""
+    from agent.redact import release_card_window
+
+    slot = str(slot_id or "")
+    return bool(slot) and slot in observed and release_card_window(slot, observed[slot], keep_for_browser=True)
 
 
 def release_slot(slot_id: str, observed: dict | None = None) -> None:

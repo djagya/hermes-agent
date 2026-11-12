@@ -622,14 +622,16 @@ class TestBrowserVaultTools:
     def test_payment_fill_registers_only_card_secrets_for_redaction(self, number, groups):
         """Every later tool result is scrubbed until the release: a payment fill opens a window that masks
         every digit run as long as the number (as typed, spaced or dashed) or the CVC, and scrubs the holder
-        as a whole word (r8); the expiry and postcode, common strings elsewhere, stay readable."""
+        as a whole word in browser and log output (r8; owner decision B: not in model output); the expiry
+        and postcode, common strings elsewhere, stay readable."""
         from tools.browser_vault_payment import _register_card_redaction
         from agent import redact
 
         try:
             _register_card_redaction({**_CARD, "card_number": number})
             text = "A User, 94110, renews 2029, month 7, build 1.27.3, date 07/29, blog /2025/07/29/, Users"
-            assert redact.redact_sensitive_text(text) == text.replace("A User,", "«redacted-card»,", 1)
+            assert redact.redact_sensitive_text(text) == text
+            assert redact.redact_sensitive_text(text, vault="browser") == text.replace("A User,", "«redacted-card»,", 1)
             assert redact.redact_sensitive_text("ratio 107/290") == "ratio •••/•••"
             for secret in (number, " ".join(groups), "-".join(groups)):
                 assert secret not in redact.redact_sensitive_text(f"page says {secret}."), secret

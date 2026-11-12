@@ -25,12 +25,19 @@ dlz: the scrub depends on who reads the text (``audience``, :func:`redact_regist
   character, so the JSON stays valid and a reload marks nothing.
 
 Values with a non-digit character are replaced exactly for every audience. Card values live in payment
-windows (:func:`register_card_window`, lengths and holder only, never the values), fenced by a per-window
-generation: a claim or an open bumps it, and a release that observed an older generation changes nothing.
-A confirmed lock release keeps the window for browser results only (the page may still show card text);
-the window goes when the slot's mark is cleared.
+windows (:func:`register_card_window`, lengths and holder only, never the values). The digit classes mask
+for ``model``, ``browser`` and ``log``; the holder name only for ``browser`` and ``log`` (owner decision B,
+2026-11-12: where text from the payment slot can be; the holder is usually the owner, and a model, authored
+or other output that names them is not card data). Windows are fenced by a per-window
+generation: a claim or an open gives it a new value from one process-wide counter (never reused, even after a
+window-less key's counter is forgotten), and a release that observed another generation changes nothing.
+A confirmed lock release keeps the window for browser and log output only (the page may still show card
+text; every browser result of the profile, whichever slot it names: a browser_exec workspace outlives its
+slot); the window goes when the slot's mark is cleared. An open whose fill stopped before its first write is taken
+back (:func:`withdraw_card_window`): the card never left the process, so the window is as it was before.
 """
 
+import itertools
 import json
 import re
 import threading
@@ -40,6 +47,10 @@ _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: _Entry}
 _CARD_WINDOWS: dict = {}  # profile home → ordered {window key: [digit lengths, holder words, released]}
 _CARD_GENERATIONS: dict = {}  # profile home → {window key: generation}
+# profile home → {window key: (identity of its last open, generation that open reached, the window before it or None)}
+_CARD_UNDO: dict = {}
+_OPEN_IDS = itertools.count(1)  # process-global, never reused: a stale withdraw can never match a newer open
+_GENERATION_VALUES = itertools.count(1)  # process-global, never reused: a dropped counter never returns an old value
 _MAX_CARD_WINDOWS = 16
 _MAX_GENERATIONS = 256
 _VAULT_REDACTION_LOCK = threading.Lock()
@@ -47,6 +58,7 @@ PLACEHOLDER = "«redacted-vault-secret»"
 CARD_PLACEHOLDER = "«redacted-card»"
 LOGIN_MASK_S = 900.0  # a pure-digit login secret masks digit runs of its length for 15 minutes
 AUDIENCES = ("model", "browser", "log", "authored")
+HOLDER_AUDIENCES = ("browser", "log")  # owner decision B, 2026-11-12: the card holder's name is masked only here
 _LONG = 12  # shortest card number: a pure-digit value this long also masks longer runs and spaced groups
 _ALL_DIGITS = re.compile(r"\d+")
 # Digit groups joined by single spaces, dots or dashes, matched whole (greedy): a run whose digits add up to a card
@@ -128,13 +140,15 @@ def clear_vault_redaction_values() -> None:
     with _VAULT_REDACTION_LOCK:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
         _CARD_WINDOWS.pop(_vault_scope(), None)
+        _CARD_UNDO.pop(_vault_scope(), None)
 
 
 def _bump(scope: str, key: str) -> int:
     gens = _CARD_GENERATIONS.setdefault(scope, {})
-    gens[key] = gens.pop(key, 0) + 1
+    gens.pop(key, None)  # re-inserted last: recency
+    gens[key] = next(_GENERATION_VALUES)  # drawn from one process-wide counter, so a forgotten key never repeats one
     windows = _CARD_WINDOWS.get(scope) or {}
-    while len(gens) > _MAX_GENERATIONS:  # forget the oldest counter with no window (it restarts above 0 anyway)
+    while len(gens) > _MAX_GENERATIONS:  # forget the oldest counter with no window (a new one is above every old one)
         stale = next((k for k in gens if k not in windows and k != key), None)
         if stale is None:
             break
@@ -154,26 +168,78 @@ def card_window_generations() -> dict:
         return dict(_CARD_GENERATIONS.get(_vault_scope()) or {})
 
 
-def card_window_keys() -> list:
+def card_window_keys(*, unreleased: bool = False) -> list:
+    """This profile's payment windows; with ``unreleased`` only those no confirmed release narrowed yet."""
     with _VAULT_REDACTION_LOCK:
-        return list(_CARD_WINDOWS.get(_vault_scope()) or {})
+        return [k for k, w in (_CARD_WINDOWS.get(_vault_scope()) or {}).items() if not (unreleased and w[2])]
+
+
+class CardWindowGone(RuntimeError):
+    """The payment window an open registered no longer exists: the fill must stop before it writes."""
 
 
 def register_card_window(window: str, digits=(), words=()) -> int:
     """Open (or extend, reopening it for every output) the payment window ``window`` of this profile: the
     card's pure-digit values (number, CVC; only their lengths are kept) and its holder (scrubbed as a whole
-    word, any case). Returns the window's new generation."""
+    word, any case). Returns this open's identity: a process-global counter value, never reused, whatever
+    happens to the window's generation counter meanwhile."""
     lengths = frozenset(len(d) for d in digits if isinstance(d, str) and _ALL_DIGITS.fullmatch(d))
     names = frozenset(w.strip() for w in words if isinstance(w, str) and w.strip())
     key = str(window or "")
     with _VAULT_REDACTION_LOCK:
         scope = _vault_scope()
         windows = _CARD_WINDOWS.setdefault(scope, {})
-        old = windows.pop(key, (frozenset(), frozenset(), False))
+        before = windows.pop(key, None)
+        old = before or (frozenset(), frozenset(), False)
         windows[key] = (old[0] | lengths, old[1] | names, False)
+        undo = _CARD_UNDO.setdefault(scope, {})
         while len(windows) > _MAX_CARD_WINDOWS:
+            undo.pop(next(iter(windows)), None)
             del windows[next(iter(windows))]
-        return _bump(scope, key)
+        opened = next(_OPEN_IDS)
+        undo[key] = (opened, _bump(scope, key), before)
+        return opened
+
+
+def withdraw_card_window(window: str, opened: int) -> bool:
+    """Take back the open that returned the identity ``opened``: its fill stopped before any card value was
+    written, so the window is put back as it was before that open (gone if there was none; a release
+    confirmed meanwhile is kept). Not a release: refused (window kept) once a claim or another open moved
+    the generation, for any open but the window's last one, and for an identity that is not the window's
+    current open. Whether it was taken back."""
+    key = str(window or "")
+    with _VAULT_REDACTION_LOCK:
+        scope = _vault_scope()
+        windows, undo = _CARD_WINDOWS.get(scope) or {}, _CARD_UNDO.get(scope) or {}
+        entry = undo.get(key)
+        if entry is None or entry[0] != opened or key not in windows:
+            return False
+        if (_CARD_GENERATIONS.get(scope) or {}).get(key, 0) != entry[1]:
+            return False
+        del undo[key]
+        before = entry[2]
+        if before is None:
+            del windows[key]
+        else:
+            windows[key] = (before[0], before[1], before[2] or windows[key][2])
+        return True
+
+
+def seal_card_window(window: str, opened: int) -> None:
+    """The fill that made open ``opened`` of ``window`` starts writing: that open can no longer be taken back
+    (:func:`withdraw_card_window` refuses it, whoever asks). Only control's unlock or a mark clear ends it.
+    Fails closed: raises :class:`CardWindowGone` when the window or this open's undo entry is gone (a mark
+    clear, an eviction, a newer open of the same window) or the window was already narrowed by a confirmed
+    release (its released flag is set: the card would be written under a window that no longer masks it for
+    the model), so the fill stops before it writes."""
+    key = str(window or "")
+    with _VAULT_REDACTION_LOCK:
+        scope = _vault_scope()
+        undo = _CARD_UNDO.get(scope) or {}
+        window = (_CARD_WINDOWS.get(scope) or {}).get(key)
+        if window is None or window[2] or key not in undo or undo[key][0] != opened:
+            raise CardWindowGone(key)
+        del undo[key]
 
 
 def release_card_window(window: str, observed: int | None = None, *, keep_for_browser: bool = False) -> bool:
@@ -190,6 +256,7 @@ def release_card_window(window: str, observed: int | None = None, *, keep_for_br
             windows[key] = (windows[key][0], windows[key][1], True)
         else:
             windows.pop(key, None)
+            (_CARD_UNDO.get(scope) or {}).pop(key, None)
         return True
 
 
@@ -226,7 +293,8 @@ def redact_registered_vault_values(text: str, *, nondigit_only: bool = False, au
     for value in sorted(bucket, key=len, reverse=True):  # longest first: a substring never shadows its superstring
         if not _ALL_DIGITS.fullmatch(value) and value in text:
             text = text.replace(value, PLACEHOLDER)
-    for name in sorted({n for _d, names, _r in windows for n in names}, key=len, reverse=True):
+    holders = {n for _d, names, _r in windows for n in names} if audience in HOLDER_AUDIENCES else ()
+    for name in sorted(holders, key=len, reverse=True):
         text = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", CARD_PLACEHOLDER, text, flags=re.IGNORECASE)
     if nondigit_only or audience == "authored":
         return text

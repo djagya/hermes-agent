@@ -203,8 +203,15 @@ def test_fill_payment_names_every_target_tags_fills_and_redacts_only_card_secret
     monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session", lambda task_id, surface=None: None)
     monkeypatch.setattr("agent.redact.register_vault_redaction_value", registered.append)
     windows = []
-    monkeypatch.setattr("agent.redact.register_card_window", lambda key, digits=(), words=(): windows.append(
-        (digits, words)))
+    from agent import redact
+
+    real_register = redact.register_card_window
+
+    def spy_register(key, digits=(), words=()):  # the seal needs the window to exist: record, then open it for real
+        windows.append((digits, words))
+        return real_register(key, digits=digits, words=words)
+
+    monkeypatch.setattr("agent.redact.register_card_window", spy_register)
     monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent",
                         lambda *args, **k: consent_text.append(args[1]) or "accept")
     meta = SimpleNamespace(id="h", kind="payment", label="Card", allowed_origins=(), origin=None, payment_scope="confirmed_page",
