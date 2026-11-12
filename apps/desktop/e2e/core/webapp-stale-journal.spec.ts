@@ -198,18 +198,22 @@ async function phoneDiesMidTurn(browser: Browser, sandbox: CoreSandbox, provider
  *  first newest-page transcript read the reopened renderer makes for the chat. */
 async function phoneReopens(phone: Phone, sandbox: CoreSandbox): Promise<{ tab: Page; newestPage: Promise<string> }> {
   const tab = await phone.context.newPage()
-  await tab.goto(webappLaunchLink(sandbox))
-  await expect(composer(tab)).toBeVisible({ timeout: 180_000 })
 
+  // Listen before the launch link loads: the reopened renderer can restore this chat and read its
+  // newest page while it boots, before the composer shows (CI: that read was over by the time a
+  // listener added after the composer started, so the wait timed out).
   const newestPage = tab
     .waitForResponse(
       response =>
         response.url().includes(`/sessions/${encodeURIComponent(phone.sessionId)}/messages?`) &&
         response.url().includes('order=latest'),
-      { timeout: 60_000 }
+      { timeout: 240_000 }
     )
     .then(response => response.text())
     .catch(() => '')
+
+  await tab.goto(webappLaunchLink(sandbox))
+  await expect(composer(tab)).toBeVisible({ timeout: 180_000 })
 
   await tab.evaluate(id => {
     window.location.hash = `#/${encodeURIComponent(id)}`
@@ -233,9 +237,14 @@ async function withWebapp(
   const sandbox = createCoreSandbox(label)
   writeProviderHome(sandbox.hermesHome, provider.url)
   // todo_list is deferred behind tool_search by default; the scripted model calls it directly.
+  // No compaction: with every tool eager, the 4 x 33 tool rows below reach the mock's 64K
+  // window threshold (~58K tokens) mid-turn. A compaction rewrites the turn (the prompt goes
+  // into the summary, the todo tool re-injects its list as a user row), so the scripted
+  // provider no longer finds the turn's marker and answers "ok": the turn never reaches its
+  // scripted reply. This journey is about the journal, not compaction.
   fs.appendFileSync(
     path.join(sandbox.hermesHome, 'config.yaml'),
-    `\nwebapp:\n  enabled: true\n  port: ${await freePort()}\ntools:\n  tool_search:\n    defer: []\n`
+    `\nwebapp:\n  enabled: true\n  port: ${await freePort()}\ntools:\n  tool_search:\n    defer: []\ncompression:\n  enabled: false\n`
   )
   let browser: Browser | null = null
 

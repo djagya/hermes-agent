@@ -514,7 +514,7 @@ import hermes_cli.sqlite_safe_read as ssr
 from fastapi import HTTPException
 from hermes_cli.web_server_sessions import _open_session_db_at_path
 
-phase = sys.argv[2]
+phase, step_s = sys.argv[2], float(sys.argv[3])
 original = ssr.connect_tracked
 
 class SlowConnection:
@@ -528,7 +528,7 @@ class SlowConnection:
         return getattr(self._conn, name)
     def set_progress_handler(self, handler, n):
         def slow():
-            time.sleep(0.01)
+            time.sleep(step_s)
             return handler() if handler is not None else 0
         return self._conn.set_progress_handler(slow, 5)
     def close(self):
@@ -562,12 +562,14 @@ except HTTPException as exc:
 
 
 @pytest.mark.platforms("linux", "macos")
-@pytest.mark.parametrize("phase", ["ddl"])
-def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(tmp_path, phase):
+@pytest.mark.parametrize("phase,step_s", [("ddl", 0.01), ("ddl", 0.1)], ids=["ddl", "ddl-cold-open"])
+def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(tmp_path, phase, step_s):
     """R2-2: the busy timeout bounds lock contention, not SQL execution. A slow DDL must be
     interrupted at the browse budget (rolled back, retryable 503), and gateway boot's wait must
     outlast that budget, so a slow browse never turns into a startup refusal. (The integrity scan
-    no longer runs under the lock: see test_gateway_boot_never_waits_on_a_slow_integrity_scan.)"""
+    no longer runs under the lock: see test_gateway_boot_never_waits_on_a_slow_integrity_scan.)
+    ``ddl-cold-open``: so slow that the barrier pragmas and BEGIN already outrun the budget (a
+    loaded macOS runner did at 0.01 s): still the same retryable 503, inside the budget."""
     import os
     import subprocess
     import sys
@@ -583,7 +585,7 @@ def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(
     home = _profile_home(tmp_path)
     path = _lagging_store_with_history(home, rows=400)
     before = _file_state(path)
-    browse = subprocess.Popen([sys.executable, "-c", _SLOW_BROWSE, str(path), phase], env=os.environ,
+    browse = subprocess.Popen([sys.executable, "-c", _SLOW_BROWSE, str(path), phase, str(step_s)], env=os.environ,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     assert browse.stdout.readline().strip() == "started"
     assert browse.stdout.readline().strip() == "slowed", "the slow phase never ran under the lock"

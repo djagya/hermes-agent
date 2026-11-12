@@ -129,11 +129,16 @@ def _parse_managed_env(path: Path) -> dict[str, str]:
 def _user_presence(user: dict) -> dict:
     """Canonicalize raw user yaml so omit sees the same leaves load_config promotes.
 
-    Root ``max_turns`` becomes ``agent.max_turns``. A bare ``model: id`` string
+    Root ``max_turns`` becomes ``agent.max_turns``, and the model-section aliases are canonicalized as on
+    load, so the save path does not mistake a user pin written under an alias for a seed. A bare ``model: id`` string
     marks ``model.default`` present so a seed ``model.provider`` cannot clobber
     a shorthand default.
     """
-    presence = dict(user)
+    # Imported lazily to avoid an import cycle (config imports managed_scope).
+    from hermes_cli.config import _normalize_root_model_keys
+    # The model-section aliases load promotes (model.name/model.model -> model.default, root
+    # provider/base_url/context_length -> model.*): a leaf the user wrote under an alias is theirs.
+    presence = dict(_normalize_root_model_keys(user))
     if "max_turns" in presence:
         agent = presence.get("agent")
         agent = dict(agent) if isinstance(agent, dict) else {}
@@ -169,6 +174,22 @@ def _omit_present_leaves(managed: dict, user: dict) -> dict:
     return out
 
 
+def _expanded_managed(managed: dict) -> dict:
+    """The managed config as seeds: ``${VAR}`` refs expanded against the process env and a bare root
+    ``model: x/y`` string promoted to ``model.default``. One helper for the overlay and for the save
+    path, so both see the same leaves."""
+    # Imported lazily to avoid an import cycle (config imports managed_scope).
+    from hermes_cli.config import _expand_env_vars, _normalize_root_model_keys
+    expanded = _normalize_root_model_keys(_expand_env_vars(managed))
+    # _normalize_root_model_keys only promotes the string when root provider/base_url
+    # keys exist to migrate; handle the bare case here (matches cli.py) so _deep_merge
+    # never replaces the caller's ``model`` dict with a string.
+    if isinstance(expanded.get("model"), str):
+        expanded = dict(expanded)
+        expanded["model"] = {"default": expanded["model"]}
+    return expanded
+
+
 def apply_managed_overlay(config: dict, *, user_raw: Optional[dict] = None) -> dict:
     """Seed administrator values for leaves the user did not set.
 
@@ -185,14 +206,8 @@ def apply_managed_overlay(config: dict, *, user_raw: Optional[dict] = None) -> d
         if not managed:
             return config
         # Imported lazily to avoid an import cycle (config imports managed_scope).
-        from hermes_cli.config import _deep_merge, _expand_env_vars, _normalize_root_model_keys
-        managed_expanded = _normalize_root_model_keys(_expand_env_vars(managed))
-        # _normalize_root_model_keys only promotes the string when root provider/base_url
-        # keys exist to migrate; handle the bare case here (matches cli.py) so _deep_merge
-        # never replaces the caller's ``model`` dict with a string.
-        if isinstance(managed_expanded.get("model"), str):
-            managed_expanded = dict(managed_expanded)
-            managed_expanded["model"] = {"default": managed_expanded["model"]}
+        from hermes_cli.config import _deep_merge
+        managed_expanded = _expanded_managed(managed)
         presence = user_raw if user_raw is not None else config
         if not isinstance(presence, dict):
             presence = {}
@@ -205,6 +220,53 @@ def apply_managed_overlay(config: dict, *, user_raw: Optional[dict] = None) -> d
     except Exception:
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config
+
+
+def non_null_paths(raw: dict, paths: set) -> set:
+    """The leaf paths in ``paths`` whose RAW value is not YAML null. A null leaf is unset on load
+    (the managed seed fills it), so it must not count as user-set on save, or the seed would be
+    pinned into the user file."""
+    def leaf(path):
+        node = raw
+        for key in path:
+            if not isinstance(node, dict):
+                return None
+            node = node.get(key)
+        return node
+
+    return {path for path in paths if leaf(path) is not None}
+
+
+def drop_unwritten_seeds(config: dict, user_raw: dict, keep: set) -> dict:
+    """dlz: *config* without the seed leaves a load put there: a managed leaf the user file does not set
+    (*user_raw*) whose value is still the seed *as of save time*. A load -> save round trip then leaves the
+    seed a seed, so a later managed change still applies. A changed value or a path in *keep* is the
+    user's and stays; so does a stale seed value (the managed config changed between the load and the
+    save): it no longer equals the current seed and is kept as a user override."""
+    try:
+        managed = load_managed_config()
+        if not managed:
+            return config
+        seeds = _omit_present_leaves(_expanded_managed(managed),
+                                     _user_presence(user_raw if isinstance(user_raw, dict) else {}))
+    except Exception:
+        logger.warning("managed scope: failed to read the seeds to leave out of a save", exc_info=True)
+        return config
+
+    def drop(target: dict, seed: dict, path: tuple) -> dict:
+        out = dict(target)
+        for key, value in seed.items():
+            here = path + (key,)
+            if key not in out or here in keep:
+                continue
+            if isinstance(value, dict) and value and isinstance(out[key], dict):
+                out[key] = drop(out[key], value, here)
+                if not out[key]:  # emptied by the drop: the section was the seed's alone
+                    del out[key]
+            elif out[key] == value:
+                del out[key]
+        return out
+    return drop(config, seeds, ())
 
 
 def _flatten_keys(d: dict, prefix: str = "") -> set:

@@ -3168,6 +3168,8 @@ approvals:
 
 The approval card is sent only to that user's private chat, with "Approve fill once" and "Deny" buttons. Every other surface — typed `/approve`, `/approve all`, the CLI/TUI, the API server, other platforms and other group members — can only deny a card fill.
 
+When the card cannot be sent, the fill stops at once as unavailable. When it expires unanswered, the owner gets one plain message saying so (no card or cart details), and the fill reports a timeout; if Hermes' Telegram connection reconnected or was rebuilt during the wait, a tap may have been lost, so the fill reports unavailable instead. Hermes never retries the fill on its own. The gateway log records each card sent (`Payment approval card sent`) and each tap (`Payment approval callback`, or `Payment approval tap refused` with the reason), with ids only.
+
 ### Card fills on unreviewed payment forms
 
 `vault.payment_destination_consent` (default `false`) lets a saved card be filled into a hosted payment form that is not one of the reviewed payment providers, after the owner approves that one fill. Only a literal `true` turns it on, and turning it on admits nothing by itself:

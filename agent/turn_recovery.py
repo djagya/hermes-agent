@@ -36,7 +36,10 @@ from agent.turn_failure_copy import (
 )
 from agent.route_verdicts import route_visit
 from agent.turn_retry_state import TurnRetryState
-from agent.turn_recovery_codex import _codex_soft_failure_error, _is_codex_token_expired, _recover_stale_codex_reasoning
+from agent.turn_recovery_codex import (
+    _codex_soft_failure_error, _is_codex_token_expired, _recover_stale_codex_reasoning,
+    log_codex_bad_request_diagnostics,
+)
 from hermes_constants import display_hermes_home
 from utils import base_url_host_matches
 
@@ -495,10 +498,10 @@ def _recover_format_errors(
 
     # 400 ``invalid_encrypted_content`` on a stale ``codex_reasoning_items`` blob (the 401
     # ``token_expired`` twin is taken ahead of the credential pool in the caller).
-    if classified.reason == FailoverReason.invalid_encrypted_content and _recover_stale_codex_reasoning(
-        agent, _retry, messages, api_messages
-    ):
-        return True
+    if classified.reason == FailoverReason.invalid_encrypted_content:
+        log_codex_bad_request_diagnostics(agent, api_error, api_messages)
+        if _recover_stale_codex_reasoning(agent, _retry, messages, api_messages):
+            return True
 
     # Structured 400 naming ``context_management``: disable native compaction for the
     # session, retry once; local compression takes over.

@@ -2348,9 +2348,9 @@ _FALLBACK_COMMENT = """
 """
 
 
-def _strip_managed_keys_for_save(config: dict[str, Any]) -> dict[str, Any]:
-    """User overrides of managed config leaves are saved; they win on the next load."""
-    return config
+def _strip_managed_keys_for_save(config: dict[str, Any], raw: dict, keep: set) -> dict[str, Any]:
+    """User overrides of managed config leaves are saved and win on the next load; seeds are not."""
+    return managed_scope.drop_unwritten_seeds(config, raw, managed_scope.non_null_paths(raw, _explicit_config_paths(raw)) | keep)
 
 
 def _commented_sections_for_save(normalized: dict[str, Any]) -> Optional[str]:
@@ -2380,7 +2380,6 @@ def save_config(
 
         config_path = get_config_path()
         _refuse_failed_read(config_path, config)
-        config = _strip_managed_keys_for_save(config)
 
         ensure_hermes_home()
         # Explicit user paths come from the RAW dict BEFORE normalisation (which may inject
@@ -2392,6 +2391,7 @@ def save_config(
         _raw_for_paths = keeping_read_base(lambda: require_readable_config_before_write(config_path))
         from hermes_cli.config_worker_save import rebase_for_save  # frozen-worker writes + merge_existing
         config = rebase_for_save(config, _raw_for_paths, merge_existing)
+        config = _strip_managed_keys_for_save(config, _raw_for_paths, set(preserve_keys or ()))
 
         normalized = current_normalized = _canonicalize_config(config)
         if _raw_for_paths:

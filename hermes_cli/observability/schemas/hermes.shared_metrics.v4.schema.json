@@ -4621,6 +4621,7 @@
                 "browser_cdp",
                 "browser_click",
                 "browser_console",
+                "browser_control",
                 "browser_dialog",
                 "browser_exec",
                 "browser_get_images",

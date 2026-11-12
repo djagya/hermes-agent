@@ -52,7 +52,8 @@ def test_cron_tick_fails_only_that_fire_and_never_runs_on_defaults(tmp_path, mon
 
     # Through the real run_job as the fire's owner: the pre-agent gates pass, then the read refuses.
     monkeypatch.setattr("gateway.session_cron.current_execution", lambda: (None, "s", "j", "fire"))
-    monkeypatch.setattr(scheduler, "_prepare_job_prompt", lambda *a, **k: (None, "do the thing"))
+    # dlz: the fork's monitor gate makes it (early, prompt, pending_monitor).
+    monkeypatch.setattr(scheduler, "_prepare_job_prompt", lambda *a, **k: (None, "do the thing", None))
     monkeypatch.setattr(scheduler, "_reload_dotenv_and_publish_delivery_target", lambda job: None)
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     success, doc, final, error = scheduler.run_job({"id": "j", "name": "job", "prompt": "p"},

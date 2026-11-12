@@ -64,6 +64,123 @@ def test_save_config_keeps_user_override_of_managed_leaf(homes):
     assert read_raw_config().get("model", {}).get("default") == "user/saved"
 
 
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("model:\n  default: managed/model\n", "model:\n  default: managed/next\n"),
+        ("model: managed/model\n", "model: managed/next\n"),  # bare shorthand string
+    ],
+    ids=["mapping", "shorthand"],
+)
+def test_load_then_save_leaves_a_seed_a_seed(homes, first, second):
+    """A bulk save of the loaded config must not copy the seed into the user file: the user leaf would then
+    win over every later managed change."""
+    from hermes_cli.config import save_config, load_config, read_raw_config
+    import hermes_cli.config as cfg
+
+    _home, managed = homes
+    (managed / "config.yaml").write_text(first, encoding="utf-8")
+    from hermes_cli import managed_scope
+    managed_scope.invalidate_managed_cache()
+    cfg._LOAD_CONFIG_CACHE.clear()
+    assert load_config()["model"]["default"] == "managed/model"
+    cfg_now = load_config()
+    cfg_now.setdefault("display", {})["skin"] = "mono"
+    save_config(cfg_now)
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert "model" not in read_raw_config() and read_raw_config()["display"]["skin"] == "mono"
+    (managed / "config.yaml").write_text(second, encoding="utf-8")
+    managed_scope.invalidate_managed_cache()
+    cfg._LOAD_CONFIG_CACHE.clear()
+    assert load_config()["model"]["default"] == "managed/next"
+
+
+@pytest.mark.parametrize(
+    "user_yaml",
+    [
+        "model:\n  name: vendor/example\n",
+        "model:\n  model: vendor/example\n",
+    ],
+    ids=["name-alias", "model-alias"],
+)
+def test_save_keeps_a_user_pin_written_under_a_model_alias(homes, user_yaml):
+    """A user model id written under an alias (model.name / model.model) is canonicalized to
+    model.default on load; an unrelated save must keep it as the user's pin, not drop it as a managed seed."""
+    from hermes_cli import managed_scope
+    from hermes_cli.config import save_config, load_config
+    import hermes_cli.config as cfg
+
+    home, managed = homes
+    (managed / "config.yaml").write_text("model:\n  default: vendor/example\n", encoding="utf-8")
+    (home / "config.yaml").write_text(user_yaml, encoding="utf-8")
+    managed_scope.invalidate_managed_cache()
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    loaded = load_config()
+    assert loaded["model"]["default"] == "vendor/example"
+    loaded.setdefault("display", {})["skin"] = "mono"
+    save_config(loaded)
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert cfg.read_raw_config()["model"]["default"] == "vendor/example"
+    (managed / "config.yaml").write_text("model:\n  default: vendor/other\n", encoding="utf-8")
+    managed_scope.invalidate_managed_cache()
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert load_config()["model"]["default"] == "vendor/example"
+
+
+def test_a_null_user_leaf_stays_unset_so_the_managed_seed_is_not_pinned(homes):
+    """A YAML null leaf is unset on load (the managed seed fills it); a save must not write the
+    seed into the user file, or later managed changes would no longer apply."""
+    from hermes_cli import managed_scope
+    from hermes_cli.config import save_config, load_config
+    import hermes_cli.config as cfg
+
+    home, managed = homes
+    (managed / "config.yaml").write_text("display:\n  skin: managedskin\n", encoding="utf-8")
+    (home / "config.yaml").write_text("display:\n  skin: null\n", encoding="utf-8")
+    managed_scope.invalidate_managed_cache()
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    loaded = load_config()
+    assert loaded["display"]["skin"] == "managedskin"
+    loaded.setdefault("model", {})
+    save_config(loaded)
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert (cfg.read_raw_config().get("display") or {}).get("skin") != "managedskin"
+    (managed / "config.yaml").write_text("display:\n  skin: nextskin\n", encoding="utf-8")
+    managed_scope.invalidate_managed_cache()
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert load_config()["display"]["skin"] == "nextskin"
+
+
+def test_save_keeps_a_user_root_provider_over_a_managed_model_provider(homes):
+    """A legacy root ``provider`` migrates under model.provider on load; it is the user's, not a seed."""
+    from hermes_cli import managed_scope
+    from hermes_cli.config import save_config, load_config
+    import hermes_cli.config as cfg
+
+    home, managed = homes
+    (managed / "config.yaml").write_text("model:\n  provider: custom\n", encoding="utf-8")
+    (home / "config.yaml").write_text("provider: custom\n", encoding="utf-8")
+    managed_scope.invalidate_managed_cache()
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    loaded = load_config()
+    assert loaded["model"]["provider"] == "custom"
+    loaded.setdefault("display", {})["skin"] = "mono"
+    save_config(loaded)
+    cfg._RAW_CONFIG_CACHE.clear()
+    raw = cfg.read_raw_config()
+    assert raw.get("model", {}).get("provider") == "custom" or raw.get("provider") == "custom"
+    (managed / "config.yaml").write_text("model:\n  provider: other\n", encoding="utf-8")
+    managed_scope.invalidate_managed_cache()
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    assert load_config()["model"]["provider"] == "custom"
+
+
 @pytest.fixture
 def env_homes(tmp_path, monkeypatch):
     home = tmp_path / "home"

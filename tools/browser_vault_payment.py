@@ -94,7 +94,7 @@ _CONSENT_OUTCOMES = frozenset({"refused", "timeout", "unavailable"})
 _CONSENT_MESSAGES = {
     "refused": "The user did not approve the card fill.",
     "timeout": "Nobody answered the card-fill approval in time.",
-    "unavailable": "The card-fill approval could not be shown to the user.",
+    "unavailable": "The card-fill approval did not reach the user, or their answer could not reach Hermes.",
 }
 # dlz: once a field was written, "nothing was submitted" is not something Hermes can promise for the page.
 _SUBMITTED_NOTHING = ("Hermes submitted nothing; page scripts may have acted on the filled fields. Check the page "

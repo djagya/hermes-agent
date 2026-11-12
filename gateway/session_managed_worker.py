@@ -148,6 +148,10 @@ def worker_turn_scope(frame):
         yield
 
 
+# Control-queue sentinel close() posts so the writer thread exits without waiting out its poll.
+_WAKE = object()
+
+
 class ManagedWorker:
     def __init__(self, process):
         self.process = process
@@ -184,6 +188,8 @@ class ManagedWorker:
                     frame = self.commands.get(timeout=.5)
                 except queue.Empty:
                     continue
+                if frame is _WAKE:
+                    continue  # close() set ``closed``: the loop test ends the thread now
                 self.send(frame)
         except (OSError, ValueError):
             self.closed.set()
@@ -319,6 +325,11 @@ class ManagedWorker:
 
     def close(self):
         self.closed.set()
+        # Wake the writer parked in its queue poll: every settled managed turn joins it below, and
+        # waiting out the poll added up to half a second to each turn. A full queue means the
+        # writer is busy and sees ``closed`` after its next frame.
+        with suppress(queue.Full):
+            self.commands.put_nowait(_WAKE)
         self._demand.release()  # a reader parked between frames exits; one mid-read ends at EOF
         if self.process.poll() is None:
             self._signal_worker(kill=False)

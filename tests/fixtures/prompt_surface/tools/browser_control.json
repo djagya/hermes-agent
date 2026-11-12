@@ -1,5 +1,5 @@
 {
-  "description": "Managed browser slot operations for the lease this task's browser_exec holds. The controller key and lease tokens stay inside Hermes. Actions: status (slots, which are yours, handoff availability); release (free your slot now); cancel (drop a queued acquire: request_id = queued_id from a busy result); handoff (single-use link for Danil to finish a CAPTCHA/login on exactly target_id, the targetId printed from current_tab() in browser_exec; returns url + expires_in); native_cancel (one Escape for Chrome's native passkey prompt on target_id); upload (local path -> /staging/<name> in the browser); download (finished file <name> from the browser's downloads -> your workspace, sha256-checked); dialog (answer a pending page dialog from a browser_exec result: dialog_action accept|dismiss, dialog_id, prompt_text for prompts). Pass identity when the task holds more than one lease.",
+  "description": "Managed browser slot operations for the lease this task's browser_exec holds. The controller key and lease tokens stay inside Hermes. Actions: status (slots, which are yours, handoff availability); release (free your slot now; a handoff link nobody opened keeps it, then revoke_unused_handoff=true frees it); cancel (drop a queued acquire: request_id = queued_id from a busy result); handoff (single-use link for Danil to finish a CAPTCHA/login on exactly target_id, the targetId printed from current_tab() in browser_exec; returns url + expires_in); native_cancel (one Escape for Chrome's native passkey prompt on target_id); upload (local path -> /staging/<name> in the browser); download (finished file <name> from the browser's downloads -> your workspace, sha256-checked); dialog (answer a pending page dialog from a browser_exec result: dialog_action accept|dismiss, dialog_id, prompt_text for prompts). Pass identity when the task holds more than one lease.",
   "name": "browser_control",
   "parameters": {
     "properties": {
@@ -53,6 +53,10 @@
       "request_id": {
         "description": "cancel: the queued_id from a busy result.",
         "type": "string"
+      },
+      "revoke_unused_handoff": {
+        "description": "release: withdraw a handoff link Danil has not opened, so the lease can be released.",
+        "type": "boolean"
       },
       "target_id": {
         "description": "handoff / native_cancel: CDP targetId of the exact tab.",

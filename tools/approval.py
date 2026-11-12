@@ -316,6 +316,16 @@ def observe_gateway_settle(session_key: str, request_id: str, observer) -> bool:
     return False
 
 
+def attach_delivery_probe(session_key: str, request_id: str, probe) -> bool:
+    """dlz: give a pending approval the delivering surface's transport check (see ``_ApprovalEntry``)."""
+    with _lock:
+        for entry in _gateway_queues.get(session_key, []):
+            if entry.data.get("request_id") == request_id:
+                entry.delivery_probe = probe
+                return True
+    return False
+
+
 def ack_gateway_approval(session_key: str, request_id: str) -> bool:
     """Record that a client received a particular pending approval request."""
     with _lock:
