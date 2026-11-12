@@ -6,6 +6,9 @@ indent-width = 4
 # version-gated fix must stay valid where annotations are evaluated eagerly (< 3.14).
 target-version = "py311"
 
+# lefthook passes the staged files by name; without this, ruff ignores [lint].exclude for them.
+force-exclude = true
+
 [format]
 # Like Black, use double quotes for strings.
 quote-style = "double"
@@ -30,6 +33,12 @@ exclude = [
     ".venv",
     ".vscode",
     "__pypackages__",
+    # dlz: vendored at the catalog pin (plugins/homeassistant/VENDORED.json); not fork-authored.
+    "plugins/homeassistant/**",
+    # dlz: vendored upstream tests, pinned by hash in plugins/homeassistant/VENDORED.json.
+    "tests/plugins/platforms/homeassistant/test_homeassistant_*.py",
+    "tests/plugins/platforms/homeassistant/test_plugin_registration.py",
+    "tests/plugins/platforms/homeassistant/test_service_policy.py",
   ]
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
