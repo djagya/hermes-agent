@@ -36,14 +36,17 @@ MAX_REPINS = 3
 CHECK_REASONS = frozenset({"navigated", "frame_changed", "fields_replaced", "fields_relabeled", "field_hidden",
                            "detached", "hidden", "hit_test", "deferred", "options_changed"})
 _DESCRIPTOR_KEYS = frozenset({"index", "autocomplete", "name", "label", "type", "formIndex", "maxLength"})
-_CHECK_KEYS = frozenset({"token", "reason", "step", "fields", "keys"})
+_CHECK_KEYS = frozenset({"token", "reason", "step", "fields", "keys", "repin_refused"})
+# Why the supervisor declined a re-pin (fill_check.repin_refused): fixed codes.
+REFUSALS = frozenset({"unreadable", "frame_changed", "too_late", "token_twice", "new_token", "role_changed",
+                      "written_gone", "number_gone", "still_missing"})
 _MAX_REBIND_FIELDS = 2000
 _MAX_REBIND_BYTES = 1024 * 1024
 
 
 def valid_check(check: Any, tokens: frozenset, fills: int) -> bool:
     """One closure stop record: ``{token, reason, step[, fields][, keys]}``, fixed vocabularies only."""
-    if not isinstance(check, dict) or not {"token", "reason", "step"} <= set(check) <= _CHECK_KEYS:
+    if not isinstance(check, dict) or not {"token", "reason", "step"} <= set(check) <= _CHECK_KEYS - {"repin_refused"}:
         return False
     names = tokens | {"other"}
     fields, keys = check.get("fields", ["other"]), check.get("keys", [])
@@ -82,48 +85,56 @@ def _rebind_row(row: Any, previous: int) -> bool:
             and (not select or isinstance(row["options"], list)))
 
 
-def repin_pins(controls: tuple, fill_tokens: list, answer: Any, written: list, number_in: bool) -> dict | None:
-    """The new pin of every token in ``fill_tokens`` (``-1``: not shown yet, written after the card number), or
-    None to stop. ``controls``: the document's card controls at inspection; ``answer``: the closure's ``rebind()``;
-    ``written``: tokens this document already wrote; ``number_in``: the card number is written (any document)."""
+def repin_pins(controls: tuple, fill_tokens: list, answer: Any, written: list, number_in: bool) -> tuple:
+    """``(pins, None)``: the new pin of every token in ``fill_tokens`` (``-1``: not shown yet, written after the
+    card number); or ``(None, refusal)`` to stop, ``refusal`` one of ``REFUSALS``. ``controls``: the document's
+    card controls at inspection; ``answer``: the closure's ``rebind()``; ``written``: tokens this document already
+    wrote; ``number_in``: the card number is written (any document)."""
     if not isinstance(answer, dict) or set(answer) != {"fields", "kept"}:
-        return None
+        return None, "unreadable"
     fields, kept = answer["fields"], answer["kept"]
     if not isinstance(fields, list) or len(fields) > _MAX_REBIND_FIELDS or len(json.dumps(fields)) > _MAX_REBIND_BYTES:
-        return None
+        return None, "unreadable"
     if not (isinstance(kept, dict) and set(kept) == set(fill_tokens)
             and all(type(v) is int and v >= -1 for v in kept.values())):
-        return None
+        return None, "unreadable"
     previous = -1
     for row in fields:
         if not _rebind_row(row, previous):
-            return None
+            return None, "unreadable"
         previous = row["index"]
     found = [c for r in fields if (c := classify_checkout_control(LoginControl.from_dict(r))) and c.token.startswith("cc-")]
     tokens = [c.token for c in found]
-    if len(tokens) != len(set(tokens)) or not set(tokens) <= {c.token for c in controls}:
-        return None
+    if len(tokens) != len(set(tokens)):
+        return None, "token_twice"
+    if not set(tokens) <= {c.token for c in controls}:
+        return None, "new_token"
     now = {c.token: c.control.index for c in found}
     exposed = {row["index"] for row in fields}
     if any(n in exposed and now.get(token) != n for token, n in kept.items()):
-        return None
+        return None, "role_changed"
     pins = {}
     for token in fill_tokens:
         if token in now:
             pins[token] = now[token]
-        elif token in written or token == "cc-number" or number_in:
-            return None
+        elif token in written:
+            return None, "written_gone"
+        elif token == "cc-number":
+            return None, "number_gone"
+        elif number_in:
+            return None, "still_missing"
         else:
             pins[token] = -1
-    return pins
+    return pins, None
 
 
-def located(result: dict, position: int, documents: int) -> dict:
+def located(result: dict, position: int, documents: int, refused: str | None = None) -> dict:
     """A document's stop with its closure record as ``fill_check``, naming the document's place in the commit
-    order (1-based) and the number of documents written."""
+    order (1-based), the number of documents written and, when the supervisor declined a re-pin, why."""
     check = result.get("check")
     if not isinstance(check, dict):
         return result
     out = {k: v for k, v in result.items() if k != "check"}
-    out["fill_check"] = {**check, "document": position, "documents": documents}
+    out["fill_check"] = {**check, "document": position, "documents": documents,
+                         **({"repin_refused": refused} if refused in REFUSALS else {})}
     return out

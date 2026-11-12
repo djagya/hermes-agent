@@ -1210,17 +1210,22 @@ class PaymentSupervisionMixin:
         # dlz (re-pin): reviewed destinations only; an unreviewed fill stops on any change, as before.
         repin = None if i.unreviewed_origins else \
             (lambda request, d=document, f=document_fills: self._repin(i, d, f, request, stop, state))
+        state["refused"] = None
         result = await self._commit_payment_document(
             document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop), strict=strict,
             paced=paced, **({"repin": repin} if repin else {}), **({"resumed": resumed} if resumed is not None else {}))
-        return located(result, position, total)
+        return located(result, position, total, state["refused"])
 
     async def _repin(self, i: PaymentInspection, d: PaymentDocument, fills: list, request: dict, stop: float,
                      state: dict) -> dict | None:
         """dlz (re-pin): the answer to one re-pin request of ``d``'s paused commit: the new pin of each of its
         fill tokens, or None (the closure then stops with its record). Inside the window only, after the frame's
         loader, URL, origin and owner <iframe>s are re-proved; the rule is ``repin_pins``'."""
-        if time.monotonic() >= stop or not await self._payment_scope_current(i, [d]):
+        if time.monotonic() >= stop:
+            state["refused"] = "too_late"
+            return None
+        if not await self._payment_scope_current(i, [d]):
+            state["refused"] = "frame_changed"
             return None
         try:
             answer = _value(await self._cdp("Runtime.callFunctionOn", {
@@ -1228,14 +1233,15 @@ class PaymentSupervisionMixin:
                 "returnByValue": True,
             }, session_id=d.frame_session))
         except Exception:  # health: allow BLE001 -- an unreadable document is not re-pinned; the closure stops
-            return None
+            answer = None
         written = request.get("written") or []
-        pins = repin_pins(d.controls, [str(f.get("token") or "") for f in fills], answer, written,
-                          state["number"] or "cc-number" in written)
-        if pins is not None and time.monotonic() < stop:
+        pins, state["refused"] = repin_pins(d.controls, [str(f.get("token") or "") for f in fills], answer, written,
+                                            state["number"] or "cc-number" in written)
+        if pins is not None and time.monotonic() >= stop:
+            pins, state["refused"] = None, "too_late"
+        if pins is not None:
             state["repins"] += 1
-            return pins
-        return None
+        return pins
 
     async def _payment_scope_current(self, i: PaymentInspection, receiving: list) -> bool:
         """dlz: between the documents of a split fill, bounded and against the pinned state (no OOPIF

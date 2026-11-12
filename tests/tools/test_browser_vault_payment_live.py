@@ -234,6 +234,76 @@ def _kps_page(path, origins):
     return None
 
 
+# dlz (re-pin): a Datatrans-shaped hosted card form (pay.datatrans.com redirect/lightbox page, 11-12 SBB incident;
+# its real DOM was not captured, so the re-render behaviours below are ASSUMED shapes of the class). The merchant
+# page holds the lightbox frame; the lightbox page holds the brand chooser (Mastercard already chosen) and the
+# expiry, with the card number and the CVC each in a Secure Fields frame on the same origin. ``single`` puts every
+# field in the lightbox document. The first write into the expiry or the CVC re-renders the other one while it is
+# still empty (the commit order of split documents follows the frame tree, not the DOM). Each variant is one way:
+# - replace: the next field is replaced by a fresh, identical input (a re-mounted component);
+# - relabel: the next field's placeholder changes (validation hint);
+# - defer: the next field is hidden until the card number is in (brand detection), then shown again;
+# - duplicate / swap_role / navigate: what must still stop (a second visible CVC; the old CVC input re-described as
+#   a promo code beside a new CVC; the field's frame changes its URL).
+_DTX_BRANDS = ('<div role="group" aria-label="Payment method"><button type="button" aria-pressed="true">Mastercard'
+               '</button><button type="button" aria-pressed="false">Visa</button></div>')
+_DTX_CVC = '<label for="cvv">Security code</label><input id="cvv" autocomplete="cc-csc" placeholder="CVC" maxlength="4">'
+_DTX_EXP = '<label for="exp">Expiry date (MM/YY)</label><input id="exp" autocomplete="cc-exp" placeholder="MM/YY">'
+_DTX_NUMBER = '<label for="num">Card number</label><input id="num" autocomplete="cc-number" inputmode="numeric">'
+# Applied to field ``el`` (by id) when the trigger fires; ``undo`` when the card number is entered.
+_DTX_MUTATIONS = {
+    "replace": "const n=el.cloneNode(true);n.value='';el.replaceWith(n);",
+    "relabel": "el.placeholder=el.placeholder+' (3 digits)';",
+    "defer": "el.style.display='none';",
+    "duplicate": "const n=el.cloneNode(true);n.id=el.id+'2';el.after(n);",
+    "swap_role": "const n=el.cloneNode(true);el.autocomplete='off';el.placeholder='Promo code';el.id='promo';"
+                 "if(el.labels)for(const l of el.labels)l.textContent='Promo code';el.after(n);",
+    "navigate": "history.pushState({},'',location.pathname+'?step=2');",
+}
+
+
+def _dtx_script(target: str, variant: str) -> str:
+    """React to 'touch' (the first write into the other field) on field ``target`` while it is still empty; show it
+    again on 'number'."""
+    act = _DTX_MUTATIONS[variant]
+    return ("<script>let done=false;addEventListener('message',e=>{const el=document.getElementById('" + target + "');"
+            "if(!el)return;if(e.data==='touch'&&!done&&!el.value){done=true;" + act + "}"
+            "if(e.data==='number')el.style.display='';})</script>")
+
+
+def _datatrans_page(path, origins):
+    psp, parts = origins.get("psp", ""), path.split("/")
+    if path.startswith("/dtx-") and path[5:] in _DTX_MUTATIONS:  # merchant: the lightbox frame
+        return f'<iframe id="lb" src="{psp}/dtx/{path[5:]}/page" style="width:640px;height:460px"></iframe>'
+    if path.startswith("/dtx1-") and path[6:] in _DTX_MUTATIONS:
+        return f'<iframe id="lb" src="{psp}/dtx/{path[6:]}/single" style="width:640px;height:460px"></iframe>'
+    if len(parts) != 4 or parts[1] != "dtx" or parts[2] not in _DTX_MUTATIONS:
+        return None
+    variant, kind = parts[2], parts[3]
+    # Same-origin frames, events dispatched synchronously: each re-render lands inside the write that causes it,
+    # so the fixture does not depend on message timing.
+    send = "const send=(w,d)=>w.dispatchEvent(new MessageEvent('message',{data:d}));"
+    relay = ("<script>" + send + "addEventListener('message',e=>{if(e.data==='number')for(let i=0;i<frames.length;"
+             "i++)send(frames[i],e.data)})</script>")
+    if kind == "page":  # expiry here; number and CVC in Secure Fields frames; writing the expiry touches the CVC
+        return (_DTX_BRANDS + _DTX_EXP + relay + _dtx_script("exp", variant)
+                + "<script>document.getElementById('exp').addEventListener('input',()=>{for(let i=0;i<frames.length;"
+                "i++)send(frames[i],'touch')})</script>"
+                + f'<iframe src="{psp}/dtx/{variant}/number" style="height:60px"></iframe>'
+                + f'<iframe src="{psp}/dtx/{variant}/cvc" style="height:60px"></iframe>')
+    if kind == "number":
+        return _DTX_NUMBER + ("<script>" + send + "document.getElementById('num').addEventListener('input',()=>"
+                              "send(parent,'number'))</script>")
+    if kind == "cvc":
+        return (_DTX_CVC + _dtx_script("cvv", variant) + "<script>" + send
+                + "document.getElementById('cvv').addEventListener('input',()=>send(parent,'touch'))</script>")
+    if kind == "single":  # one document: writing the CVC (first in the fill order) touches the expiry
+        return (_DTX_BRANDS + _DTX_NUMBER + _DTX_CVC + _DTX_EXP + _dtx_script("exp", variant)
+                + "<script>" + send + "document.getElementById('cvv').addEventListener('input',()=>send(window,'touch'));"
+                "document.getElementById('num').addEventListener('input',()=>send(window,'number'))</script>")
+    return None
+
+
 def _provider_page(path, origins):
     psp = origins.get("psp", "")
     merchants = {
@@ -305,6 +375,7 @@ def payment_browser(tmp_path, record_property):
                 f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
             }.get(self.path) or _shopify_page(self.path, origins) or _paypal_page(self.path, origins) \
                 or _payone_page(self.path, origins) or _kps_page(self.path, origins) \
+                or _datatrans_page(self.path, origins) \
                 or _provider_page(self.path, origins) or FIELDS
             body = (
                 '<!doctype html><form onsubmit="window.submitted=true;return false">'
@@ -1153,3 +1224,88 @@ def test_kps_like_form_navigated_during_consent_writes_nothing(payment_browser, 
     assert out["error_type"] == "payment_page_changed", out
     assert all(v in ("", "01", "2026") for values, _seen in state.values() for v in values), state
     print("RECEIPT kps_like navigated_during_consent=REFUSED zero_writes=PASS")
+
+
+def _dtx_values(sup):
+    """id -> value of every input in the Datatrans-shaped lightbox document and its same-origin field frames."""
+    from tools.browser_supervisor import _schedule
+
+    targets = _schedule(sup._cdp("Target.getTargets"), sup._loop, timeout=10)["result"]["targetInfos"]
+    lightbox = [t for t in targets if t["type"] == "iframe" and "/dtx/" in t["url"]]
+    assert len(lightbox) == 1, lightbox
+    fsid = _schedule(sup._cdp("Target.attachToTarget", {"targetId": lightbox[0]["targetId"], "flatten": True}),
+                     sup._loop, timeout=10)["result"]["sessionId"]
+    try:
+        reply = _schedule(sup._cdp("Runtime.evaluate", {
+            "expression": "JSON.stringify([document, ...Array.from(frames, f => f.document)].flatMap(d => "
+                          "Array.from(d.querySelectorAll('input'), e => [e.id, e.value])))",
+            "returnByValue": True}, session_id=fsid), sup._loop, timeout=10)
+    finally:
+        _schedule(sup._cdp("Target.detachFromTarget", {"sessionId": fsid}), sup._loop, timeout=10)
+    assert "exceptionDetails" not in reply["result"], reply
+    return dict(json.loads(reply["result"]["result"]["value"]))
+
+
+@pytest.mark.parametrize("layout", ["split", "single"])
+def test_datatrans_shaped_re_render_is_re_pinned_inside_one_approval(payment_browser, tmp_path, monkeypatch, caplog,
+                                                                      layout):
+    """dlz (11-12 SBB/Datatrans): a field the hosted form re-renders after the first write (replaced, re-described,
+    or hidden until the card number is in) is re-pinned and written inside the same approval; what must still stop
+    stops with nothing more written, and the stop names its check. Never submitted."""
+    import logging
+    from dataclasses import replace
+
+    from agent.vault_store import VaultStore
+    from tools.browser_vault_tool import browser_vault_fill
+
+    sup, origins = payment_browser
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item("payment", "Synthetic Datatrans card", CARD, origin=origins["merchant"])
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    original = store.get_meta
+    monkeypatch.setattr(store, "get_meta", lambda handle: (
+        replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
+    monkeypatch.setattr("agent.vault_payment_policy.PAYMENT_PSP_ORIGINS", (origins["psp"],))
+    prefix = "/dtx-" if layout == "split" else "/dtx1-"
+    full = {"exp": "07/35", "num": CARD["card_number"], "cvv": CARD["cvc"]}
+
+    def fill(variant):
+        navigate(sup, origins["merchant"] + prefix + variant)
+        caplog.clear()
+        with caplog.at_level(logging.INFO), \
+                patch("tools.approval_prompt.request_elicitation_consent", return_value="accept") as consent:
+            out = json.loads(browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"]))
+        assert consent.call_count == 1 and out["submitted"] is False, (variant, out)
+        for secret in (CARD["card_number"], CARD["cvc"], "07/35"):
+            assert secret not in json.dumps(out) and secret not in caplog.text, (variant, secret)
+        assert sup.evaluate_runtime("!!window.submitted")["result"] is False
+        print("RESULT datatrans", layout, variant, json.dumps({k: out.get(k) for k in (
+            "success", "error_type", "filled_fields", "fill_repins", "fill_check", "field_retention")}))
+        return out
+
+    for variant in ("replace", "relabel", "defer"):
+        out = fill(variant)
+        assert out["success"] and out["filled_fields"] == 3 and out["fill_repins"] >= 1, (variant, out)
+        values = _dtx_values(sup)
+        assert {k: values.get(k) for k in full} == full, (variant, values)
+        print("RECEIPT datatrans", layout, variant, "=FILLED repins", out["fill_repins"])
+
+    stops = {"duplicate": "fields_replaced", "swap_role": "fields_replaced", "navigate": "navigated"}
+    for variant, reason in stops.items():
+        out = fill(variant)
+        assert not out["success"] and out["filled_fields"] == 1 and out["partially_filled"] is True, (variant, out)
+        values = _dtx_values(sup)
+        # Nothing after the stop: only the first field written holds a value; the touched one, any copy of it and
+        # the number stay empty.
+        written = [k for k, v in values.items() if v]
+        assert len(written) == 1 and values[written[0]] == full.get(written[0]), (variant, values)
+        if layout == "split" and variant == "navigate":
+            # the CVC frame's URL changed: the between-document scope check stops it before the closure runs
+            assert out["error_type"] == "payment_page_changed", out
+        else:
+            check = out["fill_check"]
+            assert out["error_type"] == "payment_fields_changed" and check["reason"] == reason, (variant, out)
+            assert check["token"] == {"exp": "cc-csc", "cvv": "cc-exp"}[written[0]], out
+            assert check["documents"] == (3 if layout == "split" else 1), out
+            assert "card fill stopped" in caplog.text and reason in caplog.text, caplog.text
+        print("RECEIPT datatrans", layout, variant, "=STOPPED", out.get("fill_check", out["error_type"]))
