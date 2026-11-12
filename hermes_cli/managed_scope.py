@@ -129,11 +129,16 @@ def _parse_managed_env(path: Path) -> dict[str, str]:
 def _user_presence(user: dict) -> dict:
     """Canonicalize raw user yaml so omit sees the same leaves load_config promotes.
 
-    Root ``max_turns`` becomes ``agent.max_turns``. A bare ``model: id`` string
+    Root ``max_turns`` becomes ``agent.max_turns``, and the model-section aliases are canonicalized as on
+    load, so the save path does not mistake a user pin written under an alias for a seed. A bare ``model: id`` string
     marks ``model.default`` present so a seed ``model.provider`` cannot clobber
     a shorthand default.
     """
-    presence = dict(user)
+    # Imported lazily to avoid an import cycle (config imports managed_scope).
+    from hermes_cli.config import _normalize_root_model_keys
+    # The model-section aliases load promotes (model.name/model.model -> model.default, root
+    # provider/base_url/context_length -> model.*): a leaf the user wrote under an alias is theirs.
+    presence = dict(_normalize_root_model_keys(user))
     if "max_turns" in presence:
         agent = presence.get("agent")
         agent = dict(agent) if isinstance(agent, dict) else {}
