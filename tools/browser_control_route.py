@@ -937,13 +937,28 @@ def release_lease(env: dict[str, str]) -> Optional[str]:
 # dlz: release outcomes besides "released" that are not errors (fault-hunt B22, G2-R7).
 RELEASE_ALREADY_ENDED = "already_ended"
 RELEASE_DEFERRED = "deferred"
+RELEASE_DEFERRED_REVOCABLE = "deferred_revocable"
 
 
-def release_lease_outcome(env: dict[str, str]) -> tuple[str, Optional[str]]:
+def _forget_minted_handoffs(slot: str, lease_id: str) -> None:
+    """dlz: D10-B. Drop every handoff claim this process holds for the (slot, lease) pair."""
+    if not slot or not lease_id:
+        return
+    with _handoffs_lock:
+        for key in [k for k in _minted_handoffs if k[1] == slot and k[2] == lease_id]:
+            _minted_handoffs.pop(key, None)
+
+
+def release_lease_outcome(env: dict[str, str], *, revoke_unused_handoff: bool = False) -> tuple[str, Optional[str]]:
     """``(outcome, error)``. ``outcome`` is ``released``, ``already_ended`` (control had
-    already recycled the lease: the slot is free) or ``deferred`` (control keeps the lease
-    until a minted handoff link is used or expires: ``handoff_pending``); ``error`` is set
-    only on a real failure. Never retries: a deferred release is done from this side."""
+    already recycled the lease: the slot is free), ``deferred`` (control keeps the lease
+    until a minted handoff link is used or expires: ``handoff_pending``) or
+    ``deferred_revocable`` (the same, but nobody opened the link: a second release with
+    ``revoke_unused_handoff=True`` withdraws it and frees the slot; the held lease and its
+    daemon are kept for that call). ``error`` is set only on a real failure. Never retries.
+
+    ``revoke_unused_handoff`` is only for the holder's explicit release action: cleanup paths
+    (task close, atexit) never pass it."""
     control = control_url()
     lease_id = str(env.get(MANAGED_LEASE_ENV) or "").strip()
     token = str(env.get(MANAGED_TOKEN_ENV) or "").strip()
@@ -953,27 +968,47 @@ def release_lease_outcome(env: dict[str, str]) -> tuple[str, Optional[str]]:
         return "", OPERATOR_DISABLED_ERROR
     cache_name = str(env.get("BU_NAME") or "").strip()
     retired = {cache_name}
+    popped: list[tuple[str, dict[str, str]]] = []
     with _held_lock:
         for key, held in list(_held_leases.items()):
             if held.get(MANAGED_LEASE_ENV) == lease_id or (
                 cache_name and held.get("BU_NAME") == cache_name
             ):
                 retired.add(str(held.get("BU_NAME") or ""))
+                popped.append((key, held))
                 _held_leases.pop(key, None)
-    for name in retired:
-        _retire_daemon(name)
+
+    def _retire_all() -> None:
+        for name in retired:
+            _retire_daemon(name)
+
     if not control_key():
+        _retire_all()
         return "", f"unavailable: {MANAGED_KEY_ENV} missing"
-    result = _post(
-        control,
-        "/v1/release",
-        {"lease_id": lease_id, "token": token},
-    )
+    body: dict[str, Any] = {"lease_id": lease_id, "token": token}
+    if revoke_unused_handoff:
+        body["revoke_unused_handoff"] = True
+    result = _post(control, "/v1/release", body)
     if not result.get("error"):
+        _retire_all()
+        if revoke_unused_handoff:
+            # D10-B: the withdrawn link's claim must not outlive the lease it pointed at.
+            _forget_minted_handoffs(str(env.get(MANAGED_SLOT_ENV) or ""), lease_id)
         return "released", None
     if result.get("deferred") is True or result.get("reason") == "handoff_pending":
+        if result.get("revocable") is True:
+            # Nobody opened the link: keep the held lease (and its daemon) so the holder can release
+            # again with revoke_unused_handoff.
+            with _held_lock:
+                for key, held in popped:
+                    _held_leases.setdefault(key, held)
+            logger.info("browser control: release deferred lease=%s reason=handoff_pending revocable",
+                        lease_id[:12])
+            return RELEASE_DEFERRED_REVOCABLE, None
+        _retire_all()
         logger.info("browser control: release deferred lease=%s reason=handoff_pending", lease_id[:12])
         return RELEASE_DEFERRED, None
+    _retire_all()
     if result.get("error") == "stale":
         # The lease was already recycled (idle sweep, human End, restart): the slot is free.
         logger.info("browser control: release of an ended lease=%s treated as done", lease_id[:12])

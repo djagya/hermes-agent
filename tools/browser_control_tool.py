@@ -122,20 +122,29 @@ def _status(task_id: Optional[str]) -> str:
     })
 
 
-def _release(task_id: Optional[str], identity: str, mode: str) -> str:
+def _release(task_id: Optional[str], identity: str, mode: str, revoke_unused_handoff: bool = False) -> str:
     lease, err = _lease(task_id, identity, mode)
     if err:
         return tool_error(err)
     route = _route()
     slot_id = lease.get(route.MANAGED_SLOT_ENV, "")
-    outcome, failure = route.release_lease_outcome(dict(lease))
+    outcome, failure = route.release_lease_outcome(dict(lease), revoke_unused_handoff=revoke_unused_handoff)
     if failure:
         return tool_error(failure, slot_id=slot_id)
+    if outcome == route.RELEASE_DEFERRED_REVOCABLE:
+        # Nobody opened the link: the lease stays held so this call can be repeated with the flag.
+        return tool_result({"success": True, "released": slot_id, "deferred": True, "revocable": True,
+                            "note": "Control keeps the slot while the handoff link is live. Nobody has opened it: "
+                                    "if Danil is no longer needed on that tab, call release again with "
+                                    "revoke_unused_handoff=true to withdraw the link and free the slot now, and "
+                                    "tell Danil the link is withdrawn. Otherwise leave it; control releases "
+                                    "when the link is used or expires."})
     if outcome == route.RELEASE_DEFERRED:
         # dlz: G2-R7 — control keeps a lease whose handoff link is still open; not an error, never retry.
-        return tool_result({"success": True, "released": slot_id, "deferred": True,
-                            "note": "Released from your side. Control keeps the slot until Danil uses or lets "
-                                    "the open handoff link expire; do not call release again."})
+        return tool_result({"success": True, "released": slot_id, "deferred": True, "revocable": False,
+                            "note": "Danil opened the handoff link, so control keeps the slot and the release "
+                                    "completes when he hands back (or the link expires); do not call release "
+                                    "again."})
     if outcome == route.RELEASE_ALREADY_ENDED:
         return tool_result({"success": True, "released": slot_id, "already_ended": True,
                             "note": "Control had already ended this lease; the slot is free."})
@@ -317,7 +326,7 @@ def browser_control(args: dict, task_id: Optional[str] = None) -> str:
     if action == "status":
         return _status(task_id)
     if action == "release":
-        return _release(task_id, identity, mode)
+        return _release(task_id, identity, mode, args.get("revoke_unused_handoff") is True)
     if action == "cancel":
         return _cancel(task_id, str(args.get("request_id") or "").strip())
     if action == "handoff":
@@ -338,7 +347,7 @@ BROWSER_CONTROL_SCHEMA = {
     "description": (
         "Managed browser slot operations for the lease this task's browser_exec holds. The controller key and "
         "lease tokens stay inside Hermes. Actions: status (slots, which are yours, handoff availability); "
-        "release (free your slot now); cancel (drop a queued acquire: request_id = queued_id from a busy "
+        "release (free your slot now; a handoff link nobody opened keeps it, then revoke_unused_handoff=true frees it); cancel (drop a queued acquire: request_id = queued_id from a busy "
         "result); handoff (single-use link for Danil to finish a CAPTCHA/login on exactly target_id, the "
         "targetId printed from current_tab() in browser_exec; returns url + expires_in); native_cancel (one "
         "Escape for Chrome's native passkey prompt on target_id); upload (local path -> /staging/<name> in "
@@ -359,6 +368,7 @@ BROWSER_CONTROL_SCHEMA = {
             "dialog_action": {"type": "string", "enum": ["accept", "dismiss"]},
             "dialog_id": {"type": "string", "description": "dialog: id from the result's dialogs.pending."},
             "prompt_text": {"type": "string", "description": "dialog: text for a prompt() dialog."},
+            "revoke_unused_handoff": {"type": "boolean", "description": "release: withdraw a handoff link Danil has not opened, so the lease can be released."},
         },
         "required": ["action"],
     },
