@@ -76,16 +76,26 @@ class TelegramApprovalCardsMixin:
                                    already: str = _ALREADY, invalid: str = _INVALID):
         """``(record, choice, presser)`` for a tap that may act, after popping its record; else None
         (the tap was answered with a toast and nothing was resolved)."""
+        def refused(why: str) -> None:
+            # dlz: a payment tap that resolves nothing leaves a trace (no nonce, no card text). "no armed card"
+            # after a reconnect means this adapter is not the one that sent the card (it was rebuilt).
+            if kind == "pa":
+                logger.info("[%s] Payment approval tap refused (%s, message_id=%s)", self.name,
+                            why, _scalar(getattr(getattr(query, "message", None), "message_id", None)))
+
         parts = data.split(":", 2)
         if len(parts) != 3:
+            refused("malformed")
             await answer_callback(query, invalid)
             return None
         _, choice, nonce = parts
         if not await self._callback_authorized(query, cb, unauthorized):
+            refused("unauthorized")
             return None
         cards = self._approval_card_map()
         record = cards.get(nonce)
         if record is None or record["kind"] != kind:
+            refused("no armed card on this adapter")
             await answer_callback(query, already)
             return None
         message = getattr(query, "message", None)
@@ -94,10 +104,12 @@ class TelegramApprovalCardsMixin:
                 or _scalar(getattr(message, "message_id", None)) != record["message_id"]
                 or _scalar(getattr(message, "message_thread_id", None)) != record["thread_id"]
                 or choice not in record["choices"]):
+            refused("binding mismatch")
             await answer_callback(query, invalid)
             return None
         presser = f"telegram:{_scalar(getattr(query.from_user, 'id', None)) or ''}"
         if record["approver"] and presser != record["approver"]:
+            refused("not the owner")
             # Not popped: the owner's own tap on this card still counts.
             await answer_callback(query, _OWNER_ONLY)
             return None
@@ -130,6 +142,18 @@ class TelegramApprovalCardsMixin:
                                         text=text)
             return text, keyboard, on_sent
         return await self._send_prompt("send_payment_approval", chat_id, None, build, parse_mode=ParseMode.HTML)
+
+    def payment_delivery_mark(self) -> int:
+        """The polling generation now; :meth:`payment_delivery_disrupted` compares against it."""
+        return getattr(self, "_polling_generation", 0)
+
+    def payment_delivery_disrupted(self, mark: int) -> bool:
+        """Since *mark*: polling restarted (a new generation: reconnect or disconnect), is not yet proven, or this
+        adapter was retired or replaced. Any of these may have kept the owner's tap from reaching the card's
+        record, which lives only on this adapter. Reads attributes only; safe from the agent thread."""
+        return (getattr(self, "_polling_generation", 0) != mark or self.send_path_degraded
+                or getattr(self, "_bot", None) is None or self.has_fatal_error
+                or self._replacement_telegram_adapter() is not None)
 
     async def retire_payment_card(self, request_id: str, reason: str) -> None:
         """The prompt settled without a tap on this card: drop its buttons and say so."""
@@ -166,6 +190,8 @@ class TelegramApprovalCardsMixin:
         except Exception as exc:
             logger.error("Payment approval resolve failed: %s", type(exc).__name__)
             count = 0
+        logger.info("[%s] Payment approval callback (request_id=%s, message_id=%s, choice=%s, applied=%s)",
+                    self.name, record["request_id"], record["message_id"], choice, bool(count))
         if not count:
             label = "Expired or already answered: nothing was approved."
         else:

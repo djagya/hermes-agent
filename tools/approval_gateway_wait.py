@@ -24,8 +24,8 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("acknowledged", "authority", "cancelled", "card_deny_only", "data", "event", "expired", "observers",
-                 "reason", "result", "settle")
+    __slots__ = ("acknowledged", "authority", "cancelled", "card_deny_only", "data", "delivery_probe", "event",
+                 "expired", "observers", "reason", "result", "settle")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -52,6 +52,9 @@ class _ApprovalEntry:
         # another client): the tui_gateway withdraws its open server→client request through it.
         self.settle = None
         self.observers = []
+        # dlz: set by the surface that delivered the prompt (``tools.approval.attach_delivery_probe``): True when
+        # its transport was disrupted during the wait, so an unanswered prompt may never have been answerable.
+        self.delivery_probe = None
         self.result: str | None = None  # "once"|"session"|"always"|"deny"
         # Free-text reason from ``/deny <reason>`` so the agent can adapt, not just hear "denied".
         self.reason: str | None = None
@@ -304,9 +307,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         resolved = state != "timeout" or choice is not None
         extra = {"cancelled": cancelled} if cancelled else {}
         human.outcome = _hook_choice(resolved, choice, extra)
+        # dlz: an unanswered prompt whose transport dropped meanwhile (a reconnect, a rebuilt adapter) may have
+        # been tapped with the tap lost; the caller reports that as unavailable, not as nobody answering.
+        degraded = not resolved and entry.delivery_probe is not None and bool(entry.delivery_probe())
         # Bounded settle trace (#138133): without this, a timeout that nobody answered leaves no
         # gateway-side record of how the wait ended — only the BLOCKED text the agent sees.
         logger.info(
-            "Approval wait ended (state=%s, resolved=%s, choice=%s, request_id=%s, session=%s)",
-            state, resolved, choice, entry.data.get("request_id"), session_key)
-        return _finish(payload, resolved, choice, entry.reason, **extra)
+            "Approval wait ended (state=%s, resolved=%s, choice=%s, request_id=%s, session=%s%s)",
+            state, resolved, choice, entry.data.get("request_id"), session_key,
+            ", delivery_degraded=True" if degraded else "")
+        decision = _finish(payload, resolved, choice, entry.reason, **extra)
+        if degraded:
+            decision["delivery_degraded"] = True
+        return decision
