@@ -13,6 +13,7 @@ This module is stdlib-only and must stay aligned with
 from __future__ import annotations
 
 import atexit
+import http.client
 import json
 import logging
 import os
@@ -1000,7 +1001,7 @@ def release_lease_outcome(
         body["revoke_unused_handoff"] = True
     try:
         result = _post(control, "/v1/release", body)
-    except Exception as exc:  # e.g. http.client.IncompleteRead: the lease may still be live at control
+    except http.client.HTTPException as exc:  # e.g. IncompleteRead on a truncated body: the lease may still be live
         _restore()
         logger.warning("browser control: release of lease=%s failed: %s", lease_id[:12], exc)
         return "", f"unavailable: release reply unreadable: {type(exc).__name__}"
