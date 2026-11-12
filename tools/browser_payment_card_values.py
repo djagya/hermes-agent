@@ -170,40 +170,63 @@ def slot_bound(supervisor: Any) -> bool:
     return bool(url) and url == str(getattr(supervisor, "cdp_url", "") or "")
 
 
+class PaymentWindowRefused(RuntimeError):
+    """The window cannot be opened for this supervisor: the fill stops, nothing is written."""
+
+
 def open_payment_window(secret: dict, supervisor: Any) -> tuple:
     """Register the card for every model-facing output of this profile until the release is confirmed.
-    Raises when it cannot (the fill must then stop). Returns ``(window key, generation)`` of this open, for
+    Raises when it cannot (the fill must then stop): on a managed browser also when the supervisor's socket
+    is not the one its route names (:func:`slot_bound`), because the key would then name a slot this socket
+    does not drive. Returns ``(window key, open identity, supervisor, recorded)`` of this open, for
     :func:`withdraw_payment_window` and :func:`seal_payment_window`: the key is fixed here, so a route that
-    moves to another slot before the fill ends never makes it touch that slot's window."""
+    moves to another slot before the fill ends never makes it touch that slot's window; ``recorded`` says
+    whether this open added the key to the supervisor's own windows."""
     from agent.redact import register_card_window
+    from tools.browser_payment_surface import _managed
 
+    if _managed() and not slot_bound(supervisor):
+        raise PaymentWindowRefused("supervisor is not bound to its route's slot")
     key = window_key(supervisor)
-    generation = register_card_window(
+    opened = register_card_window(
         key, digits=(str(secret.get("card_number") or ""), str(secret.get("cvc") or "")),
         words=(str(secret.get("cardholder_name") or ""),))
+    recorded = False
     with _LOCK:
         try:
-            _WINDOWS.setdefault(supervisor, set()).add(key)
+            keys = _WINDOWS.setdefault(supervisor, set())
+            recorded = key not in keys
+            keys.add(key)
         except TypeError:  # unscoped: closed only by its slot's release (or never: masking stays)
             pass
-    return key, generation
+    return key, opened, supervisor, recorded
 
 
-def withdraw_payment_window(key: str, generation: int) -> bool:
-    """The fill whose open returned ``(key, generation)`` stopped before it wrote any card value: that window
-    goes back to what it was before the open (an earlier payment's window stays). Refused, and the window
-    kept, when a claim or another fill touched it since, or once that open was sealed."""
+def withdraw_payment_window(key: str, opened: int, supervisor: Any = None, recorded: bool = False) -> bool:
+    """The fill whose open returned ``(key, opened, ...)`` stopped before it wrote any card value: that
+    window goes back to what it was before the open (an earlier payment's window stays). Refused, and the
+    window kept, when a claim or another fill touched it since, or once that open was sealed. After a
+    withdraw the supervisor stops owning ``key`` unless it owned it before this open (``recorded`` false):
+    an unwritten open leaves no association for a later status read to release a slot by."""
     from agent.redact import withdraw_card_window
 
-    return withdraw_card_window(key, generation)
+    taken = withdraw_card_window(key, opened)
+    if taken and recorded and supervisor is not None:
+        with _LOCK:
+            try:
+                _WINDOWS.get(supervisor, set()).discard(key)
+            except TypeError:
+                pass
+    return taken
 
 
-def seal_payment_window(key: str, generation: int) -> None:
-    """The fill whose open returned ``(key, generation)`` starts its commit: from here a card value may be in
-    the page, so no withdraw can take that open back; only control's unlock or a mark clear ends it."""
+def seal_payment_window(key: str, opened: int, *_ignored: Any) -> None:
+    """The fill whose open returned ``(key, opened, ...)`` starts its commit: from here a card value may be in
+    the page, so no withdraw can take that open back; only control's unlock or a mark clear ends it. Raises
+    when that window is gone (the fill must stop before it writes)."""
     from agent.redact import seal_card_window
 
-    seal_card_window(key, generation)
+    seal_card_window(key, opened)
 
 
 def release_payment_window(supervisor: Any, observed: dict) -> None:

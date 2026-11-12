@@ -173,21 +173,27 @@ def test_controls_view_read_before_a_claim_never_releases_that_claims_window(mon
     assert _model() != PUBLIC
 
 
-def test_a_recovery_close_of_the_payment_tab_releases_without_another_call(monkeypatch):
-    # the model's last call of the turn closed the payment tab: the window stayed open until some later
-    # browser call read the status
+def test_a_recovery_close_of_the_payment_tab_is_released_by_the_next_status_read(monkeypatch):
+    # the model's last call of the turn closed the payment tab. The close itself reads no status (control's
+    # watcher still says locked right after closeTarget, and a read would only hold the claim lock longer);
+    # the window is released by the next status read, which sees the unlock.
     _routes(monkeypatch, t1={"slot_id": "shopping", "supervisor_url": URL})
     sup = _paying("t1")
+    reads = []
+    real_status = surface.lock_status
+    monkeypatch.setattr(surface, "lock_status", lambda s: reads.append(s) or real_status(s))
     real = sup.on
 
     def on(method, params, session):
         if method == "Target.closeTarget":
-            sup.status = dict(UNLOCKED)
             return {"success": True}
         return real(method, params, session)
 
     sup.on = on
     assert surface.recovery_call(sup, "Target.closeTarget", {"targetId": "PAGE"})["success"] is True
+    assert reads == [] and _model() != PUBLIC  # no read under the claim lock: the window is still open
+    sup.status = dict(UNLOCKED)  # control's watcher caught up
+    assert surface.lock_status(sup) == "unlocked"
     assert _model() == PUBLIC and "Ada Testperson" not in _browser()
 
 
@@ -292,6 +298,7 @@ def test_a_route_moved_after_the_open_never_withdraws_the_other_slots_committed_
     payer = _sup("t2", cdp_url="ws://control/slot/research")
     card_values.note_claim(payer)
     with bvp._UnwrittenWindow(CARD, payer) as committed:
+        committed_open = committed._opened
         committed.committing()
     filler = _sup("t1")
     card_values.note_claim(filler)
@@ -300,7 +307,7 @@ def test_a_route_moved_after_the_open_never_withdraws_the_other_slots_committed_
         routes["t1"] = routes["t2"]  # a newer exec moved t1 to research, then the fence refused
     assert redact.card_window_keys() == ["research"]  # shopping's unwritten open went, research's stayed
     assert "737" not in _model("cvc 737") and "Ada Testperson" not in _browser()
-    assert card_values.withdraw_payment_window("research", 2) is False  # sealed: no withdraw matches it
+    assert card_values.withdraw_payment_window("research", committed_open[1]) is False  # sealed: no withdraw matches it
 
 
 def test_an_orphaned_supervisor_reading_its_own_unlock_leaves_the_new_routes_window(monkeypatch):
@@ -333,3 +340,88 @@ def test_the_holder_name_is_masked_only_in_browser_and_log_output(monkeypatch):
         out = redact.redact_sensitive_text(text, force=True, vault=vault)
         assert "Testperson" not in out and "testperson" not in out and CARD_PLACEHOLDER in out
         assert "737" not in out and "1111" not in out
+
+
+R_URL = "ws://control/slot/research"
+CARD2 = {"card_number": "5555555555554444", "cvc": "321", "cardholder_name": "Bea Other",
+         "exp_month": "04", "exp_year": "2032"}
+
+
+def test_a_withdrawn_open_whose_route_moved_leaves_no_association_for_a_later_unlock_read(monkeypatch):
+    # Opus/Codex r2: the fill held supervisor A (socket on shopping) while its task's route moved to research
+    # during the card lookup. The open is keyed on research and recorded in A's own windows; the commit fence
+    # refuses and the withdraw takes the window back but, before r3, left that association. After another
+    # task committed on research, A's own unlock read on shopping then released research's live window.
+    routes = {"t1": {"slot_id": "shopping", "supervisor_url": URL}}
+    monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: routes.get(task_id, {}))
+    a = _sup("t1")
+    with surface._LOCK:
+        surface._HELD.add(a)
+    card_values.note_claim(a)
+    routes["t1"] = {"slot_id": "research"}  # moved during the card lookup: no supervisor_url
+    with bvp._UnwrittenWindow(CARD, a):
+        pass  # the commit fence refuses: withdraw
+    assert set(card_values._WINDOWS.get(a, ())) == set()
+    assert redact.card_window_keys() == []
+    routes["t2"] = {"slot_id": "research", "supervisor_url": R_URL}
+    b = _sup("t2", cdp_url=R_URL)
+    with surface._LOCK:
+        surface._HELD.add(b)
+    card_values.note_claim(b)
+    with bvp._UnwrittenWindow(CARD2, b) as w:
+        w.committing()
+    before = _model("pan 5555 5555 5555 4444 cvc 321")
+    assert before != "pan 5555 5555 5555 4444 cvc 321"
+    a.status = dict(UNLOCKED)
+    surface.lock_status(a)
+    assert _model("pan 5555 5555 5555 4444 cvc 321") == before  # research stays masked for the model
+    assert redact.card_window_keys(unreleased=True) == ["research"]
+
+
+def test_a_withdraw_keeps_the_association_an_earlier_committed_open_made(monkeypatch):
+    _routes(monkeypatch, t1={"slot_id": "shopping", "supervisor_url": URL})
+    sup = _paying("t1")
+    assert set(card_values._WINDOWS[sup]) == {"shopping"}
+    with bvp._UnwrittenWindow(CARD2, sup):
+        pass  # a second fill on the same slot never wrote
+    assert set(card_values._WINDOWS[sup]) == {"shopping"}
+    assert _model("cvc 737") != "cvc 737"
+
+
+def test_a_managed_open_for_an_unbound_supervisor_is_refused_and_writes_nothing(monkeypatch):
+    monkeypatch.setattr(surface, "_managed", lambda: True)
+    _routes(monkeypatch, t1={"slot_id": "research"})  # attach failed: no supervisor_url
+    sup = _sup("t1")
+    with pytest.raises(card_values.PaymentWindowRefused):
+        bvp._register_card_redaction(CARD, sup)
+    assert redact.card_window_keys() == [] and not card_values._WINDOWS.get(sup)
+    assert _model("cvc 737") == "cvc 737"
+
+
+def test_a_late_withdraw_of_a_reused_generation_never_deletes_a_newer_window():
+    # Codex r2 P2-1: F1's open stays unwritten while a mark clear ends the window and 300 other keys evict the
+    # counter; the next claim and open on the same key restart at the same generation. F1's late withdraw
+    # used to match and delete F2's window.
+    redact.bump_card_window("A")
+    first = redact.register_card_window("A", ("4" * 16, "123"), ("Ann A",))
+    redact.release_card_window("A")
+    for i in range(300):
+        redact.bump_card_window(f"k{i}")
+    redact.bump_card_window("A")
+    second = redact.register_card_window("A", ("5" * 16, "321"), ("Bea B",))
+    assert first != second
+    assert redact.withdraw_card_window("A", first) is False
+    assert redact.card_window_keys() == ["A"]
+    assert "321" not in _model("cvc 321")
+
+
+def test_a_seal_fails_closed_when_its_window_is_gone_and_the_fill_writes_nothing(monkeypatch):
+    _routes(monkeypatch, t1={"slot_id": "shopping", "supervisor_url": URL})
+    sup = _sup("t1")
+    committed = []
+    with pytest.raises(redact.CardWindowGone):
+        with bvp._UnwrittenWindow(CARD, sup) as w:
+            redact.clear_vault_redaction_values()  # a mark clear ended the window meanwhile
+            w.committing()
+            committed.append("write")
+    assert committed == []

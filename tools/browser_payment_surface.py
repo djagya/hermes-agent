@@ -428,7 +428,9 @@ def recovery_call(supervisor: Any, method: str, params: Any) -> dict:
         from tools.browser_payment_done import _forget
 
         _forget(supervisor, params["targetId"])  # payment_done no longer waits for (or counts) that tab
-        lock_status(supervisor)  # dlz: if that ended the lock, the payment window narrows now, not at the next call
+        # No status read here: control's watcher needs targetDestroyed and a re-read before it says unlocked, so a
+        # read straight after the close usually still says locked and only adds time under the claim lock. The
+        # window is released by the next reconcile or status read (any later browser call, or control's view).
         return {"success": True, "method": method, "result": {}}
     except Exception as exc:  # health: allow BLE001 -- CDP text is not surfaced; fixed type only
         logger.info("locked recovery call failed (%s)", type(exc).__name__)

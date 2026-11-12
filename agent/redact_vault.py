@@ -36,6 +36,7 @@ slot); the window goes when the slot's mark is cleared. An open whose fill stopp
 back (:func:`withdraw_card_window`): the card never left the process, so the window is as it was before.
 """
 
+import itertools
 import json
 import re
 import threading
@@ -45,7 +46,9 @@ _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: _Entry}
 _CARD_WINDOWS: dict = {}  # profile home → ordered {window key: [digit lengths, holder words, released]}
 _CARD_GENERATIONS: dict = {}  # profile home → {window key: generation}
-_CARD_UNDO: dict = {}  # profile home → {window key: (generation of its last open, the window before it or None)}
+# profile home → {window key: (identity of its last open, generation that open reached, the window before it or None)}
+_CARD_UNDO: dict = {}
+_OPEN_IDS = itertools.count(1)  # process-global, never reused: a stale withdraw can never match a newer open
 _MAX_CARD_WINDOWS = 16
 _MAX_GENERATIONS = 256
 _VAULT_REDACTION_LOCK = threading.Lock()
@@ -168,10 +171,15 @@ def card_window_keys(*, unreleased: bool = False) -> list:
         return [k for k, w in (_CARD_WINDOWS.get(_vault_scope()) or {}).items() if not (unreleased and w[2])]
 
 
+class CardWindowGone(RuntimeError):
+    """The payment window an open registered no longer exists: the fill must stop before it writes."""
+
+
 def register_card_window(window: str, digits=(), words=()) -> int:
     """Open (or extend, reopening it for every output) the payment window ``window`` of this profile: the
     card's pure-digit values (number, CVC; only their lengths are kept) and its holder (scrubbed as a whole
-    word, any case). Returns the window's new generation."""
+    word, any case). Returns this open's identity: a process-global counter value, never reused, whatever
+    happens to the window's generation counter meanwhile."""
     lengths = frozenset(len(d) for d in digits if isinstance(d, str) and _ALL_DIGITS.fullmatch(d))
     names = frozenset(w.strip() for w in words if isinstance(w, str) and w.strip())
     key = str(window or "")
@@ -185,23 +193,28 @@ def register_card_window(window: str, digits=(), words=()) -> int:
         while len(windows) > _MAX_CARD_WINDOWS:
             undo.pop(next(iter(windows)), None)
             del windows[next(iter(windows))]
-        undo[key] = (_bump(scope, key), before)
-        return undo[key][0]
+        opened = next(_OPEN_IDS)
+        undo[key] = (opened, _bump(scope, key), before)
+        return opened
 
 
-def withdraw_card_window(window: str, generation: int) -> bool:
-    """Take back the open that returned ``generation``: its fill stopped before any card value was written,
-    so the window is put back as it was before that open (gone if there was none; a release confirmed
-    meanwhile is kept). Not a release: refused (window kept) once a claim or another open moved the
-    generation, and for any open but the window's last one. Whether it was taken back."""
+def withdraw_card_window(window: str, opened: int) -> bool:
+    """Take back the open that returned the identity ``opened``: its fill stopped before any card value was
+    written, so the window is put back as it was before that open (gone if there was none; a release
+    confirmed meanwhile is kept). Not a release: refused (window kept) once a claim or another open moved
+    the generation, for any open but the window's last one, and for an identity that is not the window's
+    current open. Whether it was taken back."""
     key = str(window or "")
     with _VAULT_REDACTION_LOCK:
         scope = _vault_scope()
         windows, undo = _CARD_WINDOWS.get(scope) or {}, _CARD_UNDO.get(scope) or {}
-        opened, before = undo.get(key, (None, None))
-        if opened != generation or (_CARD_GENERATIONS.get(scope) or {}).get(key, 0) != generation or key not in windows:
+        entry = undo.get(key)
+        if entry is None or entry[0] != opened or key not in windows:
+            return False
+        if (_CARD_GENERATIONS.get(scope) or {}).get(key, 0) != entry[1]:
             return False
         del undo[key]
+        before = entry[2]
         if before is None:
             del windows[key]
         else:
@@ -209,15 +222,18 @@ def withdraw_card_window(window: str, generation: int) -> bool:
         return True
 
 
-def seal_card_window(window: str, generation: int) -> None:
-    """The fill that opened ``window`` at ``generation`` starts writing: that open can no longer be taken back
-    (:func:`withdraw_card_window` refuses it, whoever asks). Only control's unlock or a mark clear ends it. A
-    later open of the same window (a newer generation) keeps its own undo."""
+def seal_card_window(window: str, opened: int) -> None:
+    """The fill that made open ``opened`` of ``window`` starts writing: that open can no longer be taken back
+    (:func:`withdraw_card_window` refuses it, whoever asks). Only control's unlock or a mark clear ends it.
+    Fails closed: raises :class:`CardWindowGone` when the window or this open's undo entry is gone (a mark
+    clear, an eviction, a newer open of the same window), so the fill stops before it writes."""
     key = str(window or "")
     with _VAULT_REDACTION_LOCK:
-        undo = _CARD_UNDO.get(_vault_scope()) or {}
-        if key in undo and undo[key][0] == generation:
-            del undo[key]
+        scope = _vault_scope()
+        undo = _CARD_UNDO.get(scope) or {}
+        if key not in (_CARD_WINDOWS.get(scope) or {}) or key not in undo or undo[key][0] != opened:
+            raise CardWindowGone(key)
+        del undo[key]
 
 
 def release_card_window(window: str, observed: int | None = None, *, keep_for_browser: bool = False) -> bool:

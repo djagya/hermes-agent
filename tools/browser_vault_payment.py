@@ -29,7 +29,7 @@ def _register_card_redaction(secret: dict, supervisor=None) -> tuple:
     long as the number or the CVC is masked in every later model-facing output (spaced or dashed groups of
     the number too), and the holder name is scrubbed as a whole word in browser and log output, until the lock
     release is confirmed. The expiry and billing postcode are not secrets on their own and stay out of it. Returns the open's
-    ``(window key, generation)``."""
+    ``(window key, open identity, supervisor, recorded)``."""
     from tools.browser_payment_card_values import open_payment_window
 
     return open_payment_window(secret, supervisor)
@@ -40,7 +40,7 @@ class _UnwrittenWindow:
     else can see the card); a fill that leaves before :meth:`committing` (a refusal, an expiry, an exception)
     wrote no card value, so its open is taken back and no output of the profile stays masked for a card that
     never reached the page. Once the commit starts the window stays until control confirms the unlock.
-    The withdraw and the seal name the ``(window key, generation)`` the open returned, never the supervisor's
+    The withdraw and the seal name the ``(window key, open identity)`` the open returned, never the supervisor's
     current route: a route moved to another slot meanwhile cannot make it take back that slot's window."""
 
     def __init__(self, secret: dict, supervisor) -> None:
