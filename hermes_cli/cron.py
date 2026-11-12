@@ -234,7 +234,9 @@ def _fallback_display(job: dict[str, Any]) -> str:
     if not isinstance(entries, list):
         return ""
     return ", ".join(
-        f"{e.get('provider')}:{e.get('model')}" for e in entries if isinstance(e, dict))
+        f"{e['provider']}:{e['model']}" for e in entries
+        if isinstance(e, dict) and isinstance(e.get("provider"), str) and isinstance(e.get("model"), str)
+        and e["provider"] and e["model"])
 
 
 def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
