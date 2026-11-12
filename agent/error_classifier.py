@@ -1531,6 +1531,19 @@ def _is_server_injected_param_rejection(error_msg: str, provider: str) -> bool:
 
 _CODEX_MASKED_REPLAY_MESSAGE = "request blocked."
 _CODEX_UNSUPPORTED_CONTENT_DETAIL = "unsupported content type"
+_CODEX_BAD_REQUEST_DETAIL = "bad request"
+# Body-less form: the wrapped message carries exactly the one-key ``{'detail': 'Bad Request'}`` envelope.
+_CODEX_BAD_REQUEST_ENVELOPE_RE = re.compile(
+    r"""\{\s*['"]detail['"]\s*:\s*['"]bad request['"]\s*\}""", re.IGNORECASE,
+)
+
+
+def is_codex_bad_request_envelope(body: Any, msg: str) -> bool:
+    """The bare ``{"detail": "Bad Request"}`` envelope (exact detail, case-insensitive), as a parsed
+    body or, when the SDK surfaced only the wrapped text, as the one-key envelope inside the message."""
+    if isinstance(body, dict) and body:
+        return str(body.get("detail") or "").strip().lower() == _CODEX_BAD_REQUEST_DETAIL
+    return bool(_CODEX_BAD_REQUEST_ENVELOPE_RE.search(msg or ""))
 
 
 def _is_codex_masked_replay_rejection(c: _Ctx) -> bool:
@@ -1538,10 +1551,14 @@ def _is_codex_masked_replay_rejection(c: _Ctx) -> bool:
     ``openai-codex`` — as an SDK error body, a Responses ``error`` SSE frame, or the
     ``response.failed`` text ``"invalid_prompt: Request blocked."`` — or the bare
     ``{"detail": "Unsupported content type"}`` envelope the same backend returns for a rejected
-    encrypted-reasoning replay (#51512). Both are exact envelopes, provider-gated."""
+    encrypted-reasoning replay (#51512), or the equally bare ``{"detail": "Bad Request"}`` the backend
+    started returning for a replayed sol-minted reasoning item (2026-11). All are exact envelopes,
+    provider-gated."""
     if c.provider_slug != "openai-codex" or c.status_code not in (None, 400):
         return False
     body = c.body if isinstance(c.body, dict) else {}
+    if is_codex_bad_request_envelope(c.body, c.msg):
+        return True
     if str(body.get("detail") or "").strip().lower() == _CODEX_UNSUPPORTED_CONTENT_DETAIL or (
         not body and _CODEX_UNSUPPORTED_CONTENT_DETAIL in c.msg and "detail" in c.msg
     ):
