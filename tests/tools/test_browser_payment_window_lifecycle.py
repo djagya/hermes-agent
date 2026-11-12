@@ -425,3 +425,90 @@ def test_a_seal_fails_closed_when_its_window_is_gone_and_the_fill_writes_nothing
             w.committing()
             committed.append("write")
     assert committed == []
+
+
+def test_a_route_moving_between_the_bound_check_and_the_key_never_keys_the_open_on_another_slot(monkeypatch):
+    # Codex r3 P2 / Opus r3 P3-1: the bound check and the key used to read the route twice; a move in between
+    # keyed the open on the new slot. One snapshot per open: the second read (which would move it) never happens.
+    monkeypatch.setattr(surface, "_managed", lambda: True)
+    routes = {"t1": {"slot_id": "shopping", "supervisor_url": URL}}
+    reads = {"t1": 0}
+
+    def vault_route(task_id):
+        if task_id == "t1":
+            reads["t1"] += 1
+            if reads["t1"] == 2:  # the route moves right after the first read
+                routes["t1"] = {"slot_id": "research"}
+        return dict(routes.get(task_id, {}))
+
+    monkeypatch.setattr(browser_use_cli, "vault_route", vault_route)
+    a = _sup("t1")
+    with surface._LOCK:
+        surface._HELD.add(a)
+    card_values.note_claim(a)
+    reads["t1"] = 0
+    routes["t2"] = {"slot_id": "research", "supervisor_url": R_URL}
+    b = _sup("t2", cdp_url=R_URL)
+    with bvp._UnwrittenWindow(CARD, a) as w:
+        assert w._opened[0] == "shopping" and reads["t1"] == 1
+        with surface._LOCK:
+            surface._HELD.add(b)
+        card_values.note_claim(b)  # t2 claims research while t1's fill is still unwritten
+    with bvp._UnwrittenWindow(CARD2, b) as w2:
+        w2.committing()
+    before = _model("pan 5555 5555 5555 4444 cvc 321")
+    assert before != "pan 5555 5555 5555 4444 cvc 321"
+    a.status = dict(UNLOCKED)
+    surface.lock_status(a)
+    assert _model("pan 5555 5555 5555 4444 cvc 321") == before  # research is not released by A
+
+
+def test_an_aborted_opens_failed_withdraw_still_retires_its_association(monkeypatch):
+    # Codex r3 P2 variant: A's open was keyed on research (an unmanaged route that moved before the open); B
+    # claims, opens and seals research before A aborts, so A's withdraw is refused. A must still stop owning
+    # research, or its later unlock read on its own browser narrows B's live window.
+    routes = {"t1": {"slot_id": "research"}, "t2": {"slot_id": "research", "supervisor_url": R_URL}}
+    monkeypatch.setattr(browser_use_cli, "vault_route", lambda task_id: dict(routes.get(task_id, {})))
+    a, b = _sup("t1"), _sup("t2", cdp_url=R_URL)
+    with surface._LOCK:
+        surface._HELD.update((a, b))
+    card_values.note_claim(a)
+    with bvp._UnwrittenWindow(CARD, a):
+        assert set(card_values._WINDOWS[a]) == {"research"}
+        card_values.note_claim(b)
+        with bvp._UnwrittenWindow(CARD2, b) as w2:
+            w2.committing()
+    assert set(card_values._WINDOWS.get(a, ())) == set()  # retired though the withdraw was refused
+    before = _model("pan 5555 5555 5555 4444 cvc 321")
+    assert before != "pan 5555 5555 5555 4444 cvc 321"
+    a.status = dict(UNLOCKED)
+    surface.lock_status(a)
+    assert _model("pan 5555 5555 5555 4444 cvc 321") == before
+    assert redact.card_window_keys(unreleased=True) == ["research"]
+
+
+def test_a_stale_release_never_matches_a_generation_a_dropped_counter_could_repeat():
+    # Opus r3 P3-2: identity fixed the withdraw, but a release fenced by an observed generation compared
+    # values that restart when a window-less key's counter is dropped. Generations come from one process-wide
+    # counter now, so the observed value never equals a later one.
+    redact.bump_card_window("A")
+    redact.register_card_window("A", ("4" * 16, "123"), ("Ann A",))
+    observed = redact.card_window_generations()["A"]
+    redact.release_card_window("A")
+    for i in range(300):
+        redact.bump_card_window(f"k{i}")
+    redact.bump_card_window("A")
+    redact.register_card_window("A", ("5" * 16, "321"), ("Bea B",))
+    assert redact.card_window_generations()["A"] != observed
+    assert redact.release_card_window("A", observed, keep_for_browser=True) is False
+    assert _model("cvc 321") != "cvc 321"
+    assert redact.card_window_keys(unreleased=True) == ["A"]
+
+
+def test_a_seal_refuses_a_window_a_confirmed_release_already_narrowed():
+    # Opus r3 optional: the window still exists but a release narrowed it to browser output; a commit under it
+    # would write the card with the model no longer masked. The seal fails closed.
+    opened = redact.register_card_window("S", ("4" * 16, "737"), ("Ann A",))
+    assert redact.release_card_window("S", redact.card_window_generations()["S"], keep_for_browser=True)
+    with pytest.raises(redact.CardWindowGone):
+        redact.seal_card_window("S", opened)

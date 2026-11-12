@@ -29,7 +29,8 @@ windows (:func:`register_card_window`, lengths and holder only, never the values
 for ``model``, ``browser`` and ``log``; the holder name only for ``browser`` and ``log`` (owner decision B,
 2026-11-12: where text from the payment slot can be; the holder is usually the owner, and a model, authored
 or other output that names them is not card data). Windows are fenced by a per-window
-generation: a claim or an open bumps it, and a release that observed an older generation changes nothing.
+generation: a claim or an open gives it a new value from one process-wide counter (never reused, even after a
+window-less key's counter is forgotten), and a release that observed another generation changes nothing.
 A confirmed lock release keeps the window for browser and log output only (the page may still show card
 text; every browser result of the profile, whichever slot it names: a browser_exec workspace outlives its
 slot); the window goes when the slot's mark is cleared. An open whose fill stopped before its first write is taken
@@ -49,6 +50,7 @@ _CARD_GENERATIONS: dict = {}  # profile home → {window key: generation}
 # profile home → {window key: (identity of its last open, generation that open reached, the window before it or None)}
 _CARD_UNDO: dict = {}
 _OPEN_IDS = itertools.count(1)  # process-global, never reused: a stale withdraw can never match a newer open
+_GENERATION_VALUES = itertools.count(1)  # process-global, never reused: a dropped counter never returns an old value
 _MAX_CARD_WINDOWS = 16
 _MAX_GENERATIONS = 256
 _VAULT_REDACTION_LOCK = threading.Lock()
@@ -143,9 +145,10 @@ def clear_vault_redaction_values() -> None:
 
 def _bump(scope: str, key: str) -> int:
     gens = _CARD_GENERATIONS.setdefault(scope, {})
-    gens[key] = gens.pop(key, 0) + 1
+    gens.pop(key, None)  # re-inserted last: recency
+    gens[key] = next(_GENERATION_VALUES)  # drawn from one process-wide counter, so a forgotten key never repeats one
     windows = _CARD_WINDOWS.get(scope) or {}
-    while len(gens) > _MAX_GENERATIONS:  # forget the oldest counter with no window (it restarts above 0 anyway)
+    while len(gens) > _MAX_GENERATIONS:  # forget the oldest counter with no window (a new one is above every old one)
         stale = next((k for k in gens if k not in windows and k != key), None)
         if stale is None:
             break
@@ -226,12 +229,15 @@ def seal_card_window(window: str, opened: int) -> None:
     """The fill that made open ``opened`` of ``window`` starts writing: that open can no longer be taken back
     (:func:`withdraw_card_window` refuses it, whoever asks). Only control's unlock or a mark clear ends it.
     Fails closed: raises :class:`CardWindowGone` when the window or this open's undo entry is gone (a mark
-    clear, an eviction, a newer open of the same window), so the fill stops before it writes."""
+    clear, an eviction, a newer open of the same window) or the window was already narrowed by a confirmed
+    release (its released flag is set: the card would be written under a window that no longer masks it for
+    the model), so the fill stops before it writes."""
     key = str(window or "")
     with _VAULT_REDACTION_LOCK:
         scope = _vault_scope()
         undo = _CARD_UNDO.get(scope) or {}
-        if key not in (_CARD_WINDOWS.get(scope) or {}) or key not in undo or undo[key][0] != opened:
+        window = (_CARD_WINDOWS.get(scope) or {}).get(key)
+        if window is None or window[2] or key not in undo or undo[key][0] != opened:
             raise CardWindowGone(key)
         del undo[key]
 

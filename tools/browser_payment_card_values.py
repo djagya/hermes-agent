@@ -45,16 +45,25 @@ def _scope() -> str:
     return str(get_hermes_home())
 
 
-def slot_of(supervisor: Any) -> str:
-    """The managed slot id of ``supervisor``'s browser_exec route; ``""`` when it has none."""
+def route_of(supervisor: Any) -> dict | None:
+    """One snapshot of ``supervisor``'s browser_exec route (a copy), ``None`` when there is no route to read.
+    A caller that needs the slot and the bound check of the same moment derives both from one snapshot."""
     if supervisor is None:
-        return ""
+        return None
     try:
         from tools.browser_use_cli import vault_route
 
-        return str((vault_route(getattr(supervisor, "task_id", None)) or {}).get("slot_id") or "")
-    except Exception:  # health: allow BLE001 -- no route to name a slot
-        return ""
+        return dict(vault_route(getattr(supervisor, "task_id", None)) or {})
+    except Exception:  # health: allow BLE001 -- no route to read
+        return None
+
+
+def slot_of(supervisor: Any, route: dict | None = None) -> str:
+    """The managed slot id of ``supervisor``'s browser_exec route (``route``: a snapshot already taken);
+    ``""`` when it has none."""
+    if route is None:
+        route = route_of(supervisor)
+    return str((route or {}).get("slot_id") or "")
 
 
 def _dialog_values(secret: dict) -> list:
@@ -112,10 +121,10 @@ def dialog_card_values(supervisor: Any) -> list:
     return list(dict.fromkeys(own + extra))
 
 
-def window_key(supervisor: Any) -> str:
+def window_key(supervisor: Any, route: dict | None = None) -> str:
     """The payment window ``supervisor`` opens: its slot id, or (no slot route) its own identity, never ``""``,
-    so one slot-less supervisor's release never closes another's window."""
-    slot = slot_of(supervisor)
+    so one slot-less supervisor's release never closes another's window. ``route``: a snapshot already taken."""
+    slot = slot_of(supervisor, route)
     if slot:
         return slot
     with _LOCK:
@@ -153,16 +162,15 @@ def observe_windows(supervisor: Any) -> dict:
     return {key: gens.get(key, 0) for key in keys}
 
 
-def slot_bound(supervisor: Any) -> bool:
+def slot_bound(supervisor: Any, route: dict | None = None) -> bool:
     """Whether ``supervisor``'s socket is the one its task's route was attached with, so the route's slot id
     names the browser its status reads answer for. A supervisor without a slot route has only its own
     window (:func:`window_key`): bound. A route whose attach failed, or one a newer exec moved to another
-    browser while this socket stayed, is not: its status says nothing about the slot the route names."""
-    try:
-        from tools.browser_use_cli import vault_route
-
-        route = vault_route(getattr(supervisor, "task_id", None)) or {}
-    except Exception:  # health: allow BLE001 -- no route to compare: only the supervisor's own window
+    browser while this socket stayed, is not: its status says nothing about the slot the route names.
+    ``route``: a snapshot already taken (:func:`route_of`); without one the route is read now."""
+    if route is None:
+        route = route_of(supervisor)
+    if route is None:  # no route to compare: only the supervisor's own window
         return True
     if not route.get("slot_id"):
         return True
@@ -181,13 +189,16 @@ def open_payment_window(secret: dict, supervisor: Any) -> tuple:
     does not drive. Returns ``(window key, open identity, supervisor, recorded)`` of this open, for
     :func:`withdraw_payment_window` and :func:`seal_payment_window`: the key is fixed here, so a route that
     moves to another slot before the fill ends never makes it touch that slot's window; ``recorded`` says
-    whether this open added the key to the supervisor's own windows."""
+    whether this open added the key to the supervisor's own windows. The bind check and the key come from ONE
+    snapshot of the route: a route that moves between two reads cannot key the open on a slot the check never
+    saw. The refusal is its own fail-closed guard (nothing is written, no window registered)."""
     from agent.redact import register_card_window
     from tools.browser_payment_surface import _managed
 
-    if _managed() and not slot_bound(supervisor):
+    route = route_of(supervisor)
+    if _managed() and not slot_bound(supervisor, route):
         raise PaymentWindowRefused("supervisor is not bound to its route's slot")
-    key = window_key(supervisor)
+    key = window_key(supervisor, route)
     opened = register_card_window(
         key, digits=(str(secret.get("card_number") or ""), str(secret.get("cvc") or "")),
         words=(str(secret.get("cardholder_name") or ""),))
@@ -205,13 +216,14 @@ def open_payment_window(secret: dict, supervisor: Any) -> tuple:
 def withdraw_payment_window(key: str, opened: int, supervisor: Any = None, recorded: bool = False) -> bool:
     """The fill whose open returned ``(key, opened, ...)`` stopped before it wrote any card value: that
     window goes back to what it was before the open (an earlier payment's window stays). Refused, and the
-    window kept, when a claim or another fill touched it since, or once that open was sealed. After a
-    withdraw the supervisor stops owning ``key`` unless it owned it before this open (``recorded`` false):
-    an unwritten open leaves no association for a later status read to release a slot by."""
+    window kept, when a claim or another fill touched it since, or once that open was sealed. Taken back or
+    not, the supervisor stops owning ``key`` unless it owned it before this open (``recorded`` false): an
+    unwritten open leaves no association for a later status read to release a slot by, even when another
+    fill claimed or opened that slot meanwhile and the window stays for it (its own supervisor owns it)."""
     from agent.redact import withdraw_card_window
 
     taken = withdraw_card_window(key, opened)
-    if taken and recorded and supervisor is not None:
+    if recorded and supervisor is not None:
         with _LOCK:
             try:
                 _WINDOWS.get(supervisor, set()).discard(key)
