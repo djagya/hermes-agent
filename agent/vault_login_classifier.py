@@ -120,10 +120,9 @@ class LoginControl:
     # Plain-"code" OTP path only. ``context`` is the RENDERED text (innerText) of the control's own form, or of its
     # nearest container block when it has no form; "" when unavailable or longer than the cap (truncated context
     # never qualifies). Matched against fixed patterns, never echoed. ``visible`` is the inspection's strict
-    # visibility (rendered, not transparent, on screen); ``block_id`` identifies the container block.
+    # visibility (rendered, not transparent, on screen).
     context: str = ""
     visible: Optional[bool] = None
-    block_id: Optional[int] = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
@@ -143,7 +142,6 @@ class LoginControl:
             rendered=raw.get("rendered") if isinstance(raw.get("rendered"), bool) else None,
             context=_bounded_context(raw.get("context")),
             visible=raw.get("visible") if isinstance(raw.get("visible"), bool) else None,
-            block_id=raw.get("blockId") if type(raw.get("blockId")) is int else None,
         )
 
 
@@ -262,14 +260,8 @@ def _bare_candidate_qualifies(c: LoginControl) -> bool:
     return bool(_RE_VERIFY_CONTEXT.search(block))
 
 
-def _widget_key(c: LoginControl) -> Any:
-    """One-digit boxes (maxlength=1) of one container are ONE widget; every other field is its own."""
-    if c.max_length == 1:
-        return ("split", c.form_index) if c.form_index is not None else ("split-block", c.block_id, c.page_url)
-    return ("field", c.index)
-
-
 SEVERAL_CODE_FIELDS = "several_code_fields"
+_MIN_WHOLE_CODE_LEN = 4  # a plain-"code" fallback field must be able to hold a whole code
 
 
 def classify_otp_controls_detailed(controls: list[LoginControl]) -> tuple[list[ClassifiedLoginControl], str]:
@@ -288,11 +280,15 @@ def classify_otp_controls_detailed(controls: list[LoginControl]) -> tuple[list[C
     if out:
         return out, ""
     # Only when nothing above matched: a plain "code"/"pin" input, accepted only when it is the page's ONE
-    # qualifying widget.
+    # qualifying field and takes a whole code (no maxlength, or at least 4). Every qualifying field counts, split
+    # one-digit boxes included: a fallback never groups boxes into a widget (those go through the
+    # one-time-code / regex paths above), so several boxes are "several fields" and refuse.
     plain = [c for c in controls if _bare_candidate_qualifies(c)]
-    if len({_widget_key(c) for c in plain}) > 1:
+    if len(plain) > 1:
         return [], SEVERAL_CODE_FIELDS
-    return [ClassifiedLoginControl(c, 60, "one-time-code", strict=True) for c in plain], ""
+    if plain and (plain[0].max_length is None or plain[0].max_length >= _MIN_WHOLE_CODE_LEN):
+        return [ClassifiedLoginControl(plain[0], 60, "one-time-code", strict=True)], ""
+    return [], ""
 
 
 def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginControl]:
@@ -531,7 +527,8 @@ def build_otp_fills(otp_controls: list[ClassifiedLoginControl], code: str) -> li
     Per-digit entry only when the page unmistakably uses it: exactly len(code) OTP controls that are all
     ``maxlength=1``, all in the same form, and adjacent in DOM order (the classic N-box widget). Anything
     looser (several code-like inputs scattered over a page) gets ONE field, never a digit sprayed across
-    unrelated inputs."""
+    unrelated inputs. A whole code is never written into a control whose ``maxlength`` is below the code
+    length: that returns no fills (refusal, nothing written)."""
     best = max(otp_controls, key=lambda c: c.score)
     boxes = sorted((c for c in otp_controls if c.control.max_length == 1), key=lambda c: c.control.index)
     if (len(boxes) == len(code)
@@ -539,6 +536,8 @@ def build_otp_fills(otp_controls: list[ClassifiedLoginControl], code: str) -> li
             and all(b.control.index - a.control.index == 1 for a, b in itertools.pairwise(boxes))):
         return [{"index": b.control.index, "token": "one-time-code", "value": ch, **({"strict": True} if b.strict else {})}
                 for b, ch in zip(boxes, code)]
+    if best.control.max_length is not None and best.control.max_length < len(code):
+        return []
     return [{"index": best.control.index, "token": "one-time-code", "value": code, **({"strict": True} if best.strict else {})}]
 
 
@@ -626,7 +625,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   // form, of its nearest container block (up to 4 levels, the largest that fits). Longer than the cap or
   // unreadable -> "" (never qualifies). Page title and headings are deliberately not included.
   const BLOCK_MAX = 1500;
-  const blockText = new Map(), blockIds = new Map();
+  const blockText = new Map();
   const textOf = (node) => {
     if (blockText.has(node)) return blockText.get(node);
     let t = null;
@@ -634,6 +633,8 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     blockText.set(node, t);
     return t;
   };
+  // Without a form: walk up to 4 ancestors. If ANY ancestor in the walk is oversized or unreadable the context is
+  // empty (fail closed): a smaller inner block is never kept when an enclosing one was cut off.
   const blockOf = (element) => {
     try {
       if (element.form) return element.form;
@@ -642,7 +643,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
         node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
         if (!node || node.tagName === "BODY" || node.tagName === "HTML") break;
         const t = textOf(node);
-        if (t === null || t.length > BLOCK_MAX) break;
+        if (t === null || t.length > BLOCK_MAX) return null;
         best = node;
       }
       return best;
@@ -650,10 +651,9 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   };
   const contextOf = (element) => {
     const block = blockOf(element);
-    if (!block) return { context: "", blockId: null };
-    if (!blockIds.has(block)) blockIds.set(block, blockIds.size);
+    if (!block) return { context: "" };
     const t = textOf(block);
-    return { context: t !== null && t.length <= BLOCK_MAX ? t : "", blockId: blockIds.get(block) };
+    return { context: t !== null && t.length <= BLOCK_MAX ? t : "" };
   };
   const visible = __VISIBLE__;
   const out = elements.flatMap((element, index) => {

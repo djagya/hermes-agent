@@ -733,6 +733,10 @@ def browser_vault_enter_code(
     def write(code_value: str, source: str) -> str:
         register_vault_redaction_value(code_value, known_to_model=source == "supplied", ttl_s=_OTP_REDACTION_TTL_S)
         fills = build_otp_fills(otp_controls, code_value)
+        if not fills:  # the code would not fit the chosen field (maxlength): nothing is written
+            del code_value
+            return json.dumps({"success": False, "error_type": "no_code_field",
+                               "error": "The code field cannot hold the whole code, so none was filled. Nothing was written."})
         result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
         del code_value
         if not result.get("success"):
