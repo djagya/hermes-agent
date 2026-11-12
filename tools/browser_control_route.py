@@ -116,8 +116,45 @@ def _retire_daemon(name: str) -> None:
         return
     # The owning profile is read here, on the caller's thread: lease names are per controller, so two
     # served profiles can share one, and the retire thread has no profile scope of its own.
-    threading.Thread(target=stop_harness_daemon, args=(name, hermes_home_key()), name="bu-daemon-retire",
-                     daemon=True).start()
+    home_key = hermes_home_key()
+
+    def _run() -> None:
+        try:
+            stop_harness_daemon(name, home_key)
+        finally:
+            with _retiring_lock:
+                pending = _retiring.get(name, [])
+                if thread in pending:
+                    pending.remove(thread)
+                if not pending:
+                    _retiring.pop(name, None)
+
+    thread = threading.Thread(target=_run, name="bu-daemon-retire", daemon=True)
+    with _retiring_lock:
+        _retiring.setdefault(name, []).append(thread)
+    thread.start()
+
+
+# Retires in flight per lease name. A revocable deferral puts the lease entry back under the same
+# ``BU_NAME`` while its old daemon is still shutting down; reuse waits here so the late retire can
+# never stop the daemon/supervisor the next browser call spawns under that name.
+_retiring: dict[str, list[threading.Thread]] = {}
+_retiring_lock = threading.Lock()
+RETIRE_FENCE_S = 20.0  # a bit over the 15 s ``--reload`` bound in browser_use_cli
+
+
+def _await_retire(name: str, timeout_s: Optional[float] = None) -> bool:
+    """Wait (bounded) for every in-flight retire of ``name``. False = one is still running."""
+    deadline = time.monotonic() + (RETIRE_FENCE_S if timeout_s is None else timeout_s)
+    while True:
+        with _retiring_lock:
+            pending = list(_retiring.get(name, ()))
+        if not pending:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        pending[0].join(remaining)
 
 
 def control_url() -> str:
@@ -808,6 +845,8 @@ def _resolve_held(
         if alive is None:
             return "unavailable: control unreachable while checking the held lease"
         if alive:
+            if not _await_retire(cached.get("BU_NAME", "")):
+                return "unavailable: the lease's previous browser daemon is still shutting down; retry"
             env.update(cached)
             return None
         # Dead lease: forget it and acquire again (control hands a task its
@@ -890,6 +929,8 @@ def held_managed_cdp(
         _forget_held(key)
         _retire_daemon(cached.get("BU_NAME", ""))
         return "lease_stale"
+    if not _await_retire(cached.get("BU_NAME", "")):
+        return "lease_unavailable"
     env.update(cached)
     return None
 
