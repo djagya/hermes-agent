@@ -179,7 +179,7 @@ def test_enter_code_names_the_ambiguity_and_writes_nothing():
 
 
 def test_enter_code_reports_a_field_that_stopped_being_visible_before_the_write():
-    out, raw, seen = run_enter_code([ctl(name="code")], fill_answer={"refused": "field_not_visible"},
+    out, raw, _ = run_enter_code([ctl(name="code")], fill_answer={"refused": "field_not_visible"},
                                     code="042172", expected_origin=ORIGIN)
     assert out["success"] is False and out["error_type"] == "code_field_not_visible" and "042172" not in raw
 
