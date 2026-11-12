@@ -233,9 +233,14 @@ async function withWebapp(
   const sandbox = createCoreSandbox(label)
   writeProviderHome(sandbox.hermesHome, provider.url)
   // todo_list is deferred behind tool_search by default; the scripted model calls it directly.
+  // No compaction: with every tool eager, the 4 x 33 tool rows below reach the mock's 64K
+  // window threshold (~58K tokens) mid-turn. A compaction rewrites the turn (the prompt goes
+  // into the summary, the todo tool re-injects its list as a user row), so the scripted
+  // provider no longer finds the turn's marker and answers "ok": the turn never reaches its
+  // scripted reply. This journey is about the journal, not compaction.
   fs.appendFileSync(
     path.join(sandbox.hermesHome, 'config.yaml'),
-    `\nwebapp:\n  enabled: true\n  port: ${await freePort()}\ntools:\n  tool_search:\n    defer: []\n`
+    `\nwebapp:\n  enabled: true\n  port: ${await freePort()}\ntools:\n  tool_search:\n    defer: []\ncompression:\n  enabled: false\n`
   )
   let browser: Browser | null = null
 
