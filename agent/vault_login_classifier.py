@@ -88,7 +88,14 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
 
 
-_CONTEXT_MAX = 900
+_CONTEXT_MAX = 1500
+
+
+def _bounded_context(raw: Any) -> str:
+    """The inspection's context, or "" when it is not a string or exceeds the cap (a truncated context is no
+    evidence either way, so it never qualifies a field)."""
+    text = raw if isinstance(raw, str) else ""
+    return text if len(text) <= _CONTEXT_MAX else ""
 
 
 @dataclass(frozen=True)
@@ -110,9 +117,13 @@ class LoginControl:
     # Inspection's strict geometry: at least 2x2 px, horizontally on screen, inside the document, not
     # transparent. Only a signup target needs it; None (an older inspection) never qualifies.
     rendered: Optional[bool] = None
-    # Page/form context for the plain-"code" OTP path only: the document title, headings and the text of the
-    # control's nearest small block (capped by the inspection). Matched against fixed patterns, never echoed.
+    # Plain-"code" OTP path only. ``context`` is the RENDERED text (innerText) of the control's own form, or of its
+    # nearest container block when it has no form; "" when unavailable or longer than the cap (truncated context
+    # never qualifies). Matched against fixed patterns, never echoed. ``visible`` is the inspection's strict
+    # visibility (rendered, not transparent, on screen); ``block_id`` identifies the container block.
     context: str = ""
+    visible: Optional[bool] = None
+    block_id: Optional[int] = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
@@ -130,7 +141,9 @@ class LoginControl:
             page_url=str(raw.get("pageUrl") or ""),
             form_action=str(raw.get("formAction") or ""),
             rendered=raw.get("rendered") if isinstance(raw.get("rendered"), bool) else None,
-            context=str(raw.get("context") or "")[:_CONTEXT_MAX],
+            context=_bounded_context(raw.get("context")),
+            visible=raw.get("visible") if isinstance(raw.get("visible"), bool) else None,
+            block_id=raw.get("blockId") if type(raw.get("blockId")) is int else None,
         )
 
 
@@ -146,6 +159,8 @@ class ClassifiedLoginControl:
     control: LoginControl
     score: int
     token: str
+    # Plain-"code" fallback only: the fill script re-checks visibility right before writing.
+    strict: bool = False
 
 
 def _camel_text(control: LoginControl) -> str:
@@ -201,54 +216,65 @@ _RE_OTP = re.compile(
 # words besides code/pin; any other word (promo, gift, postal, ...) keeps it out of the bare path.
 _BARE_CODE_FILLER = frozenset({"code", "pin", "enter", "the", "your", "a", "please", "type", "input", "digit",
                                "digits", "numeric", "g", "sent", "we", "you", "to", "received", "below", "here"})
-# Words that make a "code" something other than a second factor. Checked on the context of the lone-input
-# route (the field's own text is already confined to the filler words above).
+# Non-OTP purposes. Checked FIRST, on the field's own text and on its own form/block text, before any
+# acceptance route: a verification word elsewhere never outweighs one of these.
 _RE_NOT_OTP_CODE = re.compile(
-    r"\b(?:promo\w*|gift\w*|coupon\w*|voucher\w*|discount\w*|referr?al\w*|refer|invit\w*|postal|zip\w*|"
+    r"\b(?:promo\w*|gift\w*|coupon\w*|voucher\w*|discount\w*|referr?al\w*|refer|invit\w*|postal|postcode|zip\w*|"
     r"area|country|dial\w*|calling|currency|swift|bic|cvv|cvc|csc|billing|shipping|tracking|sku|redeem\w*|"
-    r"redemption|reward\w*|loyalty|affiliate|campaign)\b")
-# The page or form says it is verifying something it just sent.
+    r"redemption|reward\w*|loyalty|affiliate|campaign|search|chat|comments?|"
+    r"(?:order|booking|reservation|reference|ref|invoice|ticket|parcel|shipment)\s*(?:number|no|id|code)|"
+    r"confirmation\s+(?:number|no|id)|send\s+(?:us\s+a\s+)?message|leave\s+a\s+message|write\s+a\s+message|"
+    r"contact\s+us)\b")
+# The field's own form (or nearest block) says it is verifying something it just sent.
 _RE_VERIFY_CONTEXT = re.compile(
-    r"\bverif\w*|\bconfirm\w*\s+(?:your\s+)?(?:e[\s-]?mail|email address|phone|number|identity|account)\b"
-    r"|\bwe\s*(?:ve\s+)?sent\b|\bsent\s+(?:you\s+)?(?:a|the|an)\s+(?:\w+\s+)?code\b"
-    r"|\bcheck\s+your\s+(?:e[\s-]?mail|inbox|phone|messages)\b"
-    r"|\bone[\s-]?time\b|\b(?:two|2)[\s-]?step\b")
-_TEXT_LIKE = ("text", "tel", "number", "email", "password", "search", "url", "")
+    r"\bverify\b|\bverification\b|\bconfirm\s+your\s+(?:e[\s-]?mail|email address|phone|number|identity|account)\b"
+    r"|\bwe\s*(?:ve\s+|have\s+)?sent\b|\bsent\s+(?:you\s+)?(?:a|the|an)\s+(?:\w+\s+)?code\b"
+    r"|\benter\s+the\s+(?:\d+\s*digit\s+)?code\b|\bone[\s-]?time\b|\b(?:two|2)[\s-]?step\b"
+    r"|\bsecurity\s+code\b")
+
+
+def _field_text(c: LoginControl) -> str:
+    return _normalize_text(re.sub(r"([a-z])([A-Z])", r"\1 \2", " ".join(p for p in (c.name, c.label) if p)))
 
 
 def _is_bare_code_field(c: LoginControl) -> bool:
     if c.type not in ("text", "tel", "number"):
         return False
-    text = _normalize_text(re.sub(r"([a-z])([A-Z])", r"\1 \2", " ".join(p for p in (c.name, c.label) if p)))
-    tokens = text.split()
+    tokens = _field_text(c).split()
     if not any(t in ("code", "pin") for t in tokens):
         return False
     return all(t in _BARE_CODE_FILLER or t.isdigit() for t in tokens)
 
 
-def _plain_code_controls(controls: list[LoginControl]) -> list[ClassifiedLoginControl]:
-    """Bare "code" inputs that are demonstrably a verification step: the page/form context says so, or the
-    input is the only text-like input of its form (and the context names no promo/gift/postal/... topic)."""
-    out: list[ClassifiedLoginControl] = []
-    for c in controls:
-        if not _is_bare_code_field(c):
-            continue
-        context = _normalize_text(c.context)
-        if _RE_VERIFY_CONTEXT.search(context):
-            out.append(ClassifiedLoginControl(c, 60, "one-time-code"))
-            continue
-        siblings = [o for o in controls if o.form_index == c.form_index and o.type in _TEXT_LIKE]
-        if len(siblings) == 1 and not _RE_NOT_OTP_CODE.search(context):
-            out.append(ClassifiedLoginControl(c, 55, "one-time-code"))
-    return out
+def _bare_candidate_qualifies(c: LoginControl) -> bool:
+    if not _is_bare_code_field(c):
+        return False
+    # Rendered and visible (strict inspection geometry); an older inspection without it never qualifies.
+    if c.visible is not True or c.rendered is not True:
+        return False
+    block = _normalize_text(c.context)
+    if not block:  # missing or truncated context never establishes suitability
+        return False
+    # 1. a non-OTP purpose in the field's own text or its own form/block refuses, before any acceptance route
+    if _RE_NOT_OTP_CODE.search(_field_text(c)) or _RE_NOT_OTP_CODE.search(block):
+        return False
+    # 2. positive evidence scoped to the field's own form/block (rendered text; page title/headings never count)
+    return bool(_RE_VERIFY_CONTEXT.search(block))
 
 
-def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginControl]:
-    """The controls that take a second-factor code. ``autocomplete=one-time-code`` is authoritative;
-    otherwise a text/tel/number input whose name/label says code/OTP/2FA/verification. Some sites split
-    the code into one input per digit (``maxlength=1`` boxes): they are returned in DOM order and the
-    fill spreads the code across them. Only when none of that matches, a plain "code"/"pin" input is
-    accepted if the page says it is a verification step or it is the form's only text-like input."""
+def _widget_key(c: LoginControl) -> Any:
+    """One-digit boxes (maxlength=1) of one container are ONE widget; every other field is its own."""
+    if c.max_length == 1:
+        return ("split", c.form_index) if c.form_index is not None else ("split-block", c.block_id, c.page_url)
+    return ("field", c.index)
+
+
+SEVERAL_CODE_FIELDS = "several_code_fields"
+
+
+def classify_otp_controls_detailed(controls: list[LoginControl]) -> tuple[list[ClassifiedLoginControl], str]:
+    """``(otp controls, refusal reason)``. The reason is ``""`` or ``SEVERAL_CODE_FIELDS`` (more than one plain
+    "code" widget qualified on the page: nothing is chosen)."""
     out: list[ClassifiedLoginControl] = []
     for c in controls:
         tokens = c.autocomplete.lower().split()
@@ -259,7 +285,24 @@ def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginC
             continue
         if _RE_OTP.search(_normalize_text(" ".join(p for p in (c.name, c.label) if p))):
             out.append(ClassifiedLoginControl(c, 70, "one-time-code"))
-    return out or _plain_code_controls(controls)
+    if out:
+        return out, ""
+    # Only when nothing above matched: a plain "code"/"pin" input, accepted only when it is the page's ONE
+    # qualifying widget.
+    plain = [c for c in controls if _bare_candidate_qualifies(c)]
+    if len({_widget_key(c) for c in plain}) > 1:
+        return [], SEVERAL_CODE_FIELDS
+    return [ClassifiedLoginControl(c, 60, "one-time-code", strict=True) for c in plain], ""
+
+
+def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginControl]:
+    """The controls that take a second-factor code. ``autocomplete=one-time-code`` is authoritative;
+    otherwise a text/tel/number input whose name/label says code/OTP/2FA/verification. Some sites split
+    the code into one input per digit (``maxlength=1`` boxes): they are returned in DOM order and the
+    fill spreads the code across them. Only when none of that matches, a plain "code"/"pin" input is
+    accepted if it is the page's single visible candidate whose own form/block text says verification and
+    names no other purpose (see ``classify_otp_controls_detailed``)."""
+    return classify_otp_controls_detailed(controls)[0]
 
 
 @dataclass(frozen=True)
@@ -494,8 +537,9 @@ def build_otp_fills(otp_controls: list[ClassifiedLoginControl], code: str) -> li
     if (len(boxes) == len(code)
             and len({b.control.form_index for b in boxes}) == 1
             and all(b.control.index - a.control.index == 1 for a, b in itertools.pairwise(boxes))):
-        return [{"index": b.control.index, "token": "one-time-code", "value": ch} for b, ch in zip(boxes, code)]
-    return [{"index": best.control.index, "token": "one-time-code", "value": code}]
+        return [{"index": b.control.index, "token": "one-time-code", "value": ch, **({"strict": True} if b.strict else {})}
+                for b, ch in zip(boxes, code)]
+    return [{"index": best.control.index, "token": "one-time-code", "value": code, **({"strict": True} if best.strict else {})}]
 
 
 def registry_name(nonce: str) -> str:
@@ -524,7 +568,7 @@ def build_inspection_js(nonce: str, bind: str = "") -> str:
     return (_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
             .replace("__REGISTRY__", json.dumps(registry_name(nonce) if bind else ""))
             .replace("__BIND__", json.dumps(bind)).replace("__REGISTER__", _REGISTER_JS)
-            .replace("__RENDERED__", _RENDERED_JS))
+            .replace("__VISIBLE__", _VISIBLE_JS).replace("__RENDERED__", _RENDERED_JS))
 
 
 # Strict geometry shared by inspection (``rendered``) and the signup writer: a real box of at least 2x2 px,
@@ -540,6 +584,20 @@ _RENDERED_JS = """((e) => {
       (typeof e.checkVisibility !== "function" || e.checkVisibility({ opacityProperty: true, visibilityProperty: true }));
   })"""
 
+
+# Strict visibility for the plain-"code" fallback, shared by the inspection (``visible``) and the fill script
+# (re-checked right before writing): everything ``_RENDERED_JS`` requires, plus no ancestor (shadow hosts
+# included) that is display:none, visibility:hidden or (almost) transparent.
+_VISIBLE_JS = """((e) => {
+    if (!(__RENDERED__)(e)) return false;
+    let n = e;
+    for (let up = 0; n && up < 200; up++) {
+      const st = getComputedStyle(n);
+      if (st.display === "none" || st.visibility === "hidden" || parseFloat(st.opacity) < 0.05) return false;
+      n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null;
+    }
+    return e.isConnected !== false;
+  })""".replace("__RENDERED__", _RENDERED_JS)
 
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   "use strict";  // a page function we call cannot read this script (and its bind secret) through .caller
@@ -563,34 +621,41 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const registry = __REGISTRY__;
   if (registry) { try { (__REGISTER__)(registry, __BIND__, elements, forms); } catch (_) { /* writer then refuses */ } }
   const rendered = __RENDERED__;
-  // Context for the plain-"code" verification path (read by the Python classifier, never shown to the model):
-  // title and headings once, plus the text of the control's nearest small block. Every read is best effort:
-  // a page that breaks a getter just yields no context.
-  const clip = (t, n) => String(t || "").replace(/ +/g, " ").trim().slice(0, n);
-  let headingText = null;
-  const headings = () => {
-    if (headingText === null) {
-      headingText = "";
-      try {
-        const hs = Array.from(document.querySelectorAll("h1,h2,h3,legend,[role=heading]")).slice(0, 6);
-        headingText = clip([document.title || ""].concat(hs.map((h) => clip(h.textContent, 120))).join(" "), 400);
-      } catch (_) { /* no context */ }
-    }
-    return headingText;
+  // Context for the plain-"code" fallback (read by the Python classifier, never shown to the model): the RENDERED
+  // text (innerText: display:none / visibility:hidden text is absent) of the control's own form, or, without a
+  // form, of its nearest container block (up to 4 levels, the largest that fits). Longer than the cap or
+  // unreadable -> "" (never qualifies). Page title and headings are deliberately not included.
+  const BLOCK_MAX = 1500;
+  const blockText = new Map(), blockIds = new Map();
+  const textOf = (node) => {
+    if (blockText.has(node)) return blockText.get(node);
+    let t = null;
+    try { const raw = node.innerText; t = typeof raw === "string" ? raw.replace(/\\s+/g, " ").trim() : null; } catch (_) { t = null; }
+    blockText.set(node, t);
+    return t;
   };
-  const nearby = (element) => {
-    let best = "", node = element;
+  const blockOf = (element) => {
     try {
-      for (let up = 0; up < 3 && node; up++) {
+      if (element.form) return element.form;
+      let best = null, node = element;
+      for (let up = 0; up < 4 && node; up++) {
         node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
         if (!node || node.tagName === "BODY" || node.tagName === "HTML") break;
-        const t = clip(node.textContent, 2000);
-        if (t.length > 500) break;
-        best = t;
+        const t = textOf(node);
+        if (t === null || t.length > BLOCK_MAX) break;
+        best = node;
       }
-    } catch (_) { /* no context */ }
-    return best;
+      return best;
+    } catch (_) { return null; }
   };
+  const contextOf = (element) => {
+    const block = blockOf(element);
+    if (!block) return { context: "", blockId: null };
+    if (!blockIds.has(block)) blockIds.set(block, blockIds.size);
+    const t = textOf(block);
+    return { context: t !== null && t.length <= BLOCK_MAX ? t : "", blockId: blockIds.get(block) };
+  };
+  const visible = __VISIBLE__;
   const out = elements.flatMap((element, index) => {
     if (element.disabled || element.readOnly) return [];
     if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
@@ -618,7 +683,8 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       ].join(" "),
       name: [element.name, element.id].join(" "),
       type: element.tagName === "SELECT" ? "select" : (element.type || ""),
-      context: clip(headings() + " " + nearby(element), 900),
+      ...(["text", "tel", "number"].includes(element.type) ? (() => { try { return contextOf(element); } catch (_) { return {}; } })() : {}),
+      visible: (() => { try { return visible(element); } catch (_) { return false; } })(),
       rendered: (() => { try { return rendered(element); } catch (_) { return false; } })(),
     }];
   });
@@ -837,7 +903,8 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     handlers, so the target is re-checked after it, immediately before the value is set.
     """
     payload = json.dumps(
-        [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
+        [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"],
+          **({"strict": True} if f.get("strict") else {})} for f in fills]
     )
     # One pass: a chained .replace() would rescan the already-spliced fill values, so a secret
     # containing "__NONCE__" (or any later placeholder) got JSON spliced into its string literal.
@@ -846,11 +913,12 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
         "__FILLS__": payload,
         "__NONCE__": json.dumps(nonce),
         "__TAG__": json.dumps(refusal_tag),
+        "__VISIBLE__": _VISIBLE_JS,
     }
     return _FILL_JS_PLACEHOLDER_RE.sub(lambda m: values[m.group(0)], _FILL_JS_TEMPLATE)
 
 
-_FILL_JS_PLACEHOLDER_RE = re.compile(r"__EXPECTED_ORIGIN__|__FILLS__|__NONCE__|__TAG__")
+_FILL_JS_PLACEHOLDER_RE = re.compile(r"__EXPECTED_ORIGIN__|__FILLS__|__NONCE__|__TAG__|__VISIBLE__")
 
 
 _FILL_JS_TEMPLATE = """(() => {
@@ -873,6 +941,19 @@ _FILL_JS_TEMPLATE = """(() => {
   const find = (selector) => roots.flatMap((r) => Array.from(r.querySelectorAll(selector)));
   let filled = 0;
   const norm = (t) => String(t || "").trim().toLowerCase();
+  const visible = __VISIBLE__;
+  // Plain-"code" fallback targets (strict): rendered and visible, checked for ALL of them before anything is
+  // written; a failure writes nothing.
+  for (const f of fills) {
+    if (f.strict !== true) continue;
+    const el = find('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]')[0];
+    let ok = false;
+    try { ok = !!el && el.isConnected && visible(el); } catch (_) { ok = false; }
+    if (!ok) {
+      find("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+      return stringify({ refused: "field_not_visible" });
+    }
+  }
   for (const f of fills) {
     const el = find('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]')[0];
     if (!el || (f.token === "current-password" && el.type !== "password")) continue;
@@ -886,7 +967,7 @@ _FILL_JS_TEMPLATE = """(() => {
       el.focus();
       // focus handlers are page code: re-check the target before the value lands.
       if (!el.isConnected || window.location.origin !== expectedOrigin ||
-          (f.token === "current-password" && el.type !== "password")) continue;
+          (f.token === "current-password" && el.type !== "password") || (f.strict === true && !visible(el))) continue;
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
