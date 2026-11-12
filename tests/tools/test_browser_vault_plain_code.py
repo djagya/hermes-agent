@@ -22,7 +22,7 @@ VERIFY = "Verify your email address Enter the code we sent to someone@example.te
 
 def ctl(**kw) -> dict:
     base = {"index": 0, "type": "text", "name": "", "label": "", "autocomplete": "", "formIndex": 0,
-            "context": VERIFY, "rendered": True, "visible": True, "blockId": 0}
+            "context": VERIFY, "rendered": True, "visible": True}
     base.update(kw)
     return base
 
@@ -57,11 +57,46 @@ def test_each_positive_phrase_in_the_fields_own_form_qualifies(text):
     assert picked(ctl(name="code", context=text)) == [0]
 
 
-def test_split_digit_boxes_of_one_container_are_one_widget():
-    boxes = [ctl(index=i, type="tel", name=f"code-{i}", maxLength=1, formIndex=None, blockId=3) for i in range(6)]
-    assert picked(*boxes) == list(range(6))
-    in_form = [ctl(index=i, type="tel", name=f"code-{i}", maxLength=1) for i in range(6)]
-    assert picked(*in_form) == list(range(6))
+def test_split_digit_boxes_are_never_a_plain_fallback_widget():
+    for form_index in (0, None):  # in one form, and form-less
+        boxes = [ctl(index=i, type="tel", name=f"code-{i}", maxLength=1, formIndex=form_index) for i in range(6)]
+        assert picked(*boxes) == []
+        assert classify_otp_controls_detailed([LoginControl.from_dict(r) for r in boxes])[1] == "several_code_fields"
+
+
+def test_two_six_box_widgets_and_a_box_next_to_a_bare_field_are_refused():
+    two = [ctl(index=i, type="tel", name=f"code-{i}", maxLength=1, formIndex=i // 6) for i in range(12)]
+    assert picked(*two) == []
+    mixed = [ctl(index=0, type="tel", name="code", maxLength=1), ctl(index=1, name="code", label="Enter code")]
+    assert picked(*mixed) == []
+    one_short = ctl(name="code", maxLength=1)  # a lone one-digit box cannot take a whole code either
+    assert picked(one_short) == []
+    assert picked(ctl(name="code", maxLength=2)) == [] and picked(ctl(name="code", maxLength=3)) == []
+
+
+def test_whole_code_fields_with_no_maxlength_or_a_roomy_one_are_accepted():
+    assert picked(ctl(name="code")) == [0]
+    assert picked(ctl(name="code", maxLength=6)) == [0]
+    assert picked(ctl(name="code", maxLength=4)) == [0]
+
+
+def test_split_boxes_stay_supported_through_the_one_time_code_and_regex_paths():
+    auto = [ctl(index=i, name=f"d{i}", maxLength=1, autocomplete="one-time-code", context="") for i in range(6)]
+    assert picked(*auto) == list(range(6))
+    regex = [ctl(index=i, type="tel", name=f"otp-{i}", maxLength=1, context="") for i in range(6)]
+    assert picked(*regex) == list(range(6))
+    fills = build_otp_fills(classify_otp_controls([LoginControl.from_dict(r) for r in auto]), "042172")
+    assert [f["value"] for f in fills] == list("042172")
+
+
+def test_build_otp_fills_never_writes_a_whole_code_into_a_short_maxlength_control():
+    one = classify_otp_controls([LoginControl.from_dict(ctl(name="otp", label="Verification code", maxLength=4, context=""))])
+    assert build_otp_fills(one, "042172") == []
+    scattered = classify_otp_controls([LoginControl.from_dict(ctl(index=i, name=f"otp-{i}", maxLength=1, context=""))
+                                       for i in range(3)])
+    assert build_otp_fills(scattered, "042172") == []  # not len(code) boxes: refuse, no fallback to the first box
+    roomy = classify_otp_controls([LoginControl.from_dict(ctl(name="otp", maxLength=6, context=""))])
+    assert build_otp_fills(roomy, "042172") == [{"index": 0, "token": "one-time-code", "value": "042172"}]
 
 
 def test_one_time_code_autocomplete_stays_authoritative_even_with_a_promo_label_and_no_context():
@@ -116,7 +151,7 @@ def test_not_visible_or_not_rendered_or_unknown_never_qualifies():
 
 
 def test_several_qualifying_candidates_are_refused_never_the_first():
-    two = [ctl(name="code", label="Code"), ctl(index=1, name="code", label="Enter code", formIndex=1, blockId=1)]
+    two = [ctl(name="code", label="Code"), ctl(index=1, name="code", label="Enter code", formIndex=1)]
     controls = [LoginControl.from_dict(r) for r in two]
     out, why = classify_otp_controls_detailed(controls)
     assert out == [] and why == "several_code_fields"
@@ -172,10 +207,16 @@ def test_enter_code_still_reports_no_code_field_for_a_promo_input():
 
 
 def test_enter_code_names_the_ambiguity_and_writes_nothing():
-    two = [ctl(name="code"), ctl(index=1, name="code", formIndex=1, blockId=1)]
+    two = [ctl(name="code"), ctl(index=1, name="code", formIndex=1)]
     out, raw, seen = run_enter_code(two, code="042172", expected_origin=ORIGIN)
     assert out["error_type"] == "no_code_field" and "Several possible code fields" in out["error"]
     assert "expr" not in seen and "042172" not in raw
+
+
+def test_enter_code_refuses_a_code_longer_than_the_fields_maxlength_and_writes_nothing():
+    out, raw, seen = run_enter_code([ctl(name="otp", label="Verification code", maxLength=4, context="")],
+                                    code="042172", expected_origin=ORIGIN)
+    assert out["success"] is False and out["error_type"] == "no_code_field" and "expr" not in seen and "042172" not in raw
 
 
 def test_enter_code_reports_a_field_that_stopped_being_visible_before_the_write():
@@ -201,7 +242,7 @@ class El {
   constructor(tag, p = {}, kids = []) {
     this.tagName = tag; this.parentElement = null; this.children = []; this.text = p.text || "";
     this.attrs = {}; this.type = p.type || ""; this.name = p.name || ""; this.id = p.id || "";
-    this.autocomplete = ""; this.disabled = false; this.readOnly = false; this.labels = [];
+    this.autocomplete = p.autocomplete || ""; this.unreadable = !!p.unreadable; this.disabled = false; this.readOnly = false; this.labels = [];
     this.maxLength = p.maxLength || -1; this.value = ""; this.isConnected = true;
     this.style = Object.assign({ display: "block", visibility: "visible", opacity: "1" }, p.style || {});
     this.rect = p.rect || { left: 10, top: 10, width: 200, height: 30, right: 210 };
@@ -213,6 +254,7 @@ class El {
   get form() { for (let n = this.parentElement; n; n = n.parentElement) if (n.tagName === "FORM") return n; return null; }
   get textContent() { return this.text + this.children.map((c) => c.textContent).join(" "); }
   get innerText() {
+    if (this.unreadable) throw new Error("not readable");
     const walk = (n, top) => (!top && HIDDEN(n) ? "" : [n.text].concat(n.children.map((c) => walk(c, false))).join(" "));
     return walk(this, true);
   }
@@ -314,10 +356,35 @@ def test_probe_microsoft_shape_without_a_form_is_accepted_and_written():
     assert res["written"] == {"real": CODE}
 
 
-def test_probe_split_digit_boxes_in_one_container_are_one_widget():
-    boxes = [f"h('INPUT', {json.dumps({'type': 'tel', 'name': f'code-{i}', 'maxLength': 1, 'ref': f'd{i}'})})" for i in range(6)]
-    res = probe(page(div(p("Verify your email: enter the code we sent"), div(*boxes))))
+def _boxes(prefix: str = "d", n: int = 6, **extra) -> list[str]:
+    return [f"h('INPUT', {json.dumps({'type': 'tel', 'name': f'code-{i}', 'maxLength': 1, 'ref': f'{prefix}{i}', **extra})})"
+            for i in range(n)]
+
+
+def test_probe_split_boxes_via_one_time_code_still_fill_one_digit_each():
+    boxes = _boxes(autocomplete="one-time-code")
+    res = probe(page(div(p("Anything"), div(*boxes))))
     assert res["written"] == {f"d{i}": CODE[i] for i in range(6)}
+
+
+def test_probe_plain_code_split_boxes_are_refused_in_a_form_and_form_less():
+    for wrap in (form, div):
+        res = probe(page(wrap(p("Verify your email: enter the code we sent"), *_boxes())))
+        assert res["otp"] == [] and res["written"] == {}
+
+
+def test_probe_two_six_box_widgets_form_and_form_less_are_refused_nothing_written():
+    two_forms = page(form(p("Verify your email: enter the code we sent"), *_boxes("a")),
+                     form(p("Verify your email: enter the code we sent"), *_boxes("b")))
+    two_blocks = page(div(p("Verify your email: enter the code we sent"), div(*_boxes("a")), div(*_boxes("b"))))
+    for pg in (two_forms, two_blocks):
+        res = probe(pg)
+        assert res["otp"] == [] and res["why"] == "several_code_fields" and res["written"] == {}
+
+
+def test_probe_a_box_next_to_a_bare_field_is_refused_nothing_written():
+    res = probe(page(form(p("Verify your email address"), *_boxes(n=1), field())))
+    assert res["otp"] == [] and res["written"] == {}
 
 
 def test_probe_verify_heading_does_not_override_a_coupon_field_in_the_same_form():
@@ -413,4 +480,24 @@ def test_inspection_context_is_rendered_form_text_and_never_includes_the_title_o
     rows = run_node(page("h('H1', {text: 'Sign up now'})", form(p("Verify your email"), field())))["rows"]
     assert len(rows) == 1 and rows[0]["visible"] is True and rows[0]["rendered"] is True
     assert rows[0]["context"] == "Verify your email" and "Sign up" not in rows[0]["context"]
-    assert rows[0]["blockId"] == 0
+
+
+def test_probe_oversized_outer_block_with_a_coupon_purpose_fails_closed():
+    inner = div(p("Enter the code"), field(aria="", ref="coupon"))
+    res = probe(page(div(p("Have a coupon?"), "h('P', {text: filler(1800)})", inner)))
+    assert res["otp"] == [] and res["written"] == {}
+    rows = run_node(page(div(p("Have a coupon?"), "h('P', {text: filler(1800)})", inner)))["rows"]
+    assert rows[0]["context"] == ""
+
+
+def test_probe_an_unreadable_outer_block_fails_closed():
+    inner = div(p("Verify your email address"), field())
+    res = probe(page(div(inner, unreadable=True)))
+    assert res["otp"] == [] and res["written"] == {}
+    res = probe(page(div(div(inner, p("Have a coupon?")), unreadable=True)))
+    assert res["otp"] == [] and res["written"] == {}
+
+
+def test_probe_a_readable_chain_within_the_cap_still_qualifies():
+    res = probe(page(div(div(p("Verify your email address"), div(field())))))
+    assert res["written"] == {"real": CODE}
