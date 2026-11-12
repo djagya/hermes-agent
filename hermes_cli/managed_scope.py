@@ -169,6 +169,22 @@ def _omit_present_leaves(managed: dict, user: dict) -> dict:
     return out
 
 
+def _expanded_managed(managed: dict) -> dict:
+    """The managed config as seeds: ``${VAR}`` refs expanded against the process env and a bare root
+    ``model: x/y`` string promoted to ``model.default``. One helper for the overlay and for the save
+    path, so both see the same leaves."""
+    # Imported lazily to avoid an import cycle (config imports managed_scope).
+    from hermes_cli.config import _expand_env_vars, _normalize_root_model_keys
+    expanded = _normalize_root_model_keys(_expand_env_vars(managed))
+    # _normalize_root_model_keys only promotes the string when root provider/base_url
+    # keys exist to migrate; handle the bare case here (matches cli.py) so _deep_merge
+    # never replaces the caller's ``model`` dict with a string.
+    if isinstance(expanded.get("model"), str):
+        expanded = dict(expanded)
+        expanded["model"] = {"default": expanded["model"]}
+    return expanded
+
+
 def apply_managed_overlay(config: dict, *, user_raw: Optional[dict] = None) -> dict:
     """Seed administrator values for leaves the user did not set.
 
@@ -185,14 +201,8 @@ def apply_managed_overlay(config: dict, *, user_raw: Optional[dict] = None) -> d
         if not managed:
             return config
         # Imported lazily to avoid an import cycle (config imports managed_scope).
-        from hermes_cli.config import _deep_merge, _expand_env_vars, _normalize_root_model_keys
-        managed_expanded = _normalize_root_model_keys(_expand_env_vars(managed))
-        # _normalize_root_model_keys only promotes the string when root provider/base_url
-        # keys exist to migrate; handle the bare case here (matches cli.py) so _deep_merge
-        # never replaces the caller's ``model`` dict with a string.
-        if isinstance(managed_expanded.get("model"), str):
-            managed_expanded = dict(managed_expanded)
-            managed_expanded["model"] = {"default": managed_expanded["model"]}
+        from hermes_cli.config import _deep_merge
+        managed_expanded = _expanded_managed(managed)
         presence = user_raw if user_raw is not None else config
         if not isinstance(presence, dict):
             presence = {}
@@ -209,14 +219,15 @@ def apply_managed_overlay(config: dict, *, user_raw: Optional[dict] = None) -> d
 
 def drop_unwritten_seeds(config: dict, user_raw: dict, keep: set) -> dict:
     """dlz: *config* without the seed leaves a load put there: a managed leaf the user file does not set
-    (*user_raw*) whose value is still the seed. A load -> save round trip then leaves the seed a seed, so
-    a later managed change still applies; a changed value or a path in *keep* is the user's and stays."""
+    (*user_raw*) whose value is still the seed *as of save time*. A load -> save round trip then leaves the
+    seed a seed, so a later managed change still applies. A changed value or a path in *keep* is the
+    user's and stays; so does a stale seed value (the managed config changed between the load and the
+    save): it no longer equals the current seed and is kept as a user override."""
     try:
         managed = load_managed_config()
         if not managed:
             return config
-        from hermes_cli.config import _expand_env_vars, _normalize_root_model_keys
-        seeds = _omit_present_leaves(_normalize_root_model_keys(_expand_env_vars(managed)),
+        seeds = _omit_present_leaves(_expanded_managed(managed),
                                      _user_presence(user_raw if isinstance(user_raw, dict) else {}))
     except Exception:
         logger.warning("managed scope: failed to read the seeds to leave out of a save", exc_info=True)
