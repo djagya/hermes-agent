@@ -995,10 +995,11 @@ def payment_close(supervisor: Any) -> dict:
         lock.release()
     released = _released(supervisor)
     logger.info("payment_close: closed %d of %d payment tab(s); lock released %s", closed, len(targets), released)
-    follow = blank or next(iter(sorted(open_ids - set(targets))), None)
-    if followed_from and released and follow:  # attaching installs the dialog bridge: never on a locked slot
+    # dlz (Opus r1 P3-2): the supervisor follows only to the blank tab this call opened, never to some other tab
+    # of the user's; without one it stays detached and the next browser action attaches where it is told.
+    if followed_from and released and blank:  # attaching installs the dialog bridge: never on a locked slot
         try:
-            _wait(_follow(supervisor, follow), loop, timeout=10)
+            _wait(_follow(supervisor, blank), loop, timeout=10)
         except Exception as exc:  # health: allow BLE001 -- the next browser action re-attaches
             logger.info("payment_close: supervisor did not follow (%s)", type(exc).__name__)
     result = {"success": closed == len(targets), "closed_tabs": closed, "lock_released": released,

@@ -77,6 +77,9 @@ _INSPECT_TEMPLATE = r"""(() => {
   const unknown = judged.some(x => x.x !== true && x.x !== false);
   let entries = judged.filter(x=>x.x === true);
   let selected = new Set(entries.map(x=>x.index));
+  // dlz (re-pin, Codex r1 P1-2): every control the inspection judged exposed, with its inspection index: its role
+  // (the supervisor's classification at inspection, card or not) binds that element for the whole commit.
+  const inspected = entries.slice();
   // dlz (Codex B r1 #2): discovery binds the exposed set: a field hidden at inspection and shown now (a revealed
   // duplicate) or one whose exposure became unknown changes the document.
   const unexposed = () => !LIM || elements.every((e,n)=>selected.has(n) || exposure(e) === false);
@@ -132,6 +135,16 @@ _INSPECT_TEMPLATE = r"""(() => {
       .elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
     return at === el;
   };
+  // dlz (re-pin, Codex r1 P1-1): a re-pinned field, after its focus scrolled it into view: its centre is inside this
+  // document's viewport and what a click there would hit (the field or a descendant of it), never an overlay.
+  const exposedHere = el => {
+    const r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const w = globalThis.innerWidth, h = globalThis.innerHeight;
+    if (!(typeof w === 'number' && typeof h === 'number' && x >= 0 && y >= 0 && x < w && y < h)) return false;
+    const root = el.getRootNode ? el.getRootNode() : doc;
+    const at = (root && typeof root.elementFromPoint === 'function' ? root : doc).elementFromPoint(x, y);
+    return !!at && (at === el || (typeof el.contains === 'function' && el.contains(at)));
+  };
   let used = false, written = null, paused = null, candidate = null;
   // One step of the commit; a finished (or never started) commit answers changed, never a second run. `answer`
   // is the supervisor's reply to a re-pin request (pins or null), undefined otherwise.
@@ -170,7 +183,9 @@ _INSPECT_TEMPLATE = r"""(() => {
     entries = now.entries;
     selected = exposed;
     signature = JSON.stringify(describe());
-    plan.forEach((f, k) => { f.index = indexes[k];
+    // every field not written yet is re-pinned: before its setter it must be fully exposed (exposedHere) and, from the
+    // supervisor, its owner chain hit at its centre (a pause after its focus), whatever `strict` is.
+    plan.forEach((f, k) => { f.index = indexes[k]; if (!f.done) f.repinned = true;
       if (f.index !== -1) elements[f.index].style.setProperty('-webkit-text-security','disc','important'); });
     return true;
   };
@@ -189,8 +204,9 @@ _INSPECT_TEMPLATE = r"""(() => {
                      now.some(x => x.x !== true && x.x !== false));
     },
     // dlz (re-pin): only while a commit waits on a re-pin answer, in the same document, URL and same-origin
-    // chain: this document's exposed fields now (the inspection's own description and limits) and, per field
-    // token, the new index of the element pinned for it so far (-1: gone). The answer is single-use.
+    // chain: this document's exposed fields now (the inspection's own description and limits), per field token the
+    // new index of the element pinned for it so far (-1: gone), and per control the inspection judged exposed its
+    // [inspection index, new index] (-1: gone), for the role check. The answer is single-use.
     rebind: () => {
       candidate = null;
       if (!paused || !written || why() === 'navigated' || !chain()) return null;
@@ -200,7 +216,7 @@ _INSPECT_TEMPLATE = r"""(() => {
       candidate = {els: now.els, sig: JSON.stringify(now.els.map(describeOne)), exposed: now.entries.map(x=>x.index)};
       const kept = {};
       for (const f of written) kept[f.token] = f.index === -1 ? -1 : now.els.indexOf(elements[f.index]);
-      return {fields, kept};
+      return {fields, kept, inspected: inspected.map(x => [x.index, now.els.indexOf(x.e)])};
     },
     // After every document was written and the page had time to settle: does each written field still
     // hold its value? States and lengths only; a value never leaves this world. Answers once.
@@ -293,14 +309,15 @@ _INSPECT_TEMPLATE = r"""(() => {
                 el.focus();
                 if (late())  // focus handlers run page code; never write past the window
                   return expired();
-                if (paced === true) {
+                if (paced === true || f.repinned) {
                   const r = el.getBoundingClientRect();
                   yield {pending:true,filled_fields:attempted,x:r.left + r.width / 2,y:r.top + r.height / 2};
                 }
                 // dlz: focus handlers can hide, swap, relabel or navigate: the whole pinned set is re-checked
                 // right before this setter, not only before the loop.
                 reason = why() || (!live(el) ? 'detached' : !shown(el) ? 'hidden' :
-                                   strict === true && !hits(el) ? 'hit_test' : null);
+                                   strict === true && !hits(el) ? 'hit_test' :
+                                   f.repinned && !exposedHere(el) ? 'hit_test' : null);
               }
             }
             if (reason) {
@@ -310,10 +327,12 @@ _INSPECT_TEMPLATE = r"""(() => {
               const pins = yield {repin:true,filled_fields:attempted,check:last,
                                   written:plan.filter(x=>x.done).map(x=>x.token)};
               if (!adopt(pins, plan)) return changed();
-              if (f.index === -1) {
-                if (reason === 'deferred') return changed();  // still not shown with the number in: stop
-                later.push(queue.shift());
-              }
+              // dlz (Opus r1 P2-2): every field not shown yet waits for the card number, wherever it stands in the
+              // queue; one that already came back after the number and is still not shown stops the commit.
+              const waiting = queue.filter(x => x.index === -1);
+              if (waiting.some(x => x.requeued)) return changed();
+              for (const x of waiting) queue.splice(queue.indexOf(x), 1);
+              later.push(...waiting);
               continue;
             }
             if (late())  // the checks above run page-visible code too (layout, style): the window again, last
@@ -336,13 +355,13 @@ _INSPECT_TEMPLATE = r"""(() => {
             el.dispatchEvent(new Event('change',{bubbles:true}));
             el.dispatchEvent(new FocusEvent('blur'));
             el.blur();
-            if (f.token === 'cc-number') queue.push(...later.splice(0));
+            if (f.token === 'cc-number') queue.push(...later.splice(0).map(x => Object.assign(x, {requeued: true})));
           }
           if (!later.length) break;
           // dlz: deferred fields wait for a card number in another document: the supervisor resumes this commit
           // after that document, and each deferred field is then re-pinned before it is written.
           yield {deferred:true,filled_fields:attempted};
-          queue.push(...later.splice(0));
+          queue.push(...later.splice(0).map(x => Object.assign(x, {requeued: true})));
         }
         const held = plan.filter(f=>f.index !== -1 && live(elements[f.index]) && same(elements[f.index].value,f.value)).length;
         return held === plan.length && location.href === href ? {success:true,filled_fields:held} :

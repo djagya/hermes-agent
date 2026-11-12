@@ -1210,22 +1210,24 @@ class PaymentSupervisionMixin:
         # dlz (re-pin): reviewed destinations only; an unreviewed fill stops on any change, as before.
         repin = None if i.unreviewed_origins else \
             (lambda request, d=document, f=document_fills: self._repin(i, d, f, request, stop, state))
+        # dlz (Codex r1 P1-1): a re-pinned field pauses after its focus, whatever ``strict`` is, for the owner-chain
+        # hit test from the parents (the closure itself requires it fully exposed in its own document).
+        exposed = None if repin is None else (lambda point, d=document: self._paced_check(i, d, point))
         state["refused"] = None
         result = await self._commit_payment_document(
             document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop), strict=strict,
-            paced=paced, **({"repin": repin} if repin else {}), **({"resumed": resumed} if resumed is not None else {}))
+            paced=paced, **({"repin": repin, "exposed": exposed} if repin else {}),
+            **({"resumed": resumed} if resumed is not None else {}))
         return located(result, position, total, state["refused"])
 
     async def _repin(self, i: PaymentInspection, d: PaymentDocument, fills: list, request: dict, stop: float,
                      state: dict) -> dict | None:
         """dlz (re-pin): the answer to one re-pin request of ``d``'s paused commit: the new pin of each of its
-        fill tokens, or None (the closure then stops with its record). Inside the window only, after the frame's
-        loader, URL, origin and owner <iframe>s are re-proved; the rule is ``repin_pins``'."""
+        fill tokens, or None (the closure then stops with its record). Inside the window only; the rule is
+        ``repin_pins``'; the frame's loader, URL, origin and owner <iframe>s are re-proved after it accepted, right
+        before the closure resumes (Opus r1 P3-1: a cross-origin parent can hide or move the frame meanwhile)."""
         if time.monotonic() >= stop:
             state["refused"] = "too_late"
-            return None
-        if not await self._payment_scope_current(i, [d]):
-            state["refused"] = "frame_changed"
             return None
         try:
             answer = _value(await self._cdp("Runtime.callFunctionOn", {
@@ -1235,8 +1237,11 @@ class PaymentSupervisionMixin:
         except Exception:  # health: allow BLE001 -- an unreadable document is not re-pinned; the closure stops
             answer = None
         written = request.get("written") or []
-        pins, state["refused"] = repin_pins(d.controls, [str(f.get("token") or "") for f in fills], answer, written,
-                                            state["number"] or "cc-number" in written)
+        tokens = [str(f.get("token") or "") for f in fills]
+        pins, state["refused"] = repin_pins(d.controls, tokens, answer, written, state["number"] or "cc-number" in written,
+                                            planned={t: f.get("index") for t, f in zip(tokens, fills)})
+        if pins is not None and not await self._payment_scope_current(i, [d]):
+            pins, state["refused"] = None, "frame_changed"
         if pins is not None and time.monotonic() >= stop:
             pins, state["refused"] = None, "too_late"
         if pins is not None:
@@ -1360,13 +1365,15 @@ class PaymentSupervisionMixin:
         return bool(i.tree) and isinstance(url, str) and url != i.tree[0][2]
 
     async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None,
-                                       strict: bool = False, paced=None, repin=None, resumed: int | None = None) -> dict:
+                                       strict: bool = False, paced=None, repin=None, resumed: int | None = None,
+                                       exposed=None) -> dict:
         """One document's commit. ``paced`` (strict fills in a frame, and every document of an unreviewed fill): an
         async ``check(point)`` run after each focus, before that field's setter; anything but True (False or an error
         type from ``_PACED_STOPS``) stops the document with nothing more written. ``repin`` (reviewed fills): an
         async ``answer(request)`` for the closure's re-pin requests (``_repin``); without it every request is
         declined. ``resumed``: the count a suspended document wrote before its deferral; its commit is resumed, not
-        started. A deferral answers ``{deferred: True, filled_fields}``.
+        started. A deferral answers ``{deferred: True, filled_fields}``. ``exposed`` (with ``repin``): the same kind of
+        check as ``paced``, for the pause the closure makes after a re-pinned field's focus when ``paced`` is None.
         dlz (Codex B r2 #2): the commit call carries the values, and each resume() runs a setter, so from the first
         call on a lost, failed or malformed reply means a write may have landed: the result then says so
         (``write_uncertain``, ``partially_filled``) with the last acknowledged count of this document's writes,
@@ -1402,7 +1409,8 @@ class PaymentSupervisionMixin:
             )
             for _ in range((len(fills) + 1) * (MAX_REPINS + 2)):
                 kind = _pause_kind(result)
-                if kind is None or (kind == "pending" and paced is None):
+                check = paced or exposed
+                if kind is None or (kind == "pending" and check is None):
                     break
                 attempted = result.get("filled_fields")
                 if kind == "pending":
@@ -1420,7 +1428,7 @@ class PaymentSupervisionMixin:
                 if kind == "repin":
                     result = await answer(await repin(result) if repin is not None else None, repinned=True)
                     continue
-                verdict = await paced((result["x"], result["y"]))
+                verdict = await check((result["x"], result["y"]))
                 if verdict is not True:
                     # dlz: the focused field is never written; earlier fields of this document are reported.
                     return {"success": False,
