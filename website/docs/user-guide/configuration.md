@@ -256,7 +256,7 @@ Point-in-time copies of `config.yaml` itself (taken before `hermes setup` rewrit
 
 For git installs, Hermes auto-stashes dirty tracked files, plus any untracked file at a path the update adds, before checking out the update branch or pulling. Untracked files the update never writes stay in place. Interactive terminal updates ask whether to keep the changes before stashing anything; answering no deletes them instead of leaving a stash entry behind. Non-interactive updates (desktop/chat app, gateway, or `--yes`) use `updates.non_interactive_local_changes`: `stash` restores local source edits after a successful pull, while `discard` drops the update-created stash after a successful pull. Use `discard` only on managed installs where local source edits are never meant to persist.
 
-Before that stash step, Hermes also restores tracked `package-lock.json` diffs left by npm install/build churn. Commit or manually stash intentional lockfile edits before updating.
+Before that stash step, Hermes also restores tracked `package-lock.json` diffs that npm installs leave in the WhatsApp bridge and Photon sidecar. Commit or manually stash intentional lockfile edits before updating.
 
 ## Terminal Backend Configuration
 
@@ -3157,6 +3157,43 @@ approvals:
 
 Patterns are case-insensitive fnmatch globs and must be quoted in YAML (a bare leading `*` is a parse error). See [Security — User-Defined Deny Rules](./security.md#user-defined-deny-rules-approvalsdeny) for details.
 
+### Card-fill approver
+
+`approvals.payment_approver` names the one account that may approve a saved-card fill (`browser_vault` payment actions). It must be a Telegram user written as `telegram:<numeric id>`, and that id must also be listed explicitly in `TELEGRAM_ALLOWED_USERS` (a `*` wildcard does not count). Empty (the default) means no card fill can be approved: every fill returns unavailable and names this setting.
+
+```yaml
+approvals:
+  payment_approver: "telegram:123456789"
+```
+
+The approval card is sent only to that user's private chat, with "Approve fill once" and "Deny" buttons. Every other surface — typed `/approve`, `/approve all`, the CLI/TUI, the API server, other platforms and other group members — can only deny a card fill.
+
+### Card fills on unreviewed payment forms
+
+`vault.payment_destination_consent` (default `false`) lets a saved card be filled into a hosted payment form that is not one of the reviewed payment providers, after the owner approves that one fill. Only a literal `true` turns it on, and turning it on admits nothing by itself:
+
+```yaml
+vault:
+  payment_destination_consent: true
+```
+
+- It is used only when the reviewed providers cannot fill the checkout, and only in the managed browser, where browser-control blocks screen capture. Reviewed providers that are off (`vault.payment_providers`) stay refused.
+- Hermes inspects the form's structure without reading any values, then asks the agent for the cart and the exact set of origins that would receive card fields. The owner's approval card (see "Card-fill approver" above) marks each unreviewed origin, shows the cart as stated by the agent, and says whether the page shows that total: matched, NOT found or ambiguous. That check reads page text only; it does not verify the charge.
+- One approval covers one fill within its 120 s window. Nothing is remembered; the next checkout asks again. Switching the key off, changing `vault.payment_providers`, or a `config.yaml` that cannot be read stops a fill that is still waiting or in progress before its next card field is written; a fill stopped part-way reports which fields it wrote.
+
+### After the payment: confirmation handover
+
+In the managed browser, a card fill locks the browser slot until the payment tab is closed. browser-control closes the agent's other browser connections and refuses everything on them except listing tabs, closing a tab and the browser version. While the slot is locked, the agent sees each tab's site (origin) only, with no title, and `payment_done` waits for and reads the confirmation itself over Hermes' own connection. Hermes applies the same lock to every agent call it relays over its own supervised connection: `browser_cdp` with `frame_id`, dialog answers (a dialog's text is withheld) and login or address fills. These return `payment_surface_locked`. A call that was still running when the lock started has its result withheld. While locked, dialog automation stands down: no tab is watched, no dialog bridge is installed, and the configured dialog policy does not answer. Instead, Hermes accepts an alert (OK is its only answer), dismisses a prompt (no text is ever typed), and accepts a beforeunload only from the tab that `payment_done` is closing at that moment. A confirm waits: `payment_controls`, `payment_click` and `payment_done` report the oldest one on the payment tab as `dialog_pending` with its `id`, `type`, `origin`, `on_payment_tab_top` (whether the payment tab's own top page raised it, proven by its session and top frame id), `on_shop_page` (that, on the shop's own origin) and its text. Every run of three or more digits and every date-like group is masked first, so no later scrub can single out the CVC or expiry. The one exception is an amount that exactly equals the cart total the owner approved for this payment (`122.66` or `122,66`; any other amount, or any amount when none was approved, stays masked); then the text is redacted (other secrets, and this browser slot's own card number, CVC, expiry and holder name) and cut to 200 characters. Dialogs on other tabs are only counted (`other_dialogs_pending`) and never hold up `payment_done`. `payment_done` returns at once with `payment_dialog_pending` when a confirm blocks the payment tab, instead of waiting out its 120 s. The agent answers with `browser_vault` `action: payment_dialog` (`dialog_id` from `dialog_pending`, `accept: true` or `false`). Hermes answers only a confirm that is still pending and was raised by the payment tab's own top page, and accepts it only on the shop's own page (a confirm on a bank or payment-provider page at the top of the tab can only be dismissed, `payment_dialog_not_shop_page`); a confirm from a card or bank frame, another tab or an unknown source, and any other dialog type, is refused. Each dialog is answered once: it is used up before the answer is sent, even if sending fails, and the timeout watchdog never answers a dialog the agent already answered. The agent accepts only a confirm on the shop page that matches the Pay it was told to make (e.g. `Place order for <amount>?`); for anything else (upsells, subscriptions, unknown) it asks the owner. If nobody answers, the timeout watchdog dismisses it, so no dialog blocks the page for good. A tab's waiting dialogs are dropped when the tab closes. The text of a dialog that opened while the slot was locked is never shown afterwards either (`browser_exec` and snapshots list its id and type only). On the managed browser, `browser_cdp` (otherwise refused there) offers exactly two calls while the slot is locked: `Target.getTargets` lists this slot's tabs by site (origin, empty title), and `Target.closeTarget {targetId}` closes one of them. Closing the payment tab yourself ends the lock without a snapshot. While the slot is locked, the agent clicks only through `browser_vault`'s native `payment_controls` / `payment_click`. These list the card frames' buttons and also the payment tab's own page: the merchant checkout with its Pay button, or a bank's 3-D Secure page after a redirect. The payment tab's page is not listed while it is a card form (on a payment provider's origin, or one of the payment's card documents). Controls show labels only, never input values. Each listing issues new refs. A ref stops working when its document changes or when a newer listing replaces it, and it is used up by a press (successful or uncertain), so a second press needs a new listing. Right before the press, Hermes checks again that the document is the same one and that the control is still the element at the click point. The owner's chat go covers one press of Pay. After an uncertain click the agent never clicks again.
+
+After pressing Pay, the agent calls `browser_vault` with `action: payment_done`. Hermes then works over its own supervised connection:
+
+1. It waits up to 120 s for the payment tab to show a new page on the shop's origin (the checkout's origin; `expected_origin` names the shop only when the checkout itself ran on a payment provider's page, and is otherwise ignored, which the result says). On a shop that shows the confirmation without loading a new page, the checkout page itself counts once all of the payment's card frames are gone, but only if the merchant page never received a card field itself. Payment-provider pages and bank (3-D Secure) pages in between are waited through. Hermes reads nothing from a page while its top document is on a payment provider's origin, or while any frame on a payment provider's origin (or on an origin that received the card) is still in the page. The one exception is a known harmless provider frame, such as Stripe.js's hidden controller frame. Card-like inputs anywhere in the page, inside open shadow roots too, also keep it waiting. The page must also be fully loaded and stay the same for two checks in a row.
+2. It reads the page's title, URL, visible text (up to 20,000 characters) and its http(s) links (up to 200), never the values of inputs, text areas or selects, and never a screenshot. The text may include a masked card number or the holder name if the shop prints them.
+3. It opens a new tab at that URL, and only then closes the payment tab. Closing the payment tab is what ends the lock: browser-control releases it only after its own watcher sees the tab destroyed. A navigation or reload never releases it; a human "Clear payment guard" or a profile wipe does.
+4. It reports `lock_released: true` only after browser-control's status confirms that the slot is unlocked. Otherwise the result is `false` with a note.
+
+If no safe confirmation page appears in time, the result is `payment_confirmation_not_reached` with the site (origin) the tab is on. The lock stays, and nothing is clicked, closed or retried. Hermes never presses Pay again on its own.
+
 ### Custom smart-approval policy
 
 `approvals.smart_policy` lets you append your own rules to the smart-approval reviewer's instructions. When set, the text is added to the guardian LLM's system prompt (the trusted channel — never alongside the untrusted command text), so you can tighten or relax its judgment for your environment without editing code:
@@ -3245,14 +3282,14 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 
 ## Clarify
 
-Configure how long Hermes waits for a response to a clarifying question. One value covers every surface — the classic CLI modal, the TUI/Desktop card, and the messaging gateway. The canonical key is `agent.clarify_timeout` (default `3600` seconds; `0` or less = unlimited); a legacy top-level `clarify.timeout` is still honored if explicitly set:
+Configure how long Hermes waits for a response to a clarifying question. One value covers every surface — the classic CLI modal, the TUI/Desktop card, and the messaging gateway. The canonical key is `agent.clarify_timeout` (default `90` seconds; `0` or less = unlimited); a legacy top-level `clarify.timeout` is still honored if explicitly set:
 
 ```yaml
 agent:
-  clarify_timeout: 3600        # Seconds to wait for user clarification response (0 or less = unlimited)
+  clarify_timeout: 90          # Seconds to wait for user clarification response (0 or less = unlimited)
 ```
 
-When the timeout expires, the agent unblocks with `"outcome": "timed_out"` (answers the user already locked are kept) and continues on its own. A clarify prompt is never cut by the generic per-tool deadline (`timeouts.tools.sequential_call`); only `agent.clarify_timeout` bounds the wait.
+When the timeout expires, the agent unblocks with `"outcome": "timed_out"` (answers the user already locked are kept) and continues on its own. On a messaging platform, sending any other message instead of an answer cancels the question at once, and the agent carries on with that message. A clarify prompt is never cut by the generic per-tool deadline (`timeouts.tools.sequential_call`); only `agent.clarify_timeout` bounds the wait.
 
 ## Context Files (SOUL.md, AGENTS.md)
 

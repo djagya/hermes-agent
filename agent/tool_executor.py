@@ -36,6 +36,7 @@ from agent.message_sanitization import coalesce_tool_call_id
 from agent.onboarding import observe_tool_result as observe_onboarding_result
 from agent import plugin_live_notes
 from agent.lsp import deferred as lsp_deferred
+from agent.prompt_cache_scope import conversation_id
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
     InlineToolContext,
@@ -701,8 +702,8 @@ def _register_supplied_otp_for_redaction(function_name: str, function_args: dict
         # Only a value the handler would accept: a malformed or 1-3 character one is refused
         # before any fill, and registering it would scrub that text from every later output.
         code, _error = _validate_supplied_otp(function_args.get(name))
-        if code:
-            register_vault_redaction_value(code)
+        if code:  # the model typed it: non-digit ones scrubbed exactly, pure-digit never registered (redact_vault)
+            register_vault_redaction_value(code, known_to_model=True)
 
 
 def register_supplied_otps(tool_calls) -> None:
@@ -1772,6 +1773,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 effective_task_id,
                 tool_call_id=tool_call_id,
                 session_id=agent.session_id or "",
+                conversation_id=conversation_id(agent),
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,

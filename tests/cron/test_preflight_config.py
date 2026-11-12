@@ -292,7 +292,8 @@ class TestHealthyJobUnaffected:
     def test_mcp_block_after_passing_preflight_alerts_once_per_interval(self, tmp_path):
         """Review F3: the config check passes, then the empty-MCP-toolset gate blocks. The
         passing check must not clear the marker, or every tick re-alerts."""
-        job = _job()
+        # dlz: a real target; a "local" job's notice is never queued for a send since v0.23.0.
+        job = _job(deliver="telegram:123")
         deliveries = []
         with cron_jobs.use_cron_store(tmp_path):
             cron_jobs.save_jobs([job])
@@ -337,6 +338,8 @@ def _tick_one(job_id, tmp_path, deliveries, *, resolve=None, mcp_reason=None):
         for p in patches:
             stack.enter_context(p)
         sched.run_one_job(fresh)
+        # dlz: queued results/notices leave through the gateway's drain (cron/delivery_queue.py).
+        sched.drain_delivery_queue(adapters={}, loop=None)
         return mock_agent_cls.called
 
 

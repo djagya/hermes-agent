@@ -4,6 +4,7 @@ Short tokens (< 18 chars) are fully masked; longer ones keep the first 6 and
 last 4 characters for debuggability.
 """
 
+import json
 import logging
 import os
 import re
@@ -16,6 +17,11 @@ from urllib.parse import unquote_plus
 # drift: a blocked file_tools read that falls back to ``cat`` is still caught.
 from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
 from agent.redact_connstr import _KV_CONNSTR_GATE_RE, _redact_kv_connection_strings
+from agent.redact_headers import (
+    _COOKIE_HEADER_JSON_RE, _COOKIE_HEADER_JSON_UNTERMINATED_RE, _SECRET_HEADER_JSON_RE,
+    _SECRET_HEADER_JSON_UNTERMINATED_RE, json_header_value_is_credential, redact_cookie_assignments,
+    redact_header_credentials,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,63 +31,14 @@ logger = logging.getLogger(__name__)
 REDACT_WALK_MAX_DEPTH = 320
 REDACT_WALK_DEPTH_MARKER = "[redacted: nesting limit]"
 
-# ---------------------------------------------------------------------------
-# Vault-value redaction registry (profile-scoped, bounded)
-# ---------------------------------------------------------------------------
-# Exact secret values that transited a server-side vault fill (browser_vault). Generic
-# credential-shaped regexes cannot catch an arbitrary user password, so the fill path registers
-# the exact bytes and every browser_* tool result (including browser_cdp Runtime.evaluate
-# passthrough) is scrubbed against them before it can reach the model. Memory only: never
-# persisted or logged. Keyed by profile home so a multiplex gateway never scrubs profile B's
-# output with profile A's passwords (which would also confirm to B that the bytes exist), and
-# bounded per profile: a fill-heavy session evicts its oldest entries rather than growing forever.
-_VAULT_REDACTION_MAX_PER_PROFILE = 64
-_VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
-_VAULT_REDACTION_LOCK = threading.Lock()
+# Vault-value redaction registry (profile-scoped, bounded; oracle-free for pure-digit values): agent/redact_vault.py
+from agent.redact_vault import (  # re-exported: callers and tests patch agent.redact.*
+    _VAULT_REDACTION_LOCK, _VAULT_REDACTION_VALUES, _vault_scope, bump_card_window, card_window_generations,
+    card_window_keys, clear_vault_redaction_values, redact_json_text, redact_number, redact_registered_vault_values,
+    register_card_window,
+    register_vault_redaction_value, release_card_window,
+)
 
-
-def _vault_scope() -> str:
-    from hermes_constants import get_hermes_home
-    return str(get_hermes_home())
-
-
-def register_vault_redaction_value(value) -> None:
-    """Register an exact vault secret value for model-facing redaction.
-
-    Called by the vault fill path BEFORE the injection happens, so no later browser tool result
-    can echo the value back into model context. Also registers the form a text input normalizes
-    it to (CR/LF stripped), since that is what the page holds.
-    """
-    if not isinstance(value, str) or not value:
-        return
-    normalized = value.replace("\r", "").replace("\n", "")
-    with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
-        for v in (value, normalized):
-            if v:
-                bucket.pop(v, None)  # re-registering refreshes recency
-                bucket[v] = None
-        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
-            del bucket[next(iter(bucket))]
-
-
-def clear_vault_redaction_values() -> None:
-    """Drop the current profile's registered values (profile teardown / explicit lock)."""
-    with _VAULT_REDACTION_LOCK:
-        _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
-
-
-def redact_registered_vault_values(text: str) -> str:
-    """Exact-substring scrub of every vault secret value registered for the current profile."""
-    if not isinstance(text, str) or not text:
-        return text
-    with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
-        values = sorted(bucket, key=len, reverse=True) if bucket else ()  # longest first: a substring never shadows its superstring
-    for value in values:
-        if value in text:
-            text = text.replace(value, "«redacted-vault-secret»")
-    return text
 
 # Sensitive query-string param names (case-insensitive): opaque tokens / OAuth
 # codes / pre-signed signatures with no vendor prefix.
@@ -627,18 +584,30 @@ _PYTHON_EXCEPTION_LINE_RE = re.compile(
 # (unterminated quote → shell EOF / SyntaxError).
 _AUTH_HEADER_RE = re.compile(r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s+)?([^\s\"']+)", re.IGNORECASE)
 
-# API-key style headers (single opaque value, no scheme word): non-vendor-prefix
-# values would otherwise leak when a curl command is echoed into tool output.
-SECRET_HEADER_NAME_LIST = ("x-api-key", "x-goog-api-key", "api-key", "apikey", "x-api-token", "x-auth-token", "x-access-token")
-_SECRET_HEADER_NAMES = rf"(?:{'|'.join(SECRET_HEADER_NAME_LIST)})"
-_SECRET_HEADER_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)", re.IGNORECASE)
 
-# Telegram bot tokens: [bot]<digits>:<token>, token >= 30 chars. The lookbehind
-# anchors the id at the start of its digit run: without it, a long run of digits
-# with no ":<token>" after it (a Unity/YAML ``_typelessdata`` blob in a 2 MB PR
-# diff, hex/decimal dumps) retried the greedy ``\d{8,}`` from every digit —
-# quadratic, one core at 100% for hours while holding the GIL.
-_TELEGRAM_RE = re.compile(r"(?<!\d)(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})")
+# Telegram bot tokens: [bot]<digits>:<token>, token >= 30 chars. Start at an
+# identifier boundary, never inside a digit run (quadratic retries on dumps).
+# Consume only bounded escape spellings so JSON/repr/URL separators survive
+# verbatim; their last letter/digit is not the token's logical left neighbor.
+# An ANSI CSI control (colored output), raw or JSON/repr-escaped, is a separator too.
+_TELEGRAM_RE = re.compile(
+    r"(?P<boundary>\\[nrtbfv]|\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}|"
+    r"\\U[0-9a-fA-F]{8}|%[0-9a-fA-F]{2}|(?P<csi>(?:\x1b|\\x1b|\\u001[bB]|\\033)\[[0-?]*[ -/]*[@-~])|(?<![A-Za-z_\d]))"
+    r"(?P<bot>bot)?(?P<id>\d{8,}):(?P<body>[-A-Za-z0-9_]{30,})"
+)
+
+
+def _redact_telegram_token(match: re.Match) -> str:
+    boundary = match.group("boundary")
+    # Encoded identifier characters are still identifiers, not separators.
+    if len(boundary) > 2 and not match.group("csi"):
+        value = int(boundary[1:] if boundary[0] == "%" else boundary[2:], 16)
+        if value > 0x10FFFF:
+            return match.group(0)
+        char = chr(value)
+        if char in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_" or char.isdecimal():
+            return match.group(0)
+    return f"{boundary}{match.group('bot') or ''}{match.group('id')}:***"
 
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
 # A base64-encoded PEM private key: kubeconfig's ``client-key-data`` and the ``*_b64``
@@ -1270,6 +1239,32 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+def _redact_json_string_value(m: re.Match, *, mask=_mask_token) -> str:
+    """Mask a captured JSON string value without breaking its escapes."""
+    encoded_value = m.group(2)
+    try:
+        value = json.loads(f'"{encoded_value}"')
+    except json.JSONDecodeError:
+        # The regex also accepts malformed escape pairs. Keep redaction
+        # fail-safe while emitting a syntactically valid replacement value.
+        value = encoded_value
+    if not json_header_value_is_credential(m.group(1), value):
+        return m.group(0)
+    masked = json.dumps(mask(value), ensure_ascii=False)[1:-1]
+    return m.group(1) + masked + m.group(3)
+
+
+def _redact_unterminated_json_string_value(m: re.Match, *, mask=_mask_token) -> str:
+    """Fail closed on a truncated JSON header value through end-of-line."""
+    encoded_value = m.group(2)
+    try:
+        value = json.loads(f'"{encoded_value}"')
+    except json.JSONDecodeError:
+        value = encoded_value
+    masked = json.dumps(mask(value), ensure_ascii=False)[1:-1]
+    return m.group(1) + masked
+
+
 def _assignment_sub(render, *, check_keyword: bool):
     """re.sub callback: keep the match unless the key/value pair (groups[0], groups[-1]) needs redaction."""
     def _sub(m):
@@ -1323,6 +1318,7 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
     truncated key and could write it back as a dead credential (#35519)."""
     mask = _mask_token_nonreusable if mask_nonreusable else _mask_token
     if "=" in text:
+        text = redact_cookie_assignments(text, mask)
         _redact_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{mask(g[2])}{g[1]}", check_keyword=True)
         text = _ENV_ASSIGN_RE.sub(_redact_env, text)
         if "://" not in text:  # lowercase names would match URL params
@@ -1345,8 +1341,13 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
             text = _CFG_ANCHORED_RE.sub(_redact_env, text)
 
     if ":" in text and '"' in text:
+        for pattern in (_SECRET_HEADER_JSON_RE, _COOKIE_HEADER_JSON_RE):
+            text = pattern.sub(lambda m: _redact_json_string_value(m, mask=mask), text)
+        for pattern in (_SECRET_HEADER_JSON_UNTERMINATED_RE, _COOKIE_HEADER_JSON_UNTERMINATED_RE):
+            text = pattern.sub(lambda m: _redact_unterminated_json_string_value(m, mask=mask), text)
+        redact_json = _assignment_sub(lambda g: f'{g[0]}: "{mask(g[1])}"', check_keyword=False)
         text = _JSON_FIELD_RE.sub(
-            _assignment_sub(lambda g: f'{g[0]}: "{mask(g[1])}"', check_keyword=False), text)
+            lambda m: m.group(0) if m.group(1)[1:-1].lower() == "apikey" else redact_json(m), text)
         if '\\"' in text:
             text = _JSON_FIELD_ESCAPED_RE.sub(
                 _assignment_sub(lambda g: f'{g[0]}: {g[1]}"{mask(g[2])}{g[1]}"', check_keyword=False), text)
@@ -1444,8 +1445,12 @@ def _redact_phone(m):
 
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
                           file_read: bool = False, secret_file: bool = False,
-                          redact_url_credentials: bool = False) -> str:
+                          redact_url_credentials: bool = False, vault: str = "model") -> str:
     """Apply all redaction patterns to a block of text.
+
+    ``vault`` names who reads the result, for the vault-value registry (agent/redact_vault.py): ``model``
+    (default: a tool result the model did not write), ``browser`` (a browser tool result), ``log`` (a log
+    file: digit values length-masked only in their mask window, never replaced exactly) or ``authored`` (persisted model-authored text: non-digit values only).
 
     Safe on any string. Enabled by default (``security.redact_secrets: false``
     disables); ``force=True`` is for safety boundaries that must never return
@@ -1488,7 +1493,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if not text:
         return text
     # Vault secrets are a hard model-egress boundary: scrubbed regardless of the redact_secrets preference.
-    text = redact_registered_vault_values(text)
+    text = redact_registered_vault_values(text, audience=vault)
     if not (force or _redact_enabled()):
         return text
     # ``secret_file`` is authoritative: a caller that classified the source as secret-bearing must not
@@ -1541,8 +1546,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)), text)
 
     if ":" in text:
-        text = _SECRET_HEADER_RE.sub(lambda m: m.group(1) + _mask_token(m.group(2)), text)
-        text = _TELEGRAM_RE.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}:***", text)
+        text = redact_header_credentials(text)
+        text = _TELEGRAM_RE.sub(_redact_telegram_token, text)
 
     # Database connection string passwords. With code_file=True, a password group that is a pure ``{...}``
     # brace expression is an f-string template reference (e.g. f"postgresql://{user}:{pass}@{host}"), not a
@@ -1951,4 +1956,8 @@ class RedactingFormatter(logging.Formatter):
     """Log formatter that redacts secrets from all log messages."""
 
     def format(self, record: logging.LogRecord) -> str:
-        return redact_sensitive_text(super().format(record))
+        line = super().format(record)  # log audience (a terminal can read logs): no exact digit scrub; the timestamp is kept
+        head = getattr(record, "asctime", "") if self.usesTime() else ""
+        if head and line.startswith(head):
+            return head + redact_sensitive_text(line[len(head):], vault="log")
+        return redact_sensitive_text(line, vault="log")

@@ -29,16 +29,18 @@ autofill (kernel-login-autofill.ts / fill_from_vault.ts).
 
 from __future__ import annotations
 
+import contextvars
 import json
 import secrets
 import logging
 from typing import Any, Dict, Optional
-from agent.vault_payment_policy import PaymentPolicyError, effective_frame_origins
+from agent.vault_payment_policy import PaymentPolicyError, destination_consent_enabled, effective_frame_origins
 
 from tools.browser_vault_context import (fill_context, plugin_errors_as_refusal, saved_origins, snapshot_refusal,
                                          write_backend_code)
 
 logger = logging.getLogger(__name__)
+_OTP_REDACTION_TTL_S = 300.0  # dlz: a one-time code is worthless after minutes; its length masking ends with it
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +83,20 @@ def _is_managed() -> bool:
         return True
 
 
+_PREVIEW_MANAGED_ERROR = ("The in-app browser is not used while Hermes drives the managed browser: open the page "
+                          "with browser_exec and call browser_vault with target=browser. Nothing was read or written.")
+# dlz: the in-app browser runs only the upstream preview operations; card, letter and payment-lock
+# actions (payment_controls / payment_click / payment_done / payment_dialog) stay on the managed browser's fences.
+_PREVIEW_ACTIONS = ("fill", "save_login", "enter_code")
+
+
+def _preview_refusal() -> Optional[str]:
+    """dlz: managed mode refuses every in-app (preview) vault operation before any page access."""
+    if not _is_managed():
+        return None
+    return json.dumps({"success": False, "error_type": "preview_unavailable", "error": _PREVIEW_MANAGED_ERROR})
+
+
 def _managed_supervisor(task_id: str, *, admit: bool = False):
     """Managed mode: the supervisor on the browser browser_exec last drove for this task.
 
@@ -88,6 +104,10 @@ def _managed_supervisor(task_id: str, *, admit: bool = False):
     path acquires without the exec's identity. A dropped socket is re-attached to the same lease after
     control confirms the agent still holds it; ``admit`` asks control even when the socket looks live
     (start of every vault page operation, and again right before a secret is written)."""
+    from tools.browser_vault_preview import active_page
+    if active_page() is not None:
+        # dlz: a vault operation pinned to the Desktop in-app page must never land on the leased slot.
+        raise _PageUnavailable("preview_unavailable", _PREVIEW_MANAGED_ERROR)
     try:
         from tools.browser_control_route import _lease_alive, control_url
     except ImportError:
@@ -124,27 +144,45 @@ def _managed_supervisor(task_id: str, *, admit: bool = False):
                                f"Could not open the vault's CDP connection to the managed browser: {cause}") from None
 
 
-# A secret-bearing script runs inside this wrapper on a page backend, so a page exception is answered
-# in-page and its message (which may quote the script) never reaches the backend's error path or logs.
-_PAGE_FILL_FAILED = {"hermes_vault_eval_failed": True}
+# A secret-bearing script runs inside this wrapper on EVERY transport (CDP supervisor and plugin page
+# backends), so a page exception is answered in-page and its message (which may quote the script or, after
+# a write, carry the value a page handler read back) never reaches a backend's error path or logs.
+# Every answer is a string primitive: an object (the old sentinel, or anything a hooked JSON.stringify
+# returns) would be assimilated through a page-defined ``then`` outside any catch. An async script is
+# observed with the Promise intrinsics captured BEFORE it runs: its value or rejection lands on the wrapper's
+# own promise, never passing through a page-reachable ``then``/``await``. Strict mode (inherited by the
+# wrapped script): a page function the script calls gets ``.caller === null``, never the secret-bearing source.
+_PAGE_FILL_FAILED = "hermes_vault_eval_failed"
+
+
+def _secret_wrapped(expression: str) -> str:
+    failed = json.dumps(_PAGE_FILL_FAILED)
+    return ("(() => { \"use strict\"; const F = " + failed + "; const P0 = Promise, then0 = Promise.prototype.then, "
+            "apply = Reflect.apply; let r; try { r = (" + expression + "); } catch (_) { return F; } "
+            "if (typeof r === \"string\") return r; let settle = null; "
+            "try { const done = new P0((ok) => { settle = ok; }); "
+            "apply(then0, r, [(v) => { settle(typeof v === \"string\" ? v : F); }, () => { settle(F); }]); "
+            "return done; } catch (_) { return F; } })()")
 
 
 def _page_backend(task_id: str):
-    """The plugin browser holding this task's live page (e.g. Camofox), or None for the CDP session.
+    """The page this operation runs on when it is not the task's CDP session: the Desktop in-app browser
+    page pinned for a ``target='preview'`` operation, else the plugin browser holding this task's live page
+    (e.g. Camofox), else None.
 
-    dlz: never in managed mode: the leased slot is the only browser, and a plugin page backend is
-    outside control's fence (capture guard, lease admission)."""
+    dlz: never in managed mode: the leased slot is the only browser, and a plugin or in-app page is
+    outside control's fence (capture guard, lease admission). A pinned preview page is refused there
+    (:func:`_preview_refusal`, :func:`_managed_supervisor`), never silently swapped for the slot."""
     if _is_managed():
         return None
     from agent.browser_page_registry import backend_for_task
-    return backend_for_task(task_id)
+    from tools.browser_vault_preview import active_page
+    return active_page() or backend_for_task(task_id)
 
 
 def _page_eval(backend: Any, task_id: str, expression: str, *, secret: bool) -> dict[str, Any]:
-    """Evaluate on a plugin page backend. On the secret path every failure gets fixed text."""
-    if secret:
-        expression = ("(() => { try { return (" + expression + "); } catch (_) { return "
-                      + json.dumps(_PAGE_FILL_FAILED) + "; } })()")
+    """Evaluate on a plugin page backend. On the secret path every failure gets fixed text (the caller,
+    _eval_js_secret, has already wrapped the expression with _secret_wrapped)."""
     try:
         result = backend.evaluate(task_id, expression, secret=secret)
     except Exception as exc:  # health: allow BLE001 -- plugin failure becomes a typed refusal
@@ -164,7 +202,8 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     dlz: managed mode reads only the supervisor on the leased slot browser_exec last drove
     (:func:`_managed_supervisor`; raises :class:`_PageUnavailable`)."""
     if _is_managed():
-        sup = _managed_supervisor(task_id).evaluate_runtime(expression)
+        managed = _managed_supervisor(task_id)
+        sup = _native(managed, lambda: managed.evaluate_runtime(expression))
         if sup.get("ok"):
             return {"success": True, "result": sup.get("result")}
         return {"success": False, "error": str(sup.get("error") or "eval failed")}
@@ -175,7 +214,7 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     if supervisor is None:
         return {"success": False, "error": "no supervised browser session for this task; open the page with "
                                            "browser_exec first"}
-    sup = supervisor.evaluate_runtime(expression)
+    sup = _native(supervisor, lambda: supervisor.evaluate_runtime(expression))
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {"success": False, "error": str(sup.get("error") or "evaluate failed")}
@@ -218,6 +257,7 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     nothing is written. A plugin browser holding the task's page (no CDP endpoint) carries the
     expression over its own transport instead; see ``agent.browser_page_backend``.
     """
+    expression = _secret_wrapped(expression)
     page = _page_backend(task_id)  # always None in managed mode
     supervisor = None
     if page is None:
@@ -244,7 +284,8 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     # human-length prompt (enter_code waits for the user's code); a takeover during that wait must
     # refuse here, before the credential lands in a page the human is now typing into. The outer
     # epoch check only discards the result, and a fill is a side effect, not a result.
-    if _bot_desktop_browser_session(task_id):
+    from tools.browser_vault_preview import active_page
+    if active_page() is None and _bot_desktop_browser_session(task_id):
         from tools.bot_desktop import lease as _bd_lease
         try:
             _bd_lease.assert_agent_may_act()
@@ -253,7 +294,9 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
 
     if page is not None:
         return _page_eval(page, task_id, expression, secret=True)
-    sup = supervisor.evaluate_runtime(expression)
+    sup = _native(supervisor, lambda: supervisor.evaluate_runtime(expression))
+    if sup.get("ok") and _parse_json_result(sup.get("result")) == _PAGE_FILL_FAILED:
+        return {"success": False, "error_type": "eval_failed", "error": "The browser could not run the vault script"}
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {
@@ -319,12 +362,12 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
         supervisor = None
     if supervisor is None:
         return None
-    focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
-    if not focused.get("ok"):
+    focused = _native(supervisor, lambda: supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind)))
+    if not focused.get("ok") and not _fence_refused():
         # The probe reads only the top document, so a field in a shadow root or an iframe is invisible to it.
         # The supervisor's previous page is usually the exec's blank first tab: a tab on the exact origin is
         # still the better target, and the classifier decides whether it holds the form.
-        focused = supervisor.focus_page(origin)
+        focused = _native(supervisor, lambda: supervisor.focus_page(origin))
     return (origin or focused.get("url")) if focused.get("ok") else None
 
 
@@ -411,7 +454,11 @@ def browser_vault_list() -> str:
                 entry.update(available=True, payment_scope=meta.payment_scope,
                              confirmation_required=True, supported_layout="single_or_split_one_provider",
                              max_card_documents=_MAX_CARD_DOCUMENTS,
-                             hosted_origins=_hosted_origins(meta))
+                             hosted_origins=_hosted_origins(meta),
+                             # dlz (Track B): hosted_origins stays the reviewed set; an unreviewed hosted form can
+                             # only be filled per fill, after the owner's own approval of its exact origins.
+                             destination_consent="per_fill_owner_approval" if destination_consent_enabled()
+                             else "off")
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
@@ -676,7 +723,7 @@ def browser_vault_enter_code(
                                      "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
 
     def write(code_value: str, source: str) -> str:
-        register_vault_redaction_value(code_value)
+        register_vault_redaction_value(code_value, known_to_model=source == "supplied", ttl_s=_OTP_REDACTION_TTL_S)
         fills = build_otp_fills(otp_controls, code_value)
         result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
         del code_value
@@ -687,7 +734,9 @@ def browser_vault_enter_code(
             parsed = _parse_json_result(parsed)
         if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
             return json.dumps({"success": False, "error_type": "origin_changed", "error": "The page navigated before the code could be entered. Nothing was written."})
-        filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+        filled = _filled_count(parsed, len(fills))
+        if filled is None:
+            return json.dumps(_FILL_UNVERIFIED)
         return json.dumps({"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
                            "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
@@ -713,13 +762,14 @@ def browser_vault_enter_code(
     return write(typed, "user")
 
 
-def _inspect_fill_controls(task_id: str, nonce: str, kind: str) -> tuple[list, list, Optional[str]]:
-    """``(raw_controls, classified, refusal)`` for this inspection's stamps; nothing secret is involved yet."""
+def _inspect_fill_controls(task_id: str, nonce: str, kind: str, bind: str = "") -> tuple[list, list, Optional[str]]:
+    """``(raw_controls, classified, refusal)`` for this inspection's stamps (and, with ``bind``, its identity
+    marks for the signup writer); nothing secret is involved yet."""
     from agent.vault_login_classifier import (
         ClassifiedLoginControl, LoginControl, build_inspection_js, classify_checkout_control, classify_login_control,
     )
 
-    inspect = _eval_js(task_id, build_inspection_js(nonce))
+    inspect = _eval_js(task_id, build_inspection_js(nonce, bind))
     if not inspect.get("success"):
         return [], [], json.dumps(
             {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
@@ -755,27 +805,48 @@ def _no_match_hint(kind: str, raw_controls: list, classified: list) -> str:
     return "Read the form: the right page or step may not be open yet. Do not retry the same fill unchanged."
 
 
-def _parse_fill_result(fill_result: dict, page_origin: str, secret: Any) -> tuple[Any, Optional[str]]:
-    """``(parsed, refusal)``: the native write's JSON, or the origin_changed refusal (secret-scrubbed)."""
-    from agent.vault_store import scrub_secret_from_text
+def _parse_fill_result(fill_result: dict, page_origin: str, refusal_tag: str = "") -> tuple[Any, Optional[str]]:
+    """``(parsed, refusal)``: the native write's JSON, or the origin_changed refusal.
 
+    The answer is page-produced: no page string is echoed (a forged ``found`` could carry an encoded value),
+    and with ``refusal_tag`` the no-write claim is made only when the answer carries this fill's tag, which
+    the script returns solely from its pre-write origin check."""
     parsed = _parse_json_result(fill_result.get("result"))
     if isinstance(parsed, str):
         parsed = _parse_json_result(parsed)
     if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
+        if refusal_tag and parsed.get("tag") != refusal_tag:
+            return parsed, json.dumps(_FILL_UNVERIFIED)
         return parsed, json.dumps(
             {
                 "success": False,
                 "error_type": "origin_changed",
                 "error": (
                     "Refused: the page navigated away from the bound origin "
-                    f"({page_origin}) before the fill could run "
-                    f"(now on {scrub_secret_from_text(str(parsed.get('found') or 'unknown'), secret)}). "
-                    "Nothing was written."
+                    f"({page_origin}) before the fill could run. Nothing was written."
                 ),
             }
         )
     return parsed, None
+
+
+_FILL_UNVERIFIED = {
+    "success": False, "error_type": "fill_result_unverified",
+    "error": "The page answered the fill with a result Hermes could not verify; the value may have been written. "
+             "Nothing was submitted. Do not submit or retry; check the page and tell the user.",
+}
+
+
+def _filled_count(parsed: Any, most: int) -> Optional[int]:
+    """The write script's ``filled`` count, or None when the page-produced answer is not a plain integer in
+    ``0..most``: a string or float (a hooked JSON.stringify can return ``{"filled": "<char codes>"}``) is never
+    converted or echoed. A dict without ``filled`` counts as 0 (nothing claimed)."""
+    if not isinstance(parsed, dict):
+        return 0
+    filled = parsed.get("filled", 0)
+    if type(filled) is not int or not 0 <= filled <= most:  # bool is not a count either
+        return None
+    return filled
 
 
 def _register_redactions(values: Any) -> Optional[str]:
@@ -793,7 +864,8 @@ def _register_redactions(values: Any) -> Optional[str]:
 
 @plugin_errors_as_refusal
 def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_origin: str = "",
-                       purpose: str = "login") -> str:
+                       purpose: str = "login", cart: Any = None, approve_origins: Any = None, *,
+                       with_identifier: bool = False) -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -802,12 +874,15 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
     the supervisor CDP WebSocket; the result reports only counts/metadata.
     """
     from tools import browser_vault_signup as signup
+    from tools.browser_vault_preview import active_page
     from agent.vault_backends import UnlockRequired, backend_for_handle
 
     effective_task_id = task_id or "default"
     if purpose not in ("login", "signup"):
         return json.dumps({"success": False, "error_type": "invalid_purpose",
                            "error": "Use purpose=login (default) or signup. Nothing was written."})
+    if active_page() is not None and (refusal := _preview_refusal()) is not None:
+        return refusal  # dlz: the Desktop key button (vault.preview.fill) reaches here without _handle_vault
     backend = backend_for_handle(handle)
     if backend is not None and backend.needs_unlock and not backend.is_unlocked():
         unlocked = json.loads(browser_vault_unlock(backend.name))
@@ -833,14 +908,26 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
     refusal = signup.kind_refusal(purpose, meta.kind)
     if refusal:
         return refusal
+    if meta.kind == "payment" and active_page() is not None:
+        # dlz: card fills run only under the managed browser's consent and capture fences.
+        return json.dumps({"success": False, "error_type": "payment_destination_requires_managed_browser",
+                           "error": "Cards are filled only in the managed browser, never in the in-app browser. "
+                                    "Nothing was written."})
     if meta.kind == "payment":
         # dlz: native card fill (tools/browser_vault_payment.py): the supervisor checks the merchant against the
         # card's bound and hosted origins before consent, re-checks before the write, and resolves the card
         # inside the backend's fill_context only after consent.
         from tools.browser_vault_payment import fill_payment
 
-        return fill_payment(backend, meta, effective_task_id, merchant_origin)
+        return fill_payment(backend, meta, effective_task_id, merchant_origin, cart=cart,
+                            approve_origins=approve_origins)
+    # dlz (payment lockdown): a login/address fill reads and writes the page.
+    return _outside_payment_lock(effective_task_id, lambda: _fill_non_card(backend, handle, meta, effective_task_id,
+                                                                           purpose, with_identifier))
 
+
+def _fill_non_card(backend: Any, handle: str, meta: Any, effective_task_id: str, purpose: str,
+                   with_identifier: bool = False) -> str:
     # Origin binding pre-check (the authoritative re-check runs inside the fill script), before the
     # backend's fill_context is entered and before any value is resolved.
     page_origin = _bound_page_origin(effective_task_id, meta, meta.kind)
@@ -851,13 +938,27 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
         refusal = snapshot_refusal(backend, handle, meta, page_origin)
         if refusal is not None:
             return json.dumps(refusal)
-        return _fill_bound_page(backend, handle, meta, page_origin, effective_task_id, purpose)
+        return _fill_bound_page(backend, handle, meta, page_origin, effective_task_id, purpose, with_identifier)
+
+
+def _identifier_fill(classified: list, password_fill: list[dict[str, Any]], identifier: str) -> list[dict[str, Any]]:
+    """The username/email/phone control for a user-chosen login (the Desktop key button fills both fields;
+    the agent types the identifier itself). Prefers a control in the password field's form; on an
+    identifier-only step (no password field yet) it is the whole fill."""
+    fields = [c for c in classified if c.token in ("username", "email", "tel")]
+    if not identifier or not fields:
+        return []
+    anchor = password_fill[0]["index"] if password_fill else None
+    form = next((c.control.form_index for c in classified if c.control.index == anchor), None)
+    best = min(fields, key=lambda c: (c.control.form_index != form, -c.score, c.control.index))
+    return [{"index": best.control.index, "token": best.token, "value": identifier}]
 
 
 def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, effective_task_id: str,
-                     purpose: str = "login") -> str:
+                     purpose: str = "login", with_identifier: bool = False) -> str:
     """Inspect the page, resolve the item's secret and write it; runs inside the backend's fill_context
-    after the origin guard passed."""
+    after the origin guard passed. ``with_identifier`` also writes the login's (non-secret) identifier
+    (login purpose only: a signup write targets the new-password controls alone)."""
     from agent.vault_login_classifier import select_checkout_fills
     from tools import browser_vault_signup as signup
     from agent.vault_backends import BackendError, UnlockRequired
@@ -865,7 +966,8 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
 
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-    raw_controls, classified, refusal = _inspect_fill_controls(effective_task_id, nonce, meta.kind)
+    bind = secrets.token_hex(8)  # never in the DOM: names the identity marks the signup writer checks
+    raw_controls, classified, refusal = _inspect_fill_controls(effective_task_id, nonce, meta.kind, bind)
     if refusal:
         return refusal
     signup_target, refusal = signup.gate(purpose, raw_controls, handle, meta.label, page_origin,
@@ -882,6 +984,8 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
         if meta.kind == "login":
             secret = {"password": backend.resolve_password(handle)}
             fills = signup.password_fills(signup_target, classified, secret["password"])
+            if with_identifier and signup_target is None:
+                fills += _identifier_fill(classified, fills, str(meta.identifier or ""))
         else:
             secret = backend.resolve_secret(handle)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
@@ -889,7 +993,7 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault action=unlock."})
     except BackendError:
-        raise  # typed manager failures carry advice and no secret; _fenced_page_op turns them into results
+        raise  # typed manager failures carry advice and no secret; typed_page_op turns them into results
     except Exception:  # health: allow BLE001 -- untyped backend errors can carry secret bytes: refuse without echoing them
         return json.dumps({"success": False, "error_type": "secret_resolution_failed",
                            "error": "Could not resolve the saved item. Nothing was written."})
@@ -907,29 +1011,38 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     if refusal:
         return refusal
 
+    tokens = signup.outcome_tokens() if signup_target is not None else None
+    refusal_tag = "hv-" + secrets.token_hex(12)
     try:
         fill_result = _eval_js_secret(
-            effective_task_id, signup.fill_expression(fills, page_origin, nonce, signup_target)
+            effective_task_id, signup.fill_expression(fills, page_origin, nonce, signup_target, bind=bind,
+                                                      tokens=tokens, refusal_tag=refusal_tag)
         )
     except Exception as exc:  # health: allow BLE001 -- any CDP failure becomes a typed result; its text is scrubbed of the secret
-        return json.dumps(
+        return signup.uncertain(signup_target, backend.name, meta.kind, page_origin) or json.dumps(
             {"success": False, "error": scrub_secret_from_text(str(exc), secret)}
         )
     if not fill_result.get("success"):
+        # dlz: a signup write may have landed before the transport failed: never "nothing written".
+        unsure = signup.uncertain(signup_target, backend.name, meta.kind, page_origin)
+        if unsure:
+            return unsure
         err = scrub_secret_from_text(str(fill_result.get("error") or "fill failed"), secret)
         out = {"success": False, "error": err}
         if fill_result.get("error_type"):
             out["error_type"] = fill_result["error_type"]
         return json.dumps(out)
 
-    parsed, refusal = _parse_fill_result(fill_result, page_origin, secret)
+    if signup_target is not None:  # its answer is one of this fill's outcome tokens, never page JSON
+        return signup.finish(fill_result.get("result"), backend.name, meta.kind, page_origin, signup_target, tokens)
+    parsed, refusal = _parse_fill_result(fill_result, page_origin, refusal_tag)
     if refusal:
         return refusal
-    if signup_target is not None:
-        return signup.finish(parsed, backend.name, meta.kind, page_origin)
-    filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
+    filled = _filled_count(parsed, len(fills))
+    if filled is None:
+        return json.dumps(_FILL_UNVERIFIED)
 
-    out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
+    out = {"success": bool(filled), "filled_fields": filled, "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
     if meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"
@@ -1100,7 +1213,9 @@ def browser_vault_letter_login(handle: str, task_id: Optional[str] = None, *, se
         parsed = _parse_json_result(parsed)
     if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
         return refuse("origin_changed", "The page navigated before the fill could run. Nothing was written.")
-    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+    filled = _filled_count(parsed, len(fills))
+    if filled is None:
+        return refuse(_FILL_UNVERIFIED["error_type"], _FILL_UNVERIFIED["error"])
     if filled < len(fills):
         return refuse("fill_incomplete", f"Only {filled} of {len(fills)} fields took a value; the form was not "
                                          "submitted. Inspect the form and retry with secret_field/identifier_field.",
@@ -1189,9 +1304,13 @@ BROWSER_VAULT_SCHEMA = {
         "duplicate or ambiguous fields, a missing number/CVC/expiry and unlisted origins are refused; HTTPS is not a "
         "seller reputation check: verify the merchant and checkout terms before requesting consent; it never "
         "submits; purpose=signup separately asks the user to approve account creation with this exact login item "
-        "on its exact origin, then fills one unambiguous new-password field on a registration form only; "
-        "confirmation-password, mixed login, OTP and recovery forms are refused; stop on signup_declined when its "
-        "consent_outcome is refused; timeout or unavailable is not a refusal: ask the user to approve once more); "
+        "on its exact origin, then fills one unambiguous new-password field on a registration form, plus its ONE "
+        "explicitly labelled confirm-password field in the same form when there is one (same password in both); "
+        "ambiguous password pairs, a third password, mixed login, OTP and recovery forms are refused; stop on "
+        "signup_declined when its consent_outcome is refused; timeout or unavailable is not a refusal: ask the user "
+        "to approve once more; it succeeds only when every approved field holds the password after the page "
+        "settled: signup_fill_partial, signup_form_changed, signup_fields_not_retained or signup_fill_uncertain mean "
+        "a field may hold it, so do not submit or retry, tell the user); "
         "save_login (nothing saved for this site: the user "
         "enters it in a masked prompt, Hermes saves and fills it); enter_code (a one-time/2FA code after the "
         "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
@@ -1215,18 +1334,75 @@ BROWSER_VAULT_SCHEMA = {
         "payment_consent_expired: the 120 s inspection window closed; with partially_filled false nothing was "
         "written, ask again; with partially_filled true some fields were written: stop, do not submit or retry, "
         "tell the user. payment_fields_not_retained: "
-        "fields were written but did not all hold after the page settled; do not submit or retry, tell the user."
+        "fields were written but did not all hold after the page settled; do not submit or retry, tell the user. "
+        "payment_surface_unavailable: browser control could not lock the browser for the payment; nothing was "
+        "read or written, stop and tell the user. "
+        "Unreviewed payment forms (list shows destination_consent per_fill_owner_approval): a card fill whose "
+        "fields go to a hosted form outside hosted_origins returns payment_destination_approval_required with "
+        "approval_origins, receiving (each origin's fields) and needs; nothing was read. Tell the user which "
+        "origins would receive the card, then call fill again with cart (items, quantities, total and currency "
+        "exactly as the checkout shows them) and approve_origins equal to approval_origins: the user gets one "
+        "approval card naming them, with your cart marked as stated by you and Hermes' page check. "
+        "payment_destination_changed: the origins on the page differ from approve_origins; nothing written, tell "
+        "the user the current ones. payment_cart_changed: the checkout's total text changed; check the cart and "
+        "fill again. payment_destination_disabled, payment_fields_ambiguous, payment_fields_unsupported, "
+        "payment_page_too_large, payment_page_unverifiable, payment_destination_requires_managed_browser: nothing "
+        "written; stop and tell the "
+        "user. A card fill locks the whole browser until the payment tab is closed: every other browser "
+        "action, page read, script, screenshot, dialog answer and login fill returns payment_surface_locked; "
+        "you can still list tabs (browser_cdp Target.getTargets, no params: each tab's site (origin) only, no "
+        "title) and close one (browser_cdp Target.closeTarget {targetId}; closing the payment tab ends the lock "
+        "without a confirmation snapshot); payment_done waits for and reads the "
+        "confirmation natively. Continue with the native actions: payment_controls lists "
+        "the buttons, links and checkboxes ({ref, role, text, disabled}; never inputs, digits masked) of the "
+        "card frames and of the payment tab's own page (the merchant checkout, or a bank's 3-D Secure page it "
+        "was redirected to) unless that page is a card form; payment_click (ref) makes one trusted click on a "
+        "listed control, so the Pay button is clicked there; refs die when the page changes, when you list again, and after one press (successful or uncertain): "
+        "a second press needs a new payment_controls. "
+        "The user's chat "
+        "go for the purchase covers pressing Pay once; never click Pay without it, never click it again when "
+        "payment_click_uncertain says a press may have landed. Page dialogs while locked: alerts are accepted and "
+        "prompts dismissed by Hermes; a confirm waits and payment_controls / payment_click / payment_done report "
+        "dialog_pending {id, type, origin, on_payment_tab_top, on_shop_page, text} for the payment tab (text "
+        "redacted, bounded, every 3+ digit run and date masked except an amount exactly equal to the cart total "
+        "the user approved; dialogs on other tabs only as "
+        "other_dialogs_pending: n; payment_done returns at once with payment_dialog_pending). payment_dialog "
+        "(dialog_id, accept true or false) answers that confirm once, never retried: only a confirm on the "
+        "payment tab's own top page (on_payment_tab_top true), and accept only on the shop's own page "
+        "(on_shop_page true; a bank or provider page's confirm can only be dismissed); card frames, other tabs "
+        "and unknown sources are refused. Accept only a confirm on the shop page that matches the Pay you were "
+        "told to make (e.g. 'Place order for <amount>?'); for anything else (upsells, subscriptions, unknown) "
+        "ask the user. An unanswered confirm is "
+        "dismissed after the dialog timeout. On 3-D Secure or redirect pages, normally just "
+        "wait and call payment_done; click a bank page only when it asks for a button and the user agreed. "
+        "After pressing Pay, call payment_done once; it is what ends the lock: it waits up to 120 s (through 3-D Secure and payment-provider pages) for the order "
+        "confirmation on the checkout's origin (expected_origin only when the checkout ran on a payment provider's own "
+        "page), then "
+        "returns its url, title, visible text and http(s) links (never field values or screenshots), opens it in a "
+        "new tab (new_tab) and closes the payment tab; lock_released true means browser control confirmed the "
+        "unlock, false (with note) means it did not, so follow the note. payment_confirmation_not_reached: no "
+        "confirmation within the wait (url: the tab's site only), the lock stays, nothing was clicked or closed; never press Pay again; "
+        "follow the error (call payment_done again after the user finishes a bank check, or ask the user). "
+        "fill_result_unverified: the page's answer to a fill could not be verified and a field may hold the "
+        "password; do not submit or retry, tell the user."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock", "letter_login",
-                                                  "letter_signed_in", "letter_done"]},
+                                                  "letter_signed_in", "letter_done", "payment_controls",
+                                                  "payment_click", "payment_done", "payment_dialog"]},
+            "ref": {"type": "string", "description": "payment_click only: a ref from payment_controls."},
+            "accept": {"type": "boolean", "description": "payment_dialog only: true accepts, false dismisses the "
+                                                         "dialog_pending confirm."},
+            "dialog_id": {"type": "string", "description": "payment_dialog only: dialog_pending.id of the confirm "
+                                                           "to answer."},
             "handle": {"type": "string", "description": "fill / enter_code / letter_*: a handle from list or a letter note."},
             "purpose": {"type": "string", "enum": ["login", "signup"], "default": "login",
                         "description": "fill only: login preserves current-password behavior; signup requires fresh "
                                        "native approval to create an account with this exact login item and origin. "
-                                       "Only one explicit new-password input is supported; never submits."},
+                                       "Fills one explicit new-password input, or that input plus one explicitly "
+                                       "labelled confirm-password input in the same form; never submits."},
             "secret_field": {"type": "string", "description":
                 "letter_login only: the field for the letter's password/code (name, id or visible label) when not recognised."},
             "identifier_field": {"type": "string", "description":
@@ -1237,15 +1413,33 @@ BROWSER_VAULT_SCHEMA = {
                 "letter_login only: true when a sign-in confirmed with letter_signed_in has expired and the login form is back."},
             "merchant_origin": {"type": "string", "description":
                 "fill, card only: exact HTTPS merchant origin to select one open tab. Omit to inspect the supervisor's current tab."},
+            "cart": {"type": "object", "description":
+                     "fill, card only: the purchase exactly as the checkout shows it, shown to the user as stated by "
+                     "you. Required after payment_destination_approval_required; optional otherwise.",
+                     "properties": {
+                         "items": {"type": "array", "minItems": 1, "maxItems": 8, "items": {
+                             "type": "object",
+                             "properties": {"description": {"type": "string", "maxLength": 80},
+                                            "quantity": {"type": "integer", "minimum": 1, "maximum": 99}},
+                             "required": ["description", "quantity"]}},
+                         "total": {"type": "string", "description": "e.g. \"22.66\" (two decimals, no symbol)."},
+                         "currency": {"type": "string", "description": "ISO code, e.g. \"EUR\"."}},
+                     "required": ["items", "total", "currency"]},
+            "approve_origins": {"type": "array", "items": {"type": "string"}, "description":
+                                "fill, card only: exactly the approval_origins of payment_destination_approval_required."},
             "code": {"type": "string", "maxLength": 16,
                      "description": "enter_code only: a one-time code Hermes obtained through its own authorized workflow (e.g. read "
                                     "from the user's mail) or a one-time code the user sent in chat for this page (SMS/2FA/"
                                     "verification code), exactly as issued including hyphens and leading zeros. Requires expected_origin. "
                                     "Never put a password or other long-lived secret here."},
             "expected_origin": {"type": "string",
-                                "description": "Mandatory with code: the page's origin (scheme://host[:port]). The fill is refused unless it matches exactly."},
+                                "description": "Mandatory with code: the page's origin (scheme://host[:port]). The fill is refused unless it matches exactly. "
+                                               "payment_done only: the shop's HTTPS origin, needed (and honoured) only when the checkout ran on a payment provider's own page; otherwise ignored (the result says so)."},
             "backend": {"type": "string", "enum": ["onepassword", "bitwarden"], "description": "unlock only."},
             "label": {"type": "string", "description": "save_login only: short site name (default: the host)."},
+            "target": {"type": "string", "enum": ["browser", "preview"],
+                       "description": "fill / save_login / enter_code: 'preview' = the Desktop in-app browser "
+                                      "page beside the chat, 'browser' = the managed automation browser."},
         },
         "required": ["action"],
     },
@@ -1257,6 +1451,18 @@ def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
     return shares_bot_desktop_browser(session_for_task(task_id))
 
 
+def typed_page_op(fn) -> str:
+    """dlz: ``fn()`` with the vault's typed failures as results: ``_PageUnavailable`` and a typed manager
+    failure (``BackendError``: rate budget, expired token, network, missing item; model-facing advice and
+    no secret) come back as their JSON result. The preview paths (``target=preview``, the Desktop key
+    button) skip ``_fenced_page_op`` and use this directly."""
+    from agent.vault_backends import BackendError
+    try:
+        return fn()
+    except (_PageUnavailable, BackendError) as exc:
+        return json.dumps(exc.result())
+
+
 def _fenced_page_op(task_id: Optional[str], fn) -> str:
     """Vault operations focus, inspect and fill the page over the supervisor socket, bypassing
     browser_exec; they must honour the Bot Desktop lease like every other page access, or a human
@@ -1264,24 +1470,168 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     from tools.browser_session import run_fenced, session_for_task
 
     def op() -> dict[str, Any]:
-        from agent.vault_backends import BackendError
         try:
             if _is_managed():
                 # dlz: control must confirm the agent still holds the slot lease before any page read.
                 _managed_supervisor(task_id or "default", admit=True)
-            return {"raw": fn()}
         except _PageUnavailable as exc:
             return {"raw": json.dumps(exc.result())}
-        except BackendError as exc:
-            # Typed manager failures (rate budget, expired token, network, missing item) carry
-            # model-facing advice and no secret material.
-            return {"raw": json.dumps(exc.result())}
+        return {"raw": typed_page_op(fn)}
 
     res = run_fenced(session_for_task(task_id), op)
     return res["raw"] if "raw" in res else json.dumps(res)
 
 
+def _payment_lock_refusal(task_id: Optional[str]) -> Optional[str]:
+    """dlz (payment lockdown): ``payment_surface_locked`` for a non-card page operation while a card payment
+    locks the task's slot. Only the native payment actions (card fill, payment_controls / payment_click,
+    payment_done) work on a locked slot; a slot this process never attached a supervisor to holds no claim."""
+    from tools.browser_payment_surface import locked_refusal
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    supervisor = SUPERVISOR_REGISTRY.get(task_id or "default")
+    refused = locked_refusal(supervisor) if supervisor is not None else None
+    return json.dumps(refused) if refused else None
+
+
+# dlz (payment lockdown): the fence of the non-card page operation running in this context, if any.
+_VAULT_FENCE: contextvars.ContextVar = contextvars.ContextVar("vault_payment_fence", default=None)
+
+
+def _outside_payment_lock(task_id: Optional[str], op) -> str:
+    """dlz (payment lockdown): run a non-card page operation only while no card payment locks the slot. Every
+    native read or write it dispatches (``_native``) is fenced again right before it goes out, so a claim
+    during a user prompt (enter_code waits for the code) stops the next write; the whole payload (success or
+    error) is withheld when a claim happened while the operation ran. Human waits never hold the claim lock."""
+    from tools import browser_payment_surface as pay
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    refused = _payment_lock_refusal(task_id)
+    if refused:
+        return refused
+    supervisor = SUPERVISOR_REGISTRY.get(task_id or "default")
+    fence = {"sup": supervisor, "before": pay.epoch(supervisor) if supervisor is not None else 0, "refused": None}
+    token = _VAULT_FENCE.set(fence)
+    try:
+        out = op()
+    finally:
+        _VAULT_FENCE.reset(token)
+    if fence["refused"] is not None:
+        return json.dumps(fence["refused"])
+    if fence["sup"] is not None and pay.epoch(fence["sup"]) != fence["before"]:
+        return json.dumps(pay.locked_withheld())
+    return out
+
+
+def _fence_refused() -> bool:
+    fence = _VAULT_FENCE.get()
+    return fence is not None and fence["refused"] is not None
+
+
+def _native(supervisor: Any, call) -> dict:
+    """One native dispatch (evaluate, focus) on the supervisor socket. Inside a fenced non-card operation it
+    goes out only under the claim lock, with the slot unlocked and no claim since the operation started (a
+    different supervisor than the one first seen refuses too); a refusal dispatches nothing."""
+    fence = _VAULT_FENCE.get()
+    if fence is None:
+        return call()
+    from tools import browser_payment_surface as pay
+
+    if fence["refused"] is not None:
+        return {"ok": False, "error": pay.LOCKED}
+    if fence["sup"] is None:
+        fence["sup"], fence["before"] = supervisor, pay.epoch(supervisor)
+    if fence["sup"] is not supervisor:
+        fence["refused"] = pay.locked_withheld()
+        return {"ok": False, "error": pay.LOCKED}
+    state, out = pay.fenced_dispatch(supervisor, fence["before"], call)
+    if state != "ok":
+        fence["refused"] = out
+        return {"ok": False, "error": pay.LOCKED}
+    return out
+
+
+def _payment_surface_action(task_id: Optional[str], ref: Optional[str]) -> str:
+    """dlz: native actions on a locked payment tab (managed browser only)."""
+    from tools import browser_payment_surface as surface
+
+    if not _is_managed():
+        return json.dumps({"success": False, "error_type": "payment_surface_none",
+                           "error": "Only the managed browser protects card frames; use browser_exec as usual."})
+    supervisor = _managed_supervisor(task_id or "default")
+    if ref is None:
+        return json.dumps(surface.payment_controls(supervisor))
+    return json.dumps(surface.payment_click(supervisor, ref))
+
+
+def _payment_dialog_action(task_id: Optional[str], dialog_id: Any, accept: Any) -> str:
+    """dlz (lockdown, owner decision 2026-11-11): one native answer to a confirm the payment lock holds."""
+    from tools.browser_payment_done import payment_dialog
+
+    if not _is_managed():
+        return json.dumps({"success": False, "error_type": "payment_surface_none",
+                           "error": "Only the managed browser locks a card payment; use the browser tools as usual."})
+    return json.dumps(payment_dialog(_managed_supervisor(task_id or "default"), dialog_id, accept))
+
+
+def _payment_done_action(task_id: Optional[str], expected_origin: str) -> str:
+    """dlz (lockdown §2): the native confirmation handover after Pay (managed browser only)."""
+    from tools.browser_payment_done import payment_done
+
+    if not _is_managed():
+        return json.dumps({"success": False, "error_type": "payment_surface_none",
+                           "error": "Only the managed browser locks a card payment; use the browser tools as usual."})
+    return json.dumps(payment_done(_managed_supervisor(task_id or "default"), expected_origin))
+
+
 def _handle_vault(args: dict[str, Any], **kwargs) -> str:
+    """dlz: every page-derived field of the result (errors, urls, titles, origins: :func:`_scrub_page_fields`)
+    and any raised error get the browser-audience vault scrub; handles, refs and the echoed approval fields
+    stay as they are so they remain usable."""
+    from agent.redact import redact_sensitive_text
+
+    try:
+        out = _handle_vault_inner(args, **kwargs)
+    except Exception as exc:  # health: allow BLE001 -- the registry fallback would quote the page text raw
+        logger.info("browser_vault %s raised %s", args.get("action"), type(exc).__name__)
+        return json.dumps({"success": False, "error_type": "vault_internal_error",
+                           "error": redact_sensitive_text(f"{type(exc).__name__}: {exc}", force=True, vault="browser")[:300]})
+    try:
+        result = json.loads(out)
+    except (TypeError, ValueError):
+        return out
+    if not isinstance(result, dict):
+        return out
+    scrubbed = _scrub_page_fields(result, redact_sensitive_text)
+    return out if scrubbed == result else json.dumps(scrubbed)
+
+
+_PAGE_FIELDS = ("error", "url", "title", "page", "origin", "receiving")  # dlz: page-derived text
+# Fields the model must echo back exactly (approve_origins = approval_origins, merchant_origin): masking them
+# would refuse every fill on a slot whose card window is still open; they are origins the page already chose.
+_ECHO_FIELDS = ("approval_origins", "merchant_origin")
+
+
+def _page_key(key: Any) -> bool:
+    return isinstance(key, str) and key not in _ECHO_FIELDS and (
+        key in _PAGE_FIELDS or key.endswith(("_origin", "_origins", "_url")))
+
+
+def _scrub_page_fields(value: Any, redact: Any, inside: bool = False) -> Any:
+    """Browser-audience scrub of every page-derived field of a vault result (errors, urls, titles, origins,
+    origin lists and origin-keyed maps, at any depth); handles, refs and ids elsewhere are left as they are so
+    they stay usable."""
+    if isinstance(value, str):
+        return redact(value, force=True, vault="browser") if inside else value
+    if isinstance(value, list):
+        return [_scrub_page_fields(v, redact, inside) for v in value]
+    if isinstance(value, dict):
+        return {(redact(k, force=True, vault="browser") if inside and isinstance(k, str) else k):
+                _scrub_page_fields(v, redact, inside or _page_key(k)) for k, v in value.items()}
+    return value
+
+
+def _handle_vault_inner(args: dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
     action = str(args.get("action") or "")
     handle, label = str(args.get("handle") or ""), str(args.get("label") or "")
@@ -1294,21 +1644,46 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     page_ops = {
         "fill": lambda: browser_vault_fill(handle=handle, task_id=tid,
                                            merchant_origin=str(args.get("merchant_origin") or ""),
-                                           purpose=str(args.get("purpose") or "login")),
-        "save_login": lambda: browser_vault_save_login(label=label, task_id=tid),
-        "enter_code": lambda: browser_vault_enter_code(handle=handle, task_id=tid, code=str(args.get("code") or ""),
-                                                       expected_origin=str(args.get("expected_origin") or "")),
-        "letter_login": lambda: browser_vault_letter_login(
+                                           purpose=str(args.get("purpose") or "login"),
+                                           # dlz (Track B): card fills only; passed only when given.
+                                           **{k: args[k] for k in ("cart", "approve_origins") if k in args}),
+        "save_login": lambda: _outside_payment_lock(tid, lambda: browser_vault_save_login(label=label, task_id=tid)),
+        "enter_code": lambda: _outside_payment_lock(tid, lambda: browser_vault_enter_code(
+            handle=handle, task_id=tid, code=str(args.get("code") or ""),
+            expected_origin=str(args.get("expected_origin") or ""))),
+        "letter_login": lambda: _outside_payment_lock(tid, lambda: browser_vault_letter_login(
             handle, task_id=tid, secret_field=str(args.get("secret_field") or ""),
             identifier_field=str(args.get("identifier_field") or ""),
             expected_origin=str(args.get("expected_origin") or ""),
             after_failed_login=args.get("after_failed_login") is True,
-            session_expired=args.get("session_expired") is True),
-        "letter_signed_in": lambda: browser_vault_letter_signed_in(handle, task_id=tid),
+            session_expired=args.get("session_expired") is True)),
+        "letter_signed_in": lambda: _outside_payment_lock(
+            tid, lambda: browser_vault_letter_signed_in(handle, task_id=tid)),
+        "payment_controls": lambda: _payment_surface_action(tid, None),
+        "payment_click": lambda: _payment_surface_action(tid, str(args.get("ref") or "")),
+        "payment_done": lambda: _payment_done_action(tid, str(args.get("expected_origin") or "")),
+        "payment_dialog": lambda: _payment_dialog_action(tid, args.get("dialog_id"), args.get("accept")),
     }
     if action not in page_ops:
         return json.dumps({"success": False, "error": f"Unknown action {action!r}; use list, fill, save_login, "
-                                                       "enter_code, unlock, letter_login, letter_signed_in or letter_done."})
+                                                       "enter_code, unlock, letter_login, letter_signed_in, "
+                                                       "letter_done, payment_controls, payment_click, payment_done or "
+                                                       "payment_dialog."})
+    target = args.get("target") or "browser"
+    if target == "preview":
+        if action not in _PREVIEW_ACTIONS:
+            return json.dumps({"success": False, "error_type": "invalid_target",
+                               "error": f"target=preview supports fill, save_login and enter_code, not {action}. "
+                                        "Nothing was read or written."})
+        if (refusal := _preview_refusal()) is not None:
+            return refusal
+        # The in-app browser is not the Bot Desktop browser; its window owns the page and refuses a
+        # changed tab or document itself. Never retried on another browser.
+        from tools.browser_vault_preview import run_preview_vault
+        return run_preview_vault(kwargs.get("preview_callback"), lambda: typed_page_op(page_ops[action]))
+    if target != "browser":
+        return json.dumps({"success": False, "error_type": "invalid_target",
+                           "error": "target must be 'browser' or 'preview'."})
     return _fenced_page_op(tid, page_ops[action])
 
 

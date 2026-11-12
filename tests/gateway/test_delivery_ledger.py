@@ -175,6 +175,21 @@ class TestRuntimeFailedSweep:
         assert claimed[0]["attempts"] == 1
         assert _row("ob-1")["state"] == "attempting"
 
+    def test_cancelled_mid_send_claim_closes_uncertain_but_never_overwrites_a_settled_row(self):
+        """dlz: close_uncertain_claim closes only this process's still-'attempting' claim; a row the
+        send already terminalized (a definite refusal stays redeliverable) is left alone."""
+        _record(platform="telegram")
+        _record("ob-2", session_key="agent:main:telegram:dm:2", platform="telegram")
+        for oid in ("ob-1", "ob-2"):
+            dl.mark_failed(oid, "send_path_degraded")
+        assert len(dl.sweep_failed_for_runtime("telegram")) == 2
+        dl.mark_failed("ob-2", "Bad Request: chat not found")
+
+        assert dl.close_uncertain_claim("ob-1") is True
+        assert dl.close_uncertain_claim("ob-2") is False
+        assert _row("ob-1")["state"] == "delivered"
+        assert _row("ob-2")["state"] == "failed"
+
     def test_permanent_failure_is_not_claimed(self):
         _record(platform="telegram")
         dl.mark_failed("ob-1", "Forbidden: bot was blocked by the user")

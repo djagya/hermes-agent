@@ -83,7 +83,11 @@ def enabled_providers() -> tuple:
     are ignored (a typo never admits anything)."""
     try:
         from hermes_cli.config import cfg_get, load_config
-        names = cfg_get(load_config(), "vault", "payment_providers", default=[]) or []
+        from hermes_cli.config_read_errors import FailedConfigRead
+        config = load_config()
+        # A failed read can carry last-known-good values; it still means the default set.
+        names = [] if isinstance(config, FailedConfigRead) else (
+            cfg_get(config, "vault", "payment_providers", default=[]) or [])
     except Exception:  # health: allow BLE001 -- unreadable config means the default set, never more
         names = []
     wanted = {str(n) for n in names} if isinstance(names, (list, tuple)) else set()
@@ -99,11 +103,12 @@ def provider_for_origin(origin: str) -> PaymentProvider | None:
     return next((p for p in PAYMENT_PROVIDERS if origin in p.origins), None)
 
 
-def coverage_hint(tree: tuple, merchant: str, allowed: tuple) -> str:
+def coverage_hint(tree: tuple, merchant: str, allowed: tuple, paths: bool = True) -> str:
     """Why a checkout yielded no complete reviewed card document, from frame origins and paths only
     (nothing is read from an unreviewed frame). ``tree`` rows are ``(id, loader, url, origin,
     parent)`` with the browser's security origin. Only constant provider text and a sanitized path
-    of a reviewed origin appear; '' when nothing specific applies."""
+    of a reviewed origin appear; '' when nothing specific applies. dlz: ``paths=False`` (typed results,
+    Codex B r1 #8) leaves the page-controlled path out: registry origins and fixed text only."""
     notes = []
     for _fid, _loader, url, origin, parent in tree:
         if not parent or origin == merchant:
@@ -114,7 +119,7 @@ def coverage_hint(tree: tuple, merchant: str, allowed: tuple) -> str:
         elif provider is not None and origin not in allowed:
             notes.append(f"{origin} is reviewed provider {provider.name}, not enabled in vault.payment_providers")
         elif provider is not None and not provider.admits(url):
-            path = re.sub(r"[^A-Za-z0-9/_.-]", "", urlsplit(url).path)[:40]
+            path = re.sub(r"[^A-Za-z0-9/_.-]", "", urlsplit(url).path)[:40] if paths else ""
             notes.append(f"{origin}{path} is not a {provider.name} card-field document "
                          "(wallet, buttons and guest-checkout pages are out of scope)")
     return "; ".join(dict.fromkeys(notes))[:400]
@@ -133,6 +138,53 @@ def effective_frame_origins(override: tuple = ()) -> tuple:
 
 class PaymentPolicyError(ValueError):
     """Fixed-message refusal; never include supplied metadata or values."""
+
+
+class PaymentDestinationError(PaymentPolicyError):
+    """dlz: a typed refusal with a fixed ``error_type``, a fixed message and a sanitized ``detail`` (origins,
+    field tokens and counts only; never a frame URL, label or page text). Raised for the unreviewed-destination
+    discovery (``payment_fields_unsupported`` / ``payment_fields_ambiguous``) and for a page over the traversal
+    bounds on either path (``payment_page_too_large``)."""
+
+    def __init__(self, error_type: str, message: str, detail: dict | None = None):
+        super().__init__(message)
+        self.error_type = error_type
+        self.detail = dict(detail or {})
+
+
+# dlz (design v2 B6): the switch for owner-approved fills on unreviewed hosted payment forms, and the config keys
+# whose values form its policy generation (a change to either withdraws a fill waiting on its approval).
+DESTINATION_CONSENT_KEY = "payment_destination_consent"
+_POLICY_KEYS = (DESTINATION_CONSENT_KEY, "payment_providers")
+DESTINATION_OFF_HINT = ("card fields may be on an unreviewed hosted payment form; owner-approved destinations are "
+                        "off (vault.payment_destination_consent)")
+
+
+def destination_policy() -> tuple[bool, str]:
+    """``(enabled, generation)``: enabled only for a literal ``True`` in ``vault.payment_destination_consent``;
+    ``generation`` is a digest of that key and ``vault.payment_providers``. Unreadable config is ``(False, "")``, also
+    when the loader falls back to a last-known-good copy.
+    The switch only lets the discovery inspection and the owner's prompt be offered: it admits no origin."""
+    import hashlib
+    import json
+
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        from hermes_cli.config_read_errors import FailedConfigRead
+        config = load_config()
+        if isinstance(config, FailedConfigRead):
+            # dlz: the loader serves last-known-good (or defaults) for a config.yaml it cannot read now: that is
+            # not the operator's current choice, so the feature is off until the file reads again.
+            return False, ""
+        values = {key: cfg_get(config, "vault", key, default=None) for key in _POLICY_KEYS}
+        generation = hashlib.sha256(json.dumps(values, sort_keys=True, default=repr).encode()).hexdigest()
+    except Exception:  # health: allow BLE001 -- unreadable config means the feature is off
+        return False, ""
+    return values[DESTINATION_CONSENT_KEY] is True, generation
+
+
+def destination_consent_enabled() -> bool:
+    return destination_policy()[0]
 
 
 def https_origin(value: str) -> str:

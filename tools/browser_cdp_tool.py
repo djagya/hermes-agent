@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import logging
 from typing import Any, Callable, Dict, Optional
 
@@ -46,12 +47,43 @@ _CDP_FLAGGED_BINARY_PATHS: dict[str, tuple] = {
 }
 
 
+# Protocol identifiers in CDP results (targetId, sessionId, frameId, nodeId, backendNodeIds, id, ...) keep their
+# value only when it has the shape Chrome issues: a key name alone is page-controllable (a header named "id").
+_PROTOCOL_ID_KEYS = frozenset({  # Chrome-issued id fields only (DOM publicId/systemId are page text)
+    "id", "targetId", "sessionId", "frameId", "loaderId", "openerId", "openerFrameId", "browserContextId",
+    "parentId", "parentFrameId", "nodeId", "backendNodeId", "nodeIds", "backendNodeIds", "objectId",
+    "executionContextId", "exceptionId", "scriptId", "contextId", "browserContextIds",
+})
+# Methods whose results carry no page-authored data under an id-like key outside a RemoteObject's "value"
+# (checked against the CDP schema); every other method (Network.*, Storage, ...) keeps the full scrub.
+_ID_METHODS = frozenset({
+    "Target.getTargets", "Target.getTargetInfo", "Target.createTarget", "Target.attachToTarget",
+    "Target.createBrowserContext", "Target.getBrowserContexts",
+    "DOM.getDocument", "DOM.querySelector", "DOM.querySelectorAll", "DOM.describeNode", "DOM.requestNode",
+    "DOM.resolveNode", "DOM.getBoxModel", "DOM.getNodeForLocation", "DOM.pushNodesByBackendIdsToFrontend",
+    "DOM.getFlattenedDocument", "DOM.getContentQuads",
+    "Page.getFrameTree", "Page.navigate", "Page.createIsolatedWorld", "Page.getNavigationHistory",
+    "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.getProperties",
+})
+_CHROME_ID = re.compile(r"[0-9A-F]{32}|-?\d{1,20}\.\d{1,10}\.\d{1,10}")  # target/frame/loader/session; objectId
+
+
+def _id_value(v: Any, key: str = "") -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, str) and key == "scriptId" and v.isdigit() and len(v) <= 12:  # Chrome's decimal script ids
+        return True
+    return isinstance(v, int) or isinstance(v, str) and bool(_CHROME_ID.fullmatch(v))
+
+
 def _redact_cdp_output(
     value: Any,
     *,
     always_paths: tuple = (),
     flagged_paths: tuple = (),
     _depth: int = 0,
+    _page: bool = False,
+    ids: bool = False,
 ) -> Any:
     """Redact browser-originated CDP result text; opaque bytes stay byte-identical.
 
@@ -68,15 +100,19 @@ def _redact_cdp_output(
     from agent.redact import (
         REDACT_WALK_DEPTH_MARKER,
         REDACT_WALK_MAX_DEPTH,
+        redact_number,
         redact_sensitive_text,
     )
     if _depth >= REDACT_WALK_MAX_DEPTH:
         return REDACT_WALK_DEPTH_MARKER
     if isinstance(value, str):
-        return redact_sensitive_text(value, force=True)
+        return redact_sensitive_text(value, force=True, vault="browser")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # dlz: a number is page data too (``value: 4711``): masked by length like text, returned as the mask
+        return redact_number(value, "browser")
     if isinstance(value, (list, tuple)):
         return type(value)(
-            _redact_cdp_output(item, _depth=_depth + 1) for item in value
+            _redact_cdp_output(item, _depth=_depth + 1, _page=_page, ids=ids) for item in value
         )
     if not isinstance(value, dict):
         return value
@@ -88,14 +124,51 @@ def _redact_cdp_output(
     redacted: dict[str, Any] = {}
     for key, item in value.items():
         opaque = leaf(always_paths, key) or (leaf(flagged_paths, key) and base64_flagged)
-        out_key = redact_sensitive_text(key, force=True) if isinstance(key, str) else key  # by-value objects can carry a secret as a KEY
+        if ids and not _page and key in _PROTOCOL_ID_KEYS and (
+                _id_value(item, key) or isinstance(item, list) and all(_id_value(v) for v in item)):
+            # dlz: Chrome-issued ids (targetId, nodeId, ...) are echoed back; masking them breaks the next call.
+            # Inside a RemoteObject's by-value payload (its "value") a key may only imitate one: scrubbed there.
+            redacted[key] = item
+            continue
+        out_key = redact_sensitive_text(key, force=True, vault="browser") if isinstance(key, str) else key  # by-value objects can carry a secret as a KEY
         redacted[out_key] = item if isinstance(item, str) and opaque else _redact_cdp_output(
             item,
             always_paths=descend(always_paths, key),
             flagged_paths=descend(flagged_paths, key),
             _depth=_depth + 1,
+            # a RemoteObject's by-value page payload, and the free-form dictionaries pages can fill
+            _page=_page or (key == "value" and "type" in value) or key in ("exceptionMetaData", "embedderData"),
+            ids=ids,
         )
     return redacted
+
+
+def _scrubbed_result(result: Any, method: str) -> Any:
+    """The redacted result, or None when redaction raised (dlz: the registry fallback would quote an exception's
+    text unscrubbed, so the caller returns fixed text instead)."""
+    try:
+        return _redact_cdp_output(result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
+                                  flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()), ids=method in _ID_METHODS)
+    except Exception as exc:  # health: allow BLE001 -- fixed text only; nothing of the result is returned
+        logger.warning("browser_cdp result redaction failed (%s)", type(exc).__name__)
+        return None
+
+
+def _success_payload(result: Any, method: str, target_id: Optional[str]) -> str:
+    scrubbed = _scrubbed_result(result, method)
+    if scrubbed is None:
+        return _err("CDP result could not be redacted; nothing was returned", method=method)
+    payload: dict[str, Any] = {"success": True, "method": method, "result": scrubbed}
+    if target_id:
+        payload["target_id"] = target_id
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _exc_text(exc: BaseException) -> str:
+    """An error's text for the result: it can quote the page (a CDP error message), so it is redacted too."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(str(exc), force=True, vault="browser")
 
 
 # ``websockets`` is a direct dependency; wrap so a stale env yields a clean error.
@@ -137,8 +210,16 @@ def _resolve_cdp_endpoint() -> str:
     return (get_cdp_override() or "").strip()
 
 
+def _err(message: str, **extra: Any) -> str:
+    """A refusal or error result. Its text can quote the page or the target (a URL, a frame id, an
+    exception), so it is scrubbed like any other browser result."""
+    from agent.redact import redact_sensitive_text
+
+    return tool_error(redact_sensitive_text(message, force=True, vault="browser"), **extra)
+
+
 def _blocked(message: str, method: str) -> str:
-    return tool_error(message, method=method, cdp_docs=CDP_DOCS_URL)
+    return _err(message, method=method, cdp_docs=CDP_DOCS_URL)
 
 
 def _expression_private_target(params: dict[str, Any], blocked: Callable[[str], bool]) -> Optional[str]:
@@ -326,12 +407,12 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
     except Exception as exc:  # pragma: no cover — defensive
-        return tool_error(f"CDP supervisor is not available: {exc}. frame_id routing requires a running "
+        return _err(f"CDP supervisor is not available: {exc}. frame_id routing requires a running "
                           "supervisor attached via /browser connect or an active Browserbase session.")
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is None:
-        return tool_error(f"No CDP supervisor is attached for task={task_id!r}. Call browser_exec or "
+        return _err(f"No CDP supervisor is attached for task={task_id!r}. Call browser_exec or "
                           "/browser connect first so the supervisor can attach; Page.getFrameTree lists the "
                           "frame ids you can pass here.")
 
@@ -343,31 +424,92 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
             raw = supervisor._frames.get(frame_id)  # type: ignore[attr-defined]
         frame_info = raw.to_dict() if raw is not None else None
     if frame_info is None:
-        return tool_error(f"frame_id {frame_id!r} not found in supervisor state. "
+        return _err(f"frame_id {frame_id!r} not found in supervisor state. "
                           "Call Page.getFrameTree to see the current frames.")
 
     child_sid = frame_info.get("session_id")
     if not child_sid:  # same-origin iframes have no dedicated session; reach them via contentWindow/contentDocument
-        return tool_error(f"frame_id {frame_id!r} is not an out-of-process iframe (no dedicated CDP session). "
+        return _err(f"frame_id {frame_id!r} is not an out-of-process iframe (no dedicated CDP session). "
                           "For same-origin iframes, use `browser_cdp(method='Runtime.evaluate', params={'expression': "
                           "\"document.querySelector('iframe').contentDocument.title\"})` at the top-level page instead.")
 
     loop = supervisor._loop  # type: ignore[attr-defined]
     if loop is None or not loop.is_running():
-        return tool_error("CDP supervisor loop is not running. Try reconnecting with /browser connect.")
+        return _err("CDP supervisor loop is not running. Try reconnecting with /browser connect.")
+
+    # dlz (payment lockdown): this socket is the runtime's native one, which browser-control does not
+    # filter; while the slot is locked for a card payment, refuse here what control refuses on every other
+    # connection. The epoch is read first: a reply that straddles a claim is withheld below.
+    from tools import browser_payment_surface as pay
+
+    before = pay.epoch(supervisor)
+    refused = pay.supervisor_route_refusal(supervisor, frame_id, method, params or {}, child_sid)
+    if refused:
+        return json.dumps(refused)
+
+    async def send() -> Optional[dict]:
+        # dlz: checked again on the supervisor loop right before the send: a claim that registered after the
+        # lock check above means the call is never sent (not only its reply withheld).
+        if pay.epoch(supervisor) != before:
+            return None
+        return await supervisor._cdp(method, params or {}, session_id=child_sid, timeout=timeout)  # type: ignore[attr-defined]
 
     try:
-        from agent.async_utils import safe_schedule_threadsafe
-        fut = safe_schedule_threadsafe(
-            supervisor._cdp(method, params or {}, session_id=child_sid, timeout=timeout), loop)  # type: ignore[attr-defined]
-        if fut is None:
-            return tool_error("CDP call via supervisor failed: loop unavailable", cdp_docs=CDP_DOCS_URL)
-        result_msg = fut.result(timeout=timeout + 2)
-    except Exception as exc:
-        return tool_error(f"CDP call via supervisor failed: {type(exc).__name__}: {exc}", cdp_docs=CDP_DOCS_URL)
+        from tools.browser_supervisor import run_bounded
 
+        # run_bounded cancels (and drains) the send on a timeout, so a call reported as failed is never sent later.
+        result_msg = run_bounded(send(), loop, timeout=timeout + 2, unavailable=RuntimeError("loop unavailable"))
+    except Exception as exc:
+        if pay.epoch(supervisor) != before:  # the error text may quote the page too
+            return json.dumps(pay.locked_withheld())
+        return _err(f"CDP call via supervisor failed: {type(exc).__name__}: {_exc_text(exc)}",
+                          cdp_docs=CDP_DOCS_URL)
+    if result_msg is None or pay.epoch(supervisor) != before:
+        # A card payment claimed the slot while this call was in flight: its result may hold card data.
+        return json.dumps(pay.locked_withheld())
+
+    result = _redact_cdp_output(result_msg.get("result", {}), always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
+                                flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()), ids=method in _ID_METHODS)
     return json.dumps({"success": True, "method": method, "frame_id": frame_id, "session_id": child_sid,
-                       "result": result_msg.get("result", {})}, ensure_ascii=False)
+                       "result": result}, ensure_ascii=False)
+
+
+def _payment_answer(task_id: str, method: str, params: Any, *, routed: bool) -> Optional[str]:
+    """dlz: what a card payment decides before any route: capture methods refused while a payment mark exists
+    (raw CDP cannot name an authoritative slot; tools/browser_payment_privacy.py), and on a locked managed
+    slot the lease-bound recovery calls. None = continue on the usual path."""
+    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
+
+    if method in _CAPTURE_METHODS and payment_session_sensitive(task_id):
+        return json.dumps(screenshot_refusal())
+    return None if routed else _locked_recovery(task_id, method, params)
+
+
+_CAPTURE_METHODS = frozenset({"Page.captureScreenshot", "Page.printToPDF", "Page.startScreencast",
+                              "Page.captureSnapshot"})
+
+
+def _locked_recovery(task_id: str, method: str, params: Any) -> Optional[str]:
+    """dlz (payment lockdown): on a managed browser whose slot is locked for a card payment, the lease-bound
+    recovery calls (list tabs by site, close a tab) go over the native supervisor; None = the usual path
+    (which refuses raw CDP on a managed browser)."""
+    from tools import browser_payment_surface as pay
+
+    if method not in pay.RECOVERY_METHODS:
+        return None
+    from tools.browser_session_cdp import managed_browser
+
+    if not managed_browser():
+        return None
+    from tools import browser_vault_tool as vault
+
+    try:
+        supervisor = vault._managed_supervisor(task_id, admit=True)  # control confirms this task's lease
+    except Exception:  # health: allow BLE001 -- no lease, no supervisor: the usual refusal applies
+        return None
+    if supervisor is None or not pay.slot_locked(supervisor):
+        return None
+    return json.dumps(pay.recovery_call(supervisor, method, params), ensure_ascii=False)
 
 
 def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id: Optional[str] = None,
@@ -379,13 +521,9 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     ``{"success": True, "method", "result"}`` or ``{"error": ...}``."""
     effective_task_id = task_id or "default"
 
-    # dlz: after a card fill, capture methods are refused while any payment mark exists (raw CDP cannot
-    # name an authoritative slot; tools/browser_payment_privacy.py).
-    from tools.browser_payment_privacy import payment_session_sensitive, screenshot_refusal
-
-    if payment_session_sensitive(effective_task_id) and method in {
-            "Page.captureScreenshot", "Page.printToPDF", "Page.startScreencast", "Page.captureSnapshot"}:
-        return json.dumps(screenshot_refusal())
+    answered = _payment_answer(effective_task_id, method, params, routed=bool(frame_id or target_id))
+    if answered is not None:
+        return answered
 
     from tools.browser_control_route import ManagedBrowserError
 
@@ -394,7 +532,7 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
         try:
             frame_endpoint = _resolve_cdp_endpoint() if _WS_AVAILABLE else ""
         except ManagedBrowserError as exc:  # dlz: surfaced, never swallowed into a guess
-            return tool_error(str(exc))
+            return _err(str(exc))
         blocked = _browser_cdp_private_guard(method=method, params=params or {}, target_id=frame_id,
                                              endpoint=frame_endpoint)
         if blocked:
@@ -403,24 +541,24 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
                                            params=params, timeout=timeout)
 
     if not method or not isinstance(method, str):
-        return tool_error("'method' is required (e.g. 'Target.getTargets')", cdp_docs=CDP_DOCS_URL)
+        return _err("'method' is required (e.g. 'Target.getTargets')", cdp_docs=CDP_DOCS_URL)
     if not _WS_AVAILABLE:
-        return tool_error("The 'websockets' Python package is required but not installed. "
+        return _err("The 'websockets' Python package is required but not installed. "
                           "Run: hermes pm repair")
     try:
         endpoint = _resolve_cdp_endpoint()
     except ManagedBrowserError as exc:  # dlz: managed mode refusal, surfaced as itself
-        return tool_error(str(exc))
+        return _err(str(exc))
     if not endpoint:
-        return tool_error("No CDP endpoint is available. Run '/browser connect' to attach to a running Chrome, "
+        return _err("No CDP endpoint is available. Run '/browser connect' to attach to a running Chrome, "
                           "Brave, Chromium, or Edge browser, or set 'browser.cdp_url' in config.yaml.", cdp_docs=CDP_DOCS_URL)
     if not endpoint.startswith(("ws://", "wss://")):
-        return tool_error(f"CDP endpoint is not a WebSocket URL: {endpoint!r}. Expected ws://... or wss://... — "
+        return _err(f"CDP endpoint is not a WebSocket URL: {endpoint!r}. Expected ws://... or wss://... — "
                           "the /browser connect resolver should have rewritten this. Check that a Chromium-family "
                           "browser is actually listening on the debug port.")
     call_params: dict[str, Any] = params or {}
     if not isinstance(call_params, dict):
-        return tool_error(f"'params' must be an object/dict, got {type(call_params).__name__}")
+        return _err(f"'params' must be an object/dict, got {type(call_params).__name__}")
 
     blocked = _browser_cdp_private_guard(method=method, params=call_params, endpoint=endpoint, target_id=target_id)
     if blocked:
@@ -434,25 +572,27 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     try:
         result = _run_async(_cdp_call(endpoint, method, call_params, target_id, safe_timeout))
     except TimeoutError as exc:
-        return tool_error(f"CDP call timed out after {safe_timeout}s: {exc}", method=method)
+        return _err(f"CDP call timed out after {safe_timeout}s: {_exc_text(exc)}", method=method)
     except RuntimeError as exc:
         if "payment_screenshot_blocked" in str(exc):
             # browser-control's capture guard refused the method on a card-filled slot.
+            from tools.browser_payment_privacy import screenshot_refusal
+
             return json.dumps(screenshot_refusal())
-        return tool_error(str(exc), method=method)
+        if "payment_surface_locked" in str(exc):
+            # dlz: browser-control refused the command: the slot is locked for a card payment.
+            from tools.browser_payment_surface import LOCKED, LOCKED_TEXT
+
+            return json.dumps({"success": False, "error_type": LOCKED, "error": LOCKED_TEXT})
+        return _err(_exc_text(exc), method=method)
     except WebSocketException as exc:
-        return tool_error(f"WebSocket error talking to CDP at {endpoint}: {exc}. The browser may have "
+        return _err(f"WebSocket error talking to CDP at {endpoint}: {_exc_text(exc)}. The browser may have "
                           "disconnected — try '/browser connect' again.", method=method)
     except Exception as exc:  # pragma: no cover — unexpected
         logger.exception("browser_cdp unexpected error")
-        return tool_error(f"Unexpected error: {type(exc).__name__}: {exc}", method=method)
+        return _err(f"Unexpected error: {type(exc).__name__}: {_exc_text(exc)}", method=method)
 
-    payload: dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
-        result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
-        flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()))}
-    if target_id:
-        payload["target_id"] = target_id
-    return json.dumps(payload, ensure_ascii=False)
+    return _success_payload(result, method, target_id)
 
 
 BROWSER_CDP_SCHEMA: dict[str, Any] = {

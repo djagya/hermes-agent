@@ -103,3 +103,13 @@ def test_config_yaml_gateway_section_is_bridged():
     gw_data: dict = {}
     bridge_toplevel_keys({"gateway": {"resume_interrupted": "ask"}}, {"resume_interrupted": "ask"}, gw_data)
     assert GatewayConfig.from_dict(gw_data).resume_interrupted == "ask"
+
+
+def test_internal_notifications_carry_no_sender_prefix_in_a_shared_topic():
+    # dlz (R-op-20261109-A11): background/delegation notices arrived as "[Danil] [INTERNAL NOTIFICATION ...]".
+    runner, source = _runner(), _topic_source()
+    notice = "[IMPORTANT: Background process finished]"
+    internal = MessageEvent(text=notice, message_type=MessageType.TEXT, source=source, internal=True)
+    assert runner._prefix_inbound_sender_context(internal, source, notice) == notice
+    human = MessageEvent(text="hi", message_type=MessageType.TEXT, source=source)
+    assert runner._prefix_inbound_sender_context(human, source, "hi").startswith("[Danil]")

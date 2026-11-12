@@ -4,6 +4,8 @@ commands, ``vault.*`` RPC handlers) get the designed error path instead of a raw
 traceback. Corruption arrives via partial-write survivors, manual edits of the
 envelope, or format drift."""
 
+import re
+
 import pytest
 
 from agent.vault_store import VaultError, VaultStore
@@ -47,3 +49,18 @@ def test_corrupt_vault_raises_vault_error_on_every_reader(tmp_path, op):
     }[op]
     with pytest.raises(VaultError):
         call()
+
+
+def test_a_payment_record_revision_follows_the_stored_record(tmp_path):
+    """Design v2 A8 (local store): meta and the secret read report the same revision; a record rewritten
+    under the same id (restore, manual edit) gets a new one. The revision is a keyed digest, not the card."""
+    store = VaultStore(tmp_path / "vault")
+    card = {"card_number": "4242424242424242", "exp_month": "07", "exp_year": "2035", "cvc": "837"}
+    meta = store.add_item("payment", "Synthetic card", card)
+    secret, revision = store.resolve_secret_with_revision(meta.id)
+    assert revision == meta.revision == store.get_meta(meta.id).revision and secret["cvc"] == "837"
+    assert re.fullmatch(r"local=[0-9a-f]{32}", revision)  # keyed digest only, never card digits
+    records = store._read_all()
+    records[0]["secret"]["cvc"] = "838"
+    store._write_all(records)
+    assert store.get_meta(meta.id).revision != meta.revision

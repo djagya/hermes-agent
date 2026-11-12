@@ -79,6 +79,9 @@ class LoginBackend(ABC):
     display_name: str        # user-facing
     prefix: str              # handle prefix ("vault_", "op:", "bw:")
     needs_unlock: bool = False
+    # dlz: True when ``VaultItemMeta.revision`` and ``resolve_payment_secret`` name the item revision; a card
+    # fill then refuses an item without one before consent. False (plugins): the in-context re-read only.
+    payment_revisions: bool = False
 
     def owns(self, handle: str) -> bool:
         return handle.startswith(self.prefix)
@@ -111,6 +114,17 @@ class LoginBackend(ABC):
         """Full payload of a payment/address item (server-side only). External managers list only
         logins, so the base returns the password-only shape."""
         return {"password": self.resolve_password(handle)}
+
+    def payment_revision(self, meta: VaultItemMeta) -> str:
+        """The revision a card fill binds for ``meta``, from metadata only (never a value): the listed
+        ``meta.revision`` here; a backend whose listing can lack its strongest part looks it up (1Password)."""
+        return str(getattr(meta, "revision", "") or "")
+
+    def resolve_payment_secret(self, handle: str) -> tuple[dict[str, str], Optional[str]]:
+        """A card payload plus the revision of the item it was read from (``VaultItemMeta.revision``), both
+        from one read. ``None``: this backend cannot say which revision it returned (plugins today); the
+        card fill then relies on its in-context metadata re-read alone."""
+        return self.resolve_secret(handle), None
 
 
 def run_with_stdin_secret(argv: Sequence[str], *, env: dict[str, str], secret: str, timeout: float,
@@ -176,8 +190,24 @@ def is_enabled(name: str) -> bool:
     return is_installed(name)
 
 
+def _browser_profile_enabled() -> bool:
+    """The real-profile browser login source is on exactly when ``browser.use_real_profile`` is — the
+    same consent that snapshots the profile's Login Data. Not a bw/op-style installed-CLI check."""
+    from tools.browser_session_cloud import use_real_profile
+    return use_real_profile()
+
+
+def managed_browser_mode() -> bool:
+    """dlz: monolith browser-control owns every browser (``tools.browser_control_route``). The real-profile
+    source would launch or attach a local Chromium over direct CDP, outside control leases and handoff
+    admission, so it never runs then. ``managed_browser`` fails closed (a broken probe counts as managed)."""
+    from tools.browser_session_cdp import managed_browser
+    return managed_browser()
+
+
 def enabled_backends() -> list[LoginBackend]:
-    """Local first (always on), then every detected external manager the user has not turned off."""
+    """Local first (always on), then every detected external manager the user has not turned off,
+    then the read-only real-profile browser source when ``browser.use_real_profile`` is on."""
     from agent.vault_backends.local import LocalLoginBackend
 
     cfg = _cfg()
@@ -186,6 +216,9 @@ def enabled_backends() -> list[LoginBackend]:
         if is_enabled(cls.name):
             section = cfg.get(cls.name) or {}
             out.append(cls(section if isinstance(section, dict) else {}))
+    if _browser_profile_enabled() and not managed_browser_mode():  # dlz: never in managed mode
+        from agent.vault_backends.browser import BrowserProfileLoginBackend
+        out.append(BrowserProfileLoginBackend())
     from agent.vault_backend_registry import enabled_plugin_backends
     return out + enabled_plugin_backends(cfg)
 

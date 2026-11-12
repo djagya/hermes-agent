@@ -135,6 +135,9 @@ jobs:
       - name: Set up locked Python and test dependencies
         uses: ./.github/actions/setup-pm
         with:
+          # Tests that drive the real scripts/build/node-deps.mjs need pnpm (and
+          # with it PM's Node) on PATH.
+          packages: pnpm
           extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain"]'
           test-environment: 'true'
           prune-python-cache: true
@@ -166,14 +169,18 @@ jobs:
 
       - name: Run tests (slice ${{ matrix.slice }})
         # Per-file isolation via scripts/run_tests.sh: each test file runs
-        # in its own freshly-spawned `python -m pytest <file>` subprocess.
-        # Each slice job discovers the plan's roots itself and runs only its
-        # own duration-balanced slice — no pre-computed file lists.
-        run: |
-          # setup-pm exports HERMES_PYTHON from its isolated test environment;
-          # it does not create a checkout-local .venv.
-          scripts/run_tests.sh --slice "${{ matrix.slice }}"
+        # in its own freshly-spawned `python -m pytest <file>` subprocess
+        # with bounded parallelism. No xdist, no shared workers, no
+        # module-level state leakage between files.
+        #
+        # No --files: each slice job discovers the plan's roots itself and runs
+        # only its own duration-balanced slice (HERMES_TEST_SLICE below) — no
+        # pre-computed file lists. setup-pm exports HERMES_PYTHON from its
+        # isolated test environment; it does not create a checkout-local .venv.
+        run: just test-all
         env:
+          # dlz: the plan job's slice of this job ("I/N"); the runner reads it as --slice.
+          HERMES_TEST_SLICE: ${{ matrix.slice }}
           # Discovery roots resolved by the plan job (full scope: "tests").
           # run_tests.sh forwards this into the hermetic runner env, where it
           # becomes the --paths default.
@@ -239,7 +246,7 @@ jobs:
         # HERMES_E2E_REQUIRE_TUI=1 below turns a missing build into a failure.
         uses: ./.github/actions/retry
         with:
-          command: npm ci --workspace ui-tui --ignore-scripts --no-audit --no-fund && npm run build --workspace ui-tui
+          command: pnpm install --frozen-lockfile --filter "{./ui-tui}..." --ignore-scripts && pnpm --dir ui-tui run build
 
       - name: Install ripgrep (prebuilt binary)
         run: |
@@ -391,10 +398,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
-          # pull_request checkouts are the synthetic merge into the base.
-          # That merge's first parent is the base, so `git describe HEAD~1`
-          # (N-1) would follow the base branch instead of the candidate.
-          # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
+          # dlz: pull_request checkouts are the synthetic merge into the base, which
+          # also reaches every release tag on the base branch. Check out the candidate
+          # itself so the upgrade start version is the newest release behind the PR
+          # head (tests/e2e/core/upgrade/_install_helpers.upgrade_base).
           ref: ${{ inputs.commit || (github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha) }}
           fetch-depth: 0
           fetch-tags: true

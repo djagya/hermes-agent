@@ -8,7 +8,6 @@ import sys
 import threading
 import time
 from concurrent.futures import Future
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import copy
@@ -28,8 +27,6 @@ _CRON_RUN_HEARTBEAT_INTERVAL = 10.0
 # wedged job, but with HERMES_CRON_TIMEOUT=0 (explicit "unlimited") a truly hung run_one_job would otherwise
 # mask the gateway watchdog forever — pre-#76502 the parent was at least reaped at ~1800s.
 _CRON_RUN_HEARTBEAT_CEILING = 6 * 3600.0
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     AmbiguousJobReference,
@@ -763,7 +760,15 @@ def _action_create(a: dict[str, Any]) -> str:
 
 
 def _action_list(a: dict[str, Any]) -> str:
-    jobs = [_format_job(job) for job in list_jobs(include_disabled=a["include_disabled"])]
+    # dlz (R-op-20261109-A7): list with job_id answers for that one job; a one-job repair read the
+    # whole ~185 KB registry before.
+    if a.get("job_id"):
+        job, error = _resolve_job_or_error(a["job_id"])
+        if error:
+            return error
+        jobs = [_format_job(job)]
+    else:
+        jobs = [_format_job(job) for job in list_jobs(include_disabled=a["include_disabled"])]
     _result = {"success": True, "count": len(jobs), "jobs": jobs}
     # Same inert-job class as create; an empty list has nothing inert.
     if jobs:
@@ -1152,7 +1157,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "job_id": {
                 "type": "string",
-                "description": "Required for update/pause/resume/remove/run/cancel."
+                "description": "Required for update/pause/resume/remove/run/cancel. With list: show only that job."
             },
             "pinned": {
                 "type": "boolean",

@@ -1,6 +1,5 @@
 """Telegram inline-photo eligibility and legacy extraction, including code literals."""
 import re
-from typing import Any
 
 from gateway.platforms.base import BasePlatformAdapter
 
@@ -103,11 +102,3 @@ class TelegramInlinePhotosMixin:
                 or self._exceeds_legacy_message_limit(content)
             )
             and self._rich_content_ok(content))
-
-    def _rich_message_payload(self, content: str, *, skip_entity_detection: bool = False) -> dict[str, Any]:
-        """Keep authored HTTPS image blocks in Telegram's native rich Markdown."""
-        from plugins.platforms.telegram.adapter import _rich_normalize_linebreaks
-        payload: dict[str, Any] = {"markdown": _rich_normalize_linebreaks(content)}
-        if skip_entity_detection:
-            payload["skip_entity_detection"] = True
-        return payload

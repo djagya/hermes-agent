@@ -148,13 +148,35 @@ class Report:
 
 def source_inventory() -> dict:
     """Deterministic source inputs, NOT a claim about a built image's contents."""
+    # dlz: the JS workspace locks with pnpm since upstream v0.23.1 (package-lock.json is gone).
     names = git("ls-files", "Dockerfile", ".dockerignore", "docker", "pm/lock.json",
-                "pyproject.toml", "uv.lock", "package-lock.json").splitlines()
+                "pyproject.toml", "uv.lock", "pnpm-lock.yaml", "pnpm-workspace.yaml").splitlines()
     rows = [{"path": name, "sha256": hashlib.sha256(Path(name).read_bytes()).hexdigest()}
             for name in sorted(names)]
     return {"kind": "image-source-inputs", "files": rows,
             "sha256": hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest(),
             "built_image_inspected": False}
+
+
+def pinned_pnpm_version() -> str:
+    """The pnpm version ``pm/lock.json`` pins (what setup-pm installs and the root preinstall demands)."""
+    version = json.loads(Path("pm/lock.json").read_text(encoding="utf-8-sig"))["packages"]["pnpm"]["version"]
+    if not isinstance(version, str) or not version:
+        raise ValueError("pm/lock.json pins no pnpm version")
+    return version
+
+
+def record_pnpm_pin(report) -> None:
+    """dlz: the pnpm on PATH must be the pinned one before it judges the lock (``--ignore-scripts`` skips
+    the root preinstall that would otherwise enforce it)."""
+    try:
+        pinned = pinned_pnpm_version()
+        found = subprocess.run(["pnpm", "--version"], capture_output=True, text=True, encoding="utf-8",
+                               timeout=120, check=False).stdout.strip()
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+        report.record("pnpm-pin", "failed", "infrastructure/runner failure", error=type(exc).__name__)
+        return
+    report.record("pnpm-pin", "passed" if found == pinned else "failed", pinned=pinned, found=found[:64])
 
 
 def parent_evidence(args, path: str, causal_class: str, witness: str = "") -> dict:
@@ -223,7 +245,13 @@ def lane(args):
     py = args.python
     if args.lane == "identity-and-contracts" and args.phase != "tests":
         report.command("lock", [py, "-m", "pm.build_env", "--source", ".", "--check-lock"])
-        report.command("npm-lock", ["npm", "ci", "--dry-run", "--ignore-scripts", "--no-audit", "--no-fund"])
+        # dlz: pnpm workspace lock (upstream v0.23.1 deleted package-lock.json): the pinned pnpm checks it
+        # against every manifest and pnpm-workspace.yaml's policy without node_modules, and the check
+        # must leave both files as committed.
+        record_pnpm_pin(report)
+        report.command("pnpm-lock", ["pnpm", "install", "--frozen-lockfile", "--lockfile-only", "--ignore-scripts"])
+        report.command("pnpm-lock-unchanged",
+                       ["git", "diff", "--exit-code", "--", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
         origins = {
             ".github/workflows/ci.yaml": ("baseline fork debt", "if: false"),
             ".github/workflows/desktop-bundle-smoke.yml": ("inherited upstream behavior", "cache-mode: read"),

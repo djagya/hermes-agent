@@ -80,7 +80,13 @@ def browser_dialog(
                 "/browser connect first."
             ),
         })
-    result = supervisor.respond_to_dialog(action=action, prompt_text=prompt_text, dialog_id=dialog_id)
+    from tools.browser_payment_surface import fenced_native
+
+    # dlz (payment lockdown): never answered on a locked slot, never across a claim (payload withheld then).
+    result = fenced_native(supervisor, lambda: supervisor.respond_to_dialog(action=action, prompt_text=prompt_text,
+                                                                           dialog_id=dialog_id))
+    if result.get("error_type"):
+        return json.dumps(result)
     if result.get("ok"):
         return json.dumps({"success": True, "action": action, "dialog": result.get("dialog", {})})
     return json.dumps({"success": False, "error": result.get("error", "unknown error")})

@@ -101,7 +101,6 @@ def _runner(session_store):
     runner._agent_cache_lock = threading.Lock()
     runner._running_agents = {}
     runner._running_agents_ts = {}
-    runner._session_run_generation = {}
     runner._session_model_overrides = {}
     runner._pending_model_notes = {}
     runner._pending_skills_reload_notes = {}
@@ -153,7 +152,8 @@ def _run_compression_failure_turn(runner, source, *, run_generation=None):
                 session_key=SESSION_KEY,
                 run_generation=run_generation,
             ),
-            timeout=2,
+            # Hang guard only: the first turn in the file pays cold imports, which overran 2s on a loaded CI runner.
+            timeout=30,
         )
     )
 

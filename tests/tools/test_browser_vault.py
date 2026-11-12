@@ -484,12 +484,13 @@ class TestBrowserVaultTools:
             assert "window.location.origin" in expression
             assert '"https://example.com"' in expression
             # Simulate the page having navigated cross-origin by the time
-            # the fill script executes: the script's own assert fires.
+            # the fill script executes: the script's own assert fires and
+            # answers with this fill's refusal tag (its pre-write proof).
+            import re
+            tag = re.search(r'tag: "(hv-[0-9a-f]+)"', expression).group(1)
             return {
                 "success": True,
-                "result": json.dumps(
-                    {"refused": "origin_changed", "found": "https://evil.com"}
-                ),
+                "result": json.dumps({"refused": "origin_changed", "tag": tag}),
             }
 
         with patch("agent.vault_store.get_vault_store", return_value=store), \
@@ -619,16 +620,17 @@ class TestBrowserVaultTools:
         ("36227206271667", ("3622", "720627", "1667")),
     ])
     def test_payment_fill_registers_only_card_secrets_for_redaction(self, number, groups):
-        """Every later tool result is scrubbed of the registered values, so a payment fill registers
-        the card number (as typed, spaced or dashed) and CVC, and never the
-        holder name, expiry or postcode, which are common strings elsewhere."""
+        """Every later tool result is scrubbed until the release: a payment fill opens a window that masks
+        every digit run as long as the number (as typed, spaced or dashed) or the CVC, and scrubs the holder
+        as a whole word (r8); the expiry and postcode, common strings elsewhere, stay readable."""
         from tools.browser_vault_payment import _register_card_redaction
         from agent import redact
 
         try:
             _register_card_redaction({**_CARD, "card_number": number})
-            text = "A User, 94110, renews 2029, month 7, build 1.27.3, date 07/29, ratio 107/290, blog /2025/07/29/"
-            assert redact.redact_sensitive_text(text) == text
+            text = "A User, 94110, renews 2029, month 7, build 1.27.3, date 07/29, blog /2025/07/29/, Users"
+            assert redact.redact_sensitive_text(text) == text.replace("A User,", "«redacted-card»,", 1)
+            assert redact.redact_sensitive_text("ratio 107/290") == "ratio •••/•••"
             for secret in (number, " ".join(groups), "-".join(groups)):
                 assert secret not in redact.redact_sensitive_text(f"page says {secret}."), secret
             assert "cvc 123." not in redact.redact_sensitive_text("cvc 123.")
@@ -940,7 +942,7 @@ class TestExplicitCodeMode:
         from agent.tool_executor import _register_supplied_otp_for_redaction
 
         registered = []
-        with patch("agent.redact.register_vault_redaction_value", registered.append):
+        with patch("agent.redact.register_vault_redaction_value", lambda value, **kw: registered.append(value)):
             for bad in ("0", "a1", "123", "12 34", "ab\ncd", "12345678901234567", ""):
                 _register_supplied_otp_for_redaction("browser_vault_enter_code", {"code": bad})
             _register_supplied_otp_for_redaction("browser_vault_enter_code", {"code": " 0421-72 "})
@@ -1049,21 +1051,21 @@ class TestExplicitCodeMode:
 
     def test_supplied_code_registered_for_redaction_and_scrubbed_from_persistence(self):
         """The pre-dispatch hook registers the code; redact_sensitive_text then scrubs
-        it from request dumps, logs and any tool_calls row projection."""
+        it from request dumps, logs and any tool_calls row projection. r9: a pure-digit code the model
+        typed is never registered (masking it would answer "is my guess the PIN?")."""
         from agent.redact import clear_vault_redaction_values, redact_sensitive_text
         from agent.tool_executor import _register_supplied_otp_for_redaction
 
         try:
-            _register_supplied_otp_for_redaction(
-                "browser_vault_enter_code",
-                {"code": "042172", "expected_origin": "https://x.example"},
-            )
+            for code in ("A7K2Q9", "042172"):
+                _register_supplied_otp_for_redaction(
+                    "browser_vault_enter_code", {"code": code, "expected_origin": "https://x.example"})
             payload = json.dumps({
                 "tool_calls": [{"function": {"name": "browser_vault_enter_code",
-                                             "arguments": "{\"code\": \"042172\"}"}}]
+                                             "arguments": "{\"code\": \"A7K2Q9\", \"pin\": \"042172\"}"}}]
             })
             scrubbed = redact_sensitive_text(payload, force=True)
-            assert "042172" not in scrubbed
+            assert "A7K2Q9" not in scrubbed and "042172" in scrubbed
             # other tools' args are untouched by the registration itself
             _register_supplied_otp_for_redaction("browser_type", {"text": "042172"})
             # (same value already registered; the point is the hook ignores other tools)
@@ -1075,11 +1077,13 @@ class TestExplicitCodeMode:
         from agent.session_persistence import _durable_tool_calls
 
         try:
-            register_vault_redaction_value("042172")
+            register_vault_redaction_value("A7K2Q9")
+            register_vault_redaction_value("042172")  # r9: pure digits stay as the model wrote them (valid JSON)
             row = [{"function": {"name": "browser_vault_enter_code",
-                                 "arguments": "{\"code\": \"042172\", \"expected_origin\": \"https://x\"}"}}]
+                                 "arguments": "{\"code\": \"A7K2Q9\", \"pin\": \"042172\", \"expected_origin\": \"https://x\"}"}}]
             out = _durable_tool_calls(row)
-            assert "042172" not in out[0]["function"]["arguments"]
+            assert "A7K2Q9" not in out[0]["function"]["arguments"]
+            assert "042172" in out[0]["function"]["arguments"]
             assert "expected_origin" in out[0]["function"]["arguments"]  # structure kept
         finally:
             clear_vault_redaction_values()
@@ -1103,7 +1107,7 @@ class TestExplicitCodeMode:
             register_supplied_otps(calls)
             rows = [{"function": {"name": c.function.name, "arguments": c.function.arguments}} for c in calls]
             out = _durable_tool_calls(rows)
-            assert "042172" not in out[0]["function"]["arguments"]
+            assert "042172" in out[0]["function"]["arguments"]  # r9: a pure-digit code the model typed: never registered
             assert "A7-99Z" not in out[1]["function"]["arguments"]
             assert out[2] is rows[2]  # other tools' args are not registered
         finally:
@@ -1139,7 +1143,7 @@ class TestExplicitCodeMode:
         agent.log_prefix, agent.quiet_mode, agent.verbose_logging = "", True, False
         agent._invalid_tool_retries = agent._invalid_json_retries = 0
         tool_call = SimpleNamespace(id="call_0", type="function", function=SimpleNamespace(
-            name="browser_vault", arguments=json.dumps({"action": "enter_code", "code": "042172",
+            name="browser_vault", arguments=json.dumps({"action": "enter_code", "code": "A7K2Q9",
                                                         "expected_origin": self.PAGE_ORIGIN})))
         try:
             with pytest.raises(_Staged):
@@ -1150,7 +1154,7 @@ class TestExplicitCodeMode:
                     compression_attempts=0, max_compression_attempts=1, final_response=None, failed=False,
                     _turn_exit_reason=None, truncated_tool_call_retries=0, current_turn_user_idx=0,
                 )
-            assert "042172" not in staged["rows"][0]["function"]["arguments"]
+            assert "A7K2Q9" not in staged["rows"][0]["function"]["arguments"]
         finally:
             clear_vault_redaction_values()
 
@@ -1172,8 +1176,11 @@ class TestExplicitCodeMode:
         with patch.object(browser_vault_tool, "browser_vault_fill", side_effect=lambda **kw: seen.update(kw) or "{}"), \
              patch.object(browser_vault_tool, "_fenced_page_op", side_effect=lambda tid, fn: fn()):
             browser_vault_tool._handle_vault(
-                {"action": "fill", "handle": "op:card", "merchant_origin": "https://shop.example"}, task_id="t")
-        assert seen == {"handle": "op:card", "task_id": "t", "merchant_origin": "https://shop.example", "purpose": "login"}
+                {"action": "fill", "handle": "op:card", "merchant_origin": "https://shop.example",
+                 "cart": {"items": []}, "approve_origins": ["https://psp.example"]}, task_id="t")
+        # dlz (Track B): the stated cart and approve_origins go through unchanged; fill_payment validates them.
+        assert seen == {"handle": "op:card", "task_id": "t", "merchant_origin": "https://shop.example", "purpose": "login",
+                        "cart": {"items": []}, "approve_origins": ["https://psp.example"]}
 
     def test_handle_bound_to_several_origins_accepts_any_of_them(self):
         from types import SimpleNamespace

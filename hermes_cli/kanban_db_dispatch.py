@@ -2557,7 +2557,7 @@ def _module_hermes_argv() -> list[str]:
     ``-m hermes_cli.main <argv>``. ``-P`` is per-invocation (unlike
     ``PYTHONSAFEPATH``): the worker's own ``python script.py`` / pytest children
     keep normal path semantics."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root = __import__("hermes_cli._startup_fast", fromlist=["project_root_str"]).project_root_str()
     source = (
         f"import sys, runpy; sys.path.insert(0, {root!r}); "
         "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"

@@ -21,6 +21,8 @@ from urllib.request import urlopen
 
 import pytest
 
+from tests.waiting import wait_until
+
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
@@ -199,6 +201,39 @@ def _payone_page(path, origins):
     return None
 
 
+# dlz (Track B): a KPS-like unreviewed hosted form (secure.kps-payment.de/customer/wallet/pc/WalletInput.jsp shape,
+# field names ASSUMED: the real KPS DOM was not captured). Merchant total text, the real form in one OOPIF, and
+# three copies of the same form the user cannot see: display:none, clipped to nothing, covered by an overlay.
+_KPS_FORM = (
+    '<meta charset="utf-8"><div>Betrag: 22,66 EUR</div>'
+    '<label for="h">Karteninhaber</label><input id="h" name="cardHolder">'
+    '<label for="n">Kartennummer</label><input id="n" name="cardNumber">'
+    '<label for="c">Prüfnummer</label><input id="c" name="cvc" maxlength="4">'
+    '<select id="m" name="expMonth" aria-label="Ablaufmonat">'
+    + "".join(f"<option>{m:02d}</option>" for m in range(1, 13)) + '</select>'
+    '<select id="y" name="expYear" aria-label="Ablaufjahr">'
+    + "".join(f"<option>{y}</option>" for y in range(2026, 2041)) + '</select>'
+    '<input autocomplete="cc-number" aria-hidden="true" tabindex="-1" style="position:absolute;width:1px;height:1px">'
+    "<script>window.seen=[];for(const el of document.querySelectorAll('input,select')){"
+    "el.addEventListener('input',()=>seen.push(el.id+':input'));el.addEventListener('change',()=>seen.push(el.id+':change'))}"
+    "</script>")
+
+
+def _kps_page(path, origins):
+    if path == "/customer/wallet/pc/WalletInput.jsp":
+        return _KPS_FORM
+    if path == "/kps-merchant":
+        form = origins["psp"] + "/customer/wallet/pc/WalletInput.jsp"
+        return ('<meta charset="utf-8"><p>2 × Erwachsene, Reihe 6</p><p>Gesamtbetrag 22,66 €</p>'
+                f'<iframe id="kps" src="{form}?ref=x" style="width:560px;height:200px"></iframe>'
+                f'<iframe src="{form}?ref=hidden" style="display:none"></iframe>'
+                '<div style="display:flex">'
+                f'<div style="overflow:hidden;width:0;height:0"><iframe src="{form}?ref=clipped"></iframe></div>'
+                f'<div style="position:relative"><iframe src="{form}?ref=covered" style="width:280px;height:150px">'
+                '</iframe><div style="position:absolute;inset:0;background:#fff"></div></div></div>')
+    return None
+
+
 def _provider_page(path, origins):
     psp = origins.get("psp", "")
     merchants = {
@@ -269,7 +304,7 @@ def payment_browser(tmp_path, record_property):
                 "/dt-duplicate": '<input autocomplete="cc-number"><input autocomplete="cc-exp">'
                 f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
             }.get(self.path) or _shopify_page(self.path, origins) or _paypal_page(self.path, origins) \
-                or _payone_page(self.path, origins) \
+                or _payone_page(self.path, origins) or _kps_page(self.path, origins) \
                 or _provider_page(self.path, origins) or FIELDS
             body = (
                 '<!doctype html><form onsubmit="window.submitted=true;return false">'
@@ -1016,3 +1051,105 @@ def test_paypal_guest_card_form_inside_buttons_fills_once(payment_browser, tmp_p
     assert values["n"] == CARD["card_number"] and values["c"] == CARD["cvc"] and values["e"]
     assert values["email"] == "a@b.example" and values["p"] == ""
     assert sup.evaluate_runtime("!!window.submitted")["result"] is False
+
+
+def _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=None):
+    """The managed-mode seams (lease route, capture guard, A9 claim) faked around a real Chromium page; the
+    unreviewed-destination switch on. Returns (first result, second result, consent kwargs, frame state)."""
+    from agent.vault_store import VaultStore
+    from tools.browser_supervisor import _schedule
+    from tools.browser_vault_tool import browser_vault_fill
+
+    sup, origins = payment_browser
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item("payment", "Synthetic card", {**CARD, "cardholder_name": "Ada Lovelace"},
+                          origin=origins["merchant"])
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    monkeypatch.setattr("tools.browser_vault_tool._is_managed", lambda: True)
+    monkeypatch.setattr("tools.browser_vault_tool._managed_supervisor", lambda task_id, admit=False: sup)
+    monkeypatch.setattr("tools.browser_vault_tool._bot_desktop_browser_session", lambda task_id: False)
+    monkeypatch.setattr("tools.browser_use_cli.vault_route", lambda task_id: {"lease": "live", "token": "t"})
+    monkeypatch.setattr("tools.browser_control_route.set_capture_guard", lambda lease, token: (True, ""))
+    monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface", lambda s, i: None)
+    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live"))
+    asked = []
+
+    def consent(message, description, **kwargs):
+        asked.append(kwargs)
+        if on_consent:
+            on_consent(sup, origins)
+        return "accept"
+
+    navigate(sup, origins["merchant"] + "/kps-merchant")
+    with patch("tools.approval_prompt.request_elicitation_consent", side_effect=consent):
+        first = browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"])
+        second = browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"],
+                                    cart={"items": [{"description": "Adult ticket", "quantity": 2}],
+                                          "total": "22.66", "currency": "EUR"},
+                                    approve_origins=[origins["psp"]])
+    state = {}
+    for t in _schedule(sup._cdp("Target.getTargets"), sup._loop, timeout=10)["result"]["targetInfos"]:
+        if t["type"] == "iframe" and "/WalletInput.jsp" in t["url"]:
+            fsid = _schedule(sup._cdp("Target.attachToTarget", {"targetId": t["targetId"], "flatten": True}),
+                             sup._loop, timeout=10)["result"]["sessionId"]
+            try:
+                reply = _schedule(sup._cdp("Runtime.evaluate", {
+                    "expression": "[[...document.querySelectorAll('input,select')].map(e=>e.value), seen]",
+                    "returnByValue": True}, session_id=fsid), sup._loop, timeout=10)
+            finally:
+                _schedule(sup._cdp("Target.detachFromTarget", {"sessionId": fsid}), sup._loop, timeout=10)
+            state[t["url"].rsplit("=", 1)[-1]] = reply["result"]["result"]["value"]
+    return json.loads(first), second, asked, state, sup
+
+
+def test_kps_like_unreviewed_form_fills_once_after_owner_approval(payment_browser, tmp_path, monkeypatch, caplog):
+    """v1 §9 test 7 with the v2 cart: the first call names the unreviewed origin and reads nothing; the second shows
+    one owner card and fills only the visible form, each select once, without submit; hidden, clipped and covered
+    copies stay empty."""
+    first, raw, asked, state, sup = _kps_fill(payment_browser, tmp_path, monkeypatch)
+    _sup, origins = payment_browser
+    assert first["error_type"] == "payment_destination_approval_required", first
+    assert first["approval_origins"] == [origins["psp"]] and first["needs"] == ["cart", "approve_origins"]
+    assert first["receiving"] == [{"origin": origins["psp"], "reviewed": False,
+                                   "fields": ["cc-csc", "cc-exp-month", "cc-exp-year", "cc-name", "cc-number"]}]
+    out = json.loads(raw)
+    assert out["success"] and out["retention_verified"] is True and out["destination_reviewed"] is False, out
+    assert out["page_match"] == "matched" and out["submitted"] is False
+    assert len(asked) == 1 and asked[0]["payment"]["unreviewed"] is True
+    assert asked[0]["payment"]["page_match"]["state"] == "matched"
+    values, seen = state["x"]
+    assert values[:3] == ["Ada Lovelace", CARD["card_number"], CARD["cvc"]] and values[3:5] == ["07", "2035"]
+    assert values[5] == ""  # the honeypot
+    assert seen.count("m:change") == 1 and seen.count("y:change") == 1
+    for copy in ("hidden", "clipped", "covered"):
+        assert all(v in ("", "01", "2026") for v in state[copy][0]) and state[copy][1] == [], (copy, state[copy])
+    assert sup.evaluate_runtime("!!window.submitted")["result"] is False
+    for secret in (CARD["card_number"], CARD["cvc"]):
+        assert secret not in raw and secret not in caplog.text
+    print("RECEIPT kps_like unreviewed=APPROVAL_REQUIRED_THEN_FILLED copies=EMPTY page_match=matched no_submit=PASS")
+
+
+def test_kps_like_form_navigated_during_consent_writes_nothing(payment_browser, tmp_path, monkeypatch):
+    """v1 §9 test 8: the approved iframe navigates while the owner's card is open: payment_page_changed, nothing
+    written anywhere."""
+    from tools.browser_supervisor import _schedule
+
+    def swap(sup, origins):
+        _schedule(sup._cdp("Runtime.evaluate", {
+            "expression": f"document.getElementById('kps').src={json.dumps(origins['psp'])}"
+                          "+'/customer/wallet/pc/WalletInput.jsp?ref=x2'"}, session_id=sup._page_session_id),
+            sup._loop, timeout=10)
+
+        def navigated():  # the approved iframe's new document is live (in the page's tree or as its own target)
+            tree = json.dumps(_schedule(sup._cdp("Page.getFrameTree", session_id=sup._page_session_id), sup._loop,
+                                        timeout=10))
+            return "ref=x2" in tree or "ref=x2" in json.dumps(_schedule(sup._cdp("Target.getTargets"), sup._loop,
+                                                                        timeout=10))
+
+        wait_until(navigated, what="the approved iframe navigated")
+
+    _first, raw, _asked, state, _sup = _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=swap)
+    out = json.loads(raw)
+    assert out["error_type"] == "payment_page_changed", out
+    assert all(v in ("", "01", "2026") for values, _seen in state.values() for v in values), state
+    print("RECEIPT kps_like navigated_during_consent=REFUSED zero_writes=PASS")

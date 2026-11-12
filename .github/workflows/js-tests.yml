@@ -6,7 +6,7 @@ on:
     inputs:
       workspaces:
         description: >-
-          JSON array of npm workspace dirs to check (from the classifier's
+          JSON array of JS workspace dirs to check (from the classifier's
           frontend_workspaces output). '[]' or empty = all workspaces —
           fail-open is deliberate: an unmapped frontend change must run
           everything, never nothing.
@@ -19,7 +19,7 @@ on:
 
 jobs:
   workspaces:
-    name: List npm workspaces
+    name: List JS workspaces
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
@@ -36,16 +36,19 @@ jobs:
         env:
           SELECTED_WORKSPACES: ${{ inputs.workspaces }}
         run: |
+          # dlz: pnpm ls lists the workspace projects (pnpm-workspace.yaml) without an
+          # install, as .github/scripts/run-workspace-checks.mjs discovers them upstream.
           node -e '
+            const { execFileSync } = require("node:child_process");
             const { readFileSync, appendFileSync } = require("node:fs");
-            const { join } = require("node:path");
-            const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
-            const locations = Object.keys(lock.packages).filter(p => p && lock.packages[p].link && lock.packages[p].resolved);
+            const { join, relative } = require("node:path");
+            const projects = JSON.parse(execFileSync("pnpm", ["ls", "--recursive", "--depth", "-1", "--json"], { encoding: "utf8" }));
             let selected = [];
             try { selected = JSON.parse(process.env.SELECTED_WORKSPACES || "[]"); } catch { /* fail open */ }
             if (!Array.isArray(selected)) selected = [];
-            const workspaces = [...new Set(locations.map(p => lock.packages[p].resolved).filter(p => !p.startsWith("node_modules/")))];
-            if (!workspaces.length) throw Error("no npm workspaces found in lockfile");
+            // The root project runs every workspace check: it is not a unit.
+            const workspaces = [...new Set(projects.map(p => relative(process.cwd(), p.path).split("\\").join("/")).filter(Boolean))];
+            if (!workspaces.length) throw Error("no pnpm workspace projects found");
             const wanted = selected.length ? workspaces.filter(p => selected.includes(p)) : workspaces;
             if (!wanted.length) throw Error("workspace selection matched no workspace");
             const checks = wanted.flatMap(p => {
@@ -94,11 +97,11 @@ jobs:
             libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 \
             xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
 
-      # setup-pm caches npm downloads, not the installed workspace tree.
-      # The job then extracts the full workspace node_modules
+      # setup-pm caches pnpm's store, not the installed workspace tree.
+      # The job then links the full workspace node_modules
       # again and runs the native postinstalls again. Electron's binary is
       # prepared explicitly below. This caches the installed tree itself, keyed on the
-      # lockfile, and skips ``npm ci`` on an exact hit. There are no
+      # lockfile, and skips ``pnpm install`` on an exact hit. There are no
       # restore-keys: a partial hit leaves a stale tree, so anything other
       # than an exact lockfile match reinstalls from the start.
       #
@@ -106,7 +109,7 @@ jobs:
       # artifacts and the explicitly prepared Electron dist, both inside the cached tree.
       #
       # The ~/.cache/electron download cache stays out of the key on purpose.
-      # ``npm ci`` is skipped on a hit, so nothing reads that cache. It only
+      # ``pnpm install`` is skipped on a hit, so nothing reads that cache. It only
       # makes the archive larger.
       - name: Restore node_modules
         id: node-modules-cache
@@ -119,7 +122,7 @@ jobs:
             ui-tui/packages/*/node_modules
             tests-js/node_modules
             web/node_modules
-          key: node-modules-scripts-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-npm${{ steps.node.outputs.npm-version }}-${{ hashFiles('package-lock.json') }}
+          key: node-modules-scripts-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-pnpm${{ steps.node.outputs.pnpm-version }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml') }}
 
       # Vitest records each file's duration and result under
       # node_modules/.vite/vitest and orders the next run from it, longest first.
@@ -130,20 +133,42 @@ jobs:
       - name: Drop vitest run history from the restored tree
         run: rm -rf node_modules/.vite/vitest apps/*/node_modules/.vite/vitest ui-tui/node_modules/.vite/vitest ui-tui/packages/*/node_modules/.vite/vitest tests-js/node_modules/.vite/vitest web/node_modules/.vite/vitest
 
+      # No --trust-lockfile: this install is the gate that checks every locked
+      # version against pnpm-workspace.yaml's release-age policy.
       - uses: ./.github/actions/retry
         if: steps.node-modules-cache.outputs.cache-hit != 'true'
         with:
-          command: npm ci
+          command: just js-install
+
+      # The cached tree is keyed on the lockfile alone, so an exact hit proves
+      # nothing about the manifests. This checks the lockfile still matches
+      # every package.json and passes the release-age policy, without
+      # touching node_modules.
+      - name: Check the lockfile against the manifests and policy
+        if: steps.node-modules-cache.outputs.cache-hit == 'true'
+        run: pnpm install --frozen-lockfile --lockfile-only
+
+      # tests-js/pnpm-workspace-policy.test.mjs reads pnpm-workspace.yaml after the install above; an
+      # install that rewrites it (an exclude prune, say) would hide what was committed, and the
+      # clean-checkout step at the end only warns.
+      - name: Check the install kept pnpm-workspace.yaml as committed
+        run: git diff --exit-code -- pnpm-workspace.yaml
+
       # Electron 42 no longer fetches its binary in postinstall (upstream v0.22.5).
       - name: Prepare locked Electron runtime
         if: matrix.package == 'apps/desktop'
-        run: node scripts/build/electron-runtime.mjs --source .
+        run: just electron-runtime
       # dlz: one check per matrix leg (the fork has no 32-core runner, so it keeps
       # the matrix); the step keeps upstream's name, which
       # tests/ci/test_js_tests_vitest_history.py orders the history drop against.
+      # Upstream runs every unit at once with `just check-js-ci`; one leg runs the
+      # unit the same way run-workspace-checks.mjs does (`pnpm --dir <pkg> run`).
       # The WhatsApp bridge suites run in the whatsapp-bridge job below.
       - name: Run all workspace checks
-        run: npm run --prefix ${{ matrix.package }} ${{ matrix.script }}
+        env:
+          PACKAGE: ${{ matrix.package }}
+          SCRIPT: ${{ matrix.script }}
+        run: pnpm --dir "$PACKAGE" run "$SCRIPT"
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
         # leaves an untracked or modified file in the checkout is reported here. Runs only when
@@ -171,9 +196,9 @@ jobs:
       - name: Install WhatsApp bridge dependencies
         uses: ./.github/actions/retry
         with:
-          command: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/whatsapp-bridge
+          command: just js-install-whatsapp-bridge
       - name: Run WhatsApp bridge node tests
-        run: node --test scripts/whatsapp-bridge/*.test.mjs
+        run: just test-whatsapp-bridge
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
         # leaves an untracked or modified file in the checkout is reported here. Runs only when

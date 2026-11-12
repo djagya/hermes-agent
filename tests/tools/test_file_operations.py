@@ -468,6 +468,20 @@ class TestSearchFilesIncludesDirectories:
         assert str(child) in result.files
         assert str(root) not in result.files
 
+    @pytest.mark.parametrize("tool", ["rg", "grep"])
+    def test_a_pattern_starting_with_a_dash_is_a_pattern_not_a_flag(self, tmp_path, monkeypatch, tool):
+        """dlz: "--bg|--ink" (CSS custom properties) failed with "rg: unrecognized flag"."""
+        import shutil
+
+        if not shutil.which(tool):
+            pytest.skip(f"{tool} not installed")
+        (tmp_path / "a.css").write_text(":root { --bg: #fff; }\n", encoding="utf-8")
+        ops = ShellFileOperations(LocalEnvironment("/"))
+        monkeypatch.setattr(ops, "_has_command", lambda command: command == tool or command not in ("rg", "grep"))
+        result = ops.search("--bg|--ink", path=str(tmp_path), target="content")
+        assert result.error is None, result.error
+        assert result.total_count >= 1
+
     def test_target_files_paginates_combined_files_and_directories(self, tmp_path, monkeypatch):
         """Files and directories share one ordering: page slices must compose."""
         root = tmp_path / "repo"

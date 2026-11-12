@@ -122,6 +122,10 @@ def _rewrite_stale_default(*, old: Any, **kw: Any) -> Callable[[dict[str, Any], 
     return functools.partial(_rewrite_key, match=lambda cur: cur == old, **kw)
 
 
+def _keep_explicit_clarify_timeout(results: dict[str, Any], quiet: bool) -> None:
+    """dlz: config v53 is a stamp only; an explicit ``agent.clarify_timeout`` is never rewritten."""
+
+
 def _lower_is(word: str) -> Callable[[Any], bool]:
     return lambda cur: isinstance(cur, str) and cur.strip().lower() == word
 
@@ -873,6 +877,12 @@ MIGRATIONS: tuple[tuple[int, Callable[[dict[str, Any], bool], None]], ...] = (
     # 51 -> 52: browser.backend + browser.extension_control dropped, AGENT_BROWSER_* .env settings ->
     # browser.* (see config_migrations_browser.migrate_to_52).
     (52, migrate_to_52),
+    # 52 -> 53: upstream lowers a saved clarify_timeout 3600 (the old default) to 90. dlz: a saved
+    # 3600 cannot be told from one the owner chose, and the fork's identity config sets it on purpose
+    # (Sera waits up to an hour for an answer; the identity sync re-stamps an older version, so the
+    # rewrite would land on every sync). The step only stamps 53; an unset key inherits the new
+    # 90-second default at read time (DEFAULT_CONFIG).
+    (53, _keep_explicit_clarify_timeout),
 )
 
 #: Steps triggered by a legacy key or identifier (a renamed or retired key, a removed plugin or

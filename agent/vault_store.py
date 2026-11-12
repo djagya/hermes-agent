@@ -19,10 +19,13 @@ Design notes:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import uuid
 from contextlib import contextmanager, suppress
@@ -188,6 +191,11 @@ class VaultItemMeta:
     allowed_origins: tuple = ()
     payment_scope: str = "origin_bound"
     payment_frame_origins: tuple = ()
+    # dlz: a non-secret snapshot id of the stored item as ``key=value`` parts joined by ";" (1Password
+    # ``op.version`` and/or ``op.updated_at``; the local store ``local`` = a keyed digest of the record).
+    # Bound when a card-fill prompt is shown and re-checked when the card is read (``revision_verdict``);
+    # "" = no revision known. Never in to_dict / model output.
+    revision: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         out = {
@@ -648,10 +656,14 @@ class VaultStore:
         Callers must never place the returned values into tool results,
         logs, exceptions, or any string that reaches the session DB.
         """
+        return self.resolve_secret_with_revision(item_id)[0]
+
+    def resolve_secret_with_revision(self, item_id: str) -> tuple[dict[str, Any], str]:
+        """``resolve_secret`` plus the record's revision, both from the same read."""
         with self._locked():
             for rec in self._read_all():
                 if rec.get("id") == item_id:
-                    return dict(rec.get("secret") or {})
+                    return dict(rec.get("secret") or {}), _record_revision(rec)
         raise VaultError(f"no vault item with id {item_id!r}")
 
     @staticmethod
@@ -666,7 +678,54 @@ class VaultStore:
             identifier_type=rec.get("identifier_type") if identifier else None,
             identifier=identifier or None,
             has_otp=bool((rec.get("secret") or {}).get("otp_secret")),
+            revision=_record_revision(rec),
         )
+
+
+# dlz: per-process key for record revisions. A plain hash of a record would be a hash of card digits
+# (brute-forceable); a keyed digest only says "same record or not" inside this process, which is all a
+# fill compares (prompt time vs. read time).
+_REVISION_KEY = secrets.token_bytes(32)
+
+
+def _record_revision(rec: dict[str, Any]) -> str:
+    """A non-secret id of the stored record: changes whenever any field or secret value changes."""
+    canonical = json.dumps(rec, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return "local=" + hmac.new(_REVISION_KEY, canonical, hashlib.sha256).hexdigest()[:32]
+
+
+def _revision_parts(revision: Optional[str]) -> dict[str, str]:
+    parts: dict[str, str] = {}
+    for part in (revision or "").split(";"):
+        key, sep, value = part.partition("=")
+        if sep and key and value:
+            parts[key] = value
+    return parts
+
+
+def revision_verdict(bound: Optional[str], read: Optional[str]) -> str:
+    """``match`` / ``changed`` / ``unavailable`` for the revision a prompt was shown for and one read later.
+
+    dlz (Codex A2 r3 #4): both sides must carry the SAME parts, and every part must agree. A part only one
+    side has (``op.version`` from the reveal, none in the listing) is not comparable: ``unavailable``, so an
+    item edited within one ``updated_at`` value cannot pass on the timestamp alone. Both sides empty is
+    ``unavailable`` too, never a match."""
+    a, b = _revision_parts(bound), _revision_parts(read)
+    if not a or a.keys() != b.keys():
+        return "unavailable"
+    return "match" if all(a[k] == b[k] for k in a) else "changed"
+
+
+def revision_binding(revision: Optional[str]) -> str:
+    """How strongly a bound revision ties the read card to the approved item, for the fill result (never a
+    value): ``version`` (1Password item version), ``record`` (local keyed digest), ``updated_at_only``
+    (1Password reported no version anywhere; an edit within the same timestamp is not seen), ``none``."""
+    parts = _revision_parts(revision)
+    if "op.version" in parts:
+        return "version"
+    if "local" in parts:
+        return "record"
+    return "updated_at_only" if "op.updated_at" in parts else "none"
 
 
 def get_vault_store() -> VaultStore:

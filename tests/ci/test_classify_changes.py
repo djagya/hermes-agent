@@ -170,7 +170,9 @@ CASES = {
         _lanes(frontend=True, workspaces=["ui-tui", "ui-tui/packages/hermes-ink"]),
     ),
     # Lockfile bump shifts every TS package's tree, but not the Python suite.
-    "root lockfile → frontend, not python": (["package-lock.json"], _lanes(frontend=True, npm_lock=True, docker=True, nix=True)),
+    "root lockfile → frontend, not python": (["pnpm-lock.yaml"], _lanes(frontend=True, npm_lock=True, docker=True, nix=True)),
+    # The workspace config (overrides, release-age policy) shifts the same trees.
+    "workspace config → frontend, not python": (["pnpm-workspace.yaml"], _lanes(frontend=True, docker=True, nix=True)),
     "nested lockfile → npm_lock": (["website/package-lock.json"], _lanes(site=True, npm_lock=True)),
     # A website file the Python suite cannot read stays site-only.
     "website config → site": (["website/docusaurus.config.ts"], _lanes(site=True)),
@@ -179,6 +181,11 @@ CASES = {
     # otherwise shows up as a blocking "uv.lock out of sync" red X.
     "docs → no uv_lock": (
         ["website/docs/developer-guide/plugins/index.md"],
+        # dlz: plus the plugin-docs import check, which reads the developer guide.
+        _lanes(python=True, site=True, py_full=False, py_roots=[["tests/website/", "tests/hermes_cli/test_plugin_docs_public_imports.py"]]),
+    ),
+    "other docs page → website tests only": (
+        ["website/docs/user-guide/other.md"],
         _lanes(python=True, site=True, py_full=False, py_roots=[["tests/website/"]]),
     ),
     "frontend → no uv_lock": (
@@ -195,6 +202,10 @@ CASES = {
     ),
     "gateway OpenRPC document → python + frontend": (
         ["apps/shared/src/gateway-contract.openrpc.json"],
+        _lanes(python=True, frontend=True, e2e_desktop_core=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
+    ),
+    "control-socket vectors → python + frontend": (
+        ["apps/shared/src/node/control-socket.vectors.json"],
         _lanes(python=True, frontend=True, e2e_desktop_core=True, workspaces=["apps/desktop", "apps/shared"], os_tests=True),
     ),
     "desktop slash-registry JSON → python + frontend": (
@@ -229,6 +240,11 @@ CASES = {
         _lanes(python=True, site=True, py_full=False, py_roots=[["tests/skills/"]]),
     ),
     "dockerfile → docker meta": (["Dockerfile"], _lanes(docker_meta=True)),
+    # The hadolint step runs it, so editing it alone must still run that step.
+    "docker lint script → docker meta, no image build": (
+        ["scripts/ci/lint_docker.sh"],
+        _lanes(python=True, docker_meta=True, docker=False, py_full=False, py_roots=[["tests/ci/"]], os_tests=True),
+    ),
     # Only the flake reads these, so they run nix alone. No Python test opens
     # them, unlike pyproject.toml and uv.lock below.
     "nix module → nix only": (["nix/homeManagerModules.nix"], _lanes(nix=True)),
@@ -273,6 +289,14 @@ CASES = {
     "updater ui.html → frontend + desktop_updater": (
         ["scripts/desktop-update/ui.html"],
         _lanes(python=True, frontend=True, desktop_updater=True, e2e_upgrade=True, e2e_desktop_update=True, workspaces=["apps/desktop"], os_tests=True),
+    ),
+    # tests-js/desktop-build-cache-inputs.test.mjs checks the key owner against the Node graph.
+    "desktop cache key owner → python + frontend": (
+        ["scripts/ci/desktop_build_cache.py"],
+        _lanes(
+            python=True, frontend=True, scan=True, py_full=False, os_tests=True,
+            py_roots=[["tests/ci/test_desktop_build_cache*.py", "tests/test_desktop_build_cache*.py", "tests/ci/"]],
+        ),
     ),
     "desktop-update test → desktop_updater": (
         ["tests/scripts/desktop_update/test_desktop_update_windows_progress.py"],
@@ -541,6 +565,12 @@ CASES = {
     ),
     # The rules README is mirrored by a docs-page test, so it keeps the suite.
     "catalog README → python": (["plugin-catalog/README.md"], _lanes(python=True)),
+    # Its code examples are held to the plugin API by a Python test.
+    # dlz: selective scope adds the test that reads it (it lives in tests/hermes_cli/).
+    "plugins AGENTS.md → python": (
+        ["plugins/AGENTS.md"],
+        _lanes(python=True, py_full=False, py_roots=[["tests/plugins/", "tests/hermes_cli/test_plugin_docs_public_imports.py"]]),
+    ),
     # Any code next to the entry brings the full suite back.
     "catalog entry + code → python and catalog": (
         ["plugin-catalog/foo.yaml", "agent/display.py"],
@@ -549,6 +579,9 @@ CASES = {
     # Fail open: CI-config / empty / blank diffs run everything.
     ".github change → all": ([".github/workflows/tests.yml"], DEFAULT),
     "action change → all": ([".github/actions/detect-changes/action.yml"], DEFAULT),
+    # Workflows call just recipes, so the recipes are CI config too.
+    "justfile change → all": (["justfile"], DEFAULT),
+    "recipe python wrapper → all": (["scripts/hermes-python"], DEFAULT),
     "empty diff → all": ([], DEFAULT),
     "blank lines → all": (["", "  "], DEFAULT),
 }
@@ -901,3 +934,24 @@ def test_whatsapp_adapter_change_selects_its_gateway_tests():
     roots = mod.resolve_roots(groups, str(_REPO))
     expected = sorted(p.relative_to(_REPO).as_posix() for p in (_REPO / "tests/gateway").glob("test_whatsapp*.py"))
     assert expected and set(expected) <= set(roots)
+
+
+def test_a_rename_counts_under_its_old_path_too(monkeypatch, capsys):
+    """Moving a file out of a slow lane's tree must still start that lane."""
+    monkeypatch.setattr(_mod, "pull_request_labels", list)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("docs/moved.md\tDockerfile\n"))
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+
+    assert main() == 0
+    assert classify(["Dockerfile"])["docker"] and "docker=true" in capsys.readouterr().out
+
+
+def test_a_list_at_the_compare_cap_runs_every_lane(monkeypatch, capsys):
+    """The compare API stops at 300 files without saying so; a docs-only first page must not skip lanes."""
+    monkeypatch.setattr(_mod, "pull_request_labels", list)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(f"docs/page{i}.md\n" for i in range(300))))
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "python=true" in out and all(f"{lane}=true" in out for lane in SLOW_LANES)

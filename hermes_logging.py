@@ -173,7 +173,7 @@ class _RedactingStdio:
 
     def write(self, text):
         from agent.redact import redact_sensitive_text
-        return self._stream.write(redact_sensitive_text(text) if isinstance(text, str) else text)
+        return self._stream.write(redact_sensitive_text(text, vault="log") if isinstance(text, str) else text)
 
     def __getattr__(self, name):
         return getattr(self._stream, name)
@@ -291,15 +291,21 @@ def _install_session_record_factory() -> None:
 _install_session_record_factory()
 
 
+def canonical_logger_name(name: str) -> str:
+    """*name* without the ``hermes_agent.`` package prefix, so a module's logger keeps its component
+    and diagnostics scope whether it runs under its top-level name or inside the package."""
+    return name.removeprefix("hermes_agent.")
+
+
 class _ComponentFilter(logging.Filter):
-    """Only pass records whose logger name starts with one of *prefixes*."""
+    """Only pass records whose canonical logger name starts with one of *prefixes*."""
 
     def __init__(self, prefixes: Sequence[str]) -> None:
         super().__init__()
         self._prefixes = tuple(prefixes)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return record.name.startswith(self._prefixes)
+        return canonical_logger_name(record.name).startswith(self._prefixes)
 
 
 # Logger name prefixes per component; used by _ComponentFilter and ``hermes logs --component``.
