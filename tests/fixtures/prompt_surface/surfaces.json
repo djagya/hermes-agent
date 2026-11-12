@@ -5,7 +5,7 @@
       "stable": 1829,
       "volatile": 1268
     },
-    "tool_tokens": 11907,
+    "tool_tokens": 11964,
     "tools": [
       "browser_cdp",
       "browser_control",
@@ -39,7 +39,7 @@
       "stable": 1225,
       "volatile": 1268
     },
-    "tool_tokens": 11907,
+    "tool_tokens": 11964,
     "tools": [
       "browser_cdp",
       "browser_control",
@@ -73,7 +73,7 @@
       "stable": 1646,
       "volatile": 1266
     },
-    "tool_tokens": 11907,
+    "tool_tokens": 11964,
     "tools": [
       "browser_cdp",
       "browser_control",
@@ -107,7 +107,7 @@
       "stable": 2420,
       "volatile": 1264
     },
-    "tool_tokens": 12062,
+    "tool_tokens": 12120,
     "tools": [
       "browser_cdp",
       "browser_control",
@@ -141,7 +141,7 @@
       "stable": 1225,
       "volatile": 1268
     },
-    "tool_tokens": 11907,
+    "tool_tokens": 11964,
     "tools": [
       "browser_cdp",
       "browser_control",
@@ -175,7 +175,7 @@
       "stable": 1211,
       "volatile": 1268
     },
-    "tool_tokens": 11907,
+    "tool_tokens": 11964,
     "tools": [
       "browser_cdp",
       "browser_control",
@@ -209,7 +209,7 @@
       "stable": 1473,
       "volatile": 1269
     },
-    "tool_tokens": 12562,
+    "tool_tokens": 12620,
     "tools": [
       "browser_cdp",
       "browser_control",
@@ -244,7 +244,7 @@
       "stable": 1244,
       "volatile": 1269
     },
-    "tool_tokens": 11907,
+    "tool_tokens": 11964,
     "tools": [
       "browser_cdp",
       "browser_control",
@@ -278,7 +278,7 @@
       "stable": 1330,
       "volatile": 1269
     },
-    "tool_tokens": 11907,
+    "tool_tokens": 11964,
     "tools": [
       "browser_cdp",
       "browser_control",
