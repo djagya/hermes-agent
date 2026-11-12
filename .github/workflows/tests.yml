@@ -217,7 +217,10 @@ jobs:
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
     if: inputs.e2e
     runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    # dlz: the fork has no 32-core runner. At HERMES_TEST_WORKERS=3 the bare upstream merge
+    # took 28m09s (run 43064168539) and the release line ran ~12% slower per file across
+    # the board, so two attempts of 43106199332 were cancelled at 30m with 0 failures at ~75%.
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 45 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
