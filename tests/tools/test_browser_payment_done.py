@@ -809,6 +809,24 @@ def test_payment_close_closes_nothing_it_cannot_name(status, error_type):
     assert out["error_type"] == error_type and out["closed_tabs"] == 0 and not sup.sent("Target.closeTarget")
 
 
+def test_payment_close_waits_for_a_payment_click_that_is_still_running(monkeypatch):
+    """Opus r2: the tab is not closed under a press that may be on the wire; once the click returned, it closes."""
+    sup = _Unlocking([CHECKOUT], status=dict(LOCKED_TAB))
+    seen = []
+
+    def click_running(supervisor, factory, progress=None):
+        seen.append(done.payment_close(sup))  # a parallel payment_close while the click runs
+        return {"success": True}
+
+    monkeypatch.setattr(surface, "_run", click_running)
+    with surface._LOCK:
+        surface._ISSUED[sup] = {"c1-0123456789": ("spec",)}
+    assert surface.payment_click(sup, "c1-0123456789")["clicked"] == "c1-0123456789"
+    assert seen[0]["error_type"] == "payment_close_busy" and seen[0]["closed_tabs"] == 0
+    assert not sup.sent("Target.closeTarget") and not surface.pressing(sup)
+    assert done.payment_close(sup)["closed_tabs"] == 1
+
+
 def test_payment_close_reports_a_failed_close():
     sup = FakeSup([CHECKOUT], status=dict(LOCKED_TAB))
     sup.fail.add("Target.closeTarget")

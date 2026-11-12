@@ -985,7 +985,7 @@ def payment_close(supervisor: Any) -> dict:
     ``Target.closeTarget {targetId}``; control sees the targets destroyed and lifts the lock the normal way, and
     ``lock_released`` is true only when its status proves it. No snapshot, no page read, nothing clicked; a blank
     tab is opened first only when the browser would otherwise be left without one."""
-    from tools.browser_payment_surface import _FENCE_WAIT_S, _claim_lock, _page_tabs
+    from tools.browser_payment_surface import _FENCE_WAIT_S, _claim_lock, _page_tabs, pressing
 
     loop = getattr(supervisor, "_loop", None)
     if loop is None or not loop.is_running():
@@ -994,6 +994,8 @@ def payment_close(supervisor: Any) -> dict:
     if not lock.acquire(timeout=_FENCE_WAIT_S):
         return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
     try:
+        if pressing(supervisor):  # dlz (Opus r2): never close the tab under a payment_click still on the wire
+            return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
         state, owning = _owning_tabs(supervisor)
         with _LOCK:
             recorded = set(_PAYMENTS.get(supervisor) or {})

@@ -743,6 +743,15 @@ def payment_controls(supervisor: Any) -> dict:
     return _with_dialog(supervisor, _run(supervisor, lambda _deadline: _controls(supervisor)))
 
 
+_PRESSING: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # supervisor -> payment_click calls running
+
+
+def pressing(supervisor: Any) -> bool:
+    """Whether a payment_click of this supervisor is still running (its press may be on the wire)."""
+    with _LOCK:
+        return _PRESSING.get(supervisor, 0) > 0
+
+
 def payment_click(supervisor: Any, ref: str) -> dict:
     """``browser_vault action=payment_click ref=…``: one trusted click on a control of the latest listing.
     Refs are single-use: the ref is taken out of the listing for the click and stays dead once a press
@@ -754,8 +763,14 @@ def payment_click(supervisor: Any, ref: str) -> dict:
         return _refusal("payment_control_unknown", "ref must be one returned by the latest payment_controls and "
                                                    "not used for a press yet; call payment_controls again.")
     progress: list = []
-    out = _with_dialog(supervisor, _run(supervisor, lambda deadline: _click(supervisor, spec, progress, deadline),
-                                        progress))
+    with _LOCK:  # dlz (Opus r2): payment_close does not close the tab under a press that is still running
+        _PRESSING[supervisor] = _PRESSING.get(supervisor, 0) + 1
+    try:
+        out = _with_dialog(supervisor, _run(supervisor, lambda deadline: _click(supervisor, spec, progress, deadline),
+                                            progress))
+    finally:
+        with _LOCK:
+            _PRESSING[supervisor] = _PRESSING.get(supervisor, 1) - 1
     if out.get("success"):
         out["clicked"] = ref
     elif not progress:  # nothing was pressed: the ref stays usable, if its listing is still the latest
