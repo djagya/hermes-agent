@@ -859,11 +859,11 @@ class TestTwoFactor:
 
         scattered = [ctl(0), ctl(3), ctl(7), ctl(9, form=1), ctl(12, score=100)]
         assert build_otp_fills(scattered, "246810") == [{"index": 12, "token": "one-time-code", "value": "246810"}]
-        # maxlength=1 but different forms / non-adjacent: still one field
-        assert len(build_otp_fills([ctl(i, form=i % 2, maxlen=1) for i in range(6)], "246810")) == 1
-        assert len(build_otp_fills([ctl(i * 2, maxlen=1) for i in range(6)], "246810")) == 1
-        # five boxes for a six-digit code: one field
-        assert len(build_otp_fills([ctl(i, maxlen=1) for i in range(5)], "246810")) == 1
+        # maxlength=1 but different forms / non-adjacent / five boxes for a six-digit code: never the whole code
+        # into a one-digit box, so nothing is written (refusal)
+        assert build_otp_fills([ctl(i, form=i % 2, maxlen=1) for i in range(6)], "246810") == []
+        assert build_otp_fills([ctl(i * 2, maxlen=1) for i in range(6)], "246810") == []
+        assert build_otp_fills([ctl(i, maxlen=1) for i in range(5)], "246810") == []
         # the real widget
         assert [f["value"] for f in build_otp_fills([ctl(i + 4, maxlen=1) for i in range(6)], "246810")] == list("246810")
 
