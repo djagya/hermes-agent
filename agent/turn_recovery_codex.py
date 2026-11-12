@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from agent.error_classifier import classify_api_error
+from agent.error_classifier import classify_api_error, is_codex_bad_request_envelope
 from agent.route_verdicts import route_visit
 from agent.turn_retry_state import TurnRetryState
 
@@ -20,6 +20,28 @@ def _is_codex_token_expired(agent: Any, api_error: Exception) -> bool:
         return False
     reason = agent._extract_api_error_context(api_error).get("reason")
     return isinstance(reason, str) and reason.strip().lower() == "token_expired"
+
+
+def log_codex_bad_request_diagnostics(agent: Any, api_error: Exception, api_messages: Any) -> None:
+    """Record-first line for the bare ``{"detail": "Bad Request"}`` replay rejection: message and
+    replayed-reasoning counts plus the response's x-request-id / cf-ray. No content, no tokens."""
+    if str(getattr(agent, "provider", "") or "").strip().lower() != "openai-codex":
+        return
+    if not is_codex_bad_request_envelope(getattr(api_error, "body", None), str(api_error)):
+        return
+    msgs = [m for m in api_messages if isinstance(m, dict)] if isinstance(api_messages, list) else []
+    replayed = sum(
+        len(m["codex_reasoning_items"])
+        for m in msgs
+        if isinstance(m.get("codex_reasoning_items"), list)
+    )
+    headers = getattr(getattr(api_error, "response", None), "headers", None)
+    get = headers.get if headers is not None and hasattr(headers, "get") else (lambda _k: None)
+    logger.warning(
+        "%sCodex Bad Request envelope: messages=%d replayed_reasoning_items=%d x-request-id=%s cf-ray=%s",
+        getattr(agent, "log_prefix", ""), len(msgs), replayed,
+        get("x-request-id") or "-", get("cf-ray") or "-",
+    )
 
 
 def reset_codex_reasoning_replay(agent: Any) -> None:
