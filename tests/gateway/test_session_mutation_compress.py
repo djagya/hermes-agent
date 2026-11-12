@@ -37,14 +37,23 @@ class SummaryModel(CatalogModel):
 
 
 # The managed_workers=True rows live in test_session_mutation_compress_managed.py: every turn
-# spawns a fresh agent.managed_worker interpreter (~5-7 s x 17 turns per row), and all five rows
-# in one file ran ~360 s, over the per-file cap.
+# spawns a fresh agent.managed_worker interpreter, and all five rows in one file ran ~360 s, over
+# the per-file cap.
 @pytest.mark.parametrize(('mode', 'in_place'), [('normal', True), ('normal', False), ('safe', None)])
 def test_compress_preserves_configured_history_and_admission_owner(tmp_path, mode, in_place):
     run_compress_case(tmp_path, mode, in_place)
 
 
+# The configured tail only has to exceed what the token-budget tail keeps on its own (4 user turns
+# with these replies, protect_last_n=2), so that a dropped frozen policy (the profile edit to 1)
+# fails the tail assertion: 5 of 8 does, with HISTORY_0 the protected head and HISTORY_1-2
+# summarized. 16 of 8 tested the same and cost 17 turns a row: the managed rows (a fresh worker
+# interpreter per turn) ran 270-300+ s on CI against the 300 s per-file cap, these 170-265 s.
+HISTORY_TURNS, MIN_TAIL_USERS = 8, 5
+
+
 def run_compress_case(tmp_path, mode, in_place):
+    history_count, min_tail = HISTORY_TURNS, MIN_TAIL_USERS
     root = Path(__file__).resolve().parents[2]
     home, user = tmp_path / 'state', tmp_path / 'user'
     home.mkdir(mode=0o700)
@@ -60,7 +69,7 @@ def run_compress_case(tmp_path, mode, in_place):
                       'compression': {'provider': 'custom', 'model': 'summary', 'base_url': url}},
         'platform_toolsets': {'cli': []},
         'compression': {'protect_first_n': 1, 'protect_last_n': 2,
-                        'min_tail_user_messages': 8, 'in_place': in_place if in_place is not None else False}}
+                        'min_tail_user_messages': min_tail, 'in_place': in_place if in_place is not None else False}}
     (home / 'config.yaml').write_text(json.dumps(cfg))
     (home / 'models_dev_cache.json').write_text(json.dumps({'custom': {'id': 'custom', 'models': {
         name: {'id': name, 'name': name, 'limit': {'context': 1000000, 'output': 4000}}
@@ -94,7 +103,6 @@ def run_compress_case(tmp_path, mode, in_place):
                     return row and row[0] == 'terminal'
                 await async_wait_until(terminal, timeout=30, what=f'{text} terminal')
                 return await call('session.resume', session_id=sid)
-            history_count = 16
             for i in range(history_count):
                 before = await turn('HISTORY_' + str(i))
             params = dict(session_id=sid, request_id='compress', operation='compress', payload={},
