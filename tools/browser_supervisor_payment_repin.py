@@ -35,6 +35,12 @@ every field token, or refuses. The rule, all of it required:
 
 Navigation, a changed frame or owner chain and a failed hit test are never re-pinned. Unreviewed destinations
 are never re-pinned (their fills keep the strict, stop-on-any-change rule). No value is read or returned.
+
+Re-pinning is OFF unless config ``vault.payment_repin`` is a literal true (round 3, 11-12: the rule's exposure,
+subset and shape checks did not converge in two money reviews; the redesign re-runs the full inspection instead).
+Off, none of this runs: the commit closure is called without its ``repin`` argument and runs the commit it ran
+before re-pinning existed, the supervisor answers only the ``pending`` pause, and any change of the pinned fields
+stops the fill. Only the stop record (:func:`valid_check`, :func:`located`) is used either way.
 """
 
 from __future__ import annotations
