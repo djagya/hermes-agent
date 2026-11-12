@@ -27,6 +27,7 @@ from agent.vault_payment_policy import (
     provider_for_origin,
 )
 from tools.browser_supervisor_payment_closure import _INSPECT_TEMPLATE
+from tools.browser_supervisor_payment_repin import MAX_REPINS, located, repin_pins, valid_check, valid_pause
 
 
 _MAX_CARD_DOCUMENTS = 4
@@ -1131,39 +1132,39 @@ class PaymentSupervisionMixin:
         # dlz: the renderer's write deadline: the consent window or the commit budget, whichever ends first.
         stop = i.expires_at if until is None else min(i.expires_at, until)
         filled = 0
+        state = {"number": False, "repins": 0}
         try:
             # Every document was re-validated just above. A split checkout is written one
             # document at a time: no cross-document transaction exists, so a later failure
             # reports what an earlier document already received instead of retrying.
             written = []
             order = _commit_order(i, _fills_by_document(i, fills))
-            for document, document_fills in order:
-                if time.monotonic() >= i.expires_at:
-                    # dlz: no write after the window closes; earlier documents' values are reported, not
-                    # completed.
-                    return _partial({"success": False, "error_type": "payment_consent_expired"}, filled)
-                # dlz: an earlier document's page handlers ran after its writes: before the next document, every
-                # approved chain is checked again against the pinned state (bounded: no OOPIF rediscovery), and
-                # each document written so far must still be the one that received its fields.
-                if written and not await self._payment_scope_current(i, [d for d, _f in written] + [document]):
-                    return _partial({"success": False, "error_type": "payment_page_changed"}, filled)
-                # dlz (Codex B r1 #1): an unreviewed fill also re-binds the cart, the absence witnesses, the candidate
-                # topology and the policy before each later document, on the consumed inspection.
-                verdict = await self._fill_scope_verdict(i) if written and i.unreviewed_origins else None
-                if verdict:
-                    return _partial({"success": False, "error_type": verdict}, filled)
-                # dlz: strict fills in a frame pause after each focus for the owner-chain check from the parents
-                # (a cross-origin parent's blur handler is out of the frame's reach); an unreviewed fill pauses in
-                # every document, for the same bindings after the focus handlers ran.
-                paced = (lambda point, d=document: self._paced_check(i, d, point)) \
-                    if strict and (_has_parent(i, document) or i.unreviewed_origins) else None
-                result = await self._commit_payment_document(
-                    document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop), strict=strict,
-                    paced=paced)
+            # dlz (re-pin): a document whose remaining fields wait for the card number in a later document is
+            # suspended (its commit paused) and resumed once, after the documents that follow it.
+            suspended: list = []
+            steps = [(n, d, f, None) for n, (d, f) in enumerate(order, 1)]
+            while steps:
+                position, document, document_fills, resumed = steps.pop(0)
+                result = await self._commit_step(i, position, len(order), document, document_fills, resumed,
+                                                 written, stop, strict, state)
+                if result.get("deferred") is True and resumed is None:
+                    suspended.append((position, document, document_fills, result["filled_fields"]))
+                    filled += result["filled_fields"]
+                    written.append((document, document_fills))
+                    continue
+                if result.get("deferred") is True:  # deferred again after the number: never a second wait
+                    count = result["filled_fields"]
+                    result = {"success": False, "error_type": "payment_fields_changed", "filled_fields": count,
+                              "partially_filled": count > 0}
                 if not result.get("success"):
-                    return _partial(result, filled)
-                filled += result.get("filled_fields", 0)
-                written.append((document, document_fills))
+                    # a resumed document's answer counts its own earlier writes
+                    return _repins(_partial(result, filled - (resumed or 0)), state)
+                filled += result.get("filled_fields", 0) - (resumed or 0)
+                if resumed is None:
+                    written.append((document, document_fills))
+                state["number"] = state["number"] or any(f.get("token") == "cc-number" for f in document_fills)
+                if not steps and suspended:
+                    steps, suspended = [(n, d, f, k) for n, d, f, k in suspended], []
             # A document's own check runs right after its writes. Providers reset controlled inputs
             # later, and a later document (brand detection on the number, a blur) can clear an
             # earlier one, so success is only reported once EVERY document still holds its values.
@@ -1177,11 +1178,64 @@ class PaymentSupervisionMixin:
                                         for d, f, a in answers])
             if await self._top_navigated(i):
                 result["navigated_after_fill"] = True
-            return result
+            return _repins(result, state)
         except PaymentPolicyError:
-            return _partial({"success": False, "error_type": "payment_fields_invalid"}, filled)
+            return _repins(_partial({"success": False, "error_type": "payment_fields_invalid"}, filled), state)
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
-            return _partial({"success": False, "error_type": "payment_transport_uncertain"}, filled)
+            return _repins(_partial({"success": False, "error_type": "payment_transport_uncertain"}, filled), state)
+
+    async def _commit_step(self, i: PaymentInspection, position: int, total: int, document: PaymentDocument,
+                           document_fills: list, resumed: int | None, written: list, stop: float, strict: bool,
+                           state: dict) -> dict:
+        """One document's turn in the commit (``resumed``: the count a suspended document already wrote): the
+        window, the approved chains, an unreviewed fill's bindings, then its commit. A stop names the document."""
+        if time.monotonic() >= i.expires_at:
+            # dlz: no write after the window closes; earlier documents' values are reported, not completed.
+            return {"success": False, "error_type": "payment_consent_expired"}
+        # dlz: an earlier document's page handlers ran after its writes: before the next document, every
+        # approved chain is checked again against the pinned state (bounded: no OOPIF rediscovery), and
+        # each document written so far must still be the one that received its fields.
+        if written and not await self._payment_scope_current(i, [d for d, _f in written] + [document]):
+            return {"success": False, "error_type": "payment_page_changed"}
+        # dlz (Codex B r1 #1): an unreviewed fill also re-binds the cart, the absence witnesses, the candidate
+        # topology and the policy before each later document, on the consumed inspection.
+        verdict = await self._fill_scope_verdict(i) if written and i.unreviewed_origins else None
+        if verdict:
+            return {"success": False, "error_type": verdict}
+        # dlz: strict fills in a frame pause after each focus for the owner-chain check from the parents
+        # (a cross-origin parent's blur handler is out of the frame's reach); an unreviewed fill pauses in
+        # every document, for the same bindings after the focus handlers ran.
+        paced = (lambda point, d=document: self._paced_check(i, d, point)) \
+            if strict and (_has_parent(i, document) or i.unreviewed_origins) else None
+        # dlz (re-pin): reviewed destinations only; an unreviewed fill stops on any change, as before.
+        repin = None if i.unreviewed_origins else \
+            (lambda request, d=document, f=document_fills: self._repin(i, d, f, request, stop, state))
+        result = await self._commit_payment_document(
+            document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop), strict=strict,
+            paced=paced, **({"repin": repin} if repin else {}), **({"resumed": resumed} if resumed is not None else {}))
+        return located(result, position, total)
+
+    async def _repin(self, i: PaymentInspection, d: PaymentDocument, fills: list, request: dict, stop: float,
+                     state: dict) -> dict | None:
+        """dlz (re-pin): the answer to one re-pin request of ``d``'s paused commit: the new pin of each of its
+        fill tokens, or None (the closure then stops with its record). Inside the window only, after the frame's
+        loader, URL, origin and owner <iframe>s are re-proved; the rule is ``repin_pins``'."""
+        if time.monotonic() >= stop or not await self._payment_scope_current(i, [d]):
+            return None
+        try:
+            answer = _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": d.object_id, "functionDeclaration": "function(){return this.rebind()}",
+                "returnByValue": True,
+            }, session_id=d.frame_session))
+        except Exception:  # health: allow BLE001 -- an unreadable document is not re-pinned; the closure stops
+            return None
+        written = request.get("written") or []
+        pins = repin_pins(d.controls, [str(f.get("token") or "") for f in fills], answer, written,
+                          state["number"] or "cc-number" in written)
+        if pins is not None and time.monotonic() < stop:
+            state["repins"] += 1
+            return pins
+        return None
 
     async def _payment_scope_current(self, i: PaymentInspection, receiving: list) -> bool:
         """dlz: between the documents of a split fill, bounded and against the pinned state (no OOPIF
@@ -1300,22 +1354,33 @@ class PaymentSupervisionMixin:
         return bool(i.tree) and isinstance(url, str) and url != i.tree[0][2]
 
     async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None,
-                                       strict: bool = False, paced=None) -> dict:
+                                       strict: bool = False, paced=None, repin=None, resumed: int | None = None) -> dict:
         """One document's commit. ``paced`` (strict fills in a frame, and every document of an unreviewed fill): an
         async ``check(point)`` run after each focus, before that field's setter; anything but True (False or an error
-        type from ``_PACED_STOPS``) stops the document with nothing more written.
+        type from ``_PACED_STOPS``) stops the document with nothing more written. ``repin`` (reviewed fills): an
+        async ``answer(request)`` for the closure's re-pin requests (``_repin``); without it every request is
+        declined. ``resumed``: the count a suspended document wrote before its deferral; its commit is resumed, not
+        started. A deferral answers ``{deferred: True, filled_fields}``.
         dlz (Codex B r2 #2): the commit call carries the values, and each resume() runs a setter, so from the first
         call on a lost, failed or malformed reply means a write may have landed: the result then says so
         (``write_uncertain``, ``partially_filled``) with the last acknowledged count of this document's writes,
         never as if nothing was written."""
-        acknowledged = 0
+        acknowledged = resumed or 0
+        tokens = frozenset(str(f.get("token") or "") for f in fills)
 
         def uncertain(error_type: str) -> dict:
             return {"success": False, "error_type": error_type, "filled_fields": acknowledged,
                     "partially_filled": True, "write_uncertain": True}
 
+        async def answer(pins: Any = None, repinned: bool = False) -> Any:
+            # A re-pin answer (pins, or null to stop) is passed in; any other resume carries nothing.
+            call = {"functionDeclaration": "function(a){return this.resume(a)}", "arguments": [{"value": pins}]} \
+                if repinned else {"functionDeclaration": "function(){return this.resume()}"}
+            return _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": d.object_id, **call, "returnByValue": True}, session_id=d.frame_session))
+
         try:
-            result = _value(
+            result = await answer() if resumed is not None else _value(
                 await self._cdp(
                     "Runtime.callFunctionOn",
                     {
@@ -1329,30 +1394,36 @@ class PaymentSupervisionMixin:
                     session_id=d.frame_session,
                 )
             )
-            for _ in range(len(fills) + 1):
-                if paced is None or not isinstance(result, dict) or result.get("pending") is not True:
+            for _ in range((len(fills) + 1) * (MAX_REPINS + 2)):
+                kind = _pause_kind(result)
+                if kind is None or (kind == "pending" and paced is None):
                     break
                 attempted = result.get("filled_fields")
-                # dlz (Codex B r3 #2): the focus point is checked here for every document, the top one included
-                # (its paced check reads no point): a finite number each, never a bool or a missing value.
-                if set(result) != {"pending", "filled_fields", "x", "y"} or type(attempted) is not int \
-                        or not acknowledged <= attempted < len(fills) \
-                        or not all(type(result[k]) in (int, float) and math.isfinite(result[k]) for k in ("x", "y")):
+                if kind == "pending":
+                    # dlz (Codex B r3 #2): the focus point is checked here for every document, the top one included
+                    # (its paced check reads no point): a finite number each, never a bool or a missing value.
+                    if set(result) != {"pending", "filled_fields", "x", "y"} or type(attempted) is not int \
+                            or not acknowledged <= attempted < len(fills) \
+                            or not all(type(result[k]) in (int, float) and math.isfinite(result[k]) for k in ("x", "y")):
+                        return uncertain("payment_result_invalid")
+                elif not valid_pause(result, kind, tokens, len(fills), acknowledged):
                     return uncertain("payment_result_invalid")
                 acknowledged = attempted
+                if kind == "deferred":
+                    return {"deferred": True, "filled_fields": attempted}
+                if kind == "repin":
+                    result = await answer(await repin(result) if repin is not None else None, repinned=True)
+                    continue
                 verdict = await paced((result["x"], result["y"]))
                 if verdict is not True:
                     # dlz: the focused field is never written; earlier fields of this document are reported.
                     return {"success": False,
                             "error_type": verdict if verdict in _PACED_STOPS else "payment_page_changed",
                             "filled_fields": attempted, "partially_filled": attempted > 0}
-                result = _value(await self._cdp("Runtime.callFunctionOn", {
-                    "objectId": d.object_id, "functionDeclaration": "function(){return this.resume()}",
-                    "returnByValue": True,
-                }, session_id=d.frame_session))
+                result = await answer()
         except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; typed, never retried
             return uncertain("payment_transport_uncertain")
-        if not _valid_document_result(result, len(fills)) or result["filled_fields"] < acknowledged:
+        if not _valid_document_result(result, len(fills), tokens) or result["filled_fields"] < acknowledged:
             return uncertain("payment_result_invalid")  # dlz (Codex B r3 #1): a count never goes backwards
         if result["success"] is not True and (acknowledged or result.get("filled_fields", 0)):
             # An acknowledged write is never reported away by a later answer, nor by its own partial flag.
@@ -1694,7 +1765,19 @@ _DOCUMENT_ERRORS = frozenset({"payment_fields_changed", "payment_consent_expired
                               "payment_expiry_option_unmatched", "payment_validation_failed"})
 
 
-def _valid_document_result(result: Any, fills: int) -> bool:
+def _pause_kind(result: Any) -> str | None:
+    """Which pause a closure answer is (``pending``, ``repin``, ``deferred``), or None for a final answer."""
+    if not isinstance(result, dict):
+        return None
+    return next((k for k in ("pending", "repin", "deferred") if result.get(k) is True), None)
+
+
+def _repins(result: dict, state: dict) -> dict:
+    """dlz (re-pin): the commit's result, with how many re-pins it accepted (a count only) when there were any."""
+    return {**result, "fill_repins": state["repins"]} if state.get("repins") else result
+
+
+def _valid_document_result(result: Any, fills: int, tokens: frozenset = frozenset()) -> bool:
     """dlz (Codex B r2 #2, r3 #1): one document's final commit answer, exact keys and types. A success is exactly
     ``{success, filled_fields}`` with every one of the ``fills`` written; a failure names its error type and counts
     at most ``fills``."""
@@ -1704,7 +1787,8 @@ def _valid_document_result(result: Any, fills: int) -> bool:
     if result["success"]:
         return set(result) == {"success", "filled_fields"} and type(count) is int and count == fills
     # dlz (Codex B r4 #1): one of the closure's own error types, and always an explicit count (0 before any write).
-    return (not set(result) - {"success", "filled_fields", "error_type", "partially_filled"}
+    return (not set(result) - {"success", "filled_fields", "error_type", "partially_filled", "check"}
+            and ("check" not in result or valid_check(result["check"], tokens, fills))
             and type(result.get("error_type")) is str and result["error_type"] in _DOCUMENT_ERRORS
             and type(count) is int and 0 <= count <= fills
             and type(result.get("partially_filled", False)) is bool)

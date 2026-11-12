@@ -130,7 +130,7 @@ class _FakeSupervisor(sp.PaymentSupervisionMixin):
     async def _payment_scope_current(self, i, documents):
         return True  # pinned-scope checks are exercised over a fake CDP in _PayPalPage below
 
-    async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False, paced=None):
+    async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False, paced=None, **_kw):
         self.deadlines = getattr(self, "deadlines", []) + [deadline_ms]
         self.writes.append((d.origin, fills))
         return self.results.pop(0)
@@ -437,7 +437,7 @@ def test_commit_never_writes_after_the_window_closes(lapse_at):
                 inspection.expires_at = 0
             return True
 
-        async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False, paced=None):
+        async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False, paced=None, **_kw):
             out = await super()._commit_payment_document(d, fills, deadline_ms)
             i.expires_at = 0  # the first document's write ends after the window
             return out
@@ -633,12 +633,24 @@ n.onfocus = {none: () => {}, hide: () => { n.hidden = true; }, hide_other: () =>
 let result = api.commit([{index: 0, token: 'cc-csc', value: '837'}, {index: 1, token: 'cc-number', value: '4242'}],
                         CASE.focus === 'slow_checks' ? 1500 : 60000, CASE.strict, CASE.paced === true);
 const paused = [];  // [fields written so far, setter calls so far] at each pause
-while (result && result.pending === true && paused.length < 4) {
+const repins = [];  // the check of each re-pin request; CASE.pins 'auto' answers by autocomplete, else null (stop)
+while (result && (result.pending === true || result.repin === true) && paused.length + repins.length < 8) {
+  if (result.repin === true) {
+    repins.push(result.check);
+    const seen = api.rebind();
+    let pins = null;
+    if (CASE.pins === 'auto' && seen && Array.isArray(seen.fields)) {
+      pins = {'cc-csc': -1, 'cc-number': -1};
+      for (const f of seen.fields) pins[f.autocomplete] = f.index;
+    }
+    result = api.resume(pins);
+    continue;
+  }
   paused.push([result.filled_fields, writes.length]);
   if (CASE.paused === 'hide' && result.filled_fields === 1) n.hidden = true;  // between the pause and resume()
   result = api.resume();
 }
-process.stdout.write(JSON.stringify({result, writes, paused}));
+process.stdout.write(JSON.stringify({result, writes, paused, repins}));
 """
 
 
@@ -657,25 +669,51 @@ def _setter_harness(case: dict) -> dict:
     return json.loads(run.stdout)
 
 
-@pytest.mark.parametrize("focus, strict, writes", [
-    ("none", True, ["c", "n"]), ("cover", False, ["c", "n"]),  # reviewed shapes keep today's behaviour
-    ("hide", False, ["c"]), ("hide_other", False, ["c"]), ("relabel", False, ["c"]), ("swap", False, ["c"]),
-    ("navigate", False, ["c"]), ("cover", True, ["c"]),
+_NUMBER_STEP = {"token": "cc-number", "step": 2}
+
+
+@pytest.mark.parametrize("focus, strict, writes, check", [
+    ("none", True, ["c", "n"], None), ("cover", False, ["c", "n"], None),  # reviewed shapes keep today's behaviour
+    ("hide", False, ["c"], {"reason": "field_hidden", "fields": ["cc-number"]}),
+    ("hide_other", False, ["c"], {"reason": "field_hidden", "fields": ["cc-csc"]}),
+    ("relabel", False, ["c"], {"reason": "fields_relabeled", "fields": ["cc-number"], "keys": ["label"]}),
+    ("swap", False, ["c"], {"reason": "fields_replaced", "fields": ["cc-number"]}),
+    ("navigate", False, ["c"], {"reason": "navigated"}), ("cover", True, ["c"], {"reason": "hit_test"}),
     # the parent iframe turned transparent / the top URL rewritten by focus code (same-origin chain)
-    ("parent_transparent", True, ["c"]), ("top_replaced", True, ["c"]),
-    ("slow_checks", False, ["c"]),  # the re-checks themselves crossed the deadline: no setter after it
+    ("parent_transparent", True, ["c"], {"reason": "frame_changed"}), ("top_replaced", True, ["c"], {"reason": "navigated"}),
+    ("slow_checks", False, ["c"], None),  # the re-checks themselves crossed the deadline: no setter after it
 ])
-def test_a_focus_handler_that_changes_the_pinned_set_stops_the_next_setter(focus, strict, writes):
+def test_a_focus_handler_that_changes_the_pinned_set_stops_the_next_setter(focus, strict, writes, check):
     """Design v2 A5: page code runs on focus; the field is written only if the whole pinned set still holds
-    right before its setter (and, strict, the field is what a click at its centre would hit)."""
+    right before its setter (and, strict, the field is what a click at its centre would hit). A re-render asks the
+    supervisor for a re-pin first (declined here); the stop names the failed check with fixed codes only."""
     out = _setter_harness({"focus": focus, "strict": strict})
     assert out["writes"] == writes and out["paused"] == []
     if len(writes) == 1:
         error_type = "payment_consent_expired" if focus == "slow_checks" else "payment_fields_changed"
-        assert out["result"] == {"success": False, "error_type": error_type, "filled_fields": 1,
-                                 "partially_filled": True}
+        expected = {"success": False, "error_type": error_type, "filled_fields": 1, "partially_filled": True}
+        if check:
+            expected["check"] = {**_NUMBER_STEP, **check}
+        assert out["result"] == expected
+        repinnable = check is not None and check["reason"] not in ("navigated", "frame_changed", "hit_test")
+        assert out["repins"] == ([expected["check"]] if repinnable else [])
     else:
-        assert out["result"]["success"] is True
+        assert out["result"]["success"] is True and out["repins"] == []
+
+
+@pytest.mark.parametrize("focus, writes, repins", [
+    ("swap", ["c", "n2"], ["fields_replaced"]),  # a fresh number input, same document, same token: written
+    ("relabel", ["c", "n"], ["fields_relabeled"]),  # the same input re-described: written once re-pinned
+    ("hide", ["c"], ["field_hidden"]),  # the number is never deferred (the closure refuses it too): stop
+])
+def test_a_re_render_is_written_only_after_an_accepted_re_pin(focus, writes, repins):
+    """dlz (re-pin): the supervisor's answer moves the pins; every check then runs again before the setter."""
+    out = _setter_harness({"focus": focus, "strict": False, "pins": "auto"})
+    assert out["writes"] == writes and [c["reason"] for c in out["repins"]] == repins
+    if len(writes) == 2:
+        assert out["result"] == {"success": True, "filled_fields": 2}
+    else:
+        assert out["result"]["error_type"] == "payment_fields_changed" and out["result"]["filled_fields"] == 1
 
 
 @pytest.mark.parametrize("paused, writes", [("none", ["c", "n"]), ("hide", ["c"])])
@@ -689,7 +727,8 @@ def test_a_paced_commit_pauses_after_each_focus_and_rechecks_before_the_setter(p
         assert out["result"] == {"success": True, "filled_fields": 2}
     else:
         assert out["result"] == {"success": False, "error_type": "payment_fields_changed", "filled_fields": 1,
-                                 "partially_filled": True}
+                                 "partially_filled": True,
+                                 "check": {**_NUMBER_STEP, "reason": "field_hidden", "fields": ["cc-number"]}}
 
 
 class _PayPalPage(sp.PaymentSupervisionMixin):
