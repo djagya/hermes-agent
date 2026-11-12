@@ -70,7 +70,7 @@ def test_load_then_save_leaves_a_seed_a_seed(homes):
     from hermes_cli.config import save_config, load_config, read_raw_config
     import hermes_cli.config as cfg
 
-    home, managed = homes
+    _home, managed = homes
     cfg_now = load_config()
     cfg_now.setdefault("display", {})["skin"] = "mono"
     save_config(cfg_now)
