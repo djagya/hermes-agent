@@ -70,7 +70,10 @@ jobs:
     name: ${{ matrix.package }} / ${{ matrix.script }}
     needs: workspaces
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # dlz: apps/desktop check:test:ui is one vitest run of the whole renderer suite on a
+    # 4-vCPU runner: 17m10s (run 43106199332) to past 20m (cancelled in 43106216223 and
+    # 43064168539 with tests still passing). The other legs keep 20.
+    timeout-minutes: ${{ matrix.script == 'check:test:ui' && 30 || 20 }}
     strategy:
       fail-fast: false
       matrix:
