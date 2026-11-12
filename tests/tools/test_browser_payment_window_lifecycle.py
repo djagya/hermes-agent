@@ -290,7 +290,7 @@ def test_a_released_window_masks_every_slots_browser_results(monkeypatch):
 
 def test_a_route_moved_after_the_open_never_withdraws_the_other_slots_committed_window(monkeypatch):
     # Opus/Codex r1: t2 committed a card on "research"; t1 opened "shopping", its route then moved to
-    # "research" and the commit fence refused. Both windows had generation 2 (claim 1, open 2): withdrawing by
+    # "research" and the commit fence refused. Both windows had the same generation (then 2: claim 1, open 2): withdrawing by
     # the route's slot at exit took back research's committed window.
     routes = {"t1": {"slot_id": "shopping", "supervisor_url": URL},
               "t2": {"slot_id": "research", "supervisor_url": "ws://control/slot/research"}}
@@ -303,7 +303,8 @@ def test_a_route_moved_after_the_open_never_withdraws_the_other_slots_committed_
     filler = _sup("t1")
     card_values.note_claim(filler)
     with bvp._UnwrittenWindow({**CARD, "cvc": "1234"}, filler):
-        assert redact.card_window_generations() == {"shopping": 2, "research": 2}
+        gens = redact.card_window_generations()
+        assert set(gens) == {"shopping", "research"} and gens["shopping"] != gens["research"]
         routes["t1"] = routes["t2"]  # a newer exec moved t1 to research, then the fence refused
     assert redact.card_window_keys() == ["research"]  # shopping's unwritten open went, research's stayed
     assert "737" not in _model("cvc 737") and "Ada Testperson" not in _browser()
