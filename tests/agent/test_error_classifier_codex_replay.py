@@ -22,7 +22,7 @@ from tests.agent.test_error_classifier import MockAPIError
     ("openai-codex", None, 400, "Error code: 400 - bad request detail unknown", FailoverReason.format_error),
 ], ids=["codex-dict-body", "codex-case-strip", "codex-message-only", "codex-statusless", "other-provider",
         "other-detail", "loose-message"])
-def test_codex_bad_request_detail_reaches_replay_strip(self, provider, body, status, msg, expected):
+def test_codex_bad_request_detail_reaches_replay_strip(provider, body, status, msg, expected):
     """The ChatGPT Codex backend now rejects a replayed sol-minted reasoning item as a bare
     ``{"detail": "Bad Request"}`` 400. Same hints as the other masked replay rejections."""
     e = MockAPIError(msg, status_code=status, body=body)
@@ -30,6 +30,6 @@ def test_codex_bad_request_detail_reaches_replay_strip(self, provider, body, sta
     assert result.reason == expected
     assert result.retryable is False and result.should_fallback is True
 
-def test_codex_bad_request_detail_other_status_stays_format(self):
+def test_codex_bad_request_detail_other_status_stays_format():
     e = MockAPIError("Error code: 422 - {'detail': 'Bad Request'}", status_code=422, body={"detail": "Bad Request"})
     assert classify_api_error(e, provider="openai-codex", model="gpt-5.5").reason != FailoverReason.invalid_encrypted_content
