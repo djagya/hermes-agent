@@ -88,6 +88,9 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
 
 
+_CONTEXT_MAX = 900
+
+
 @dataclass(frozen=True)
 class LoginControl:
     """Descriptor of a visible input control, as inspected in the page."""
@@ -107,6 +110,9 @@ class LoginControl:
     # Inspection's strict geometry: at least 2x2 px, horizontally on screen, inside the document, not
     # transparent. Only a signup target needs it; None (an older inspection) never qualifies.
     rendered: Optional[bool] = None
+    # Page/form context for the plain-"code" OTP path only: the document title, headings and the text of the
+    # control's nearest small block (capped by the inspection). Matched against fixed patterns, never echoed.
+    context: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
@@ -124,6 +130,7 @@ class LoginControl:
             page_url=str(raw.get("pageUrl") or ""),
             form_action=str(raw.get("formAction") or ""),
             rendered=raw.get("rendered") if isinstance(raw.get("rendered"), bool) else None,
+            context=str(raw.get("context") or "")[:_CONTEXT_MAX],
         )
 
 
@@ -189,11 +196,59 @@ _RE_OTP = re.compile(
 )
 
 
+# A bare "code" field (Google/Microsoft email-verification pages: ``<input type=tel name=code
+# aria-label="Enter code">``). The field's own text (name, id, label, placeholder) may hold only these filler
+# words besides code/pin; any other word (promo, gift, postal, ...) keeps it out of the bare path.
+_BARE_CODE_FILLER = frozenset({"code", "pin", "enter", "the", "your", "a", "please", "type", "input", "digit",
+                               "digits", "numeric", "g", "sent", "we", "you", "to", "received", "below", "here"})
+# Words that make a "code" something other than a second factor. Checked on the context of the lone-input
+# route (the field's own text is already confined to the filler words above).
+_RE_NOT_OTP_CODE = re.compile(
+    r"\b(?:promo\w*|gift\w*|coupon\w*|voucher\w*|discount\w*|referr?al\w*|refer|invit\w*|postal|zip\w*|"
+    r"area|country|dial\w*|calling|currency|swift|bic|cvv|cvc|csc|billing|shipping|tracking|sku|redeem\w*|"
+    r"redemption|reward\w*|loyalty|affiliate|campaign)\b")
+# The page or form says it is verifying something it just sent.
+_RE_VERIFY_CONTEXT = re.compile(
+    r"\bverif\w*|\bconfirm\w*\s+(?:your\s+)?(?:e[\s-]?mail|email address|phone|number|identity|account)\b"
+    r"|\bwe\s*(?:ve\s+)?sent\b|\bsent\s+(?:you\s+)?(?:a|the|an)\s+(?:\w+\s+)?code\b"
+    r"|\bcheck\s+your\s+(?:e[\s-]?mail|inbox|phone|messages)\b"
+    r"|\bone[\s-]?time\b|\b(?:two|2)[\s-]?step\b")
+_TEXT_LIKE = ("text", "tel", "number", "email", "password", "search", "url", "")
+
+
+def _is_bare_code_field(c: LoginControl) -> bool:
+    if c.type not in ("text", "tel", "number"):
+        return False
+    text = _normalize_text(re.sub(r"([a-z])([A-Z])", r"\1 \2", " ".join(p for p in (c.name, c.label) if p)))
+    tokens = text.split()
+    if not any(t in ("code", "pin") for t in tokens):
+        return False
+    return all(t in _BARE_CODE_FILLER or t.isdigit() for t in tokens)
+
+
+def _plain_code_controls(controls: list[LoginControl]) -> list[ClassifiedLoginControl]:
+    """Bare "code" inputs that are demonstrably a verification step: the page/form context says so, or the
+    input is the only text-like input of its form (and the context names no promo/gift/postal/... topic)."""
+    out: list[ClassifiedLoginControl] = []
+    for c in controls:
+        if not _is_bare_code_field(c):
+            continue
+        context = _normalize_text(c.context)
+        if _RE_VERIFY_CONTEXT.search(context):
+            out.append(ClassifiedLoginControl(c, 60, "one-time-code"))
+            continue
+        siblings = [o for o in controls if o.form_index == c.form_index and o.type in _TEXT_LIKE]
+        if len(siblings) == 1 and not _RE_NOT_OTP_CODE.search(context):
+            out.append(ClassifiedLoginControl(c, 55, "one-time-code"))
+    return out
+
+
 def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginControl]:
     """The controls that take a second-factor code. ``autocomplete=one-time-code`` is authoritative;
     otherwise a text/tel/number input whose name/label says code/OTP/2FA/verification. Some sites split
     the code into one input per digit (``maxlength=1`` boxes): they are returned in DOM order and the
-    fill spreads the code across them."""
+    fill spreads the code across them. Only when none of that matches, a plain "code"/"pin" input is
+    accepted if the page says it is a verification step or it is the form's only text-like input."""
     out: list[ClassifiedLoginControl] = []
     for c in controls:
         tokens = c.autocomplete.lower().split()
@@ -204,7 +259,7 @@ def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginC
             continue
         if _RE_OTP.search(_normalize_text(" ".join(p for p in (c.name, c.label) if p))):
             out.append(ClassifiedLoginControl(c, 70, "one-time-code"))
-    return out
+    return out or _plain_code_controls(controls)
 
 
 @dataclass(frozen=True)
@@ -508,6 +563,34 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const registry = __REGISTRY__;
   if (registry) { try { (__REGISTER__)(registry, __BIND__, elements, forms); } catch (_) { /* writer then refuses */ } }
   const rendered = __RENDERED__;
+  // Context for the plain-"code" verification path (read by the Python classifier, never shown to the model):
+  // title and headings once, plus the text of the control's nearest small block. Every read is best effort:
+  // a page that breaks a getter just yields no context.
+  const clip = (t, n) => String(t || "").replace(/ +/g, " ").trim().slice(0, n);
+  let headingText = null;
+  const headings = () => {
+    if (headingText === null) {
+      headingText = "";
+      try {
+        const hs = Array.from(document.querySelectorAll("h1,h2,h3,legend,[role=heading]")).slice(0, 6);
+        headingText = clip([document.title || ""].concat(hs.map((h) => clip(h.textContent, 120))).join(" "), 400);
+      } catch (_) { /* no context */ }
+    }
+    return headingText;
+  };
+  const nearby = (element) => {
+    let best = "", node = element;
+    try {
+      for (let up = 0; up < 3 && node; up++) {
+        node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
+        if (!node || node.tagName === "BODY" || node.tagName === "HTML") break;
+        const t = clip(node.textContent, 2000);
+        if (t.length > 500) break;
+        best = t;
+      }
+    } catch (_) { /* no context */ }
+    return best;
+  };
   const out = elements.flatMap((element, index) => {
     if (element.disabled || element.readOnly) return [];
     if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
@@ -535,6 +618,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       ].join(" "),
       name: [element.name, element.id].join(" "),
       type: element.tagName === "SELECT" ? "select" : (element.type || ""),
+      context: clip(headings() + " " + nearby(element), 900),
       rendered: (() => { try { return rendered(element); } catch (_) { return false; } })(),
     }];
   });
