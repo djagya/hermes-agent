@@ -894,6 +894,53 @@ def test_retire_daemon_passes_the_callers_profile(monkeypatch):
     assert calls == [("bu-ctrl-research-1-g-7", "home-a")]
 
 
+def test_slow_retire_cannot_stop_the_daemon_a_revocable_deferral_lets_the_next_call_spawn(monkeypatch):
+    """A revocable deferral restores the lease entry while the old daemon's retire is still running; the next
+    browser call reuses the same BU_NAME. Reuse must wait for that retire, or the late retire stops the new
+    daemon (Codex p1 P2)."""
+    import threading
+
+    import tools.browser_use_cli as cli
+
+    name = "bu-ctrl-research-1-g-7"
+    release_stop, stopped, spawned = threading.Event(), [], []
+
+    def slow_stop(n, home):
+        assert release_stop.wait(10)
+        stopped.append((n, tuple(spawned)))  # what was alive when the old retire actually ran
+
+    monkeypatch.setattr(cli, "stop_harness_daemon", slow_stop)
+    route = _fake_control(monkeypatch, lambda *a, **k: pytest.fail("no new lease expected"))
+    monkeypatch.setattr(route, "_post", lambda control, path, body: {
+        "error": "handoff_pending", "reason": "handoff_pending", "deferred": True, "revocable": True})
+    monkeypatch.setattr(route, "RETIRE_FENCE_S", 0.2)
+    clear_held_leases()
+    entry = {MANAGED_LEASE_ENV: "lease-1", route.MANAGED_TOKEN_ENV: "tok-1", "BU_NAME": name,
+             "BU_CDP_URL": "ws://127.0.0.1:9/x"}
+    key = route._hold_key("t1", "", "", "research")
+    route._held_leases[key] = dict(entry)
+    try:
+        outcome, error = route.release_lease_outcome(dict(entry), keep_if_revocable=True)
+        assert (outcome, error) == (route.RELEASE_DEFERRED_REVOCABLE, None)
+        assert key in route._held_leases and stopped == []  # restored, retire still in flight
+
+        # The next call must not hand out the name while the old retire runs.
+        env = {}
+        err = resolve_managed_cdp(env, task_id="t1", mode="research")
+        assert err and "shutting down" in err and "BU_NAME" not in env
+        assert route.held_managed_cdp({}, task_id="t1", identity="", mode="research") == "lease_unavailable"
+
+        release_stop.set()
+        assert route._await_retire(name, 5) is True
+        assert stopped == [(name, ())]  # the old retire finished before any new daemon existed
+        env = {}
+        assert resolve_managed_cdp(env, task_id="t1", mode="research") is None
+        assert env["BU_NAME"] == name
+    finally:
+        release_stop.set()
+        clear_held_leases()
+
+
 def test_registry_handler_passes_managed_kwargs(monkeypatch):
     """The v0.23 handler wraps browser_exec in record_browser_call; dropping mode/identity there would run a
     work:<org> call in a research slot (B2b)."""
