@@ -1350,10 +1350,10 @@ BROWSER_VAULT_SCHEMA = {
         "written; stop and tell the "
         "user. A card fill locks the whole browser until the payment tab is closed: every other browser "
         "action, page read, script, screenshot, dialog answer and login fill returns payment_surface_locked; "
-        "you can still list tabs (browser_cdp Target.getTargets, no params: each tab's site (origin) only, no "
-        "title) and close one (browser_cdp Target.closeTarget {targetId}; closing the payment tab ends the lock "
-        "without a confirmation snapshot); payment_done waits for and reads the "
-        "confirmation natively. Continue with the native actions: payment_controls lists "
+        "payment_done waits for and reads the confirmation natively; payment_close (when the payment will not go "
+        "ahead: a stopped fill, the user cancelled) closes the payment tab(s) and ends the lock without a "
+        "confirmation snapshot (closed_tabs, lock_released; nothing read or clicked). "
+        "Continue with the native actions: payment_controls lists "
         "the buttons, links and checkboxes ({ref, role, text, disabled}; never inputs, digits masked) of the "
         "card frames and of the payment tab's own page (the merchant checkout, or a bank's 3-D Secure page it "
         "was redirected to) unless that page is a card form; payment_click (ref) makes one trusted click on a "
@@ -1391,7 +1391,7 @@ BROWSER_VAULT_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock", "letter_login",
                                                   "letter_signed_in", "letter_done", "payment_controls",
-                                                  "payment_click", "payment_done", "payment_dialog"]},
+                                                  "payment_click", "payment_done", "payment_dialog", "payment_close"]},
             "ref": {"type": "string", "description": "payment_click only: a ref from payment_controls."},
             "accept": {"type": "boolean", "description": "payment_dialog only: true accepts, false dismisses the "
                                                          "dialog_pending confirm."},
@@ -1584,6 +1584,17 @@ def _payment_done_action(task_id: Optional[str], expected_origin: str) -> str:
     return json.dumps(payment_done(_managed_supervisor(task_id or "default"), expected_origin))
 
 
+def _payment_close_action(task_id: Optional[str]) -> str:
+    """dlz (11-12): close the locked payment tab(s) natively, no confirmation (managed browser only); control
+    confirms this task's lease first."""
+    from tools.browser_payment_done import payment_close
+
+    if not _is_managed():
+        return json.dumps({"success": False, "error_type": "payment_surface_none",
+                           "error": "Only the managed browser locks a card payment; use the browser tools as usual."})
+    return json.dumps(payment_close(_managed_supervisor(task_id or "default", admit=True)))
+
+
 def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     """dlz: every page-derived field of the result (errors, urls, titles, origins: :func:`_scrub_page_fields`)
     and any raised error get the browser-audience vault scrub; handles, refs and the echoed approval fields
@@ -1663,12 +1674,13 @@ def _handle_vault_inner(args: dict[str, Any], **kwargs) -> str:
         "payment_click": lambda: _payment_surface_action(tid, str(args.get("ref") or "")),
         "payment_done": lambda: _payment_done_action(tid, str(args.get("expected_origin") or "")),
         "payment_dialog": lambda: _payment_dialog_action(tid, args.get("dialog_id"), args.get("accept")),
+        "payment_close": lambda: _payment_close_action(tid),
     }
     if action not in page_ops:
         return json.dumps({"success": False, "error": f"Unknown action {action!r}; use list, fill, save_login, "
                                                        "enter_code, unlock, letter_login, letter_signed_in, "
-                                                       "letter_done, payment_controls, payment_click, payment_done or "
-                                                       "payment_dialog."})
+                                                       "letter_done, payment_controls, payment_click, payment_done, "
+                                                       "payment_dialog or payment_close."})
     target = args.get("target") or "browser"
     if target == "preview":
         if action not in _PREVIEW_ACTIONS:
