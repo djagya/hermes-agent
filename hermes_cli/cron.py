@@ -228,6 +228,15 @@ def _last_run_display(job: dict[str, Any]) -> str:
     return display
 
 
+def _fallback_display(job: dict[str, Any]) -> str:
+    """``provider:model`` list of the job's own opt-in fallbacks, in walk order ('' when none)."""
+    entries = job.get("fallback_providers")
+    if not isinstance(entries, list):
+        return ""
+    return ", ".join(
+        f"{e.get('provider')}:{e.get('model')}" for e in entries if isinstance(e, dict))
+
+
 def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
     """``(label, value)`` detail rows for one job in ``cron list``."""
     # `repeat` / `deliver` may be present-but-null (dict-default only covers a missing key).
@@ -254,6 +263,7 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
         ("Changed", mon_state.get("last_changed_at") if monitor_source else ""),
         ("Mode", color("no-agent", Colors.DIM) + " (script stdout delivered directly)"
          if job.get("no_agent") else ""),
+        ("Fallback", _fallback_display(job)),
         ("Timezone", job.get("timezone")),
         ("Grace", f"{job['grace_minutes']} min" if job.get("grace_minutes") is not None else ""),
         ("Workdir", job.get("workdir")),
@@ -797,7 +807,13 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
 
 def _job_api_kwargs(args) -> dict[str, Any]:
     """Collect the create/update kwargs shared by ``cron create`` and ``cron edit``."""
-    return {api_key: getattr(args, attr, None) for api_key, attr in _JOB_ARG_FIELDS}
+    kwargs = {api_key: getattr(args, attr, None) for api_key, attr in _JOB_ARG_FIELDS}
+    # --fallback is repeatable (order kept); --clear-fallback (edit only) sends [] = clear.
+    if getattr(args, "clear_fallback", False):
+        kwargs["fallback_providers"] = []
+    else:
+        kwargs["fallback_providers"] = getattr(args, "fallback", None) or None
+    return kwargs
 
 
 _JOB_DETAIL_LINES = (
@@ -808,6 +824,7 @@ _JOB_DETAIL_LINES = (
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
     ("timezone", "  Timezone: {} (schedule runs on this zone's wall clock)"),
     ("workdir", "  Workdir: {}"),
+    ("fallback_providers", "  Fallback: {}"),
     ("interpreter", "  Python: {}"),
     ("alert_after_consecutive_failures", "  Alerts: after {} failed runs in a row"),
     ("alert_when_stale_minutes", "  Alerts: once failing for {} min"))
@@ -817,7 +834,8 @@ def _print_job_details(job_data: dict[str, Any]) -> None:
     """Print the optional Script/Monitor/Mode/Continuity/Workdir lines of a job record."""
     for key, template in _JOB_DETAIL_LINES:
         if job_data.get(key):
-            print(template.format(job_data[key]))
+            value = _fallback_display(job_data) if key == "fallback_providers" else job_data[key]
+            print(template.format(value))
 
 
 def cron_create(args):

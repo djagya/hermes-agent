@@ -1695,6 +1695,44 @@ def _normalize_str_list(items: Any) -> Optional[list[str]]:
     return [str(j).strip() for j in items if str(j).strip()] or None
 
 
+_FALLBACK_ENTRY_KEYS = frozenset({"provider", "model", "base_url"})
+
+
+def _normalize_fallback_providers(value: Any) -> Optional[list[dict[str, str]]]:
+    """Per-job fallback list (opt-in; the only fallback a pinned job may walk). None = not set.
+    Entries are ``{provider, model[, base_url]}`` like config ``fallback_providers``; credentials
+    (``api_key``/``key_env``) are refused: a job record must not carry or name a secret. Invalid
+    input raises BEFORE anything is stored. ``[]`` is kept as an explicit "no fallback"."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(
+            "fallback_providers must be a list of {provider, model[, base_url]} entries.")
+    out: list[dict[str, str]] = []
+    for i, entry in enumerate(value, 1):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"fallback_providers entry {i} must be an object with provider and model, "
+                f"got {type(entry).__name__}.")
+        extra = sorted(str(k) for k in set(entry) - _FALLBACK_ENTRY_KEYS)
+        if extra:
+            raise ValueError(
+                f"fallback_providers entry {i} has unsupported key(s): {', '.join(extra)} "
+                "(allowed: provider, model, base_url).")
+        provider = _normalize_job_optional_text(entry.get("provider"))
+        model = _normalize_job_optional_text(entry.get("model"))
+        if not provider or not model:
+            raise ValueError(
+                f"fallback_providers entry {i} needs a non-empty provider and model "
+                "(PROVIDER:MODEL).")
+        normalized = {"provider": provider, "model": model}
+        base_url = _normalize_base_url(entry.get("base_url"))
+        if base_url:
+            normalized["base_url"] = base_url
+        out.append(normalized)
+    return out
+
+
 def _normalize_enabled_toolsets(value: Any) -> Optional[list[str]]:
     """Per-job toolset allowlist. An explicitly-set EMPTY list means 'nothing allowed' and must
     persist as [] — normalizing it to None would read back as 'no restriction' (#82010). Absent
@@ -1799,6 +1837,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "fallback_providers": _normalize_fallback_providers,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1816,6 +1855,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "fallback_providers": _normalize_fallback_providers,
 }
 
 
@@ -1871,6 +1911,7 @@ def create_job(
     script_timeout_seconds: Optional[int] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    fallback_providers: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1883,7 +1924,9 @@ def create_job(
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation). timezone: IANA key pinning the schedule's
     wall clock (None/'' = inherit the profile zone). grace_minutes: catch-up window override
-    (0 = never catch up)."""
+    (0 = never catch up). fallback_providers: the job's own ``[{provider, model[, base_url]}]``
+    fallback list, the only chain a pinned job may walk (None = none; unpinned jobs then inherit
+    the global chain)."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1975,7 +2018,7 @@ def create_job(
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("script_timeout_seconds", f["script_timeout_seconds"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
-        ("catch_up", f["catch_up"]),
+        ("catch_up", f["catch_up"]), ("fallback_providers", f["fallback_providers"]),
     ):
         if value is not None:
             job[key] = value
@@ -2167,6 +2210,8 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         updated = _apply_skill_fields({**job, **updates})
         if "script_timeout_seconds" in updates and updated.get("script_timeout_seconds") is None:
             updated.pop("script_timeout_seconds", None)  # cleared: absent key = global config
+        if "fallback_providers" in updates and updated.get("fallback_providers") is None:
+            updated.pop("fallback_providers", None)  # cleared: absent key = no per-job list
         if "catch_up" in updates:
             # dlz: an explicit catch_up edit supersedes the legacy per-job key for good, so a
             # later reset to the default cannot fall back to a stale catch_up_missed.

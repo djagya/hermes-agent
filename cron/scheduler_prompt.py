@@ -416,14 +416,35 @@ def _scan_assembled_cron_prompt(
     return assembled
 
 
+def _fallback_entries_exfil_error(job: dict) -> Optional[str]:
+    """Same provider/base_url check for the job's own ``fallback_providers`` entries: unlike the
+    global chain they are stored in the job record, so a hand-written entry is not operator config.
+    Raises on validator errors (the caller fails closed)."""
+    from tools.cronjob_tools import _validate_cron_base_url
+    for entry in job.get("fallback_providers") or []:
+        if isinstance(entry, dict) and entry.get("base_url"):
+            err = _validate_cron_base_url(entry.get("provider"), entry.get("base_url"))
+            if err:
+                return f"fallback_providers: {err}"
+    return None
+
+
+def _has_base_url_override(job: dict) -> bool:
+    entries = job.get("fallback_providers")
+    return bool(job.get("base_url")) or (isinstance(entries, list) and any(
+        isinstance(e, dict) and e.get("base_url") for e in entries))
+
+
 def _guard_job_credential_exfil(job: dict) -> None:
     """Fail closed (RuntimeError) if the stored provider/base_url pair could exfiltrate a key.
     Runtime backstop: jobs persisted before the create/update guard, or written directly to the
-    store, reach provider resolution unchecked. Fallback providers come from operator config and
-    are validated by the caller, not here."""
+    store, reach provider resolution unchecked. The global fallback chain comes from operator config
+    and is validated by the caller; a job's OWN ``fallback_providers`` entries live in the record, so
+    they are checked here."""
     try:
         from tools.cronjob_tools import _validate_cron_base_url
-        err = _validate_cron_base_url(job.get("provider"), job.get("base_url"))
+        err = (_validate_cron_base_url(job.get("provider"), job.get("base_url"))
+               or _fallback_entries_exfil_error(job))
     except Exception as exc:
         # Fail CLOSED on validator/import errors — but only for jobs WITH a base_url override;
         # a job without one cannot exfiltrate via this path, so it still runs.
@@ -431,7 +452,7 @@ def _guard_job_credential_exfil(job: dict) -> None:
             f"could not validate provider/base_url pair "
             f"({exc.__class__.__name__}: {exc}); refusing to run a job with "
             "an unverified base_url override"
-        ) if job.get("base_url") else None
+        ) if _has_base_url_override(job) else None
     if err:
         job_id = job.get("id")
         logger.error(
