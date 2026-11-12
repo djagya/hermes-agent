@@ -22,7 +22,8 @@ class TestVaultDigitValuesLeaveNoOracle:
             assert outs[0] == outs[1], outs
             assert not any(ch.isdigit() for ch in outs[0][0].split(";")[0]), outs[0]
             assert "4711" not in outs[0][0] and "code 042172" in outs[0][0]  # r9: a model-typed code: not registered
-            assert outs[0][1] == "x ••• y •••• •••• •••• •••• z «redacted-card»"
+            assert outs[0][1] == "x ••• y •••• •••• •••• •••• z Li"  # owner decision B: holder in browser/log only
+            assert redact.redact_sensitive_text("z Li", force=True, vault="browser") == "z «redacted-card»"
             assert redact.release_card_window("shopping")
             assert redact.redact_sensitive_text("printed 737, Li", force=True) == "printed 737, Li"
         finally:

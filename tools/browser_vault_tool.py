@@ -674,7 +674,10 @@ def browser_vault_enter_code(
     boundary the same way a generated one is."""
     from agent.redact import register_vault_redaction_value
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
-    from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
+    from agent.vault_login_classifier import (
+        SEVERAL_CODE_FIELDS, LoginControl, build_fill_js, build_inspection_js, build_otp_fills,
+        classify_otp_controls_detailed,
+    )
 
     effective_task_id = task_id or "default"
 
@@ -716,7 +719,12 @@ def browser_vault_enter_code(
     raw_controls = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
     if isinstance(raw_controls, str):
         raw_controls = _parse_json_result(raw_controls)
-    otp_controls = classify_otp_controls([LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)])
+    otp_controls, why_none = classify_otp_controls_detailed(
+        [LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)])
+    if why_none == SEVERAL_CODE_FIELDS:
+        return json.dumps({"success": False, "error_type": "no_code_field",
+                           "error": ("Several possible code fields on the current page, so none was filled. Nothing was written. "
+                                     "Tell the user which field takes the code, or ask them to enter it themselves.")})
     if not otp_controls:
         return json.dumps({"success": False, "error_type": "no_code_field",
                            "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or "
@@ -725,6 +733,10 @@ def browser_vault_enter_code(
     def write(code_value: str, source: str) -> str:
         register_vault_redaction_value(code_value, known_to_model=source == "supplied", ttl_s=_OTP_REDACTION_TTL_S)
         fills = build_otp_fills(otp_controls, code_value)
+        if not fills:  # the code would not fit the chosen field (maxlength): nothing is written
+            del code_value
+            return json.dumps({"success": False, "error_type": "no_code_field",
+                               "error": "The code field cannot hold the whole code, so none was filled. Nothing was written."})
         result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
         del code_value
         if not result.get("success"):
@@ -734,6 +746,9 @@ def browser_vault_enter_code(
             parsed = _parse_json_result(parsed)
         if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
             return json.dumps({"success": False, "error_type": "origin_changed", "error": "The page navigated before the code could be entered. Nothing was written."})
+        if isinstance(parsed, dict) and parsed.get("refused") == "field_not_visible":
+            return json.dumps({"success": False, "error_type": "code_field_not_visible",
+                               "error": "The code field is not visible on the page. Nothing was written."})
         filled = _filled_count(parsed, len(fills))
         if filled is None:
             return json.dumps(_FILL_UNVERIFIED)
