@@ -128,11 +128,12 @@ def _release(task_id: Optional[str], identity: str, mode: str, revoke_unused_han
         return tool_error(err)
     route = _route()
     slot_id = lease.get(route.MANAGED_SLOT_ENV, "")
-    outcome, failure = route.release_lease_outcome(dict(lease), revoke_unused_handoff=revoke_unused_handoff)
+    outcome, failure = route.release_lease_outcome(
+        dict(lease), revoke_unused_handoff=revoke_unused_handoff, keep_if_revocable=True)
     if failure:
         return tool_error(failure, slot_id=slot_id)
     if outcome == route.RELEASE_DEFERRED_REVOCABLE:
-        # Nobody opened the link: the lease stays held so this call can be repeated with the flag.
+        # Nobody opened the link: the lease entry (no daemon) stays so this call can be repeated with the flag.
         return tool_result({"success": True, "released": slot_id, "deferred": True, "revocable": True,
                             "note": "Control keeps the slot while the handoff link is live. Nobody has opened it: "
                                     "if Danil is no longer needed on that tab, call release again with "
@@ -141,10 +142,10 @@ def _release(task_id: Optional[str], identity: str, mode: str, revoke_unused_han
                                     "when the link is used or expires."})
     if outcome == route.RELEASE_DEFERRED:
         # dlz: G2-R7 — control keeps a lease whose handoff link is still open; not an error, never retry.
-        return tool_result({"success": True, "released": slot_id, "deferred": True, "revocable": False,
-                            "note": "Danil opened the handoff link, so control keeps the slot and the release "
-                                    "completes when he hands back (or the link expires); do not call release "
-                                    "again."})
+        return tool_result({"success": True, "released": slot_id, "deferred": True,
+                            "note": "Released from your side. Control keeps the slot while the handoff link is "
+                                    "still live and frees it when the link is used or expires; do not call "
+                                    "release again."})
     if outcome == route.RELEASE_ALREADY_ENDED:
         return tool_result({"success": True, "released": slot_id, "already_ended": True,
                             "note": "Control had already ended this lease; the slot is free."})

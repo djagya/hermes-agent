@@ -168,12 +168,13 @@ def test_release_body_has_the_flag_only_when_set(release_posts):
     ]
 
 
-def test_deferred_revocable_keeps_the_held_lease_and_daemon(release_posts):
+def test_deferred_revocable_keeps_the_lease_entry_but_retires_the_daemon(release_posts):
     release_posts.replies.append(dict(_PENDING_REVOCABLE))
     out = _call(action="release")
     assert out["deferred"] is True and out["revocable"] is True
     assert "revoke_unused_handoff=true" in out["note"]
-    assert release_posts.retired == [] and "t1||research" in route._held_leases
+    # The daemon goes before the POST in every case; only the lease entry (id/token) comes back.
+    assert release_posts.retired == ["bu"] and "t1||research" in route._held_leases
     assert route.held_leases_for_task("t1")  # Sera can still address the lease
 
 
@@ -186,22 +187,85 @@ def test_revoking_second_release_frees_the_slot_and_drops_the_minted_claim(relea
     out = _call(action="release", revoke_unused_handoff=True)
     assert out == {**out, "success": True, "released": "research-1"} and "deferred" not in out
     assert release_posts.posts[-1]["revoke_unused_handoff"] is True
-    assert "t1||research" not in route._held_leases and release_posts.retired == ["bu"]
+    assert "t1||research" not in route._held_leases and release_posts.retired == ["bu", "bu"]
     assert list(route._minted_handoffs) == [("t1", "research-2", "lease-9")]
 
 
 def test_deferred_not_revocable_keeps_the_old_behaviour(release_posts):
     release_posts.replies.append(dict(_PENDING_OPENED))
     out = _call(action="release", revoke_unused_handoff=True)
-    assert out["deferred"] is True and out["revocable"] is False
-    assert "Danil opened" in out["note"] and "hands back" in out["note"] and "revoke_unused_handoff" not in out["note"]
+    assert out["deferred"] is True and "revocable" not in out
+    assert "revoke_unused_handoff" not in out["note"] and "do not call release again" in out["note"]
     assert "t1||research" not in route._held_leases and "bu" in release_posts.retired
 
 
-def test_old_control_deferral_without_revocable_drops_the_lease(release_posts):
+def test_old_control_deferral_without_revocable_does_not_claim_the_link_was_opened(release_posts):
     release_posts.replies.append({"error": "handoff_pending", "reason": "handoff_pending", "deferred": True})
-    assert _call(action="release")["revocable"] is False
+    out = _call(action="release")
+    assert out["deferred"] is True and "revocable" not in out
+    assert "opened" not in out["note"] and "still live" in out["note"] and "used or expires" in out["note"]
     assert "t1||research" not in route._held_leases and "bu" in release_posts.retired
+
+
+def test_raising_post_retires_the_daemon_and_keeps_the_lease_for_a_retry(monkeypatch, release_posts):
+    import http.client
+
+    def boom(control, path, payload):
+        raise http.client.IncompleteRead(b"")
+
+    monkeypatch.setattr(route, "_post", boom)
+    out = _call(action="release")
+    assert "error" in out and "IncompleteRead" in out["error"]
+    assert release_posts.retired == ["bu"]
+    assert "t1||research" in route._held_leases  # not silently lost: a retry (or atexit) can still release it
+    # The same through the cleanup shape: nothing escapes, the daemon is retired.
+    release_posts.retired.clear()
+    assert route.release_lease({route.MANAGED_LEASE_ENV: "lease-1", route.MANAGED_TOKEN_ENV: "tok-1",
+                                "BU_NAME": "bu"}) is not None
+    assert release_posts.retired == ["bu"]
+
+
+def test_task_end_after_an_ignored_revocable_deferral_leaks_no_daemon(release_posts):
+    route.note_handoff("t1", "research-1", "lease-1", 600)
+    release_posts.replies.append(dict(_PENDING_REVOCABLE))
+    assert _call(action="release")["revocable"] is True
+    assert release_posts.retired == ["bu"]  # the only retire: nothing is left to leak
+    # Claim still open: task end keeps the entry (as for any open handoff), still no daemon to retire.
+    assert route.release_task_leases(["t1"]) == 0
+    assert release_posts.retired == ["bu"]
+    # Claim expired: the entry no longer blocks task-end cleanup, which releases it without the flag.
+    route._minted_handoffs.clear()
+    release_posts.replies.append(dict(_PENDING_REVOCABLE))
+    assert route.release_task_leases(["t1"]) == 1
+    assert "t1||research" not in route._held_leases
+    assert release_posts.retired == ["bu", "bu"]
+    assert "revoke_unused_handoff" not in release_posts.posts[-1]
+
+
+def test_cleanup_shaped_release_retires_on_a_revocable_reply_and_restores_nothing(release_posts):
+    release_posts.replies.append(dict(_PENDING_REVOCABLE))
+    assert route.release_task_leases(["t1"]) == 1
+    assert release_posts.retired == ["bu"] and not route._held_leases
+    route._held_leases["t1||research"] = {route.MANAGED_LEASE_ENV: "lease-1", route.MANAGED_TOKEN_ENV: "tok-1",
+                                         route.MANAGED_SLOT_ENV: "research-1", "BU_NAME": "bu"}
+    release_posts.replies.append(dict(_PENDING_REVOCABLE))
+    route.release_all_held_leases()
+    assert release_posts.retired == ["bu", "bu"] and not route._held_leases
+
+
+def test_restore_does_not_clobber_a_concurrent_reacquire(monkeypatch, release_posts):
+    fresh = {route.MANAGED_LEASE_ENV: "lease-2", route.MANAGED_TOKEN_ENV: "tok-2",
+             route.MANAGED_SLOT_ENV: "research-1", "BU_NAME": "bu2"}
+
+    def racing_post(control, path, payload):
+        release_posts.posts.append(dict(payload))
+        route._held_leases["t1||research"] = dict(fresh)  # a parallel browser_exec acquired meanwhile
+        return dict(_PENDING_REVOCABLE)
+
+    monkeypatch.setattr(route, "_post", racing_post)
+    assert _call(action="release")["revocable"] is True
+    assert route._held_leases["t1||research"] == fresh
+    assert release_posts.retired == ["bu"]  # the old lease's daemon was retired before the POST
 
 
 def test_cleanup_paths_never_send_the_flag(release_posts):

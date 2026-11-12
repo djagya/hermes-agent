@@ -949,16 +949,23 @@ def _forget_minted_handoffs(slot: str, lease_id: str) -> None:
             _minted_handoffs.pop(key, None)
 
 
-def release_lease_outcome(env: dict[str, str], *, revoke_unused_handoff: bool = False) -> tuple[str, Optional[str]]:
+def release_lease_outcome(
+    env: dict[str, str], *, revoke_unused_handoff: bool = False, keep_if_revocable: bool = False
+) -> tuple[str, Optional[str]]:
     """``(outcome, error)``. ``outcome`` is ``released``, ``already_ended`` (control had
     already recycled the lease: the slot is free), ``deferred`` (control keeps the lease
     until a minted handoff link is used or expires: ``handoff_pending``) or
     ``deferred_revocable`` (the same, but nobody opened the link: a second release with
-    ``revoke_unused_handoff=True`` withdraws it and frees the slot; the held lease and its
-    daemon are kept for that call). ``error`` is set only on a real failure. Never retries.
+    ``revoke_unused_handoff=True`` withdraws it and frees the slot). ``error`` is set only on
+    a real failure. Never retries.
 
-    ``revoke_unused_handoff`` is only for the holder's explicit release action: cleanup paths
-    (task close, atexit) never pass it."""
+    The harness daemon is always retired before the POST, in every case (a held lease whose
+    release is deferred must not keep a daemon: nothing would ever retire it). Only with
+    ``keep_if_revocable`` does a revocable deferral put the held lease entry back (lease id and
+    token, no daemon: the next browser call re-spawns one under the same ``BU_NAME``), so the
+    holder's explicit second release can name it. ``revoke_unused_handoff`` and
+    ``keep_if_revocable`` are for the holder's explicit release action only: cleanup paths
+    (task close, atexit) never pass either, so a revocable reply is just ``deferred`` for them."""
     control = control_url()
     lease_id = str(env.get(MANAGED_LEASE_ENV) or "").strip()
     token = str(env.get(MANAGED_TOKEN_ENV) or "").strip()
@@ -977,38 +984,39 @@ def release_lease_outcome(env: dict[str, str], *, revoke_unused_handoff: bool = 
                 retired.add(str(held.get("BU_NAME") or ""))
                 popped.append((key, held))
                 _held_leases.pop(key, None)
+    for name in retired:
+        _retire_daemon(name)
 
-    def _retire_all() -> None:
-        for name in retired:
-            _retire_daemon(name)
+    def _restore() -> None:
+        # setdefault: a concurrent re-acquire under the same hold key keeps its fresh entry.
+        with _held_lock:
+            for key, held in popped:
+                _held_leases.setdefault(key, held)
 
     if not control_key():
-        _retire_all()
         return "", f"unavailable: {MANAGED_KEY_ENV} missing"
     body: dict[str, Any] = {"lease_id": lease_id, "token": token}
     if revoke_unused_handoff:
         body["revoke_unused_handoff"] = True
-    result = _post(control, "/v1/release", body)
+    try:
+        result = _post(control, "/v1/release", body)
+    except Exception as exc:  # e.g. http.client.IncompleteRead: the lease may still be live at control
+        _restore()
+        logger.warning("browser control: release of lease=%s failed: %s", lease_id[:12], exc)
+        return "", f"unavailable: release reply unreadable: {type(exc).__name__}"
     if not result.get("error"):
-        _retire_all()
         if revoke_unused_handoff:
             # D10-B: the withdrawn link's claim must not outlive the lease it pointed at.
             _forget_minted_handoffs(str(env.get(MANAGED_SLOT_ENV) or ""), lease_id)
         return "released", None
     if result.get("deferred") is True or result.get("reason") == "handoff_pending":
-        if result.get("revocable") is True:
-            # Nobody opened the link: keep the held lease (and its daemon) so the holder can release
-            # again with revoke_unused_handoff.
-            with _held_lock:
-                for key, held in popped:
-                    _held_leases.setdefault(key, held)
+        if result.get("revocable") is True and keep_if_revocable:
+            _restore()
             logger.info("browser control: release deferred lease=%s reason=handoff_pending revocable",
                         lease_id[:12])
             return RELEASE_DEFERRED_REVOCABLE, None
-        _retire_all()
         logger.info("browser control: release deferred lease=%s reason=handoff_pending", lease_id[:12])
         return RELEASE_DEFERRED, None
-    _retire_all()
     if result.get("error") == "stale":
         # The lease was already recycled (idle sweep, human End, restart): the slot is free.
         logger.info("browser control: release of an ended lease=%s treated as done", lease_id[:12])
