@@ -39,6 +39,9 @@ def _retire_if_sent_late(turn_runner, adapter, fut, request_id: str) -> None:
     def done(f) -> None:
         if f.cancelled() or f.exception() is not None or not getattr(f.result(), "success", False):
             return
+        # The card did post after the wait gave up: trace it (ids only) so "did it reach the owner?" has an answer.
+        logger.info("Payment approval card posted late and is withdrawn (request_id=%s, message_id=%s)",
+                    request_id, getattr(f.result(), "message_id", None))
         turn_runner._schedule(adapter.retire_payment_card(request_id, "unavailable"),
                               "late payment card retire scheduling error")
 

@@ -66,8 +66,8 @@ UNAVAILABLE_INCOMPLETE = ("The card-fill approval could not be shown completely,
                           "Tell the user; do not retry with different wording.")
 UNAVAILABLE_UNDELIVERED = ("The card-fill approval card was not delivered to the owner's private Telegram chat (the "
                            "send failed, Telegram did not confirm it in time, or the card could not show every "
-                           "fact), so nobody was asked. Tell the user the approval did not go out; do not retry the "
-                           "fill on your own.")
+                           "fact). If it posted late, it was withdrawn at once and a tap on it does nothing. Tell "
+                           "the user the approval did not go through; do not retry the fill on your own.")
 UNAVAILABLE_DEGRADED = ("The card-fill approval card was sent, but Hermes' Telegram connection dropped or reconnected "
                         "while it waited, so the owner's tap may not have arrived. Nothing was approved. Tell the user "
                         "what happened and ask once whether to try again; do not retry the fill on your own.")
