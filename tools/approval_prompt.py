@@ -383,7 +383,9 @@ def _elicit_payment(message: str, description: str, *, timeout_seconds: int | No
         logger.error("Payment approval dispatch failed: %s", type(exc).__name__)
         return (*unavailable, _pay.UNAVAILABLE_INCOMPLETE)
     if decision.get("notify_failed"):
-        return (*unavailable, _pay.UNAVAILABLE_INCOMPLETE)
+        return (*unavailable, _pay.UNAVAILABLE_UNDELIVERED)
+    if decision.get("delivery_degraded"):
+        return (*unavailable, _pay.UNAVAILABLE_DEGRADED)
     if not decision.get("resolved") or decision.get("cancelled"):
         return "cancel", "timeout", ""
     if decision.get("choice") == "once":
