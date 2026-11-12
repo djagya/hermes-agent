@@ -632,7 +632,8 @@ n.onfocus = {none: () => {}, hide: () => { n.hidden = true; }, hide_other: () =>
   parent_transparent: () => { owner.op = '0'; }, top_replaced: () => { parentWin.location.href += '?step=2'; },
   slow_checks: () => { n.slow = true; }}[CASE.focus];
 let result = api.commit([{index: 0, token: 'cc-csc', value: '837'}, {index: 1, token: 'cc-number', value: '4242'}],
-                        CASE.focus === 'slow_checks' ? 1500 : 60000, CASE.strict, CASE.paced === true);
+                        CASE.focus === 'slow_checks' ? 1500 : 60000, CASE.strict, CASE.paced === true,
+                        ...(CASE.repin === true ? [true] : []));
 const paused = [];  // [fields written so far, setter calls so far] at each pause
 const repins = [];  // the check of each re-pin request; CASE.pins 'auto' answers by autocomplete, else null (stop)
 while (result && (result.pending === true || result.repin === true) && paused.length + repins.length < 8) {
@@ -684,11 +685,13 @@ _NUMBER_STEP = {"token": "cc-number", "step": 2}
     ("parent_transparent", True, ["c"], {"reason": "frame_changed"}), ("top_replaced", True, ["c"], {"reason": "navigated"}),
     ("slow_checks", False, ["c"], None),  # the re-checks themselves crossed the deadline: no setter after it
 ])
-def test_a_focus_handler_that_changes_the_pinned_set_stops_the_next_setter(focus, strict, writes, check):
+@pytest.mark.parametrize("repin", [False, True])
+def test_a_focus_handler_that_changes_the_pinned_set_stops_the_next_setter(focus, strict, writes, check, repin):
     """Design v2 A5: page code runs on focus; the field is written only if the whole pinned set still holds
-    right before its setter (and, strict, the field is what a click at its centre would hit). A re-render asks the
-    supervisor for a re-pin first (declined here); the stop names the failed check with fixed codes only."""
-    out = _setter_harness({"focus": focus, "strict": strict})
+    right before its setter (and, strict, the field is what a click at its centre would hit). The stop names the
+    failed check with fixed codes only. With re-pin switched on, a re-render asks the supervisor for a re-pin first
+    (declined here); switched off (the default), the closure never asks."""
+    out = _setter_harness({"focus": focus, "strict": strict, "repin": repin})
     assert out["writes"] == writes and out["paused"] == []
     if len(writes) == 1:
         error_type = "payment_consent_expired" if focus == "slow_checks" else "payment_fields_changed"
@@ -696,7 +699,7 @@ def test_a_focus_handler_that_changes_the_pinned_set_stops_the_next_setter(focus
         if check:
             expected["check"] = {**_NUMBER_STEP, **check}
         assert out["result"] == expected
-        repinnable = check is not None and check["reason"] not in ("navigated", "frame_changed", "hit_test")
+        repinnable = repin and check is not None and check["reason"] not in ("navigated", "frame_changed", "hit_test")
         assert out["repins"] == ([expected["check"]] if repinnable else [])
     else:
         assert out["result"]["success"] is True and out["repins"] == []
@@ -710,7 +713,10 @@ def test_a_focus_handler_that_changes_the_pinned_set_stops_the_next_setter(focus
 def test_a_re_render_is_written_only_after_an_accepted_re_pin(focus, writes, repins):
     """dlz (re-pin): the supervisor's answer moves the pins; every check then runs again before the setter, and a
     re-pinned field pauses after its focus for the owner-chain check though the fill is not strict (Codex r1 P1-1)."""
-    out = _setter_harness({"focus": focus, "strict": False, "pins": "auto"})
+    out = _setter_harness({"focus": focus, "strict": False, "pins": "auto", "repin": True})
+    off = _setter_harness({"focus": focus, "strict": False, "pins": "auto"})  # switched off: stops, never asks
+    assert off["writes"] == ["c"] and off["repins"] == [] and off["paused"] == []
+    assert off["result"]["error_type"] == "payment_fields_changed" and off["result"]["check"]["reason"] == repins[0]
     assert out["writes"] == writes and [c["reason"] for c in out["repins"]] == repins
     assert out["paused"] == ([[1, 1]] if len(writes) == 2 else [])
     if len(writes) == 2:

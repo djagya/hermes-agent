@@ -205,7 +205,7 @@ def _deferring_commit(resumed_answer, monkeypatch):
     fills = [{"document": k, "index": 0, "token": t, "value": "x"} for k, t in enumerate(("cc-exp", "cc-csc", "cc-number"))]
     sup = _Deferring(resumed_answer)
     monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
-    return sup, asyncio.run(sup._commit_payment_once(i, fills, None))
+    return sup, asyncio.run(sup._commit_payment_once(i, fills, None, repin=True))
 
 
 def test_a_deferred_document_is_resumed_once_after_the_number_document(monkeypatch):
@@ -419,6 +419,7 @@ class _ClosureSupervisor(sp.PaymentSupervisionMixin):
         assert method == "Runtime.callFunctionOn", method
         name = re.search(r"return this\.(\w+)\(", params["functionDeclaration"]).group(1)
         self.events.append(name)
+        self.calls = getattr(self, "calls", []) + [(params["functionDeclaration"], len(params.get("arguments", [])))]
         return {"result": {"result": {"value": self.js.call(name, *[a["value"] for a in params.get("arguments", [])])}}}
 
     async def _payment_is_current(self, i, during_fill=False):
@@ -442,8 +443,9 @@ class _ClosureSupervisor(sp.PaymentSupervisionMixin):
         pass
 
 
-def _closure_commit(scenario, tmp_path, monkeypatch, secret=None, **checks):
-    """Inspect the scenario's document, build the fills as the vault does, run the approval's page code, commit."""
+def _closure_commit(scenario, tmp_path, monkeypatch, secret=None, repin=True, **checks):
+    """Inspect the scenario's document, build the fills as the vault does, run the approval's page code, commit
+    (``repin``: config vault.payment_repin, on for the re-pin tests)."""
     from tools.browser_vault_payment import _document_fills
 
     js = _NodeClosure(scenario, tmp_path)
@@ -456,7 +458,7 @@ def _closure_commit(scenario, tmp_path, monkeypatch, secret=None, **checks):
         js.call("approve")
         sup = _ClosureSupervisor(js, **checks)
         monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
-        out = asyncio.run(sup._commit_payment_once(i, fills, None))
+        out = asyncio.run(sup._commit_payment_once(i, fills, None, **({"repin": True} if repin else {})))
         return out, js.call("values"), sup.events, fills
     finally:
         js.close()
@@ -548,3 +550,120 @@ def test_a_document_replaced_by_fewer_card_fields_before_any_write_gets_nothing(
     assert out["success"] is False and out["filled_fields"] == 0, out
     assert out["fill_check"]["repin_refused"] == "set_changed"
     assert not any(values.values())
+
+
+# -- Re-pin switched off (config vault.payment_repin, the default): the commit as it was before re-pinning. --
+# Each round-1/round-2 scenario stops where the base commit (4ecd5a7afb) stops, with the same writes; the table is
+# that base's own outcome (a differential run of the base closure and supervisor against this code over these
+# scenarios and random ones: .scratch/release-p2/pay-dt/r3/diff_base_off.py), plus the stop record, the one addition.
+_OFF = {  # scenario: (fields written, what was written, the stop record)
+    "both_hidden": (0, {}, {"reason": "field_hidden", "step": 1, "token": "cc-number", "fields": ["cc-csc", "cc-exp"]}),
+    "not_next_hidden": (0, {}, {"reason": "field_hidden", "step": 1, "token": "cc-number", "fields": ["cc-exp"]}),
+    "hidden_by_a_write": (1, {"name": "JANE DOE"},
+                          {"reason": "field_hidden", "step": 2, "token": "cc-csc", "fields": ["cc-exp"]}),
+    "never_shown": (0, {}, {"reason": "field_hidden", "step": 1, "token": "cc-number", "fields": ["cc-csc"]}),
+    "covered_replacement": (1, {"csc": "123"},
+                            {"reason": "fields_replaced", "step": 2, "token": "cc-exp", "fields": ["cc-exp"]}),
+    "replacement": (1, {"csc": "123"}, {"reason": "fields_replaced", "step": 2, "token": "cc-exp", "fields": ["cc-exp"]}),
+    "offscreen_replacement": (1, {"csc": "123"},
+                              {"reason": "fields_replaced", "step": 2, "token": "cc-exp", "fields": ["cc-exp"]}),
+    "holder_becomes_number": (1, {"exp": "07/35"},
+                              {"reason": "fields_replaced", "step": 2, "token": "cc-number", "fields": ["cc-number"]}),
+    "promo_becomes_expiry": (1, {"csc": "123"},
+                             {"reason": "fields_replaced", "step": 2, "token": "cc-exp", "fields": ["cc-exp"]}),
+    "month_relisted": (0, {}, {"reason": "fields_relabeled", "step": 1, "token": "cc-exp-month",
+                               "fields": ["cc-exp-month"], "keys": ["options"]}),
+    "year_widened": (1, {"month": "7"}, {"reason": "fields_relabeled", "step": 2, "token": "cc-exp-year",
+                                         "fields": ["cc-exp-year"], "keys": ["maxLength"]}),
+    "cvc_widened": (0, {}, {"reason": "fields_relabeled", "step": 1, "token": "cc-csc", "fields": ["cc-csc"],
+                            "keys": ["maxLength"]}),
+    "gift_card": (0, {}, {"reason": "fields_replaced", "step": 1, "token": "cc-number",
+                          "fields": ["cc-csc", "cc-exp", "cc-number"]}),
+}
+
+
+def test_the_switched_off_table_covers_every_re_pin_scenario():
+    assert set(_OFF) == set(_SCENARIOS)
+
+
+@pytest.mark.parametrize("scenario", sorted(_OFF))
+def test_with_re_pin_switched_off_every_re_render_stops_the_fill_as_before(scenario, tmp_path, monkeypatch):
+    """Off (the default), no re-pin code runs: the closure is called with the four arguments it always had, never
+    asked to rebind, never resumed with an answer; any re-render, hide, relabel or replacement stops the fill with
+    payment_fields_changed and nothing more written. The stop record is kept."""
+    filled, written, check = _OFF[scenario]
+    secret = {**_SYNTHETIC, **({"cardholder_name": "JANE DOE"} if scenario == "hidden_by_a_write" else {})}
+    js = _NodeClosure(scenario, tmp_path)
+    try:
+        from tools.browser_vault_payment import _document_fills
+
+        doc = PaymentDocument("card", "s", "o-card", PSP, sp._card_controls(js.call("describe")),
+                              clock_anchor=time.monotonic())
+        i = PaymentInspection("op", "s", "tab", MERCHANT, (doc,), (("card", "L", PSP + "/card", PSP, ""),),
+                              time.monotonic() + 60)
+        fills = _document_fills(i, secret)
+        js.call("approve")
+        sup = _ClosureSupervisor(js)
+        monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
+        out = asyncio.run(sup._commit_payment_once(i, fills, None))  # the base call: no repin argument
+        values = js.call("values")
+        # the stopped commit answers no re-pin call: rebind() reads nothing, a resume with pins writes nothing
+        pins = {f["token"]: f["index"] for f in fills}
+        assert js.call("rebind") is None
+        assert js.call("resume", pins) == {"success": False, "error_type": "payment_fields_changed", "filled_fields": 0}
+        assert js.call("values") == values
+    finally:
+        js.close()
+    assert out == {"success": False, "error_type": "payment_fields_changed", "filled_fields": filled,
+                   **({"partially_filled": filled > 0} if filled or scenario.endswith(("relisted", "widened")) else {}),
+                   "fill_check": {**check, "document": 1, "documents": 1}}
+    assert {k: v for k, v in values.items() if v} == written
+    assert sup.calls == [("function(fills,deadline,strict,paced){return this.commit(fills,deadline,strict,paced)}", 4)]
+    assert sup.events == ["commit"]  # no rebind, no resume, no scope re-proof, no owner-chain pause
+
+
+@pytest.mark.parametrize("answer", [
+    {"repin": True, "filled_fields": 0, "check": {"token": "cc-csc", "reason": "hidden", "step": 1}, "written": []},
+    {"deferred": True, "filled_fields": 0},
+])
+def test_with_re_pin_switched_off_a_re_pin_request_or_deferral_is_an_invalid_answer(answer):
+    """Off, the supervisor knows only the ``pending`` pause: a closure answer asking for a re-pin or a deferral is
+    not followed (no rebind, no resume): it is a malformed result, reported as an uncertain write, as before."""
+    class Sup(sp.PaymentSupervisionMixin):
+        calls = []
+
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            self.calls.append(params["functionDeclaration"])
+            return {"result": {"result": {"value": answer}}}
+
+    doc = PaymentDocument("cvc", "s", "o-cvc", PSP, _controls("cc-csc"), clock_anchor=time.monotonic())
+    sup = Sup()
+    out = asyncio.run(sup._commit_payment_document(doc, [{"index": 0, "token": "cc-csc", "value": "x"}], 60000.0))
+    assert out == {"success": False, "error_type": "payment_result_invalid", "filled_fields": 0,
+                   "partially_filled": True, "write_uncertain": True}
+    assert len(sup.calls) == 1 and "commit(fills,deadline,strict,paced)" in sup.calls[0]
+
+
+@pytest.mark.parametrize("config, unreviewed, expected", [
+    ({"vault": {"payment_repin": True}}, False, True), ({"vault": {"payment_repin": True}}, True, False),
+    ({"vault": {"payment_repin": "true"}}, False, False), ({"vault": {"payment_repin": 1}}, False, False),
+    ({"vault": {}}, False, False), ({}, False, False), (None, False, False),
+])
+def test_re_pin_is_switched_on_only_by_a_literal_true_and_never_for_an_unreviewed_fill(config, unreviewed, expected,
+                                                                                         monkeypatch):
+    """vault.payment_repin: off by default and for anything but a literal true (also config that cannot be read);
+    switched on, only a reviewed fill's commit is told to re-pin."""
+    from agent.vault_payment_policy import payment_repin_enabled
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    from tools import browser_vault_payment as payment
+
+    def load():
+        if config is None:
+            raise OSError("config.yaml unreadable")
+        return config
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: DEFAULT_CONFIG)
+    assert payment_repin_enabled() is False  # the shipped defaults leave it off (the key is not listed there)
+    monkeypatch.setattr("hermes_cli.config.load_config", load)
+    assert payment_repin_enabled() is (config is not None and config.get("vault", {}).get("payment_repin") is True)
+    assert payment._repin_argument(unreviewed) == ({"repin": True} if expected else {})
