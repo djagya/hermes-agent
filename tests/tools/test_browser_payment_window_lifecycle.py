@@ -513,3 +513,35 @@ def test_a_seal_refuses_a_window_a_confirmed_release_already_narrowed():
     assert redact.release_card_window("S", redact.card_window_generations()["S"], keep_for_browser=True)
     with pytest.raises(redact.CardWindowGone):
         redact.seal_card_window("S", opened)
+
+
+def test_an_observe_whose_route_moves_between_the_bound_check_and_the_key_never_observes_another_slot(monkeypatch):
+    # Codex r4 P2: observe_windows checked slot_bound on one route read and took the key from a second one; a
+    # route that moved to research in between made A observe research's generation, and A's own unlock then
+    # released research while research stayed locked with its committed card. One snapshot per observe.
+    raw = "pan 5555 5555 5555 4444 cvc 321"
+    routes = {"t1": {"slot_id": "shopping", "supervisor_url": URL},
+              "t2": {"slot_id": "research", "supervisor_url": R_URL}}
+    moving = {"on": False, "reads": 0}
+
+    def vault_route(task_id):
+        if task_id == "t1" and moving["on"]:
+            moving["reads"] += 1
+            if moving["reads"] >= 2:  # every read after the first sees the route on research, still "bound"
+                return {"slot_id": "research", "supervisor_url": URL}
+        return dict(routes.get(task_id, {}))
+
+    monkeypatch.setattr(browser_use_cli, "vault_route", vault_route)
+    a = _sup("t1")
+    b = _sup("t2", cdp_url=R_URL)
+    with surface._LOCK:
+        surface._HELD.add(b)
+    card_values.note_claim(b)
+    with bvp._UnwrittenWindow(CARD2, b) as w:
+        w.committing()
+    before = _model(raw)
+    assert before != raw
+    a.status = dict(UNLOCKED)
+    moving["on"] = True
+    surface.lock_status(a)
+    assert redact.card_window_keys(unreleased=True) == ["research"] and _model(raw) == before

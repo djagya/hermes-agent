@@ -156,8 +156,11 @@ def observe_windows(supervisor: Any) -> dict:
             keys = set(_WINDOWS.get(supervisor, ()))
         except TypeError:
             keys = set()
-    if slot_bound(supervisor):
-        keys.add(window_key(supervisor))
+    # dlz: ONE route snapshot for the bind check and the key (as open_payment_window): a route that moves
+    # between two reads would make this supervisor observe, and later release, a slot it does not drive.
+    route = route_of(supervisor)
+    if slot_bound(supervisor, route):
+        keys.add(window_key(supervisor, route))
     gens = card_window_generations()
     return {key: gens.get(key, 0) for key in keys}
 
