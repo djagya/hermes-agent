@@ -950,7 +950,7 @@ _FILL_JS_TEMPLATE = """(() => {
     let ok = false;
     try { ok = !!el && el.isConnected && visible(el); } catch (_) { ok = false; }
     if (!ok) {
-      find("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+      clearStamps();
       return stringify({ refused: "field_not_visible" });
     }
   }
@@ -977,6 +977,8 @@ _FILL_JS_TEMPLATE = """(() => {
       if (el.value.length > 0) filled += 1;
     } catch (e) { /* skip */ }
   }
-  find("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+  clearStamps();
   return stringify({ filled });
+  // (a hoisted declaration, so the early no-write refusal above can use it too)
+  function clearStamps() { find("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot")); }
 })()"""
