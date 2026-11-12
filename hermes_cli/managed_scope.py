@@ -222,6 +222,21 @@ def apply_managed_overlay(config: dict, *, user_raw: Optional[dict] = None) -> d
         return config
 
 
+def non_null_paths(raw: dict, paths: set) -> set:
+    """The leaf paths in ``paths`` whose RAW value is not YAML null. A null leaf is unset on load
+    (the managed seed fills it), so it must not count as user-set on save, or the seed would be
+    pinned into the user file."""
+    def leaf(path):
+        node = raw
+        for key in path:
+            if not isinstance(node, dict):
+                return None
+            node = node.get(key)
+        return node
+
+    return {path for path in paths if leaf(path) is not None}
+
+
 def drop_unwritten_seeds(config: dict, user_raw: dict, keep: set) -> dict:
     """dlz: *config* without the seed leaves a load put there: a managed leaf the user file does not set
     (*user_raw*) whose value is still the seed *as of save time*. A load -> save round trip then leaves the

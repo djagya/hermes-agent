@@ -2350,18 +2350,7 @@ _FALLBACK_COMMENT = """
 
 def _strip_managed_keys_for_save(config: dict[str, Any], raw: dict, keep: set) -> dict[str, Any]:
     """User overrides of managed config leaves are saved and win on the next load; seeds are not."""
-    # A YAML null leaf counts as unset on load (the managed seed fills it), so it must not count
-    # as user-set here either, or the seed would be pinned into the user file.
-    def _raw_leaf(path: tuple[str, ...]) -> Any:
-        node: Any = raw
-        for key in path:
-            if not isinstance(node, dict):
-                return None
-            node = node.get(key)
-        return node
-
-    written = {path for path in _explicit_config_paths(raw) if _raw_leaf(path) is not None}
-    return managed_scope.drop_unwritten_seeds(config, raw, written | keep)
+    return managed_scope.drop_unwritten_seeds(config, raw, managed_scope.non_null_paths(raw, _explicit_config_paths(raw)) | keep)
 
 
 def _commented_sections_for_save(normalized: dict[str, Any]) -> Optional[str]:
