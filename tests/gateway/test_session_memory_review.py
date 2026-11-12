@@ -80,12 +80,15 @@ def test_kanban_with_an_unclosed_quote_is_refused_by_name():
     assert command_verdict('kanban', 'show "two words"') == 'read'
 
 def _stage(home, pending_id, content):
+    """dlz: a current-schema record (hash-bound payload); the fork refuses to apply a legacy one."""
+    from tools.write_approval import PENDING_SCHEMA_VERSION, _payload_sha256
     folder = home / 'pending' / 'memory'
     folder.mkdir(parents=True, exist_ok=True)
+    payload = {'action': 'add', 'target': 'memory', 'content': content}
     (folder / f'{pending_id}.json').write_text(json.dumps({
-        'id': pending_id, 'subsystem': 'memory', 'action': 'add', 'summary': f'add {content}',
-        'origin': 'foreground', 'created_at': time.time(),
-        'payload': {'action': 'add', 'target': 'memory', 'content': content}}))
+        'schema_version': PENDING_SCHEMA_VERSION, 'id': pending_id, 'subsystem': 'memory', 'action': 'add',
+        'summary': f'add {content}', 'origin': 'foreground', 'created_at': time.time(), 'state': 'pending',
+        'payload': payload, 'payload_sha256': _payload_sha256(payload), 'persisted': True}))
 
 
 @pytest.mark.platforms("linux")
