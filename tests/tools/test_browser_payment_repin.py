@@ -147,6 +147,6 @@ def test_a_deferred_document_is_resumed_once_after_the_number_document(monkeypat
     ({"deferred": True, "filled_fields": 0}, 2),  # deferred again after the number: a stop, never a second wait
 ])
 def test_a_resumed_document_that_stops_reports_every_write_so_far(answer, filled, monkeypatch):
-    sup, out = _deferring_commit(answer, monkeypatch)
+    _sup, out = _deferring_commit(answer, monkeypatch)
     assert out["success"] is False and out["error_type"] == "payment_fields_changed"
     assert out["filled_fields"] == filled and out["partially_filled"] is True
