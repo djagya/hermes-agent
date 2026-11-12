@@ -6,11 +6,14 @@ Two places hold them, both filled by the card fill before any field is written:
   length (every model-facing output masks every digit run of their lengths, so nothing marks which run
   was the card) and the holder name, keyed by the slot (by the supervisor's own identity without a slot
   route, :func:`window_key`). A confirmed payment lock release (:func:`release_payment_window`: control
-  proves the slot unlocked after this process saw it locked, which ``payment_done``'s ``lock_released``, a
-  recovery close of the payment tab and any later status read all go through) narrows it to browser tool
-  results (the page may still show card text); it closes when the slot's exposure ends
-  (:func:`release_slot`: a wipe, a human clear or an operator clear of its mark). Every release is fenced
-  by the window generation it observed first: a claim (:func:`note_claim`) or an open since then wins;
+  proves the slot unlocked, which ``payment_done``'s ``lock_released``, a recovery close of the payment
+  tab and any later status read all go through, by whichever supervisor is attached to the slot,
+  :func:`slot_bound`; and :func:`release_unlocked_slot`, control's own view of the slot, when no supervisor
+  reads it) narrows it to browser tool results (the page may still show card text); it closes when the
+  slot's exposure ends (:func:`release_slot`: a wipe, a human clear or an operator clear of its mark).
+  Every release is fenced by the window generation it observed first: a claim (:func:`note_claim`) or an
+  open since then wins. A fill that stops before its first write takes its open back
+  (:func:`withdraw_payment_window`): nothing of the card reached the page;
 * the dialog values (number, CVC, holder, expiry forms): per supervisor AND per slot, so a fresh supervisor
   for the same slot still scrubs them from dialog text while the slot's mark keeps it exposed. Dropped,
   every supervisor's on the slot included, only when the slot's exposure ends; they are used for dialog and
@@ -24,6 +27,8 @@ import threading
 import weakref
 from typing import Any
 
+from agent.redact_vault import UNSLOTTED_WINDOW_PREFIX as SUPERVISOR_KEY_PREFIX
+
 _LOCK = threading.Lock()
 _BY_SUPERVISOR: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # supervisor → dialog values
 _BY_SLOT: dict = {}  # (profile home, slot id) → dialog values
@@ -31,7 +36,6 @@ _WINDOWS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # supervisor 
 _SUPERVISOR_SLOTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # supervisor → slot of its dialog values
 _SUPERVISOR_KEYS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # slot-less supervisor → its window key
 _KEY_COUNTER = itertools.count(1)
-SUPERVISOR_KEY_PREFIX = "supervisor:"
 MAX_VALUES = 64
 
 
@@ -145,19 +149,48 @@ def observe_windows(supervisor: Any) -> dict:
     return {key: gens.get(key, 0) for key in keys}
 
 
-def open_payment_window(secret: dict, supervisor: Any) -> None:
+def slot_bound(supervisor: Any) -> bool:
+    """Whether ``supervisor``'s socket is the one its task's route was attached with, so the route's slot id
+    names the browser its status reads answer for. A supervisor without a slot route has only its own
+    window (:func:`window_key`): bound. A route whose attach failed, or one a newer exec moved to another
+    browser while this socket stayed, is not: its status says nothing about the slot the route names."""
+    try:
+        from tools.browser_use_cli import vault_route
+
+        route = vault_route(getattr(supervisor, "task_id", None)) or {}
+    except Exception:  # health: allow BLE001 -- no route to compare: only the supervisor's own window
+        return True
+    if not route.get("slot_id"):
+        return True
+    url = str(route.get("supervisor_url") or "")
+    return bool(url) and url == str(getattr(supervisor, "cdp_url", "") or "")
+
+
+def open_payment_window(secret: dict, supervisor: Any) -> int:
     """Register the card for every model-facing output of this profile until the release is confirmed.
-    Raises when it cannot (the fill must then stop)."""
+    Raises when it cannot (the fill must then stop). Returns the window's generation, for
+    :func:`withdraw_payment_window`."""
     from agent.redact import register_card_window
 
     key = window_key(supervisor)
-    register_card_window(key, digits=(str(secret.get("card_number") or ""), str(secret.get("cvc") or "")),
-                         words=(str(secret.get("cardholder_name") or ""),))
+    generation = register_card_window(
+        key, digits=(str(secret.get("card_number") or ""), str(secret.get("cvc") or "")),
+        words=(str(secret.get("cardholder_name") or ""),))
     with _LOCK:
         try:
             _WINDOWS.setdefault(supervisor, set()).add(key)
         except TypeError:  # unscoped: closed only by its slot's release (or never: masking stays)
             pass
+    return generation
+
+
+def withdraw_payment_window(supervisor: Any, generation: int) -> bool:
+    """The fill that opened ``supervisor``'s window at ``generation`` stopped before it wrote any card value:
+    the window goes back to what it was before that open (an earlier payment's window stays). Refused, and
+    the window kept, when a claim or another fill touched it since."""
+    from agent.redact import withdraw_card_window
+
+    return withdraw_card_window(window_key(supervisor), generation)
 
 
 def release_payment_window(supervisor: Any, observed: dict) -> None:
@@ -173,6 +206,24 @@ def release_payment_window(supervisor: Any, observed: dict) -> None:
                     _WINDOWS.get(supervisor, set()).discard(key)
                 except TypeError:
                     pass
+
+
+def unreleased_slots() -> list:
+    """The slots whose payment window still masks every output of this profile (no confirmed release yet)."""
+    from agent.redact import card_window_keys
+
+    return [k for k in card_window_keys(unreleased=True) if k and not k.startswith(SUPERVISOR_KEY_PREFIX)]
+
+
+def release_unlocked_slot(slot_id: str, observed: dict) -> bool:
+    """Control's own view of ``slot_id`` proved its payment lock gone (the tab was closed by someone else, a
+    human clear): its window narrows to browser tool results, as after a supervisor's confirmed release,
+    unless a claim or a card fill touched it since ``observed`` (the generations read before control was
+    asked). Whether it narrowed."""
+    from agent.redact import release_card_window
+
+    slot = str(slot_id or "")
+    return bool(slot) and slot in observed and release_card_window(slot, observed[slot], keep_for_browser=True)
 
 
 def release_slot(slot_id: str, observed: dict | None = None) -> None:

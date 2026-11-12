@@ -243,6 +243,7 @@ def _prune_wiped(marks: list[dict[str, Any]] | None) -> list[dict[str, Any]] | N
             continue
         if isinstance(row, dict):
             rows[slot_id] = row
+    _narrow_unlocked(views, observed)
     if not rows and not views:
         return marks
 
@@ -297,6 +298,49 @@ def _window_generations() -> dict:
         return card_window_generations()
     except Exception:  # health: allow BLE001 -- nothing observed: nothing is released
         return {}
+
+
+def _surface_unlocked(view: Any, slot_id: str) -> bool:
+    """Control's capture-guard view of ``slot_id`` says, in full, that no payment lock holds it:
+    ``payment_surface {locked: false, tabs: [], unverified: false}``. Anything else (an error, another slot,
+    a control without the field, a lock record that did not read back) is not an unlock."""
+    if not isinstance(view, dict) or view.get("error") or view.get("slot_id") != slot_id:
+        return False
+    surface = view.get("payment_surface")
+    return (isinstance(surface, dict) and surface.get("locked") is False and surface.get("tabs") == []
+            and surface.get("unverified") is False)
+
+
+def _narrow_unlocked(views: dict, observed: dict) -> None:
+    """dlz: a slot control reports unlocked stops masking non-browser output, whoever closed the payment tab."""
+    try:
+        from tools.browser_payment_card_values import release_unlocked_slot
+
+        for slot_id, view in views.items():
+            if _surface_unlocked(view, slot_id):
+                release_unlocked_slot(slot_id, observed)
+    except Exception as exc:  # health: allow BLE001 -- window kept: more masking, never less
+        logger.info("payment window not narrowed (%s)", type(exc).__name__)
+
+
+def reconcile_payment_windows() -> None:
+    """dlz: managed mode, at every browser_exec of this profile. Each slot whose payment window still masks
+    every output is looked up in control (``GET /v1/capture-guard``, the same view the marks use); one that
+    control reports unlocked narrows to browser results, fenced by the generations read before the lookup. A
+    payment tab closed by someone else, with no supervisor left on that slot to read its status, would
+    otherwise mask the profile until the next card fill. No open window: no lookup. Any failure keeps it."""
+    try:
+        from tools.browser_payment_card_values import unreleased_slots
+
+        slots = unreleased_slots()
+        if not slots or not _managed():
+            return
+        from tools.browser_control_route import capture_guard_view
+
+        observed = _window_generations()
+        _narrow_unlocked({slot_id: capture_guard_view(slot_id) for slot_id in slots}, observed)
+    except Exception as exc:  # health: allow BLE001 -- window kept: more masking, never less
+        logger.info("payment windows not reconciled (%s)", type(exc).__name__)
 
 
 def _released_slots(slot_ids: set, observed: dict) -> None:

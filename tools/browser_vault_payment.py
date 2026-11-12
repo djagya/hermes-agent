@@ -24,14 +24,42 @@ from tools.browser_supervisor_payment import _COVERAGE_REFUSALS, OPTIONAL_CARD_T
 logger = logging.getLogger(__name__)
 
 
-def _register_card_redaction(secret: dict, supervisor=None) -> None:
+def _register_card_redaction(secret: dict, supervisor=None) -> int:
     """Open the card's payment window for redaction (tools.browser_payment_card_values): every digit run as
     long as the number or the CVC is masked in every later model-facing output (spaced or dashed groups of
     the number too), and the holder name is scrubbed as a whole word, until the lock release is confirmed.
-    The expiry and billing postcode are not secrets on their own and stay out of it."""
+    The expiry and billing postcode are not secrets on their own and stay out of it. Returns the window's
+    generation."""
     from tools.browser_payment_card_values import open_payment_window
 
-    open_payment_window(secret, supervisor)
+    return open_payment_window(secret, supervisor)
+
+
+class _UnwrittenWindow:
+    """dlz: the payment window of a card that was read but not yet written. Opened on entry (before anything
+    else can see the card); a fill that leaves before :meth:`committing` (a refusal, an expiry, an exception)
+    wrote no card value, so its open is taken back and no output of the profile stays masked for a card that
+    never reached the page. Once the commit starts the window stays until control confirms the unlock."""
+
+    def __init__(self, secret: dict, supervisor) -> None:
+        self._secret, self._supervisor, self._generation = secret, supervisor, None
+
+    def __enter__(self) -> _UnwrittenWindow:
+        self._generation = _register_card_redaction(self._secret, self._supervisor)
+        return self
+
+    def committing(self) -> None:
+        self._generation = None
+
+    def __exit__(self, *_exc) -> None:
+        if self._generation is None:
+            return
+        try:
+            from tools.browser_payment_card_values import withdraw_payment_window
+
+            withdraw_payment_window(self._supervisor, self._generation)
+        except Exception as exc:  # health: allow BLE001 -- window kept: more masking, never less
+            logger.info("payment window not withdrawn (%s)", type(exc).__name__)
 
 
 class ExpiryOptionUnmatched(Exception):
@@ -766,34 +794,35 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 return json.dumps({"success": False, "error_type": "payment_item_revision_unavailable",
                                    "error": _REVISION_UNAVAILABLE_ON_READ})
             secret = validate_card(raw)
-            _register_card_redaction(secret, supervisor)
-            from tools.browser_payment_done import register_dialog_card_values
+            with _UnwrittenWindow(secret, supervisor) as window:  # dlz: taken back by every return before the commit
+                from tools.browser_payment_done import register_dialog_card_values
 
-            register_dialog_card_values(secret, supervisor)  # dlz: this slot's dialog texts are scrubbed of it
-            try:
-                fills = _document_fills(inspected, secret)
-            except ExpiryOptionUnmatched:
-                return json.dumps({
-                    "success": False,
-                    "error_type": "payment_expiry_option_unmatched",
-                    "error": _EXPIRY_UNMATCHED,
-                })
-            if fills is None:
-                return json.dumps({
-                    "success": False,
-                    "error_type": "payment_fields_incomplete",
-                })
-            # Commit fence: a takeover or lease loss while the card was read stops here, before any write.
-            refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
-            if refused:
-                refused["error"] += _READ_NOT_WRITTEN
-                return json.dumps(refused)
-            if time.monotonic() >= inspected.expires_at:
-                out = _expired()
-                out["error"] += _READ_NOT_WRITTEN
-                return json.dumps(out)
-            if unreviewed and destination_policy() != policy:  # B6, A6 step 16: the commit fence
-                return json.dumps(_disabled(after_read=True))
+                register_dialog_card_values(secret, supervisor)  # dlz: this slot's dialog texts are scrubbed of it
+                try:
+                    fills = _document_fills(inspected, secret)
+                except ExpiryOptionUnmatched:
+                    return json.dumps({
+                        "success": False,
+                        "error_type": "payment_expiry_option_unmatched",
+                        "error": _EXPIRY_UNMATCHED,
+                    })
+                if fills is None:
+                    return json.dumps({
+                        "success": False,
+                        "error_type": "payment_fields_incomplete",
+                    })
+                # Commit fence: a takeover or lease loss while the card was read stops here, before any write.
+                refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
+                if refused:
+                    refused["error"] += _READ_NOT_WRITTEN
+                    return json.dumps(refused)
+                if time.monotonic() >= inspected.expires_at:
+                    out = _expired()
+                    out["error"] += _READ_NOT_WRITTEN
+                    return json.dumps(out)
+                if unreviewed and destination_policy() != policy:  # B6, A6 step 16: the commit fence
+                    return json.dumps(_disabled(after_read=True))
+                window.committing()  # from here a card value may be in the page: only control's unlock releases it
             result = supervisor.commit_payment(inspected, fills, strict=strict, **_repin_argument(unreviewed))
             _log_commit(result)
             _commit_text(result)

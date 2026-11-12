@@ -133,3 +133,28 @@ def test_marks_survive_a_gateway_restart_and_clear_only_by_operator(tmp_path):
     assert guard.capture_blocked_for_surface("shopping", "g2") is False
     audit = [json.loads(line) for line in guard._state_path().with_suffix(".log").read_text(encoding="utf-8-sig").splitlines()]
     assert audit[-1]["slot_id"] == "shopping" and audit[-1]["confirmed_by"] == "operator: tab closed"
+
+
+def test_exec_ends_a_window_control_unlocked_and_scopes_the_rest_to_the_payment_slot(managed, monkeypatch):
+    # dlz 11-12: the payment tab was closed outside Hermes and nothing read that slot's status again, so a
+    # research slot's page text (a name, a count, a status id) came back masked for hours
+    from agent import redact
+
+    grants, _ = managed
+    page = "Ada Testperson posted 731 times: /status/" + "7" * 19 + "\n"
+    monkeypatch.setattr(browser_use_cli, "_run_cli_killing_process_group",
+                        lambda cmd, code, env, timeout: subprocess.CompletedProcess(cmd, 0, page, ""))
+    view = {"locked": True, "tabs": ["TAB"], "unverified": False}
+    monkeypatch.setattr(browser_control_route, "capture_guard_view",
+                        lambda slot_id: {"slot_id": slot_id, "capture_blocked": True, "payment_surface": dict(view)})
+    redact.register_card_window("shopping", digits=("0" * 16, "000"), words=("Ada Testperson",))
+    try:
+        grants[:] = [_lease("research-1")]
+        assert _exec("print(page_info())")["output"] != page  # control still reports the lock: every slot masked
+        view.update(locked=False, tabs=[])
+        assert _exec("print(page_info())")["output"] == page  # unlocked: another slot's page is not masked
+        assert redact.redact_sensitive_text(page, force=True) == page
+        grants[:] = [_lease("shopping")]
+        assert _exec("print(page_info())")["output"] != page  # the payment slot may still show the card
+    finally:
+        redact.clear_vault_redaction_values()

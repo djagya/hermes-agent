@@ -247,12 +247,25 @@ def _observed_windows(supervisor: Any) -> dict:
         return {}
 
 
+def _slot_bound(supervisor: Any) -> bool:
+    try:
+        from tools.browser_payment_card_values import slot_bound
+
+        return slot_bound(supervisor)
+    except Exception:  # health: allow BLE001 -- unknown binding: this read releases nothing it did not lock
+        return False
+
+
 def lock_status(supervisor: Any) -> str:
     """Control's answer for this supervisor's slot: ``locked`` | ``unlocked`` | ``unknown``. A read that
     straddles a claim (one on the wire at its start or end, or started meanwhile) is ``locked``: only a
     clean unlock clears the local lock or counts as a release, and it releases only the payment windows
-    whose generation it observed before the read (a claim by any supervisor on the slot since then wins)."""
+    whose generation it observed before the read (a claim by any supervisor on the slot since then wins).
+    dlz: the unlock counts whoever saw the lock: a supervisor that never did (it replaced the paying one, or
+    the tab was closed by someone else before its first read) releases its slot's window too, when its socket
+    is the one its route names (``slot_bound``, checked before and after the read)."""
     observed = _observed_windows(supervisor)
+    bound = _slot_bound(supervisor)
     with _LOCK:
         start, busy = _EPOCHS.get(supervisor, 0), _claiming(supervisor)
     try:
@@ -260,18 +273,19 @@ def lock_status(supervisor: Any) -> str:
         state, _tabs = parse_lock_status(reply.get("result") if isinstance(reply, dict) else None)
     except Exception:  # health: allow BLE001 -- an unanswered status proves nothing
         state = "unknown"
-    released = False
+    unlocked = saw_lock = False
     with _LOCK:
         if busy or _claiming(supervisor) or _EPOCHS.get(supervisor, 0) != start:
             return "locked"
         if state == "unlocked":
-            released = supervisor in _HELD or supervisor in _KNOWN_LOCKED
+            unlocked, saw_lock = True, supervisor in _HELD or supervisor in _KNOWN_LOCKED
             _HELD.discard(supervisor)
             _GENS.pop(supervisor, None)  # the lock ended
             _KNOWN_LOCKED.discard(supervisor)
         elif state == "locked":
             _KNOWN_LOCKED.add(supervisor)
-    if released:  # dlz: the confirmed release narrows the payment window to browser results (card_values)
+    # dlz: the confirmed release narrows the payment window to browser results (card_values)
+    if unlocked and (saw_lock or (bound and _slot_bound(supervisor))):
         try:
             from tools.browser_payment_card_values import release_payment_window
 
@@ -414,6 +428,7 @@ def recovery_call(supervisor: Any, method: str, params: Any) -> dict:
         from tools.browser_payment_done import _forget
 
         _forget(supervisor, params["targetId"])  # payment_done no longer waits for (or counts) that tab
+        lock_status(supervisor)  # dlz: if that ended the lock, the payment window narrows now, not at the next call
         return {"success": True, "method": method, "result": {}}
     except Exception as exc:  # health: allow BLE001 -- CDP text is not surfaced; fixed type only
         logger.info("locked recovery call failed (%s)", type(exc).__name__)

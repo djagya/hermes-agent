@@ -1217,7 +1217,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
-    from tools.browser_payment_privacy import exec_capture_refusal, exec_slot_capture_refusal
+    from tools.browser_payment_privacy import exec_capture_refusal, exec_slot_capture_refusal, reconcile_payment_windows
 
     early = _bridge_or_usage_error(
         code, binding_id=bridge, action=action, session=session, timeout_s=timeout_s,
@@ -1318,6 +1318,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         if refused:
             return {"error_result": refused}
         _attach_vault_supervisor(env, task_id)
+        reconcile_payment_windows()  # dlz: a payment lock that ended elsewhere stops masking this profile
         _arm_dialogs(managed, task_id, env, on_dialog, identity)
         with _driven_daemons_lock:
             daemon = daemon_identity(env)
@@ -1395,10 +1396,12 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
     # browser_vault fill registers injected values with this forced model-egress
     # boundary. Preserve raw stdout only for screenshot-path detection below.
+    # dlz: the slot control leased for this call; a released payment window of another slot does not mask it.
+    slot = str(env.get("HERMES_BROWSER_SLOT_ID") or "") if managed else ""
     result = {
         "success": proc.returncode == 0,
         "exit_code": proc.returncode,
-        "output": redact_sensitive_text(proc.stdout, force=True, vault="browser"),
+        "output": redact_sensitive_text(proc.stdout, force=True, vault="browser", vault_slot=slot),
     }
     if workspace:
         result["workspace"] = workspace
@@ -1406,7 +1409,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         result["session"] = session
     result.update(_take_real_profile_note(route_key))
     result.update({"dialogs": dialogs} if dialogs else {})
-    stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True, vault="browser")
+    stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True, vault="browser", vault_slot=slot)
     failure = _managed_connect_failure(stderr) if managed and never_started else ""
     if failure == "gate":
         stderr = _GATE_REFUSED_HINT + "\n" + stderr
