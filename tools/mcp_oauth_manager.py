@@ -333,8 +333,10 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                             and incoming.headers.get("www-authenticate", "").strip().lower()
                                 == 'bearer error="invalid_token"'):
                         await inner.aclose()  # release the SDK lock before restarting
-                        # In-memory invalidation only; never edit persisted expiry.
+                        # In-memory invalidation only; never edit persisted expiry. The server rejected this
+                        # token, so a failed refresh must not fall back to it as a still-live early refresh.
                         self.context.token_expiry_time = time.time() - 1
+                        self._hermes_hard_expiry = None
                         resource_401_refresh_attempted = True
                         inner = super().async_auth_flow(request)
                         outgoing = await inner.__anext__()
