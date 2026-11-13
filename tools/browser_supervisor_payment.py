@@ -1384,9 +1384,15 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
 
     async def _paced_check(self, i: PaymentInspection, d: PaymentDocument, point) -> bool | str:
         """After a strict fill's focus, before the setter: True, or the error type that stops the document."""
+        # dlz (fill-auto, r4 F3): the scope verdict first. Its ``_document_valid`` may accept a label-only change
+        # asynchronously, and the merchant can navigate the top document (history.pushState) in that pause; the
+        # parent-chain check, which is the last word before the setter, must come after it.
+        verdict = await self._fill_scope_verdict(i) if i.unreviewed_origins else None
+        if verdict:
+            return verdict
         if _has_parent(i, d) and not await self._owner_chain_current(i, d, point):
             return "payment_page_changed"
-        return (await self._fill_scope_verdict(i) or True) if i.unreviewed_origins else True
+        return True
 
     async def _owner_chain_current(self, i: PaymentInspection, d: PaymentDocument, point) -> bool:
         """dlz: strict fills, after the focus and before each setter (Codex A2 r3 #1): from the card document up

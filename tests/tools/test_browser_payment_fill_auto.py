@@ -657,6 +657,57 @@ def test_an_accepted_relabel_goes_through_the_owner_chain_check_again_before_the
     assert out["success"] is True and values == _FILLED and events.count("owner_check") == 4, (out, events)
 
 
+def test_a_relabel_accepted_silently_inside_the_scope_check_is_followed_by_the_owner_chain_check(tmp_path, monkeypatch):
+    """r4 F3 (Codex P1): the REAL ``_paced_check`` of an unreviewed strict fill. The focus handler relabels the form;
+    ``_fill_scope_verdict`` -> ``_payment_is_current`` -> ``_document_valid`` accepts it asynchronously (the closure's
+    signature is then current, so it makes no relabel pause of its own), and the top URL changes (history.pushState)
+    in that pause. The parent-chain check has to run after the acceptance: nothing is written."""
+    import threading
+
+    from tools.browser_vault_payment import _document_fills
+
+    top = ("top", "LT", MERCHANT + "/pay", MERCHANT, "")
+    card = ("card", "L", PSP + "/card", PSP, "top")
+
+    class Real(_AutoSupervisor):
+        _payment_is_current = sp.PaymentSupervisionMixin._payment_is_current  # the real ones, over the fake CDP
+        _paced_check = sp.PaymentSupervisionMixin._paced_check
+        _state_lock, _page_session_id, _active = threading.Lock(), "s", True
+        changed = False
+
+        async def _payment_tree(self, sid, child_sessions=None):
+            return (top[:2] + (top[2] + ("#next" if self.changed else ""),) + top[3:], card)
+
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if params and params.get("objectId") == "o-owner":  # the owner <iframe> hit test in the parent
+                self.events.append("owner_hit")
+                point = params["arguments"][2:]
+                return {"result": {"result": {"value": [] if self.changed else [point[0]["value"], point[1]["value"]]}}}
+            out = await super()._cdp(method, params, session_id, timeout)
+            if "this.accept()" in params["functionDeclaration"]:
+                self.changed = True  # the merchant's pushState lands while the acceptance is in flight
+            return out
+
+    js = _NodeClosure("auto_focus_relabel", tmp_path, _SCENARIOS)
+    try:
+        sup = Real(js)
+        doc = PaymentDocument("card", "s", "o-card", PSP, sp._card_controls(js.call("describe")),
+                              clock_anchor=time.monotonic())
+        i = PaymentInspection("op", "s", "tab", MERCHANT, (doc,), (top, card), time.monotonic() + 60, owner=sup,
+                              approval_id="op", unreviewed_origins=(PSP,), frame_owners={"top": ("ps", (("card", "o-owner"),))})
+        assert asyncio.run(sup._arm_payment_auto(i)) is True and i.auto is True
+        js.call("approve")
+        monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
+        out = asyncio.run(sup._commit_payment_auto(i, _document_fills(i, _SYNTHETIC), None, True,
+                                                   lambda fresh: _document_fills(fresh, _SYNTHETIC), None, None))
+        values = js.call("values")
+    finally:
+        js.close()
+    assert sup.changed and "accept" in sup.events, sup.events  # the silent acceptance did run, and the URL changed in it
+    assert out["success"] is False and out["error_type"] == "payment_page_changed", out
+    assert not any(values.values()) and out.get("filled_fields", 0) == 0, (values, out)
+
+
 def test_a_field_adopted_through_a_re_inspection_must_be_exposed_even_on_a_reviewed_destination(tmp_path, monkeypatch):
     """F4 (Codex P2-4, peer P3-5): the first inspection of a reviewed form stays as it was (no overlay test); a field
     the first inspection never saw (the form re-mounted during the approval) is hit-tested, locally and, in a frame,
