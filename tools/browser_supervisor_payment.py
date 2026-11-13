@@ -1855,6 +1855,11 @@ def _pause_kind(result: Any, repin: bool, auto: bool = False) -> str | None:
     return next((k for k in kinds if result.get(k) is True), None)
 
 
+def _repins(result: dict, state: dict) -> dict:
+    """dlz (re-pin): the commit's result, with how many re-pins it accepted (a count only) when there were any."""
+    return {**result, "fill_repins": state["repins"]} if state.get("repins") else result
+
+
 def _valid_document_result(result: Any, fills: int, tokens: frozenset = frozenset()) -> bool:
     """dlz (Codex B r2 #2, r3 #1): one document's final commit answer, exact keys and types. A success is exactly
     ``{success, filled_fields}`` with every one of the ``fills`` written; a failure names its error type and counts

@@ -1626,8 +1626,10 @@ def test_fill_auto_continues_on_a_re_mounted_field_and_keeps_its_stops(payment_b
         print("RECEIPT fill-auto stop", variant, json.dumps({k: out.get(k) for k in (
             "success", "error_type", "filled_fields", "fill_reinspect", "fill_check")}, sort_keys=True))
         assert out["error_type"] == "payment_fields_changed" and out["partially_filled"] is True, (variant, out)
-        assert out["filled_fields"] == 1 and out["fill_reinspect"] == {"count": 0, "repairs": 0, "refused": refused}, \
+        again = out["fill_reinspect"]  # `seen`: the card field tokens per origin of the refused reading, when it got one
+        assert out["filled_fields"] == 1 and (again["count"], again["repairs"], again["refused"]) == (0, 0, refused), \
             (variant, out)
+        assert set(again) <= {"count", "repairs", "refused", "seen"} and set(again.get("seen", {})) <= {origins["merchant"]}
         # The one field written before the change keeps its value; the card number (last) and the promo field
         # never get one (relabel_swap: the CVC went into its field before that field's label became the promo's).
         assert sorted(states.values()) == ["empty", "empty", "empty", "held"], (variant, states)
@@ -1644,7 +1646,8 @@ def test_fill_auto_card_fields_on_another_origin_after_the_approval_stop(payment
     moved = "document.getElementById('slot').innerHTML=" + json.dumps(_FA_FIELDS.replace('name="f3"', 'autocomplete="cc-csc"'))
     out = _fa_fill(sup, origins, card, caplog, on_consent=lambda: sup.evaluate_runtime(moved))
     assert out["error_type"] == "payment_page_changed" and not out.get("partially_filled"), out
-    assert out["fill_reinspect"] == {"count": 0, "repairs": 0, "refused": "origin_changed"}, out
+    assert out["fill_reinspect"] == {"count": 0, "repairs": 0, "refused": "origin_changed",
+                                     "seen": {origins["merchant"]: ["cc-csc", "cc-exp", "cc-number"]}}, out
     assert set(_fa_top(sup)[0].values()) == {"empty"} and "re-inspection refused (origin_changed)" in caplog.text
     # The same form left alone fills (the hosted frame is the approved destination).
     navigate(sup, origins["merchant"] + "/fa-hosted")

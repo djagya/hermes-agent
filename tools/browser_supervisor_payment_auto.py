@@ -385,8 +385,3 @@ def _seen_detail(detail: Any) -> dict | None:
                                       and isinstance(r.get("fields"), list) for r in rows):
         return {r["origin"]: sorted(str(t) for t in r["fields"]) for r in rows[:8]}
     return None
-
-
-def _repins(result: dict, state: dict) -> dict:
-    """dlz (re-pin): the commit's result, with how many re-pins it accepted (a count only) when there were any."""
-    return {**result, "fill_repins": state["repins"]} if state.get("repins") else result
