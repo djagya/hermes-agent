@@ -130,8 +130,11 @@ _PP_VARIANTS = {
     # A re-render that hides the written number input and shows a fresh, empty one beside it.
     "hidden": {"number": "el.addEventListener('input',()=>setTimeout(()=>{el.style.display='none';"
                "const n=document.createElement('input');n.autocomplete='cc-number';el.after(n)},200))"},
-    # The page hides the written number FRAME and shows a fresh, empty one (the old one keeps its value).
-    "frameswap": {"number": "el.addEventListener('input',()=>setTimeout(()=>parent.postMessage('swap','*'),200))"},
+    # The page hides the written number FRAME and shows a fresh, empty one beside it at the same path with another
+    # query (the old one keeps its value; only the first document swaps itself).
+    "frameswap": {"number": "if(!location.search)el.addEventListener('input',()=>setTimeout(()=>parent.postMessage('swap','*'),200))"},
+    # ... and the same swap to a frame at ANOTHER path of the provider's origin (r1 F8: the approval binds the paths)
+    "pathswap": {"number": "el.addEventListener('input',()=>setTimeout(()=>parent.postMessage('swap','*'),200))"},
     # A reset that lands later than one second after the last write.
     "late": {"number": "el.addEventListener('input',()=>setTimeout(()=>{el.value=''},1500))"},
     # The provider re-formats the expiry ("07/35" -> "07 / 35"), which is the same value.
@@ -167,7 +170,7 @@ def _paypal_page(path, origins):
                  "for(let i=0;i<frames.length;i++)frames[i].postMessage('brand','*');"
                  "if(e.data==='swap')for(const f of document.querySelectorAll('iframe'))if(f.contentWindow===e.source)"
                  "{f.style.display='none';const n=document.createElement('iframe');"
-                 "n.src=f.src.replace('/frameswap/','/stable/');f.after(n)}})</script>")
+                 "n.src=f.src.includes('/pathswap/')?f.src.replace('/pathswap/','/stable/'):f.src+'?swapped';f.after(n)}})</script>")
         return relay + "".join(
             f'<iframe src="{origins["psp"]}/smart/card-field/{path[4:]}/{f}"></iframe>' for f in _PP_FIELDS)
     return None
@@ -326,7 +329,9 @@ _FA_FIELDS = ('<label for="num">Card number</label><input id="num" autocomplete=
               '<label for="exp">Expiry date (MM/YY)</label><input id="exp" autocomplete="cc-exp" placeholder="MM/YY">'
               '<label for="c3">Security code</label><input id="c3" name="f3" maxlength="4">')
 _FA_PROMO = '<label for="c4">Promo code</label><input id="c4" name="f4">'
-_FA_LOG = ("<script>window.log=[];document.addEventListener('input',e=>log.push(e.target.id),true);"
+# `log`: the fields whose value an input event changed (a kept field's no-op events change nothing and are not writes).
+_FA_LOG = ("<script>window.log=[];const was=new WeakMap();document.addEventListener('input',e=>{"
+           "if(e.target.value!==(was.get(e.target)||''))log.push(e.target.id);was.set(e.target,e.target.value)},true);"
            "const $=id=>document.getElementById(id),lab=id=>document.querySelector('label[for='+id+']');</script>")
 _FA_SCRIPTS = {
     # SBB / pay.datatrans.com: every write re-labels the other fields (validation text), on the same elements;
@@ -1044,7 +1049,7 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
             assert not empty and out["filled_fields"] == 4 and out["retention_verified"] is True, (variant, out)
         else:
             # ``frame_values`` reads the written frames only: a swapped-out one still holds its values.
-            assert empty or variant in ("replace", "hidden", "frameswap"), (variant, out, values)
+            assert empty or variant in ("replace", "hidden", "frameswap", "pathswap"), (variant, out, values)
     assert outcomes["stable"][0]["success"] and outcomes["expiry"][0]["success"]
     assert outcomes["expiry_digits"][0]["success"] and outcomes["expiry_digits"][1]["expiry"] == "0735"
     assert outcomes["stable"][1] == {"name": "Ada Lovelace", "number": CARD["card_number"], "expiry": "07/35",
@@ -1060,6 +1065,7 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
         "replace": {"cc-number": "replaced"},
         "hidden": {"cc-number": "replaced"},
         "frameswap": {"cc-number": "replaced"},
+        "pathswap": {"cc-number": "replaced"},
         "late": {"cc-number": "empty"},
     }
     if auto:
@@ -1069,8 +1075,13 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
             assert out["success"] and out["fill_reinspect"] == {"count": 1, "repairs": 1}, (variant, out)
             del expected[variant]
         expected["sync"] = {"cc-number": "empty"}
+        # r1 F8: the fresh frame is at another path of the origin than any approved document: never adopted
+        assert outcomes["pathswap"][0]["fill_reinspect"]["refused"] == "documents_changed", outcomes["pathswap"][0]
+        assert outcomes["pathswap"][0]["fill_reinspect"]["count"] == 0
+        del expected["pathswap"]
         for variant in expected:
             assert outcomes[variant][0]["fill_reinspect"] == {"count": 1, "repairs": 1, "refused": "budget"}, variant
+        expected["pathswap"] = {"cc-number": "replaced"}
     for variant, dropped in expected.items():
         out = outcomes[variant][0]
         assert out["error_type"] == "payment_fields_not_retained" and out["partially_filled"] is True, (variant, out)
@@ -1646,8 +1657,9 @@ def test_fill_auto_card_fields_on_another_origin_after_the_approval_stop(payment
     moved = "document.getElementById('slot').innerHTML=" + json.dumps(_FA_FIELDS.replace('name="f3"', 'autocomplete="cc-csc"'))
     out = _fa_fill(sup, origins, card, caplog, on_consent=lambda: sup.evaluate_runtime(moved))
     assert out["error_type"] == "payment_page_changed" and not out.get("partially_filled"), out
-    assert out["fill_reinspect"] == {"count": 0, "repairs": 0, "refused": "origin_changed",
-                                     "seen": {origins["merchant"]: ["cc-csc", "cc-exp", "cc-number"]}}, out
+    # r1 F1: the origin the card fields moved to is page-chosen and not in the approval: only counted, never named
+    assert out["fill_reinspect"] == {"count": 0, "repairs": 0, "refused": "origin_changed", "seen": {"other": 1}}, out
+    assert origins["merchant"] not in json.dumps(out) and "it saw other 1" in caplog.text
     assert set(_fa_top(sup)[0].values()) == {"empty"} and "re-inspection refused (origin_changed)" in caplog.text
     # The same form left alone fills (the hosted frame is the approved destination).
     navigate(sup, origins["merchant"] + "/fa-hosted")
@@ -1709,7 +1721,7 @@ def test_fill_auto_unreviewed_form_re_rendered_during_the_approval(payment_brows
 # What the armed fill does with each Datatrans-shaped re-render (the fixtures of the re-pin tests above): filled, with
 # the number of re-inspections it took, or stopped, with the reason the re-inspection gave.
 _DTX_AUTO = {
-    "relabel": ("filled", 0), "replace": ("filled", 1), "navigate": ("filled", 1), "cover": ("filled", 1),
+    "relabel": ("filled", 0), "replace": ("filled", 1), "navigate": ("filled", 1), "cover": ("covered", "hit_test"),
     "defer": ("stopped", "incomplete"), "defer_ahead": ("stopped", "incomplete"),
     "duplicate": ("stopped", "incomplete"), "swap_role": ("stopped", "role_changed"),
     "holder_swap": ("stopped", "fields_changed"),
@@ -1719,9 +1731,9 @@ _DTX_AUTO = {
 @pytest.mark.parametrize("layout", ["split", "single"])
 def test_fill_auto_datatrans_shaped_re_renders(payment_browser, tmp_path, monkeypatch, caplog, layout):
     """Armed, on the Datatrans-shaped hosted form (one lightbox document, or the number and the CVC in their own
-    frames): a relabelled field never uses a re-inspection; a re-mounted field, a frame whose URL changed in place and
-    a re-mounted field under an overlay of its own reviewed document are inspected again and filled; a field hidden
-    until the card number is in, a second CVC, an old field re-described as a promo code beside its copy, and a holder
+    frames): a relabelled field never uses a re-inspection; a re-mounted field and a frame whose URL changed in place
+    are inspected again and filled; a re-mounted field under an overlay of its own reviewed document is inspected
+    again and not written (hit test); a field hidden until the card number is in, a second CVC, an old field re-described as a promo code beside its copy, and a holder
     field turned into the card number all still stop, with nothing written after the change."""
     from agent.vault_store import VaultStore
 
@@ -1743,6 +1755,14 @@ def test_fill_auto_datatrans_shaped_re_renders(payment_browser, tmp_path, monkey
             assert out["success"] and out["filled_fields"] == 3, (variant, out)
             assert out.get("fill_reinspect", {"count": 0}).get("count") == detail, (variant, out)
             assert all(states[k] == "held" for k in ("exp", "num", "cvv")), (variant, states)
+            continue
+        if outcome == "covered":
+            # r1 F4: a field the first inspection never saw (re-mounted during the approval) must be exposed, on a
+            # reviewed destination too: the re-mounted expiry under the overlay is never written, nor the number after it
+            assert not out["success"] and out["error_type"] == "payment_fields_changed", (variant, out)
+            assert out["fill_check"]["reason"] == detail and out["fill_check"]["token"] == "cc-exp", (variant, out)
+            assert states.get("num", "empty") == "empty" and not any(
+                v == "held" for k, v in states.items() if k.startswith("exp")), (variant, states)
             continue
         assert not out["success"] and out["fill_reinspect"]["refused"] == detail, (variant, out)
         assert out["fill_reinspect"]["count"] == 0 and out["partially_filled"] is True, (variant, out)
