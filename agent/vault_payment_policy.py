@@ -201,6 +201,22 @@ def payment_repin_enabled() -> bool:
         return False
 
 
+def payment_fill_auto_enabled() -> bool:
+    """dlz (11-13): ``vault.payment_fill_auto`` (on unless a literal ``False``): a card form that re-renders between
+    the inspection and the approval, or under the fill, is inspected again in full inside the same approval and the
+    fill continues on that reading; a label-only change is classified again in place; a field that lost its value
+    after settling gets one repair pass. Off, or config that cannot be read now: any change stops the fill, as before
+    11-13."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        from hermes_cli.config_read_errors import FailedConfigRead
+        config = load_config()
+        return (not isinstance(config, FailedConfigRead)
+                and cfg_get(config, "vault", "payment_fill_auto", default=None) is not False)
+    except Exception:  # health: allow BLE001 -- unreadable config means the stop-on-any-change fill
+        return False
+
+
 def https_origin(value: str) -> str:
     """Require a canonical live HTTPS origin, not a URL or inferred origin."""
     if not isinstance(value, str) or not value or any(c.isspace() for c in value):

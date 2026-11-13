@@ -90,6 +90,29 @@ _SETTLE_SECONDS = 2.0
 # dlz: commit_payment's whole budget; no write lands in a renderer after it (see _renderer_deadline_ms).
 _COMMIT_BUDGET_SECONDS = 20.0
 _RETENTION_STATES = frozenset({"held", "empty", "changed", "replaced"})
+# dlz (fill-auto, 11-13): one approval, several inspections. A card form that re-renders (between the inspection and
+# the approval, or under the fill) is inspected again in full, by the same code, inside the same approval window:
+# at most _MAX_REINSPECTIONS per fill, at most _MAX_REPAIRS of them for a field that lost its value after settling,
+# each waiting at most _REINSPECT_WAIT_SECONDS for a complete form that matches the approval. The whole commit has
+# _AUTO_BUDGET_SECONDS (and never outlives the approval window).
+_MAX_REINSPECTIONS = 3
+_MAX_REPAIRS = 1
+_REINSPECT_WAIT_SECONDS = 10.0
+_REINSPECT_POLL_SECONDS = 0.4
+_REINSPECT_SETTLE_SECONDS = 0.25
+_AUTO_BUDGET_SECONDS = 50.0
+# Why a re-inspection did not continue the fill (fill_reinspect.refused): fixed codes. The first group ends the
+# attempt at once; the second is retried until the wait is over (a form still rendering).
+_REINSPECT_FINAL = frozenset({"navigated", "origin_changed", "role_changed", "role_unproven", "cart_changed",
+                              "too_late", "budget", "fills"})
+_REINSPECT_RETRIED = frozenset({"incomplete", "ambiguous", "fields_changed", "unsettled", "unverifiable",
+                                "unavailable"})
+# The commit stops a re-inspection may continue from: a changed field set or frame. Never an expiry, a changed cart,
+# a switched-off policy, an invalid plan or a write whose outcome is unknown.
+_REINSPECTABLE = frozenset({"payment_fields_changed", "payment_page_changed"})
+# Repair order (a field that lost its value): card number, expiry, holder, postcode, CVC last.
+_REPAIR_RANK = {"cc-number": 0, "cc-exp": 1, "cc-exp-month": 1, "cc-exp-year": 2, "cc-name": 3, "postal-code": 4,
+                "cc-csc": 5}
 # Card fields a saved card may lack: left empty for the user instead of refusing the whole fill.
 OPTIONAL_CARD_TOKENS = frozenset({"cc-name", "postal-code"})
 
@@ -140,6 +163,15 @@ class PaymentInspection:
     # (session, object id) of each pinned amount witness (B5), and the page-check result shown to the owner.
     witnesses: tuple = field(default=(), repr=False)
     page_match: tuple = ("not_checked", "")
+    # dlz (fill-auto): the stated cart this inspection was read with and each witnessed document's reading; set by
+    # arm_payment_auto: ``auto`` (this fill may be continued on a re-inspection), ``approval`` (what the owner's
+    # approval binds: tab, top document, card field tokens per origin, unreviewed origins, cart readings), and the
+    # name shared by every inspection of the approval (their isolated world, the role record in it).
+    cart: Any = None
+    cart_pins: tuple = ()
+    auto: bool = False
+    approval: Any = field(default=None, repr=False, compare=False)
+    approval_id: str = ""
 
     @property
     def controls(self) -> tuple:
@@ -554,21 +586,25 @@ class PaymentSupervisionMixin:
 
     async def _inspect_payment(
         self, origin: str, bound: tuple, allowed_frames: tuple, unreviewed: bool = False,
-        cart: tuple | None = None,
+        cart: tuple | None = None, prior: PaymentInspection | None = None,
     ) -> PaymentInspection:
+        """``prior`` (dlz, fill-auto): a re-inspection inside ``prior``'s approval: the same page session (never a
+        tab search), its frame sessions reused, its approval window and bindings carried over; the inspect closures
+        go into the approval's isolated world, where the role record of the earlier inspections lives."""
         if origin:
             https_origin(origin)
         with self._state_lock:
             sid = self._page_session_id if self._active else None
-        if not sid:
+        if not sid or (prior is not None and (sid != prior.page_session or prior.owner is not self)):
             raise PaymentPolicyError("Supervised browser required")
         if origin:
             sid = await self._merchant_tab_session(origin, sid)
         page = (await self._cdp("Target.getTargetInfo", session_id=sid))["result"][
             "targetInfo"
         ]
-        child_sessions = {}
+        child_sessions = {} if prior is None else dict(prior.child_sessions)
         operation = secrets.token_hex(16)
+        world = operation if prior is None else prior.approval_id
         # dlz: what this inspection pins; released on any refusal below.
         # dlz (Codex B r3 #4): "pending" holds each closure from the moment it exists until it is classified.
         found = {"candidates": [], "anchors": {}, "absence": [], "witnesses": [], "owners": {}, "pending": []}
@@ -582,7 +618,7 @@ class PaymentSupervisionMixin:
                 # The tab itself is a provider's non-card page (PayPal wallet or login), not a checkout.
                 raise PaymentPolicyError("Merchant origin mismatch")
             unreviewed_frames = await self._inspect_frames(tree, merchant, allowed_frames, unreviewed, sid,
-                                                           child_sessions, operation, found)
+                                                           child_sessions, world, found)
             candidates, absence = found["candidates"], found["absence"]
             if unreviewed:
                 documents = _discovery_documents(candidates, merchant, allowed_frames, unreviewed_frames)
@@ -609,7 +645,7 @@ class PaymentSupervisionMixin:
                 merchant,
                 documents,
                 tree,
-                time.monotonic() + 120,
+                time.monotonic() + 120 if prior is None else prior.expires_at,
                 owner=self,
                 child_sessions=child_sessions,
                 frame_owners=found["owners"],
@@ -617,7 +653,11 @@ class PaymentSupervisionMixin:
                 allowed_frames=tuple(allowed_frames),
                 absence=tuple((fsid, obj) for fsid, obj, _origin, _fid in absence),
                 absence_frames=tuple(fid for _fsid, _obj, _origin, fid in absence),
+                approval_id=world,
             )
+            if prior is not None:
+                inspection.auto, inspection.approval, inspection.policy_check = \
+                    prior.auto, prior.approval, prior.policy_check
             if inspection.unreviewed_origins and \
                     await self._shown_documents(inspection) != {d.frame_id for d in documents}:
                 # v1 §3.2: a card form the user cannot see, by the strict test over the whole owner chain.
@@ -629,7 +669,10 @@ class PaymentSupervisionMixin:
         except BaseException:  # health: allow BLE001 -- released, then re-raised unchanged (cancellation too)
             # dlz (Codex B r3 #4): one release pass of everything pinned so far, as its own task: a cancellation
             # (the caller's timeout) cannot cut it short, and is re-raised once the pass is under way.
-            cleanup = asyncio.ensure_future(self._release_found(found, child_sessions))
+            # dlz (fill-auto): a re-inspection shares the earlier inspection's frame sessions; only its own go.
+            own = child_sessions if prior is None else {
+                k: v for k, v in child_sessions.items() if prior.child_sessions.get(k) != v}
+            cleanup = asyncio.ensure_future(self._release_found(found, own))
             try:
                 await asyncio.shield(cleanup)
             except asyncio.CancelledError:
@@ -804,6 +847,9 @@ class PaymentSupervisionMixin:
             pins.append((place, await self._amount_witness(wfid, wsid, inspection.operation_id, cart, witnesses)))
         inspection.witnesses = tuple(witnesses)
         inspection.page_match = _page_match(pins, cart[0])
+        # dlz (fill-auto): the reading itself, per witnessed document, for a re-inspection's comparison.
+        inspection.cart = tuple(cart)
+        inspection.cart_pins = tuple(sorted((place, json.dumps(pin, sort_keys=True)) for place, pin in pins))
 
     async def _pin_frame_owners(self, documents: tuple, tree: tuple, page_sid: str, child_sessions: dict,
                                 groups: dict | None = None) -> dict:
@@ -995,18 +1041,7 @@ class PaymentSupervisionMixin:
             elif current != i.tree:
                 return False
             for d in i.documents:
-                valid = _value(
-                    await self._cdp(
-                        "Runtime.callFunctionOn",
-                        {
-                            "objectId": d.object_id,
-                            "functionDeclaration": "function(){return this.valid()}",
-                            "returnByValue": True,
-                        },
-                        session_id=d.frame_session,
-                    )
-                )
-                if valid is not True:
+                if not await self._document_valid(i, d):
                     return False
             if i.unreviewed_origins:
                 if not await self._absence_holds(i):
@@ -1015,6 +1050,42 @@ class PaymentSupervisionMixin:
                     return False
             return True
         except Exception:  # health: allow BLE001 -- any CDP failure means the approved page is not current; fail closed
+            return False
+
+    async def _document_valid(self, i: PaymentInspection, d: PaymentDocument) -> bool:
+        """The document's pinned state holds (its closure's ``valid()``). dlz (fill-auto): when it does not and the
+        fill is armed, a label-only change is classified again and, with every role unchanged, accepted
+        (``_accept_relabel``); ``valid()`` then decides again."""
+        async def valid() -> bool:
+            return _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": d.object_id, "functionDeclaration": "function(){return this.valid()}",
+                "returnByValue": True}, session_id=d.frame_session)) is True
+
+        if await valid():
+            return True
+        return i.auto is True and await self._accept_relabel(i, d) and await valid()
+
+    async def _accept_relabel(self, i: PaymentInspection, d: PaymentDocument) -> bool:
+        """dlz (fill-auto): the document's fields are the pinned elements and only label text changed (the closure's
+        ``relabeled()``: validation text, a floating label, a placeholder): its exposed fields, read now, are
+        classified by the inspection's classifier, and only when every card control keeps its index and token and no
+        other control became a card field does the closure take the new description as pinned (``accept()``, which
+        requires the description to be still the one read). Anything else: False, and the change stands as one."""
+        try:
+            raw = _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": d.object_id, "functionDeclaration": "function(){return this.relabeled()}",
+                "returnByValue": True}, session_id=d.frame_session))
+            if raw is None:
+                return False
+            rows = _bounded_description(raw) if i.unreviewed_origins else raw
+            if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                return False
+            if _roles(_card_controls(rows)) != _roles(d.controls):
+                return False
+            return _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": d.object_id, "functionDeclaration": "function(){return this.accept()}",
+                "returnByValue": True}, session_id=d.frame_session)) is True
+        except Exception:  # health: allow BLE001 -- an unreadable or malformed reading is never accepted
             return False
 
     async def _relevant_unchanged(self, i: PaymentInspection, current: tuple) -> bool:
@@ -1074,23 +1145,137 @@ class PaymentSupervisionMixin:
         except Exception:  # health: allow BLE001 -- an unreadable witness is not the page the owner approved
             return False
 
+    def arm_payment_auto(self, inspected: PaymentInspection) -> bool:
+        """dlz (fill-auto): make this inspection the first of an approval that may be continued on re-inspections:
+        record what the approval binds and, in each card document, the role of every exposed field. False (and the
+        fill stays the stop-on-any-change fill it was) when a document cannot record its roles."""
+        from tools.browser_supervisor import _schedule
+
+        try:
+            return _schedule(self._arm_payment_auto(inspected), self._loop, timeout=10) is True
+        except Exception:  # health: allow BLE001 -- not armed: the fill runs as it did before re-inspection existed
+            return False
+
+    async def _arm_payment_auto(self, i: PaymentInspection) -> bool:
+        if i.consumed or i.owner is not self or not i.approval_id:
+            return False
+        if await self._remember_roles(i, frozenset()) is not None:
+            return False
+        i.approval = _approval_facts(i)
+        i.auto = True
+        return True
+
+    async def _remember_roles(self, i: PaymentInspection, earlier: frozenset) -> str | None:
+        """dlz (fill-auto): record, in each card document's isolated world, the role this inspection gave every
+        exposed field (its closure's ``remember``); None when every document did. ``role_changed``: an element an
+        earlier inspection of this approval classified, still exposed, has another role now (a CVC field turned
+        into a promo code, a holder field into the card number). ``role_unproven``: a document in ``earlier`` (the
+        ``(frame, loader)`` of the documents already recorded) does not hold the approval's record, or did not
+        answer: its fields' earlier roles cannot be compared, so the fill does not go on."""
+        loaders = {f[0]: f[1] for f in i.tree}
+        for d in i.documents:
+            roles = {str(c.control.index): c.token for c in d.controls}
+            try:
+                answer = _value(await self._cdp("Runtime.callFunctionOn", {
+                    "objectId": d.object_id, "functionDeclaration": "function(a,r){return this.remember(a,r)}",
+                    "arguments": [{"value": i.approval_id}, {"value": roles}], "returnByValue": True,
+                }, session_id=d.frame_session))
+            except Exception:  # health: allow BLE001 -- a document that cannot answer proves nothing
+                answer = None
+            if not (isinstance(answer, dict) and set(answer) == {"known", "moved"}
+                    and type(answer["known"]) is bool and type(answer["moved"]) is bool):
+                return "role_unproven"
+            if answer["moved"]:
+                return "role_changed"
+            if (d.frame_id, loaders.get(d.frame_id)) in earlier and not answer["known"]:
+                return "role_unproven"
+        return None
+
+    def reinspect_payment(self, prior: PaymentInspection, wait: float = _REINSPECT_WAIT_SECONDS) -> tuple:
+        """dlz (fill-auto): ``(fresh inspection, "")`` that continues ``prior``'s approval on the page as it is now
+        (``prior`` is released), or ``(None, code)`` when no complete card form matching the approval was found
+        within ``wait`` seconds (``prior`` is then left as it was, for the caller to discard)."""
+        from tools.browser_supervisor import _schedule
+
+        stop = min(prior.expires_at, time.monotonic() + wait)
+        return _schedule(self._reinspect(prior, stop, wait), self._loop, timeout=wait + 30)
+
+    async def _reinspect(self, prior: PaymentInspection, stop: float, wait: float) -> tuple:
+        """One re-inspection inside an approval: the full inspection again (``_inspect_payment``: the same frame
+        admission, exposure rules, classifier and exact-once rules, the reviewed or the discovery pass as the first
+        one was), repeated until ``stop`` or ``wait`` seconds while the form is incomplete or still moving. The
+        reading continues the fill only when it matches the approval (``_approval_mismatch``: same tab and top
+        document, the same card field tokens on the same origins, no other origin, the same cart readings), every
+        element an earlier inspection classified kept its role (``_remember_roles``), and it is still current a
+        moment later. Its window is the approval's; nothing extends it."""
+        if prior.auto is not True or not isinstance(prior.approval, dict):
+            return None, "unavailable"
+        deadline = min(stop, prior.expires_at, time.monotonic() + wait)
+        refused = "too_late"
+        while time.monotonic() < deadline:
+            fresh = None
+            try:
+                fresh = await self._inspect_payment("", (), prior.allowed_frames, bool(prior.unreviewed_origins),
+                                                    prior.cart, prior=prior)
+            except PaymentDestinationError as exc:
+                refused = {"payment_fields_unsupported": "incomplete",
+                           "payment_fields_ambiguous": "ambiguous"}.get(exc.error_type, "unverifiable")
+            except PaymentPolicyError as exc:
+                refused = _reinspect_refusal(str(exc))
+            except Exception:  # health: allow BLE001 -- a page that cannot be read now may be read a moment later
+                refused = "unavailable"
+            if fresh is not None:
+                refused = _approval_mismatch(prior.approval, fresh) or ""
+                if not refused:
+                    # Still the same reading a moment later (a form caught mid-render is read again instead).
+                    await asyncio.sleep(_REINSPECT_SETTLE_SECONDS)
+                    if time.monotonic() >= deadline:
+                        refused = "too_late"
+                    elif not await self._payment_is_current(fresh):
+                        refused = "unsettled"
+                if not refused:
+                    refused = await self._remember_roles(fresh, frozenset(prior.approval["documents"])) or ""
+                if not refused:
+                    loaders = {f[0]: f[1] for f in fresh.tree}
+                    prior.approval["documents"] |= {(d.frame_id, loaders.get(d.frame_id)) for d in fresh.documents}
+                    # The fresh inspection owns the shared frame sessions from here; the earlier one's objects go.
+                    prior.child_sessions = {}
+                    prior.consumed = True
+                    await self._release_once(prior)
+                    return fresh, ""
+                fresh.consumed = True
+                fresh.child_sessions = {k: v for k, v in fresh.child_sessions.items()
+                                        if prior.child_sessions.get(k) != v}
+                await self._release_once(fresh)
+            if refused in _REINSPECT_FINAL:
+                return None, refused
+            await asyncio.sleep(_REINSPECT_POLL_SECONDS)
+        return None, refused
+
     def commit_payment(self, inspected: PaymentInspection, fills: list[dict], strict: bool = False,
-                       repin: bool = False) -> dict:
+                       repin: bool = False, refill=None, adopted=None) -> dict:
         """Write the fills. ``strict`` (unreviewed destinations) adds a hit test at each field's centre
         before its setter; reviewed provider shapes keep ``False`` so they cannot regress. ``repin`` (config
         ``vault.payment_repin``, off by default; a literal True only): a re-rendered reviewed card document may be
-        re-pinned inside this commit; without it any change of the pinned fields stops the commit."""
+        re-pinned inside this commit; without it any change of the pinned fields stops the commit.
+        dlz (fill-auto): ``refill`` (an armed inspection only, see ``arm_payment_auto``): ``refill(inspection)``
+        answers the fills for a re-inspection of this approval; the commit may then continue on re-inspections
+        (``_commit_payment_auto``), and ``adopted(inspection)`` is told of each one it continues on."""
         import concurrent.futures
 
         from agent.async_utils import safe_schedule_threadsafe
         from tools.browser_supervisor import _LoopUnavailable
 
-        until = time.monotonic() + _COMMIT_BUDGET_SECONDS
-        future = safe_schedule_threadsafe(self._commit_payment(inspected, fills, until, strict, repin), self._loop)
+        auto = refill is not None and getattr(inspected, "auto", False) is True
+        budget = _AUTO_BUDGET_SECONDS if auto else _COMMIT_BUDGET_SECONDS
+        until = time.monotonic() + budget
+        future = safe_schedule_threadsafe(
+            self._commit_payment(inspected, fills, until, strict, repin, *((refill, adopted) if auto else ())),
+            self._loop)
         if future is None:
             raise _LoopUnavailable("Browser supervisor loop unavailable")
         try:
-            return future.result(timeout=_COMMIT_BUDGET_SECONDS)
+            return future.result(timeout=budget)
         except concurrent.futures.TimeoutError:
             # dlz: stop the commit where it is; a write already in flight is refused by the renderer past
             # `until`, and what landed is unknown. Consumed (never a retry), so the caller skips its discard:
@@ -1105,14 +1290,123 @@ class PaymentSupervisionMixin:
                     "write_uncertain": True}
 
     async def _commit_payment(self, i: PaymentInspection, fills: list[dict], until: float | None = None,
-                              strict: bool = False, repin: bool = False) -> dict:
+                              strict: bool = False, repin: bool = False, refill=None, adopted=None) -> dict:
         if i.consumed:
             return {"success": False, "error_type": "payment_consent_consumed"}
         try:
+            if refill is not None and i.auto is True:
+                return await self._commit_payment_auto(i, fills, until, strict, refill, adopted)
             return await self._commit_payment_once(i, fills, until, strict, repin)
         finally:
             # dlz: one cleanup for the whole lifecycle (freshness included) that a cancellation cannot cut short.
             await self._release_once(i)
+
+    async def _commit_payment_auto(self, i: PaymentInspection, fills: list[dict], until: float | None, strict: bool,
+                                   refill, adopted) -> dict:
+        """dlz (fill-auto): the commit of an armed fill, as generations: each one is a whole commit on one
+        inspection (``_commit_generation``: the same freshness, cart, policy and window checks, the same
+        per-document and per-setter checks, the settled retention check). When a generation stops on a changed
+        field set or frame, or a written field lost its value after settling, the page is inspected again in full
+        (``_reinspect``); if that reading matches the approval, the next generation writes, into the fields it
+        classified, what they do not hold yet. Bounded: ``_MAX_REINSPECTIONS`` re-inspections, ``_MAX_REPAIRS`` of
+        them for lost values, the commit budget and the approval window. Every other stop ends the fill as before,
+        and the stop it returns is the generation's own, with ``fill_reinspect`` saying what was tried."""
+        stop = i.expires_at if until is None else min(i.expires_at, until)
+        st = {"reinspections": 0, "repairs": 0, "refused": "", "wrote": 0}
+        current, current_fills, mode = i, fills, "fill"
+        try:
+            while True:
+                again, result = await self._commit_generation(current, current_fills, stop, strict, mode,
+                                                              st["reinspections"] > 0, st)
+                if not again:
+                    return _auto_result(result, st)
+                if st["reinspections"] >= _MAX_REINSPECTIONS or (again == "repair" and st["repairs"] >= _MAX_REPAIRS):
+                    st["refused"] = "budget"
+                    return _auto_result(result, st)
+                fresh, st["refused"] = await self._reinspect(current, stop, _REINSPECT_WAIT_SECONDS)
+                if fresh is None:
+                    return _auto_result(result, st)
+                current = fresh
+                st["reinspections"] += 1
+                st["repairs"] += again == "repair"
+                mode = "repair" if again == "repair" else "fill"
+                try:
+                    if adopted is not None:
+                        adopted(fresh)
+                    current_fills = refill(fresh)
+                except Exception:  # health: allow BLE001 -- no plan for this reading (an expiry list without the card's month)
+                    current_fills = None
+                if not current_fills:
+                    st["refused"] = "fills"
+                    return _auto_result(result, st)
+        finally:
+            if current is not i:
+                current.consumed = True
+                await self._release_once(current)
+
+    async def _commit_generation(self, i: PaymentInspection, fills: list[dict], stop: float, strict: bool,
+                                 mode: str, kept: bool, st: dict) -> tuple:
+        """One generation of an armed commit on inspection ``i``: ``(again, result)``. ``again``: "" (the result is
+        final), "changed" (stopped on a changed field set or frame; a re-inspection may continue) or "repair" (every
+        field was written, and after settling some are empty or were replaced). ``kept``: an earlier generation
+        wrote; a field that already holds its value is not written again. ``mode`` "repair" writes the card number
+        first and the CVC last."""
+        def later(result: dict) -> dict:  # a stop after an earlier generation wrote is a partial fill
+            return {**result, "partially_filled": True} if st["wrote"] and not result.get("success") else result
+
+        if time.monotonic() >= i.expires_at:
+            i.consumed = True
+            return "", later({"success": False, "error_type": "payment_consent_expired"})
+        if not await self._payment_is_current(i):
+            i.consumed = True
+            return "changed", later({"success": False, "error_type": "payment_page_changed"})
+        if i.witnesses and not await self._cart_current(i):
+            i.consumed = True
+            return "", later({"success": False, "error_type": "payment_cart_changed"})
+        if not _policy_holds(i):
+            i.consumed = True
+            return "", later({"success": False, "error_type": "payment_destination_disabled"})
+        if time.monotonic() >= i.expires_at:
+            i.consumed = True
+            return "", later({"success": False, "error_type": "payment_consent_expired"})
+        i.consumed = True  # consume before ingress, as _commit_payment_once does
+        filled = 0
+        state = {"number": False, "repins": 0, "repin": False}
+        auto = {"mode": mode, "kept": kept}
+        try:
+            written: list = []
+            order = _commit_order(i, _fills_by_document(i, fills))
+            if mode == "repair":
+                order = sorted(order, key=lambda p: min(_REPAIR_RANK.get(str(f.get("token")), 4) for f in p[1]))
+            for position, (document, document_fills) in enumerate(order, 1):
+                result = await self._commit_step(i, position, len(order), document, document_fills, None, written,
+                                                 stop, strict, state, auto=auto)
+                count = result.get("filled_fields")
+                st["wrote"] = max(st["wrote"], filled + (count if type(count) is int else 0),
+                                  1 if result.get("write_uncertain") else 0)
+                if not result.get("success"):
+                    result = later(_partial(result, filled))
+                    retry = result.get("error_type") in _REINSPECTABLE and not result.get("write_uncertain")
+                    return ("changed" if retry else ""), result
+                filled += result.get("filled_fields", 0)
+                written.append((document, document_fills))
+            await asyncio.sleep(_SETTLE_SECONDS)
+            before = await self._shown_documents(i)
+            answers = [(d, f, await self._payment_retention(i, d)) for d, f in written]
+            after = await self._shown_documents(i)
+            result = _retention_result([(f, a if d.frame_id in before and d.frame_id in after else None)
+                                        for d, f, a in answers])
+            if await self._top_navigated(i):
+                result["navigated_after_fill"] = True
+                return "", result
+            if result.get("success"):
+                return "", result
+            lost = set(result.get("field_retention", {}).values()) - {"held"}
+            return ("repair" if lost <= {"empty", "replaced"} else ""), result
+        except PaymentPolicyError:
+            return "", later(_partial({"success": False, "error_type": "payment_fields_invalid"}, filled))
+        except Exception:  # health: allow BLE001 -- CDP/transport text can carry values; reported as a fixed type, never retried
+            return "", later(_partial({"success": False, "error_type": "payment_transport_uncertain"}, filled))
 
     async def _commit_payment_once(self, i: PaymentInspection, fills: list[dict], until: float | None,
                                    strict: bool = False, repin: bool = False) -> dict:
@@ -1193,7 +1487,7 @@ class PaymentSupervisionMixin:
 
     async def _commit_step(self, i: PaymentInspection, position: int, total: int, document: PaymentDocument,
                            document_fills: list, resumed: int | None, written: list, stop: float, strict: bool,
-                           state: dict) -> dict:
+                           state: dict, auto: dict | None = None) -> dict:
         """One document's turn in the commit (``resumed``: the count a suspended document already wrote): the
         window, the approved chains, an unreviewed fill's bindings, then its commit. A stop names the document."""
         if time.monotonic() >= i.expires_at:
@@ -1225,7 +1519,9 @@ class PaymentSupervisionMixin:
         result = await self._commit_payment_document(
             document, document_fills, deadline_ms=_renderer_deadline_ms(document, stop), strict=strict,
             paced=paced, **({"repin": repin, "exposed": exposed} if repin else {}),
-            **({"resumed": resumed} if resumed is not None else {}))
+            **({"resumed": resumed} if resumed is not None else {}),
+            # dlz (fill-auto): the armed commit's mode, and the judge of its label-only pauses.
+            **({"auto": auto, "relabel": lambda d=document: self._accept_relabel(i, d)} if auto else {}))
         return located(result, position, total, state["refused"])
 
     async def _repin(self, i: PaymentInspection, d: PaymentDocument, fills: list, request: dict, stop: float,
@@ -1374,7 +1670,7 @@ class PaymentSupervisionMixin:
 
     async def _commit_payment_document(self, d: PaymentDocument, fills: list[dict], deadline_ms: float | None = None,
                                        strict: bool = False, paced=None, repin=None, resumed: int | None = None,
-                                       exposed=None) -> dict:
+                                       exposed=None, auto: dict | None = None, relabel=None) -> dict:
         """One document's commit. ``paced`` (strict fills in a frame, and every document of an unreviewed fill): an
         async ``check(point)`` run after each focus, before that field's setter; anything but True (False or an error
         type from ``_PACED_STOPS``) stops the document with nothing more written. ``repin`` (reviewed fills): an
@@ -1386,11 +1682,20 @@ class PaymentSupervisionMixin:
         dlz (Codex B r2 #2): the commit call carries the values, and each resume() runs a setter, so from the first
         call on a lost, failed or malformed reply means a write may have landed: the result then says so
         (``write_uncertain``, ``partially_filled``) with the last acknowledged count of this document's writes,
-        never as if nothing was written."""
+        never as if nothing was written. dlz (fill-auto): ``auto`` (``{mode, kept}``, an armed fill; never with
+        ``repin``): the closure's auto commit, whose ``relabel`` pause is answered by the async ``relabel()`` (True:
+        the label-only change was classified again with every role unchanged and is now the pinned description)."""
         acknowledged = resumed or 0
         tokens = frozenset(str(f.get("token") or "") for f in fills)
         # dlz: the commit call of a fill without re-pin is the one it always was (four arguments).
-        names = "fills,deadline,strict,paced" + (",repin" if repin is not None else "")
+        names = "fills,deadline,strict,paced" + (",repin,auto" if auto else ",repin" if repin is not None else "")
+        if auto:
+            repin = None
+            extra = [{"value": False}, {"value": auto["mode"]}]
+            if auto["kept"]:
+                fills = [{**f, "kept": True} for f in fills]
+        else:
+            extra = [{"value": True}] if repin is not None else []
 
         def uncertain(error_type: str) -> dict:
             return {"success": False, "error_type": error_type, "filled_fields": acknowledged,
@@ -1411,14 +1716,23 @@ class PaymentSupervisionMixin:
                         "objectId": d.object_id,
                         "functionDeclaration": f"function({names}){{return this.commit({names})}}",
                         "arguments": [{"value": fills}, {"value": deadline_ms}, {"value": strict is True},
-                                      {"value": paced is not None}, *([{"value": True}] if repin is not None else [])],
+                                      {"value": paced is not None}, *extra],
                         "returnByValue": True,
                     },
                     session_id=d.frame_session,
                 )
             )
-            for _ in range((len(fills) + 1) * (MAX_REPINS + 2 if repin is not None else 1)):
-                kind = _pause_kind(result, repin is not None)
+            # An armed commit pauses at most once per field for its focus and 4 per field + 8 times for labels.
+            for _ in range(6 * len(fills) + 12 if auto else (len(fills) + 1) * (MAX_REPINS + 2 if repin is not None else 1)):
+                kind = _pause_kind(result, repin is not None, bool(auto))
+                if kind == "relabel":
+                    count = result.get("filled_fields")
+                    if set(result) != {"relabel", "filled_fields"} or type(count) is not int \
+                            or not acknowledged <= count < len(fills):
+                        return uncertain("payment_result_invalid")
+                    acknowledged = count
+                    result = await answer((await relabel()) is True if relabel is not None else False, repinned=True)
+                    continue
                 check = paced or (exposed if repin is not None else None)
                 if kind is None or (kind == "pending" and check is None):
                     break
@@ -1789,12 +2103,75 @@ _DOCUMENT_ERRORS = frozenset({"payment_fields_changed", "payment_consent_expired
                               "payment_expiry_option_unmatched", "payment_validation_failed"})
 
 
-def _pause_kind(result: Any, repin: bool) -> str | None:
-    """Which pause a closure answer is (``pending``; with ``repin`` also ``repin``, ``deferred``), or None for a
-    final answer."""
+def _pause_kind(result: Any, repin: bool, auto: bool = False) -> str | None:
+    """Which pause a closure answer is (``pending``; with ``repin`` also ``repin``, ``deferred``; with ``auto`` also
+    ``relabel``), or None for a final answer."""
     if not isinstance(result, dict):
         return None
-    return next((k for k in (("pending", "repin", "deferred") if repin else ("pending",)) if result.get(k) is True), None)
+    kinds = ("pending", "repin", "deferred") if repin else ("pending", "relabel") if auto else ("pending",)
+    return next((k for k in kinds if result.get(k) is True), None)
+
+
+def _roles(controls: Any) -> list:
+    """The card roles of a document's classified controls: ``(inspection index, token)`` in document order."""
+    return [(c.control.index, c.token) for c in controls]
+
+
+def _approval_facts(i: PaymentInspection) -> dict:
+    """dlz (fill-auto): what the owner's approval binds, read off the inspection the approval card was built from:
+    the tab and its top document (frame, loader, URL, origin), the card field tokens each origin receives, the
+    unreviewed origins, the cart readings, and the card documents whose field roles are recorded so far."""
+    fields: dict = {}
+    for d in i.documents:
+        fields.setdefault(d.origin, set()).update(c.token for c in d.controls)
+    loaders = {f[0]: f[1] for f in i.tree}
+    return {"page": i.page_id, "top": i.tree[0] if i.tree else None,
+            "fields": {origin: frozenset(tokens) for origin, tokens in fields.items()},
+            "unreviewed": frozenset(i.unreviewed_origins), "cart": (i.cart, i.cart_pins, tuple(i.page_match)),
+            "documents": {(d.frame_id, loaders.get(d.frame_id)) for d in i.documents}}
+
+
+def _approval_mismatch(approval: dict, fresh: PaymentInspection) -> str | None:
+    """dlz (fill-auto): why a re-inspection is not the checkout the owner approved, or None. ``navigated``: another
+    tab or top document (a reload or a changed URL counts); ``origin_changed``: a card field on an origin the approval
+    did not name, or another unreviewed set; ``fields_changed``: an approved origin receives other card fields than
+    approved (fewer too: a form still rendering reads like that and is read again); ``cart_changed``: a page-check
+    reading differs."""
+    now = _approval_facts(fresh)
+    if now["page"] != approval["page"] or now["top"] is None or now["top"] != approval["top"]:
+        return "navigated"
+    if not set(now["fields"]) <= set(approval["fields"]) or now["unreviewed"] - approval["unreviewed"]:
+        return "origin_changed"
+    if now["fields"] != approval["fields"] or now["unreviewed"] != approval["unreviewed"]:
+        return "fields_changed"
+    return None if now["cart"] == approval["cart"] else "cart_changed"
+
+
+def _reinspect_refusal(text: str) -> str:
+    """The code for a re-inspection the reviewed pass refused with ``text``."""
+    head = text.split(" (", 1)[0]
+    if head in _COVERAGE_REFUSALS:
+        return "incomplete"
+    if head in ("Ambiguous card expiry fields", "Card fields split across payment providers"):
+        return "ambiguous"
+    return "navigated" if head in ("Supervised browser required", "Merchant origin mismatch") else "unavailable"
+
+
+def _auto_result(result: dict, st: dict) -> dict:
+    """dlz (fill-auto): the armed commit's result: a stop after any write is a partial fill that counts the writes,
+    and ``fill_reinspect`` says how many re-inspections continued the fill (``repairs`` of them for lost values)
+    and, when one did not, why (a fixed code)."""
+    out = dict(result)
+    if not out.get("success") and st["wrote"]:
+        out["partially_filled"] = True
+        if out.get("error_type") != "payment_fields_not_retained":
+            count = out.get("filled_fields")
+            out["filled_fields"] = max(count if type(count) is int else 0, st["wrote"])
+    if st["reinspections"] or st["refused"]:
+        refused = st["refused"] if st["refused"] in _REINSPECT_FINAL | _REINSPECT_RETRIED else ""
+        out["fill_reinspect"] = {"count": st["reinspections"], "repairs": st["repairs"],
+                                 **({"refused": refused} if refused else {})}
+    return out
 
 
 def _repins(result: dict, state: dict) -> dict:

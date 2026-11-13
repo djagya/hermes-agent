@@ -151,6 +151,8 @@ _INSPECT_TEMPLATE = r"""(() => {
     return !!at && (at === el || (typeof el.contains === 'function' && el.contains(at)));
   };
   let used = false, written = null, paused = null, candidate = null, repinning = false;
+  // dlz (fill-auto): the description a label-only change was read as (single use; see relabeled / accept).
+  let relabel = null;
   // One step of the commit; a finished (or never started) commit answers changed, never a second run. `answer`
   // is the supervisor's reply to a re-pin request (pins or null), undefined otherwise.
   const advance = answer => {
@@ -163,6 +165,14 @@ _INSPECT_TEMPLATE = r"""(() => {
   const MAX_REPINS = 3;
   // dlz: the fixed descriptor keys that differ between two descriptions (names only, never their values).
   const keysOf = (a, b) => Object.keys(a).filter(k => JSON.stringify(a[k]) !== JSON.stringify(b && b[k]));
+  // dlz (fill-auto): the pinned elements are the same ones and, row by row, only their `label` text differs from
+  // the pinned description (validation text, a floating label, a placeholder hint). Type, autocomplete, name and id,
+  // form, length limit and a select's options are all unchanged.
+  const labelOnly = () => {
+    const now = describe(), before = JSON.parse(signature);
+    return now.length === before.length && now.every((d, n) =>
+      keysOf(d, before[n]).every(k => k === 'label') && keysOf(before[n], d).every(k => k === 'label'));
+  };
   // dlz: what a failed check saw, for the stop record: reason code, field token, write step, and for a changed
   // description the descriptor KEYS that changed; `fields` names the pinned tokens involved ('other': none).
   // `plan`: the fill entries (token and current pin). Fixed codes only, never a value, label or name.
@@ -223,6 +233,43 @@ _INSPECT_TEMPLATE = r"""(() => {
       return bounded(now.filter(x=>x.x === true).map(x=>describeOne(x.e,x.index)),
                      now.some(x => x.x !== true && x.x !== false));
     },
+    // dlz (fill-auto): a label-only change of the pinned fields, for the supervisor to classify again with the
+    // inspection's classifier: this document's exposed fields as described now, or null when the pinned state
+    // differs in any other way (then nothing here applies and the change stops the fill or is re-inspected).
+    relabeled: () => {
+      relabel = null;
+      if (why() !== 'fields_relabeled' || !labelOnly()) return null;
+      const d = describe();
+      relabel = JSON.stringify(d);
+      return bounded(d.filter(x=>selected.has(x.index)), false);
+    },
+    // The supervisor found every field's role unchanged in that reading: it becomes the pinned description, only if
+    // the same elements are still described exactly as it was read. Single use; anything else answers false.
+    accept: () => {
+      const c = relabel;
+      relabel = null;
+      if (!c || document !== doc || location.href !== href || !sameSet(allInputs()) ||
+          JSON.stringify(describe()) !== c) return false;
+      signature = c;
+      return true;
+    },
+    // dlz (fill-auto): the role (card token, or '' for any other exposed control) each exposed element was given
+    // by an inspection of this approval, kept per element in this isolated world for the life of the document. A
+    // later inspection of the same document (a re-inspection after a re-render) must give every element it still
+    // exposes the role it had: `moved` when one differs (nothing is recorded then). `known`: the record of this
+    // approval already existed here. Names of roles only.
+    remember: (approval, roles) => {
+      const KEY = '__hermesPaymentRoles';
+      if (typeof approval !== 'string' || !approval || !roles || typeof roles !== 'object') return null;
+      let reg = globalThis[KEY];
+      const known = !!reg && reg.approval === approval;
+      if (!known) reg = {approval, map: new WeakMap()};
+      const role = x => String(Object.prototype.hasOwnProperty.call(roles, x.index) ? roles[x.index] : '');
+      if (entries.some(x => reg.map.has(x.e) && reg.map.get(x.e) !== role(x))) return {known, moved: true};
+      for (const x of entries) reg.map.set(x.e, role(x));
+      globalThis[KEY] = reg;
+      return {known, moved: false};
+    },
     // dlz (re-pin): only while a commit waits on a re-pin answer, in the same document, URL and same-origin
     // chain: this document's exposed fields now (the inspection's own description and limits), per field token the
     // new index of the element pinned for it so far (-1: gone), and per control the inspection judged exposed its
@@ -255,9 +302,27 @@ _INSPECT_TEMPLATE = r"""(() => {
     // dlz: `repin` (config vault.payment_repin, reviewed destinations; a literal true only): the commit may pause
     // for a re-pin or a deferral. Without it this is the commit as it was before re-pinning existed: any change of
     // the pinned state stops it (`plain` below), and the only addition is the stop record.
-    commit: (fills, deadline, strict, paced, repin) => {
+    // dlz (fill-auto): `auto` ('fill' or 'repair'; config vault.payment_fill_auto, on by default): the commit of a
+    // fill that may be continued on a fresh inspection. It writes like `plain`, with three differences: a label-only
+    // change pauses for the supervisor's re-classification instead of stopping (`relabel`); a field marked `kept`
+    // (an earlier inspection of this approval may already have written its token) that still holds its value is not written
+    // again; 'repair' writes the card number first and the CVC last. Every other change stops it exactly as `plain`
+    // stops, with the stop record; the supervisor then decides, by a full new inspection, whether the fill goes on.
+    commit: (fills, deadline, strict, paced, repin, auto) => {
       const first = () => String((Array.isArray(fills) && fills[0] && fills[0].token) || 'other');
-      if (repin !== true) {
+      const automatic = auto === 'fill' || auto === 'repair';
+      if (automatic) {
+        if (used) return {success:false,error_type:'payment_fields_changed',filled_fields:0};
+        used = true;
+        const start = why();
+        if (start && !(start === 'fields_relabeled' && labelOnly())) {
+          let check = null;
+          try {
+            if (Array.isArray(fills)) check = record(fills.map(f=>({index:f.index,token:String(f.token||'')})), first(), start, 1);
+          } catch (_) {}
+          return {success:false,error_type:'payment_fields_changed',filled_fields:0,...(check ? {check} : {})};
+        }
+      } else if (repin !== true) {
         if (used) return {success:false,error_type:'payment_fields_changed',filled_fields:0};
         if (!valid()) {
           // the decision is taken; the record only names it (which pinned fields, which descriptor keys)
@@ -304,7 +369,8 @@ _INSPECT_TEMPLATE = r"""(() => {
       const ordered = fills.slice().sort((a,b)=>(a.token==='cc-number')-(b.token==='cc-number'));
       // dlz: the plan, one entry per field: its token, value and CURRENT pin (a re-pin moves it; -1: deferred
       // until the card number is in), and, re-pinning, whether it was written (`done`).
-      const plan = fills.map(f=>({index:f.index,token:String(f.token||''),value:f.value,...(repinning ? {done:false} : {})}));
+      const plan = fills.map(f=>({index:f.index,token:String(f.token||''),value:f.value,...(repinning ? {done:false} : {}),
+                                  ...(automatic && f.kept === true ? {kept:true} : {})}));
       written = plan;
       const queue = plan.slice().sort((a,b)=>(a.token==='cc-number')-(b.token==='cc-number'));
       const later = [];
@@ -440,7 +506,64 @@ _INSPECT_TEMPLATE = r"""(() => {
         return held === plan.length && location.href === href ? {success:true,filled_fields:held} :
           {success:false,error_type:'payment_validation_failed',filled_fields:held,partially_filled:true};
       };
-      paused = repinning ? steps() : plain();
+      // dlz (fill-auto): see `commit`. The same checks as `plain` before the focus and before the setter; `settled`
+      // answers them, pausing while the only change is a label. dlz (SBB/Datatrans, 11-13): there every write and
+      // every focus re-labels some other field (validation text), so the bound grows with the plan and only ends a
+      // page that never stops re-labelling: four per field and eight more. It is no re-inspection budget.
+      const MAX_RELABELS = 4 * plan.length + 8;
+      let relabels = 0;
+      const RANK = {'cc-number': 0, 'cc-exp': 1, 'cc-exp-month': 1, 'cc-exp-year': 2, 'cc-name': 3, 'postal-code': 4, 'cc-csc': 5};
+      const settled = function* (f, el, focused) {
+        for (;;) {
+          const reason = why() || (!live(el) ? 'detached' : !focused ? null : !shown(el) ? 'hidden' :
+                                   strict === true && !hits(el) ? 'hit_test' : null);
+          if (reason !== 'fields_relabeled' || relabels >= MAX_RELABELS || !labelOnly() || late()) return reason;
+          relabels += 1;
+          const accepted = yield {relabel:true,filled_fields:attempted};
+          if (accepted !== true) return reason;
+        }
+      };
+      const automaticSteps = function* () {
+        const queue = auto === 'repair'
+          ? plan.slice().sort((a,b)=>(RANK[a.token] ?? 4) - (RANK[b.token] ?? 4)) : plan.slice().sort((a,b)=>(a.token==='cc-number')-(b.token==='cc-number'));
+        for (const f of queue) {
+          const el = elements[f.index];
+          let reason = yield* settled(f, el, false);
+          if (reason) { note(f, reason); return changed(); }
+          if (f.kept === true && shown(el) && same(el.value,f.value)) {  // written before and still held
+            attempted += 1;
+            continue;
+          }
+          el.focus();
+          if (late())  // focus handlers run page code; never write past the window
+            return expired();
+          if (paced === true) {
+            const r = el.getBoundingClientRect();
+            yield {pending:true,filled_fields:attempted,x:r.left + r.width / 2,y:r.top + r.height / 2};
+          }
+          reason = yield* settled(f, el, true);
+          if (!reason && isSelect(el) && !oneOption(el,f.value)) reason = 'options_changed';
+          if (reason) { note(f, reason); return changed(); }
+          if (late())  // the checks above run page-visible code too (layout, style): the window again, last
+            return expired();
+          attempted += 1;
+          if (isSelect(el)) {
+            selectSetter.call(el,f.value);
+            el.dispatchEvent(new Event('input',{bubbles:true}));
+          } else {
+            setter.call(el,f.value);
+            el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
+          }
+          el.dispatchEvent(new Event('change',{bubbles:true}));
+          el.dispatchEvent(new FocusEvent('blur'));
+          el.blur();
+        }
+        // Whether every field holds its value is judged once the page settled (retained()): a provider that clears
+        // a field right after its write gets one repair pass there. A moved document is never a success.
+        return location.href === href ? {success:true,filled_fields:plan.length} :
+          {success:false,error_type:'payment_validation_failed',filled_fields:attempted,partially_filled:true};
+      };
+      paused = automatic ? automaticSteps() : repinning ? steps() : plain();
       return advance();
     },
     resume: answer => advance(answer)
