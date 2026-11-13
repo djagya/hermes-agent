@@ -1024,16 +1024,17 @@ def test_cross_site_compares_registrable_domains_and_unknown_is_same_site(url, m
 BANK_IN_CARD = ("CARD", "L9", "https://acs.bank.test/challenge", "https://acs.bank.test", "PAGE")
 
 
-@pytest.mark.parametrize("case", ["admitted", "first", "same_site"])
+@pytest.mark.parametrize("case", ["admitted", "first", "same_site", "provider"])
 def test_a_bank_challenge_that_replaced_a_card_frame_is_pressed_after_an_admitted_pay(case):
     """r4 C5 (Codex r3 P2): after the admitted Pay, a bank challenge replaces the card frame and the merchant hides its
     summary: the challenge's control is pressed with no merchant total. Not before an admitted press, and not when the
-    frame's new document is the merchant's own site (the total is read, and missing)."""
+    frame's new document is the merchant's own site or the payment provider's (the total is read, and missing)."""
     sup = _claimed()
     if case != "first":
         _admitted(sup)
-    frame = BANK_IN_CARD if case != "same_site" else ("CARD", "L9", "https://pay.shop.test/x", "https://pay.shop.test",
-                                                      "PAGE")
+    frame = {"same_site": ("CARD", "L9", "https://pay.shop.test/x", "https://pay.shop.test", "PAGE"),
+             # the provider's own next page in its frame (psp.test received card fields): not a bank challenge
+             "provider": ("CARD", "L9", "https://psp.test/confirm", "https://psp.test", "PAGE")}.get(case, BANK_IN_CARD)
     sup.tree = sup.listed = (TREE[0], frame)
     sup.page_text = "Thank you, please confirm with your bank"
     reads = len(_total_reads(sup))

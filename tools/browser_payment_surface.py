@@ -1042,7 +1042,8 @@ async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, elemen
 
 def _bank_challenge(sup: Any, clicked: tuple, merchant: str) -> bool:
     """r4 C5: the pressed document is a bank challenge in place of a card document: a frame that held one of this
-    payment's card documents now shows another document (new loader) on a site that is not the merchant's."""
+    payment's card documents now shows another document (new loader) on a site that is not the merchant's, and not on
+    a payment provider's or card-receiving origin (a provider's own next page keeps the merchant total check)."""
     fid, loader, url, is_top = clicked
     if is_top:
         return False
@@ -1051,7 +1052,9 @@ def _bank_challenge(sup: Any, clicked: tuple, merchant: str) -> bool:
     with done._LOCK:
         payments = list((done._PAYMENTS.get(sup) or {}).values())
     documents = {d for p in payments for d in p.documents}
-    return fid in {d[0] for d in documents} and (fid, loader) not in documents and cross_site(url, merchant)
+    providers = {o for p in payments for o in done._card_origins(p)}
+    return (fid in {d[0] for d in documents} and (fid, loader) not in documents and cross_site(url, merchant)
+            and _origin_of(url) not in providers)
 
 
 # r4 C4: public suffixes with two labels, so ``shop.co.uk`` is one site and ``bank.co.uk`` another. A suffix not
