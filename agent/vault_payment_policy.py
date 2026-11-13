@@ -201,8 +201,12 @@ def payment_repin_enabled() -> bool:
         return False
 
 
+_FILL_AUTO_ON = frozenset({"true", "on", "yes", "1", "enabled"})
+
+
 def payment_fill_auto_enabled() -> bool:
-    """dlz (11-13): ``vault.payment_fill_auto`` (on unless a literal ``False``): a card form that re-renders between
+    """dlz (11-13): ``vault.payment_fill_auto`` (absent: on; present: on only when clearly on, so ``false``, ``"false"``,
+    ``"False"``, ``0``, ``"off"``, ``"no"`` and any other value turn it off): a card form that re-renders between
     the inspection and the approval, or under the fill, is inspected again in full inside the same approval and the
     fill continues on that reading; a label-only change is classified again in place; a field that lost its value
     after settling gets one repair pass. Off, or config that cannot be read now: any change stops the fill, as before
@@ -211,8 +215,14 @@ def payment_fill_auto_enabled() -> bool:
         from hermes_cli.config import cfg_get, load_config
         from hermes_cli.config_read_errors import FailedConfigRead
         config = load_config()
-        return (not isinstance(config, FailedConfigRead)
-                and cfg_get(config, "vault", "payment_fill_auto", default=None) is not False)
+        if isinstance(config, FailedConfigRead):
+            return False
+        value = cfg_get(config, "vault", "payment_fill_auto", default=None)
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in _FILL_AUTO_ON
+        return value is True or (type(value) is int and value == 1)
     except Exception:  # health: allow BLE001 -- unreadable config means the stop-on-any-change fill
         return False
 
