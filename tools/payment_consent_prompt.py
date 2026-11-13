@@ -397,6 +397,16 @@ def request_payment_approval(facts: PaymentPromptFacts, *, timeout_seconds: Opti
     return PaymentConsent(outcome, reason, str(detail.get("detail") or ""))
 
 
+def _page_check(inspected) -> PageMatch:
+    """The page check the card shows. r4 C6 (peer r3 P2-3): Pay is gated on the merchant page alone, so a check that
+    matched across the merchant page and a payment form, but not on the merchant page by itself (or with that result
+    unknown), shows as ambiguous: the card is then fill-only."""
+    state, where = getattr(inspected, "page_match", ("not_checked", ""))
+    if state == "matched" and getattr(inspected, "merchant_match", None) != "matched":
+        state = "ambiguous"
+    return PageMatch(state, where)
+
+
 def facts_for_inspection(inspected, *, card_label: str, cart: Optional[StatedCart] = None) -> PaymentPromptFacts:
     """Facts for a fill: the inspected documents' origins and fields. dlz (Track B): with ``cart`` (Sera's stated
     cart), the page check the inspection pinned (``inspected.page_match``: state and where it looked) goes with it;
@@ -416,5 +426,5 @@ def facts_for_inspection(inspected, *, card_label: str, cart: Optional[StatedCar
         ref=inspected.operation_id, card_label=card_label, merchant_origin=merchant, receiving=receiving,
         expires_in_s=max(1, min(600, int(inspected.expires_at - time.monotonic()))),
         cart=cart,
-        page_match=PageMatch(*getattr(inspected, "page_match", ("not_checked", ""))) if cart is not None else PageMatch(),
+        page_match=_page_check(inspected) if cart is not None else PageMatch(),
         unreviewed=any(r.status == "UNREVIEWED" for r in receiving))

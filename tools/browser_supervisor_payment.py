@@ -142,6 +142,7 @@ class PaymentInspection:
     # (session, object id) of each pinned amount witness (B5), and the page-check result shown to the owner.
     witnesses: tuple = field(default=(), repr=False)
     page_match: tuple = ("not_checked", "")
+    merchant_match: str = "not_checked"  # approval-qol r4 C6: the merchant page's own result (Pay is gated on it)
 
     @property
     def controls(self) -> tuple:
@@ -806,6 +807,7 @@ class PaymentSupervisionMixin:
             pins.append((place, await self._amount_witness(wfid, wsid, inspection.operation_id, cart, witnesses)))
         inspection.witnesses = tuple(witnesses)
         inspection.page_match = _page_match(pins, cart[0])
+        inspection.merchant_match = _page_match(pins[:1], cart[0])[0]  # approval-qol r4 C6
 
     async def _pin_frame_owners(self, documents: tuple, tree: tuple, page_sid: str, child_sessions: dict,
                                 groups: dict | None = None) -> dict:

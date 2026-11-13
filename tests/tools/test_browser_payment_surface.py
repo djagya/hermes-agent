@@ -1092,6 +1092,39 @@ def test_the_go_required_text_never_claims_the_card_said_fill_only():
     assert "restart" in out["error"] and "owner_go true" in out["error"]
 
 
+@pytest.mark.parametrize("merchant, card", [("not_found", "ambiguous"), ("ambiguous", "ambiguous"),
+                                            ("matched", "matched")])
+def test_pay_once_rests_on_the_merchant_page_alone(merchant, card):
+    """r4 C6 (peer r3 P2-3): the page check matched across the merchant page and an unreviewed payment form, but Pay
+    is gated on the merchant page only: unless that page alone matched, the card is fill-only (ambiguous)."""
+    from tools.payment_consent_prompt import CartItem, StatedCart, facts_for_inspection, pays_once
+
+    inspected = SimpleNamespace(
+        operation_id="c" * 32, merchant_origin="https://shop.test", expires_at=time.monotonic() + 100,
+        documents=(SimpleNamespace(origin="https://psp.test", controls=(SimpleNamespace(token="cc-number"),)),),
+        page_match=("matched", "the merchant page and the payment form"), merchant_match=merchant)
+    facts = facts_for_inspection(inspected, card_label="Test card",
+                                 cart=StatedCart((CartItem("Ticket", 1),), "100.00", "EUR"))
+    assert facts.page_match.state == card and pays_once(facts) is (card == "matched")
+
+
+def test_the_inspection_keeps_the_merchant_pages_own_check():
+    """r4 C6: the inspection records the merchant page's own result beside the result over every witnessed document."""
+    from tools.browser_supervisor_payment import PaymentSupervisionMixin
+
+    pins = {"PAGE": {"state": "not_found", "labelled": [], "stated": 0, "unclear": False},
+            "FORM": {"state": "matched", "labelled": [10000], "stated": 1, "unclear": False}}
+
+    async def witness(fid, sid, operation, cart, pinned):
+        return pins[fid]
+
+    inspection = SimpleNamespace(tree=TREE, page_session="S-page", operation_id="op", unreviewed_origins=("https://f.test",),
+                                 documents=(SimpleNamespace(frame_id="FORM", frame_session="S-f", origin="https://f.test"),))
+    asyncio.run(PaymentSupervisionMixin._bind_amount_witnesses(SimpleNamespace(_amount_witness=witness), inspection,
+                                                               (10000, "EUR"), []))
+    assert inspection.page_match[0] == "matched" and inspection.merchant_match == "not_found"
+
+
 @pytest.mark.parametrize("state, bound", [("matched", True), ("ambiguous", False), ("not_found", False),
                                           (None, False)])
 def test_a_fill_binds_the_total_only_when_its_card_covered_pay(state, bound):
@@ -1847,3 +1880,4 @@ console.log(JSON.stringify(out));
     assert run.returncode == 0, run.stderr
     assert json.loads(run.stdout) == {"failed": "NATIVE", "answered": True,
                                       "calls": ["native:Place order?", "native-alert:Saved"]}
+
