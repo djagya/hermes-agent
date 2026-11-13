@@ -1377,14 +1377,19 @@ BROWSER_VAULT_SCHEMA = {
         "was redirected to) unless that page is a card form; payment_click (ref) makes one trusted click on a "
         "listed control, so the Pay button is clicked there; refs die when the page changes, when you list again, and after one press (successful or uncertain): "
         "a second press needs a new payment_controls. "
-        "The owner's Approve on a card-fill approval card that stated the cart total is the go for pressing Pay once "
+        "The owner's Approve on a card-fill approval card that stated the cart total and whose page check matched it "
+        "(the button says \"fill + Pay once\") is the go for pressing Pay once "
         "for that checkout (the card says so; no separate chat go is needed): press Pay exactly once after a "
         "successful fill, never press it a second time, and never click it again when "
-        "payment_click_uncertain says a press may have landed. payment_controls and payment_done report "
+        "payment_click_uncertain says a press may have landed. Before every press Hermes reads the merchant "
+        "checkout page again: payment_total_changed means it no longer shows the approved total (or the checkout "
+        "page changed before any press); nothing was pressed, so stop and tell the owner, never retry. A bank or "
+        "3-D Secure page can be clicked only after a first press was admitted. payment_controls and payment_done report "
         "presses_in_lock (null = unknown): the presses this process started in the lock, an uncertain one included; "
         "once it is 1 (or null), another payment_click is only for a bank or 3-D Secure step the owner asked for, "
-        "never a second Pay. A card with no stated total says \"fill only\": "
-        "its Approve is not a go for Pay, so do not press Pay until the owner says to in chat. Page dialogs while locked: alerts are accepted and "
+        "never a second Pay. A card with no stated total, or whose page check did not match it, says \"fill only\": "
+        "its Approve is not a go for Pay, so do not press Pay until the owner says to in chat; then every "
+        "payment_click needs owner_go true (payment_go_required otherwise; nothing pressed). Page dialogs while locked: alerts are accepted and "
         "prompts dismissed by Hermes; a confirm waits and payment_controls / payment_click / payment_done report "
         "dialog_pending {id, type, origin, on_payment_tab_top, on_shop_page, text} for the payment tab (text "
         "redacted, bounded, every 3+ digit run and date masked except an amount exactly equal to the cart total "
@@ -1416,6 +1421,9 @@ BROWSER_VAULT_SCHEMA = {
                                                   "letter_signed_in", "letter_done", "payment_controls",
                                                   "payment_click", "payment_done", "payment_dialog", "payment_close"]},
             "ref": {"type": "string", "description": "payment_click only: a ref from payment_controls."},
+            "owner_go": {"type": "boolean", "description": "payment_click only: true only after the owner's "
+                         "explicit go in chat for this purchase, when its approval card said fill only. Never set "
+                         "it on your own judgement; it does not override payment_total_changed."},
             "accept": {"type": "boolean", "description": "payment_dialog only: true accepts, false dismisses the "
                                                          "dialog_pending confirm."},
             "dialog_id": {"type": "string", "description": "payment_dialog only: dialog_pending.id of the confirm "
@@ -1574,7 +1582,7 @@ def _native(supervisor: Any, call) -> dict:
     return out
 
 
-def _payment_surface_action(task_id: Optional[str], ref: Optional[str]) -> str:
+def _payment_surface_action(task_id: Optional[str], ref: Optional[str], owner_go: bool = False) -> str:
     """dlz: native actions on a locked payment tab (managed browser only)."""
     from tools import browser_payment_surface as surface
 
@@ -1584,7 +1592,7 @@ def _payment_surface_action(task_id: Optional[str], ref: Optional[str]) -> str:
     supervisor = _managed_supervisor(task_id or "default")
     if ref is None:
         return json.dumps(surface.payment_controls(supervisor))
-    return json.dumps(surface.payment_click(supervisor, ref))
+    return json.dumps(surface.payment_click(supervisor, ref, owner_go=owner_go))
 
 
 def _payment_dialog_action(task_id: Optional[str], dialog_id: Any, accept: Any) -> str:
@@ -1697,7 +1705,8 @@ def _handle_vault_inner(args: dict[str, Any], **kwargs) -> str:
         "letter_signed_in": lambda: _outside_payment_lock(
             tid, lambda: browser_vault_letter_signed_in(handle, task_id=tid)),
         "payment_controls": lambda: _payment_surface_action(tid, None),
-        "payment_click": lambda: _payment_surface_action(tid, str(args.get("ref") or "")),
+        "payment_click": lambda: _payment_surface_action(tid, str(args.get("ref") or ""),
+                                                         owner_go=args.get("owner_go") is True),
         "payment_done": lambda: _payment_done_action(tid, str(args.get("expected_origin") or "")),
         "payment_dialog": lambda: _payment_dialog_action(tid, args.get("dialog_id"), args.get("accept")),
         "payment_close": lambda: _payment_close_action(tid),

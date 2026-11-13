@@ -650,6 +650,22 @@ def _record_approved_amount(supervisor, inspected, stated) -> None:
     record_approved_amount(supervisor, getattr(inspected, "page_id", None), stated.total, stated.currency)
 
 
+def _bind_approved_total(supervisor, inspected, stated, facts) -> None:
+    """B1: a successful fill whose card covered one Pay (``pays_once``: a stated total the page check matched)
+    binds that total and the merchant top document to the payment lock; payment_click re-reads it before every
+    press. Never raises (the result must still say what was written); nothing bound means Pay needs the owner's go."""
+    try:
+        from tools.payment_consent_prompt import pays_once
+
+        if stated is None or facts is None or not pays_once(facts):
+            return
+        from tools.browser_payment_surface import record_approved_total
+
+        record_approved_total(supervisor, *_cents(stated), tuple(inspected.tree[0][:2]))
+    except Exception as exc:  # health: allow BLE001 -- unbound: every press then needs the owner's go in chat
+        logger.info("approved total not bound to the payment lock (%s)", type(exc).__name__)
+
+
 def _claim_and_readmit(vault, task_id: str, supervisor, inspected, lease: str) -> dict | None:
     """The last steps before the card is read. None = may proceed."""
     # dlz: A9: browser-control must confirm this supervisor's claim on the card documents before
@@ -831,6 +847,8 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                     return json.dumps(_disabled(after_read=True))
                 window.committing()  # from here a card value may be in the page: only control's unlock releases it
             result = supervisor.commit_payment(inspected, fills, strict=strict, **_repin_argument(unreviewed))
+            if result.get("success"):
+                _bind_approved_total(supervisor, inspected, stated, facts)
             _log_commit(result)
             _commit_text(result)
             return json.dumps(_describe_result(result, backend, inspected, fills, prompt, bound_revision,

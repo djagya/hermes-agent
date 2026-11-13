@@ -232,12 +232,23 @@ def _check_origins(facts: PaymentPromptFacts) -> None:
             raise PromptIncomplete("an origin is not a plain https origin")
 
 
+def pays_once(facts: PaymentPromptFacts) -> bool:
+    """Whether the owner's Approve also covers one Pay press: only when Sera stated the total and the page check
+    matched it (peer r2 P2). Otherwise the card is fill-only and Pay needs the owner's go in chat; the payment lock
+    binds the total only in this case (``browser_vault_payment._bind_approved_total``)."""
+    return facts.cart is not None and facts.page_match.state == "matched"
+
+
 def scope_line(facts: PaymentPromptFacts) -> str:
     """What one Approve tap does, in plain words: the fill and exactly one Pay press of this checkout, or (no
-    stated total) the fill only."""
+    stated total, or a total the page check did not match) the fill only."""
     if facts.cart is None:
         return (f"Approve: Sera fills the card only, at {facts.merchant_origin}. No total was stated, so this "
                 "does not cover pressing Pay: Pay needs your go in chat.")
+    if not pays_once(facts):
+        return (f"Approve: Sera fills the card only, at {facts.merchant_origin}. Hermes did not find "
+                f"{facts.cart.total} {facts.cart.currency} clearly as the page's total, so this does not cover "
+                "pressing Pay: Pay needs your go in chat.")
     return (f"Approve: Sera fills the card and presses Pay once for {facts.cart.total} {facts.cart.currency} "
             f"at {facts.merchant_origin}.")
 
@@ -264,7 +275,7 @@ def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
         where = f" Checked on {esc(facts.page_match.where)}." if facts.page_match.where else ""
         lines.append(esc(PAGE_MATCH_LINES[facts.page_match.state]) + where)
     covers = ("One tap covers one fill and one Pay press for this checkout; any other payment needs a new approval."
-              if facts.cart is not None else
+              if pays_once(facts) else
               "One tap covers one fill only: pressing Pay needs your go in chat. Any other payment needs a new approval.")
     lines += ["", f"{covers} Expires in {facts.expires_in_s} s.",
               "Hermes cannot verify what will be charged. HTTPS does not mean the seller is legitimate.",

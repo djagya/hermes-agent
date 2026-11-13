@@ -54,6 +54,7 @@ class FakeSup:
         self.dialogs, self.extra_tabs, self.closing = [], [], []
         self.targets = {}  # session id → target id; the page session is "TAB", others "OTHER"
         self.lock_tabs = None  # control's owning tabs in its claim answer (None: just the claimed ones)
+        self.pin = {"state": "matched", "labelled": [2266], "stated": 1, "unclear": False}  # "Pay 22.66 EUR" page
 
     async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
         self.calls.append((method, params or {}, session_id, self.tree))
@@ -76,6 +77,8 @@ class FakeSup:
         if method == "Page.createIsolatedWorld":
             return {"executionContextId": 7}
         if method == "Runtime.evaluate":
+            if params.get("returnByValue") and params["expression"].endswith(".pin()"):  # B1: the total at Pay
+                return {"result": {"type": "object", "value": dict(self.pin)}}
             if params["expression"] != done.SNAPSHOT_JS:  # the payment_controls lister
                 return {"result": {"objectId": "arr"}}
             return {"result": {"type": "object", "value": self.page}}
@@ -415,7 +418,9 @@ def test_locked_payment_tab_top_document_is_listed_and_clicked_natively(tree):
     assert {"ref": ref, "role": "button", "text": "Pay 22.66 EUR", "disabled": False} in out["controls"]
     worlds = [c for c in sup.sent("Page.createIsolatedWorld") if c[1]["frameId"] == "TOP"]
     assert len(worlds) == 1 and worlds[0][2] == "S-page"
-    assert surface.payment_click(sup, ref)["success"] is True
+    # no claim of this process, so no approved total is bound: the press needs the owner's go (B1)
+    assert surface.payment_click(sup, ref)["error_type"] == "payment_go_required"
+    assert surface.payment_click(sup, ref, owner_go=True)["success"] is True
     assert [c[1]["type"] for c in sup.sent("Input.dispatchMouseEvent")] == [
         "mouseMoved", "mousePressed", "mouseReleased"]
     assert {c[2] for c in sup.sent("Input.dispatchMouseEvent")} == {"S-page"}
@@ -445,13 +450,32 @@ def test_top_document_never_offered_when_it_is_a_card_frame(tree, merchant_field
     assert not sup.sent("Input.dispatchMouseEvent")
 
 
+@pytest.mark.parametrize("first", ["checkout", "bank"])
+def test_a_3ds_page_is_clicked_only_after_the_checkouts_pay_was_admitted(first):
+    """B1: the fill bound EUR 22.66 to the checkout document (TOP, L0). Pay on it reads the total again; the bank's
+    3-D Secure page (same tab, another document) has no merchant total and is clickable only after that press."""
+    sup = _claimed(_Unlocking([CHECKOUT] if first == "checkout" else [ACS], status=dict(LOCKED_TAB)))
+    surface.record_approved_total(sup, 2266, "EUR", ("TOP", "L0"))
+    tree = CHECKOUT if first == "checkout" else ACS
+    _top_controls(sup)
+    out = surface.payment_click(sup, _top_ref(sup, tree))
+    presses = lambda: [c for c in sup.sent("Input.dispatchMouseEvent") if c[1]["type"] == "mousePressed"]
+    if first == "bank":  # the first press of the lock on a page that is not the filled checkout
+        assert out["error_type"] == "payment_total_changed" and not presses()
+        return
+    assert out["success"] is True and len(presses()) == 1
+    sup.trees = [ACS]  # redirected to the bank's challenge page
+    _top_controls(sup)
+    assert surface.payment_click(sup, _top_ref(sup, ACS))["success"] is True and len(presses()) == 2
+
+
 def test_a_top_document_ref_dies_with_its_document():
     sup = _paid([CHECKOUT])
     _top_controls(sup)
     ref = _top_ref(sup, CHECKOUT)
     assert ref is not None
     sup.trees = [(("TOP", "L5", SHOP + "/checkout", SHOP, ""),)]  # navigated: same frame and text, new document
-    assert surface.payment_click(sup, ref)["error_type"] == "payment_control_unknown"
+    assert surface.payment_click(sup, ref, owner_go=True)["error_type"] == "payment_control_unknown"
     assert not sup.sent("Input.dispatchMouseEvent")
 
 

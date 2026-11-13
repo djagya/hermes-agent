@@ -27,6 +27,7 @@ wipe or a human clear); a failed or malformed status keeps it.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import secrets
@@ -189,6 +190,8 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
         held_before = supervisor in _HELD
         if not held_before:  # a new lock of this process (pressed_in_lock)
             gen = _GENS[supervisor] = _LockGen(known=_PRESSING_N == 0 and supervisor not in _KNOWN_LOCKED)
+        elif _GENS.get(supervisor) is not None:  # B1: a new fill is a new approval; only its success binds a total
+            _GENS[supervisor].approved = None
         _HELD.add(supervisor)
         _CLAIMING[supervisor] = _CLAIMING.get(supervisor, 0) + 1
         _EPOCHS[supervisor] = _EPOCHS.get(supervisor, 0) + 1
@@ -673,7 +676,10 @@ async def _target_point(sup: Any, sid: str, element: str, page_sid: str, tree: t
     return x, y, outer
 
 
-async def _click(sup: Any, spec: tuple, progress: list, deadline: float) -> dict:
+async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: tuple) -> dict:
+    """``gate``: ``(approved, admitted, owner_go)`` read when the click was admitted (B1, ``_pay_gate``)."""
+    if gate[0] is None and not gate[2]:
+        return _refusal(GO_REQUIRED, _GO_REQUIRED_TEXT)  # before anything is read on the page
     page_sid, tree, child_sessions, listed = await _list_all(sup)
     element = None
     sid = ""
@@ -710,6 +716,10 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float) -> dict
             return _refusal("payment_control_changed", "The control moved or changed just before the click; nothing "
                                                        "was pressed. Call payment_controls again.")
         await _same_document(sup, sid, fid, loader)
+        if gate[0] is not None:  # B1: the approved total, read last, right before the press
+            refused = await _pay_gate(sup, page_sid, gate[0], gate[1])
+            if refused:
+                return refused
         for kind in ("mousePressed", "mouseReleased"):
             if kind == "mousePressed":
                 # Nothing awaits between this check and the dispatch: past the deadline the caller may
@@ -725,6 +735,72 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float) -> dict
         if element:
             await sup._release_payment_object(sid, element)
         await _release(sup, child_sessions, listed)
+
+
+TOTAL_CHANGED = "payment_total_changed"
+GO_REQUIRED = "payment_go_required"
+_TOTAL_CHANGED_TEXT = (
+    "Hermes could not confirm that the merchant's checkout page still shows the total the owner approved (it changed, "
+    "is no longer clear, or the checkout page is not the one that was filled), so nothing was pressed and the lock "
+    "stays. Stop: do not press Pay or anything else, do not retry, and tell the owner (Danil) what you see. A "
+    "different total needs a new approval: payment_close, then fill again with the current cart.")
+_GO_REQUIRED_TEXT = (
+    "The approval card for this fill did not cover pressing Pay (it said fill only: no stated total, or the page "
+    "check did not match it), so nothing was pressed. Ask the owner (Danil) in chat; only after his explicit go for "
+    "this purchase call payment_click again with owner_go true.")
+
+
+def record_approved_total(supervisor: Any, cents: Any, currency: Any, top: Any) -> None:
+    """B1: after a successful card fill whose card stated the total and whose page check matched it, bind that total
+    (integer cents, ISO code) and the merchant top document it was read in (``(frame id, loader)``) to the current
+    lock: every payment_click in this lock reads it again before its press. Nothing is bound without a lock of this
+    process or with a malformed value (the clicks then need the owner's go)."""
+    if not (type(cents) is int and 0 <= cents < 10**9 and isinstance(currency, str)
+            and re.fullmatch(r"[A-Z]{3}", currency) and isinstance(top, tuple) and len(top) == 2
+            and _valid_id(top[0]) and isinstance(top[1], str) and _ID_RE.fullmatch(top[1])):
+        return
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        if gen is not None:
+            gen.approved = (cents, currency, top[0], top[1])
+
+
+def approved_total(supervisor: Any) -> Optional[tuple]:
+    """``(cents, currency)`` bound to this supervisor's current lock, or None."""
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        return gen.approved[:2] if gen is not None and gen.approved else None
+
+
+async def _page_total(sup: Any, sid: str, fid: str, cents: int, currency: str) -> Any:
+    """The fill's amount check (``_AMOUNT_WITNESS``, the same parser and rules) read once in a fresh isolated world of
+    document ``fid``: only its pin (state words and numbers) leaves the world, nothing stays pinned."""
+    from tools.browser_supervisor_payment import _AMOUNT_WITNESS
+
+    ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": fid, "worldName": "hermes-payment-total"},
+                          session_id=sid))["result"]["executionContextId"]
+    reply = await sup._cdp("Runtime.evaluate", {
+        "expression": "(" + _AMOUNT_WITNESS + ")(" + str(cents) + "," + json.dumps(currency) + ").pin()",
+        "contextId": ctx, "returnByValue": True}, session_id=sid)
+    return ((reply.get("result") or {}).get("result") or {}).get("value")
+
+
+async def _pay_gate(sup: Any, page_sid: str, approved: tuple, admitted: bool) -> Optional[dict]:
+    """B1 (owner 2026-11-13): None when this press may go out, else ``payment_total_changed``. On the merchant top
+    document the fill bound (same frame, same loader, read before and after) the approved total must be ``matched``
+    by the fill's own rule: every labelled total is the approved one, none unclear. Any other top document (a bank or
+    3-D Secure page) has no merchant total: it may be pressed only after this lock already admitted a press."""
+    from tools.browser_supervisor_payment import _page_match, _valid_pin
+
+    cents, currency, fid, loader = approved
+    if await _loader_of(sup, page_sid, fid) != loader:
+        return None if admitted else _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT)
+    pin = await _page_total(sup, page_sid, fid, cents, currency)
+    if await _loader_of(sup, page_sid, fid) != loader:  # the document changed during the read
+        return _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT)
+    if not _valid_pin(pin) or _page_match([("merchant page", pin)], cents)[0] != "matched":
+        return _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT)
+    return None
 
 
 def _run(supervisor: Any, coro_factory, progress: list | None = None) -> dict:
@@ -784,10 +860,13 @@ class _LockGen:
     press may have landed in it), when control already reported the slot locked, or when control's lock already
     held other tabs. Read and written under ``_LOCK``."""
 
-    __slots__ = ("known", "pressed", "presses")
+    __slots__ = ("known", "pressed", "presses", "approved")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
+        # B1: (cents, currency, top frame id, top loader) of the last successful fill in this lock whose card stated
+        # the total and whose page check matched it (record_approved_total); None: no press is covered by the card.
+        self.approved: Optional[tuple] = None
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
@@ -837,12 +916,16 @@ def closing() -> bool:
         return _CLOSING_N > 0
 
 
-def payment_click(supervisor: Any, ref: str) -> dict:
+def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
     """``browser_vault action=payment_click ref=…``: one trusted click on a control of the latest listing.
     Refs are single-use: the ref is taken out of the listing for the click and stays dead once a press
-    started (successful or uncertain); a second press needs a fresh payment_controls."""
+    started (successful or uncertain); a second press needs a fresh payment_controls.
+
+    B1: a lock with an approved total (``record_approved_total``) admits a press only through ``_pay_gate``; a lock
+    without one refuses ``payment_go_required`` unless ``owner_go`` (Sera's word that the owner gave his go in chat)."""
     global _PRESSING_N
     gen = None
+    gate = (None, False, owner_go is True)
     with _LOCK:  # dlz (Codex r3/r4 P1): one step admits the click against a payment_close running anywhere
         if _CLOSING_N > 0:  # the ref stays in its listing
             return _refusal("payment_close_busy", _CLICK_CLOSING)
@@ -851,13 +934,15 @@ def payment_click(supervisor: Any, ref: str) -> dict:
         if spec is not None:  # dlz (Opus r2): payment_close does not close the tab under a press still running
             _PRESSING_N += 1
             gen = _GENS.get(supervisor) if supervisor in _HELD else None  # the lock this press belongs to
+            if gen is not None:
+                gate = (gen.approved, gen.presses > 0, owner_go is True)
     if spec is None:
         return _refusal("payment_control_unknown", "ref must be one returned by the latest payment_controls and "
                                                    "not used for a press yet; call payment_controls again.")
     progress: list = []
     try:
-        out = _with_dialog(supervisor, _run(supervisor, lambda deadline: _click(supervisor, spec, progress, deadline),
-                                            progress))
+        out = _with_dialog(supervisor, _run(
+            supervisor, lambda deadline: _click(supervisor, spec, progress, deadline, gate), progress))
     finally:
         with _LOCK:
             if progress and gen is not None and _GENS.get(supervisor) is gen:  # never a later lock
