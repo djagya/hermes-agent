@@ -410,14 +410,14 @@ def test_a_refused_re_inspection_never_copies_a_page_chosen_origin_into_the_resu
 
     from tools import browser_vault_payment as bvp
 
-    sup, prior, fresh, refused = _loop([_fresh([(MERCHANT, ("cc-exp",)), (_HOLDER, ("cc-number", "cc-csc"))], "x"), None],
-                                       monkeypatch)
+    _sup, prior, fresh, refused = _loop([_fresh([(MERCHANT, ("cc-exp",)), (_HOLDER, ("cc-number", "cc-csc"))], "x"), None],
+                                        monkeypatch)
     assert fresh is None and refused == "origin_changed"
     assert prior.approval["seen"] == {MERCHANT: ["cc-exp"], "other": 1}
     # the discovery pass reports its origins in the error's detail: same rule
     detail = {"receiving_origins": [{"origin": PSP, "fields": ["cc-number"]}, {"origin": _HOLDER, "fields": ["cc-csc"]}]}
-    sup, prior, fresh, refused = _loop([PaymentDestinationError("payment_fields_ambiguous", "x", detail)], monkeypatch,
-                                       wait=0.05)
+    _sup, prior, _fresh_reading, _refused = _loop([PaymentDestinationError("payment_fields_ambiguous", "x", detail)],
+                                                  monkeypatch, wait=0.05)
     assert prior.approval["seen"] == {PSP: ["cc-number"], "other": 1}
     st = {"reinspections": 0, "repairs": 0, "refused": "origin_changed", "wrote": 3, "seen": prior.approval["seen"]}
     out = spa._auto_result({"success": False, "error_type": "payment_page_changed"}, st)
@@ -430,8 +430,10 @@ def test_a_refused_re_inspection_never_copies_a_page_chosen_origin_into_the_resu
 def test_a_rejected_re_inspection_releases_only_the_sessions_it_attached_by_session_not_by_frame(monkeypatch):
     """F6 (Codex P2-6, peer P2-4, GLM P3-1): a new child frame shares its parent's session; the frame key is new, the
     session is the earlier inspection's and must stay attached."""
-    shared = lambda prior: _reading(_APPROVED, operation="x", approval=prior.approval,   # noqa: E731
-                                    child_sessions={"f1": "shared", "child": "shared", "mine": "own"}, page="other")
+    def shared(prior):
+        return _reading(_APPROVED, operation="x", approval=prior.approval, page="other",
+                        child_sessions={"f1": "shared", "child": "shared", "mine": "own"})
+
     sup, prior, fresh, refused = _loop([shared, None], monkeypatch)
     assert fresh is None and refused == "navigated"
     assert sup.released == [("x", {"mine": "own"})] and prior.child_sessions == {"f1": "shared"}
@@ -470,20 +472,26 @@ def test_inspect_payment_cleanup_keeps_the_sessions_the_earlier_inspection_uses(
 
 def test_a_cancelled_re_inspection_releases_the_fresh_reading(monkeypatch):
     """F5 (Codex P2-5, peer P3-1, GLM P3-2): a reading that was read but not yet handed over is not leaked when the
-    commit is cancelled (its timeout) while it settles."""
+    commit is cancelled (its timeout) while it is checked for settling."""
     monkeypatch.setattr(spa, "_REINSPECT_POLL_SECONDS", 0)
-    monkeypatch.setattr(spa, "_REINSPECT_SETTLE_SECONDS", 30)  # cancelled in the settle wait
+    monkeypatch.setattr(spa, "_REINSPECT_SETTLE_SECONDS", 0)
     sup = _Loop([_fresh(_APPROVED, "x")])
     prior = _reading(_APPROVED, operation="prior", child_sessions={"f1": "shared"})
     prior.approval = spa._approval_facts(prior)
 
     async def main():
+        entered = asyncio.Event()
+
+        async def current(i, during_fill=False):  # the settle check hangs: the commit is cancelled in it
+            entered.set()
+            await asyncio.Event().wait()
+
+        sup._payment_is_current = current
         task = asyncio.ensure_future(sup._reinspect(prior, time.monotonic() + 60, 60))
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(entered.wait(), 10)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        await asyncio.sleep(0.05)
 
     asyncio.run(main())
     assert sup.released == [("x", {"new": "x"})] and not prior.consumed and prior.child_sessions == {"f1": "shared"}
@@ -497,22 +505,23 @@ def test_a_commit_cancelled_while_the_earlier_reading_is_released_still_releases
     sup = _Loop([_fresh(_APPROVED, "x")])
     prior = _reading(_APPROVED, operation="prior", child_sessions={"f1": "shared"})
     prior.approval = spa._approval_facts(prior)
-    slow = sup._release_payment_documents
-
-    async def release(i):
-        if i.operation_id == "prior":
-            await asyncio.sleep(30)  # the earlier reading's release is slow
-        await slow(i)
-
-    sup._release_payment_documents = release
+    recorded = sup._release_payment_documents
 
     async def main():
+        entered = asyncio.Event()
+
+        async def release(i):
+            if i.operation_id == "prior":  # the earlier reading's release is slow
+                entered.set()
+                await asyncio.Event().wait()
+            await recorded(i)
+
+        sup._release_payment_documents = release
         task = asyncio.ensure_future(sup._reinspect(prior, time.monotonic() + 60, 60))
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(entered.wait(), 10)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        await asyncio.sleep(0.1)
 
     asyncio.run(main())
     assert sup.released == [("x", {"f1": "shared", "new": "x"})]
@@ -522,10 +531,10 @@ def test_cart_changed_mid_render_is_read_again_and_adopted_only_on_an_equal_cart
     """F9 (peer P3-3): a Payrails reading caught mid-render lacks its amount text; it is read again."""
     pins = (("merchant page", _pin()), ("payment form", _pin()))
     mid_render = _fresh(_APPROVED, "mid", cart=(("merchant page", _pin()), ("payment form", _pin(labelled=[]))))
-    sup, prior, fresh, refused = _loop([mid_render, _fresh(_APPROVED, "ok", cart=pins)], monkeypatch,
-                                       prior_more={"cart": pins})
+    _sup, prior, fresh, refused = _loop([mid_render, _fresh(_APPROVED, "ok", cart=pins)], monkeypatch,
+                                        prior_more={"cart": pins})
     assert refused == "" and fresh.operation_id == "ok"
-    sup, prior, fresh, refused = _loop([mid_render], monkeypatch, wait=0.05, prior_more={"cart": pins})
+    _sup, prior, fresh, refused = _loop([mid_render], monkeypatch, wait=0.05, prior_more={"cart": pins})
     assert fresh is None and refused == "cart_changed" and not prior.consumed  # still not the approved cart: no adoption
 
 
@@ -577,8 +586,8 @@ def test_a_document_that_held_no_card_field_may_not_become_card_bearing():
 
 def test_an_adopted_reading_extends_the_free_documents(monkeypatch):
     """A document that was free in an adopted reading may not become card-bearing in the next one either."""
-    sup, prior, fresh, refused = _loop([lambda p: _reading(_APPROVED, operation="ok", approval=p.approval,
-                                                          free=[(PSP, "fX")])], monkeypatch)
+    _sup, prior, _fresh_reading, refused = _loop([lambda p: _reading(_APPROVED, operation="ok", approval=p.approval,
+                                                                     free=[(PSP, "fX")])], monkeypatch)
     assert refused == "" and prior.approval["free"] == {("fX", "LfX")}
 
 
@@ -638,7 +647,7 @@ def test_a_field_adopted_through_a_re_inspection_must_be_exposed_even_on_a_revie
 
 
 def test_a_first_generation_reviewed_fill_has_no_owner_chain_check_as_before(tmp_path, monkeypatch):
-    out, values, events = _auto_commit("auto_relabel", tmp_path, monkeypatch, parent=True)
+    out, _values, events = _auto_commit("auto_relabel", tmp_path, monkeypatch, parent=True)
     assert out["success"] is True and "owner_check" not in events
 
 
@@ -646,7 +655,7 @@ def test_a_first_generation_reviewed_fill_has_no_owner_chain_check_as_before(tmp
 def test_a_kept_field_still_gets_the_events_of_a_write(scenario, kept, tmp_path, monkeypatch):
     """F14 (GLM P3-4): a field that already holds its value is not written again, but the page's own state may not
     have it (a controlled field re-mounted with the value): input and change are dispatched, selects included."""
-    out, values, events = _auto_commit(scenario, tmp_path, monkeypatch)
+    out, values, _events = _auto_commit(scenario, tmp_path, monkeypatch)
     assert out["success"] is True and out["fill_reinspect"] == {"count": 1, "repairs": 1}, out
     log = values["log"].split()
     for field in kept:  # once for its write in the first generation, once more, as no-ops, in the repair generation
