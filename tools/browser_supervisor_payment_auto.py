@@ -27,8 +27,10 @@ imported lazily (it imports this module).
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from agent.vault_payment_policy import PaymentDestinationError, PaymentPolicyError
 
@@ -51,10 +53,12 @@ _REINSPECT_SETTLE_SECONDS = 0.25
 AUTO_BUDGET_SECONDS = 50.0
 # Why a re-inspection did not continue the fill (fill_reinspect.refused): fixed codes. The first group ends the
 # attempt at once; the second is retried until the wait is over (a form still rendering).
-_REINSPECT_FINAL = frozenset({"navigated", "origin_changed", "role_changed", "role_unproven", "cart_changed",
-                              "too_late", "budget", "fills"})
+_REINSPECT_FINAL = frozenset({"navigated", "origin_changed", "role_changed", "role_unproven", "too_late", "budget",
+                              "fills"})
+# cart_changed: a card form caught mid-render can lack its amount text; read again, adopted only on an equal cart.
+# documents_changed: more card documents, or another document path, than approved (a re-render shows old and new).
 _REINSPECT_RETRIED = frozenset({"incomplete", "ambiguous", "fields_changed", "unsettled", "unverifiable",
-                                "unavailable"})
+                                "unavailable", "cart_changed", "documents_changed"})
 # The commit stops a re-inspection may continue from: a changed field set or frame. Never an expiry, a changed cart,
 # a switched-off policy, an invalid plan or a write whose outcome is unknown.
 _REINSPECTABLE = frozenset({"payment_fields_changed", "payment_page_changed"})
@@ -155,46 +159,57 @@ class PaymentAutoMixin:
             return None, "unavailable"
         deadline = min(stop, prior.expires_at, time.monotonic() + wait)
         refused = "too_late"
-        # dlz: what the last refused reading held, for the stop record: card field tokens per origin, or the
-        # discovery's own count of frames it looked into. Origins, fixed tokens and counts only.
+        # dlz: what the last refused reading held, for the stop record: card field tokens per APPROVED origin (any
+        # other origin is the fixed word `other` and a count: a page chooses its origins, and values are in the page
+        # by now), or the discovery's own count of frames it looked into.
         prior.approval.pop("seen", None)
         while time.monotonic() < deadline:
             fresh = None
+            adopted = False
             try:
-                fresh = await self._inspect_payment("", (), prior.allowed_frames, bool(prior.unreviewed_origins),
-                                                    prior.cart, prior=prior)
-            except PaymentDestinationError as exc:
-                refused = {"payment_fields_unsupported": "incomplete",
-                           "payment_fields_ambiguous": "ambiguous"}.get(exc.error_type, "unverifiable")
-                prior.approval["seen"] = _seen_detail(exc.detail)
-            except PaymentPolicyError as exc:
-                refused = _reinspect_refusal(str(exc))
-            except Exception:  # health: allow BLE001 -- a page that cannot be read now may be read a moment later
-                refused = "unavailable"
-            if fresh is not None:
-                refused = _approval_mismatch(prior.approval, fresh) or ""
-                prior.approval["seen"] = {origin: sorted(tokens)
-                                          for origin, tokens in _approval_facts(fresh)["fields"].items()}
-                if not refused:
-                    # Still the same reading a moment later (a form caught mid-render is read again instead).
-                    await asyncio.sleep(_REINSPECT_SETTLE_SECONDS)
-                    if time.monotonic() >= deadline or not await self._payment_is_current(fresh):
-                        refused = "unsettled"  # changed again, or no time left to see that it did not
-                if not refused:
-                    refused = await self._remember_roles(fresh, frozenset(prior.approval["documents"])) or ""
-                if not refused:
-                    loaders = {f[0]: f[1] for f in fresh.tree}
-                    prior.approval["documents"] |= {(d.frame_id, loaders.get(d.frame_id)) for d in fresh.documents}
-                    prior.approval.pop("seen", None)
-                    # The fresh inspection owns the shared frame sessions from here; the earlier one's objects go.
-                    prior.child_sessions = {}
-                    prior.consumed = True
-                    await self._release_once(prior)
-                    return fresh, ""
-                fresh.consumed = True
-                fresh.child_sessions = {k: v for k, v in fresh.child_sessions.items()
-                                        if prior.child_sessions.get(k) != v}
-                await self._release_once(fresh)
+                try:
+                    fresh = await self._inspect_payment("", (), prior.allowed_frames, bool(prior.unreviewed_origins),
+                                                        prior.cart, prior=prior)
+                except PaymentDestinationError as exc:
+                    refused = {"payment_fields_unsupported": "incomplete",
+                               "payment_fields_ambiguous": "ambiguous"}.get(exc.error_type, "unverifiable")
+                    prior.approval["seen"] = _seen_detail(exc.detail, prior.approval)
+                except PaymentPolicyError as exc:
+                    refused = _reinspect_refusal(str(exc))
+                except Exception:  # health: allow BLE001 -- a page that cannot be read now may be read a moment later
+                    refused = "unavailable"
+                if fresh is not None:
+                    refused = _approval_mismatch(prior.approval, fresh) or ""
+                    prior.approval["seen"] = _seen_fields(prior.approval, fresh)
+                    if not refused:
+                        # Still the same reading a moment later (a form caught mid-render is read again instead).
+                        await asyncio.sleep(_REINSPECT_SETTLE_SECONDS)
+                        if time.monotonic() >= deadline or not await self._payment_is_current(fresh):
+                            refused = "unsettled"  # changed again, or no time left to see that it did not
+                    if not refused:
+                        refused = await self._remember_roles(fresh, frozenset(prior.approval["documents"])) or ""
+                    if not refused:
+                        loaders = {f[0]: f[1] for f in fresh.tree}
+                        prior.approval["documents"] |= {(d.frame_id, loaders.get(d.frame_id)) for d in fresh.documents}
+                        prior.approval["free"] = (prior.approval["free"] | _free_documents(fresh)) \
+                            - prior.approval["documents"]
+                        prior.approval.pop("seen", None)
+                        # The hand-over has no await in it: the fresh inspection owns the shared frame sessions from
+                        # here and a cancellation finds one owner. Only the earlier one's objects are left to go.
+                        prior.child_sessions = {}
+                        prior.consumed = True
+                        await self._release_once(prior)  # cancelled here: ``finally`` still releases ``fresh``
+                        adopted = True  # no await between this and the return: the caller has it from here
+                        return fresh, ""
+            finally:
+                if fresh is not None and not adopted:
+                    # Refused (or cancelled mid-way): release the fresh reading with only the sessions it attached
+                    # itself (by session, not by frame: a new child frame can share its parent's session).
+                    # After a hand-over that was cancelled in the release, ``prior.child_sessions`` is empty: all go.
+                    owned = set(prior.child_sessions.values())
+                    fresh.consumed = True
+                    fresh.child_sessions = {k: v for k, v in fresh.child_sessions.items() if v not in owned}
+                    await self._release_once(fresh)
             if refused in _REINSPECT_FINAL:
                 return None, refused
             await asyncio.sleep(_REINSPECT_POLL_SECONDS)
@@ -316,24 +331,68 @@ def _roles(controls: Any) -> list:
 
 def _approval_facts(i: Any) -> dict:
     """dlz (fill-auto): what the owner's approval binds, read off the inspection the approval card was built from:
-    the tab and its top document (frame, loader, URL, origin), the card field tokens each origin receives, the
-    unreviewed origins, the cart readings, and the card documents whose field roles are recorded so far."""
+    the tab and its top document (frame, loader, URL, origin), the card field tokens each origin receives, how many
+    card documents each origin has and at which paths, the unreviewed origins, the cart readings, the card documents
+    whose field roles are recorded so far (``documents``) and the admissible documents that held no card field
+    (``free``: a document that held none may not become card-bearing later)."""
     fields: dict = {}
+    counts: dict = {}
+    paths: dict = {}
+    by_id = {f[0]: f for f in i.tree}
     for d in i.documents:
         fields.setdefault(d.origin, set()).update(c.token for c in d.controls)
+        counts[d.origin] = counts.get(d.origin, 0) + 1
+        paths.setdefault(d.origin, set()).add(_path(by_id.get(d.frame_id)))
     loaders = {f[0]: f[1] for f in i.tree}
     return {"page": i.page_id, "top": i.tree[0] if i.tree else None,
             "fields": {origin: frozenset(tokens) for origin, tokens in fields.items()},
-            "unreviewed": frozenset(i.unreviewed_origins), "cart": (i.cart, i.cart_pins, tuple(i.page_match)),
-            "documents": {(d.frame_id, loaders.get(d.frame_id)) for d in i.documents}}
+            "counts": counts, "paths": {origin: frozenset(p) for origin, p in paths.items()},
+            "unreviewed": frozenset(i.unreviewed_origins), "cart": _cart_reading(i),
+            "documents": {(d.frame_id, loaders.get(d.frame_id)) for d in i.documents},
+            "free": _free_documents(i) - {(d.frame_id, loaders.get(d.frame_id)) for d in i.documents}}
+
+
+def _path(record: Any) -> str:
+    """The pathname of a frame record's URL: a provider re-mints its session query and fragment on each render, the
+    path is what a merchant could already have chosen before the approval."""
+    try:
+        return urlsplit(record[2]).path if record else ""
+    except (ValueError, IndexError, TypeError):
+        return ""
+
+
+def _free_documents(i: Any) -> frozenset:
+    """``(frame, loader)`` of each admissible document this inspection looked into and found without a card field."""
+    loaders = {f[0]: f[1] for f in i.tree}
+    return frozenset((fid, loaders.get(fid)) for fid in getattr(i, "free_frames", ()))
+
+
+def _cart_reading(i: Any) -> tuple:
+    """The cart readings an approval binds: the stated cart, the page-check state, and per witnessed place the union
+    of its documents' labelled totals and whether any was unclear. Places are merged as ``_page_match`` merges them:
+    a form re-shaped from two same-origin documents to one is the same reading."""
+    places: dict = {}
+    for place, raw in i.cart_pins:
+        try:
+            pin = json.loads(raw)
+            labelled, unclear = set(pin["labelled"]), bool(pin["unclear"])
+        except (ValueError, KeyError, TypeError):
+            labelled, unclear = {"?"}, True
+        seen = places.setdefault(place, [set(), False])
+        seen[0] |= labelled
+        seen[1] = seen[1] or unclear
+    return (i.cart, tuple(i.page_match),
+            tuple(sorted((place, tuple(sorted(map(str, v[0]))), v[1]) for place, v in places.items())))
 
 
 def _approval_mismatch(approval: dict, fresh: Any) -> str | None:
     """dlz (fill-auto): why a re-inspection is not the checkout the owner approved, or None. ``navigated``: another
     tab or top document (a reload or a changed URL counts); ``origin_changed``: a card field on an origin the approval
     did not name, or another unreviewed set; ``fields_changed``: an approved origin receives other card fields than
-    approved (fewer too: a form still rendering reads like that and is read again); ``cart_changed``: a page-check
-    reading differs."""
+    approved (fewer too: a form still rendering reads like that and is read again); ``role_changed``: a document that
+    held no card field when the approval was built holds one now (its controls had another role); ``documents_changed``:
+    an origin has more card documents than approved, or one at a path the approval did not show for that origin;
+    ``cart_changed``: a page-check reading differs."""
     now = _approval_facts(fresh)
     if now["page"] != approval["page"] or now["top"] is None or now["top"] != approval["top"]:
         return "navigated"
@@ -341,6 +400,11 @@ def _approval_mismatch(approval: dict, fresh: Any) -> str | None:
         return "origin_changed"
     if now["fields"] != approval["fields"] or now["unreviewed"] != approval["unreviewed"]:
         return "fields_changed"
+    if now["documents"] & approval["free"]:
+        return "role_changed"
+    if any(n > approval["counts"].get(origin, 0) or not now["paths"][origin] <= approval["paths"].get(origin, frozenset())
+           for origin, n in now["counts"].items()):
+        return "documents_changed"
     return None if now["cart"] == approval["cart"] else "cart_changed"
 
 
@@ -372,9 +436,21 @@ def _auto_result(result: dict, st: dict) -> dict:
     return out
 
 
-def _seen_detail(detail: Any) -> dict | None:
+def _seen_fields(approval: dict, fresh: Any) -> dict:
+    """What a refused reading held, for ``fill_reinspect.seen``: the card field tokens of each origin the approval
+    names; every other origin is only counted, as the fixed word ``other``."""
+    fields = _approval_facts(fresh)["fields"]
+    named = set(approval["fields"]) | set(approval["unreviewed"])
+    out: dict = {origin: sorted(tokens) for origin, tokens in fields.items() if origin in named}
+    if len(fields) > len(out):
+        out["other"] = len(fields) - len(out)
+    return out
+
+
+def _seen_detail(detail: Any, approval: dict) -> dict | None:
     """What a refused discovery reading reported (``PaymentDestinationError.detail``), for ``fill_reinspect.seen``:
-    its count of unreviewed frames looked into, or the card field tokens per origin. Nothing else passes."""
+    its count of unreviewed frames looked into, or the card field tokens per approved origin (other origins: only
+    ``other`` and their count). Nothing else passes."""
     if not isinstance(detail, dict):
         return None
     count = detail.get("unreviewed_frames_inspected")
@@ -383,5 +459,9 @@ def _seen_detail(detail: Any) -> dict | None:
     rows = detail.get("receiving_origins")
     if isinstance(rows, list) and all(isinstance(r, dict) and isinstance(r.get("origin"), str)
                                       and isinstance(r.get("fields"), list) for r in rows):
-        return {r["origin"]: sorted(str(t) for t in r["fields"]) for r in rows[:8]}
+        named = set(approval["fields"]) | set(approval["unreviewed"])
+        out = {r["origin"]: sorted(str(t) for t in r["fields"]) for r in rows[:8] if r["origin"] in named}
+        if len(rows) > len(out):
+            out["other"] = len(rows) - len(out)
+        return out
     return None

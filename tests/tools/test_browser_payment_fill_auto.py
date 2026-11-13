@@ -184,21 +184,30 @@ def test_the_unarmed_commit_never_takes_the_armed_path(tmp_path, monkeypatch):
 
 # -- What the approval binds --
 
-def _reading(fields, *, top=("top", "L", MERCHANT + "/pay", MERCHANT, ""), page="tab", unreviewed=(), cart=(), **more):
-    docs = tuple(PaymentDocument(f"f{n}", "s", f"o{n}", origin, _controls(*tokens))
-                 for n, (origin, tokens) in enumerate(fields))
-    tree = (top, *((d.frame_id, "L" + d.frame_id, d.origin + "/card", d.origin, "top") for d in docs))
+def _reading(fields, *, top=("top", "L", MERCHANT + "/pay", MERCHANT, ""), page="tab", unreviewed=(), cart=(),
+             free=(), **more):
+    """``fields``: ``(origin, tokens)`` or ``(origin, tokens, frame id)``; ``free``: ``(origin, frame id)`` of card-free
+    admissible documents."""
+    docs = tuple(PaymentDocument(f[2] if len(f) > 2 else f"f{n}", "s", f"o{n}", f[0], _controls(*f[1]))
+                 for n, f in enumerate(fields))
+    tree = (top, *((d.frame_id, "L" + d.frame_id, d.origin + "/card", d.origin, "top") for d in docs),
+            *((fid, "L" + fid, origin + "/promo", origin, "top") for origin, fid in free))
     return PaymentInspection(more.pop("operation", "op"), "s", page, MERCHANT, docs, tree, time.monotonic() + 60,
                              unreviewed_origins=tuple(unreviewed), cart_pins=tuple(cart), auto=True,
-                             approval_id="op", **more)
+                             approval_id="op", free_frames=tuple(fid for _o, fid in free), **more)
 
 
 _APPROVED = [(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"))]
 
 
+def _pin(labelled=(2266,), stated=1, unclear=False, state="matched"):
+    """One witnessed document's pin, as the supervisor stores it (``cart_pins``)."""
+    return json.dumps({"state": state, "labelled": list(labelled), "stated": stated, "unclear": unclear}, sort_keys=True)
+
+
 @pytest.mark.parametrize("change, refused", [
     ({}, None),
-    ({"fields": [(MERCHANT, ("cc-exp",)), (PSP, ("cc-number",)), (PSP, ("cc-csc",))]}, None),  # other frames, same origins
+    ({"fields": [(MERCHANT, ("cc-exp",)), (PSP, ("cc-number",)), (PSP, ("cc-csc",))]}, "documents_changed"),  # 1 -> 2 frames
     ({"top": ("top", "L2", MERCHANT + "/pay", MERCHANT, "")}, "navigated"),                    # reloaded
     ({"top": ("top", "L", MERCHANT + "/pay?step=2", MERCHANT, "")}, "navigated"),
     ({"page": "tab2"}, "navigated"),
@@ -207,11 +216,12 @@ _APPROVED = [(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"))]
     ({"fields": [(MERCHANT, ("cc-exp", "cc-csc")), (PSP, ("cc-number",))]}, "fields_changed"),  # a token moved origin
     ({"fields": [(PSP, ("cc-number", "cc-csc"))]}, "fields_changed"),                           # fewer: still rendering
     ({"fields": [(MERCHANT, ("cc-exp", "cc-name")), (PSP, ("cc-number", "cc-csc"))]}, "fields_changed"),
-    ({"cart": (("merchant page", '{"state": "ambiguous"}'),)}, "cart_changed"),
+    ({"cart": (("merchant page", _pin(labelled=[])),)}, "cart_changed"),
+    ({"cart": (("merchant page", _pin(labelled=[2266, 5])),)}, "cart_changed"),
 ])
 def test_a_re_inspection_must_show_the_checkout_the_owner_approved(change, refused):
-    approval = spa._approval_facts(_reading(_APPROVED, cart=(("merchant page", '{"state": "matched"}'),)))
-    fresh = _reading(**{"fields": _APPROVED, "cart": (("merchant page", '{"state": "matched"}'),), **change})
+    approval = spa._approval_facts(_reading(_APPROVED, cart=(("merchant page", _pin()),)))
+    fresh = _reading(**{"fields": _APPROVED, "cart": (("merchant page", _pin()),), **change})
     assert spa._approval_mismatch(approval, fresh) == refused
 
 
@@ -239,11 +249,11 @@ class _Loop(sp.PaymentSupervisionMixin):
         self.released.append((i.operation_id, dict(i.child_sessions)))
 
 
-def _loop(readings, monkeypatch, wait=5.0, **answers):
+def _loop(readings, monkeypatch, wait=5.0, prior_more=None, **answers):
     monkeypatch.setattr(spa, "_REINSPECT_POLL_SECONDS", 0)
     monkeypatch.setattr(spa, "_REINSPECT_SETTLE_SECONDS", 0)
     sup = _Loop(readings, **answers)
-    prior = _reading(_APPROVED, operation="prior", child_sessions={"f1": "shared"})
+    prior = _reading(_APPROVED, operation="prior", child_sessions={"f1": "shared"}, **(prior_more or {}))
     prior.approval = spa._approval_facts(prior)
     fresh, refused = asyncio.run(sup._reinspect(prior, time.monotonic() + wait, wait))
     return sup, prior, fresh, refused
@@ -349,3 +359,212 @@ def test_fill_payment_re_inspects_before_the_card_is_read_or_refuses(switch, arm
     assert out["error_type"] == expected and out["success"] is False and CARD["card_number"] not in json.dumps(out)
     assert calls == (["arm"] if switch else []) + (["reinspect"] if code else []) + ["discard"], calls
     assert out.get("fill_reinspect") == ({"count": 0, "repairs": 0, "refused": code} if code else None)
+
+
+# -- Round 2 (r1 review findings F1-F9) --
+
+_HOLDER = "https://john-q-public-4111.evil.example"  # a page-chosen origin that carries a (synthetic) holder name
+
+
+def test_a_refused_re_inspection_never_copies_a_page_chosen_origin_into_the_result_or_the_log(monkeypatch, caplog):
+    """F1 (Codex P1-1, peer P2-1): values are in the page when a repair re-inspects; the page chooses its origins."""
+    import logging
+
+    from tools import browser_vault_payment as bvp
+
+    sup, prior, fresh, refused = _loop([_fresh([(MERCHANT, ("cc-exp",)), (_HOLDER, ("cc-number", "cc-csc"))], "x"), None],
+                                       monkeypatch)
+    assert fresh is None and refused == "origin_changed"
+    assert prior.approval["seen"] == {MERCHANT: ["cc-exp"], "other": 1}
+    # the discovery pass reports its origins in the error's detail: same rule
+    detail = {"receiving_origins": [{"origin": PSP, "fields": ["cc-number"]}, {"origin": _HOLDER, "fields": ["cc-csc"]}]}
+    sup, prior, fresh, refused = _loop([PaymentDestinationError("payment_fields_ambiguous", "x", detail)], monkeypatch,
+                                       wait=0.05)
+    assert prior.approval["seen"] == {PSP: ["cc-number"], "other": 1}
+    st = {"reinspections": 0, "repairs": 0, "refused": "origin_changed", "wrote": 3, "seen": prior.approval["seen"]}
+    out = spa._auto_result({"success": False, "error_type": "payment_page_changed"}, st)
+    with caplog.at_level(logging.INFO, logger="tools.browser_vault_payment"):
+        bvp._log_commit(out)
+    assert "evil" not in json.dumps(out) + caplog.text and "john" not in json.dumps(out) + caplog.text
+    assert "other 1" in caplog.text and PSP in caplog.text
+
+
+def test_a_rejected_re_inspection_releases_only_the_sessions_it_attached_by_session_not_by_frame(monkeypatch):
+    """F6 (Codex P2-6, peer P2-4, GLM P3-1): a new child frame shares its parent's session; the frame key is new, the
+    session is the earlier inspection's and must stay attached."""
+    shared = lambda prior: _reading(_APPROVED, operation="x", approval=prior.approval,   # noqa: E731
+                                    child_sessions={"f1": "shared", "child": "shared", "mine": "own"}, page="other")
+    sup, prior, fresh, refused = _loop([shared, None], monkeypatch)
+    assert fresh is None and refused == "navigated"
+    assert sup.released == [("x", {"mine": "own"})] and prior.child_sessions == {"f1": "shared"}
+
+
+def test_inspect_payment_cleanup_keeps_the_sessions_the_earlier_inspection_uses(monkeypatch):
+    """F6, the other place: ``_inspect_payment(prior=)`` failing midway detaches only sessions it attached itself."""
+    import threading
+
+    detached = []
+
+    class Supervisor(sp.PaymentSupervisionMixin):
+        _state_lock, _page_session_id, _active = threading.Lock(), "page", True
+
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            return {"result": {"targetInfo": {}}}
+
+        async def _payment_tree(self, sid, child_sessions):
+            child_sessions["child"] = "shared"  # a same-process child frame maps to its parent's session
+            child_sessions["mine"] = "own"
+            return (("top", "L", MERCHANT + "/pay", MERCHANT, ""),)
+
+        async def _inspect_frames(self, *args):
+            raise PaymentPolicyError("Missing card expiry fields")
+
+        async def _release_all(self, objects, sessions):
+            detached.extend(sessions.values())
+
+    prior = _reading(_APPROVED, child_sessions={"f1": "shared"}, owner=None)
+    sup = Supervisor()
+    prior.owner, prior.page_session = sup, "page"
+    with pytest.raises(PaymentPolicyError):
+        asyncio.run(sup._inspect_payment("", (), (), False, None, prior=prior))
+    assert detached == ["own"]
+
+
+def test_a_cancelled_re_inspection_releases_the_fresh_reading(monkeypatch):
+    """F5 (Codex P2-5, peer P3-1, GLM P3-2): a reading that was read but not yet handed over is not leaked when the
+    commit is cancelled (its timeout) while it settles."""
+    monkeypatch.setattr(spa, "_REINSPECT_POLL_SECONDS", 0)
+    monkeypatch.setattr(spa, "_REINSPECT_SETTLE_SECONDS", 30)  # cancelled in the settle wait
+    sup = _Loop([_fresh(_APPROVED, "x")])
+    prior = _reading(_APPROVED, operation="prior", child_sessions={"f1": "shared"})
+    prior.approval = spa._approval_facts(prior)
+
+    async def main():
+        task = asyncio.ensure_future(sup._reinspect(prior, time.monotonic() + 60, 60))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.05)
+
+    asyncio.run(main())
+    assert sup.released == [("x", {"new": "x"})] and not prior.consumed and prior.child_sessions == {"f1": "shared"}
+
+
+def test_a_commit_cancelled_while_the_earlier_reading_is_released_still_releases_the_fresh_one(monkeypatch):
+    """F5: the hand-over of the shared sessions is one step; a cancellation in the earlier reading's release leaves
+    the fresh reading released (all its sessions: the earlier one no longer uses any)."""
+    monkeypatch.setattr(spa, "_REINSPECT_POLL_SECONDS", 0)
+    monkeypatch.setattr(spa, "_REINSPECT_SETTLE_SECONDS", 0)
+    sup = _Loop([_fresh(_APPROVED, "x")])
+    prior = _reading(_APPROVED, operation="prior", child_sessions={"f1": "shared"})
+    prior.approval = spa._approval_facts(prior)
+    slow = sup._release_payment_documents
+
+    async def release(i):
+        if i.operation_id == "prior":
+            await asyncio.sleep(30)  # the earlier reading's release is slow
+        await slow(i)
+
+    sup._release_payment_documents = release
+
+    async def main():
+        task = asyncio.ensure_future(sup._reinspect(prior, time.monotonic() + 60, 60))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.1)
+
+    asyncio.run(main())
+    assert sup.released == [("x", {"f1": "shared", "new": "x"})]
+
+
+def test_cart_changed_mid_render_is_read_again_and_adopted_only_on_an_equal_cart(monkeypatch):
+    """F9 (peer P3-3): a Payrails reading caught mid-render lacks its amount text; it is read again."""
+    pins = (("merchant page", _pin()), ("payment form", _pin()))
+    mid_render = _fresh(_APPROVED, "mid", cart=(("merchant page", _pin()), ("payment form", _pin(labelled=[]))))
+    sup, prior, fresh, refused = _loop([mid_render, _fresh(_APPROVED, "ok", cart=pins)], monkeypatch,
+                                       prior_more={"cart": pins})
+    assert refused == "" and fresh.operation_id == "ok"
+    sup, prior, fresh, refused = _loop([mid_render], monkeypatch, wait=0.05, prior_more={"cart": pins})
+    assert fresh is None and refused == "cart_changed" and not prior.consumed  # still not the approved cart: no adoption
+
+
+def test_two_same_origin_documents_re_shaped_into_one_are_the_same_cart_reading():
+    """F9 (GLM P3-3): the witnessed place is the same; only the number of documents under it changed."""
+    two = _reading([(MERCHANT, ("cc-exp",)), (PSP, ("cc-number",)), (PSP, ("cc-csc",))],
+                   cart=(("merchant page", _pin()), ("payment form", _pin()), ("payment form", _pin(labelled=[], stated=0))))
+    one = _reading([(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"))],
+                   cart=(("merchant page", _pin()), ("payment form", _pin())))
+    assert spa._cart_reading(two) == spa._cart_reading(one)
+    assert spa._cart_reading(one) != spa._cart_reading(_reading(_APPROVED, cart=(("merchant page", _pin(labelled=[])),)))
+
+
+@pytest.mark.parametrize("fresh_url, refused", [
+    (PSP + "/card?mid=ATTACKER&txn=B#frag", None),             # query and fragment are re-minted on each render
+    (PSP + "/other", "documents_changed"),                      # another path on an approved origin
+    (PSP + "/card/../checkout", "documents_changed"),
+])
+def test_a_card_document_must_be_at_a_path_the_approval_showed(fresh_url, refused):
+    """F8 (peer P2-2): the approval binds origin and path of each card document, not its session query."""
+    approval = spa._approval_facts(_reading(_APPROVED))
+    fresh = _reading(_APPROVED)
+    tree = tuple((f[0], f[1], fresh_url, *f[3:]) if f[3] == PSP else f for f in fresh.tree)
+    assert spa._approval_mismatch(approval, replace(fresh, tree=tree)) == refused
+
+
+def test_a_re_inspection_may_not_have_more_card_documents_than_approved_on_an_origin():
+    approval = spa._approval_facts(_reading([(MERCHANT, ("cc-exp",)), (PSP, ("cc-number",), "a"), (PSP, ("cc-csc",), "b")]))
+    same_count = _reading([(MERCHANT, ("cc-exp",)), (PSP, ("cc-number",), "c"), (PSP, ("cc-csc",), "d")])
+    fewer = _reading([(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"), "c")])
+    assert [spa._approval_mismatch(approval, r) for r in (same_count, fewer)] == [None, None]
+    three = _reading([(MERCHANT, ("cc-exp",)), (PSP, ("cc-number",), "c"), (PSP, ("cc-csc",), "d"), (PSP, ("cc-csc",), "e")])
+    assert spa._approval_mismatch(approval, three) == "documents_changed"
+
+
+def test_a_document_that_held_no_card_field_may_not_become_card_bearing():
+    """F2 (Codex P1-2, peer P3-4): the card form's frame goes away and a sibling's promo/address controls are
+    re-labelled as the card fields; the sibling never had a role record as a card document."""
+    approved = _reading([(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"), "a")], free=[(PSP, "b")])
+    approval = spa._approval_facts(approved)
+    assert approval["free"] == {("b", "Lb")} and approval["documents"] == {("a", "La"), ("f0", "Lf0")}
+    reclassified = _reading([(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"), "b")])
+    assert spa._approval_mismatch(approval, reclassified) == "role_changed"
+    brand_new = _reading([(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"), "c")])
+    assert spa._approval_mismatch(approval, brand_new) is None  # a new document inside the same binding
+    still = _reading([(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"), "a")], free=[(PSP, "b")])
+    assert spa._approval_mismatch(approval, still) is None
+
+
+def test_an_adopted_reading_extends_the_free_documents(monkeypatch):
+    """A document that was free in an adopted reading may not become card-bearing in the next one either."""
+    sup, prior, fresh, refused = _loop([lambda p: _reading(_APPROVED, operation="ok", approval=p.approval,
+                                                          free=[(PSP, "fX")])], monkeypatch)
+    assert refused == "" and prior.approval["free"] == {("fX", "LfX")}
+
+
+def test_the_reviewed_and_the_discovery_pass_both_name_the_card_free_documents():
+    """F2: the inspection records the frame of every admissible document it found without a card field."""
+    rows = {"o-a": [{"index": 0, "autocomplete": "cc-number", "name": "", "label": "", "type": "text", "formIndex": None,
+                     "maxLength": None}], "o-b": [], "o-c": [], "o-top": []}
+
+    class Supervisor(sp.PaymentSupervisionMixin):
+        async def _frame_inspectable(self, record, *args):
+            return "reviewed" if record[0] != "skipped" else ""
+
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if method == "Page.createIsolatedWorld":
+                return {"result": {"executionContextId": params["frameId"]}}
+            if method == "Runtime.evaluate":
+                return {"result": {"result": {"objectId": "o-" + params["contextId"]}}}
+            return {"result": {"result": {"value": rows[params["objectId"]]}}}
+
+        async def _release_payment_object(self, sid, obj):
+            pass
+
+    tree = tuple((fid, "L" + fid, MERCHANT + "/x", MERCHANT, "" if fid == "top" else "top")
+                 for fid in ("top", "a", "b", "skipped", "c"))
+    found = {"candidates": [], "anchors": {}, "absence": [], "witnesses": [], "owners": {}, "pending": [], "free": []}
+    asyncio.run(Supervisor()._inspect_frames(tree, MERCHANT, (), False, "s", {}, "op", found))
+    assert [c[0] for c in found["candidates"]] == ["a"] and found["free"] == ["top", "b", "c"]  # not the skipped one

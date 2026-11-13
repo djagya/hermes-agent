@@ -135,6 +135,10 @@ class PaymentInspection:
     # dlz (Codex B r1 #2): their frame ids. With the card chains these are the frames bound by pinned objects; any
     # other admissible frame on an approved origin, new or present but hidden at inspection, must stay unexposed.
     absence_frames: tuple = ()
+    # dlz (fill-auto): the frame ids of every admissible document this inspection looked into and found without a card
+    # field (the reviewed pass releases them at once, discovery keeps them as absence witnesses): the armed fill's
+    # approval records them, and such a document may not become card-bearing in a re-inspection.
+    free_frames: tuple = ()
     # dlz (Codex B r1, switch/write race): a callable answering whether the destination policy still holds (set by
     # fill_payment for an unreviewed fill); re-read between documents and on every paced resume.
     policy_check: Any = field(default=None, repr=False, compare=False)
@@ -585,7 +589,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         world = operation if prior is None else prior.approval_id
         # dlz: what this inspection pins; released on any refusal below.
         # dlz (Codex B r3 #4): "pending" holds each closure from the moment it exists until it is classified.
-        found = {"candidates": [], "anchors": {}, "absence": [], "witnesses": [], "owners": {}, "pending": []}
+        found = {"candidates": [], "anchors": {}, "absence": [], "witnesses": [], "owners": {}, "pending": [], "free": []}
         try:
             tree = await self._payment_tree(sid, child_sessions)
             merchant = https_origin(tree[0][3])
@@ -631,6 +635,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 allowed_frames=tuple(allowed_frames),
                 absence=tuple((fsid, obj) for fsid, obj, _origin, _fid in absence),
                 absence_frames=tuple(fid for _fsid, _obj, _origin, fid in absence),
+                free_frames=tuple(found["free"]),
                 approval_id=world,
             )
             if prior is not None:
@@ -648,8 +653,9 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             # dlz (Codex B r3 #4): one release pass of everything pinned so far, as its own task: a cancellation
             # (the caller's timeout) cannot cut it short, and is re-raised once the pass is under way.
             # dlz (fill-auto): a re-inspection shares the earlier inspection's frame sessions; only its own go.
-            own = child_sessions if prior is None else {
-                k: v for k, v in child_sessions.items() if prior.child_sessions.get(k) != v}
+            # By session, not by frame: a new child frame can share its parent frame's session.
+            held = set() if prior is None else set(prior.child_sessions.values())
+            own = {k: v for k, v in child_sessions.items() if v not in held}
             cleanup = asyncio.ensure_future(self._release_found(found, own))
             try:
                 await asyncio.shield(cleanup)
@@ -809,9 +815,11 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 else:
                     # dlz (B4): a card-free document; it may become an absence witness.
                     found["absence"].append((fsid, obj, frame_origin, fid))
+                    found["free"].append(fid)
             else:
                 await self._release_payment_object(fsid, obj)
                 found["pending"].remove((fsid, obj))
+                found["free"].append(fid)
         return unreviewed_frames
 
     async def _bind_amount_witnesses(self, inspection: PaymentInspection, cart: tuple, witnesses: list) -> None:
