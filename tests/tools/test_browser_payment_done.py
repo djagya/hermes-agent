@@ -663,6 +663,19 @@ def test_only_the_owner_approved_total_is_shown_in_a_dialog():
     assert "122.66" not in done._dialog_text(text, _paid([CHECKOUT]))  # another slot's payment: masked
 
 
+def test_a_second_record_of_the_same_tab_keeps_the_approved_total():
+    """11-13 (fill-auto, Codex P3-7): an armed fill records each reading it continues on; the merge of the document
+    history must not drop the total the owner approved, or the dialog masks it."""
+    sup = _paid([CHECKOUT])
+    done.record_approved_amount(sup, "TAB", "122.66", "EUR")
+    done.record_payment(sup, SimpleNamespace(page_id="TAB", merchant_origin=SHOP, tree=CHECKOUT,
+                                             documents=(SimpleNamespace(frame_id="CARD2", origin=STRIPE),),
+                                             unreviewed_origins=()))
+    payment = done._PAYMENTS[sup]["TAB"]
+    assert (payment.amount, payment.currency) == ("122.66", "EUR") and len(payment.documents) == 2
+    assert "122.66 EUR" in done._dialog_text("Place order for 122.66 EUR?", sup)
+
+
 def test_other_amounts_stay_masked_and_only_the_approved_total_shows():
     # r5 P3: "9.99", "12.34" and "9,99" carried no 3+ digit run and passed verbatim,
     # while the shipped schema text promises every amount but the total stays masked
