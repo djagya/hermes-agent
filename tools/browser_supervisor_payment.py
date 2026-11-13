@@ -1191,12 +1191,13 @@ class PaymentSupervisionMixin:
                 return "role_unproven"
         return None
 
-    def reinspect_payment(self, prior: PaymentInspection, wait: float = _REINSPECT_WAIT_SECONDS) -> tuple:
+    def reinspect_payment(self, prior: PaymentInspection, wait: float | None = None) -> tuple:
         """dlz (fill-auto): ``(fresh inspection, "")`` that continues ``prior``'s approval on the page as it is now
         (``prior`` is released), or ``(None, code)`` when no complete card form matching the approval was found
         within ``wait`` seconds (``prior`` is then left as it was, for the caller to discard)."""
         from tools.browser_supervisor import _schedule
 
+        wait = _REINSPECT_WAIT_SECONDS if wait is None else wait
         stop = min(prior.expires_at, time.monotonic() + wait)
         return _schedule(self._reinspect(prior, stop, wait), self._loop, timeout=wait + 30)
 
