@@ -130,7 +130,8 @@ async def test_payment_card_goes_to_the_owners_dm_and_only_the_owner_answers():
     adapter = _adapter()
     entry = _pending(exact_request=True, approver=OWNER)
     rid = entry.data["request_id"]
-    result = await adapter.send_payment_approval(chat_id=str(OWNER_ID), facts=_facts(), request_id=rid,
+    stated = _facts(cart=StatedCart((CartItem("Ticket", 1),), "12.50", "CHF"), page_match=PageMatch("matched", "https://shop.example"))
+    result = await adapter.send_payment_approval(chat_id=str(OWNER_ID), facts=stated, request_id=rid,
                                                  session_key=SESSION, approver=OWNER)
     assert result.success
     kwargs = adapter._bot.send_message.call_args.kwargs
@@ -177,11 +178,12 @@ def test_rendered_card_has_every_fact_verbatim_or_raises(state):
     plain = html.unescape(text)
     cart_facts = () if state == "not_checked" else ("1234.50 EUR", "stated by Sera", *(i.description for i in items))
     # One tap = the fill and one Pay press, said in plain words with the stated total and the merchant.
-    scope = (f"Approve: Sera fills the card and presses Pay once at {origins[0]}. No total was stated"
+    scope = (f"Approve: Sera fills the card only, at {origins[0]}. No total was stated"
              if state == "not_checked" else
              f"Approve: Sera fills the card and presses Pay once for 1234.50 EUR at {origins[0]}.")
     for fact in (origins[0], origins[1], "UNREVIEWED", "cc-number, cc-csc, cc-exp", "Test card",
-                 PAGE_MATCH_LINES[state], "Expires in 97 s", "c" * 32, scope, "one Pay press",
+                 PAGE_MATCH_LINES[state], "Expires in 97 s", "c" * 32, scope,
+                 "one Pay press" if state != "not_checked" else "Pay needs your go in chat",
                  "cannot verify what will be charged", *cart_facts):
         assert fact in plain, fact
     assert "3-D Secure" not in plain and "3DS" not in plain
@@ -297,6 +299,26 @@ def _topic_gone_bot(adapter):
             raise BadRequest("Bad Request: message thread not found")
         return posted(**kw)
     adapter._bot.send_message = AsyncMock(side_effect=send)
+
+
+@pytest.mark.asyncio
+async def test_a_card_without_a_stated_total_is_fill_only_in_button_and_toast():
+    """Codex r1 P1-2 / peer P2: no stated total means Approve does not cover Pay: button, card and toast say so."""
+    from tools.payment_consent_prompt import APPROVE_LABEL_FILL_ONLY
+    adapter = _adapter()
+    entry = _pending(exact_request=True, approver=OWNER)
+    rid = entry.data["request_id"]
+    result = await adapter.send_payment_approval(chat_id=str(OWNER_ID), facts=_facts(), request_id=rid,
+                                                 session_key=SESSION, approver=OWNER)
+    kwargs = adapter._bot.send_message.call_args.kwargs
+    buttons = [b for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert [b.text for b in buttons] == [APPROVE_LABEL_FILL_ONLY, DENY_LABEL] and "Pay" not in APPROVE_LABEL_FILL_ONLY
+    assert "does not cover pressing Pay" in kwargs["text"] and "presses Pay once" not in kwargs["text"]
+    coro, query = _tap(adapter, buttons[0].callback_data, chat_id=OWNER_ID, message_id=int(result.message_id))
+    await coro
+    assert entry.result == "once"
+    toast = query.answer.call_args.kwargs["text"]
+    assert "Pay needs your go in chat" in toast and "presses Pay once" not in toast
 
 
 @pytest.mark.asyncio

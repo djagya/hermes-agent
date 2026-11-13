@@ -7,8 +7,9 @@ the owner's private chat; ``gateway.payment_approval``). Rendering shows every
 mandatory fact or raises :class:`PromptIncomplete`: it never truncates, and there is no plain-text
 ``/approve`` fallback. Only the owner's own Telegram button approves (``approvals.payment_approver``,
 checked in ``tools.approval.resolve_gateway_approval``); every other surface can only deny, and another
-group member's tap on the card changes nothing. The owner's Approve is also the go for one Pay press of
-that checkout (owner decision 2026-11-13): the card says so, and nothing else authorizes a second press.
+group member's tap on the card changes nothing. When the card states the cart total, the owner's Approve is
+also the go for one Pay press of that checkout (owner decision 2026-11-13): the card says so, and nothing else
+authorizes a second press. A card without a stated total is fill-only: Pay needs the owner's go in chat.
 
 No card value ever enters these facts: they hold the card's label, origins, field names and the
 cart as Sera stated it.
@@ -46,6 +47,8 @@ _CURRENCY_RE = re.compile(r"[A-Z]{3}")
 _UNSAFE_TEXT_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff`]")
 
 APPROVE_LABEL = "Approve: fill + Pay once"
+# No total was stated: the card is fill-only, Pay needs the owner's go in chat.
+APPROVE_LABEL_FILL_ONLY = "Approve: fill only"
 DENY_LABEL = "Deny"
 # The session's chat, when it is someone else's private chat (the card went to the owner's own chat).
 GROUP_NOTICE = "Card-fill approval sent to the owner privately."
@@ -230,10 +233,11 @@ def _check_origins(facts: PaymentPromptFacts) -> None:
 
 
 def scope_line(facts: PaymentPromptFacts) -> str:
-    """What one Approve tap does, in plain words: the fill and exactly one Pay press of this checkout."""
+    """What one Approve tap does, in plain words: the fill and exactly one Pay press of this checkout, or (no
+    stated total) the fill only."""
     if facts.cart is None:
-        return (f"Approve: Sera fills the card and presses Pay once at {facts.merchant_origin}. "
-                "No total was stated: check the amount before approving.")
+        return (f"Approve: Sera fills the card only, at {facts.merchant_origin}. No total was stated, so this "
+                "does not cover pressing Pay: Pay needs your go in chat.")
     return (f"Approve: Sera fills the card and presses Pay once for {facts.cart.total} {facts.cart.currency} "
             f"at {facts.merchant_origin}.")
 
@@ -259,9 +263,10 @@ def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
         lines.append(f"Total (stated by Sera): {bold(esc(facts.cart.total + ' ' + facts.cart.currency))}")
         where = f" Checked on {esc(facts.page_match.where)}." if facts.page_match.where else ""
         lines.append(esc(PAGE_MATCH_LINES[facts.page_match.state]) + where)
-    lines += ["",
-              "One tap covers one fill and one Pay press for this checkout; any other payment needs a new "
-              f"approval. Expires in {facts.expires_in_s} s.",
+    covers = ("One tap covers one fill and one Pay press for this checkout; any other payment needs a new approval."
+              if facts.cart is not None else
+              "One tap covers one fill only: pressing Pay needs your go in chat. Any other payment needs a new approval.")
+    lines += ["", f"{covers} Expires in {facts.expires_in_s} s.",
               "Hermes cannot verify what will be charged. HTTPS does not mean the seller is legitimate.",
               f"Ref: {code(facts.ref)}"]
     return lines
