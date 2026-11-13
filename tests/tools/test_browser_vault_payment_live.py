@@ -1195,7 +1195,7 @@ def test_paypal_guest_card_form_inside_buttons_fills_once(payment_browser, tmp_p
     assert sup.evaluate_runtime("!!window.submitted")["result"] is False
 
 
-def _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=None):
+def _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=None, auto=True):
     """The managed-mode seams (lease route, capture guard, A9 claim) faked around a real Chromium page; the
     unreviewed-destination switch on. Returns (first result, second result, consent kwargs, frame state)."""
     from agent.vault_store import VaultStore
@@ -1214,6 +1214,7 @@ def _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=None):
     monkeypatch.setattr("tools.browser_control_route.set_capture_guard", lambda lease, token: (True, ""))
     monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface", lambda s, i: None)
     monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live"))
+    monkeypatch.setattr("tools.browser_vault_payment.payment_fill_auto_enabled", lambda: auto)
     asked = []
 
     def consent(message, description, **kwargs):
@@ -1273,7 +1274,9 @@ def test_kps_like_unreviewed_form_fills_once_after_owner_approval(payment_browse
 
 def test_kps_like_form_navigated_during_consent_writes_nothing(payment_browser, tmp_path, monkeypatch):
     """v1 §9 test 8: the approved iframe navigates while the owner's card is open: payment_page_changed, nothing
-    written anywhere."""
+    written anywhere. dlz (11-13): this is the fill with vault.payment_fill_auto off; armed, a frame loaded again on
+    the approved origin is inspected again and filled (test_fill_auto_unreviewed_form_re_rendered_during_the_approval,
+    variant reload)."""
     from tools.browser_supervisor import _schedule
 
     def swap(sup, origins):
@@ -1290,7 +1293,7 @@ def test_kps_like_form_navigated_during_consent_writes_nothing(payment_browser, 
 
         wait_until(navigated, what="the approved iframe navigated")
 
-    _first, raw, _asked, state, _sup = _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=swap)
+    _first, raw, _asked, state, _sup = _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=swap, auto=False)
     out = json.loads(raw)
     assert out["error_type"] == "payment_page_changed", out
     assert all(v in ("", "01", "2026") for values, _seen in state.values() for v in values), state
@@ -1341,6 +1344,7 @@ def test_datatrans_shaped_re_render_is_re_pinned_inside_one_approval(payment_bro
         replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
     monkeypatch.setattr("agent.vault_payment_policy.PAYMENT_PSP_ORIGINS", (origins["psp"],))
     monkeypatch.setattr("tools.browser_vault_payment.payment_repin_enabled", lambda: True)
+    monkeypatch.setattr("tools.browser_vault_payment.payment_fill_auto_enabled", lambda: False)  # re-pin needs it off
     prefix = "/dtx-" if layout == "split" else "/dtx1-"
     full = {"exp": "07/35", "num": CARD["card_number"], "cvv": CARD["cvc"]}
 
@@ -1607,7 +1611,10 @@ def test_fill_auto_continues_on_a_re_mounted_field_and_keeps_its_stops(payment_b
         assert out["error_type"] == "payment_fields_changed" and out["partially_filled"] is True, (variant, out)
         assert out["filled_fields"] == 1 and out["fill_reinspect"] == {"count": 0, "repairs": 0, "refused": refused}, \
             (variant, out)
-        assert states == {"num": "empty", "exp": "held", "c3": "empty", "c4": "empty"}, (variant, states)
+        # The one field written before the change keeps its value; the card number (last) and the promo field
+        # never get one (relabel_swap: the CVC went into its field before that field's label became the promo's).
+        assert sorted(states.values()) == ["empty", "empty", "empty", "held"], (variant, states)
+        assert states["num"] == "empty" and states["c4"] == "empty", (variant, states)
         assert sum(writes.values()) == 1 and "re-inspection" in caplog.text, (variant, writes)
 
 
@@ -1676,6 +1683,7 @@ def test_fill_auto_unreviewed_form_re_rendered_during_the_approval(payment_brows
     assert out["success"] and out["filled_fields"] == 3 and out["destination_reviewed"] is False, out
     assert states == {"num": "held", "exp": "held", "c3": "held"}, states
     assert writes == {"num": 1, "exp": 1, "c3": 1} and "re-inspected after the approval" in caplog.text, writes
+    assert out["fill_reinspect"] == {"count": 1, "repairs": 0}, out  # the one after the approval; none under the fill
 
 
 # What the armed fill does with each Datatrans-shaped re-render (the fixtures of the re-pin tests above): filled, with
@@ -1719,4 +1727,5 @@ def test_fill_auto_datatrans_shaped_re_renders(payment_browser, tmp_path, monkey
         assert not out["success"] and out["fill_reinspect"]["refused"] == detail, (variant, out)
         assert out["fill_reinspect"]["count"] == 0 and out["partially_filled"] is True, (variant, out)
         held = sorted(k for k, v in states.items() if v == "held")
-        assert len(held) == 1 and "other" not in states.values() and states["num"] == "empty", (variant, states)
+        assert len(held) == 1 and "other" not in states.values(), (variant, states)
+        assert states.get("num", "empty") == "empty" and states.get("name", "empty") in ("empty", "held"), (variant, states)

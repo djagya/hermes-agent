@@ -819,13 +819,14 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
             if refused:
                 return json.dumps(refused)
+            refreshed = 0
             if auto and not supervisor.payment_is_current(inspected):
                 # dlz (fill-auto): the form re-rendered while the approval was open: inspected again in full, and
                 # continued only on a reading that matches what the approval card showed. Before any card byte.
                 fresh, code = supervisor.reinspect_payment(inspected)
                 if fresh is None:
                     return json.dumps(_reinspect_stop(code))
-                inspected = fresh
+                inspected, refreshed = fresh, 1
                 logger.info("card fill: the checkout was re-inspected after the approval (form re-rendered)")
             refused = _page_refusal(supervisor, inspected, unreviewed, policy)
             if refused:
@@ -886,6 +887,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 window.committing()  # from here a card value may be in the page: only control's unlock releases it
             if auto and getattr(inspected, "auto", False) is True:
                 result = _auto_commit(vault, supervisor, inspected, fills, strict, secret)
+                if refreshed:  # the re-inspection after the approval counts with those under the fill
+                    again = result.setdefault("fill_reinspect", {"count": 0, "repairs": 0})
+                    again["count"] = again.get("count", 0) + refreshed
             else:
                 result = supervisor.commit_payment(inspected, fills, strict=strict, **_repin_argument(unreviewed))
             _log_commit(result)
