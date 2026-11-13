@@ -187,14 +187,14 @@ _PAGE_CHANGED = (
     "approval prompt."
 )
 _CONSENT_EXPIRED = (
-    "The approval arrived (or the fill reached the page) after the 120 s inspection window closed, so no "
+    "The approval arrived (or the fill reached the page) after the 5-minute inspection window closed, so no "
     "card field was written and nothing was submitted. Ask the user again: call fill once more for a new "
     "prompt and approve it in time."
 )
 
 
 _CONSENT_EXPIRED_PARTIAL = (
-    "The 120 s inspection window closed part-way through the fill: some card fields were written, the rest "
+    "The 5-minute inspection window closed part-way through the fill: some card fields were written, the rest "
     "were not. " + _SUBMITTED_NOTHING + " Do not submit the checkout and do not retry; tell the user. Another "
     "fill needs a new approval."
 )

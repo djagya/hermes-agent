@@ -89,6 +89,8 @@ _COVERAGE_REFUSALS = frozenset({
 _SETTLE_SECONDS = 2.0
 # dlz: commit_payment's whole budget; no write lands in a renderer after it (see _renderer_deadline_ms).
 _COMMIT_BUDGET_SECONDS = 20.0
+# dlz: one inspection's life, and so the owner's approval window (owner 2026-11-13: 5 min, was 120 s).
+INSPECTION_WINDOW_S = 300
 _RETENTION_STATES = frozenset({"held", "empty", "changed", "replaced"})
 # Card fields a saved card may lack: left empty for the user instead of refusing the whole fill.
 OPTIONAL_CARD_TOKENS = frozenset({"cc-name", "postal-code"})
@@ -609,7 +611,7 @@ class PaymentSupervisionMixin:
                 merchant,
                 documents,
                 tree,
-                time.monotonic() + 120,
+                time.monotonic() + INSPECTION_WINDOW_S,
                 owner=self,
                 child_sessions=child_sessions,
                 frame_owners=found["owners"],
