@@ -21,7 +21,7 @@ import pytest
 
 # Module level on purpose (see test_approval_delivery_observability): gateway.run's import side effects
 # must happen at collection time, outside the per-test home-I/O guard.
-import gateway.run  # noqa: F401
+import gateway.run
 from gateway import payment_approval
 from gateway.config import PlatformConfig
 from tools import approval
