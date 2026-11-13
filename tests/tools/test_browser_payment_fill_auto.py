@@ -18,6 +18,7 @@ from agent.vault_payment_policy import PaymentDestinationError, PaymentPolicyErr
 from tests.tools.test_browser_payment_repin import (MERCHANT, PSP, _SCENARIOS, _SYNTHETIC, _ClosureSupervisor,
                                                     _controls, _NodeClosure)
 from tools import browser_supervisor_payment as sp
+from tools import browser_supervisor_payment_auto as spa
 from tools.browser_supervisor_payment import PaymentDocument, PaymentInspection
 
 _FIELDS = """
@@ -67,7 +68,7 @@ class _AutoSupervisor(_ClosureSupervisor):
         document = PaymentDocument(d.frame_id, d.frame_session, d.object_id, d.origin,
                                    sp._card_controls(self.js.call("describe")), clock_anchor=time.monotonic())
         fresh = replace(prior, documents=(document,), consumed=False, release_task=None)
-        refused = sp._approval_mismatch(prior.approval, fresh) \
+        refused = spa._approval_mismatch(prior.approval, fresh) \
             or await self._remember_roles(fresh, frozenset(prior.approval["documents"]))
         return (None, refused) if refused else (fresh, "")
 
@@ -206,9 +207,9 @@ _APPROVED = [(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"))]
     ({"cart": (("merchant page", '{"state": "ambiguous"}'),)}, "cart_changed"),
 ])
 def test_a_re_inspection_must_show_the_checkout_the_owner_approved(change, refused):
-    approval = sp._approval_facts(_reading(_APPROVED, cart=(("merchant page", '{"state": "matched"}'),)))
+    approval = spa._approval_facts(_reading(_APPROVED, cart=(("merchant page", '{"state": "matched"}'),)))
     fresh = _reading(**{"fields": _APPROVED, "cart": (("merchant page", '{"state": "matched"}'),), **change})
-    assert sp._approval_mismatch(approval, fresh) == refused
+    assert spa._approval_mismatch(approval, fresh) == refused
 
 
 class _Loop(sp.PaymentSupervisionMixin):
@@ -236,11 +237,11 @@ class _Loop(sp.PaymentSupervisionMixin):
 
 
 def _loop(readings, monkeypatch, wait=5.0, **answers):
-    monkeypatch.setattr(sp, "_REINSPECT_POLL_SECONDS", 0)
-    monkeypatch.setattr(sp, "_REINSPECT_SETTLE_SECONDS", 0)
+    monkeypatch.setattr(spa, "_REINSPECT_POLL_SECONDS", 0)
+    monkeypatch.setattr(spa, "_REINSPECT_SETTLE_SECONDS", 0)
     sup = _Loop(readings, **answers)
     prior = _reading(_APPROVED, operation="prior", child_sessions={"f1": "shared"})
-    prior.approval = sp._approval_facts(prior)
+    prior.approval = spa._approval_facts(prior)
     fresh, refused = asyncio.run(sup._reinspect(prior, time.monotonic() + wait, wait))
     return sup, prior, fresh, refused
 
@@ -289,12 +290,12 @@ def test_a_re_inspection_that_does_not_match_never_continues_the_fill(readings, 
 
 def test_the_armed_result_counts_writes_and_names_the_refusal():
     st = {"reinspections": 1, "repairs": 0, "refused": "incomplete", "wrote": 2}
-    out = sp._auto_result({"success": False, "error_type": "payment_page_changed", "filled_fields": 0}, st)
+    out = spa._auto_result({"success": False, "error_type": "payment_page_changed", "filled_fields": 0}, st)
     assert out == {"success": False, "error_type": "payment_page_changed", "filled_fields": 2, "partially_filled": True,
                    "fill_reinspect": {"count": 1, "repairs": 0, "refused": "incomplete"}}
-    assert sp._auto_result({"success": True, "filled_fields": 3}, {**st, "reinspections": 0, "refused": ""}) == {
+    assert spa._auto_result({"success": True, "filled_fields": 3}, {**st, "reinspections": 0, "refused": ""}) == {
         "success": True, "filled_fields": 3}
-    assert "refused" not in sp._auto_result({"success": True}, {**st, "refused": "<b>"})["fill_reinspect"]
+    assert "refused" not in spa._auto_result({"success": True}, {**st, "refused": "<b>"})["fill_reinspect"]
 
 
 # -- The vault: a checkout that changed during the approval is re-inspected before any card byte is read --

@@ -600,6 +600,39 @@ def _seen_text(seen) -> str:
     return "; ".join(f"{re.sub(r'[^A-Za-z0-9:/._-]', '', str(k))[:80]} {_code(v)}" for k, v in list(seen.items())[:8])
 
 
+def _approved_page(vault, task_id: str, supervisor, inspected, lease: str, unreviewed: bool, policy,
+                   auto: bool) -> tuple:
+    """Inside the fill context, before the card is read: ``(inspection, re-inspections, refusal)``. Live ownership,
+    then the page: the inspection the approval was shown for is still current, or (dlz, fill-auto: an armed fill
+    only) the form re-rendered while the approval was open and is inspected again in full; the fill goes on with that
+    reading only when it matches what the approval binds (``reinspect_payment``; the earlier inspection is released
+    by it). Then the cart witnesses and the destination policy, on the inspection the fill will use."""
+    refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
+    if refused:
+        return inspected, 0, refused
+    refreshed = 0
+    if auto and not supervisor.payment_is_current(inspected):
+        fresh, code = supervisor.reinspect_payment(inspected)
+        if fresh is None:
+            return inspected, 0, _reinspect_stop(code, inspected)
+        inspected, refreshed = fresh, 1
+        logger.info("card fill: the checkout was re-inspected after the approval (form re-rendered)")
+    return inspected, refreshed, _page_refusal(supervisor, inspected, unreviewed, policy)
+
+
+def _commit(vault, supervisor, inspected, fills: list, strict: bool, secret: dict, unreviewed: bool, auto: bool,
+            refreshed: int) -> dict:
+    """The commit: the armed one (``_auto_commit``) when this fill was armed, else the one it always was (with the
+    re-pin argument when ``vault.payment_repin`` is on; an armed fill never re-pins)."""
+    if not (auto and getattr(inspected, "auto", False) is True):
+        return supervisor.commit_payment(inspected, fills, strict=strict, **_repin_argument(unreviewed))
+    result = _auto_commit(vault, supervisor, inspected, fills, strict, secret)
+    if refreshed:  # the re-inspection after the approval counts with those under the fill
+        again = result.setdefault("fill_reinspect", {"count": 0, "repairs": 0})
+        again["count"] = again.get("count", 0) + refreshed
+    return result
+
+
 def _auto_commit(vault, supervisor, inspected, fills: list, strict: bool, secret: dict) -> dict:
     """dlz (fill-auto): the commit of an armed fill: the supervisor may continue it on re-inspections of this
     approval. ``refill`` computes the fills for such a reading from the card already read for this fill (same rules
@@ -825,19 +858,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             if unreviewed and destination_policy() != policy:  # B6, A6 step 7
                 return json.dumps(_disabled())
             # dlz: live ownership and page freshness inside the context, right before the card is read.
-            refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
-            if refused:
-                return json.dumps(refused)
-            refreshed = 0
-            if auto and not supervisor.payment_is_current(inspected):
-                # dlz (fill-auto): the form re-rendered while the approval was open: inspected again in full, and
-                # continued only on a reading that matches what the approval card showed. Before any card byte.
-                fresh, code = supervisor.reinspect_payment(inspected)
-                if fresh is None:
-                    return json.dumps(_reinspect_stop(code, inspected))
-                inspected, refreshed = fresh, 1
-                logger.info("card fill: the checkout was re-inspected after the approval (form re-rendered)")
-            refused = _page_refusal(supervisor, inspected, unreviewed, policy)
+            # dlz (fill-auto): an armed fill whose form re-rendered during the approval goes on with a fresh inspection.
+            inspected, refreshed, refused = _approved_page(vault, task_id, supervisor, inspected, lease, unreviewed,
+                                                           policy, auto)
             if refused:
                 return json.dumps(refused)
             # Capture lock (control's CDP guard, then the local mark) BEFORE the card is read: both are
@@ -894,13 +917,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 if unreviewed and destination_policy() != policy:  # B6, A6 step 16: the commit fence
                     return json.dumps(_disabled(after_read=True))
                 window.committing()  # from here a card value may be in the page: only control's unlock releases it
-            if auto and getattr(inspected, "auto", False) is True:
-                result = _auto_commit(vault, supervisor, inspected, fills, strict, secret)
-                if refreshed:  # the re-inspection after the approval counts with those under the fill
-                    again = result.setdefault("fill_reinspect", {"count": 0, "repairs": 0})
-                    again["count"] = again.get("count", 0) + refreshed
-            else:
-                result = supervisor.commit_payment(inspected, fills, strict=strict, **_repin_argument(unreviewed))
+            result = _commit(vault, supervisor, inspected, fills, strict, secret, unreviewed, auto, refreshed)
             _log_commit(result)
             _commit_text(result)
             return json.dumps(_describe_result(result, backend, inspected, fills, prompt, bound_revision,

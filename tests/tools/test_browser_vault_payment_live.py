@@ -1028,7 +1028,7 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
         # No extra wait: the fill itself settles 2.0 s after the last write, past every scripted
         # reset (the latest fires at 1.5 s), so the frames are final when it returns.
         outcomes[variant] = (json.loads(raw), frame_values(variant), raw)
-        print("OUTCOME", "auto=%s" % auto, variant, {k: v for k, v in outcomes[variant][0].items()
+        print("OUTCOME", f"auto={auto}", variant, {k: v for k, v in outcomes[variant][0].items()
                                    if k in ("success", "error_type", "filled_fields", "field_retention", "fill_reinspect")},
               {k: len(v) for k, v in outcomes[variant][1].items()})
 
@@ -1497,7 +1497,7 @@ def _fa_setup(payment_browser, tmp_path, monkeypatch, *, hosted=False, auto=True
             replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
         monkeypatch.setattr("agent.vault_payment_policy.PAYMENT_PSP_ORIGINS", (origins["psp"],))
     monkeypatch.setattr("tools.browser_vault_payment.payment_fill_auto_enabled", lambda: auto)
-    monkeypatch.setattr("tools.browser_supervisor_payment._REINSPECT_WAIT_SECONDS", wait)
+    monkeypatch.setattr("tools.browser_supervisor_payment_auto._REINSPECT_WAIT_SECONDS", wait)
     return sup, origins, card
 
 
@@ -1568,7 +1568,7 @@ def test_fill_auto_label_only_changes_never_stop_the_fill(payment_browser, tmp_p
     navigate(sup, origins["merchant"] + "/fa/relabel")
     out = _fa_fill(sup, origins, card, caplog, on_consent=lambda: sup.evaluate_runtime("relabelNow()"))
     states, writes = _fa_top(sup)
-    print("RECEIPT fill-auto relabel auto=%s" % auto, json.dumps({k: out.get(k) for k in (
+    print(f"RECEIPT fill-auto relabel auto={auto}", json.dumps({k: out.get(k) for k in (
         "success", "error_type", "filled_fields", "fill_reinspect", "fill_check")}, sort_keys=True))
     if auto:
         assert out["success"] and out["filled_fields"] == 3 and out["retention_verified"] is True, out
@@ -1594,7 +1594,7 @@ def test_fill_auto_a_field_that_lost_its_value_is_written_once_more(payment_brow
         navigate(sup, origins["merchant"] + "/fa/" + variant)
         out = _fa_fill(sup, origins, card, caplog)
         states, writes = _fa_top(sup)
-        print("RECEIPT fill-auto", variant, "auto=%s" % auto, json.dumps({k: out.get(k) for k in (
+        print("RECEIPT fill-auto", variant, f"auto={auto}", json.dumps({k: out.get(k) for k in (
             "success", "error_type", "filled_fields", "fill_reinspect", "field_retention")}, sort_keys=True))
         if auto and variant != "retain_never":
             assert out["success"] and out["filled_fields"] == 3 and states == _HELD, (variant, out, states)
@@ -1679,7 +1679,7 @@ def test_fill_auto_unreviewed_form_re_rendered_during_the_approval(payment_brows
                                                         sup._loop, timeout=10)), what="the frame loaded again")
             return
         delay = 1500 if variant == "slow" else 0
-        sup.evaluate_runtime("document.getElementById('pr').contentWindow.postMessage({t:'rerender',delay:%d},'*')" % delay)
+        sup.evaluate_runtime(f"document.getElementById('pr').contentWindow.postMessage({{t:'rerender',delay:{delay}}},'*')")
         if not delay:
             wait_until(lambda: sup.evaluate_runtime("window.rerendered===true")["result"] is True,
                        what="the form re-rendered")
