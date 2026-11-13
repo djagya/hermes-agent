@@ -766,7 +766,8 @@ def _with_dialog(supervisor: Any, out: dict) -> dict:
 
 def payment_controls(supervisor: Any) -> dict:
     """``browser_vault action=payment_controls``: ``{ref, role, text, disabled}`` per control."""
-    return _with_dialog(supervisor, _run(supervisor, lambda _deadline: _controls(supervisor)))
+    out = _with_dialog(supervisor, _run(supervisor, lambda _deadline: _controls(supervisor)))
+    return {**out, "presses_in_lock": presses_in_lock(supervisor)}
 
 
 # dlz (Codex r3 P1, r4 P1): payment_click / payment_close admission, process-wide under _LOCK (not per supervisor:
@@ -783,10 +784,10 @@ class _LockGen:
     press may have landed in it), when control already reported the slot locked, or when control's lock already
     held other tabs. Read and written under ``_LOCK``."""
 
-    __slots__ = ("known", "pressed")
+    __slots__ = ("known", "pressed", "presses")
 
     def __init__(self, known: bool):
-        self.known, self.pressed = known, False
+        self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
@@ -813,6 +814,15 @@ def admit_close(supervisor: Any) -> tuple[bool, Optional[bool]]:
         _CLOSING_N += 1
         gen = _GENS.get(supervisor) if supervisor in _HELD else None
         return True, (gen.pressed if gen is not None and gen.known else None)
+
+
+def presses_in_lock(supervisor: Any) -> Optional[int]:
+    """How many payment_click presses this process started in this supervisor's current lock (a press that may have
+    landed counts), so Sera and the owner can see a second Pay before it happens. None when unknown, on the same
+    terms as ``pressed_in_lock`` (a restart, a replaced supervisor, an unlock read in between)."""
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        return gen.presses if gen is not None and gen.known else None
 
 
 def end_close() -> None:
@@ -852,6 +862,7 @@ def payment_click(supervisor: Any, ref: str) -> dict:
         with _LOCK:
             if progress and gen is not None and _GENS.get(supervisor) is gen:  # never a later lock
                 gen.pressed = True
+                gen.presses += 1
             _PRESSING_N = max(0, _PRESSING_N - 1)
     if out.get("success"):
         out["clicked"] = ref

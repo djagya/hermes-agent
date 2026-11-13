@@ -238,3 +238,32 @@ def test_a_five_minute_window_is_not_cut_and_reminds_at_two_minutes_with_three_l
     worker.join(10)
     gate.set()
     assert result["consent"].outcome == "accept"
+
+
+@pytest.mark.parametrize("configured, reminders, stated", [(120, 0, 120), (150, 0, 150), (200, 1, 200)])
+def test_the_card_states_the_effective_window_and_a_short_one_gets_no_reminder(loop, monkeypatch, configured, reminders,
+                                                                                stated):
+    """peer r1 P3 / GLM P3-2: with approvals.timeout below the inspection window the card, the retire time and the
+    reminder all use the smaller one; an effective window of 150 s or less needs no reminder."""
+    from tools import approval_context
+    monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: configured)
+    gate = threading.Event()
+
+    async def held(_seconds):
+        await asyncio.to_thread(gate.wait, 10)
+
+    monkeypatch.setattr(payment_approval, "_wait", held)
+    adapter, scheduled, result = _adapter(), [], {}
+    _runner(adapter, loop, scheduled)
+    worker = _ask(result, _facts(300), 300)  # the inspection has 300 s left; the config allows less
+    assert wait_until(lambda: adapter._bot.send_message.await_count == 1, what="card sent")
+    with approval._lock:
+        (entry,) = approval._gateway_queues[SESSION]
+    assert entry.data["timeout_s"] == stated
+    assert f"Expires in {stated} s" in adapter._bot.send_message.await_args_list[0].kwargs["text"]
+    assert [name for name, _ in scheduled].count("_remind_later") == reminders
+    _, (approve, _deny) = _card(adapter)
+    _tap(adapter, loop, approve, 40, OWNER_ID)
+    worker.join(10)
+    gate.set()
+    assert result["consent"].outcome == "accept"

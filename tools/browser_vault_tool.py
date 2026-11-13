@@ -1380,7 +1380,10 @@ BROWSER_VAULT_SCHEMA = {
         "The owner's Approve on a card-fill approval card that stated the cart total is the go for pressing Pay once "
         "for that checkout (the card says so; no separate chat go is needed): press Pay exactly once after a "
         "successful fill, never press it a second time, and never click it again when "
-        "payment_click_uncertain says a press may have landed. A card with no stated total says \"fill only\": "
+        "payment_click_uncertain says a press may have landed. payment_controls and payment_done report "
+        "presses_in_lock (null = unknown): the presses this process started in the lock, an uncertain one included; "
+        "once it is 1 (or null), another payment_click is only for a bank or 3-D Secure step the owner asked for, "
+        "never a second Pay. A card with no stated total says \"fill only\": "
         "its Approve is not a go for Pay, so do not press Pay until the owner says to in chat. Page dialogs while locked: alerts are accepted and "
         "prompts dismissed by Hermes; a confirm waits and payment_controls / payment_click / payment_done report "
         "dialog_pending {id, type, origin, on_payment_tab_top, on_shop_page, text} for the payment tab (text "
@@ -1596,12 +1599,15 @@ def _payment_dialog_action(task_id: Optional[str], dialog_id: Any, accept: Any) 
 
 def _payment_done_action(task_id: Optional[str], expected_origin: str) -> str:
     """dlz (lockdown §2): the native confirmation handover after Pay (managed browser only)."""
+    from tools import browser_payment_surface as surface
     from tools.browser_payment_done import payment_done
 
     if not _is_managed():
         return json.dumps({"success": False, "error_type": "payment_surface_none",
                            "error": "Only the managed browser locks a card payment; use the browser tools as usual."})
-    return json.dumps(payment_done(_managed_supervisor(task_id or "default"), expected_origin))
+    supervisor = _managed_supervisor(task_id or "default")
+    presses = surface.presses_in_lock(supervisor)  # read before the call: a done that ends the lock forgets it
+    return json.dumps({**payment_done(supervisor, expected_origin), "presses_in_lock": presses})
 
 
 def _payment_close_action(task_id: Optional[str]) -> str:

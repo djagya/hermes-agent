@@ -465,6 +465,49 @@ def test_a_ref_is_single_use_once_a_press_started(outcome):
     assert len([c for c in sup.sent("Input.dispatchMouseEvent") if c[1]["type"] == "mousePressed"]) == presses == 1
 
 
+@pytest.mark.parametrize("outcome", ["pressed", "uncertain"])
+def test_presses_in_lock_counts_every_press_including_an_uncertain_one(outcome):
+    """Codex r1 P2-3 / GLM Q4: the listing shows how many presses this lock saw, so a second Pay is visible."""
+    sup = _claimed()
+    listing = surface.payment_controls(sup)
+    assert listing["presses_in_lock"] == 0
+    if outcome == "uncertain":
+        base = sup.on
+
+        def on(method, params, session):
+            if method == "Input.dispatchMouseEvent" and params.get("type") == "mouseReleased":
+                raise TimeoutError("lost reply")
+            return base(method, params, session)
+
+        sup.on = on
+    surface.payment_click(sup, listing["controls"][0]["ref"])
+    again = surface.payment_controls(sup)
+    assert again["presses_in_lock"] == 1  # a fresh listing hands out fresh refs, but the count stays
+    surface.payment_click(sup, again["controls"][0]["ref"])
+    assert surface.payment_controls(sup)["presses_in_lock"] == 2
+
+
+def test_payment_done_reports_the_presses_read_before_it_ends_the_lock(monkeypatch):
+    import json
+    from tools import browser_payment_done, browser_vault_tool
+
+    sup = _claimed()
+    surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    monkeypatch.setattr(browser_vault_tool, "_is_managed", lambda: True)
+    monkeypatch.setattr(browser_vault_tool, "_managed_supervisor", lambda _task: sup)
+
+    def done(supervisor, expected_origin=""):  # the real one ends the lock, which forgets the count
+        surface._GENS.pop(supervisor, None)
+        return {"success": True}
+
+    monkeypatch.setattr(browser_payment_done, "payment_done", done)
+    assert json.loads(browser_vault_tool._payment_done_action("t", "")) == {"success": True, "presses_in_lock": 1}
+
+
+def test_presses_in_lock_is_null_for_a_lock_this_process_did_not_see():
+    assert surface.presses_in_lock(object()) is None
+
+
 def test_a_ref_survives_a_click_refused_before_any_press():
     sup = _claimed()
     ref = surface.payment_controls(sup)["controls"][0]["ref"]
