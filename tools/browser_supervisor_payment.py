@@ -1257,8 +1257,11 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         # dlz: strict fills in a frame pause after each focus for the owner-chain check from the parents
         # (a cross-origin parent's blur handler is out of the frame's reach); an unreviewed fill pauses in
         # every document, for the same bindings after the focus handlers ran.
+        # dlz (fill-auto, r1 F4): fields adopted through a re-inspection (``auto["kept"]``: a generation after the first)
+        # are paced on a reviewed destination too, as re-pinned fields are: the owner-chain hit test from the parents.
+        adopted = bool(auto and auto.get("kept"))
         paced = (lambda point, d=document: self._paced_check(i, d, point)) \
-            if strict and (_has_parent(i, document) or i.unreviewed_origins) else None
+            if (strict or adopted) and (_has_parent(i, document) or i.unreviewed_origins) else None
         # dlz (re-pin): only when switched on, and reviewed destinations only; otherwise the fill stops on any
         # change, as before, and the document's commit gets no re-pin hook at all.
         repin = None if not state["repin"] or i.unreviewed_origins else \
@@ -1473,8 +1476,9 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                     session_id=d.frame_session,
                 )
             )
-            # An armed commit pauses at most once per field for its focus and 4 per field + 8 times for labels.
-            for _ in range(6 * len(fills) + 12 if auto else (len(fills) + 1) * (MAX_REPINS + 2 if repin is not None else 1)):
+            # An armed commit pauses at most once per field for its focus, and for each of the 4 per field + 8 label changes
+            # once for the relabel and once more for the paced check that follows it.
+            for _ in range(10 * len(fills) + 20 if auto else (len(fills) + 1) * (MAX_REPINS + 2 if repin is not None else 1)):
                 kind = _pause_kind(result, repin is not None, bool(auto))
                 if kind == "relabel":
                     count = result.get("filled_fields")

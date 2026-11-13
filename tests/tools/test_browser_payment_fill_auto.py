@@ -26,7 +26,12 @@ _FIELDS = """
 const exp = input({id: 'exp', autocomplete: 'cc-exp', aria: 'Expiry'}), csc = input({id: 'csc', autocomplete: 'cc-csc', aria: 'CVC'});
 const num = input({id: 'num', autocomplete: 'cc-number', aria: 'Card number'});
 els = [exp, csc, num];
-const twice = e => { if (e.seen) e.held = 'TWICE'; e.seen = true; };  // a second write of one field shows"""
+// a second write of one field shows as 'TWICE' (events without a write, from the kept-field no-ops, do not count); a
+// value cleared by page code starts the count again
+const track = e => { let h = '', n = 0; Object.defineProperty(e, 'held', {get: () => h, set: v => {
+  if (v === '') { h = ''; n = 0; } else { n++; h = n > 1 ? 'TWICE' : v; } }}); };
+for (const e of els) track(e);
+const twice = () => {};"""
 _AUTO_SCENARIOS = {
     # SBB / pay.datatrans.com: every focus and every write re-labels the other fields, and the approval wait one
     "auto_relabel": _FIELDS + """
@@ -43,14 +48,45 @@ exp.oninput = () => { promo.aria = 'Security code'; csc.aria = 'Promo code'; };"
     # Eurowings: the first card number write clears the CVC
     "auto_cvc_cleared": _FIELDS + """
 for (const e of els) e.oninput = () => twice(e);
-num.oninput = () => { twice(num); csc.held = ''; csc.seen = false; };""",
+num.oninput = () => { csc.held = ''; };""",
     # a CVC that never keeps its value
     "auto_cvc_never": _FIELDS + """
 csc.oninput = () => { csc.held = ''; };""",
     # FlixBus / Payrails: while the approval is open the whole form is built again from fresh elements
     "auto_remounted": _FIELDS + """
 for (const e of els) e.oninput = () => twice(e);
-approve = () => { for (const e of [exp, csc, num]) { const n = replace(e); n.aria = e.aria; n.oninput = () => twice(n); } };""",
+approve = () => { for (const e of [exp, csc, num]) { const n = replace(e); n.aria = e.aria; track(n); } };""",
+    # r1 F3: the first focus re-labels the other fields once (a label-only change, accepted in the focused phase)
+    "auto_focus_relabel": _FIELDS + """
+let first = true;
+for (const e of els) e.onfocus = () => { if (first) { first = false; for (const o of els) if (o !== e) o.aria = o.aria + ' - check'; } };""",
+    # r1 F4: the form is built again while the approval is open, and a merchant overlay covers the new expiry field
+    "auto_remounted_covered": _FIELDS + """
+approve = () => { for (const e of [exp, csc, num]) { const n = replace(e); n.aria = e.aria; if (e === exp) covers.push({top: n.top}); } };""",
+    # a re-mounted expiry input that appears once, after the CVC's write (the repin test's "replacement" re-does it on each CVC event)
+    "auto_replacement": """
+const exp = input({id: 'exp', autocomplete: 'cc-exp'}), csc = input({id: 'csc', autocomplete: 'cc-csc'});
+const num = input({id: 'num', autocomplete: 'cc-number'});
+els = [exp, csc, num];
+let done = false;
+csc.oninput = () => { if (!done) { done = true; replace(exp); } };""",
+    # r1 F14: the CVC is cleared by the card number's write; every event each field gets is logged
+    "auto_kept_events": """
+const exp = input({id: 'exp', autocomplete: 'cc-exp', aria: 'Expiry'}), csc = input({id: 'csc', autocomplete: 'cc-csc', aria: 'CVC'});
+const num = input({id: 'num', autocomplete: 'cc-number', aria: 'Card number'}), log = input({id: 'log'});
+log.held = '';
+els = [exp, csc, num];
+for (const e of els) e.dispatchEvent = function (ev) { log.held += this.id + ':' + ev.type + ' '; if (ev.type === 'input' && this.oninput) this.oninput(); return true; };
+num.oninput = () => { csc.held = ''; };""",
+    # r1 F14, a select: the year select is cleared by the number's write
+    "auto_kept_select": """
+const month = select({id: 'month', autocomplete: 'cc-exp-month', options: months(1), aria: 'Month'});
+const year = select({id: 'year', autocomplete: 'cc-exp-year', options: [{value: '2035', text: '2035', disabled: false}], aria: 'Year'});
+const csc = input({id: 'csc', autocomplete: 'cc-csc', aria: 'CVC'}), num = input({id: 'num', autocomplete: 'cc-number', aria: 'Card number'});
+const log = input({id: 'log'}); log.held = '';
+els = [month, year, csc, num];
+for (const e of els) e.dispatchEvent = function (ev) { log.held += this.id + ':' + ev.type + ' '; if (ev.type === 'input' && this.oninput) this.oninput(); return true; };
+num.oninput = () => { csc.held = ''; };""",
     # a field that changes type (not a label): never accepted in place, inspected again
     "auto_retyped": _FIELDS + """
 csc.oninput = () => { exp.type = 'tel'; };""",
@@ -76,20 +112,22 @@ class _AutoSupervisor(_ClosureSupervisor):
         return (None, refused) if refused else (fresh, "")
 
 
-def _auto_commit(scenario, tmp_path, monkeypatch):
+def _auto_commit(scenario, tmp_path, monkeypatch, strict=False, parent=False, **checks):
+    """``parent``: the card document sits in an iframe of the merchant page (its owner chain is checked: ``owner``)."""
     from tools.browser_vault_payment import _document_fills
 
     js = _NodeClosure(scenario, tmp_path, _SCENARIOS)
     try:
-        sup = _AutoSupervisor(js)
+        sup = _AutoSupervisor(js, **checks)
         doc = PaymentDocument("card", "s", "o-card", PSP, sp._card_controls(js.call("describe")),
                               clock_anchor=time.monotonic())
-        i = PaymentInspection("op", "s", "tab", MERCHANT, (doc,), (("card", "L", PSP + "/card", PSP, ""),),
+        tree = (("card", "L", PSP + "/card", PSP, "top"),) if parent else (("card", "L", PSP + "/card", PSP, ""),)
+        i = PaymentInspection("op", "s", "tab", MERCHANT, (doc,), tree,
                               time.monotonic() + 60, owner=sup, approval_id="op")
         assert asyncio.run(sup._arm_payment_auto(i)) is True and i.auto is True
         js.call("approve")
         monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
-        out = asyncio.run(sup._commit_payment_auto(i, _document_fills(i, _SYNTHETIC), None, False,
+        out = asyncio.run(sup._commit_payment_auto(i, _document_fills(i, _SYNTHETIC), None, strict,
                                                    lambda fresh: _document_fills(fresh, _SYNTHETIC), None))
         return out, js.call("values"), sup.events
     finally:
@@ -114,7 +152,7 @@ def test_a_label_change_that_moves_a_role_is_not_accepted_and_the_re_inspection_
 
 
 @pytest.mark.parametrize("scenario, refused", [
-    ("replacement", None),                    # a re-mounted expiry input: inspected again, written
+    ("auto_replacement", None),               # a re-mounted expiry input: inspected again, written
     ("auto_retyped", None),                   # a changed input type is no label change: inspected again, same role
     ("promo_becomes_expiry", "role_changed"),  # same token set, but the promo field took the expiry's role
     ("holder_becomes_number", "fields_changed"),
@@ -125,7 +163,7 @@ def test_a_changed_field_set_goes_on_only_on_a_matching_re_inspection(scenario, 
     assert events.count("reinspect") == 1, events
     if refused is None:
         assert out["success"] and out["fill_reinspect"] == {"count": 1, "repairs": 0}, out
-        assert {k: v for k, v in values.items() if v} == {("exp2" if scenario == "replacement" else "exp"): "07/35",
+        assert {k: v for k, v in values.items() if v} == {("exp2" if scenario == "auto_replacement" else "exp"): "07/35",
                                                           "csc": "123", "num": "4111111111111111"}
         return
     assert out["error_type"] == "payment_fields_changed" and out["fill_reinspect"]["refused"] == refused, out
@@ -568,3 +606,49 @@ def test_the_reviewed_and_the_discovery_pass_both_name_the_card_free_documents()
     found = {"candidates": [], "anchors": {}, "absence": [], "witnesses": [], "owners": {}, "pending": [], "free": []}
     asyncio.run(Supervisor()._inspect_frames(tree, MERCHANT, (), False, "s", {}, "op", found))
     assert [c[0] for c in found["candidates"]] == ["a"] and found["free"] == ["top", "b", "c"]  # not the skipped one
+
+
+def test_an_accepted_relabel_goes_through_the_owner_chain_check_again_before_the_setter(tmp_path, monkeypatch):
+    """F3 (Codex P1-3, peer P2-3): the relabel pause is asynchronous; the cross-origin owner chain (or the cart) can
+    change in it. After the acceptance the focused, paced field is checked again before anything is written."""
+    out, values, events = _auto_commit("auto_focus_relabel", tmp_path, monkeypatch, strict=True, parent=True,
+                                       owner=lambda n: n < 2)  # the check after the focus passes, the next one fails
+    assert out["success"] is False and out["error_type"] == "payment_page_changed", out
+    # focus, check (passes), relabel pause, accepted, check again (fails): nothing written; the re-inspections that
+    # follow (a changed page is read again) stop the same way at their first check
+    assert events[:9] == ["remember", "commit", "owner_check", "resume", "relabeled", "accept", "resume", "owner_check",
+                          "reinspect"], events
+    assert not any(values.values()) and out.get("filled_fields", 0) == 0, (values, out)
+    # the same page with a check that holds: written, one more check than fields' own focus checks
+    out, values, events = _auto_commit("auto_focus_relabel", tmp_path, monkeypatch, strict=True, parent=True)
+    assert out["success"] is True and values == _FILLED and events.count("owner_check") == 4, (out, events)
+
+
+def test_a_field_adopted_through_a_re_inspection_must_be_exposed_even_on_a_reviewed_destination(tmp_path, monkeypatch):
+    """F4 (Codex P2-4, peer P3-5): the first inspection of a reviewed form stays as it was (no overlay test); a field
+    the first inspection never saw (the form re-mounted during the approval) is hit-tested, locally and, in a frame,
+    from the parents."""
+    out, values, events = _auto_commit("auto_remounted_covered", tmp_path, monkeypatch)
+    assert out["success"] is False and out["error_type"] == "payment_fields_changed", out
+    assert out["fill_check"]["reason"] == "hit_test" and out["fill_check"]["token"] == "cc-exp", out
+    assert values["exp2"] == "" and values["num2"] == "" and out["fill_reinspect"]["count"] >= 1  # never written
+    # uncovered, in a frame: written, and every write of the adopted generation had its owner-chain check
+    out, values, events = _auto_commit("auto_remounted", tmp_path, monkeypatch, parent=True)
+    assert out["success"] is True and events.count("owner_check") == 3 and values["exp2"] == "07/35", (out, events)
+
+
+def test_a_first_generation_reviewed_fill_has_no_owner_chain_check_as_before(tmp_path, monkeypatch):
+    out, values, events = _auto_commit("auto_relabel", tmp_path, monkeypatch, parent=True)
+    assert out["success"] is True and "owner_check" not in events
+
+
+@pytest.mark.parametrize("scenario, kept", [("auto_kept_events", {"exp", "num"}), ("auto_kept_select", {"month", "year", "num"})])
+def test_a_kept_field_still_gets_the_events_of_a_write(scenario, kept, tmp_path, monkeypatch):
+    """F14 (GLM P3-4): a field that already holds its value is not written again, but the page's own state may not
+    have it (a controlled field re-mounted with the value): input and change are dispatched, selects included."""
+    out, values, events = _auto_commit(scenario, tmp_path, monkeypatch)
+    assert out["success"] is True and out["fill_reinspect"] == {"count": 1, "repairs": 1}, out
+    log = values["log"].split()
+    for field in kept:  # once for its write in the first generation, once more, as no-ops, in the repair generation
+        assert log.count(field + ":change") == 2 and log.count(field + ":input") == 2, (field, log)
+    assert log.count("csc:change") == 2 and log.count("csc:input") == 2, log  # the cleared one: written again
