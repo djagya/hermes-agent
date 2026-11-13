@@ -129,7 +129,7 @@ def deliver(turn_runner, approval_data: dict) -> None:
     retirement for when the prompt settles, and arm the one reminder."""
     from tools.approval import attach_delivery_probe, observe_gateway_settle, valid_request_id
     from tools.approval_context import payment_approver
-    from tools.payment_consent_prompt import GROUP_NOTICE, PaymentPromptFacts
+    from tools.payment_consent_prompt import CARD_TOPIC_UNAVAILABLE, GROUP_NOTICE, PaymentPromptFacts
 
     ctx = turn_runner._ctx
     adapter = ctx._status_adapter
@@ -146,20 +146,31 @@ def deliver(turn_runner, approval_data: dict) -> None:
     # Class check, not instance: MagicMock adapters invent every attribute.
     if not callable(getattr(type(adapter), "send_payment_approval", None)):
         raise PaymentCardUndeliverable("this session's adapter cannot send the payment card")
-    chat_id, metadata, other_private_chat = _card_route(ctx, user_id)
+    route = _card_route(ctx, user_id)
     probe = _delivery_probe(adapter)  # armed before the send: a reconnect while it is in flight counts too
-    fut = turn_runner._schedule(
-        adapter.send_payment_approval(chat_id=chat_id, facts=facts, request_id=request_id,
-                                      session_key=session_key, approver=approver, metadata=metadata,
-                                      requester=_requester_id(ctx)),
-        "send_payment_approval scheduling error")
-    if fut is None:
-        raise PaymentCardUndeliverable("gateway loop unavailable")
-    try:
-        result = fut.result(timeout=SEND_TIMEOUT_S)
-    except Exception as exc:  # timeout included: a card that may have posted is still unavailable
-        _retire_if_sent_late(turn_runner, adapter, fut, request_id)
-        raise PaymentCardUndeliverable(f"payment card send failed: {type(exc).__name__}") from None
+    result = None
+    for attempt in range(2):
+        chat_id, metadata, other_private_chat = route
+        fut = turn_runner._schedule(
+            adapter.send_payment_approval(chat_id=chat_id, facts=facts, request_id=request_id,
+                                          session_key=session_key, approver=approver, metadata=metadata,
+                                          requester=_requester_id(ctx)),
+            "send_payment_approval scheduling error")
+        if fut is None:
+            raise PaymentCardUndeliverable("gateway loop unavailable")
+        try:
+            result = fut.result(timeout=SEND_TIMEOUT_S)
+        except Exception as exc:  # timeout included: a card that may have posted is still unavailable
+            _retire_if_sent_late(turn_runner, adapter, fut, request_id)
+            raise PaymentCardUndeliverable(f"payment card send failed: {type(exc).__name__}") from None
+        # The session's topic is gone: the adapter sent nothing (never the group's General topic); the card goes
+        # to the owner's own chat once, with the neutral notice in the session's chat.
+        if (attempt == 0 and not other_private_chat and not getattr(result, "success", False)
+                and getattr(result, "error", None) == CARD_TOPIC_UNAVAILABLE):
+            logger.warning("Payment approval card topic unavailable (request_id=%s); sending to the owner's chat", request_id)
+            route = (user_id, None, True)
+            continue
+        break
     if not getattr(result, "success", False):
         raise PaymentCardUndeliverable("payment card send failed")
     # Delivery trace: correlation and timing only, never card, cart or amount text.

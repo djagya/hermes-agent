@@ -24,8 +24,13 @@ import time
 from typing import Any, Optional
 
 from plugins.platforms.telegram.callback_answer import answer_callback
+from tools.payment_consent_prompt import CARD_TOPIC_UNAVAILABLE
 
 logger = logging.getLogger(__name__)
+
+
+class TopicUnavailable(RuntimeError):
+    """A fail-closed send found its forum topic gone; nothing was sent."""
 
 _MAX_CARDS = 512
 _OWNER_ONLY = "Only the owner can approve this card payment."
@@ -153,7 +158,8 @@ class TelegramApprovalCardsMixin:
                                         text=text)
             return text, keyboard, on_sent
         return await self._send_prompt("send_payment_approval", chat_id, metadata, build, parse_mode=ParseMode.HTML,
-                                       thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
+                                       thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode,
+                                       fail_closed=group)
 
     async def remind_payment_card(self, request_id: str, text: str) -> bool:
         """One plain *text* replying to the armed payment card of *request_id*, in its chat and thread. False (nothing
@@ -169,7 +175,7 @@ class TelegramApprovalCardsMixin:
         if record["thread_id"] is not None:
             kwargs["message_thread_id"] = int(record["thread_id"])
         try:
-            await self._send_message_with_thread_fallback(**kwargs)
+            await self._send_message_with_thread_fallback(fail_closed=True, **kwargs)
         except Exception as exc:  # health: allow BLE001 -- best effort: the card itself is still live
             logger.warning("[%s] Payment approval reminder failed: %s", self.name, type(exc).__name__)
             return False

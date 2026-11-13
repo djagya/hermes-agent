@@ -49,6 +49,8 @@ APPROVE_LABEL = "Approve: fill + Pay once"
 DENY_LABEL = "Deny"
 # The session's chat, when it is someone else's private chat (the card went to the owner's own chat).
 GROUP_NOTICE = "Card-fill approval sent to the owner privately."
+# The card's group topic is gone: the send fails closed (never the group's General topic) and the card goes to the owner's chat.
+CARD_TOPIC_UNAVAILABLE = "payment card topic unavailable"
 # Reply to a typed /approve that a waiting card fill stopped (FIFO) or that skipped it (/approve all).
 TYPED_APPROVE_HELD = ("A card payment is waiting: only the owner's Approve button on its card approves it. "
                       "Typed /approve does not; /deny refuses it.")

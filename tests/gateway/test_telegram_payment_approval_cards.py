@@ -284,6 +284,52 @@ async def test_the_adapter_refuses_a_group_card_unless_the_owner_asked():
     assert sent.success and adapter._bot.send_message.call_args.kwargs["chat_id"] == GROUP
 
 
+class BadRequest(Exception):  # the adapter recognises Telegram's BadRequest by its class name
+    pass
+
+
+def _topic_gone_bot(adapter):
+    """A bot that rejects any send carrying message_thread_id as a deleted topic, and posts the rest."""
+    posted = adapter._bot.send_message.side_effect
+
+    def send(**kw):
+        if kw.get("message_thread_id") is not None:
+            raise BadRequest("Bad Request: message thread not found")
+        return posted(**kw)
+    adapter._bot.send_message = AsyncMock(side_effect=send)
+
+
+@pytest.mark.asyncio
+async def test_a_card_never_retries_at_the_groups_root_when_its_topic_is_gone():
+    """Codex r1 P1-1: the generic control send retries a missing topic without message_thread_id, which would post the
+    card in the group's General topic. A payment card fails closed: one attempt, nothing posted, nothing armed."""
+    from tools.payment_consent_prompt import CARD_TOPIC_UNAVAILABLE
+    adapter = _adapter()
+    _topic_gone_bot(adapter)
+    rid = _pending(exact_request=True, approver=OWNER).data["request_id"]
+    result = await adapter.send_payment_approval(chat_id=str(GROUP), facts=_facts(), request_id=rid, session_key=SESSION,
+                                                 approver=OWNER, metadata={"thread_id": "5"}, requester=str(OWNER_ID))
+    assert not result.success and result.error == CARD_TOPIC_UNAVAILABLE
+    assert adapter._bot.send_message.call_count == 1  # no retry without the thread
+    assert adapter._bot.send_message.call_args.kwargs["message_thread_id"] == 5
+    assert not adapter._approval_cards
+
+
+def test_a_gone_topic_sends_the_card_to_the_owners_chat_and_a_notice_to_the_session(monkeypatch):
+    from tools import approval_context
+    monkeypatch.setattr(approval_context, "payment_approver", lambda: OWNER)
+    adapter = _adapter()
+    _topic_gone_bot(adapter)
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True))
+    entry = _pending(exact_request=True, approver=OWNER, payment=_facts().to_dict())
+    _turn_runner(adapter, GROUP)._approval_notify_sync(dict(entry.data))
+    calls = adapter._bot.send_message.call_args_list
+    assert [(c.kwargs["chat_id"], c.kwargs.get("message_thread_id")) for c in calls] == [(GROUP, 5), (OWNER_ID, None)]
+    assert len(adapter._approval_cards) == 1 and next(iter(adapter._approval_cards.values()))["chat_id"] == str(OWNER_ID)
+    (notice,) = adapter.send.call_args_list
+    assert notice.args[:2] == (str(GROUP), GROUP_NOTICE)
+
+
 @pytest.mark.parametrize("case", ["no_card_adapter", "bad_request_id", "send_failed", "approver_changed"])
 def test_undeliverable_payment_card_raises_so_the_prompt_is_unavailable(monkeypatch, case):
     from gateway.payment_approval import PaymentCardUndeliverable
