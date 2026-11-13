@@ -849,7 +849,7 @@ def test_a_fill_binds_the_total_only_when_its_card_covered_pay(state, bound):
     sup = _claimed(approved=None)
     stated = bvp._stated_cart({"items": [{"description": "Ticket", "quantity": 1}], "total": "100.00",
                                "currency": "EUR"}) if state else None
-    facts = SimpleNamespace(cart=stated, page_match=SimpleNamespace(state=state or "not_checked"))
+    facts = SimpleNamespace(cart=stated, page_match=SimpleNamespace(state=state or "not_checked"), pay_once_on=True)
     bvp._bind_approved_total(sup, _inspected(), stated, facts, {"success": False})  # a failed fill binds nothing
     assert surface.approved_total(sup) is None
     bvp._bind_approved_total(sup, _inspected(), stated, facts, {"success": True})
@@ -857,6 +857,31 @@ def test_a_fill_binds_the_total_only_when_its_card_covered_pay(state, bound):
     if bound:
         with surface._LOCK:
             assert surface._GENS[sup].approved == (10000, "EUR", "PAGE", "LP", "https://shop.test")  # its top document
+
+
+@pytest.mark.parametrize("made, now", [(False, False), (True, False), (False, True)])
+def test_with_the_pay_once_switch_off_nothing_is_bound_and_pay_needs_the_owners_go(made, now, monkeypatch):
+    """r4 S (owner fallback): ``vault.payment_pay_once`` off (when the card's facts were made, or now) binds no total,
+    so every press needs ``owner_go`` exactly as for a fill-only card."""
+    from tools.payment_consent_prompt import CartItem, PageMatch, PaymentPromptFacts, ReceivingOrigin, StatedCart
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"vault": {"payment_pay_once": made}})
+    stated = bvp._stated_cart({"items": [{"description": "Ticket", "quantity": 1}], "total": "100.00",
+                               "currency": "EUR"})
+    facts = PaymentPromptFacts(ref="c" * 32, card_label="Test card", merchant_origin="https://shop.test",
+                               receiving=(ReceivingOrigin("https://psp.test", "reviewed", ("cc-number",)),),
+                               expires_in_s=97, cart=StatedCart((CartItem("Ticket", 1),), "100.00", "EUR"),
+                               page_match=PageMatch("matched", "the merchant page"))
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"vault": {"payment_pay_once": now}})
+    sup = _claimed(approved=None)
+    bvp._bind_approved_total(sup, _inspected(), stated, facts, {"success": True})
+    assert surface.approved_total(sup) is None
+    ref = surface.payment_controls(sup)["controls"][0]["ref"]
+    assert surface.payment_click(sup, ref)["error_type"] == "payment_go_required" and not _presses(sup)
+    assert surface.payment_click(sup, ref, owner_go=True)["success"] is True and not _total_reads(sup)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"vault": {"payment_pay_once": True}})
+    bvp._bind_approved_total(sup, _inspected(), stated, facts, {"success": True})  # control: on, on binds
+    assert surface.approved_total(sup) == ((10000, "EUR") if made else None)
 
 
 def test_no_total_is_bound_without_a_lock_of_this_process_or_from_a_malformed_value():

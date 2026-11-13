@@ -372,6 +372,58 @@ async def test_pay_once_only_when_the_page_check_matched_the_stated_total(state,
     assert ("Pay needs your go in chat" in query.answer.call_args.kwargs["text"]) is not pays
 
 
+@pytest.mark.parametrize("config, expected", [
+    ({}, True), ({"vault": {}}, True),                                   # absent: on
+    ({"vault": {"payment_pay_once": True}}, True), ({"vault": {"payment_pay_once": " On "}}, True),
+    ({"vault": {"payment_pay_once": 1}}, True),
+    ({"vault": {"payment_pay_once": False}}, False), ({"vault": {"payment_pay_once": "false"}}, False),
+    ({"vault": {"payment_pay_once": 0}}, False), ({"vault": {"payment_pay_once": "off"}}, False),
+    ({"vault": {"payment_pay_once": None}}, False), ({"vault": {"payment_pay_once": 2}}, False),
+    ({"vault": False}, False), ({"vault": None}, False),               # a vault section that is no mapping
+    (None, False),                                                       # config that cannot be read
+])
+def test_the_pay_once_switch_is_off_for_anything_present_that_is_not_clearly_on(config, expected, monkeypatch):
+    from tools.payment_consent_prompt import payment_pay_once_enabled
+
+    def load():
+        if config is None:
+            raise OSError("config.yaml unreadable")
+        return config
+
+    monkeypatch.setattr("hermes_cli.config.load_config", load)
+    assert payment_pay_once_enabled() is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("made, now", [(False, False), (True, False), (False, True)])
+async def test_with_the_pay_once_switch_off_every_card_is_fill_only(made, now, monkeypatch):
+    """r4 S (owner fallback): ``vault.payment_pay_once`` off makes a stated, matched card fill-only in its scope line,
+    footer, button, record and toast. The switch must be on both when the facts were made and when the card is
+    shown, so a switch turned on in between never upgrades a card the fill made fill-only."""
+    from tools.payment_consent_prompt import APPROVE_LABEL_FILL_ONLY, pays_once, render_plain, scope_line
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"vault": {"payment_pay_once": made}})
+    facts = _facts(cart=StatedCart((CartItem("Ticket", 1),), "12.50", "CHF"),
+                   page_match=PageMatch("matched", "the merchant page"))
+    assert facts.pay_once_on is made and facts.to_dict()["pay_once_on"] is made
+    assert PaymentPromptFacts.from_dict(facts.to_dict()) == facts  # the gateway's copy keeps the fill's reading
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"vault": {"payment_pay_once": now}})
+    assert pays_once(facts) is False
+    assert "presses Pay once" not in scope_line(facts) and "Pay needs your go in chat" in scope_line(facts)
+    assert "did not find" not in scope_line(facts)  # the page check did match: the card does not say otherwise
+    assert "One tap covers one fill only" in render_plain(facts)
+    adapter = _adapter()
+    entry = _pending(exact_request=True, approver=OWNER)
+    result = await adapter.send_payment_approval(chat_id=str(OWNER_ID), facts=facts,
+                                                 request_id=entry.data["request_id"], session_key=SESSION,
+                                                 approver=OWNER)
+    buttons = [b for row in adapter._bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard for b in row]
+    assert buttons[0].text == APPROVE_LABEL_FILL_ONLY
+    assert next(iter(adapter._approval_cards.values()))["fill_only"] is True
+    coro, query = _tap(adapter, buttons[0].callback_data, chat_id=OWNER_ID, message_id=int(result.message_id))
+    await coro
+    assert "Pay needs your go in chat" in query.answer.call_args.kwargs["text"]
+
+
 @pytest.mark.asyncio
 async def test_a_card_never_retries_at_the_groups_root_when_its_topic_is_gone():
     """Codex r1 P1-1: the generic control send retries a missing topic without message_thread_id, which would post the

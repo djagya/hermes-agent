@@ -179,6 +179,8 @@ class PaymentPromptFacts:
     cart: Optional[StatedCart] = None
     page_match: PageMatch = field(default_factory=PageMatch)
     unreviewed: bool = False
+    # r4 S: ``vault.payment_pay_once`` as read when these facts were made (the card and the binding both need it on).
+    pay_once_on: bool = field(default_factory=lambda: payment_pay_once_enabled())
 
     def __post_init__(self):
         if not isinstance(self.ref, str) or not _REF_RE.fullmatch(self.ref):
@@ -202,6 +204,8 @@ class PaymentPromptFacts:
             raise FactsInvalid("a stated cart needs a page check, and no cart means not_checked")
         if bool(self.unreviewed) != any(r.status == "UNREVIEWED" for r in receiving):
             raise FactsInvalid("unreviewed must match the receiving origins")
+        if type(self.pay_once_on) is not bool:
+            raise FactsInvalid("pay_once_on must be a bool")
 
     def to_dict(self) -> dict:
         return {
@@ -213,6 +217,7 @@ class PaymentPromptFacts:
                 "total": self.cart.total, "currency": self.cart.currency},
             "page_match": {"state": self.page_match.state, "where": self.page_match.where},
             "unreviewed": self.unreviewed,
+            "pay_once_on": self.pay_once_on,
         }
 
     @classmethod
@@ -220,7 +225,7 @@ class PaymentPromptFacts:
         if not isinstance(data, dict):
             raise FactsInvalid("payment facts must be a mapping")
         expected = {"ref", "card_label", "merchant_origin", "receiving", "expires_in_s", "cart", "page_match",
-                    "unreviewed"}
+                    "unreviewed", "pay_once_on"}
         if set(data) != expected:
             raise FactsInvalid("payment facts have missing or unknown keys")
         return cls(**{**data, "receiving": tuple(data["receiving"] or ())})
@@ -232,19 +237,54 @@ def _check_origins(facts: PaymentPromptFacts) -> None:
             raise PromptIncomplete("an origin is not a plain https origin")
 
 
+_PAY_ONCE_ON = frozenset({"true", "on", "yes", "1", "enabled"})
+_MISSING = object()
+
+
+def payment_pay_once_enabled() -> bool:
+    """r4 S (owner fallback 2026-11-13): ``vault.payment_pay_once``. Absent: on. Present: on only when clearly on
+    (``true``, ``"on"``, ``"yes"``, ``1`` ...); ``false``, ``"false"``, ``0``, ``"off"``, an explicit null, any other
+    value, a ``vault`` section that is not a mapping, and config that cannot be read now are off. Off, every card is
+    fill-only: nothing is bound to the payment lock and every Pay press needs the owner's go in chat."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        from hermes_cli.config_read_errors import FailedConfigRead
+        config = load_config()
+        if isinstance(config, FailedConfigRead) or not isinstance(config, dict):
+            return False
+        vault = cfg_get(config, "vault", default=_MISSING)
+        if vault is _MISSING:
+            return True
+        if not isinstance(vault, dict):
+            return False
+        value = cfg_get(vault, "payment_pay_once", default=_MISSING)
+        if value is _MISSING:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in _PAY_ONCE_ON
+        return value is True or (type(value) is int and value == 1)
+    except Exception:  # health: allow BLE001 -- unreadable config: every card is fill-only
+        return False
+
+
 def pays_once(facts: PaymentPromptFacts) -> bool:
     """Whether the owner's Approve also covers one Pay press: only when Sera stated the total and the page check
-    matched it (peer r2 P2). Otherwise the card is fill-only and Pay needs the owner's go in chat; the payment lock
-    binds the total only in this case (``browser_vault_payment._bind_approved_total``)."""
-    return facts.cart is not None and facts.page_match.state == "matched"
+    matched it (peer r2 P2), and ``vault.payment_pay_once`` is on, both when the facts were made and now (r4 S).
+    Otherwise the card is fill-only and Pay needs the owner's go in chat; the payment lock binds the total only in
+    this case (``browser_vault_payment._bind_approved_total``)."""
+    return (facts.cart is not None and facts.page_match.state == "matched" and facts.pay_once_on is True
+            and payment_pay_once_enabled())
 
 
 def scope_line(facts: PaymentPromptFacts) -> str:
     """What one Approve tap does, in plain words: the fill and exactly one Pay press of this checkout, or (no
-    stated total, or a total the page check did not match) the fill only."""
+    stated total, a total the page check did not match, or ``vault.payment_pay_once`` off) the fill only."""
     if facts.cart is None:
         return (f"Approve: Sera fills the card only, at {facts.merchant_origin}. No total was stated, so this "
                 "does not cover pressing Pay: Pay needs your go in chat.")
+    if facts.page_match.state == "matched" and not pays_once(facts):
+        return (f"Approve: Sera fills the card only, at {facts.merchant_origin}. Pay-once approvals are switched "
+                "off, so this does not cover pressing Pay: Pay needs your go in chat.")
     if not pays_once(facts):
         return (f"Approve: Sera fills the card only, at {facts.merchant_origin}. Hermes did not find "
                 f"{facts.cart.total} {facts.cart.currency} clearly as the page's total, so this does not cover "

@@ -3189,6 +3189,8 @@ vault:
 
 Hermes pins a card form's fields when it inspects the page. If the form changes any of them before the last field is written (a field replaced, hidden, re-labelled, or its options or length changed), the fill stops with `payment_fields_changed` and writes nothing more. The result's `fill_check` names the failed check with fixed codes only: the field's role (`token`), the `reason`, the write `step`, the document (`document` of `documents`), and the pinned `fields` and descriptor `keys` involved. It never holds a value, a label or a name. Hermes logs one `card fill stopped` line with the same codes. Hermes does not retry. The agent ends the lock with `browser_vault` `action: payment_close` (below).
 
+`vault.payment_pay_once` (default on when absent) lets a card that stated the total and matched it cover one Pay press. Anything present that is not clearly on (`false`, `"false"`, `0`, `"off"`, an empty value, a `vault` section that is not a mapping) turns it off, and so does config that cannot be read: every card is then fill-only ("Approve: fill only"), no total is bound to the payment lock, and every `payment_click` needs `owner_go: true` after the owner's explicit go in chat. It must be on both when the card is made and when it is shown, so switching it on during an approval never upgrades a fill-only card.
+
 `vault.payment_repin` (default `false`) is experimental and should stay off. With a literal `true`, a reviewed provider's form that re-renders a field during the fill is re-read inside the same approval and the fill continues on the new field. Its exposure checks are still under review, so it is not safe for real payments yet. Unreviewed payment forms never use it.
 
 ### After the payment: confirmation handover
