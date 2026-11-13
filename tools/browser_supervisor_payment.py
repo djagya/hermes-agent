@@ -1109,14 +1109,16 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             return False
 
     def commit_payment(self, inspected: PaymentInspection, fills: list[dict], strict: bool = False,
-                       repin: bool = False, refill=None, adopted=None) -> dict:
+                       repin: bool = False, refill=None, adopted=None, ownership=None) -> dict:
         """Write the fills. ``strict`` (unreviewed destinations) adds a hit test at each field's centre
         before its setter; reviewed provider shapes keep ``False`` so they cannot regress. ``repin`` (config
         ``vault.payment_repin``, off by default; a literal True only): a re-rendered reviewed card document may be
         re-pinned inside this commit; without it any change of the pinned fields stops the commit.
         dlz (fill-auto): ``refill`` (an armed inspection only, see ``arm_payment_auto``): ``refill(inspection)``
         answers the fills for a re-inspection of this approval; the commit may then continue on re-inspections
-        (``_commit_payment_auto``), and ``adopted(inspection)`` is told of each one it continues on."""
+        (``_commit_payment_auto``), and ``adopted(inspection)`` is told of each one it continues on; ``ownership(inspection)``
+        answers the error type when the browser is no longer this task's to act on (checked before each later
+        generation), or None."""
         import concurrent.futures
 
         from agent.async_utils import safe_schedule_threadsafe
@@ -1126,7 +1128,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         budget = AUTO_BUDGET_SECONDS if auto else _COMMIT_BUDGET_SECONDS
         until = time.monotonic() + budget
         future = safe_schedule_threadsafe(
-            self._commit_payment(inspected, fills, until, strict, repin, *((refill, adopted) if auto else ())),
+            self._commit_payment(inspected, fills, until, strict, repin, *((refill, adopted, ownership) if auto else ())),
             self._loop)
         if future is None:
             raise _LoopUnavailable("Browser supervisor loop unavailable")
@@ -1148,12 +1150,13 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                     "write_uncertain": True}
 
     async def _commit_payment(self, i: PaymentInspection, fills: list[dict], until: float | None = None,
-                              strict: bool = False, repin: bool = False, refill=None, adopted=None) -> dict:
+                              strict: bool = False, repin: bool = False, refill=None, adopted=None,
+                              ownership=None) -> dict:
         if i.consumed:
             return {"success": False, "error_type": "payment_consent_consumed"}
         try:
             if refill is not None and i.auto is True:
-                return await self._commit_payment_auto(i, fills, until, strict, refill, adopted)
+                return await self._commit_payment_auto(i, fills, until, strict, refill, adopted, ownership)
             return await self._commit_payment_once(i, fills, until, strict, repin)
         finally:
             # dlz: one cleanup for the whole lifecycle (freshness included) that a cancellation cannot cut short.

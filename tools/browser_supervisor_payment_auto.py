@@ -98,9 +98,15 @@ class PaymentAutoMixin:
         from tools.browser_supervisor import _schedule
 
         try:
-            return _schedule(self._arm_payment_auto(inspected), self._loop, timeout=10) is True
+            armed = _schedule(self._arm_payment_auto(inspected), self._loop, timeout=10) is True
         except Exception:  # health: allow BLE001 -- not armed: the fill runs as it did before re-inspection existed
-            return False
+            armed = False
+        if not armed:
+            # The caller's view is authoritative: an arming that timed out may still have got as far as setting the
+            # flag, and an inspection that is armed for the supervisor (relabel acceptance, re-inspection) but whose
+            # caller runs the base fill would be a fill that is neither.
+            inspected.auto, inspected.approval = False, None
+        return armed
 
     async def _arm_payment_auto(self, i: Any) -> bool:
         if i.consumed or i.owner is not self or not i.approval_id:
@@ -215,8 +221,17 @@ class PaymentAutoMixin:
             await asyncio.sleep(_REINSPECT_POLL_SECONDS)
         return None, refused
 
+    async def _ownership_stop(self, i: Any, ownership) -> str | None:
+        """dlz (fill-auto, r1 F11): the error type when the browser is no longer this task's to act on (the lease ended,
+        the supervisor was replaced, a human took control), asked of the vault's live check on a worker thread (it may
+        wait on control); None when it holds. A check that cannot answer is a stop."""
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, ownership, i)
+        except Exception:  # health: allow BLE001 -- an ownership check that cannot answer is not a yes
+            return "payment_browser_changed"
+
     async def _commit_payment_auto(self, i: Any, fills: list[dict], until: float | None, strict: bool,
-                                   refill, adopted) -> dict:
+                                   refill, adopted, ownership=None) -> dict:
         """dlz (fill-auto): the commit of an armed fill, as generations: each one is a whole commit on one
         inspection (``_commit_generation``: the same freshness, cart, policy and window checks, the same
         per-document and per-setter checks, the settled retention check). When a generation stops on a changed
@@ -230,6 +245,13 @@ class PaymentAutoMixin:
         current, current_fills, mode = i, fills, "fill"
         try:
             while True:
+                # The vault checked ownership at the commit fence for the first generation; a later generation starts
+                # after re-inspections and settling (seconds): the browser must still be this task's to act on.
+                if current is not i and ownership is not None:
+                    stopped = await self._ownership_stop(current, ownership)
+                    if stopped:
+                        current.consumed = True
+                        return _auto_result({"success": False, "error_type": stopped}, st)
                 again, result = await self._commit_generation(current, current_fills, stop, strict, mode,
                                                               st["reinspections"] > 0, st)
                 if not again:

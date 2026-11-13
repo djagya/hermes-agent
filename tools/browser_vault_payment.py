@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
@@ -531,6 +532,9 @@ _COMMIT_TEXTS = {
     "payment_result_invalid": (_TRANSPORT_UNCERTAIN, _TRANSPORT_UNCERTAIN),
     "payment_cart_changed": (_CART_CHANGED, _CART_CHANGED_PARTIAL),
     "payment_destination_disabled": (_DESTINATION_DISABLED + _READ_NOT_WRITTEN, _DESTINATION_DISABLED_PARTIAL),
+    # dlz (fill-auto): ownership lost between the generations of an armed commit; earlier generations may have written
+    "payment_browser_changed": (_BROWSER_CHANGED, _PARTIAL_STOPPED),
+    "human_has_control": (_BROWSER_CHANGED, _PARTIAL_STOPPED),
 }
 
 
@@ -621,19 +625,20 @@ def _approved_page(vault, task_id: str, supervisor, inspected, lease: str, unrev
 
 
 def _commit(vault, supervisor, inspected, fills: list, strict: bool, secret: dict, unreviewed: bool, auto: bool,
-            refreshed: int) -> dict:
+            refreshed: int, task_id: str = "", lease: str = "") -> dict:
     """The commit: the armed one (``_auto_commit``) when this fill was armed, else the one it always was (with the
     re-pin argument when ``vault.payment_repin`` is on; an armed fill never re-pins)."""
     if not (auto and getattr(inspected, "auto", False) is True):
         return supervisor.commit_payment(inspected, fills, strict=strict, **_repin_argument(unreviewed))
-    result = _auto_commit(vault, supervisor, inspected, fills, strict, secret)
+    result = _auto_commit(vault, supervisor, inspected, fills, strict, secret, task_id, lease)
     if refreshed:  # the re-inspection after the approval counts with those under the fill
         again = result.setdefault("fill_reinspect", {"count": 0, "repairs": 0})
         again["count"] = again.get("count", 0) + refreshed
     return result
 
 
-def _auto_commit(vault, supervisor, inspected, fills: list, strict: bool, secret: dict) -> dict:
+def _auto_commit(vault, supervisor, inspected, fills: list, strict: bool, secret: dict, task_id: str = "",
+                 lease: str = "") -> dict:
     """dlz (fill-auto): the commit of an armed fill: the supervisor may continue it on re-inspections of this
     approval. ``refill`` computes the fills for such a reading from the card already read for this fill (same rules
     as the first plan; no plan, no further write); each reading it continues on is recorded for payment_done."""
@@ -646,7 +651,15 @@ def _auto_commit(vault, supervisor, inspected, fills: list, strict: bool, secret
 
             record_payment(supervisor, fresh)
 
-    return supervisor.commit_payment(inspected, fills, strict=strict, refill=refill, adopted=adopted)
+    context = contextvars.copy_context()  # the check runs on a worker thread of the supervisor's loop
+
+    def ownership(current):
+        """The error type of a live-ownership refusal (the lease, the live supervisor, a Bot Desktop human), or None."""
+        refused = context.run(_ownership_refusal, vault, task_id, supervisor, current, lease)
+        return None if refused is None else str(refused.get("error_type") or "payment_browser_changed")
+
+    return supervisor.commit_payment(inspected, fills, strict=strict, refill=refill, adopted=adopted,
+                                     ownership=ownership)
 
 
 def _repin_argument(unreviewed: bool) -> dict:
@@ -924,7 +937,8 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 if unreviewed and destination_policy() != policy:  # B6, A6 step 16: the commit fence
                     return json.dumps(_disabled(after_read=True))
                 window.committing()  # from here a card value may be in the page: only control's unlock releases it
-            result = _commit(vault, supervisor, inspected, fills, strict, secret, unreviewed, auto, refreshed)
+            result = _commit(vault, supervisor, inspected, fills, strict, secret, unreviewed, auto, refreshed,
+                             task_id, lease)
             _log_commit(result)
             _commit_text(result)
             return json.dumps(_describe_result(result, backend, inspected, fills, prompt, bound_revision,

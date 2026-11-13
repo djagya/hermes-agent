@@ -112,7 +112,7 @@ class _AutoSupervisor(_ClosureSupervisor):
         return (None, refused) if refused else (fresh, "")
 
 
-def _auto_commit(scenario, tmp_path, monkeypatch, strict=False, parent=False, **checks):
+def _auto_commit(scenario, tmp_path, monkeypatch, strict=False, parent=False, ownership=None, **checks):
     """``parent``: the card document sits in an iframe of the merchant page (its owner chain is checked: ``owner``)."""
     from tools.browser_vault_payment import _document_fills
 
@@ -128,7 +128,7 @@ def _auto_commit(scenario, tmp_path, monkeypatch, strict=False, parent=False, **
         js.call("approve")
         monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
         out = asyncio.run(sup._commit_payment_auto(i, _document_fills(i, _SYNTHETIC), None, strict,
-                                                   lambda fresh: _document_fills(fresh, _SYNTHETIC), None))
+                                                   lambda fresh: _document_fills(fresh, _SYNTHETIC), None, ownership))
         return out, js.call("values"), sup.events
     finally:
         js.close()
@@ -652,3 +652,77 @@ def test_a_kept_field_still_gets_the_events_of_a_write(scenario, kept, tmp_path,
     for field in kept:  # once for its write in the first generation, once more, as no-ops, in the repair generation
         assert log.count(field + ":change") == 2 and log.count(field + ":input") == 2, (field, log)
     assert log.count("csc:change") == 2 and log.count("csc:input") == 2, log  # the cleared one: written again
+
+
+@pytest.mark.parametrize("refusal", ["human_has_control", "payment_browser_changed"])
+def test_ownership_is_asked_again_at_the_start_of_each_later_generation(refusal, tmp_path, monkeypatch):
+    """F11 (peer P3-7): a commit of up to 58 s must not go on writing after a human took control or the lease ended;
+    the first generation follows the vault's commit fence, every later one asks again."""
+    asked = []
+
+    def ownership(current):
+        asked.append(current)
+        return refusal
+
+    out, values, events = _auto_commit("auto_cvc_cleared", tmp_path, monkeypatch, ownership=ownership)
+    assert out["success"] is False and out["error_type"] == refusal and out["partially_filled"] is True, out
+    assert len(asked) == 1 and asked[0].consumed and events.count("commit") == 1, events  # asked once, before generation 2
+    assert out["filled_fields"] == 3 and out["fill_reinspect"] == {"count": 1, "repairs": 1}, out
+    asked.clear()
+    out, values, events = _auto_commit("auto_cvc_cleared", tmp_path, monkeypatch, ownership=lambda current: None)
+    assert out["success"] is True and values == _FILLED and events.count("commit") == 2
+    out, values, events = _auto_commit("auto_cvc_cleared", tmp_path, monkeypatch,
+                                       ownership=lambda current: (_ for _ in ()).throw(RuntimeError("control down")))
+    assert out["error_type"] == "payment_browser_changed" and events.count("commit") == 1  # cannot answer: a stop
+
+
+def test_the_vaults_ownership_check_is_the_live_one_and_its_stop_has_a_fixed_text(monkeypatch):
+    from types import SimpleNamespace
+
+    from tools import browser_vault_payment as bvp
+
+    seen = {}
+
+    class Supervisor:
+        def commit_payment(self, inspected, fills, **kw):
+            seen.update(kw)
+            return {"success": True}
+
+    refusals = [{"success": False, "error_type": "human_has_control", "error": "x"}, None]
+    monkeypatch.setattr(bvp, "_ownership_refusal", lambda vault, task_id, supervisor, current, lease:
+                        (seen.update(args=(task_id, lease, current)) or refusals.pop(0)))
+    bvp._auto_commit(SimpleNamespace(), Supervisor(), "inspection", [], False, {}, "task-1", "lease-1")
+    assert seen["ownership"]("fresh") == "human_has_control" and seen["args"] == ("task-1", "lease-1", "fresh")
+    assert seen["ownership"]("fresh") is None
+    for error_type in ("human_has_control", "payment_browser_changed"):
+        out = {"success": False, "error_type": error_type, "partially_filled": True}
+        bvp._commit_text(out)
+        assert out["error"] == bvp._PARTIAL_STOPPED
+        out = {"success": False, "error_type": error_type}
+        bvp._commit_text(out)
+        assert out["error"] == bvp._BROWSER_CHANGED
+
+
+def test_an_arming_that_timed_out_leaves_the_inspection_unarmed(monkeypatch):
+    """F12 (peer P3-8): the caller's view is authoritative; a timeout after the flag was set disarms."""
+    class Supervisor(sp.PaymentSupervisionMixin):
+        _loop = None
+
+        async def _remember_roles(self, i, earlier):
+            return None
+
+        async def _release_payment_documents(self, i):
+            pass
+
+    sup = Supervisor()
+    i = _reading(_APPROVED, owner=sup)
+    i.auto = False
+
+    def schedule(coro, loop, timeout):  # the arming got through, then the wait timed out
+        asyncio.run(coro)
+        assert i.auto is True
+        raise TimeoutError("arming timed out")
+
+    monkeypatch.setattr("tools.browser_supervisor._schedule", schedule)
+    assert sup.arm_payment_auto(i) is False
+    assert i.auto is False and i.approval is None
