@@ -2,10 +2,14 @@
 
 The card-fill path builds a :class:`PaymentPromptFacts` and calls :func:`request_payment_approval`.
 The facts travel to the gateway as ``approval_data["payment"]``; the Telegram adapter renders them
-with :func:`render_html` on a dedicated card in the owner's private chat. Rendering shows every
+with :func:`render_html` on a dedicated card where the owner talks to Sera (the session's group thread, or
+the owner's private chat; ``gateway.payment_approval``). Rendering shows every
 mandatory fact or raises :class:`PromptIncomplete`: it never truncates, and there is no plain-text
 ``/approve`` fallback. Only the owner's own Telegram button approves (``approvals.payment_approver``,
-checked in ``tools.approval.resolve_gateway_approval``); every other surface can only deny.
+checked in ``tools.approval.resolve_gateway_approval``); every other surface can only deny, and another
+group member's tap on the card changes nothing. When the card states the cart total, the owner's Approve is
+also the go for one Pay press of that checkout (owner decision 2026-11-13): the card says so, and nothing else
+authorizes a second press. A card without a stated total is fill-only: Pay needs the owner's go in chat.
 
 No card value ever enters these facts: they hold the card's label, origins, field names and the
 cart as Sera stated it.
@@ -42,12 +46,17 @@ _CURRENCY_RE = re.compile(r"[A-Z]{3}")
 # Control characters (C0, DEL, C1), bidi overrides/isolates, zero-width and line/paragraph separators.
 _UNSAFE_TEXT_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff`]")
 
-APPROVE_LABEL = "Approve fill once"
+APPROVE_LABEL = "Approve: fill + Pay once"
+# No total was stated: the card is fill-only, Pay needs the owner's go in chat.
+APPROVE_LABEL_FILL_ONLY = "Approve: fill only"
 DENY_LABEL = "Deny"
+# The session's chat, when it is someone else's private chat (the card went to the owner's own chat).
 GROUP_NOTICE = "Card-fill approval sent to the owner privately."
+# The card's group topic is gone: the send fails closed (never the group's General topic) and the card goes to the owner's chat.
+CARD_TOPIC_UNAVAILABLE = "payment card topic unavailable"
 # Reply to a typed /approve that a waiting card fill stopped (FIFO) or that skipped it (/approve all).
-TYPED_APPROVE_HELD = ("A card fill is waiting: only the owner's Approve button in the private Telegram chat "
-                      "approves it. Typed /approve does not; /deny refuses it.")
+TYPED_APPROVE_HELD = ("A card payment is waiting: only the owner's Approve button on its card approves it. "
+                      "Typed /approve does not; /deny refuses it.")
 
 PAGE_MATCH_LINES = {
     "matched": "Page check: the page shows this total (text check only).",
@@ -64,7 +73,7 @@ UNAVAILABLE_SURFACE = ("Card-fill approvals are only shown as a Telegram card to
                        "cannot send one. Ask the user to run the checkout from Telegram.")
 UNAVAILABLE_INCOMPLETE = ("The card-fill approval could not be shown completely, so it was not shown at all. "
                           "Tell the user; do not retry with different wording.")
-UNAVAILABLE_UNDELIVERED = ("The card-fill approval card was not delivered to the owner's private Telegram chat (the "
+UNAVAILABLE_UNDELIVERED = ("The card-fill approval card was not delivered to the owner on Telegram (the "
                            "send failed, Telegram did not confirm it in time, or the card could not show every "
                            "fact). If it posted late, it was withdrawn at once and a tap on it does nothing. Tell "
                            "the user the approval did not go through; do not retry the fill on your own.")
@@ -170,6 +179,8 @@ class PaymentPromptFacts:
     cart: Optional[StatedCart] = None
     page_match: PageMatch = field(default_factory=PageMatch)
     unreviewed: bool = False
+    # r4 S: ``vault.payment_pay_once`` as read when these facts were made (the card and the binding both need it on).
+    pay_once_on: bool = field(default_factory=lambda: payment_pay_once_enabled())
 
     def __post_init__(self):
         if not isinstance(self.ref, str) or not _REF_RE.fullmatch(self.ref):
@@ -193,6 +204,8 @@ class PaymentPromptFacts:
             raise FactsInvalid("a stated cart needs a page check, and no cart means not_checked")
         if bool(self.unreviewed) != any(r.status == "UNREVIEWED" for r in receiving):
             raise FactsInvalid("unreviewed must match the receiving origins")
+        if type(self.pay_once_on) is not bool:
+            raise FactsInvalid("pay_once_on must be a bool")
 
     def to_dict(self) -> dict:
         return {
@@ -204,6 +217,7 @@ class PaymentPromptFacts:
                 "total": self.cart.total, "currency": self.cart.currency},
             "page_match": {"state": self.page_match.state, "where": self.page_match.where},
             "unreviewed": self.unreviewed,
+            "pay_once_on": self.pay_once_on,
         }
 
     @classmethod
@@ -211,7 +225,7 @@ class PaymentPromptFacts:
         if not isinstance(data, dict):
             raise FactsInvalid("payment facts must be a mapping")
         expected = {"ref", "card_label", "merchant_origin", "receiving", "expires_in_s", "cart", "page_match",
-                    "unreviewed"}
+                    "unreviewed", "pay_once_on"}
         if set(data) != expected:
             raise FactsInvalid("payment facts have missing or unknown keys")
         return cls(**{**data, "receiving": tuple(data["receiving"] or ())})
@@ -223,12 +237,69 @@ def _check_origins(facts: PaymentPromptFacts) -> None:
             raise PromptIncomplete("an origin is not a plain https origin")
 
 
+_PAY_ONCE_ON = frozenset({"true", "on", "yes", "1", "enabled"})
+_MISSING = object()
+
+
+def payment_pay_once_enabled() -> bool:
+    """r4 S (owner fallback 2026-11-13): ``vault.payment_pay_once``. Absent: on. Present: on only when clearly on
+    (``true``, ``"on"``, ``"yes"``, ``1`` ...); ``false``, ``"false"``, ``0``, ``"off"``, an explicit null, any other
+    value, a ``vault`` section that is not a mapping, and config that cannot be read now are off. Off, every card is
+    fill-only: nothing is bound to the payment lock and every Pay press needs the owner's go in chat."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        from hermes_cli.config_read_errors import FailedConfigRead
+        config = load_config()
+        if isinstance(config, FailedConfigRead) or not isinstance(config, dict):
+            return False
+        vault = cfg_get(config, "vault", default=_MISSING)
+        if vault is _MISSING:
+            return True
+        if not isinstance(vault, dict):
+            return False
+        value = cfg_get(vault, "payment_pay_once", default=_MISSING)
+        if value is _MISSING:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in _PAY_ONCE_ON
+        return value is True or (type(value) is int and value == 1)
+    except Exception:  # health: allow BLE001 -- unreadable config: every card is fill-only
+        return False
+
+
+def pays_once(facts: PaymentPromptFacts) -> bool:
+    """Whether the owner's Approve also covers one Pay press: only when Sera stated the total and the page check
+    matched it (peer r2 P2), and ``vault.payment_pay_once`` is on, both when the facts were made and now (r4 S).
+    Otherwise the card is fill-only and Pay needs the owner's go in chat; the payment lock binds the total only in
+    this case (``browser_vault_payment._bind_approved_total``)."""
+    return (facts.cart is not None and facts.page_match.state == "matched" and facts.pay_once_on is True
+            and payment_pay_once_enabled())
+
+
+def scope_line(facts: PaymentPromptFacts) -> str:
+    """What one Approve tap does, in plain words: the fill and exactly one Pay press of this checkout, or (no
+    stated total, a total the page check did not match, or ``vault.payment_pay_once`` off) the fill only."""
+    if facts.cart is None:
+        return (f"Approve: Sera fills the card only, at {facts.merchant_origin}. No total was stated, so this "
+                "does not cover pressing Pay: Pay needs your go in chat.")
+    if facts.page_match.state == "matched" and not pays_once(facts):
+        return (f"Approve: Sera fills the card only, at {facts.merchant_origin}. Pay-once approvals are switched "
+                "off, so this does not cover pressing Pay: Pay needs your go in chat.")
+    if not pays_once(facts):
+        return (f"Approve: Sera fills the card only, at {facts.merchant_origin}. Hermes did not find "
+                f"{facts.cart.total} {facts.cart.currency} clearly as the page's total, so this does not cover "
+                "pressing Pay: Pay needs your go in chat.")
+    return (f"Approve: Sera fills the card and presses Pay once for {facts.cart.total} {facts.cart.currency} "
+            f"at {facts.merchant_origin}.")
+
+
 def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
     """The card body, one fact per line, in the order the owner reads it."""
-    lines = [bold("Approve card fill?"), ""]
+    lines = [bold("Approve card payment?"), ""]
     if facts.unreviewed:
         lines += ["⚠️ " + bold("UNREVIEWED destination:") + " Hermes has not reviewed where some card "
                   "fields go. Check every origin below.", ""]
+    lines += [bold(esc(scope_line(facts))), ""]
     lines += [f"Card: {bold(esc(facts.card_label))}",
               f"Merchant (top-level page): {code(facts.merchant_origin)}",
               "Card fields go to:"]
@@ -243,10 +314,10 @@ def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
         lines.append(f"Total (stated by Sera): {bold(esc(facts.cart.total + ' ' + facts.cart.currency))}")
         where = f" Checked on {esc(facts.page_match.where)}." if facts.page_match.where else ""
         lines.append(esc(PAGE_MATCH_LINES[facts.page_match.state]) + where)
-    lines += ["",
-              f"Scope: fill only, once. Expires in {facts.expires_in_s} s.",
-              "Hermes will not press Pay. If you told Sera in chat to pay, that go covers pressing Pay "
-              "after the fill.",
+    covers = ("One tap covers one fill and one Pay press for this checkout; any other payment needs a new approval."
+              if pays_once(facts) else
+              "One tap covers one fill only: pressing Pay needs your go in chat. Any other payment needs a new approval.")
+    lines += ["", f"{covers} Expires in {facts.expires_in_s} s.",
               "Hermes cannot verify what will be charged. HTTPS does not mean the seller is legitimate.",
               f"Ref: {code(facts.ref)}"]
     return lines
@@ -326,6 +397,16 @@ def request_payment_approval(facts: PaymentPromptFacts, *, timeout_seconds: Opti
     return PaymentConsent(outcome, reason, str(detail.get("detail") or ""))
 
 
+def _page_check(inspected) -> PageMatch:
+    """The page check the card shows. r4 C6 (peer r3 P2-3): Pay is gated on the merchant page alone, so a check that
+    matched across the merchant page and a payment form, but not on the merchant page by itself (or with that result
+    unknown), shows as ambiguous: the card is then fill-only."""
+    state, where = getattr(inspected, "page_match", ("not_checked", ""))
+    if state == "matched" and getattr(inspected, "merchant_match", None) != "matched":
+        state = "ambiguous"
+    return PageMatch(state, where)
+
+
 def facts_for_inspection(inspected, *, card_label: str, cart: Optional[StatedCart] = None) -> PaymentPromptFacts:
     """Facts for a fill: the inspected documents' origins and fields. dlz (Track B): with ``cart`` (Sera's stated
     cart), the page check the inspection pinned (``inspected.page_match``: state and where it looked) goes with it;
@@ -345,5 +426,5 @@ def facts_for_inspection(inspected, *, card_label: str, cart: Optional[StatedCar
         ref=inspected.operation_id, card_label=card_label, merchant_origin=merchant, receiving=receiving,
         expires_in_s=max(1, min(600, int(inspected.expires_at - time.monotonic()))),
         cart=cart,
-        page_match=PageMatch(*getattr(inspected, "page_match", ("not_checked", ""))) if cart is not None else PageMatch(),
+        page_match=_page_check(inspected) if cart is not None else PageMatch(),
         unreviewed=any(r.status == "UNREVIEWED" for r in receiving))

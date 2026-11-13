@@ -414,7 +414,7 @@ def test_consent_is_bounded_by_the_inspection_window_and_a_late_accept_writes_no
 
     out, calls = _fill_with_consent(monkeypatch, "accept", "accepted", on_consent=late, expires_in=40)
     assert 30 <= asked["timeout"] <= 40  # the prompt closes with the inspection window
-    assert out["error_type"] == "payment_consent_expired" and "120 s inspection window" in out["error"]
+    assert out["error_type"] == "payment_consent_expired" and "5-minute inspection window" in out["error"]
     assert calls == ["discard_payment"]  # no freshness pass, no secret, no write
 
 

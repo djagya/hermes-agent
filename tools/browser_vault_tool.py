@@ -1346,7 +1346,7 @@ BROWSER_VAULT_SCHEMA = {
         "save_declined; never retry payment_declined (the user refused the card-fill approval; never a bank or "
         "issuer decline). payment_consent_missing: no approval arrived (consent_outcome timeout or unavailable), "
         "nothing was written; stop and ask the user once before a new fill, which shows a new prompt. "
-        "payment_consent_expired: the 120 s inspection window closed; with partially_filled false nothing was "
+        "payment_consent_expired: the 5-minute inspection window closed; with partially_filled false nothing was "
         "written, ask again; with partially_filled true some fields were written: stop, do not submit or retry, "
         "tell the user. payment_fields_not_retained: "
         "fields were written but did not all hold after the page settled; do not submit or retry, tell the user. "
@@ -1377,9 +1377,27 @@ BROWSER_VAULT_SCHEMA = {
         "was redirected to) unless that page is a card form; payment_click (ref) makes one trusted click on a "
         "listed control, so the Pay button is clicked there; refs die when the page changes, when you list again, and after one press (successful or uncertain): "
         "a second press needs a new payment_controls. "
-        "The user's chat "
-        "go for the purchase covers pressing Pay once; never click Pay without it, never click it again when "
-        "payment_click_uncertain says a press may have landed. Page dialogs while locked: alerts are accepted and "
+        "The owner's Approve on a card-fill approval card that stated the cart total and whose page check matched it "
+        "(the button says \"fill + Pay once\") is the go for pressing Pay once "
+        "for that checkout (the card says so; no separate chat go is needed). Preparatory clicks of the checkout "
+        "(Continue, Next, Review order, a terms checkbox) are allowed before it; the one final press that places the "
+        "order and charges the card (Pay, Place order, Buy now) is made exactly once after a successful fill, never "
+        "a second time, and never again (nor anything else) when payment_click_uncertain says a press may have "
+        "landed. Before every press Hermes reads the merchant checkout page again and the pressed control's caption: "
+        "payment_total_changed means the page no longer shows exactly the approved total, shows another amount or "
+        "currency as what is charged, the control's caption holds another amount, or the checkout page changed "
+        "before any press; nothing was pressed, so stop and tell the owner, never retry. payment_approval_changed "
+        "(a new fill started meanwhile; nothing pressed) needs a new payment_controls; payment_total_unbound (the "
+        "card covered Pay but its total could not be bound) means stop and tell the owner, owner_go does not help. "
+        "A bank or 3-D Secure page (another site in the payment tab, or a bank challenge in place of the card form) "
+        "can be clicked only after a press checked against this approval; a later page of the shop's own site is "
+        "checked like the checkout. payment_controls and payment_done report "
+        "presses_in_lock (null = unknown): the presses this process started in the lock, an uncertain one included; "
+        "count your own presses: after the final Pay press, another payment_click is only for a bank or 3-D Secure "
+        "step, never a second Pay. A card with no stated total, or whose page check did not match it, or with "
+        "Pay-once switched off, says \"fill only\": "
+        "its Approve is not a go for Pay, so do not press Pay until the owner says to in chat; then every "
+        "payment_click needs owner_go true (payment_go_required otherwise; nothing pressed). Page dialogs while locked: alerts are accepted and "
         "prompts dismissed by Hermes; a confirm waits and payment_controls / payment_click / payment_done report "
         "dialog_pending {id, type, origin, on_payment_tab_top, on_shop_page, text} for the payment tab (text "
         "redacted, bounded, every 3+ digit run and date masked except an amount exactly equal to the cart total "
@@ -1411,6 +1429,9 @@ BROWSER_VAULT_SCHEMA = {
                                                   "letter_signed_in", "letter_done", "payment_controls",
                                                   "payment_click", "payment_done", "payment_dialog", "payment_close"]},
             "ref": {"type": "string", "description": "payment_click only: a ref from payment_controls."},
+            "owner_go": {"type": "boolean", "description": "payment_click only: true only after the owner's "
+                         "explicit go in chat for this purchase, when its approval card said fill only. Never set "
+                         "it on your own judgement; it does not override payment_total_changed."},
             "accept": {"type": "boolean", "description": "payment_dialog only: true accepts, false dismisses the "
                                                          "dialog_pending confirm."},
             "dialog_id": {"type": "string", "description": "payment_dialog only: dialog_pending.id of the confirm "
@@ -1569,7 +1590,7 @@ def _native(supervisor: Any, call) -> dict:
     return out
 
 
-def _payment_surface_action(task_id: Optional[str], ref: Optional[str]) -> str:
+def _payment_surface_action(task_id: Optional[str], ref: Optional[str], owner_go: bool = False) -> str:
     """dlz: native actions on a locked payment tab (managed browser only)."""
     from tools import browser_payment_surface as surface
 
@@ -1579,7 +1600,7 @@ def _payment_surface_action(task_id: Optional[str], ref: Optional[str]) -> str:
     supervisor = _managed_supervisor(task_id or "default")
     if ref is None:
         return json.dumps(surface.payment_controls(supervisor))
-    return json.dumps(surface.payment_click(supervisor, ref))
+    return json.dumps(surface.payment_click(supervisor, ref, owner_go=owner_go))
 
 
 def _payment_dialog_action(task_id: Optional[str], dialog_id: Any, accept: Any) -> str:
@@ -1594,12 +1615,15 @@ def _payment_dialog_action(task_id: Optional[str], dialog_id: Any, accept: Any) 
 
 def _payment_done_action(task_id: Optional[str], expected_origin: str) -> str:
     """dlz (lockdown §2): the native confirmation handover after Pay (managed browser only)."""
+    from tools import browser_payment_surface as surface
     from tools.browser_payment_done import payment_done
 
     if not _is_managed():
         return json.dumps({"success": False, "error_type": "payment_surface_none",
                            "error": "Only the managed browser locks a card payment; use the browser tools as usual."})
-    return json.dumps(payment_done(_managed_supervisor(task_id or "default"), expected_origin))
+    supervisor = _managed_supervisor(task_id or "default")
+    presses = surface.presses_in_lock(supervisor)  # read before the call: a done that ends the lock forgets it
+    return json.dumps({**payment_done(supervisor, expected_origin), "presses_in_lock": presses})
 
 
 def _payment_close_action(task_id: Optional[str]) -> str:
@@ -1689,7 +1713,8 @@ def _handle_vault_inner(args: dict[str, Any], **kwargs) -> str:
         "letter_signed_in": lambda: _outside_payment_lock(
             tid, lambda: browser_vault_letter_signed_in(handle, task_id=tid)),
         "payment_controls": lambda: _payment_surface_action(tid, None),
-        "payment_click": lambda: _payment_surface_action(tid, str(args.get("ref") or "")),
+        "payment_click": lambda: _payment_surface_action(tid, str(args.get("ref") or ""),
+                                                         owner_go=args.get("owner_go") is True),
         "payment_done": lambda: _payment_done_action(tid, str(args.get("expected_origin") or "")),
         "payment_dialog": lambda: _payment_dialog_action(tid, args.get("dialog_id"), args.get("accept")),
         "payment_close": lambda: _payment_close_action(tid),

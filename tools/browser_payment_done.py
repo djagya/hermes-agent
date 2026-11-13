@@ -119,10 +119,12 @@ def _url_origin(url: Any) -> str:
     return f"{parts.scheme}://{authority}" + (f":{port}" if port not in (None, default) else "")
 
 
-def record_payment(supervisor: Any, inspected: Any) -> None:
+def record_payment(supervisor: Any, inspected: Any, adopted: bool = False) -> None:
     """Called once control confirmed a claim: remember the payment tab and its card documents for
     ``payment_done``. Never raises; an inspection it cannot read records nothing (payment_done then
-    refuses with ``payment_done_no_payment``)."""
+    refuses with ``payment_done_no_payment``). ``adopted`` (fill-auto): a re-inspection an armed fill continues on,
+    inside the approval already recorded: the total the owner approved stays. Any other second record of the tab is a
+    fill of its own and starts without one, as before 11-13."""
     try:
         tree, merchant = tuple(inspected.tree), inspected.merchant_origin
         loaders = {row[0]: row[1] for row in tree}
@@ -147,7 +149,8 @@ def record_payment(supervisor: Any, inspected: Any) -> None:
         old = tabs.get(payment.tab)
         if old is not None:  # a second fill on the same tab: every card document of both counts
             payment = _Payment(payment.tab, payment.merchant, payment.loader, old.documents | payment.documents,
-                               old.receiving | payment.receiving, old.merchant_fields or payment.merchant_fields)
+                               old.receiving | payment.receiving, old.merchant_fields or payment.merchant_fields,
+                               *((old.amount, old.currency) if adopted is True else ()))
         tabs[payment.tab] = payment
 
 

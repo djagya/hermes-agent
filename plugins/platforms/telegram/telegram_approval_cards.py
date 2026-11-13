@@ -7,8 +7,9 @@ payment card, the approver. A tap acts only when every binding matches; the reco
 the one tap that acts, so a replay, another card's nonce, or any button from before an adapter
 restart (an empty map) resolves nothing.
 
-``ea:`` is the exec-approval card; ``pa:`` the card-fill approval card (``send_payment_approval``),
-sent only to the approver's private chat and answered only by the approver's own Telegram user.
+``ea:`` is the exec-approval card; ``pa:`` the card-fill approval card (``send_payment_approval``), sent to the
+approver's private chat or to a group chat (the session's own chat and thread, ``gateway.payment_approval``) and
+answered only by the approver's own Telegram user: anyone else's tap, Deny included, changes nothing.
 Every tap is answered through ``callback_answer.answer_callback``: Telegram refusing the answer of an
 expired query never escapes the handler, so a settled card still loses its buttons.
 """
@@ -23,11 +24,16 @@ import time
 from typing import Any, Optional
 
 from plugins.platforms.telegram.callback_answer import answer_callback
+from tools.payment_consent_prompt import CARD_TOPIC_UNAVAILABLE
 
 logger = logging.getLogger(__name__)
 
+
+class TopicUnavailable(RuntimeError):
+    """A fail-closed send found its forum topic gone; nothing was sent."""
+
 _MAX_CARDS = 512
-_OWNER_ONLY = "Only the owner can answer this card-fill approval."
+_OWNER_ONLY = "Only the owner can approve this card payment."
 _INVALID = "This button does not match its approval card."
 _ALREADY = "This approval was already answered or has expired."
 _RETIRED = {
@@ -56,7 +62,7 @@ class TelegramApprovalCardsMixin:
 
     def _arm_approval_card(self, nonce: str, kind: str, msg: Any, *, chat_id: str, session_key: str,
                            request_id: Optional[str], choices, approver: Optional[str] = None,
-                           text: str = "") -> None:
+                           text: str = "", fill_only: bool = False) -> None:
         """Record the card once it was sent: its identity is the sent message itself."""
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 
@@ -65,7 +71,7 @@ class TelegramApprovalCardsMixin:
             cards.pop(next(iter(cards)))
         cards[nonce] = {
             "kind": kind, "session_key": session_key, "request_id": request_id, "choices": tuple(choices),
-            "approver": approver, "text": text,
+            "approver": approver, "text": text, "fill_only": fill_only,
             "chat_id": _scalar(getattr(msg, "chat_id", None)) or _scalar(normalize_telegram_chat_id(chat_id)),
             "message_id": _scalar(getattr(msg, "message_id", None)),
             "thread_id": _scalar(getattr(msg, "message_thread_id", None)),
@@ -117,15 +123,25 @@ class TelegramApprovalCardsMixin:
         return record, choice, presser
 
     async def send_payment_approval(self, chat_id: str, facts, request_id: str, session_key: str,
-                                    approver: str):
-        """The card-fill approval card in the approver's private chat: every mandatory fact or no
-        card (``SendResult(success=False)``), buttons "Approve fill once" / "Deny"."""
+                                    approver: str, metadata: Optional[dict] = None, requester: str = ""):
+        """The card-fill approval card in the approver's private chat or a group chat (in the thread
+        *metadata* names): every mandatory fact or no card (``SendResult(success=False)``), buttons
+        ``APPROVE_LABEL`` / ``DENY_LABEL``. Any other private chat (someone else's) never gets it, and a group
+        chat only when *requester* (the turn's sender) is the approver himself."""
         from gateway.platforms.base import SendResult
-        from tools.payment_consent_prompt import APPROVE_LABEL, DENY_LABEL, PromptIncomplete, render_html
+        from tools.payment_consent_prompt import (
+            APPROVE_LABEL, APPROVE_LABEL_FILL_ONLY, DENY_LABEL, PromptIncomplete, pays_once, render_html)
         from plugins.platforms.telegram.adapter import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
+        from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 
-        if not approver or approver != f"telegram:{chat_id}" or not request_id:
-            return SendResult(success=False, error="the payment card goes only to the approver's private chat")
+        platform, _, user_id = str(approver or "").partition(":")
+        target = normalize_telegram_chat_id(chat_id)
+        own_chat = isinstance(target, int) and str(target) == user_id
+        group = isinstance(target, int) and target < 0 and str(requester or "") == user_id
+        if (platform != "telegram" or not user_id.isascii() or not user_id.isdigit() or not (own_chat or group)
+                or not request_id):
+            return SendResult(success=False,
+                              error="the payment card goes only to the approver's private chat or a group chat")
 
         def build():
             try:
@@ -133,15 +149,58 @@ class TelegramApprovalCardsMixin:
             except PromptIncomplete:
                 return SendResult(success=False, error="payment prompt incomplete")
             nonce = secrets.token_urlsafe(16)
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(APPROVE_LABEL, callback_data=f"pa:once:{nonce}"),
-                                              InlineKeyboardButton(DENY_LABEL, callback_data=f"pa:deny:{nonce}")]])
+            # One button per row: the approve label is never cut on a phone.
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
+                APPROVE_LABEL if pays_once(facts) else APPROVE_LABEL_FILL_ONLY, callback_data=f"pa:once:{nonce}")],
+                                             [InlineKeyboardButton(DENY_LABEL, callback_data=f"pa:deny:{nonce}")]])
 
             def on_sent(msg):
                 self._arm_approval_card(nonce, "pa", msg, chat_id=chat_id, session_key=session_key,
                                         request_id=request_id, choices=("once", "deny"), approver=approver,
-                                        text=text)
+                                        text=text, fill_only=not pays_once(facts))
             return text, keyboard, on_sent
-        return await self._send_prompt("send_payment_approval", chat_id, None, build, parse_mode=ParseMode.HTML)
+        return await self._send_prompt("send_payment_approval", chat_id, metadata, build, parse_mode=ParseMode.HTML,
+                                       thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode,
+                                       fail_closed=group)
+
+    async def remind_payment_card(self, request_id: str, text: str) -> bool:
+        """One plain *text* replying to the armed payment card of *request_id*, in its chat and thread. False (nothing
+        sent) once the card is gone: tapped, retired or evicted."""
+        record = next((r for r in self._approval_card_map().values()
+                       if r["kind"] == "pa" and r["request_id"] == request_id), None)
+        if record is None or record["message_id"] is None or self._bot is None:
+            return False
+        from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+
+        kwargs = {"chat_id": normalize_telegram_chat_id(record["chat_id"]), "text": text,
+                  "reply_to_message_id": int(record["message_id"])}
+        if record["thread_id"] is not None:
+            kwargs["message_thread_id"] = int(record["thread_id"])
+        try:
+            await self._send_message_with_thread_fallback(fail_closed=True, **kwargs)
+        except Exception as exc:  # health: allow BLE001 -- best effort: the card itself is still live
+            logger.warning("[%s] Payment approval reminder failed: %s", self.name, type(exc).__name__)
+            return False
+        return True
+
+    async def send_payment_notice(self, chat_id: str, text: str, metadata: Optional[dict] = None) -> bool:
+        """One fixed payment notice (the card's expiry in a group) in *chat_id* and the thread *metadata* names, sent
+        fail-closed (peer r2 P3): a gone topic drops it, never the group's General topic. False when nothing was
+        sent."""
+        if self._bot is None:
+            return False
+        from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+
+        kwargs = {"chat_id": normalize_telegram_chat_id(chat_id), "text": text}
+        thread = self._metadata_thread_id(metadata)
+        if thread is not None and str(thread).isascii() and str(thread).isdigit():
+            kwargs["message_thread_id"] = int(thread)
+        try:
+            await self._send_message_with_thread_fallback(fail_closed=True, **kwargs)
+        except Exception as exc:  # health: allow BLE001 -- best effort: the card's own edit already says it expired
+            logger.warning("[%s] Payment approval notice failed: %s", self.name, type(exc).__name__)
+            return False
+        return True
 
     def payment_delivery_mark(self) -> int:
         """The polling generation now; :meth:`payment_delivery_disrupted` compares against it."""
@@ -176,10 +235,10 @@ class TelegramApprovalCardsMixin:
 
     async def _handle_payment_approval_callback(self, query, data: str, cb: dict) -> None:
         """``pa:<once|deny>:<nonce>`` — the owner answers a card-fill approval."""
-        from plugins.platforms.telegram.adapter import _unauthorized
         from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 
-        claimed = await self._claim_approval_card(query, data, cb, "pa", _unauthorized())
+        # Every tap but the owner's is answered with the owner-only text, the callback allowlist's refusal too.
+        claimed = await self._claim_approval_card(query, data, cb, "pa", _OWNER_ONLY)
         if claimed is None:
             return
         record, choice, presser = claimed
@@ -195,6 +254,8 @@ class TelegramApprovalCardsMixin:
         if not count:
             label = "Expired or already answered: nothing was approved."
         else:
-            label = "Approved: fill once." if choice == "once" else "Denied: nothing will be filled."
+            approved = ("Approved: Sera fills the card. Pay needs your go in chat." if record.get("fill_only")
+                        else "Approved: Sera fills the card and presses Pay once.")
+            label = approved if choice == "once" else "Denied: nothing will be filled or paid."
         await answer_callback(query, label)
         await edit_keeping_prompt(self, query, label)

@@ -193,7 +193,8 @@ from plugins.platforms.telegram.telegram_media_flood import TelegramMediaFloodMi
 from plugins.platforms.telegram import telegram_flood_window as _flood_window
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
-from plugins.platforms.telegram.telegram_approval_cards import TelegramApprovalCardsMixin
+from plugins.platforms.telegram.telegram_approval_cards import TelegramApprovalCardsMixin, TopicUnavailable
+from tools.payment_consent_prompt import CARD_TOPIC_UNAVAILABLE
 from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt, log_resolved, tap_matches_prompt
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
 from plugins.platforms.telegram.callback_answer import TOAST_LIMIT as _TOAST_LIMIT, answer_callback, answer_or_note
@@ -3897,10 +3898,13 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramContactMixin, TelegramH
         ``sendMessageDraft``; reusing ``draft_id`` animates the preview. The caller sends the final text."""
         return await _flood_window.send_draft(self, chat_id, draft_id, content, metadata)
 
-    async def _send_message_with_thread_fallback(self, **kwargs):
+    async def _send_message_with_thread_fallback(self, *, fail_closed: bool = False, **kwargs):
         """Send a control-style message (approval prompts, pickers, update prompts) that can carry a stale
         thread_id from a DM reply chain: on a missing topic, a private chat goes to the root without the anchor;
         a forum retries without message_thread_id. ``_send_chunk_with_retries`` has its own.
+
+        ``fail_closed``: a missing topic raises ``TopicUnavailable`` instead of retrying at the chat root (a
+        message with private details must never land in a group's General topic).
         """
         if not self._bot:
             raise RuntimeError("Not connected")
@@ -3910,6 +3914,10 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramContactMixin, TelegramH
                 self._bot.send_message(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
         except Exception as send_err:
             if (message_thread_id is not None and self._is_bad_request_error(send_err) and self._is_thread_not_found_error(send_err)):
+                if fail_closed:
+                    logger.warning("[%s] Thread %s not found for a fail-closed message, not retrying at the root",
+                                   self.name, message_thread_id)
+                    raise TopicUnavailable(CARD_TOPIC_UNAVAILABLE) from None
                 logger.warning(
                     "[%s] Thread %s not found for control message, retrying without message_thread_id", self.name, message_thread_id)
                 # Same prune as the text send path; an anchor into the dead topic must not steer the retry.
@@ -3921,8 +3929,8 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramContactMixin, TelegramH
 
     async def _send_control_message(
         self, chat_id: str, text: str, *, parse_mode: Any, thread_id: Optional[str], metadata: Optional[dict[str, Any]],
-        reply_markup: Any = None, reply_to_mode: Optional[str] = None):
-        """Send a control-style message (prompt/picker) with topic routing + thread fallback."""
+        reply_markup: Any = None, reply_to_mode: Optional[str] = None, fail_closed: bool = False):
+        """Send a control-style message (prompt/picker) with topic routing + thread fallback (none when *fail_closed*)."""
         reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=reply_to_mode)
         kwargs: dict[str, Any] = {
             "chat_id": normalize_telegram_chat_id(chat_id), "text": text, "parse_mode": parse_mode, **self._link_preview_kwargs()}
@@ -3931,10 +3939,11 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramContactMixin, TelegramH
         kwargs["reply_to_message_id"] = reply_to_id
         kwargs.update(self._thread_kwargs_for_send(
             chat_id, thread_id, metadata, reply_to_message_id=reply_to_id, reply_to_mode=reply_to_mode))
-        return await self._send_message_with_thread_fallback(**kwargs)
+        return await self._send_message_with_thread_fallback(fail_closed=fail_closed, **kwargs)
 
     async def _send_prompt(self, what: str, chat_id: str, metadata: Optional[dict[str, Any]], build, *,
-                           parse_mode: Any = None, thread_id: Any = None, reply_to_mode: Any = None) -> SendResult:
+                           parse_mode: Any = None, thread_id: Any = None, reply_to_mode: Any = None,
+                           fail_closed: bool = False) -> SendResult:
         """Shared control-prompt shell: not-connected guard, ``build()`` → ``(text, keyboard, on_sent)`` (or a
         SendResult to return as-is), routed send, state hook, redacted failure log."""
         if not self._bot:
@@ -3946,7 +3955,8 @@ class TelegramAdapter(TelegramInlinePhotosMixin, TelegramContactMixin, TelegramH
             text, keyboard, on_sent = built
             msg = await self._send_control_message(
                 chat_id, text, parse_mode=parse_mode if parse_mode is not None else ParseMode.MARKDOWN_V2,
-                reply_markup=keyboard, thread_id=thread_id, metadata=metadata, reply_to_mode=reply_to_mode)
+                reply_markup=keyboard, thread_id=thread_id, metadata=metadata, reply_to_mode=reply_to_mode,
+                fail_closed=fail_closed)
             if on_sent is not None:
                 on_sent(msg)
             return SendResult(success=True, message_id=str(msg.message_id))

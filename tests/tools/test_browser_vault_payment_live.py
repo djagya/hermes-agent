@@ -130,8 +130,11 @@ _PP_VARIANTS = {
     # A re-render that hides the written number input and shows a fresh, empty one beside it.
     "hidden": {"number": "el.addEventListener('input',()=>setTimeout(()=>{el.style.display='none';"
                "const n=document.createElement('input');n.autocomplete='cc-number';el.after(n)},200))"},
-    # The page hides the written number FRAME and shows a fresh, empty one (the old one keeps its value).
-    "frameswap": {"number": "el.addEventListener('input',()=>setTimeout(()=>parent.postMessage('swap','*'),200))"},
+    # The page hides the written number FRAME and shows a fresh, empty one beside it at the same path with another
+    # query (the old one keeps its value; only the first document swaps itself).
+    "frameswap": {"number": "if(!location.search)el.addEventListener('input',()=>setTimeout(()=>parent.postMessage('swap','*'),200))"},
+    # ... and the same swap to a frame at ANOTHER path of the provider's origin (r1 F8: the approval binds the paths)
+    "pathswap": {"number": "el.addEventListener('input',()=>setTimeout(()=>parent.postMessage('swap','*'),200))"},
     # A reset that lands later than one second after the last write.
     "late": {"number": "el.addEventListener('input',()=>setTimeout(()=>{el.value=''},1500))"},
     # The provider re-formats the expiry ("07/35" -> "07 / 35"), which is the same value.
@@ -150,6 +153,7 @@ _PP_GUEST_FORM = ('<label for="email">E-Mail</label><input id="email" name="emai
 
 
 def _paypal_page(path, origins):
+    path = path.split("?")[0]  # a swapped frame carries a query
     parts = path.split("/")
     if path == "/pp-guest":
         return f'<iframe src="{origins["psp"]}/smart/buttons/g"></iframe>'
@@ -167,7 +171,7 @@ def _paypal_page(path, origins):
                  "for(let i=0;i<frames.length;i++)frames[i].postMessage('brand','*');"
                  "if(e.data==='swap')for(const f of document.querySelectorAll('iframe'))if(f.contentWindow===e.source)"
                  "{f.style.display='none';const n=document.createElement('iframe');"
-                 "n.src=f.src.replace('/frameswap/','/stable/');f.after(n)}})</script>")
+                 "n.src=f.src.includes('/pathswap/')?f.src.replace('/pathswap/','/stable/'):f.src+'?swapped';f.after(n)}})</script>")
         return relay + "".join(
             f'<iframe src="{origins["psp"]}/smart/card-field/{path[4:]}/{f}"></iframe>' for f in _PP_FIELDS)
     return None
@@ -320,6 +324,66 @@ def _datatrans_page(path, origins):
     return None
 
 
+# dlz (fill-auto, 11-13): the three real stops of 11-12/13 as synthetic shapes (the real DOMs were not captured; each
+# is the behaviour its stop record describes) and the changes that must still stop.
+_FA_FIELDS = ('<label for="num">Card number</label><input id="num" autocomplete="cc-number">'
+              '<label for="exp">Expiry date (MM/YY)</label><input id="exp" autocomplete="cc-exp" placeholder="MM/YY">'
+              '<label for="c3">Security code</label><input id="c3" name="f3" maxlength="4">')
+_FA_PROMO = '<label for="c4">Promo code</label><input id="c4" name="f4">'
+# `log`: the fields whose value an input event changed (a kept field's no-op events change nothing and are not writes).
+_FA_LOG = ("<script>window.log=[];const was=new WeakMap();document.addEventListener('input',e=>{"
+           "if(e.target.value!==(was.get(e.target)||''))log.push(e.target.id);was.set(e.target,e.target.value)},true);"
+           "const $=id=>document.getElementById(id),lab=id=>document.querySelector('label[for='+id+']');</script>")
+_FA_SCRIPTS = {
+    # SBB / pay.datatrans.com: every write re-labels the other fields (validation text), on the same elements;
+    # relabelNow() does it once more while the approval is open.
+    "relabel": "let n=0;document.addEventListener('input',()=>{n++;for(const id of ['num','exp','c3'])"
+               "lab(id).textContent=lab(id).textContent.split(' - ')[0]+($(id).value?'':' - required ('+n+')')});"
+               "window.relabelNow=()=>{lab('num').textContent='Card number - please check'};",
+    # A label-only change that moves a role: the CVC's and the promo field's labels swap on the first write.
+    "relabel_swap": "let d=0;document.addEventListener('input',()=>{if(d++)return;lab('c3').textContent='Promo code';"
+                    "lab('c4').textContent='Security code'});",
+    # A re-mounted component: the first write replaces the (still empty) CVC input by a fresh, identical one.
+    "replace": "let d=0;document.addEventListener('input',()=>{if(d++)return;const n=$('c3').cloneNode(true);"
+               "$('c3').replaceWith(n)});",
+    # Eurowings: brand detection after the card number clears the CVC a moment later (once).
+    "retain": "let d=0;$('num').addEventListener('input',()=>{if(d++)return;setTimeout(()=>{$('c3').value='';was.set($('c3'),'')},300)});",
+    # ... or re-mounts it empty.
+    "retain_remount": "let d=0;$('num').addEventListener('input',()=>{if(d++)return;setTimeout(()=>{"
+                      "const n=$('c3').cloneNode(true);n.value='';$('c3').replaceWith(n)},300)});",
+    # r3 G3: the clear follows EVERY card number input event (30 ms / 300 ms later), a repeated no-op event included.
+    "retain_every30": "$('num').addEventListener('input',()=>{setTimeout(()=>{$('c3').value='';was.set($('c3'),'')},30)});",
+    "retain_every": "$('num').addEventListener('input',()=>{setTimeout(()=>{$('c3').value='';was.set($('c3'),'')},300)});",
+    # A CVC that never keeps its value.
+    "retain_never": "document.addEventListener('input',e=>{if(e.target.id==='c3')setTimeout(()=>{$('c3').value='';was.set($('c3'),'')},100)},true);",
+    # Still stops: the next field hidden for good; the top document's URL changed.
+    "hide": "let d=0;document.addEventListener('input',()=>{if(d++)return;$('c3').style.display='none'});",
+    "navigate": "let d=0;document.addEventListener('input',()=>{if(d++)return;history.pushState({},'',location.pathname+'?step=2')});",
+    "plain": "",
+}
+# FlixBus / assets.payrails.io: an unreviewed hosted form that re-renders while the approval is open. On 'rerender'
+# from the merchant page the form is removed and, `delay` ms later, built again from fresh elements.
+_FA_PAYRAILS = ('<meta charset="utf-8"><div>Total 22,66 EUR</div><div id="root">' + _FA_FIELDS.replace(
+    'name="f3"', 'autocomplete="cc-csc"') + "</div>" + _FA_LOG + "<script>addEventListener('message',e=>{"
+    "if(!e.data||e.data.t!=='rerender')return;const root=$('root'),html=root.innerHTML;root.innerHTML='';"
+    "setTimeout(()=>{root.innerHTML=html;parent.postMessage('rerendered','*')},e.data.delay)})</script>")
+
+
+def _fill_auto_page(path, origins):
+    psp, parts = origins.get("psp", ""), path.split("?")[0].split("/")
+    if len(parts) == 3 and parts[1] == "fa" and parts[2] in _FA_SCRIPTS:
+        return _FA_FIELDS + _FA_PROMO + _FA_LOG + "<script>" + _FA_SCRIPTS[parts[2]] + "</script>"
+    if path.startswith("/fa/payrails"):
+        return _FA_PAYRAILS
+    if path == "/fa-hosted":  # a reviewed hosted form in one frame
+        return f'<div id="slot"><iframe id="card" src="{psp}/fa/plain" style="width:560px;height:200px"></iframe></div>'
+    if path == "/fa-payrails":
+        return ('<meta charset="utf-8"><p>2 x Adult</p><p>Gesamtbetrag 22,66 €</p>'
+                f'<iframe id="pr" src="{psp}/fa/payrails?v=1" style="width:560px;height:220px"></iframe>'
+                "<script>addEventListener('message',e=>{if(e.data==='rerendered')window.rerendered=true})</script>")
+    return None
+
+
 def _provider_page(path, origins):
     psp = origins.get("psp", "")
     merchants = {
@@ -391,7 +455,7 @@ def payment_browser(tmp_path, record_property):
                 f'<iframe src="{origins["psp"]}/dt-number"></iframe><iframe src="{origins["psp"]}/dt-cvc"></iframe>',
             }.get(self.path) or _shopify_page(self.path, origins) or _paypal_page(self.path, origins) \
                 or _payone_page(self.path, origins) or _kps_page(self.path, origins) \
-                or _datatrans_page(self.path, origins) \
+                or _datatrans_page(self.path, origins) or _fill_auto_page(self.path, origins) \
                 or _provider_page(self.path, origins) or FIELDS
             body = (
                 '<!doctype html><form onsubmit="window.submitted=true;return false">'
@@ -922,10 +986,14 @@ def test_provider_shapes_fill_once_without_submit(payment_browser, tmp_path, mon
     assert fill("/wallet")["target_origins"] == [origins["psp"]] and len(frame_values("/smart/")) == 2
 
 
-def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browser, tmp_path, monkeypatch, caplog):
+@pytest.mark.parametrize("auto", [False, True])
+def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browser, tmp_path, monkeypatch, caplog, auto):
     """Four hosted card-field frames on one provider origin. A value the provider drops after the
     per-document check (delayed reset, brand detection in another frame, reset on blur, a replaced
-    node) must not come back as success; a stable fill and a re-formatted expiry must."""
+    node) must not come back as success; a stable fill and a re-formatted expiry must.
+    dlz (11-13): ``auto`` (vault.payment_fill_auto): a value lost once (brand detection, a re-mounted or swapped
+    field or frame) is written once more on a fresh inspection and then holds; a field that drops every write still
+    ends as not retained after that one repair, and success is still only what every field holds after settling."""
     from dataclasses import replace
 
     from agent import vault_payment_policy as policy
@@ -943,12 +1011,13 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
     monkeypatch.setattr(policy, "PAYMENT_PROVIDERS", policy.PAYMENT_PROVIDERS + (
         replace(policy.OPT_IN_PROVIDERS[0], name="synthetic-paypal", origins=(origins["psp"],), max_documents=4,
                 paths=("/smart/card-field",)),))
+    monkeypatch.setattr("tools.browser_vault_payment.payment_fill_auto_enabled", lambda: auto)
 
     def frame_values(variant):
         out = {}
         targets = _schedule(sup._cdp("Target.getTargets"), sup._loop, timeout=10)["result"]["targetInfos"]
         for t in targets:
-            if t["type"] == "iframe" and f"/smart/card-field/{variant}/" in t["url"]:
+            if t["type"] == "iframe" and f"/smart/card-field/{variant}/" in t["url"] and "?swapped" not in t["url"]:
                 fsid = _schedule(sup._cdp("Target.attachToTarget", {"targetId": t["targetId"], "flatten": True}),
                                  sup._loop, timeout=10)["result"]["sessionId"]
                 try:
@@ -968,8 +1037,8 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
         # No extra wait: the fill itself settles 2.0 s after the last write, past every scripted
         # reset (the latest fires at 1.5 s), so the frames are final when it returns.
         outcomes[variant] = (json.loads(raw), frame_values(variant), raw)
-        print("OUTCOME", variant, {k: v for k, v in outcomes[variant][0].items()
-                                   if k in ("success", "error_type", "filled_fields", "field_retention")},
+        print("OUTCOME", f"auto={auto}", variant, {k: v for k, v in outcomes[variant][0].items()
+                                   if k in ("success", "error_type", "filled_fields", "field_retention", "fill_reinspect")},
               {k: len(v) for k, v in outcomes[variant][1].items()})
 
     for variant, (out, values, raw) in outcomes.items():
@@ -984,13 +1053,14 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
             assert not empty and out["filled_fields"] == 4 and out["retention_verified"] is True, (variant, out)
         else:
             # ``frame_values`` reads the written frames only: a swapped-out one still holds its values.
-            assert empty or variant in ("replace", "hidden", "frameswap"), (variant, out, values)
+            assert empty or variant in ("replace", "hidden", "frameswap", "pathswap"), (variant, out, values)
     assert outcomes["stable"][0]["success"] and outcomes["expiry"][0]["success"]
     assert outcomes["expiry_digits"][0]["success"] and outcomes["expiry_digits"][1]["expiry"] == "0735"
     assert outcomes["stable"][1] == {"name": "Ada Lovelace", "number": CARD["card_number"], "expiry": "07/35",
                                      "cvv": CARD["cvc"]}
     assert outcomes["expiry"][1]["expiry"] == "07 / 35"
-    assert outcomes["sync"][0]["error_type"] == "payment_validation_failed"
+    if not auto:
+        assert outcomes["sync"][0]["error_type"] == "payment_validation_failed"
     assert outcomes["sync"][0]["partially_filled"] is True
     expected = {
         "delayed": {"cc-number": "empty", "cc-csc": "empty"},
@@ -999,8 +1069,23 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
         "replace": {"cc-number": "replaced"},
         "hidden": {"cc-number": "replaced"},
         "frameswap": {"cc-number": "replaced"},
+        "pathswap": {"cc-number": "replaced"},
         "late": {"cc-number": "empty"},
     }
+    if auto:
+        # Lost once: repaired by the one extra pass. Dropped on every write: still not retained after it.
+        for variant in ("brand", "replace", "hidden", "frameswap"):
+            out = outcomes[variant][0]
+            assert out["success"] and out["fill_reinspect"] == {"count": 1, "repairs": 1}, (variant, out)
+            del expected[variant]
+        expected["sync"] = {"cc-number": "empty"}
+        # r1 F8: the fresh frame is at another path of the origin than any approved document: never adopted
+        assert outcomes["pathswap"][0]["fill_reinspect"]["refused"] == "documents_changed", outcomes["pathswap"][0]
+        assert outcomes["pathswap"][0]["fill_reinspect"]["count"] == 0
+        del expected["pathswap"]
+        for variant in expected:
+            assert outcomes[variant][0]["fill_reinspect"] == {"count": 1, "repairs": 1, "refused": "budget"}, variant
+        expected["pathswap"] = {"cc-number": "replaced"}
     for variant, dropped in expected.items():
         out = outcomes[variant][0]
         assert out["error_type"] == "payment_fields_not_retained" and out["partially_filled"] is True, (variant, out)
@@ -1140,7 +1225,7 @@ def test_paypal_guest_card_form_inside_buttons_fills_once(payment_browser, tmp_p
     assert sup.evaluate_runtime("!!window.submitted")["result"] is False
 
 
-def _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=None):
+def _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=None, auto=True):
     """The managed-mode seams (lease route, capture guard, A9 claim) faked around a real Chromium page; the
     unreviewed-destination switch on. Returns (first result, second result, consent kwargs, frame state)."""
     from agent.vault_store import VaultStore
@@ -1159,6 +1244,7 @@ def _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=None):
     monkeypatch.setattr("tools.browser_control_route.set_capture_guard", lambda lease, token: (True, ""))
     monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface", lambda s, i: None)
     monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live"))
+    monkeypatch.setattr("tools.browser_vault_payment.payment_fill_auto_enabled", lambda: auto)
     asked = []
 
     def consent(message, description, **kwargs):
@@ -1185,6 +1271,8 @@ def _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=None):
                     "returnByValue": True}, session_id=fsid), sup._loop, timeout=10)
             finally:
                 _schedule(sup._cdp("Target.detachFromTarget", {"sessionId": fsid}), sup._loop, timeout=10)
+            assert "value" in reply["result"]["result"], (t["url"], reply["result"].get("exceptionDetails", {}).get("text"),
+                                                          reply["result"]["result"].get("description", "")[:200])
             state[t["url"].rsplit("=", 1)[-1]] = reply["result"]["result"]["value"]
     return json.loads(first), second, asked, state, sup
 
@@ -1218,7 +1306,9 @@ def test_kps_like_unreviewed_form_fills_once_after_owner_approval(payment_browse
 
 def test_kps_like_form_navigated_during_consent_writes_nothing(payment_browser, tmp_path, monkeypatch):
     """v1 §9 test 8: the approved iframe navigates while the owner's card is open: payment_page_changed, nothing
-    written anywhere."""
+    written anywhere. dlz (11-13): this is the fill with vault.payment_fill_auto off; armed, a frame loaded again on
+    the approved origin is inspected again and filled (test_fill_auto_unreviewed_form_re_rendered_during_the_approval,
+    variant reload)."""
     from tools.browser_supervisor import _schedule
 
     def swap(sup, origins):
@@ -1235,7 +1325,7 @@ def test_kps_like_form_navigated_during_consent_writes_nothing(payment_browser, 
 
         wait_until(navigated, what="the approved iframe navigated")
 
-    _first, raw, _asked, state, _sup = _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=swap)
+    _first, raw, _asked, state, _sup = _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=swap, auto=False)
     out = json.loads(raw)
     assert out["error_type"] == "payment_page_changed", out
     assert all(v in ("", "01", "2026") for values, _seen in state.values() for v in values), state
@@ -1286,6 +1376,7 @@ def test_datatrans_shaped_re_render_is_re_pinned_inside_one_approval(payment_bro
         replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
     monkeypatch.setattr("agent.vault_payment_policy.PAYMENT_PSP_ORIGINS", (origins["psp"],))
     monkeypatch.setattr("tools.browser_vault_payment.payment_repin_enabled", lambda: True)
+    monkeypatch.setattr("tools.browser_vault_payment.payment_fill_auto_enabled", lambda: False)  # re-pin needs it off
     prefix = "/dtx-" if layout == "split" else "/dtx1-"
     full = {"exp": "07/35", "num": CARD["card_number"], "cvv": CARD["cvc"]}
 
@@ -1368,6 +1459,7 @@ def test_datatrans_shaped_re_render_stops_the_fill_while_re_pin_is_switched_off(
         replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
     monkeypatch.setattr("agent.vault_payment_policy.PAYMENT_PSP_ORIGINS", (origins["psp"],))
     monkeypatch.setattr("tools.browser_vault_payment.payment_repin_enabled", lambda: False, raising=False)
+    monkeypatch.setattr("tools.browser_vault_payment.payment_fill_auto_enabled", lambda: False)  # the fill before 11-13
     full = {"exp": "07/35", "num": CARD["card_number"], "cvv": CARD["cvc"], "name": "JANE DOE"}
     for variant, reason in _DTX_OFF.items():
         if layout == "split" and variant in ("defer_ahead", "holder_swap"):
@@ -1398,3 +1490,288 @@ def test_datatrans_shaped_re_render_stops_the_fill_while_re_pin_is_switched_off(
         assert check["reason"] == reason and "repin_refused" not in check, (variant, out)
         assert "card fill stopped" in caplog.text and reason in caplog.text, caplog.text
         print("RECORD datatrans-off", layout, variant, json.dumps(check, sort_keys=True))
+
+
+# --- dlz (fill-auto, 11-13): one approval, several inspections -------------------------------------------------------
+
+_FA_FULL = {"num": CARD["card_number"], "exp": "07/35", "c3": CARD["cvc"]}
+
+
+def _fa_setup(payment_browser, tmp_path, monkeypatch, *, hosted=False, auto=True, wait=2.0):
+    from dataclasses import replace
+
+    from agent.vault_store import VaultStore
+
+    sup, origins = payment_browser
+    store = VaultStore(base_dir=tmp_path / "vault")
+    card = store.add_item("payment", "Synthetic card", CARD, origin=origins["merchant"])
+    monkeypatch.setattr("agent.vault_store.get_vault_store", lambda: store)
+    if hosted:
+        original = store.get_meta
+        monkeypatch.setattr(store, "get_meta", lambda handle: (
+            replace(original(handle), payment_frame_origins=(origins["psp"],)) if original(handle) else None))
+        monkeypatch.setattr("agent.vault_payment_policy.PAYMENT_PSP_ORIGINS", (origins["psp"],))
+    monkeypatch.setattr("tools.browser_vault_payment.payment_fill_auto_enabled", lambda: auto)
+    monkeypatch.setattr("tools.browser_supervisor_payment_auto._REINSPECT_WAIT_SECONDS", wait)
+    return sup, origins, card
+
+
+def _fa_fill(sup, origins, card, caplog, on_consent=None, **arguments):
+    """One fill with the owner accepting; ``on_consent`` runs while the approval is open. The result, checked for
+    card values (none in it or in the log)."""
+    import logging
+
+    from tools.browser_vault_tool import browser_vault_fill
+
+    def consent(*_a, **_k):
+        if on_consent:
+            on_consent()
+        return "accept"
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO), \
+            patch("tools.approval_prompt.request_elicitation_consent", side_effect=consent) as asked:
+        raw = browser_vault_fill(card.id, task_id="payment-live", merchant_origin=origins["merchant"], **arguments)
+    out = json.loads(raw)
+    leaked = [n for n, secret in enumerate((CARD["card_number"], CARD["cvc"], "07/35")) if secret in raw
+              or secret in caplog.text]
+    assert not leaked and asked.call_count <= 1 and out.get("submitted") in (False, None), (leaked, sorted(out))
+    return out
+
+
+def _fa_states(pairs, log):
+    """Per field id: held / empty / other (never a value), and how often each field got an input event."""
+    states = {k: "held" if v == _FA_FULL.get(k) else "empty" if not v else "other" for k, v in pairs}
+    return states, {k: log.count(k) for k in dict(pairs)}
+
+
+def _fa_top(sup):
+    read = sup.evaluate_runtime("JSON.stringify([[...document.querySelectorAll('input')].map(e=>[e.id,e.value]),"
+                                "window.log||[]])")["result"]
+    return _fa_states(*json.loads(read))
+
+
+def _fa_frame(sup):
+    """The same reading from the one hosted /fa/ frame (None when there is none)."""
+    from tools.browser_supervisor import _schedule
+
+    targets = _schedule(sup._cdp("Target.getTargets"), sup._loop, timeout=10)["result"]["targetInfos"]
+    frames = [t for t in targets if t["type"] == "iframe" and "/fa/" in t["url"]]
+    if len(frames) != 1:
+        return None
+    fsid = _schedule(sup._cdp("Target.attachToTarget", {"targetId": frames[0]["targetId"], "flatten": True}),
+                     sup._loop, timeout=10)["result"]["sessionId"]
+    try:
+        reply = _schedule(sup._cdp("Runtime.evaluate", {
+            "expression": "JSON.stringify([[...document.querySelectorAll('input')].map(e=>[e.id,e.value]),window.log||[]])",
+            "returnByValue": True}, session_id=fsid), sup._loop, timeout=10)
+    finally:
+        _schedule(sup._cdp("Target.detachFromTarget", {"sessionId": fsid}), sup._loop, timeout=10)
+    return _fa_states(*json.loads(reply["result"]["result"]["value"]))
+
+
+_HELD = {"num": "held", "exp": "held", "c3": "held", "c4": "empty"}
+
+
+@pytest.mark.parametrize("auto", [True, False])
+def test_fill_auto_label_only_changes_never_stop_the_fill(payment_browser, tmp_path, monkeypatch, caplog, auto):
+    """SBB / pay.datatrans.com (11-12, 11-13): every write re-labels the other fields with validation text, on the
+    same elements, and one label changes while the approval is open. Armed: every field is written exactly once and no
+    re-inspection is used (a label-only change is classified again in place). Switched off (the fill before 11-13):
+    the label change during the approval refuses the fill, and without it the first write stops it."""
+    sup, origins, card = _fa_setup(payment_browser, tmp_path, monkeypatch, auto=auto)
+    navigate(sup, origins["merchant"] + "/fa/relabel")
+    out = _fa_fill(sup, origins, card, caplog, on_consent=lambda: sup.evaluate_runtime("relabelNow()"))
+    states, writes = _fa_top(sup)
+    print(f"RECEIPT fill-auto relabel auto={auto}", json.dumps({k: out.get(k) for k in (
+        "success", "error_type", "filled_fields", "fill_reinspect", "fill_check")}, sort_keys=True))
+    if auto:
+        assert out["success"] and out["filled_fields"] == 3 and out["retention_verified"] is True, out
+        assert "fill_reinspect" not in out and states == _HELD, (out.get("fill_reinspect"), states)
+        assert writes == {"num": 1, "exp": 1, "c3": 1, "c4": 0}, writes
+        return
+    assert out["error_type"] == "payment_page_changed" and set(states.values()) == {"empty"}, (out, states)
+    navigate(sup, origins["merchant"] + "/fa/relabel")
+    out = _fa_fill(sup, origins, card, caplog)
+    assert out["error_type"] == "payment_fields_changed" and out["filled_fields"] == 1, out
+    assert out["fill_check"]["reason"] == "fields_relabeled" and out["fill_check"]["keys"] == ["label"], out
+
+
+@pytest.mark.parametrize("auto", [True, False])
+def test_fill_auto_a_field_that_lost_its_value_is_written_once_more(payment_browser, tmp_path, monkeypatch, caplog,
+                                                                     auto):
+    """Eurowings (11-13): the CVC is empty after the page settled (cleared, or re-mounted, a moment after the card
+    number went in). Armed: one repair pass on a fresh inspection writes it again, the fields that kept their value
+    are not written twice, and a CVC that never keeps its value still stops after that one pass. Switched off: the
+    fill stops as payment_fields_not_retained."""
+    sup, origins, card = _fa_setup(payment_browser, tmp_path, monkeypatch, auto=auto)
+    for variant in ("retain", "retain_remount", "retain_every30", "retain_every", "retain_never"):
+        navigate(sup, origins["merchant"] + "/fa/" + variant)
+        out = _fa_fill(sup, origins, card, caplog)
+        states, writes = _fa_top(sup)
+        print("RECEIPT fill-auto", variant, f"auto={auto}", json.dumps({k: out.get(k) for k in (
+            "success", "error_type", "filled_fields", "fill_reinspect", "field_retention")}, sort_keys=True))
+        if auto and variant != "retain_never":
+            assert out["success"] and out["filled_fields"] == 3 and states == _HELD, (variant, out, states)
+            assert out["fill_reinspect"] == {"count": 1, "repairs": 1}, (variant, out)
+            assert writes["num"] == 1 and writes["exp"] == 1 and writes["c3"] >= 1, (variant, writes)
+            assert "1 re-inspection(s), 1 for lost values" in caplog.text
+            continue
+        assert out["error_type"] == "payment_fields_not_retained" and out["partially_filled"] is True, (variant, out)
+        assert out["field_retention"]["cc-csc"] in ("empty", "replaced") and states["c3"] == "empty", (variant, out)
+        assert out.get("fill_reinspect") == ({"count": 1, "repairs": 1, "refused": "budget"} if auto else None), out
+        assert writes["num"] == 1 and writes["c3"] == (2 if auto else 1), (variant, writes)
+
+
+def test_fill_auto_continues_on_a_re_mounted_field_and_keeps_its_stops(payment_browser, tmp_path, monkeypatch, caplog):
+    """Armed, one document. A field replaced by a fresh, identical input under the fill: inspected again, filled.
+    Still stopping: a label change that moves a role (the CVC's and a promo field's labels swap: role_changed, the
+    promo field never gets the CVC), a field hidden for good (no complete form within the wait), and a changed top
+    URL (navigated). Each stop keeps what was written before it and writes nothing after."""
+    sup, origins, card = _fa_setup(payment_browser, tmp_path, monkeypatch)
+    navigate(sup, origins["merchant"] + "/fa/replace")
+    out = _fa_fill(sup, origins, card, caplog)
+    states, writes = _fa_top(sup)
+    assert out["success"] and out["fill_reinspect"] == {"count": 1, "repairs": 0}, out
+    # c3: the write on the old input, then (r1 F14) the no-op input event on its re-mounted clone, which Chromium
+    # clones WITH the value: it is kept, not written again. The page log counts events that changed a value.
+    assert states == _HELD and writes == {"num": 1, "exp": 1, "c3": 2, "c4": 0}, (states, writes)
+    for variant, refused in (("relabel_swap", "role_changed"), ("hide", "incomplete"), ("navigate", "navigated")):
+        navigate(sup, origins["merchant"] + "/fa/" + variant)
+        out = _fa_fill(sup, origins, card, caplog)
+        states, writes = _fa_top(sup)
+        print("RECEIPT fill-auto stop", variant, json.dumps({k: out.get(k) for k in (
+            "success", "error_type", "filled_fields", "fill_reinspect", "fill_check")}, sort_keys=True))
+        assert out["error_type"] == "payment_fields_changed" and out["partially_filled"] is True, (variant, out)
+        again = out["fill_reinspect"]  # `seen`: the card field tokens per origin of the refused reading, when it got one
+        assert out["filled_fields"] == 1 and (again["count"], again["repairs"], again["refused"]) == (0, 0, refused), \
+            (variant, out)
+        assert set(again) <= {"count", "repairs", "refused", "seen"} and set(again.get("seen", {})) <= {origins["merchant"]}
+        # The one field written before the change keeps its value; the card number (last) and the promo field
+        # never get one (relabel_swap: the CVC went into its field before that field's label became the promo's).
+        assert sorted(states.values()) == ["empty", "empty", "empty", "held"], (variant, states)
+        assert states["num"] == "empty" and states["c4"] == "empty", (variant, states)
+        assert sum(writes.values()) == 1 and "re-inspection" in caplog.text, (variant, writes)
+
+
+def test_fill_auto_card_fields_on_another_origin_after_the_approval_stop(payment_browser, tmp_path, monkeypatch,
+                                                                         caplog):
+    """Armed, a reviewed hosted form in a frame. While the approval is open the frame is removed and the same card
+    fields appear in the merchant's own document, an origin the approval did not name for them: nothing is written."""
+    sup, origins, card = _fa_setup(payment_browser, tmp_path, monkeypatch, hosted=True)
+    navigate(sup, origins["merchant"] + "/fa-hosted")
+    moved = "document.getElementById('slot').innerHTML=" + json.dumps(_FA_FIELDS.replace('name="f3"', 'autocomplete="cc-csc"'))
+    out = _fa_fill(sup, origins, card, caplog, on_consent=lambda: sup.evaluate_runtime(moved))
+    assert out["error_type"] == "payment_page_changed" and not out.get("partially_filled"), out
+    # r1 F1: the origin the card fields moved to is page-chosen and not in the approval: only counted, never named
+    assert out["fill_reinspect"] == {"count": 0, "repairs": 0, "refused": "origin_changed", "seen": {"other": 1}}, out
+    assert origins["merchant"] not in json.dumps(out) and "it saw other 1" in caplog.text
+    assert set(_fa_top(sup)[0].values()) == {"empty"} and "re-inspection refused (origin_changed)" in caplog.text
+    # The same form left alone fills (the hosted frame is the approved destination).
+    navigate(sup, origins["merchant"] + "/fa-hosted")
+    out = _fa_fill(sup, origins, card, caplog)
+    assert out["success"] and "fill_reinspect" not in out and _fa_frame(sup)[0] == _HELD | {"c4": "empty"}, out
+
+
+@pytest.mark.parametrize("variant", ["rerender", "slow", "reload", "off"])
+def test_fill_auto_unreviewed_form_re_rendered_during_the_approval(payment_browser, tmp_path, monkeypatch, caplog,
+                                                                   variant):
+    """FlixBus / assets.payrails.io (11-13): an owner-approved unreviewed hosted form re-renders while the approval is
+    open (fresh elements in the same document, at once or 1.5 s later, or the frame's document loaded again). Armed:
+    the form is inspected again after the approval, by the discovery inspection, and filled once, strict checks
+    included. Switched off: payment_page_changed, nothing written."""
+    from tools.browser_supervisor import _schedule
+
+    sup, origins, card = _fa_setup(payment_browser, tmp_path, monkeypatch, auto=variant != "off", wait=10.0)
+    monkeypatch.setattr("tools.browser_vault_tool._is_managed", lambda: True)
+    monkeypatch.setattr("tools.browser_vault_tool._managed_supervisor", lambda task_id, admit=False: sup)
+    monkeypatch.setattr("tools.browser_vault_tool._bot_desktop_browser_session", lambda task_id: False)
+    monkeypatch.setattr("tools.browser_use_cli.vault_route", lambda task_id: {"lease": "live", "token": "t"})
+    monkeypatch.setattr("tools.browser_control_route.set_capture_guard", lambda lease, token: (True, ""))
+    monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface", lambda s, i: None)
+    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live"))
+    navigate(sup, origins["merchant"] + "/fa-payrails")
+
+    def rerender():
+        if variant == "reload":
+            sup.evaluate_runtime("document.getElementById('pr').src=" + json.dumps(origins["psp"] + "/fa/payrails?v=2"))
+            wait_until(lambda: "v=2" in json.dumps(_schedule(sup._cdp("Target.getTargets"), sup._loop, timeout=10))
+                       or "v=2" in json.dumps(_schedule(sup._cdp("Page.getFrameTree", session_id=sup._page_session_id),
+                                                        sup._loop, timeout=10)), what="the frame loaded again")
+            return
+        delay = 1500 if variant == "slow" else 0
+        sup.evaluate_runtime(f"document.getElementById('pr').contentWindow.postMessage({{t:'rerender',delay:{delay}}},'*')")
+        if not delay:
+            wait_until(lambda: sup.evaluate_runtime("window.rerendered===true")["result"] is True,
+                       what="the form re-rendered")
+
+    first = _fa_fill(sup, origins, card, caplog)
+    assert first["error_type"] == "payment_destination_approval_required", first
+    out = _fa_fill(sup, origins, card, caplog, on_consent=rerender,
+                   cart={"items": [{"description": "Adult ticket", "quantity": 2}], "total": "22.66", "currency": "EUR"},
+                   approve_origins=[origins["psp"]])
+    if variant == "slow":
+        wait_until(lambda: sup.evaluate_runtime("window.rerendered===true")["result"] is True, what="the form came back")
+    states, writes = _fa_frame(sup)
+    print("RECEIPT fill-auto payrails", variant, json.dumps({k: out.get(k) for k in (
+        "success", "error_type", "filled_fields", "fill_reinspect", "destination_reviewed")}, sort_keys=True))
+    if variant == "off":
+        assert out["error_type"] == "payment_page_changed" and set(states.values()) == {"empty"}, (out, states)
+        return
+    assert out["success"] and out["filled_fields"] == 3 and out["destination_reviewed"] is False, out
+    assert states == {"num": "held", "exp": "held", "c3": "held"}, states
+    assert writes == {"num": 1, "exp": 1, "c3": 1} and "re-inspected after the approval" in caplog.text, writes
+    assert out["fill_reinspect"] == {"count": 1, "repairs": 0}, out  # the one after the approval; none under the fill
+
+
+# What the armed fill does with each Datatrans-shaped re-render (the fixtures of the re-pin tests above): filled, with
+# the number of re-inspections it took, or stopped, with the reason the re-inspection gave.
+_DTX_AUTO = {
+    "relabel": ("filled", 0), "replace": ("filled", 1), "navigate": ("filled", 1), "cover": ("covered", "hit_test"),
+    "defer": ("stopped", "incomplete"), "defer_ahead": ("stopped", "incomplete"),
+    "duplicate": ("stopped", "incomplete"), "swap_role": ("stopped", "role_changed"),
+    "holder_swap": ("stopped", "fields_changed"),
+}
+
+
+@pytest.mark.parametrize("layout", ["split", "single"])
+def test_fill_auto_datatrans_shaped_re_renders(payment_browser, tmp_path, monkeypatch, caplog, layout):
+    """Armed, on the Datatrans-shaped hosted form (one lightbox document, or the number and the CVC in their own
+    frames): a relabelled field never uses a re-inspection; a re-mounted field and a frame whose URL changed in place
+    are inspected again and filled; a re-mounted field under an overlay of its own reviewed document is inspected
+    again and not written (hit test); a field hidden until the card number is in, a second CVC, an old field re-described as a promo code beside its copy, and a holder
+    field turned into the card number all still stop, with nothing written after the change."""
+    from agent.vault_store import VaultStore
+
+    sup, origins, card = _fa_setup(payment_browser, tmp_path, monkeypatch, hosted=True)
+    store = VaultStore(base_dir=tmp_path / "vault")
+    holder = store.add_item("payment", "Synthetic card with holder", {**CARD, "cardholder_name": "JANE DOE"},
+                            origin=origins["merchant"])
+    full = {"exp": "07/35", "num": CARD["card_number"], "cvv": CARD["cvc"], "name": "JANE DOE"}
+    for variant, (outcome, detail) in _DTX_AUTO.items():
+        if layout == "split" and variant in ("defer_ahead", "holder_swap"):
+            continue  # single-document variants
+        navigate(sup, origins["merchant"] + ("/dtx-" if layout == "split" else "/dtx1-") + variant)
+        out = _fa_fill(sup, origins, holder if variant == "defer_ahead" else card, caplog)
+        values = _dtx_values(sup)
+        states = {k: "held" if v == full.get(k.rstrip("2")) else "empty" if not v else "other" for k, v in values.items()}
+        print("RECEIPT fill-auto datatrans", layout, variant, json.dumps({k: out.get(k) for k in (
+            "success", "error_type", "filled_fields", "fill_reinspect", "fill_check")}, sort_keys=True))
+        if outcome == "filled":
+            assert out["success"] and out["filled_fields"] == 3, (variant, out)
+            assert out.get("fill_reinspect", {"count": 0}).get("count") == detail, (variant, out)
+            assert all(states[k] == "held" for k in ("exp", "num", "cvv")), (variant, states)
+            continue
+        if outcome == "covered":
+            # r1 F4: a field the first inspection never saw (re-mounted during the approval) must be exposed, on a
+            # reviewed destination too: the re-mounted expiry under the overlay is never written, nor the number after it
+            assert not out["success"] and out["error_type"] == "payment_fields_changed", (variant, out)
+            assert out["fill_check"]["reason"] == detail and out["fill_check"]["token"] in ("cc-exp", "cc-csc"), (variant, out)
+            held = [k for k, v in states.items() if v == "held"]
+            assert out["filled_fields"] == 1 and len(held) == 1 and states.get("num", "empty") == "empty", (variant, states)
+            continue
+        assert not out["success"] and out["fill_reinspect"]["refused"] == detail, (variant, out)
+        assert out["fill_reinspect"]["count"] == 0 and out["partially_filled"] is True, (variant, out)
+        held = sorted(k for k, v in states.items() if v == "held")
+        assert len(held) == 1 and "other" not in states.values(), (variant, states)
+        assert states.get("num", "empty") == "empty" and states.get("name", "empty") in ("empty", "held"), (variant, states)

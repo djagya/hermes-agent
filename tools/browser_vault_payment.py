@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
@@ -16,6 +17,7 @@ from agent.vault_payment_policy import (
     PaymentPolicyError,
     destination_policy,
     effective_frame_origins,
+    payment_fill_auto_enabled,
     payment_repin_enabled,
 )
 from agent.vault_store import PAYMENT_FIELDS, revision_binding
@@ -187,14 +189,14 @@ _PAGE_CHANGED = (
     "approval prompt."
 )
 _CONSENT_EXPIRED = (
-    "The approval arrived (or the fill reached the page) after the 120 s inspection window closed, so no "
+    "The approval arrived (or the fill reached the page) after the 5-minute inspection window closed, so no "
     "card field was written and nothing was submitted. Ask the user again: call fill once more for a new "
     "prompt and approve it in time."
 )
 
 
 _CONSENT_EXPIRED_PARTIAL = (
-    "The 120 s inspection window closed part-way through the fill: some card fields were written, the rest "
+    "The 5-minute inspection window closed part-way through the fill: some card fields were written, the rest "
     "were not. " + _SUBMITTED_NOTHING + " Do not submit the checkout and do not retry; tell the user. Another "
     "fill needs a new approval."
 )
@@ -530,6 +532,9 @@ _COMMIT_TEXTS = {
     "payment_result_invalid": (_TRANSPORT_UNCERTAIN, _TRANSPORT_UNCERTAIN),
     "payment_cart_changed": (_CART_CHANGED, _CART_CHANGED_PARTIAL),
     "payment_destination_disabled": (_DESTINATION_DISABLED + _READ_NOT_WRITTEN, _DESTINATION_DISABLED_PARTIAL),
+    # dlz (fill-auto): ownership lost between the generations of an armed commit; earlier generations may have written
+    "payment_browser_changed": (_BROWSER_CHANGED, _PARTIAL_STOPPED),
+    "human_has_control": (_BROWSER_CHANGED, _PARTIAL_STOPPED),
 }
 
 
@@ -548,6 +553,12 @@ def _log_commit(result: dict) -> None:
     """dlz (11-12): one content-free line per commit that stopped or needed a re-pin: the error type, counts, and
     which check failed where (fill_check: document k of n, field token, write step, reason, changed keys)."""
     repins = result.get("fill_repins", 0)
+    again = result.get("fill_reinspect")
+    if isinstance(again, dict):  # dlz (fill-auto): counts and a fixed code
+        logger.log(logging.INFO if result.get("success") else logging.WARNING,
+                   "card fill %s: %s re-inspection(s), %s for lost values, refused %s; it saw %s",
+                   "written" if result.get("success") else "re-inspection", _code(again.get("count", 0)),
+                   _code(again.get("repairs", 0)), _code(again.get("refused", "-")), _seen_text(again.get("seen")))
     if result.get("success"):
         if repins:
             logger.info("card fill written after %s re-pin(s) of re-rendered fields", _code(repins))
@@ -563,6 +574,92 @@ def _log_commit(result: dict) -> None:
     else:
         logger.warning("card fill stopped: %s; filled %s, re-pins %s", _code(result.get("error_type")),
                        _code(result.get("filled_fields", 0)), _code(repins))
+
+
+def _arm_auto(supervisor, inspected) -> bool:
+    """dlz (fill-auto): whether this fill may be continued on a re-inspection of the checkout inside the one approval
+    (``vault.payment_fill_auto``, on by default): the supervisor recorded what the approval binds and every field's
+    role. False: the fill is the stop-on-any-change fill."""
+    arm = getattr(supervisor, "arm_payment_auto", None)
+    return callable(arm) and payment_fill_auto_enabled() and arm(inspected) is True
+
+
+def _reinspect_stop(code: str, inspected=None) -> dict:
+    """The stop when the checkout changed after the inspection and a re-inspection (``code``: its fixed reason) found
+    no complete card form matching the approval. Nothing was read or written. ``seen``: what its last reading held
+    (card field tokens per origin, or a count of frames), when it got that far."""
+    seen = (getattr(inspected, "approval", None) or {}).get("seen")
+    logger.warning("card fill stopped before any write: the checkout changed after it was inspected; "
+                   "re-inspection refused (%s); it saw %s", _code(code), _seen_text(seen))
+    cart = code == "cart_changed"
+    return {"success": False, "error_type": "payment_cart_changed" if cart else "payment_page_changed",
+            "error": _CART_CHANGED if cart else _PAGE_CHANGED,
+            "fill_reinspect": {"count": 0, "repairs": 0, "refused": _code(code), **({"seen": seen} if seen else {})}}
+
+
+def _seen_text(seen) -> str:
+    """``fill_reinspect.seen`` for the log line: origins with their field tokens, or a count; bounded."""
+    if not isinstance(seen, dict) or not seen:
+        return "-"
+    return "; ".join(f"{re.sub(r'[^A-Za-z0-9:/._-]', '', str(k))[:80]} {_code(v)}" for k, v in list(seen.items())[:8])
+
+
+def _approved_page(vault, task_id: str, supervisor, inspected, lease: str, unreviewed: bool, policy,
+                   auto: bool) -> tuple:
+    """Inside the fill context, before the card is read: ``(inspection, re-inspections, refusal)``. Live ownership,
+    then the page: the inspection the approval was shown for is still current, or (dlz, fill-auto: an armed fill
+    only) the form re-rendered while the approval was open and is inspected again in full; the fill goes on with that
+    reading only when it matches what the approval binds (``reinspect_payment``; the earlier inspection is released
+    by it). Then the cart witnesses and the destination policy, on the inspection the fill will use."""
+    refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
+    if refused:
+        return inspected, 0, refused
+    refreshed = 0
+    if auto and not supervisor.payment_is_current(inspected):
+        fresh, code = supervisor.reinspect_payment(inspected)
+        if fresh is None:
+            return inspected, 0, _reinspect_stop(code, inspected)
+        inspected, refreshed = fresh, 1
+        logger.info("card fill: the checkout was re-inspected after the approval (form re-rendered)")
+    return inspected, refreshed, _page_refusal(supervisor, inspected, unreviewed, policy)
+
+
+def _commit(vault, supervisor, inspected, fills: list, strict: bool, secret: dict, unreviewed: bool, auto: bool,
+            refreshed: int, task_id: str = "", lease: str = "") -> dict:
+    """The commit: the armed one (``_auto_commit``) when this fill was armed, else the one it always was (with the
+    re-pin argument when ``vault.payment_repin`` is on; an armed fill never re-pins)."""
+    if not (auto and getattr(inspected, "auto", False) is True):
+        return supervisor.commit_payment(inspected, fills, strict=strict, **_repin_argument(unreviewed))
+    result = _auto_commit(vault, supervisor, inspected, fills, strict, secret, task_id, lease)
+    if refreshed:  # the re-inspection after the approval counts with those under the fill
+        again = result.setdefault("fill_reinspect", {"count": 0, "repairs": 0})
+        again["count"] = again.get("count", 0) + refreshed
+    return result
+
+
+def _auto_commit(vault, supervisor, inspected, fills: list, strict: bool, secret: dict, task_id: str = "",
+                 lease: str = "") -> dict:
+    """dlz (fill-auto): the commit of an armed fill: the supervisor may continue it on re-inspections of this
+    approval. ``refill`` computes the fills for such a reading from the card already read for this fill (same rules
+    as the first plan; no plan, no further write); each reading it continues on is recorded for payment_done."""
+    def refill(fresh):
+        return _document_fills(fresh, secret)
+
+    def adopted(fresh):
+        if vault._is_managed():
+            from tools.browser_payment_done import record_payment
+
+            record_payment(supervisor, fresh, adopted=True)  # the approved total stays (fill-auto r3 G5)
+
+    context = contextvars.copy_context()  # the check runs on a worker thread of the supervisor's loop
+
+    def ownership(current):
+        """The error type of a live-ownership refusal (the lease, the live supervisor, a Bot Desktop human), or None."""
+        refused = context.run(_ownership_refusal, vault, task_id, supervisor, current, lease)
+        return None if refused is None else str(refused.get("error_type") or "payment_browser_changed")
+
+    return supervisor.commit_payment(inspected, fills, strict=strict, refill=refill, adopted=adopted,
+                                     ownership=ownership)
 
 
 def _repin_argument(unreviewed: bool) -> dict:
@@ -650,6 +747,37 @@ def _record_approved_amount(supervisor, inspected, stated) -> None:
     record_approved_amount(supervisor, getattr(inspected, "page_id", None), stated.total, stated.currency)
 
 
+def _bind_approved_total(supervisor, inspected, stated, facts, result: dict) -> None:
+    """B1: a successful fill (``result``) whose card covered one Pay (``pays_once``: a stated total the page check matched)
+    binds that total and the merchant top document to the payment lock; payment_click re-reads it before every
+    press. Never raises (the result must still say what was written). r4 C8: a covered card whose total could not be
+    bound marks the lock unbound (every press refused, owner_go too); a fill-only card binds nothing (owner's go)."""
+    if not result.get("success") or stated is None or facts is None:
+        return
+    try:
+        from tools import browser_payment_surface as surface
+        from tools.payment_consent_prompt import pays_once
+
+        if not pays_once(facts):
+            return
+        if surface.record_approved_total(supervisor, *_cents(stated), tuple(inspected.tree[0][:2]),
+                                         inspected.merchant_origin):
+            return
+        surface.mark_unbound(supervisor)
+    except Exception as exc:  # health: allow BLE001 -- r4 C8: unbound, so every press of this lock is refused
+        logger.info("approved total not bound to the payment lock (%s)", type(exc).__name__)
+        _mark_unbound(supervisor)
+
+
+def _mark_unbound(supervisor) -> None:
+    try:
+        from tools.browser_payment_surface import mark_unbound
+
+        mark_unbound(supervisor)
+    except Exception as exc:  # health: allow BLE001 -- no lock state to mark: presses then need the owner's go
+        logger.info("payment lock not marked unbound (%s)", type(exc).__name__)
+
+
 def _claim_and_readmit(vault, task_id: str, supervisor, inspected, lease: str) -> dict | None:
     """The last steps before the card is read. None = may proceed."""
     # dlz: A9: browser-control must confirm this supervisor's claim on the card documents before
@@ -687,6 +815,13 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
     continues with the strict checks, the topology/cart/absence bindings and the switch re-read after the accept,
     in context, after the page checks, at the commit fence and inside the commit (between documents and on every
     paced resume).
+
+    dlz (fill-auto, 11-13; ``vault.payment_fill_auto``, on by default): the inspection the approval card is built
+    from is armed (``_arm_auto``): the approval binds the tab and top document, the card field tokens per origin,
+    the unreviewed origins and the cart readings, not DOM nodes. A form that re-rendered while the approval was
+    open (``_approved_page``) or re-renders under the fill (``_auto_commit``) is inspected again in full and the
+    fill goes on only on a reading that matches (tools.browser_supervisor_payment_auto); no second approval, no
+    second card read. Not armed, any change stops the fill as before.
 
     Order after consent (design v2 A6): backend context -> item revision -> live ownership -> page freshness
     -> capture guard (for the approved lease only) and local mark -> expiry -> live ownership again -> read the
@@ -741,6 +876,8 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             inspected.policy_check = lambda: destination_policy() == policy
         elif cart is not None and stated is None:
             return json.dumps({"success": False, "error_type": "payment_cart_invalid", "error": _CART_INVALID})
+        # dlz (fill-auto): the approval card is built from this inspection; what it binds is recorded now.
+        auto = _arm_auto(supervisor, inspected)
         prompt = inspected.prompt()
         # dlz: the owner-only payment card (tools.payment_consent_prompt): every fact or no prompt.
         try:
@@ -772,8 +909,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             if unreviewed and destination_policy() != policy:  # B6, A6 step 7
                 return json.dumps(_disabled())
             # dlz: live ownership and page freshness inside the context, right before the card is read.
-            refused = (_ownership_refusal(vault, task_id, supervisor, inspected, lease)
-                       or _page_refusal(supervisor, inspected, unreviewed, policy))
+            # dlz (fill-auto): an armed fill whose form re-rendered during the approval goes on with a fresh inspection.
+            inspected, refreshed, refused = _approved_page(vault, task_id, supervisor, inspected, lease, unreviewed,
+                                                           policy, auto)
             if refused:
                 return json.dumps(refused)
             # Capture lock (control's CDP guard, then the local mark) BEFORE the card is read: both are
@@ -830,7 +968,9 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 if unreviewed and destination_policy() != policy:  # B6, A6 step 16: the commit fence
                     return json.dumps(_disabled(after_read=True))
                 window.committing()  # from here a card value may be in the page: only control's unlock releases it
-            result = supervisor.commit_payment(inspected, fills, strict=strict, **_repin_argument(unreviewed))
+            result = _commit(vault, supervisor, inspected, fills, strict, secret, unreviewed, auto, refreshed,
+                             task_id, lease)
+            _bind_approved_total(supervisor, inspected, stated, facts, result)
             _log_commit(result)
             _commit_text(result)
             return json.dumps(_describe_result(result, backend, inspected, fills, prompt, bound_revision,
