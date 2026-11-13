@@ -273,11 +273,13 @@ const replace = (e, a) => { const n = input({autocomplete: e.autocomplete, id: e
                             els = els.map(x => x === e ? n : x); e.isConnected = false; return n; };
 let approve = () => {};  // page code that runs during the approval, after the inspection
 SCENARIO
-const api = INSPECT;
+const inspect = () => INSPECT;  // 'inspect': a fresh closure over the document as it is now (a re-inspection)
+let api = inspect();
 require('readline').createInterface({input: process.stdin}).on('line', line => {
   const {fn, args} = JSON.parse(line);
   let ok;
   if (fn === 'approve') ok = approve();
+  else if (fn === 'inspect') { api = inspect(); ok = true; }
   else if (fn === 'values') ok = Object.fromEntries(all.map(e => [e.id, e.value]));
   else ok = api[fn](...args);
   process.stdout.write(JSON.stringify({ok: ok === undefined ? null : ok}) + '\n');

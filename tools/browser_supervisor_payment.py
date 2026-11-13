@@ -1230,10 +1230,8 @@ class PaymentSupervisionMixin:
                 if not refused:
                     # Still the same reading a moment later (a form caught mid-render is read again instead).
                     await asyncio.sleep(_REINSPECT_SETTLE_SECONDS)
-                    if time.monotonic() >= deadline:
-                        refused = "too_late"
-                    elif not await self._payment_is_current(fresh):
-                        refused = "unsettled"
+                    if time.monotonic() >= deadline or not await self._payment_is_current(fresh):
+                        refused = "unsettled"  # changed again, or no time left to see that it did not
                 if not refused:
                     refused = await self._remember_roles(fresh, frozenset(prior.approval["documents"])) or ""
                 if not refused:
