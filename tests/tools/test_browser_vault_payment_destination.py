@@ -504,7 +504,8 @@ def _kps_inspection(merchant_holder=False, page_match=("matched", "the merchant 
     if merchant_holder:
         docs.insert(0, PaymentDocument("top", "page", "o-top", MERCHANT, _controls("cc-name")))
     return PaymentInspection("a" * 32, "page", "target", MERCHANT, tuple(docs), _TREE, time.monotonic() + 120,
-                             unreviewed_origins=(KPS,), witnesses=(("page", "w-top"),), page_match=page_match)
+                             unreviewed_origins=(KPS,), witnesses=(("page", "w-top"),), page_match=page_match,
+                             merchant_match=page_match[0])  # approval-qol r4 C6: the merchant page's own check
 
 
 @pytest.fixture

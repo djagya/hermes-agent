@@ -90,6 +90,8 @@ _COVERAGE_REFUSALS = frozenset({
 _SETTLE_SECONDS = 2.0
 # dlz: commit_payment's whole budget; no write lands in a renderer after it (see _renderer_deadline_ms).
 _COMMIT_BUDGET_SECONDS = 20.0
+# dlz: one inspection's life, and so the owner's approval window (owner 2026-11-13: 5 min, was 120 s).
+INSPECTION_WINDOW_S = 300
 _RETENTION_STATES = frozenset({"held", "empty", "changed", "replaced"})
 # Card fields a saved card may lack: left empty for the user instead of refusing the whole fill.
 OPTIONAL_CARD_TOKENS = frozenset({"cc-name", "postal-code"})
@@ -160,6 +162,7 @@ class PaymentInspection:
     adopted: bool = False
     approval: Any = field(default=None, repr=False, compare=False)
     approval_id: str = ""
+    merchant_match: str = "not_checked"  # approval-qol r4 C6: the merchant page's own result (Pay is gated on it)
 
     @property
     def controls(self) -> tuple:
@@ -633,7 +636,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 merchant,
                 documents,
                 tree,
-                time.monotonic() + 120 if prior is None else prior.expires_at,
+                time.monotonic() + INSPECTION_WINDOW_S if prior is None else prior.expires_at,
                 owner=self,
                 child_sessions=child_sessions,
                 frame_owners=found["owners"],
@@ -842,6 +845,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         # dlz (fill-auto): the reading itself, per witnessed document, for a re-inspection's comparison.
         inspection.cart = tuple(cart)
         inspection.cart_pins = tuple(sorted((place, json.dumps(pin, sort_keys=True)) for place, pin in pins))
+        inspection.merchant_match = _page_match(pins[:1], cart[0])[0]  # approval-qol r4 C6
 
     async def _pin_frame_owners(self, documents: tuple, tree: tuple, page_sid: str, child_sessions: dict,
                                 groups: dict | None = None) -> dict:

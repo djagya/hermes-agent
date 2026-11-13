@@ -1,19 +1,32 @@
-"""dlz: deliver a card-fill approval as the payment card in the owner's private Telegram chat.
+"""dlz: deliver a card-fill approval as the payment card where the owner talks to Sera.
 
 Called by ``TurnRunner._render_approval_sync`` for approval data carrying ``"payment"`` (built by
 ``tools.approval_prompt._elicit_payment``). Every failure raises, which the gateway wait turns into
 ``notify_failed`` and so an ``unavailable`` consent: there is no plain-text ``/approve`` fallback and
-nothing is ever shown shortened. The session's own chat, when it is not that private chat, gets a
-fixed notice with no details.
+nothing is ever shown shortened.
+
+Where the card goes (owner decision 2026-11-13): a group session (a negative Telegram chat id, e.g. the
+forum topic he talks to Sera in) gets the card in its own chat and thread only when the OWNER sent the turn;
+the owner's own private chat gets it there, in the session's thread. Only the owner's own Telegram user can act on it either way (the
+adapter's presser check); anyone else's tap changes nothing. Every other case (another member's turn, a channel post, an
+anonymous admin, someone else's private chat) sends the card to the owner's private chat as before and the
+session's chat gets a fixed notice with no details.
+One reminder replying to the card goes to the same place ``REMINDER_AT_S`` after the send, only while the
+card is still unanswered; the expiry notice goes there too.
 """
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import logging
 
 logger = logging.getLogger(__name__)
 
 SEND_TIMEOUT_S = 15
+REMINDER_AT_S = 120
+# No reminder unless more than this would be left at REMINDER_AT_S (an effective window of 150 s or less needs none).
+REMINDER_MIN_LEFT_S = 30
 # dlz: the owner's one plain message when a card expires unanswered; never any card or cart detail.
 EXPIRED_NOTICE = "Card approval expired: nothing was filled or paid. Ask Sera to retry if you still want it."
 EXPIRED_NOTICE_DEGRADED = ("Card approval expired while Hermes' Telegram connection was reconnecting, so a tap may "
@@ -68,18 +81,74 @@ def _delivery_probe(adapter):
     return probe
 
 
-def _notify_expired(turn_runner, adapter, user_id: str, probe) -> None:
-    """Best effort: one plain message to the owner that the card expired (a card edit alone does not notify)."""
+def _notify_expired(turn_runner, adapter, chat_id: str, metadata, probe) -> None:
+    """Best effort: one plain message where the card is that it expired (a card edit alone does not notify). In a
+    group it is sent fail-closed (peer r2 P3): a gone topic drops it, never the group's General topic; a group chat
+    whose adapter cannot send that way gets no notice. The owner's private chat keeps the ordinary send."""
+    from gateway.run import _interim_metadata
+
     text = EXPIRED_NOTICE_DEGRADED if probe is not None and probe() else EXPIRED_NOTICE
-    turn_runner._schedule(adapter.send(user_id, text), "payment expiry notice scheduling error")
+    if not str(chat_id).startswith("-"):
+        turn_runner._schedule(adapter.send(chat_id, text, metadata=_interim_metadata(metadata)),
+                              "payment expiry notice scheduling error")
+    elif callable(getattr(type(adapter), "send_payment_notice", None)):
+        turn_runner._schedule(adapter.send_payment_notice(chat_id, text, metadata=metadata),
+                              "payment expiry notice scheduling error")
+    else:
+        logger.info("payment expiry notice not sent: this adapter cannot send it fail-closed in a group")
+
+
+def reminder_text(left_s: float) -> str:
+    """The one reminder: time left only, never any card or cart detail."""
+    return f"Card approval waiting — {max(1, round(left_s / 60))} min left. Tap Approve on the card above."
+
+
+async def _wait(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+async def _remind_later(adapter, request_id: str, text: str, state: dict) -> None:
+    """After REMINDER_AT_S: one reply to the card, only while it is unanswered. A settle cancels this task and
+    sets ``state["settled"]``; the adapter also sends nothing once the card's record is gone (tapped or retired)."""
+    try:
+        await _wait(REMINDER_AT_S)
+        if state["settled"]:
+            return
+        sent = await adapter.remind_payment_card(request_id, text)
+        logger.info("Payment approval reminder (request_id=%s, sent=%s)", request_id, bool(sent))
+    except asyncio.CancelledError:  # a settle cancels the reminder: not an error
+        raise
+    except Exception:  # health: allow BLE001 -- best effort: the card itself stays live; the future is never read
+        logger.debug("payment approval reminder failed (request_id=%s)", request_id, exc_info=True)
+
+
+def _requester_id(ctx) -> str:
+    """The Telegram user id of whoever sent the turn (empty for a channel post or an anonymous admin)."""
+    return str(getattr(getattr(ctx, "source", None), "user_id", "") or "")
+
+
+_GROUP_CHAT_TYPES = frozenset({"group", "forum", "supergroup"})  # Telegram sources say "group" for both kinds
+
+
+def _card_route(ctx, user_id: str) -> tuple[str, object, bool]:
+    """``(chat_id, thread metadata, other_private_chat)`` for the card: the session's own chat and thread when it
+    is the owner's private chat, or a group (a negative id AND a group chat type: a channel's direct-messages chat
+    has a negative id too) AND the owner himself asked in it; every other case (another member, a channel post, an
+    anonymous admin) is the owner's private chat plus a notice in the session's chat."""
+    chat = str(ctx._status_chat_id or "")
+    group = (chat.startswith("-") and chat[1:].isascii() and chat[1:].isdigit()
+             and str(getattr(getattr(ctx, "source", None), "chat_type", "") or "") in _GROUP_CHAT_TYPES)
+    if chat == user_id or (group and _requester_id(ctx) == user_id):
+        return chat, ctx._status_thread_metadata, False
+    return user_id, None, True
 
 
 def deliver(turn_runner, approval_data: dict) -> None:
-    """Send the card through the session's own Telegram adapter to the approver's private chat,
-    arm the card's retirement for when the prompt settles, and post the neutral notice to a group."""
+    """Send the card through the session's own Telegram adapter (see ``_card_route``), arm the card's
+    retirement for when the prompt settles, and arm the one reminder."""
     from tools.approval import attach_delivery_probe, observe_gateway_settle, valid_request_id
     from tools.approval_context import payment_approver
-    from tools.payment_consent_prompt import GROUP_NOTICE, PaymentPromptFacts
+    from tools.payment_consent_prompt import CARD_TOPIC_UNAVAILABLE, GROUP_NOTICE, PaymentPromptFacts
 
     ctx = turn_runner._ctx
     adapter = ctx._status_adapter
@@ -93,39 +162,65 @@ def deliver(turn_runner, approval_data: dict) -> None:
         raise PaymentCardUndeliverable("payment approver changed or unset")
     user_id = _approver_user_id(approver)
     facts = PaymentPromptFacts.from_dict(approval_data.get("payment"))
+    # The card's stated expiry is the real one: the wait is cut to approvals.timeout (``timeout_s``), so the card,
+    # the retire time and the reminder all use min(remaining inspection window, approvals.timeout).
+    window_s = min(facts.expires_in_s, int(approval_data.get("timeout_s") or facts.expires_in_s))
+    facts = dataclasses.replace(facts, expires_in_s=max(1, window_s))
     # Class check, not instance: MagicMock adapters invent every attribute.
     if not callable(getattr(type(adapter), "send_payment_approval", None)):
         raise PaymentCardUndeliverable("this session's adapter cannot send the payment card")
+    route = _card_route(ctx, user_id)
     probe = _delivery_probe(adapter)  # armed before the send: a reconnect while it is in flight counts too
-    fut = turn_runner._schedule(
-        adapter.send_payment_approval(chat_id=user_id, facts=facts, request_id=request_id,
-                                      session_key=session_key, approver=approver),
-        "send_payment_approval scheduling error")
-    if fut is None:
-        raise PaymentCardUndeliverable("gateway loop unavailable")
-    try:
-        result = fut.result(timeout=SEND_TIMEOUT_S)
-    except Exception as exc:  # timeout included: a card that may have posted is still unavailable
-        _retire_if_sent_late(turn_runner, adapter, fut, request_id)
-        raise PaymentCardUndeliverable(f"payment card send failed: {type(exc).__name__}") from None
+    result = None
+    for attempt in range(2):
+        chat_id, metadata, other_private_chat = route
+        fut = turn_runner._schedule(
+            adapter.send_payment_approval(chat_id=chat_id, facts=facts, request_id=request_id,
+                                          session_key=session_key, approver=approver, metadata=metadata,
+                                          requester=_requester_id(ctx)),
+            "send_payment_approval scheduling error")
+        if fut is None:
+            raise PaymentCardUndeliverable("gateway loop unavailable")
+        try:
+            result = fut.result(timeout=SEND_TIMEOUT_S)
+        except Exception as exc:  # timeout included: a card that may have posted is still unavailable
+            _retire_if_sent_late(turn_runner, adapter, fut, request_id)
+            raise PaymentCardUndeliverable(f"payment card send failed: {type(exc).__name__}") from None
+        # The session's topic is gone: the adapter sent nothing (never the group's General topic); the card goes
+        # to the owner's own chat once, with the neutral notice in the session's chat.
+        if (attempt == 0 and not other_private_chat and not getattr(result, "success", False)
+                and getattr(result, "error", None) == CARD_TOPIC_UNAVAILABLE):
+            logger.warning("Payment approval card topic unavailable (request_id=%s); sending to the owner's chat", request_id)
+            route = (user_id, None, True)
+            continue
+        break
     if not getattr(result, "success", False):
         raise PaymentCardUndeliverable("payment card send failed")
     # Delivery trace: correlation and timing only, never card, cart or amount text.
     logger.info("Payment approval card sent (request_id=%s, chat=%s, message_id=%s, expires_in_s=%s)",
-                request_id, user_id, getattr(result, "message_id", None),
-                approval_data.get("timeout_s") or facts.expires_in_s)
+                request_id, chat_id, getattr(result, "message_id", None), window_s)
+    # Settles run on this (the waiting) thread after deliver returns, or inline just below: never concurrently.
+    reminder: dict = {"settled": False, "future": None}
 
     def retire(reason: str) -> None:
+        reminder["settled"] = True
+        if reminder["future"] is not None:
+            reminder["future"].cancel()
         turn_runner._schedule(adapter.retire_payment_card(request_id, reason), "payment card retire scheduling error")
         if reason == "timeout":
-            _notify_expired(turn_runner, adapter, user_id, probe)
+            _notify_expired(turn_runner, adapter, chat_id, metadata, probe)
 
     if probe is not None:
         attach_delivery_probe(session_key, request_id, probe)
     if not observe_gateway_settle(session_key, request_id, retire):
         # Settled while the card was being sent: retire it now.
         retire("resolved")
-    if str(ctx._status_chat_id) != user_id:
+    left_s = int(window_s) - REMINDER_AT_S
+    if (not reminder["settled"] and left_s > REMINDER_MIN_LEFT_S
+            and callable(getattr(type(adapter), "remind_payment_card", None))):
+        reminder["future"] = turn_runner._schedule(
+            _remind_later(adapter, request_id, reminder_text(left_s), reminder), "payment reminder scheduling error")
+    if other_private_chat:
         try:
             from gateway.run import _interim_metadata
             turn_runner._schedule(
