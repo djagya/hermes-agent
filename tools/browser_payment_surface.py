@@ -750,19 +750,26 @@ _GO_REQUIRED_TEXT = (
     "this purchase call payment_click again with owner_go true.")
 
 
-def record_approved_total(supervisor: Any, cents: Any, currency: Any, top: Any) -> None:
+def record_approved_total(supervisor: Any, cents: Any, currency: Any, top: Any, merchant: Any) -> None:
     """B1: after a successful card fill whose card stated the total and whose page check matched it, bind that total
-    (integer cents, ISO code) and the merchant top document it was read in (``(frame id, loader)``) to the current
-    lock: every payment_click in this lock reads it again before its press. Nothing is bound without a lock of this
-    process or with a malformed value (the clicks then need the owner's go)."""
+    (integer cents, ISO code), the merchant top document it was read in (``(frame id, loader)``) and the merchant
+    origin to the current lock: every payment_click in this lock reads it again before its press. Nothing is bound
+    without a lock of this process or with a malformed value (the clicks then need the owner's go)."""
     if not (type(cents) is int and 0 <= cents < 10**9 and isinstance(currency, str)
             and re.fullmatch(r"[A-Z]{3}", currency) and isinstance(top, tuple) and len(top) == 2
-            and _valid_id(top[0]) and isinstance(top[1], str) and _ID_RE.fullmatch(top[1])):
+            and _valid_id(top[0]) and isinstance(top[1], str) and _ID_RE.fullmatch(top[1])
+            and isinstance(merchant, str) and merchant.startswith("https://") and _origin_of(merchant) == merchant):
         return
     with _LOCK:
         gen = _GENS.get(supervisor) if supervisor in _HELD else None
         if gen is not None:
-            gen.approved = (cents, currency, top[0], top[1])
+            gen.approved = (cents, currency, top[0], top[1], merchant)
+
+
+def _origin_of(url: Any) -> str:
+    from tools.browser_payment_done import _url_origin
+
+    return _url_origin(url)
 
 
 def approved_total(supervisor: Any) -> Optional[tuple]:
@@ -785,18 +792,31 @@ async def _page_total(sup: Any, sid: str, fid: str, cents: int, currency: str) -
     return ((reply.get("result") or {}).get("result") or {}).get("value")
 
 
+async def _top_frame(sup: Any, sid: str) -> tuple:
+    """``(frame id, loader, url)`` of the page's current top document."""
+    frame = (await sup._cdp("Page.getFrameTree", session_id=sid))["result"]["frameTree"].get("frame") or {}
+    return frame.get("id"), frame.get("loaderId"), frame.get("url")
+
+
 async def _pay_gate(sup: Any, page_sid: str, approved: tuple, admitted: bool) -> Optional[dict]:
-    """B1 (owner 2026-11-13): None when this press may go out, else ``payment_total_changed``. On the merchant top
-    document the fill bound (same frame, same loader, read before and after) the approved total must be ``matched``
-    by the fill's own rule: every labelled total is the approved one, none unclear. Any other top document (a bank or
-    3-D Secure page) has no merchant total: it may be pressed only after this lock already admitted a press."""
+    """B1 (owner 2026-11-13): None when this press may go out, else ``payment_total_changed``.
+
+    The first press of the lock needs the merchant top document the fill bound (same frame and loader). On it, and
+    after an admitted press on any later top document of the merchant's own origin (a review page the checkout went
+    on to), the approved total must be ``matched`` by the fill's own rule (every labelled total is the approved one,
+    none unclear), the document read again after the check. A top document on another origin (a bank's 3-D Secure
+    page) has no merchant total: it may be pressed only after this lock already admitted a press."""
     from tools.browser_supervisor_payment import _page_match, _valid_pin
 
-    cents, currency, fid, loader = approved
-    if await _loader_of(sup, page_sid, fid) != loader:
-        return None if admitted else _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT)
-    pin = await _page_total(sup, page_sid, fid, cents, currency)
-    if await _loader_of(sup, page_sid, fid) != loader:  # the document changed during the read
+    cents, currency, fid, loader, merchant = approved
+    top = await _top_frame(sup, page_sid)
+    if top[:2] != (fid, loader):
+        if not admitted:
+            return _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT)
+        if _origin_of(top[2]) != merchant:
+            return None
+    pin = await _page_total(sup, page_sid, top[0], cents, currency)
+    if (await _top_frame(sup, page_sid))[:2] != top[:2]:  # the document changed during the read
         return _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT)
     if not _valid_pin(pin) or _page_match([("merchant page", pin)], cents)[0] != "matched":
         return _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT)
@@ -864,7 +884,7 @@ class _LockGen:
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
-        # B1: (cents, currency, top frame id, top loader) of the last successful fill in this lock whose card stated
+        # B1: (cents, currency, top frame id, top loader, merchant origin) of the last successful fill in this lock whose card stated
         # the total and whose page check matched it (record_approved_total); None: no press is covered by the card.
         self.approved: Optional[tuple] = None
 

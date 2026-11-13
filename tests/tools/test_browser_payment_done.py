@@ -455,7 +455,7 @@ def test_a_3ds_page_is_clicked_only_after_the_checkouts_pay_was_admitted(first):
     """B1: the fill bound EUR 22.66 to the checkout document (TOP, L0). Pay on it reads the total again; the bank's
     3-D Secure page (same tab, another document) has no merchant total and is clickable only after that press."""
     sup = _claimed(_Unlocking([CHECKOUT] if first == "checkout" else [ACS], status=dict(LOCKED_TAB)))
-    surface.record_approved_total(sup, 2266, "EUR", ("TOP", "L0"))
+    surface.record_approved_total(sup, 2266, "EUR", ("TOP", "L0"), SHOP)
     tree = CHECKOUT if first == "checkout" else ACS
     _top_controls(sup)
     out = surface.payment_click(sup, _top_ref(sup, tree))

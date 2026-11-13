@@ -661,7 +661,7 @@ def _bind_approved_total(supervisor, inspected, stated, facts) -> None:
             return
         from tools.browser_payment_surface import record_approved_total
 
-        record_approved_total(supervisor, *_cents(stated), tuple(inspected.tree[0][:2]))
+        record_approved_total(supervisor, *_cents(stated), tuple(inspected.tree[0][:2]), inspected.merchant_origin)
     except Exception as exc:  # health: allow BLE001 -- unbound: every press then needs the owner's go in chat
         logger.info("approved total not bound to the payment lock (%s)", type(exc).__name__)
 

@@ -29,7 +29,7 @@ ROWS = [
 
 
 # B1: the approved total _claimed binds (EUR 100.00) and the page check that matches it
-APPROVED = (10000, "EUR", ("PAGE", "LP"))
+APPROVED = (10000, "EUR", ("PAGE", "LP"), "https://shop.test")
 MATCHED_PIN = {"state": "matched", "labelled": [10000], "stated": 1, "unclear": False}
 
 
@@ -824,6 +824,23 @@ def test_a_bank_page_is_pressed_only_after_an_admitted_press(admitted_first):
         assert out["error_type"] == "payment_total_changed" and not _presses(sup)
 
 
+@pytest.mark.parametrize("page, admitted", [("Gesamtsumme 100,00 €", True), ("Gesamtsumme 120,00 €", False)])
+def test_a_later_merchant_page_after_an_admitted_press_is_checked_like_the_checkout(page, admitted):
+    """A checkout that goes on to its own review page (a new document on the merchant's origin) after the first
+    admitted press ("Continue"): the final "Place order" there reads the approved total in that page too."""
+    sup = _claimed()
+    sup.page_text = "Gesamtsumme 100,00 €"
+    assert surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])["success"] is True
+    sup.tree = (("PAGE", "LR", "https://shop.test/review", "https://shop.test", ""), TREE[1])
+    sup.page_text = page
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    assert len(_total_reads(sup)) == 2
+    if admitted:
+        assert out["success"] is True and len(_presses(sup)) == 2
+    else:
+        assert out["error_type"] == "payment_total_changed" and len(_presses(sup)) == 1
+
+
 @pytest.mark.parametrize("state, bound", [("matched", True), ("ambiguous", False), ("not_found", False),
                                           (None, False)])
 def test_a_fill_binds_the_total_only_when_its_card_covered_pay(state, bound):
@@ -835,16 +852,18 @@ def test_a_fill_binds_the_total_only_when_its_card_covered_pay(state, bound):
     assert surface.approved_total(sup) == ((10000, "EUR") if bound else None)
     if bound:
         with surface._LOCK:
-            assert surface._GENS[sup].approved == (10000, "EUR", "PAGE", "LP")  # the merchant top document
+            assert surface._GENS[sup].approved == (10000, "EUR", "PAGE", "LP", "https://shop.test")  # its top document
 
 
 def test_no_total_is_bound_without_a_lock_of_this_process_or_from_a_malformed_value():
     sup = FakeSup()
-    surface.record_approved_total(sup, 10000, "EUR", ("PAGE", "LP"))
+    surface.record_approved_total(sup, *APPROVED)
     assert surface.approved_total(sup) is None
     sup = _claimed(approved=None)
-    for bad in [(-1, "EUR", ("PAGE", "LP")), ("10000", "EUR", ("PAGE", "LP")), (10000, "eur", ("PAGE", "LP")),
-                (10000, "EUR", ("PAGE", "")), (10000, "EUR", "PAGE|LP")]:
+    top, shop = ("PAGE", "LP"), "https://shop.test"
+    for bad in [(-1, "EUR", top, shop), ("10000", "EUR", top, shop), (10000, "eur", top, shop),
+                (10000, "EUR", ("PAGE", ""), shop), (10000, "EUR", "PAGE|LP", shop), (10000, "EUR", top, ""),
+                (10000, "EUR", top, "http://shop.test"), (10000, "EUR", top, "https://shop.test/checkout")]:
         surface.record_approved_total(sup, *bad)
         assert surface.approved_total(sup) is None
 
