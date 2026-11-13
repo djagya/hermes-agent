@@ -140,3 +140,26 @@ def test_an_unreadable_config_drops_opt_in_providers_through_the_real_loader(tmp
     broken.write_text("vault: [unclosed\n", encoding="utf-8")
     os.replace(broken, path)
     assert name not in {p.name for p in enabled_providers()}
+
+
+@pytest.mark.parametrize("config, expected", [
+    ({}, True), ({"vault": {}}, True),                                  # absent: on (owner wants it on)
+    ({"vault": {"payment_fill_auto": True}}, True), ({"vault": {"payment_fill_auto": "true"}}, True),
+    ({"vault": {"payment_fill_auto": " On "}}, True), ({"vault": {"payment_fill_auto": 1}}, True),
+    ({"vault": {"payment_fill_auto": False}}, False), ({"vault": {"payment_fill_auto": "false"}}, False),
+    ({"vault": {"payment_fill_auto": "False"}}, False), ({"vault": {"payment_fill_auto": 0}}, False),
+    ({"vault": {"payment_fill_auto": "off"}}, False), ({"vault": {"payment_fill_auto": "no"}}, False),
+    ({"vault": {"payment_fill_auto": ""}}, False), ({"vault": {"payment_fill_auto": ["x"]}}, False),
+    ({"vault": {"payment_fill_auto": 2}}, False),
+    (None, False),                                                       # config that cannot be read: off
+])
+def test_fill_auto_is_off_for_anything_present_that_is_not_clearly_on(config, expected, monkeypatch):
+    from agent.vault_payment_policy import payment_fill_auto_enabled
+
+    def load():
+        if config is None:
+            raise OSError("config.yaml unreadable")
+        return config
+
+    monkeypatch.setattr("hermes_cli.config.load_config", load)
+    assert payment_fill_auto_enabled() is expected

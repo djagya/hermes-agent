@@ -273,11 +273,13 @@ const replace = (e, a) => { const n = input({autocomplete: e.autocomplete, id: e
                             els = els.map(x => x === e ? n : x); e.isConnected = false; return n; };
 let approve = () => {};  // page code that runs during the approval, after the inspection
 SCENARIO
-const api = INSPECT;
+const inspect = () => INSPECT;  // 'inspect': a fresh closure over the document as it is now (a re-inspection)
+let api = inspect();
 require('readline').createInterface({input: process.stdin}).on('line', line => {
   const {fn, args} = JSON.parse(line);
   let ok;
   if (fn === 'approve') ok = approve();
+  else if (fn === 'inspect') { api = inspect(); ok = true; }
   else if (fn === 'values') ok = Object.fromEntries(all.map(e => [e.id, e.value]));
   else ok = api[fn](...args);
   process.stdout.write(JSON.stringify({ok: ok === undefined ? null : ok}) + '\n');
@@ -379,7 +381,7 @@ _SYNTHETIC = {"card_number": "4111111111111111", "exp_month": "07", "exp_year": 
 class _NodeClosure:
     """One card document: the real closure over a fake DOM in a Node process, one JSON line per call."""
 
-    def __init__(self, scenario, tmp_path):
+    def __init__(self, scenario, tmp_path, scenarios=None):
         import re
         import shutil
         import subprocess
@@ -388,7 +390,7 @@ class _NodeClosure:
         if not node:
             pytest.skip("Node required for the synthetic commit closure")
         script = tmp_path / "closure.js"
-        values = {"SCENARIO": _SCENARIOS[scenario], "INSPECT": sp._INSPECT}
+        values = {"SCENARIO": (scenarios or _SCENARIOS)[scenario], "INSPECT": sp._INSPECT}
         script.write_text(re.sub(r"\bSCENARIO\b|\bINSPECT\b", lambda m: values[m.group(0)], _DOM))
         self.proc = subprocess.Popen([node, str(script)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True)

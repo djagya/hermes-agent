@@ -147,7 +147,8 @@ def record_payment(supervisor: Any, inspected: Any) -> None:
         old = tabs.get(payment.tab)
         if old is not None:  # a second fill on the same tab: every card document of both counts
             payment = _Payment(payment.tab, payment.merchant, payment.loader, old.documents | payment.documents,
-                               old.receiving | payment.receiving, old.merchant_fields or payment.merchant_fields)
+                               old.receiving | payment.receiving, old.merchant_fields or payment.merchant_fields,
+                               old.amount, old.currency)  # the approved total stays (fill-auto: each adoption merges)
         tabs[payment.tab] = payment
 
 
