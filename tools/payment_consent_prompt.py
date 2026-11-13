@@ -2,10 +2,13 @@
 
 The card-fill path builds a :class:`PaymentPromptFacts` and calls :func:`request_payment_approval`.
 The facts travel to the gateway as ``approval_data["payment"]``; the Telegram adapter renders them
-with :func:`render_html` on a dedicated card in the owner's private chat. Rendering shows every
+with :func:`render_html` on a dedicated card where the owner talks to Sera (the session's group thread, or
+the owner's private chat; ``gateway.payment_approval``). Rendering shows every
 mandatory fact or raises :class:`PromptIncomplete`: it never truncates, and there is no plain-text
 ``/approve`` fallback. Only the owner's own Telegram button approves (``approvals.payment_approver``,
-checked in ``tools.approval.resolve_gateway_approval``); every other surface can only deny.
+checked in ``tools.approval.resolve_gateway_approval``); every other surface can only deny, and another
+group member's tap on the card changes nothing. The owner's Approve is also the go for one Pay press of
+that checkout (owner decision 2026-11-13): the card says so, and nothing else authorizes a second press.
 
 No card value ever enters these facts: they hold the card's label, origins, field names and the
 cart as Sera stated it.
@@ -42,12 +45,13 @@ _CURRENCY_RE = re.compile(r"[A-Z]{3}")
 # Control characters (C0, DEL, C1), bidi overrides/isolates, zero-width and line/paragraph separators.
 _UNSAFE_TEXT_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff`]")
 
-APPROVE_LABEL = "Approve fill once"
+APPROVE_LABEL = "Approve: fill + Pay once"
 DENY_LABEL = "Deny"
+# The session's chat, when it is someone else's private chat (the card went to the owner's own chat).
 GROUP_NOTICE = "Card-fill approval sent to the owner privately."
 # Reply to a typed /approve that a waiting card fill stopped (FIFO) or that skipped it (/approve all).
-TYPED_APPROVE_HELD = ("A card fill is waiting: only the owner's Approve button in the private Telegram chat "
-                      "approves it. Typed /approve does not; /deny refuses it.")
+TYPED_APPROVE_HELD = ("A card payment is waiting: only the owner's Approve button on its card approves it. "
+                      "Typed /approve does not; /deny refuses it.")
 
 PAGE_MATCH_LINES = {
     "matched": "Page check: the page shows this total (text check only).",
@@ -64,7 +68,7 @@ UNAVAILABLE_SURFACE = ("Card-fill approvals are only shown as a Telegram card to
                        "cannot send one. Ask the user to run the checkout from Telegram.")
 UNAVAILABLE_INCOMPLETE = ("The card-fill approval could not be shown completely, so it was not shown at all. "
                           "Tell the user; do not retry with different wording.")
-UNAVAILABLE_UNDELIVERED = ("The card-fill approval card was not delivered to the owner's private Telegram chat (the "
+UNAVAILABLE_UNDELIVERED = ("The card-fill approval card was not delivered to the owner on Telegram (the "
                            "send failed, Telegram did not confirm it in time, or the card could not show every "
                            "fact). If it posted late, it was withdrawn at once and a tap on it does nothing. Tell "
                            "the user the approval did not go through; do not retry the fill on your own.")
@@ -223,12 +227,22 @@ def _check_origins(facts: PaymentPromptFacts) -> None:
             raise PromptIncomplete("an origin is not a plain https origin")
 
 
+def scope_line(facts: PaymentPromptFacts) -> str:
+    """What one Approve tap does, in plain words: the fill and exactly one Pay press of this checkout."""
+    if facts.cart is None:
+        return (f"Approve: Sera fills the card and presses Pay once at {facts.merchant_origin}. "
+                "No total was stated: check the amount before approving.")
+    return (f"Approve: Sera fills the card and presses Pay once for {facts.cart.total} {facts.cart.currency} "
+            f"at {facts.merchant_origin}.")
+
+
 def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
     """The card body, one fact per line, in the order the owner reads it."""
-    lines = [bold("Approve card fill?"), ""]
+    lines = [bold("Approve card payment?"), ""]
     if facts.unreviewed:
         lines += ["⚠️ " + bold("UNREVIEWED destination:") + " Hermes has not reviewed where some card "
                   "fields go. Check every origin below.", ""]
+    lines += [bold(esc(scope_line(facts))), ""]
     lines += [f"Card: {bold(esc(facts.card_label))}",
               f"Merchant (top-level page): {code(facts.merchant_origin)}",
               "Card fields go to:"]
@@ -244,9 +258,8 @@ def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
         where = f" Checked on {esc(facts.page_match.where)}." if facts.page_match.where else ""
         lines.append(esc(PAGE_MATCH_LINES[facts.page_match.state]) + where)
     lines += ["",
-              f"Scope: fill only, once. Expires in {facts.expires_in_s} s.",
-              "Hermes will not press Pay. If you told Sera in chat to pay, that go covers pressing Pay "
-              "after the fill.",
+              "One tap covers one fill and one Pay press for this checkout; any other payment needs a new "
+              f"approval. Expires in {facts.expires_in_s} s.",
               "Hermes cannot verify what will be charged. HTTPS does not mean the seller is legitimate.",
               f"Ref: {code(facts.ref)}"]
     return lines
