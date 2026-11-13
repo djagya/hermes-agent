@@ -370,7 +370,8 @@ _INSPECT_TEMPLATE = r"""(() => {
       // dlz: the plan, one entry per field: its token, value and CURRENT pin (a re-pin moves it; -1: deferred
       // until the card number is in), and, re-pinning, whether it was written (`done`).
       const plan = fills.map(f=>({index:f.index,token:String(f.token||''),value:f.value,...(repinning ? {done:false} : {}),
-                                  ...(automatic && f.kept === true ? {kept:true} : {})}));
+                                  ...(automatic && f.kept === true ? {kept:true} : {}),
+                                  ...(automatic && f.adopted === true ? {adopted:true} : {})}));
       written = plan;
       const queue = plan.slice().sort((a,b)=>(a.token==='cc-number')-(b.token==='cc-number'));
       const later = [];
@@ -513,17 +514,18 @@ _INSPECT_TEMPLATE = r"""(() => {
       const MAX_RELABELS = 4 * plan.length + 8;
       let relabels = 0;
       const RANK = {'cc-number': 0, 'cc-exp': 1, 'cc-exp-month': 1, 'cc-exp-year': 2, 'cc-name': 3, 'postal-code': 4, 'cc-csc': 5};
-      // dlz (fill-auto, r1 F4): a field of a generation that follows a re-inspection (`f.kept`, set on every fill of
-      // such a generation) is one the first inspection never saw: before its setter it must be fully exposed (its
-      // centre inside the viewport and hit there by the field or a descendant), on a reviewed destination too, as a
-      // re-pinned field must (`exposedHere`); the supervisor adds the owner-chain hit test from the parents (paced).
+      // dlz (fill-auto, r1 F4, r3 G2): a field of a reading adopted through a re-inspection (`f.adopted`, set on every
+      // fill of such a reading, the first generation after a re-inspection before the card read too) is one the
+      // inspection shown to the owner never saw: before its setter it must be fully exposed (its centre inside the
+      // viewport and hit there by the field or a descendant), on a reviewed destination too, as a re-pinned field
+      // must (`exposedHere`); the supervisor adds the owner-chain hit test from the parents (paced).
       // dlz (fill-auto, r1 F3): an accepted relabel is an asynchronous pause after the paced check passed: a focused
       // field that is paced goes through that check again (`pending`) before the checks above run once more.
       const settled = function* (f, el, focused) {
         for (;;) {
           const reason = why() || (!live(el) ? 'detached' : !focused ? null : !shown(el) ? 'hidden' :
                                    strict === true && !hits(el) ? 'hit_test' :
-                                   f.kept === true && !exposedHere(el) ? 'hit_test' : null);
+                                   f.adopted === true && !exposedHere(el) ? 'hit_test' : null);
           if (reason !== 'fields_relabeled' || relabels >= MAX_RELABELS || !labelOnly() || late()) return reason;
           relabels += 1;
           const accepted = yield {relabel:true,filled_fields:attempted};

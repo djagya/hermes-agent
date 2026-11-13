@@ -154,6 +154,10 @@ class PaymentInspection:
     auto: bool = False
     # the caller stopped waiting for the arming (it runs the base fill): a late finish never arms (r3 G6)
     arm_abandoned: bool = False
+    # r3 G2: a re-inspection an armed fill continues on (before the card read or under the fill). Its fields were not in
+    # the reading the approval card was built from: before each setter they get the exposure/hit test and, in a frame,
+    # the paced owner-chain check, whichever generation writes them.
+    adopted: bool = False
     approval: Any = field(default=None, repr=False, compare=False)
     approval_id: str = ""
 
@@ -1262,9 +1266,10 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         # dlz: strict fills in a frame pause after each focus for the owner-chain check from the parents
         # (a cross-origin parent's blur handler is out of the frame's reach); an unreviewed fill pauses in
         # every document, for the same bindings after the focus handlers ran.
-        # dlz (fill-auto, r1 F4): fields adopted through a re-inspection (``auto["kept"]``: a generation after the first)
-        # are paced on a reviewed destination too, as re-pinned fields are: the owner-chain hit test from the parents.
-        adopted = bool(auto and auto.get("kept"))
+        # dlz (fill-auto, r1 F4, r3 G2): fields of a reading adopted through a re-inspection (``auto["adopted"]``, the
+        # inspection's own provenance: also the first generation after a re-inspection before the card read) are paced
+        # on a reviewed destination too, as re-pinned fields are: the owner-chain hit test from the parents.
+        adopted = bool(auto and auto.get("adopted"))
         paced = (lambda point, d=document: self._paced_check(i, d, point)) \
             if (strict or adopted) and (_has_parent(i, document) or i.unreviewed_origins) else None
         # dlz (re-pin): only when switched on, and reviewed destinations only; otherwise the fill stops on any
@@ -1441,7 +1446,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         dlz (Codex B r2 #2): the commit call carries the values, and each resume() runs a setter, so from the first
         call on a lost, failed or malformed reply means a write may have landed: the result then says so
         (``write_uncertain``, ``partially_filled``) with the last acknowledged count of this document's writes,
-        never as if nothing was written. dlz (fill-auto): ``auto`` (``{mode, kept}``, an armed fill; never with
+        never as if nothing was written. dlz (fill-auto): ``auto`` (``{mode, kept, adopted}``, an armed fill; never with
         ``repin``): the closure's auto commit, whose ``relabel`` pause is answered by the async ``relabel()`` (True:
         the label-only change was classified again with every role unchanged and is now the pinned description)."""
         acknowledged = resumed or 0
@@ -1451,8 +1456,8 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         if auto:
             repin = None
             extra = [{"value": False}, {"value": auto["mode"]}]
-            if auto["kept"]:
-                fills = [{**f, "kept": True} for f in fills]
+            fills = [{**f, **({"kept": True} if auto["kept"] else {}), **({"adopted": True} if auto.get("adopted") else {})}
+                     for f in fills]
         else:
             extra = [{"value": True}] if repin is not None else []
 

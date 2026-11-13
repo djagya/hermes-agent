@@ -230,6 +230,7 @@ class PaymentAutoMixin:
                         # here and a cancellation finds one owner. Only the earlier one's objects are left to go.
                         prior.child_sessions = {}
                         prior.consumed = True
+                        fresh.adopted = True  # r3 G2: its fields are checked as re-inspected ones by every generation
                         await self._release_once(prior)  # cancelled here: ``finally`` still releases ``fresh``
                         adopted = True  # no await between this and the return: the caller has it from here
                         return fresh, ""
@@ -312,7 +313,8 @@ class PaymentAutoMixin:
         """One generation of an armed commit on inspection ``i``: ``(again, result)``. ``again``: "" (the result is
         final), "changed" (stopped on a changed field set or frame; a re-inspection may continue) or "repair" (every
         field was written, and after settling some are empty or were replaced). ``kept``: an earlier generation
-        wrote; a field that already holds its value is not written again. ``mode`` "repair" writes the card number
+        wrote; a field that already holds its value is not written again. ``i.adopted`` (r3 G2): ``i`` is a
+        re-inspection (before the card read or after an earlier generation): every field gets the exposure/hit test. ``mode`` "repair" writes the card number
         first and the CVC last."""
         def later(result: dict) -> dict:  # a stop after an earlier generation wrote is a partial fill
             return {**result, "partially_filled": True} if st["wrote"] and not result.get("success") else result
@@ -335,7 +337,7 @@ class PaymentAutoMixin:
         i.consumed = True  # consume before ingress, as _commit_payment_once does
         filled = 0
         state = {"number": False, "repins": 0, "repin": False}
-        auto = {"mode": mode, "kept": kept}
+        auto = {"mode": mode, "kept": kept, "adopted": i.adopted is True}
         try:
             written: list = []
             order = _sp()._commit_order(i, _sp()._fills_by_document(i, fills))
