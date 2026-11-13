@@ -552,9 +552,9 @@ def _log_commit(result: dict) -> None:
     again = result.get("fill_reinspect")
     if isinstance(again, dict):  # dlz (fill-auto): counts and a fixed code
         logger.log(logging.INFO if result.get("success") else logging.WARNING,
-                   "card fill %s: %s re-inspection(s), %s for lost values, refused %s",
+                   "card fill %s: %s re-inspection(s), %s for lost values, refused %s; it saw %s",
                    "written" if result.get("success") else "re-inspection", _code(again.get("count", 0)),
-                   _code(again.get("repairs", 0)), _code(again.get("refused", "-")))
+                   _code(again.get("repairs", 0)), _code(again.get("refused", "-")), _seen_text(again.get("seen")))
     if result.get("success"):
         if repins:
             logger.info("card fill written after %s re-pin(s) of re-rendered fields", _code(repins))
@@ -580,15 +580,24 @@ def _arm_auto(supervisor, inspected) -> bool:
     return callable(arm) and payment_fill_auto_enabled() and arm(inspected) is True
 
 
-def _reinspect_stop(code: str) -> dict:
+def _reinspect_stop(code: str, inspected=None) -> dict:
     """The stop when the checkout changed after the inspection and a re-inspection (``code``: its fixed reason) found
-    no complete card form matching the approval. Nothing was read or written."""
+    no complete card form matching the approval. Nothing was read or written. ``seen``: what its last reading held
+    (card field tokens per origin, or a count of frames), when it got that far."""
+    seen = (getattr(inspected, "approval", None) or {}).get("seen")
     logger.warning("card fill stopped before any write: the checkout changed after it was inspected; "
-                   "re-inspection refused (%s)", _code(code))
+                   "re-inspection refused (%s); it saw %s", _code(code), _seen_text(seen))
     cart = code == "cart_changed"
     return {"success": False, "error_type": "payment_cart_changed" if cart else "payment_page_changed",
             "error": _CART_CHANGED if cart else _PAGE_CHANGED,
-            "fill_reinspect": {"count": 0, "repairs": 0, "refused": _code(code)}}
+            "fill_reinspect": {"count": 0, "repairs": 0, "refused": _code(code), **({"seen": seen} if seen else {})}}
+
+
+def _seen_text(seen) -> str:
+    """``fill_reinspect.seen`` for the log line: origins with their field tokens, or a count; bounded."""
+    if not isinstance(seen, dict) or not seen:
+        return "-"
+    return "; ".join(f"{re.sub(r'[^A-Za-z0-9:/._-]', '', str(k))[:80]} {_code(v)}" for k, v in list(seen.items())[:8])
 
 
 def _auto_commit(vault, supervisor, inspected, fills: list, strict: bool, secret: dict) -> dict:
@@ -825,7 +834,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 # continued only on a reading that matches what the approval card showed. Before any card byte.
                 fresh, code = supervisor.reinspect_payment(inspected)
                 if fresh is None:
-                    return json.dumps(_reinspect_stop(code))
+                    return json.dumps(_reinspect_stop(code, inspected))
                 inspected, refreshed = fresh, 1
                 logger.info("card fill: the checkout was re-inspected after the approval (form re-rendered)")
             refused = _page_refusal(supervisor, inspected, unreviewed, policy)

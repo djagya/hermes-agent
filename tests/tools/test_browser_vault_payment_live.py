@@ -977,10 +977,14 @@ def test_provider_shapes_fill_once_without_submit(payment_browser, tmp_path, mon
     assert fill("/wallet")["target_origins"] == [origins["psp"]] and len(frame_values("/smart/")) == 2
 
 
-def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browser, tmp_path, monkeypatch, caplog):
+@pytest.mark.parametrize("auto", [False, True])
+def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browser, tmp_path, monkeypatch, caplog, auto):
     """Four hosted card-field frames on one provider origin. A value the provider drops after the
     per-document check (delayed reset, brand detection in another frame, reset on blur, a replaced
-    node) must not come back as success; a stable fill and a re-formatted expiry must."""
+    node) must not come back as success; a stable fill and a re-formatted expiry must.
+    dlz (11-13): ``auto`` (vault.payment_fill_auto): a value lost once (brand detection, a re-mounted or swapped
+    field or frame) is written once more on a fresh inspection and then holds; a field that drops every write still
+    ends as not retained after that one repair, and success is still only what every field holds after settling."""
     from dataclasses import replace
 
     from agent import vault_payment_policy as policy
@@ -998,6 +1002,7 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
     monkeypatch.setattr(policy, "PAYMENT_PROVIDERS", policy.PAYMENT_PROVIDERS + (
         replace(policy.OPT_IN_PROVIDERS[0], name="synthetic-paypal", origins=(origins["psp"],), max_documents=4,
                 paths=("/smart/card-field",)),))
+    monkeypatch.setattr("tools.browser_vault_payment.payment_fill_auto_enabled", lambda: auto)
 
     def frame_values(variant):
         out = {}
@@ -1023,8 +1028,8 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
         # No extra wait: the fill itself settles 2.0 s after the last write, past every scripted
         # reset (the latest fires at 1.5 s), so the frames are final when it returns.
         outcomes[variant] = (json.loads(raw), frame_values(variant), raw)
-        print("OUTCOME", variant, {k: v for k, v in outcomes[variant][0].items()
-                                   if k in ("success", "error_type", "filled_fields", "field_retention")},
+        print("OUTCOME", "auto=%s" % auto, variant, {k: v for k, v in outcomes[variant][0].items()
+                                   if k in ("success", "error_type", "filled_fields", "field_retention", "fill_reinspect")},
               {k: len(v) for k, v in outcomes[variant][1].items()})
 
     for variant, (out, values, raw) in outcomes.items():
@@ -1045,7 +1050,8 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
     assert outcomes["stable"][1] == {"name": "Ada Lovelace", "number": CARD["card_number"], "expiry": "07/35",
                                      "cvv": CARD["cvc"]}
     assert outcomes["expiry"][1]["expiry"] == "07 / 35"
-    assert outcomes["sync"][0]["error_type"] == "payment_validation_failed"
+    if not auto:
+        assert outcomes["sync"][0]["error_type"] == "payment_validation_failed"
     assert outcomes["sync"][0]["partially_filled"] is True
     expected = {
         "delayed": {"cc-number": "empty", "cc-csc": "empty"},
@@ -1056,6 +1062,15 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
         "frameswap": {"cc-number": "replaced"},
         "late": {"cc-number": "empty"},
     }
+    if auto:
+        # Lost once: repaired by the one extra pass. Dropped on every write: still not retained after it.
+        for variant in ("brand", "replace", "hidden", "frameswap"):
+            out = outcomes[variant][0]
+            assert out["success"] and out["fill_reinspect"] == {"count": 1, "repairs": 1}, (variant, out)
+            del expected[variant]
+        expected["sync"] = {"cc-number": "empty"}
+        for variant in expected:
+            assert outcomes[variant][0]["fill_reinspect"] == {"count": 1, "repairs": 1, "refused": "budget"}, variant
     for variant, dropped in expected.items():
         out = outcomes[variant][0]
         assert out["error_type"] == "payment_fields_not_retained" and out["partially_filled"] is True, (variant, out)

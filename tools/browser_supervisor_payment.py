@@ -1213,6 +1213,9 @@ class PaymentSupervisionMixin:
             return None, "unavailable"
         deadline = min(stop, prior.expires_at, time.monotonic() + wait)
         refused = "too_late"
+        # dlz: what the last refused reading held, for the stop record: card field tokens per origin, or the
+        # discovery's own count of frames it looked into. Origins, fixed tokens and counts only.
+        prior.approval.pop("seen", None)
         while time.monotonic() < deadline:
             fresh = None
             try:
@@ -1221,12 +1224,15 @@ class PaymentSupervisionMixin:
             except PaymentDestinationError as exc:
                 refused = {"payment_fields_unsupported": "incomplete",
                            "payment_fields_ambiguous": "ambiguous"}.get(exc.error_type, "unverifiable")
+                prior.approval["seen"] = _seen_detail(exc.detail)
             except PaymentPolicyError as exc:
                 refused = _reinspect_refusal(str(exc))
             except Exception:  # health: allow BLE001 -- a page that cannot be read now may be read a moment later
                 refused = "unavailable"
             if fresh is not None:
                 refused = _approval_mismatch(prior.approval, fresh) or ""
+                prior.approval["seen"] = {origin: sorted(tokens)
+                                          for origin, tokens in _approval_facts(fresh)["fields"].items()}
                 if not refused:
                     # Still the same reading a moment later (a form caught mid-render is read again instead).
                     await asyncio.sleep(_REINSPECT_SETTLE_SECONDS)
@@ -1237,6 +1243,7 @@ class PaymentSupervisionMixin:
                 if not refused:
                     loaders = {f[0]: f[1] for f in fresh.tree}
                     prior.approval["documents"] |= {(d.frame_id, loaders.get(d.frame_id)) for d in fresh.documents}
+                    prior.approval.pop("seen", None)
                     # The fresh inspection owns the shared frame sessions from here; the earlier one's objects go.
                     prior.child_sessions = {}
                     prior.consumed = True
@@ -1274,7 +1281,9 @@ class PaymentSupervisionMixin:
         if future is None:
             raise _LoopUnavailable("Browser supervisor loop unavailable")
         try:
-            return future.result(timeout=budget)
+            # An armed commit ends its writes at `until`; the settle and retention reads of its last generation may
+            # run a few seconds past it, and their answer is the truth about the page, not an unknown outcome.
+            return future.result(timeout=budget + (8 if auto else 0))
         except concurrent.futures.TimeoutError:
             # dlz: stop the commit where it is; a write already in flight is refused by the renderer past
             # `until`, and what landed is unknown. Consumed (never a retry), so the caller skips its discard:
@@ -1324,6 +1333,7 @@ class PaymentSupervisionMixin:
                     return _auto_result(result, st)
                 fresh, st["refused"] = await self._reinspect(current, stop, _REINSPECT_WAIT_SECONDS)
                 if fresh is None:
+                    st["seen"] = current.approval.get("seen")
                     return _auto_result(result, st)
                 current = fresh
                 st["reinspections"] += 1
@@ -2169,8 +2179,24 @@ def _auto_result(result: dict, st: dict) -> dict:
     if st["reinspections"] or st["refused"]:
         refused = st["refused"] if st["refused"] in _REINSPECT_FINAL | _REINSPECT_RETRIED else ""
         out["fill_reinspect"] = {"count": st["reinspections"], "repairs": st["repairs"],
-                                 **({"refused": refused} if refused else {})}
+                                 **({"refused": refused} if refused else {}),
+                                 **({"seen": st["seen"]} if refused and st.get("seen") else {})}
     return out
+
+
+def _seen_detail(detail: Any) -> dict | None:
+    """What a refused discovery reading reported (``PaymentDestinationError.detail``), for ``fill_reinspect.seen``:
+    its count of unreviewed frames looked into, or the card field tokens per origin. Nothing else passes."""
+    if not isinstance(detail, dict):
+        return None
+    count = detail.get("unreviewed_frames_inspected")
+    if type(count) is int:
+        return {"unreviewed_frames_inspected": count}
+    rows = detail.get("receiving_origins")
+    if isinstance(rows, list) and all(isinstance(r, dict) and isinstance(r.get("origin"), str)
+                                      and isinstance(r.get("fields"), list) for r in rows):
+        return {r["origin"]: sorted(str(t) for t in r["fields"]) for r in rows[:8]}
+    return None
 
 
 def _repins(result: dict, state: dict) -> dict:
