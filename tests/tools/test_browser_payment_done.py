@@ -79,6 +79,8 @@ class FakeSup:
         if method == "Runtime.evaluate":
             if params.get("returnByValue") and params["expression"].endswith(".pin()"):  # B1: the total at Pay
                 return {"result": {"type": "object", "value": dict(self.pin)}}
+            if params.get("returnByValue") and params["expression"].startswith("(" + surface._pay_js("page")):
+                return {"result": {"type": "object", "value": {"ok": True, "why": "ok"}}}  # r4 C1: the Pay check
             if params["expression"] != done.SNAPSHOT_JS:  # the payment_controls lister
                 return {"result": {"objectId": "arr"}}
             return {"result": {"type": "object", "value": self.page}}
@@ -86,7 +88,9 @@ class FakeSup:
             fn = params["functionDeclaration"]
             if fn == surface._DESCRIBE:
                 return {"result": {"value": [{"i": 0, "role": "button", "text": "Pay 22.66 EUR", "disabled": False}]}}
-            return {"result": {"value": True}} if fn == surface._HIT else {"result": {"objectId": "el"}}
+            if fn in (surface._HIT, surface._pay_js("caption")):  # r4 C1: the caption check
+                return {"result": {"value": True}}
+            return {"result": {"objectId": "el"}}
         if method == "DOM.getContentQuads":
             return {"quads": [[10, 10, 30, 10, 30, 30, 10, 30]]}
         if method == "Page.getFrameTree":

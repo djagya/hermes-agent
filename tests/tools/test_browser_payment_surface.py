@@ -46,6 +46,19 @@ def _witness_pin(text, expression):
     return json.loads(run.stdout)
 
 
+def _caption_check(caption, params):
+    """The real caption check (as payment_click sends it) on a control whose text is ``caption``."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for the amount check")
+    args = ", ".join(json.dumps(a["value"]) for a in params["arguments"])
+    harness = ("const el = {getAttribute: () => null, innerText: " + json.dumps(caption) + ", value: '', title: ''};\n"
+               "process.stdout.write(JSON.stringify((" + params["functionDeclaration"] + ").call(el, " + args + ")));")
+    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
 def frame_tree(rows):
     """``Page.getFrameTree``'s result for tree rows ``(id, loader, url, origin, parent)``."""
     def node(row):
@@ -69,6 +82,7 @@ class FakeSup:
         self.tree = TREE  # what Page.getFrameTree answers (the document check before a listing and a press)
         # B1: the merchant page's amount check at Pay; page_text (when set) runs the real _AMOUNT_WITNESS in node
         self.pin, self.page_text = dict(MATCHED_PIN), None
+        self.caption = None  # r4 C1: the pressed control's caption, checked by the real _CAPTION_CHECK in node when set
 
     def default(self, method, params, session):
         if method == "Hermes.claimPaymentSurface":
@@ -86,9 +100,15 @@ class FakeSup:
             if params.get("returnByValue") and params["expression"].endswith(".pin()"):
                 pin = self.pin if self.page_text is None else _witness_pin(self.page_text, params["expression"])
                 return {"result": {"type": "object", "value": pin}}
+            if params.get("returnByValue") and params["expression"].startswith("(" + surface._pay_js("page")):
+                check = ({"ok": True, "why": "ok"} if self.page_text is None
+                         else _witness_pin(self.page_text, params["expression"]))
+                return {"result": {"type": "object", "value": check}}
             return {"result": {"objectId": "arr"}}
         if method == "Runtime.callFunctionOn":
             fn = params["functionDeclaration"]
+            if fn == surface._pay_js("caption"):
+                return {"result": {"value": True if self.caption is None else _caption_check(self.caption, params)}}
             if fn == surface._DESCRIBE:
                 return {"result": {"value": ROWS}}
             if fn == surface._HIT:
@@ -107,6 +127,8 @@ class FakeSup:
         return {}
 
     async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
+        if method in getattr(self, "pre_delays", {}):  # r4 C2: a slow send (the call reaches Chrome late)
+            await asyncio.sleep(self.pre_delays[method])
         self.calls.append((method, params or {}, session_id))
         if method in self.delays:
             await asyncio.sleep(self.delays[method])
@@ -114,7 +136,7 @@ class FakeSup:
 
     async def _payment_tree(self, sid, child_sessions):
         child_sessions["CARD"] = "S-card"
-        return TREE
+        return getattr(self, "listed", None) or TREE  # r4 C5: what the listing sees, when a test sets it
 
     async def _release_payment_object(self, sid, obj):
         pass
@@ -841,6 +863,233 @@ def test_a_later_merchant_page_after_an_admitted_press_is_checked_like_the_check
         assert out["success"] is True and len(_presses(sup)) == 2
     else:
         assert out["error_type"] == "payment_total_changed" and len(_presses(sup)) == 1
+
+
+# ---------------------------------------------- r4 (Codex r3 P1-1..3, P2; peer r3 P2-1..3, P3-1..3)
+
+
+@pytest.mark.parametrize("page", [
+    "Items total 100.00 EUR\nOrder total\n120.00 EUR",                    # label and amount on separate lines
+    "Items total 100.00 EUR\nOrder total\n100.00 USD",                    # ... in another currency
+    "Order total 100.00 EUR\nCard fee 20.00 EUR\nAmount to be charged 120.00 EUR",
+    "Total 100.00 EUR\nYou will be charged CHF 97.50",                    # another currency anywhere
+    "Gesamtsumme 100,00 €\nEndbetrag 120,00 €",
+    "Gesamtsumme 100,00 €\nZahlbetrag\n120,00 €",
+    "Total 100.00 EUR\nPay 120.00 EUR",
+    "Total 100.00 EUR\n120.00 EUR order total",                           # amount before its label
+])
+def test_pay_refuses_a_total_the_fill_check_reads_as_matched_but_cannot_reconcile(page):
+    """r4 C1: every page here passes the fill's own check (matched), yet shows another amount as what is charged."""
+    from tools.browser_supervisor_payment import _AMOUNT_WITNESS
+
+    assert _witness_pin(page, "(" + _AMOUNT_WITNESS + ")(10000, 'EUR').pin()")["state"] == "matched"
+    sup = _claimed()
+    sup.page_text = page
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    assert out["error_type"] == "payment_total_changed" and not _presses(sup) and surface.locally_locked(sup)
+
+
+@pytest.mark.parametrize("page", ["Subtotal 80.00 €\nShipping\n20.00 €\nTotal 100.00 €",
+                                  "VAT 16.00 EUR\nTotal 100.00 EUR\nPay with card ending 4242"])
+def test_pay_is_admitted_on_a_summary_whose_every_amount_reconciles(page):
+    sup = _claimed()
+    sup.page_text = page
+    assert surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])["success"] is True
+
+
+@pytest.mark.parametrize("caption, admitted", [("Pay 100.00 EUR", True), ("Pay with card 4242 4242", True),
+                                               ("Continue", True), ("Pay 120.00 EUR", False),
+                                               ("Pay CHF 100.00", False), ("Jetzt 120,00 € zahlen", False)])
+def test_a_control_whose_caption_shows_another_amount_is_never_pressed(caption, admitted):
+    """r4 C1: the cheapest strong check: the pressed control's own caption holds no amount but the approved total."""
+    sup = _claimed()
+    sup.page_text, sup.caption = "Order total 100.00 EUR", caption
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    assert (out.get("success") is True) is admitted and len(_presses(sup)) == int(admitted)
+    if not admitted:
+        assert out["error_type"] == "payment_total_changed"
+
+
+def _claim_during(sup, method, *, delay=("Page.getFrameTree", 0.4), match=None):
+    """When ``method`` is sent (first time, ``match`` on its params), a new card fill claims the slot from another
+    thread (the real claim path) while the click's next CDP replies are slowed down."""
+    base, started, results = sup.on, [], []
+
+    def on(m, params, session):
+        out = base(m, params, session)
+        if m == method and not started and (match is None or match(params)):
+            started.append(True)
+            if len(delay) > 2:
+                sup.pre_delays = {delay[0]: delay[1]}
+            else:
+                sup.delays[delay[0]] = delay[1]
+            threading.Thread(target=lambda: results.append(surface.claim_payment_surface(sup, _inspected())),
+                             daemon=True).start()
+        return out
+
+    sup.on = on
+    return results
+
+
+def test_a_new_fill_during_the_total_read_revokes_the_click():
+    """r4 C2 (Codex r3 P1-2): a claim (a new fill: a new approval) while the click reads the total; the click saved the
+    old approval, but the press must not go out on it."""
+    sup = _claimed()
+    ref = surface.payment_controls(sup)["controls"][0]["ref"]
+    results = _claim_during(sup, "Runtime.evaluate", match=lambda p: p.get("expression", "").endswith(".pin()"))
+    out = surface.payment_click(sup, ref)
+    wait_until(lambda: results, timeout=5)
+    assert results == [None] and surface.approved_total(sup) is None  # the new fill's claim went through
+    assert out["error_type"] == "payment_approval_changed" and not _presses(sup)
+
+
+def test_a_claim_waits_until_a_press_in_flight_is_dispatched():
+    """r4 C2: claims are fenced against the final check and the dispatch: one that starts at mousePressed reaches
+    the browser only after mouseReleased."""
+    sup = _claimed()
+    ref = surface.payment_controls(sup)["controls"][0]["ref"]
+    results = _claim_during(sup, "Input.dispatchMouseEvent", delay=("Input.dispatchMouseEvent", 0.4, "pre"),
+                            match=lambda p: p.get("type") == "mousePressed")
+    assert surface.payment_click(sup, ref)["success"] is True
+    wait_until(lambda: results, timeout=5)
+    names = [c[0] if c[0] != "Input.dispatchMouseEvent" else c[1]["type"] for c in sup.calls]
+    assert names.index("Hermes.claimPaymentSurface", names.index("mousePressed")) > names.index("mouseReleased")
+
+
+@pytest.mark.parametrize("change", ["frame", "covered", "owner"])
+def test_a_change_during_the_total_read_never_gets_the_press(change):
+    """r4 C3 (Codex r3 P1-3, peer P3-2): the clicked card frame navigates, its control is covered, or its iframe owner
+    is no longer at the point while the gate reads the merchant total: no press."""
+    sup = _claimed()
+    ref = surface.payment_controls(sup)["controls"][0]["ref"]  # a control in the CARD frame
+    base = sup.on
+
+    def on(method, params, session):
+        out = base(method, params, session)
+        if method == "Runtime.evaluate" and params.get("expression", "").endswith(".pin()"):
+            if change == "frame":
+                sup.tree = (TREE[0], ("CARD", "L2", "https://psp.test/f", "https://psp.test", "PAGE"))
+            elif change == "covered":
+                sup.hit = False
+            else:
+                sup.at_point = 99
+        return out
+
+    sup.on = on
+    out = surface.payment_click(sup, ref)
+    assert out["error_type"] in {"payment_surface_unavailable", "payment_control_covered", "payment_control_changed"}
+    assert not _presses(sup)
+
+
+def _admitted(sup):
+    assert surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])["success"] is True
+
+
+@pytest.mark.parametrize("top, read", [
+    (("PAGE", "LR", "https://checkout.shop.test/review", "https://checkout.shop.test", ""), True),  # same site
+    (("PAGE", "LR", "http://shop.test/review", "http://shop.test", ""), True),                    # unknown: read
+    (("PAGE", "LB", "https://acs.bank.test/challenge", "https://acs.bank.test", ""), False),      # another site
+])
+def test_only_a_page_on_another_site_skips_the_total_after_an_admitted_press(top, read):
+    """r4 C4 (peer r3 P2-1): the bank exemption needs another registrable domain; a same-site subdomain review page
+    with a changed total is refused."""
+    sup = _claimed()
+    _admitted(sup)
+    sup.tree, sup.page_text = (top, TREE[1]), "Order total 120.00 EUR"
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    assert len(_total_reads(sup)) == 1 + int(read)
+    assert (out.get("success") is True) is not read and len(_presses(sup)) == 1 + int(not read)
+
+
+def test_a_bank_page_in_another_tab_is_never_exempt():
+    """r4 C4: the exemption holds only in the payment tab the fill bound (same top frame)."""
+    sup = _claimed()
+    _admitted(sup)
+    sup.tree = (("OTHER", "LB", "https://acs.bank.test/challenge", "https://acs.bank.test", ""),
+                ("CARD", "L1", "https://psp.test/f", "https://psp.test", "OTHER"))
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    assert out["error_type"] == "payment_total_changed" and len(_presses(sup)) == 1
+
+
+@pytest.mark.parametrize("url, merchant, other", [
+    ("https://acs.bank.test/x", "https://shop.test", True), ("https://checkout.shop.test/", "https://shop.test", False),
+    ("https://pay.shop.co.uk/", "https://shop.co.uk", False), ("https://bank.co.uk/", "https://shop.co.uk", True),
+    ("https://a.shop.com.au/", "https://shop.com.au", False), ("https://10.0.0.1/", "https://shop.test", False),
+    ("http://bank.test/", "https://shop.test", False), ("https://localhost/", "https://shop.test", False),
+])
+def test_cross_site_compares_registrable_domains_and_unknown_is_same_site(url, merchant, other):
+    assert surface.cross_site(url, merchant) is other
+
+
+BANK_IN_CARD = ("CARD", "L9", "https://acs.bank.test/challenge", "https://acs.bank.test", "PAGE")
+
+
+@pytest.mark.parametrize("case", ["admitted", "first", "same_site"])
+def test_a_bank_challenge_that_replaced_a_card_frame_is_pressed_after_an_admitted_pay(case):
+    """r4 C5 (Codex r3 P2): after the admitted Pay, a bank challenge replaces the card frame and the merchant hides its
+    summary: the challenge's control is pressed with no merchant total. Not before an admitted press, and not when the
+    frame's new document is the merchant's own site (the total is read, and missing)."""
+    sup = _claimed()
+    if case != "first":
+        _admitted(sup)
+    frame = BANK_IN_CARD if case != "same_site" else ("CARD", "L9", "https://pay.shop.test/x", "https://pay.shop.test",
+                                                      "PAGE")
+    sup.tree = sup.listed = (TREE[0], frame)
+    sup.page_text = "Thank you, please confirm with your bank"
+    reads = len(_total_reads(sup))
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    if case == "admitted":
+        assert out["success"] is True and len(_total_reads(sup)) == reads and len(_presses(sup)) == 2
+    else:
+        assert out["error_type"] == "payment_total_changed" and len(_presses(sup)) == int(case != "first")
+
+
+def test_an_owner_go_press_or_one_before_a_new_fill_never_admits_a_bank_page():
+    """r4 C7 (peer r3 P3-1): only a press checked against the current approval admits the bank step; an owner_go press,
+    and a checked press of an earlier fill in the same lock, do not."""
+    sup = _claimed(approved=None)
+    assert surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"], owner_go=True)["success"]
+    assert surface.claim_payment_surface(sup, _inspected()) is None  # a new fill in the same lock, bound
+    surface.record_approved_total(sup, *APPROVED)
+    _admitted(sup)  # checked: admits this approval's bank step
+    assert surface.claim_payment_surface(sup, _inspected()) is None  # and another fill
+    surface.record_approved_total(sup, *APPROVED)
+    sup.tree = (("PAGE", "LB", "https://acs.bank.test/challenge", "https://acs.bank.test", ""), TREE[1])
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    assert out["error_type"] == "payment_total_changed" and len(_presses(sup)) == 2
+
+
+@pytest.mark.parametrize("failure", ["malformed", "raises"])
+def test_a_card_that_covered_pay_but_was_not_bound_refuses_even_with_owner_go(failure, monkeypatch):
+    """r4 C8 (peer r3 P3-3): the binding of a Pay-once card failed: every press is refused with its own code, never
+    the owner_go path (which would press with no total read)."""
+    sup = _claimed(approved=None)
+    stated = bvp._stated_cart({"items": [{"description": "Ticket", "quantity": 1}], "total": "100.00",
+                               "currency": "EUR"})
+    facts = SimpleNamespace(cart=stated, page_match=SimpleNamespace(state="matched"), pay_once_on=True)
+    inspected = _inspected()
+    if failure == "malformed":
+        inspected.tree = (("PAGE", "", "https://shop.test/", "https://shop.test", ""),)
+    else:
+        def boom(*a):
+            raise RuntimeError("binding failed")
+        monkeypatch.setattr(surface, "record_approved_total", boom)
+    bvp._bind_approved_total(sup, inspected, stated, facts, {"success": True})
+    assert surface.approved_total(sup) is None
+    ref = surface.payment_controls(sup)["controls"][0]["ref"]
+    for go in (False, True):
+        out = surface.payment_click(sup, ref, owner_go=go)
+        assert out == {"success": False, "error_type": "payment_total_unbound", "error": surface._TOTAL_UNBOUND_TEXT}
+    assert not _presses(sup) and not _total_reads(sup)
+
+
+def test_the_go_required_text_never_claims_the_card_said_fill_only():
+    """r4 C8: payment_go_required also comes after a restart or with Pay-once switched off: the text names every case."""
+    sup = _claimed(approved=None)
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    assert out["error_type"] == "payment_go_required"
+    assert "it said fill only" not in out["error"] and "vault.payment_pay_once" in out["error"]
+    assert "restart" in out["error"] and "owner_go true" in out["error"]
 
 
 @pytest.mark.parametrize("state, bound", [("matched", True), ("ambiguous", False), ("not_found", False),

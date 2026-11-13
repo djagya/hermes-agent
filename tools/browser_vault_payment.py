@@ -653,17 +653,32 @@ def _record_approved_amount(supervisor, inspected, stated) -> None:
 def _bind_approved_total(supervisor, inspected, stated, facts, result: dict) -> None:
     """B1: a successful fill (``result``) whose card covered one Pay (``pays_once``: a stated total the page check matched)
     binds that total and the merchant top document to the payment lock; payment_click re-reads it before every
-    press. Never raises (the result must still say what was written); nothing bound means Pay needs the owner's go."""
+    press. Never raises (the result must still say what was written). r4 C8: a covered card whose total could not be
+    bound marks the lock unbound (every press refused, owner_go too); a fill-only card binds nothing (owner's go)."""
+    if not result.get("success") or stated is None or facts is None:
+        return
     try:
+        from tools import browser_payment_surface as surface
         from tools.payment_consent_prompt import pays_once
 
-        if not result.get("success") or stated is None or facts is None or not pays_once(facts):
+        if not pays_once(facts):
             return
-        from tools.browser_payment_surface import record_approved_total
-
-        record_approved_total(supervisor, *_cents(stated), tuple(inspected.tree[0][:2]), inspected.merchant_origin)
-    except Exception as exc:  # health: allow BLE001 -- unbound: every press then needs the owner's go in chat
+        if surface.record_approved_total(supervisor, *_cents(stated), tuple(inspected.tree[0][:2]),
+                                         inspected.merchant_origin):
+            return
+        surface.mark_unbound(supervisor)
+    except Exception as exc:  # health: allow BLE001 -- r4 C8: unbound, so every press of this lock is refused
         logger.info("approved total not bound to the payment lock (%s)", type(exc).__name__)
+        _mark_unbound(supervisor)
+
+
+def _mark_unbound(supervisor) -> None:
+    try:
+        from tools.browser_payment_surface import mark_unbound
+
+        mark_unbound(supervisor)
+    except Exception as exc:  # health: allow BLE001 -- no lock state to mark: presses then need the owner's go
+        logger.info("payment lock not marked unbound (%s)", type(exc).__name__)
 
 
 def _claim_and_readmit(vault, task_id: str, supervisor, inspected, lease: str) -> dict | None:
