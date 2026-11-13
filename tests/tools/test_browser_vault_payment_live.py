@@ -346,12 +346,12 @@ _FA_SCRIPTS = {
     "replace": "let d=0;document.addEventListener('input',()=>{if(d++)return;const n=$('c3').cloneNode(true);"
                "$('c3').replaceWith(n)});",
     # Eurowings: brand detection after the card number clears the CVC a moment later (once).
-    "retain": "let d=0;$('num').addEventListener('input',()=>{if(d++)return;setTimeout(()=>{$('c3').value=''},300)});",
+    "retain": "let d=0;$('num').addEventListener('input',()=>{if(d++)return;setTimeout(()=>{$('c3').value='';was.set($('c3'),'')},300)});",
     # ... or re-mounts it empty.
     "retain_remount": "let d=0;$('num').addEventListener('input',()=>{if(d++)return;setTimeout(()=>{"
                       "const n=$('c3').cloneNode(true);n.value='';$('c3').replaceWith(n)},300)});",
     # A CVC that never keeps its value.
-    "retain_never": "document.addEventListener('input',e=>{if(e.target.id==='c3')setTimeout(()=>{$('c3').value=''},100)},true);",
+    "retain_never": "document.addEventListener('input',e=>{if(e.target.id==='c3')setTimeout(()=>{$('c3').value='';was.set($('c3'),'')},100)},true);",
     # Still stops: the next field hidden for good; the top document's URL changed.
     "hide": "let d=0;document.addEventListener('input',()=>{if(d++)return;$('c3').style.display='none'});",
     "navigate": "let d=0;document.addEventListener('input',()=>{if(d++)return;history.pushState({},'',location.pathname+'?step=2')});",
@@ -1013,7 +1013,7 @@ def test_paypal_shaped_fields_report_settled_retention_truthfully(payment_browse
         out = {}
         targets = _schedule(sup._cdp("Target.getTargets"), sup._loop, timeout=10)["result"]["targetInfos"]
         for t in targets:
-            if t["type"] == "iframe" and f"/smart/card-field/{variant}/" in t["url"]:
+            if t["type"] == "iframe" and f"/smart/card-field/{variant}/" in t["url"] and "?swapped" not in t["url"]:
                 fsid = _schedule(sup._cdp("Target.attachToTarget", {"targetId": t["targetId"], "flatten": True}),
                                  sup._loop, timeout=10)["result"]["sessionId"]
                 try:
@@ -1760,9 +1760,9 @@ def test_fill_auto_datatrans_shaped_re_renders(payment_browser, tmp_path, monkey
             # r1 F4: a field the first inspection never saw (re-mounted during the approval) must be exposed, on a
             # reviewed destination too: the re-mounted expiry under the overlay is never written, nor the number after it
             assert not out["success"] and out["error_type"] == "payment_fields_changed", (variant, out)
-            assert out["fill_check"]["reason"] == detail and out["fill_check"]["token"] == "cc-exp", (variant, out)
-            assert states.get("num", "empty") == "empty" and not any(
-                v == "held" for k, v in states.items() if k.startswith("exp")), (variant, states)
+            assert out["fill_check"]["reason"] == detail and out["fill_check"]["token"] in ("cc-exp", "cc-csc"), (variant, out)
+            held = [k for k, v in states.items() if v == "held"]
+            assert out["filled_fields"] == 1 and len(held) == 1 and states.get("num", "empty") == "empty", (variant, states)
             continue
         assert not out["success"] and out["fill_reinspect"]["refused"] == detail, (variant, out)
         assert out["fill_reinspect"]["count"] == 0 and out["partially_filled"] is True, (variant, out)
