@@ -850,7 +850,9 @@ def test_a_fill_binds_the_total_only_when_its_card_covered_pay(state, bound):
     stated = bvp._stated_cart({"items": [{"description": "Ticket", "quantity": 1}], "total": "100.00",
                                "currency": "EUR"}) if state else None
     facts = SimpleNamespace(cart=stated, page_match=SimpleNamespace(state=state or "not_checked"))
-    bvp._bind_approved_total(sup, _inspected(), stated, facts)
+    bvp._bind_approved_total(sup, _inspected(), stated, facts, {"success": False})  # a failed fill binds nothing
+    assert surface.approved_total(sup) is None
+    bvp._bind_approved_total(sup, _inspected(), stated, facts, {"success": True})
     assert surface.approved_total(sup) == ((10000, "EUR") if bound else None)
     if bound:
         with surface._LOCK:
@@ -871,16 +873,16 @@ def test_no_total_is_bound_without_a_lock_of_this_process_or_from_a_malformed_va
 
 
 @pytest.mark.parametrize("success", [True, False])
-def test_fill_payment_binds_the_total_after_a_successful_commit_only(fill, success):
+def test_fill_payment_hands_the_commit_result_to_the_binding(fill, success):
     run, events, monkeypatch = fill
     monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface", lambda sup, i: events.append("claim"))
-    monkeypatch.setattr(bvp, "_bind_approved_total", lambda *a: events.append("bind"))
+    monkeypatch.setattr(bvp, "_bind_approved_total", lambda *a: events.append(("bind", a[-1]["success"])))
     from tools import browser_vault_tool
 
     supervisor = browser_vault_tool._ensure_supervisor("task")
     supervisor.commit_payment = lambda i, f, strict=False: events.append("commit") or {"success": success}
     run()
-    assert events[-2:] == (["commit", "bind"] if success else ["resolve", "commit"])
+    assert events[-2:] == ["commit", ("bind", success)]  # the binding sees the commit's own result
 
 
 _LISTER_HARNESS = r"""

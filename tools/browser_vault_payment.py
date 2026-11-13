@@ -650,14 +650,14 @@ def _record_approved_amount(supervisor, inspected, stated) -> None:
     record_approved_amount(supervisor, getattr(inspected, "page_id", None), stated.total, stated.currency)
 
 
-def _bind_approved_total(supervisor, inspected, stated, facts) -> None:
-    """B1: a successful fill whose card covered one Pay (``pays_once``: a stated total the page check matched)
+def _bind_approved_total(supervisor, inspected, stated, facts, result: dict) -> None:
+    """B1: a successful fill (``result``) whose card covered one Pay (``pays_once``: a stated total the page check matched)
     binds that total and the merchant top document to the payment lock; payment_click re-reads it before every
     press. Never raises (the result must still say what was written); nothing bound means Pay needs the owner's go."""
     try:
         from tools.payment_consent_prompt import pays_once
 
-        if stated is None or facts is None or not pays_once(facts):
+        if not result.get("success") or stated is None or facts is None or not pays_once(facts):
             return
         from tools.browser_payment_surface import record_approved_total
 
@@ -847,8 +847,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                     return json.dumps(_disabled(after_read=True))
                 window.committing()  # from here a card value may be in the page: only control's unlock releases it
             result = supervisor.commit_payment(inspected, fills, strict=strict, **_repin_argument(unreviewed))
-            if result.get("success"):
-                _bind_approved_total(supervisor, inspected, stated, facts)
+            _bind_approved_total(supervisor, inspected, stated, facts, result)
             _log_commit(result)
             _commit_text(result)
             return json.dumps(_describe_result(result, backend, inspected, fills, prompt, bound_revision,
