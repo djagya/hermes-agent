@@ -128,7 +128,7 @@ class FakeSup:
 
     async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
         if method in getattr(self, "pre_delays", {}):  # r4 C2: a slow send (the call reaches Chrome late)
-            await asyncio.sleep(self.pre_delays[method])
+            await asyncio.sleep(self.pre_delays[method])  # health: allow HX013 -- the slow send IS the behaviour under test
         self.calls.append((method, params or {}, session_id))
         if method in self.delays:
             await asyncio.sleep(self.delays[method])

@@ -678,7 +678,7 @@ async def _target_point(sup: Any, sid: str, element: str, page_sid: str, tree: t
     return x, y, outer
 
 
-async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: "_Gate") -> dict:
+async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _Gate) -> dict:
     """``gate``: what payment_click admitted the click with (B1, ``_pay_gate``; r4 C2: the claim generation)."""
     if gate.approved is UNBOUND:  # r4 C8: the card covered Pay but its total is not bound: never the owner_go path
         return _refusal(TOTAL_UNBOUND, _TOTAL_UNBOUND_TEXT)
@@ -785,7 +785,7 @@ async def _fence(sup: Any, deadline: float) -> threading.Lock:
     return lock
 
 
-def _admission_holds(sup: Any, gate: "_Gate") -> bool:
+def _admission_holds(sup: Any, gate: _Gate) -> bool:
     """r4 C2: no claim (a new fill, so a new approval) started since the click was admitted, and the lock and the
     approval it was admitted under are still the current ones."""
     with _LOCK:
