@@ -131,7 +131,8 @@ class TelegramApprovalCardsMixin:
         target = normalize_telegram_chat_id(chat_id)
         own_chat = isinstance(target, int) and str(target) == user_id
         group = isinstance(target, int) and target < 0
-        if platform != "telegram" or not user_id.isdigit() or not (own_chat or group) or not request_id:
+        if (platform != "telegram" or not user_id.isascii() or not user_id.isdigit() or not (own_chat or group)
+                or not request_id):
             return SendResult(success=False,
                               error="the payment card goes only to the approver's private chat or a group chat")
 
