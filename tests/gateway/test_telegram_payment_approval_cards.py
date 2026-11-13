@@ -177,13 +177,14 @@ def test_rendered_card_has_every_fact_verbatim_or_raises(state):
     assert utf16_len(text) <= 4096
     plain = html.unescape(text)
     cart_facts = () if state == "not_checked" else ("1234.50 EUR", "stated by Sera", *(i.description for i in items))
-    # One tap = the fill and one Pay press, said in plain words with the stated total and the merchant.
-    scope = (f"Approve: Sera fills the card only, at {origins[0]}. No total was stated"
-             if state == "not_checked" else
-             f"Approve: Sera fills the card and presses Pay once for 1234.50 EUR at {origins[0]}.")
+    # One tap = the fill and one Pay press, said in plain words with the stated total and the merchant; only a
+    # matched page check covers Pay (peer r2 P2), anything else is the fill only.
+    scope = {"not_checked": f"Approve: Sera fills the card only, at {origins[0]}. No total was stated",
+             "matched": f"Approve: Sera fills the card and presses Pay once for 1234.50 EUR at {origins[0]}."}.get(
+                 state, f"Approve: Sera fills the card only, at {origins[0]}. Hermes did not find 1234.50 EUR clearly")
     for fact in (origins[0], origins[1], "UNREVIEWED", "cc-number, cc-csc, cc-exp", "Test card",
                  PAGE_MATCH_LINES[state], "Expires in 97 s", "c" * 32, scope,
-                 "one Pay press" if state != "not_checked" else "Pay needs your go in chat",
+                 "one Pay press" if state == "matched" else "Pay needs your go in chat",
                  "cannot verify what will be charged", *cart_facts):
         assert fact in plain, fact
     assert "3-D Secure" not in plain and "3DS" not in plain
@@ -319,6 +320,34 @@ async def test_a_card_without_a_stated_total_is_fill_only_in_button_and_toast():
     assert entry.result == "once"
     toast = query.answer.call_args.kwargs["text"]
     assert "Pay needs your go in chat" in toast and "presses Pay once" not in toast
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state, pays", [("matched", True), ("ambiguous", False), ("not_found", False),
+                                         (None, False)])
+async def test_pay_once_only_when_the_page_check_matched_the_stated_total(state, pays):
+    """Peer r2 P2: a stated total the page check did not match (not_found / ambiguous) is a fill-only card in its
+    scope line, its footer, its button, its record and its toast, like a card with no stated total."""
+    from tools.payment_consent_prompt import (APPROVE_LABEL, APPROVE_LABEL_FILL_ONLY, pays_once, render_plain,
+                                              scope_line)
+    facts = _facts() if state is None else _facts(cart=StatedCart((CartItem("Ticket", 1),), "12.50", "CHF"),
+                                                  page_match=PageMatch(state, "the merchant page"))
+    assert pays_once(facts) is pays
+    text = render_plain(facts)
+    assert ("presses Pay once for 12.50 CHF" in scope_line(facts)) is pays
+    assert ("does not cover pressing Pay: Pay needs your go in chat" in scope_line(facts)) is not pays
+    assert ("One tap covers one fill and one Pay press" in text) is pays
+    assert ("One tap covers one fill only" in text) is not pays
+    adapter = _adapter()
+    entry = _pending(exact_request=True, approver=OWNER)
+    result = await adapter.send_payment_approval(chat_id=str(OWNER_ID), facts=facts, request_id=entry.data["request_id"],
+                                                 session_key=SESSION, approver=OWNER)
+    buttons = [b for row in adapter._bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard for b in row]
+    assert buttons[0].text == (APPROVE_LABEL if pays else APPROVE_LABEL_FILL_ONLY)
+    assert next(iter(adapter._approval_cards.values()))["fill_only"] is not pays
+    coro, query = _tap(adapter, buttons[0].callback_data, chat_id=OWNER_ID, message_id=int(result.message_id))
+    await coro
+    assert ("Pay needs your go in chat" in query.answer.call_args.kwargs["text"]) is not pays
 
 
 @pytest.mark.asyncio
