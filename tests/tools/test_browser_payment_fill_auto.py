@@ -735,3 +735,24 @@ def test_an_arming_that_timed_out_leaves_the_inspection_unarmed(monkeypatch):
     monkeypatch.setattr("tools.browser_supervisor._schedule", schedule)
     assert sup.arm_payment_auto(i) is False
     assert i.auto is False and i.approval is None
+
+
+# -- Round 3 (r2 final review: G1-G6) --
+
+def test_only_the_armed_fills_adoption_keeps_the_approved_total(monkeypatch):
+    """G5 (peer P3-3): the vault's ``adopted`` hook records a continued reading as an adoption (the total stays); the
+    vault's own record after a claim is the base one."""
+    from tools import browser_vault_payment as bvp
+
+    seen, recorded = {}, []
+
+    class Supervisor:
+        def commit_payment(self, inspected, fills, **kw):
+            seen.update(kw)
+            return {"success": True}
+
+    monkeypatch.setattr("tools.browser_payment_done.record_payment",
+                        lambda supervisor, inspected, **kw: recorded.append((inspected, kw)))
+    bvp._auto_commit(SimpleNamespace(_is_managed=lambda: True), Supervisor(), "inspection", [], False, {}, "t", "l")
+    seen["adopted"]("fresh")
+    assert recorded == [("fresh", {"adopted": True})]

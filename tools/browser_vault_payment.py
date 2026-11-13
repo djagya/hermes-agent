@@ -649,7 +649,7 @@ def _auto_commit(vault, supervisor, inspected, fills: list, strict: bool, secret
         if vault._is_managed():
             from tools.browser_payment_done import record_payment
 
-            record_payment(supervisor, fresh)
+            record_payment(supervisor, fresh, adopted=True)  # the approved total stays (fill-auto r3 G5)
 
     context = contextvars.copy_context()  # the check runs on a worker thread of the supervisor's loop
 
