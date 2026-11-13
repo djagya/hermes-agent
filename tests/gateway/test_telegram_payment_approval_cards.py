@@ -2,7 +2,8 @@
 
 Buttons carry a random single-use nonce bound to the card's request, chat, thread and message, so a
 button from before an adapter restart, a replay, or another card's data resolves nothing. The
-payment card goes only to the owner's private chat with every mandatory fact, or is not sent.
+payment card goes to the owner's private chat or a group chat (never someone else's private chat) with every
+mandatory fact, or is not sent.
 """
 
 import html
@@ -17,7 +18,7 @@ from gateway.platforms.base import utf16_len
 from tools import approval
 from tools.approval_gateway_wait import _ApprovalEntry
 from tools.payment_consent_prompt import (
-    GROUP_NOTICE, MAX_ITEM_TEXT, PAGE_MATCH_LINES, CartItem, PageMatch, PaymentPromptFacts, PromptIncomplete,
+    APPROVE_LABEL, DENY_LABEL, GROUP_NOTICE, MAX_ITEM_TEXT, PAGE_MATCH_LINES, CartItem, PageMatch, PaymentPromptFacts, PromptIncomplete,
     ReceivingOrigin, StatedCart, render_html)
 
 SESSION = "agent:main:telegram:group:-1001:5"
@@ -134,8 +135,8 @@ async def test_payment_card_goes_to_the_owners_dm_and_only_the_owner_answers():
     assert result.success
     kwargs = adapter._bot.send_message.call_args.kwargs
     assert kwargs["chat_id"] == OWNER_ID and kwargs["parse_mode"] == "HTML"
-    buttons = kwargs["reply_markup"].inline_keyboard[0]
-    assert [b.text for b in buttons] == ["Approve fill once", "Deny"]
+    buttons = [b for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert [b.text for b in buttons] == [APPROVE_LABEL, DENY_LABEL] and "Pay once" in APPROVE_LABEL
     approve = buttons[0].callback_data
     mid = int(result.message_id)
     # Another (authorized) user presses: refused, card still live; typed /approve: nothing.
@@ -150,8 +151,8 @@ async def test_payment_card_goes_to_the_owners_dm_and_only_the_owner_answers():
     coro, _ = _tap(adapter, approve, chat_id=OWNER_ID, message_id=mid)
     await coro
     assert entry.result == "once"
-    # A card for anyone but the approver's own private chat is never sent.
-    refused = await adapter.send_payment_approval(chat_id=str(GROUP), facts=_facts(), request_id=rid,
+    # Someone else's private chat never gets the card (a group chat may: see the thread tests).
+    refused = await adapter.send_payment_approval(chat_id="222", facts=_facts(), request_id=rid,
                                                   session_key=SESSION, approver=OWNER)
     assert not refused.success
 
@@ -175,8 +176,12 @@ def test_rendered_card_has_every_fact_verbatim_or_raises(state):
     assert utf16_len(text) <= 4096
     plain = html.unescape(text)
     cart_facts = () if state == "not_checked" else ("1234.50 EUR", "stated by Sera", *(i.description for i in items))
+    # One tap = the fill and one Pay press, said in plain words with the stated total and the merchant.
+    scope = (f"Approve: Sera fills the card and presses Pay once at {origins[0]}. No total was stated"
+             if state == "not_checked" else
+             f"Approve: Sera fills the card and presses Pay once for 1234.50 EUR at {origins[0]}.")
     for fact in (origins[0], origins[1], "UNREVIEWED", "cc-number, cc-csc, cc-exp", "Test card",
-                 PAGE_MATCH_LINES[state], "Expires in 97 s", "c" * 32, "Hermes will not press Pay",
+                 PAGE_MATCH_LINES[state], "Expires in 97 s", "c" * 32, scope, "one Pay press",
                  "cannot verify what will be charged", *cart_facts):
         assert fact in plain, fact
     assert "3-D Secure" not in plain and "3DS" not in plain
@@ -220,7 +225,10 @@ def _turn_runner(adapter, chat_id):
     return runner
 
 
-def test_group_session_gets_only_a_neutral_notice_and_never_the_text_fallback(monkeypatch):
+@pytest.mark.parametrize("session_chat", [GROUP, OWNER_ID, 222])
+def test_card_route_and_never_the_text_fallback(monkeypatch, session_chat):
+    """A group session's card goes into its own chat and thread with no notice; the owner's private chat gets it
+    there; someone else's private chat gets only the neutral notice while the card goes to the owner's chat."""
     from tools import approval_context
     monkeypatch.setattr(approval_context, "payment_approver", lambda: OWNER)
     adapter = MagicMock(spec=["send_payment_approval", "retire_payment_card", "send", "send_exec_approval"])
@@ -228,12 +236,17 @@ def test_group_session_gets_only_a_neutral_notice_and_never_the_text_fallback(mo
     adapter.send_payment_approval = AsyncMock(return_value=SimpleNamespace(success=True, message_id="9"))
     adapter.send = AsyncMock(return_value=SimpleNamespace(success=True))
     entry = _pending(exact_request=True, approver=OWNER, payment=_facts().to_dict())
-    runner = _turn_runner(adapter, GROUP)
+    runner = _turn_runner(adapter, session_chat)
     runner._approval_notify_sync(dict(entry.data))
     call = adapter.send_payment_approval.call_args.kwargs
-    assert call["chat_id"] == str(OWNER_ID) and call["approver"] == OWNER and call["request_id"] == entry.data["request_id"]
-    (notice,) = adapter.send.call_args_list
-    assert notice.args[:2] == (str(GROUP), GROUP_NOTICE)
+    assert call["approver"] == OWNER and call["request_id"] == entry.data["request_id"]
+    if session_chat == 222:
+        assert call["chat_id"] == str(OWNER_ID) and call["metadata"] is None
+        (notice,) = adapter.send.call_args_list
+        assert notice.args[:2] == ("222", GROUP_NOTICE)
+    else:
+        assert call["chat_id"] == str(session_chat) and call["metadata"] == {"thread_id": "5"}
+        adapter.send.assert_not_called()
     adapter.send_exec_approval.assert_not_called()
 
 

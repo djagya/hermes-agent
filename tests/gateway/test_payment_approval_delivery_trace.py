@@ -173,7 +173,7 @@ def test_an_unanswered_card_times_out_and_tells_the_owner_once(caplog):
     _runner(adapter)
     consent, _ = _ask(1)
     assert (consent.outcome, consent.reason) == ("timeout", "timeout")
-    adapter.send.assert_called_once_with(str(OWNER_ID), payment_approval.EXPIRED_NOTICE)
+    adapter.send.assert_called_once_with(str(OWNER_ID), payment_approval.EXPIRED_NOTICE, metadata={"_interim_send": True})
     adapter._bot.edit_message_text.assert_called_once()  # the card itself loses its buttons
     _assert_no_card_text(caplog, adapter)
 
@@ -199,7 +199,8 @@ def test_an_unanswered_card_whose_connection_dropped_is_unavailable_not_timeout(
     consent, _ = _ask(1)
     thread.join(5)
     assert (consent.outcome, consent.reason, consent.detail) == ("unavailable", "unavailable", UNAVAILABLE_DEGRADED)
-    adapter.send.assert_called_once_with(str(OWNER_ID), payment_approval.EXPIRED_NOTICE_DEGRADED)
+    adapter.send.assert_called_once_with(str(OWNER_ID), payment_approval.EXPIRED_NOTICE_DEGRADED,
+                                         metadata={"_interim_send": True})
     assert any("delivery_degraded=True" in m for m in _messages(caplog) if m.startswith("Approval wait ended"))
     _assert_no_card_text(caplog, adapter)
 
