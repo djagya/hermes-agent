@@ -152,6 +152,8 @@ class PaymentInspection:
     cart: Any = None
     cart_pins: tuple = ()
     auto: bool = False
+    # the caller stopped waiting for the arming (it runs the base fill): a late finish never arms (r3 G6)
+    arm_abandoned: bool = False
     approval: Any = field(default=None, repr=False, compare=False)
     approval_id: str = ""
 

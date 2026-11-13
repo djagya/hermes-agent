@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -65,6 +66,8 @@ _REINSPECTABLE = frozenset({"payment_fields_changed", "payment_page_changed"})
 # Repair order (a field that lost its value): card number, expiry, holder, postcode, CVC last.
 _REPAIR_RANK = {"cc-number": 0, "cc-exp": 1, "cc-exp-month": 1, "cc-exp-year": 2, "cc-name": 3, "postal-code": 4,
                 "cc-csc": 5}
+# r3 G6: the caller's thread clears an arming it stopped waiting for while the loop may be finishing it.
+_ARM_LOCK = threading.Lock()
 
 
 class PaymentAutoMixin:
@@ -104,8 +107,11 @@ class PaymentAutoMixin:
         if not armed:
             # The caller's view is authoritative: an arming that timed out may still have got as far as setting the
             # flag, and an inspection that is armed for the supervisor (relabel acceptance, re-inspection) but whose
-            # caller runs the base fill would be a fill that is neither.
-            inspected.auto, inspected.approval = False, None
+            # caller runs the base fill would be a fill that is neither. r3 G6: the arming may also still be running
+            # on the loop and finish later; ``arm_abandoned`` (under the lock it checks under) keeps it from arming.
+            with _ARM_LOCK:
+                inspected.arm_abandoned = True
+                inspected.auto, inspected.approval = False, None
         return armed
 
     async def _arm_payment_auto(self, i: Any) -> bool:
@@ -113,8 +119,11 @@ class PaymentAutoMixin:
             return False
         if await self._remember_roles(i, frozenset()) is not None:
             return False
-        i.approval = _approval_facts(i)
-        i.auto = True
+        approval = _approval_facts(i)
+        with _ARM_LOCK:  # no await inside: the caller's give-up and this either come first or after, never between
+            if i.arm_abandoned:
+                return False
+            i.approval, i.auto = approval, True
         return True
 
     async def _remember_roles(self, i: Any, earlier: frozenset) -> str | None:

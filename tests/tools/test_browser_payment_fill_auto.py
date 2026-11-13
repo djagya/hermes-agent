@@ -756,3 +756,27 @@ def test_only_the_armed_fills_adoption_keeps_the_approved_total(monkeypatch):
     bvp._auto_commit(SimpleNamespace(_is_managed=lambda: True), Supervisor(), "inspection", [], False, {}, "t", "l")
     seen["adopted"]("fresh")
     assert recorded == [("fresh", {"adopted": True})]
+
+
+def test_an_arming_that_finishes_after_the_caller_gave_up_never_arms(monkeypatch):
+    """G6 (peer P3-4): the caller timed out and runs the base fill; the arming coroutine, still on the supervisor's
+    loop, finishes later. It must not set the flag the caller already cleared."""
+    class Supervisor(sp.PaymentSupervisionMixin):
+        _loop = None
+
+        async def _remember_roles(self, i, earlier):
+            return None
+
+    sup = Supervisor()
+    i = _reading(_APPROVED, owner=sup)
+    i.auto = False
+    pending = []
+
+    def schedule(coro, loop, timeout):  # the wait times out before the arming ran at all
+        pending.append(coro)
+        raise TimeoutError("arming timed out")
+
+    monkeypatch.setattr("tools.browser_supervisor._schedule", schedule)
+    assert sup.arm_payment_auto(i) is False and i.auto is False
+    assert asyncio.run(pending[0]) is False  # the late finish
+    assert i.auto is False and i.approval is None
