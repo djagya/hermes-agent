@@ -151,6 +151,8 @@ def test_an_unreadable_config_drops_opt_in_providers_through_the_real_loader(tmp
     ({"vault": {"payment_fill_auto": "off"}}, False), ({"vault": {"payment_fill_auto": "no"}}, False),
     ({"vault": {"payment_fill_auto": ""}}, False), ({"vault": {"payment_fill_auto": ["x"]}}, False),
     ({"vault": {"payment_fill_auto": 2}}, False),
+    ({"vault": {"payment_fill_auto": None}}, False),                    # r2 G4: an explicit null (`~`) is present
+    ({"vault": False}, False), ({"vault": None}, False), ({"vault": "off"}, False),  # a vault section that is no mapping
     (None, False),                                                       # config that cannot be read: off
 ])
 def test_fill_auto_is_off_for_anything_present_that_is_not_clearly_on(config, expected, monkeypatch):

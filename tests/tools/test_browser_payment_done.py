@@ -670,10 +670,23 @@ def test_a_second_record_of_the_same_tab_keeps_the_approved_total():
     done.record_approved_amount(sup, "TAB", "122.66", "EUR")
     done.record_payment(sup, SimpleNamespace(page_id="TAB", merchant_origin=SHOP, tree=CHECKOUT,
                                              documents=(SimpleNamespace(frame_id="CARD2", origin=STRIPE),),
-                                             unreviewed_origins=()))
+                                             unreviewed_origins=()), adopted=True)
     payment = done._PAYMENTS[sup]["TAB"]
     assert (payment.amount, payment.currency) == ("122.66", "EUR") and len(payment.documents) == 2
     assert "122.66 EUR" in done._dialog_text("Place order for 122.66 EUR?", sup)
+
+
+def test_a_second_fill_on_the_same_tab_without_a_cart_resets_the_total_as_before():
+    """fill-auto r3 G5 (peer P3-3): only an armed fill's adoption keeps the approved total; a second fill of its own
+    (another approval, no cart total) records the tab as it did before 11-13: the earlier total is not shown."""
+    sup = _paid([CHECKOUT])
+    done.record_approved_amount(sup, "TAB", "122.66", "EUR")
+    done.record_payment(sup, SimpleNamespace(page_id="TAB", merchant_origin=SHOP, tree=CHECKOUT,
+                                             documents=(SimpleNamespace(frame_id="CARD2", origin=STRIPE),),
+                                             unreviewed_origins=()))
+    payment = done._PAYMENTS[sup]["TAB"]
+    assert (payment.amount, payment.currency) == ("", "") and len(payment.documents) == 2  # _Payment's defaults
+    assert "122.66" not in done._dialog_text("Place order for 122.66 EUR?", sup)
 
 
 def test_other_amounts_stay_masked_and_only_the_approved_total_shows():

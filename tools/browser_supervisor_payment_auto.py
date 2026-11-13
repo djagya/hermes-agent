@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -65,6 +66,8 @@ _REINSPECTABLE = frozenset({"payment_fields_changed", "payment_page_changed"})
 # Repair order (a field that lost its value): card number, expiry, holder, postcode, CVC last.
 _REPAIR_RANK = {"cc-number": 0, "cc-exp": 1, "cc-exp-month": 1, "cc-exp-year": 2, "cc-name": 3, "postal-code": 4,
                 "cc-csc": 5}
+# r3 G6: the caller's thread clears an arming it stopped waiting for while the loop may be finishing it.
+_ARM_LOCK = threading.Lock()
 
 
 class PaymentAutoMixin:
@@ -104,8 +107,11 @@ class PaymentAutoMixin:
         if not armed:
             # The caller's view is authoritative: an arming that timed out may still have got as far as setting the
             # flag, and an inspection that is armed for the supervisor (relabel acceptance, re-inspection) but whose
-            # caller runs the base fill would be a fill that is neither.
-            inspected.auto, inspected.approval = False, None
+            # caller runs the base fill would be a fill that is neither. r3 G6: the arming may also still be running
+            # on the loop and finish later; ``arm_abandoned`` (under the lock it checks under) keeps it from arming.
+            with _ARM_LOCK:
+                inspected.arm_abandoned = True
+                inspected.auto, inspected.approval = False, None
         return armed
 
     async def _arm_payment_auto(self, i: Any) -> bool:
@@ -113,13 +119,17 @@ class PaymentAutoMixin:
             return False
         if await self._remember_roles(i, frozenset()) is not None:
             return False
-        i.approval = _approval_facts(i)
-        i.auto = True
+        approval = _approval_facts(i)
+        with _ARM_LOCK:  # no await inside: the caller's give-up and this either come first or after, never between
+            if i.arm_abandoned:
+                return False
+            i.approval, i.auto = approval, True
         return True
 
     async def _remember_roles(self, i: Any, earlier: frozenset) -> str | None:
         """dlz (fill-auto): record, in each card document's isolated world, the role this inspection gave every
-        exposed field (its closure's ``remember``); None when every document did. ``role_changed``: an element an
+        exposed field (its closure's ``remember``; card-free absence witnesses: every role empty); None when every
+        document did. ``role_changed``: an element an
         earlier inspection of this approval classified, still exposed, has another role now (a CVC field turned
         into a promo code, a holder field into the card number). ``role_unproven``: a document in ``earlier`` (the
         ``(frame, loader)`` of the documents already recorded) does not hold the approval's record, or did not
@@ -141,6 +151,20 @@ class PaymentAutoMixin:
                 return "role_changed"
             if (d.frame_id, loaders.get(d.frame_id)) in earlier and not answer["known"]:
                 return "role_unproven"
+        # r3 G1: a card-free document the discovery pass keeps (an absence witness) records its exposed controls'
+        # empty roles too, so an element that held a card role in an earlier reading and is still exposed here under
+        # another one is a changed role. Best effort: the approval's ``free`` set already refuses any later card
+        # field in a document read card-free, whether or not its record could be written.
+        for sid, obj in i.absence:
+            try:
+                answer = _sp()._value(await self._cdp("Runtime.callFunctionOn", {
+                    "objectId": obj, "functionDeclaration": "function(a,r){return this.remember(a,r)}",
+                    "arguments": [{"value": i.approval_id}, {"value": {}}], "returnByValue": True,
+                }, session_id=sid))
+            except Exception:  # health: allow BLE001 -- see above: the free set holds without the record
+                continue
+            if isinstance(answer, dict) and answer.get("moved") is True:
+                return "role_changed"
         return None
 
     def reinspect_payment(self, prior: Any, wait: float | None = None) -> tuple:
@@ -197,13 +221,16 @@ class PaymentAutoMixin:
                     if not refused:
                         loaders = {f[0]: f[1] for f in fresh.tree}
                         prior.approval["documents"] |= {(d.frame_id, loaders.get(d.frame_id)) for d in fresh.documents}
-                        prior.approval["free"] = (prior.approval["free"] | _free_documents(fresh)) \
-                            - prior.approval["documents"]
+                        # r3 G1: every document an adopted reading found card-free stays in ``free`` for the rest of
+                        # the approval, a card document of an earlier reading too (A -> B -> A: A's promo or address
+                        # controls of the middle reading must not come back as its card fields).
+                        prior.approval["free"] = prior.approval["free"] | _free_documents(fresh)
                         prior.approval.pop("seen", None)
                         # The hand-over has no await in it: the fresh inspection owns the shared frame sessions from
                         # here and a cancellation finds one owner. Only the earlier one's objects are left to go.
                         prior.child_sessions = {}
                         prior.consumed = True
+                        fresh.adopted = True  # r3 G2: its fields are checked as re-inspected ones by every generation
                         await self._release_once(prior)  # cancelled here: ``finally`` still releases ``fresh``
                         adopted = True  # no await between this and the return: the caller has it from here
                         return fresh, ""
@@ -286,7 +313,8 @@ class PaymentAutoMixin:
         """One generation of an armed commit on inspection ``i``: ``(again, result)``. ``again``: "" (the result is
         final), "changed" (stopped on a changed field set or frame; a re-inspection may continue) or "repair" (every
         field was written, and after settling some are empty or were replaced). ``kept``: an earlier generation
-        wrote; a field that already holds its value is not written again. ``mode`` "repair" writes the card number
+        wrote; a field that already holds its value is not written again. ``i.adopted`` (r3 G2): ``i`` is a
+        re-inspection (before the card read or after an earlier generation): every field gets the exposure/hit test. ``mode`` "repair" writes the card number
         first and the CVC last."""
         def later(result: dict) -> dict:  # a stop after an earlier generation wrote is a partial fill
             return {**result, "partially_filled": True} if st["wrote"] and not result.get("success") else result
@@ -309,7 +337,7 @@ class PaymentAutoMixin:
         i.consumed = True  # consume before ingress, as _commit_payment_once does
         filled = 0
         state = {"number": False, "repins": 0, "repin": False}
-        auto = {"mode": mode, "kept": kept}
+        auto = {"mode": mode, "kept": kept, "adopted": i.adopted is True}
         try:
             written: list = []
             order = _sp()._commit_order(i, _sp()._fills_by_document(i, fills))
@@ -356,7 +384,8 @@ def _approval_facts(i: Any) -> dict:
     the tab and its top document (frame, loader, URL, origin), the card field tokens each origin receives, how many
     card documents each origin has and at which paths, the unreviewed origins, the cart readings, the card documents
     whose field roles are recorded so far (``documents``) and the admissible documents that held no card field
-    (``free``: a document that held none may not become card-bearing later)."""
+    (``free``: a document that held none, in this or any adopted reading of the approval, may not become card-bearing
+    later; a card document that an adopted reading found card-free stays in it)."""
     fields: dict = {}
     counts: dict = {}
     paths: dict = {}

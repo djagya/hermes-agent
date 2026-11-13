@@ -351,6 +351,9 @@ _FA_SCRIPTS = {
     # ... or re-mounts it empty.
     "retain_remount": "let d=0;$('num').addEventListener('input',()=>{if(d++)return;setTimeout(()=>{"
                       "const n=$('c3').cloneNode(true);n.value='';$('c3').replaceWith(n)},300)});",
+    # r3 G3: the clear follows EVERY card number input event (30 ms / 300 ms later), a repeated no-op event included.
+    "retain_every30": "$('num').addEventListener('input',()=>{setTimeout(()=>{$('c3').value='';was.set($('c3'),'')},30)});",
+    "retain_every": "$('num').addEventListener('input',()=>{setTimeout(()=>{$('c3').value='';was.set($('c3'),'')},300)});",
     # A CVC that never keeps its value.
     "retain_never": "document.addEventListener('input',e=>{if(e.target.id==='c3')setTimeout(()=>{$('c3').value='';was.set($('c3'),'')},100)},true);",
     # Still stops: the next field hidden for good; the top document's URL changed.
@@ -1602,7 +1605,7 @@ def test_fill_auto_a_field_that_lost_its_value_is_written_once_more(payment_brow
     are not written twice, and a CVC that never keeps its value still stops after that one pass. Switched off: the
     fill stops as payment_fields_not_retained."""
     sup, origins, card = _fa_setup(payment_browser, tmp_path, monkeypatch, auto=auto)
-    for variant in ("retain", "retain_remount", "retain_never"):
+    for variant in ("retain", "retain_remount", "retain_every30", "retain_every", "retain_never"):
         navigate(sup, origins["merchant"] + "/fa/" + variant)
         out = _fa_fill(sup, origins, card, caplog)
         states, writes = _fa_top(sup)

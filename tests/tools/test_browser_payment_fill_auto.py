@@ -87,6 +87,25 @@ const log = input({id: 'log'}); log.held = '';
 els = [month, year, csc, num];
 for (const e of els) e.dispatchEvent = function (ev) { log.held += this.id + ':' + ev.type + ' '; if (ev.type === 'input' && this.oninput) this.oninput(); return true; };
 num.oninput = () => { csc.held = ''; };""",
+    # r2 G3 (Eurowings-like, delayed): every card number `input` schedules a clear of the CVC (30 ms / 300 ms later)
+    "auto_cvc_timer_30": """
+const exp = input({id: 'exp', autocomplete: 'cc-exp'}), csc = input({id: 'csc', autocomplete: 'cc-csc'});
+const num = input({id: 'num', autocomplete: 'cc-number'});
+els = [exp, csc, num];
+num.oninput = () => { setTimeout(() => { csc.held = ''; }, 30); };""",
+    "auto_cvc_timer_300": """
+const exp = input({id: 'exp', autocomplete: 'cc-exp'}), csc = input({id: 'csc', autocomplete: 'cc-csc'});
+const num = input({id: 'num', autocomplete: 'cc-number'});
+els = [exp, csc, num];
+num.oninput = () => { setTimeout(() => { csc.held = ''; }, 300); };""",
+    # r1 F14 kept: the number's write re-mounts the form; the clones carry the values, the CVC's comes back empty
+    "auto_kept_clone": """
+const exp = input({id: 'exp', autocomplete: 'cc-exp'}), csc = input({id: 'csc', autocomplete: 'cc-csc'});
+const num = input({id: 'num', autocomplete: 'cc-number'}), log = input({id: 'log'});
+log.held = '';
+const logged = e => { e.dispatchEvent = function (ev) { log.held += this.id + ':' + ev.type + ' '; if (ev.type === 'input' && this.oninput) this.oninput(); return true; }; return e; };
+els = [exp, csc, num].map(logged);
+num.oninput = () => { for (const e of [exp, csc, num]) { const n = logged(replace(e)); if (e !== csc) n.held = e.held; } };""",
     # a field that changes type (not a label): never accepted in place, inspected again
     "auto_retyped": _FIELDS + """
 csc.oninput = () => { exp.type = 'tel'; };""",
@@ -109,11 +128,15 @@ class _AutoSupervisor(_ClosureSupervisor):
         fresh = replace(prior, documents=(document,), consumed=False, release_task=None)
         refused = spa._approval_mismatch(prior.approval, fresh) \
             or await self._remember_roles(fresh, frozenset(prior.approval["documents"]))
-        return (None, refused) if refused else (fresh, "")
+        if refused:
+            return None, refused
+        fresh.adopted = True  # as the real _reinspect marks a reading it continues on
+        return fresh, ""
 
 
-def _auto_commit(scenario, tmp_path, monkeypatch, strict=False, parent=False, ownership=None, **checks):
-    """``parent``: the card document sits in an iframe of the merchant page (its owner chain is checked: ``owner``)."""
+def _auto_commit(scenario, tmp_path, monkeypatch, strict=False, parent=False, ownership=None, settle=0, **checks):
+    """``parent``: the card document sits in an iframe of the merchant page (its owner chain is checked: ``owner``).
+    ``settle``: the wait before the retention check (0; the page's own timers need a real one)."""
     from tools.browser_vault_payment import _document_fills
 
     js = _NodeClosure(scenario, tmp_path, _SCENARIOS)
@@ -126,7 +149,7 @@ def _auto_commit(scenario, tmp_path, monkeypatch, strict=False, parent=False, ow
                               time.monotonic() + 60, owner=sup, approval_id="op")
         assert asyncio.run(sup._arm_payment_auto(i)) is True and i.auto is True
         js.call("approve")
-        monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
+        monkeypatch.setattr(sp, "_SETTLE_SECONDS", settle)
         out = asyncio.run(sup._commit_payment_auto(i, _document_fills(i, _SYNTHETIC), None, strict,
                                                    lambda fresh: _document_fills(fresh, _SYNTHETIC), None, ownership))
         return out, js.call("values"), sup.events
@@ -315,6 +338,7 @@ def test_a_re_inspection_waits_for_a_complete_form_and_takes_over_the_shared_fra
     assert refused == "" and fresh.operation_id == "match" and fresh.expires_at == pytest.approx(prior.expires_at, abs=1)
     assert sup.released == [("partial", {"new": "partial"}), ("prior", {})]
     assert fresh.child_sessions == {"f1": "shared", "new": "match"} and prior.consumed and not fresh.consumed
+    assert fresh.adopted is True and prior.adopted is False  # r3 G2: the provenance travels on the reading
 
 
 @pytest.mark.parametrize("readings, answers, refused, left", [
@@ -633,6 +657,57 @@ def test_an_accepted_relabel_goes_through_the_owner_chain_check_again_before_the
     assert out["success"] is True and values == _FILLED and events.count("owner_check") == 4, (out, events)
 
 
+def test_a_relabel_accepted_silently_inside_the_scope_check_is_followed_by_the_owner_chain_check(tmp_path, monkeypatch):
+    """r4 F3 (Codex P1): the REAL ``_paced_check`` of an unreviewed strict fill. The focus handler relabels the form;
+    ``_fill_scope_verdict`` -> ``_payment_is_current`` -> ``_document_valid`` accepts it asynchronously (the closure's
+    signature is then current, so it makes no relabel pause of its own), and the top URL changes (history.pushState)
+    in that pause. The parent-chain check has to run after the acceptance: nothing is written."""
+    import threading
+
+    from tools.browser_vault_payment import _document_fills
+
+    top = ("top", "LT", MERCHANT + "/pay", MERCHANT, "")
+    card = ("card", "L", PSP + "/card", PSP, "top")
+
+    class Real(_AutoSupervisor):
+        _payment_is_current = sp.PaymentSupervisionMixin._payment_is_current  # the real ones, over the fake CDP
+        _paced_check = sp.PaymentSupervisionMixin._paced_check
+        _state_lock, _page_session_id, _active = threading.Lock(), "s", True
+        changed = False
+
+        async def _payment_tree(self, sid, child_sessions=None):
+            return (top[:2] + (top[2] + ("/other" if self.changed else ""),) + top[3:], card)  # a path change (fragments are ignored)
+
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if params and params.get("objectId") == "o-owner":  # the owner <iframe> hit test in the parent
+                self.events.append("owner_hit")
+                point = params["arguments"][2:]
+                return {"result": {"result": {"value": [] if self.changed else [point[0]["value"], point[1]["value"]]}}}
+            out = await super()._cdp(method, params, session_id, timeout)
+            if "this.accept()" in params["functionDeclaration"]:
+                self.changed = True  # the merchant's pushState lands while the acceptance is in flight
+            return out
+
+    js = _NodeClosure("auto_focus_relabel", tmp_path, _SCENARIOS)
+    try:
+        sup = Real(js)
+        doc = PaymentDocument("card", "s", "o-card", PSP, sp._card_controls(js.call("describe")),
+                              clock_anchor=time.monotonic())
+        i = PaymentInspection("op", "s", "tab", MERCHANT, (doc,), (top, card), time.monotonic() + 60, owner=sup,
+                              approval_id="op", unreviewed_origins=(PSP,), frame_owners={"top": ("ps", (("card", "o-owner"),))})
+        assert asyncio.run(sup._arm_payment_auto(i)) is True and i.auto is True
+        js.call("approve")
+        monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
+        out = asyncio.run(sup._commit_payment_auto(i, _document_fills(i, _SYNTHETIC), None, True,
+                                                   lambda fresh: _document_fills(fresh, _SYNTHETIC), None, None))
+        values = js.call("values")
+    finally:
+        js.close()
+    assert sup.changed and "accept" in sup.events, sup.events  # the silent acceptance did run, and the URL changed in it
+    assert out["success"] is False and out["error_type"] == "payment_page_changed", out
+    assert not any(values.values()) and out.get("filled_fields", 0) == 0, (values, out)
+
+
 def test_a_field_adopted_through_a_re_inspection_must_be_exposed_even_on_a_reviewed_destination(tmp_path, monkeypatch):
     """F4 (Codex P2-4, peer P3-5): the first inspection of a reviewed form stays as it was (no overlay test); a field
     the first inspection never saw (the form re-mounted during the approval) is hit-tested, locally and, in a frame,
@@ -652,15 +727,37 @@ def test_a_first_generation_reviewed_fill_has_no_owner_chain_check_as_before(tmp
 
 
 @pytest.mark.parametrize("scenario, kept", [("auto_kept_events", {"exp", "num"}), ("auto_kept_select", {"month", "year", "num"})])
-def test_a_kept_field_still_gets_the_events_of_a_write(scenario, kept, tmp_path, monkeypatch):
-    """F14 (GLM P3-4): a field that already holds its value is not written again, but the page's own state may not
-    have it (a controlled field re-mounted with the value): input and change are dispatched, selects included."""
+def test_a_kept_field_gets_no_second_events_where_its_element_already_had_them(scenario, kept, tmp_path, monkeypatch):
+    """F14 (GLM P3-4) as r3 G3 keeps it: a field that already holds its value is not written again; the element that
+    got the events of its write in an earlier generation gets none again (they are what made the page clear the CVC),
+    selects included."""
     out, values, _events = _auto_commit(scenario, tmp_path, monkeypatch)
     assert out["success"] is True and out["fill_reinspect"] == {"count": 1, "repairs": 1}, out
     log = values["log"].split()
-    for field in kept:  # once for its write in the first generation, once more, as no-ops, in the repair generation
-        assert log.count(field + ":change") == 2 and log.count(field + ":input") == 2, (field, log)
+    for field in kept:  # once, for its write in the first generation
+        assert log.count(field + ":change") == 1 and log.count(field + ":input") == 1, (field, log)
     assert log.count("csc:change") == 2 and log.count("csc:input") == 2, log  # the cleared one: written again
+
+
+def test_a_re_mounted_clone_that_holds_its_value_still_gets_the_events_of_a_write(tmp_path, monkeypatch):
+    """F14 (GLM P3-4): a controlled field re-mounted with the value holds it in the DOM but maybe not in the page's own
+    state: the new element, which never got the events for its token, gets input and change once."""
+    out, values, _events = _auto_commit("auto_kept_clone", tmp_path, monkeypatch)
+    assert out["success"] is True and out["fill_reinspect"] == {"count": 1, "repairs": 1}, out
+    assert values["exp2"] == "07/35" and values["num2"] == "4111111111111111" and values["csc2"] == "123", values
+    log = values["log"].split()
+    for field in ("exp2", "num2", "csc2"):
+        assert log.count(field + ":change") == 1 and log.count(field + ":input") == 1, (field, log)
+
+
+@pytest.mark.parametrize("delay", ["30", "300"])
+def test_a_cvc_cleared_by_a_timer_on_every_number_input_is_repaired_once(delay, tmp_path, monkeypatch):
+    """G3 (Codex P3, peer P2-1, F14 regression): the page clears the CVC a moment after each card number ``input``. The
+    repair writes the CVC again and must not fire the number's ``input`` again (it already holds its value and got its
+    events): filled after one repair, never ``payment_fields_not_retained``."""
+    out, values, _events = _auto_commit("auto_cvc_timer_" + delay, tmp_path, monkeypatch, settle=0.6)
+    assert out["success"] is True and out["fill_reinspect"] == {"count": 1, "repairs": 1}, out
+    assert values == _FILLED, values
 
 
 @pytest.mark.parametrize("refusal", ["human_has_control", "payment_browser_changed"])
@@ -735,3 +832,150 @@ def test_an_arming_that_timed_out_leaves_the_inspection_unarmed(monkeypatch):
     monkeypatch.setattr("tools.browser_supervisor._schedule", schedule)
     assert sup.arm_payment_auto(i) is False
     assert i.auto is False and i.approval is None
+
+
+# -- Round 3 (r2 final review: G1-G6) --
+
+def test_only_the_armed_fills_adoption_keeps_the_approved_total(monkeypatch):
+    """G5 (peer P3-3): the vault's ``adopted`` hook records a continued reading as an adoption (the total stays); the
+    vault's own record after a claim is the base one."""
+    from tools import browser_vault_payment as bvp
+
+    seen, recorded = {}, []
+
+    class Supervisor:
+        def commit_payment(self, inspected, fills, **kw):
+            seen.update(kw)
+            return {"success": True}
+
+    monkeypatch.setattr("tools.browser_payment_done.record_payment",
+                        lambda supervisor, inspected, **kw: recorded.append((inspected, kw)))
+    bvp._auto_commit(SimpleNamespace(_is_managed=lambda: True), Supervisor(), "inspection", [], False, {}, "t", "l")
+    seen["adopted"]("fresh")
+    assert recorded == [("fresh", {"adopted": True})]
+
+
+def test_an_arming_that_finishes_after_the_caller_gave_up_never_arms(monkeypatch):
+    """G6 (peer P3-4): the caller timed out and runs the base fill; the arming coroutine, still on the supervisor's
+    loop, finishes later. It must not set the flag the caller already cleared."""
+    class Supervisor(sp.PaymentSupervisionMixin):
+        _loop = None
+
+        async def _remember_roles(self, i, earlier):
+            return None
+
+    sup = Supervisor()
+    i = _reading(_APPROVED, owner=sup)
+    i.auto = False
+    pending = []
+
+    def schedule(coro, loop, timeout):  # the wait times out before the arming ran at all
+        pending.append(coro)
+        raise TimeoutError("arming timed out")
+
+    monkeypatch.setattr("tools.browser_supervisor._schedule", schedule)
+    assert sup.arm_payment_auto(i) is False and i.auto is False
+    assert asyncio.run(pending[0]) is False  # the late finish
+    assert i.auto is False and i.approval is None
+
+
+def test_a_card_document_once_seen_card_free_may_not_become_card_bearing_again(monkeypatch):
+    """G1 (Codex P1, F2 partial): approved card document A; the card form moves to B (same path) and A, now holding
+    promo/address controls, is read card-free; then those controls are re-described as the card fields and the form
+    moves back to A. A's card-free reading is part of the approval's history: refused, nothing continues on it."""
+    monkeypatch.setattr(spa, "_REINSPECT_POLL_SECONDS", 0)
+    monkeypatch.setattr(spa, "_REINSPECT_SETTLE_SECONDS", 0)
+    on_a = [(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"), "a")]
+    on_b = [(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"), "b")]
+    sup = _Loop([lambda p: _reading(on_b, operation="on-b", approval=p.approval, free=[(PSP, "a")])])
+    prior = _reading(on_a, operation="prior")
+    prior.approval = spa._approval_facts(prior)
+    moved, refused = asyncio.run(sup._reinspect(prior, time.monotonic() + 5, 5))
+    assert refused == "" and moved.operation_id == "on-b"  # a re-render onto a sibling at the approved path: continued
+    sup.readings = [lambda p: _reading(on_a, operation="back-on-a", approval=p.approval, free=[(PSP, "b")])]
+    back, refused = asyncio.run(sup._reinspect(moved, time.monotonic() + 5, 5))
+    assert back is None and refused == "role_changed"
+    assert ("a", "La") in prior.approval["free"] and ("a", "La") in prior.approval["documents"]
+    # a reloaded A (another loader: a new document, no element of the old one in it) is inside the binding
+    def reloaded(p):
+        fresh = _reading(on_a, operation="reloaded-a", approval=p.approval)
+        return replace(fresh, tree=tuple((r[0], r[1] + "-2", *r[2:]) if r[0] == "a" else r for r in fresh.tree))
+
+    sup.readings = [reloaded]
+    again, refused = asyncio.run(sup._reinspect(moved, time.monotonic() + 5, 5))
+    assert refused == "" and again.operation_id == "reloaded-a"
+
+
+def test_a_card_free_absence_witness_records_empty_roles_and_a_moved_one_is_refused():
+    """G1: the discovery pass keeps card-free documents as absence witnesses; their exposed controls get the empty
+    role, and one that held a card role before is a changed role. A witness that cannot answer: the free set holds."""
+    calls = []
+
+    class Supervisor(sp.PaymentSupervisionMixin):
+        def __init__(self, witness):
+            self.witness = witness
+
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            calls.append((params["objectId"], params["arguments"][1]["value"]))
+            if params["objectId"] == "o-free":
+                if isinstance(self.witness, Exception):
+                    raise self.witness
+                return {"result": {"result": {"value": self.witness}}}
+            return {"result": {"result": {"value": {"known": False, "moved": False}}}}
+
+    i = _reading(_APPROVED, absence=(("s-free", "o-free"),))
+    assert asyncio.run(Supervisor({"known": False, "moved": False})._remember_roles(i, frozenset())) is None
+    assert ("o-free", {}) in calls
+    assert asyncio.run(Supervisor({"known": True, "moved": True})._remember_roles(i, frozenset())) == "role_changed"
+    assert asyncio.run(Supervisor(RuntimeError("frame gone"))._remember_roles(i, frozenset())) is None
+
+
+@pytest.mark.parametrize("scenario, parent", [("auto_remounted_covered", False), ("auto_remounted", True)])
+def test_a_reading_adopted_before_the_card_read_is_checked_like_a_later_generation(scenario, parent, tmp_path,
+                                                                                    monkeypatch):
+    """G2 (Codex P2, peer P3-1, F4 partial): the form re-mounted while the approval was open; the vault's
+    ``_approved_page`` re-inspects and adopts the new reading before the card read, so the commit's first generation
+    writes fields no inspection shown to the owner saw. They get the exposure/hit test and, in a frame, the paced
+    owner-chain check, as a generation after a re-inspection does."""
+    from tools import browser_vault_payment as bvp
+    from tools.browser_vault_payment import _document_fills
+
+    js = _NodeClosure(scenario, tmp_path, _SCENARIOS)
+
+    class Sync(_AutoSupervisor):
+        def payment_is_current(self, i):
+            return False  # the pinned elements are gone
+
+        def reinspect_payment(self, i):
+            return asyncio.run(self._reinspect(i, time.monotonic() + 5, 5))
+
+        def commit_payment(self, inspected, fills, strict=False, refill=None, adopted=None, ownership=None):
+            return asyncio.run(self._commit_payment(inspected, fills, None, strict, False, refill, adopted, ownership))
+
+    try:
+        sup = Sync(js)
+        doc = PaymentDocument("card", "s", "o-card", PSP, sp._card_controls(js.call("describe")),
+                              clock_anchor=time.monotonic())
+        tree = (("card", "L", PSP + "/card", PSP, "top" if parent else ""),)
+        i = PaymentInspection("op", "s", "tab", MERCHANT, (doc,), tree, time.monotonic() + 60, owner=sup,
+                              approval_id="op")
+        assert asyncio.run(sup._arm_payment_auto(i)) is True
+        js.call("approve")
+        monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
+        monkeypatch.setattr(bvp, "_ownership_refusal", lambda *a: None)
+        monkeypatch.setattr(bvp, "_page_refusal", lambda *a: None)
+        vault = SimpleNamespace(_is_managed=lambda: False)
+        inspected, refreshed, refusal = bvp._approved_page(vault, "t", sup, i, "l", False, None, True)
+        assert refusal is None and refreshed == 1 and inspected is not i
+        out = bvp._commit(vault, sup, inspected, _document_fills(inspected, _SYNTHETIC), False, _SYNTHETIC, False,
+                          True, refreshed, "t", "l")
+        values = js.call("values")
+    finally:
+        js.close()
+    if parent:  # uncovered, in a frame: written, each field after its owner-chain check from the parents
+        assert out["success"] is True and values["exp2"] == "07/35", out
+        assert sup.events.count("owner_check") == 3, sup.events
+    else:  # the covered replacement is never written
+        assert out["success"] is False and out["error_type"] == "payment_fields_changed", out
+        assert out["fill_check"]["reason"] == "hit_test" and out["fill_check"]["token"] == "cc-exp", out
+        assert values["exp2"] == "" and values["num2"] == "", values  # the covered field, and the number after it
