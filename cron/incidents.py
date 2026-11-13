@@ -33,7 +33,12 @@ INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
 _FAILURE_TYPE_ORDER = (
     ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
     ("timeout", ("timeout", "timed out")),
-    ("auth", (r"\b401\b", "unauthorized", "authentication", "auth")),
+    # Word-bounded: a bare "auth" substring also matched "OAuth", "author" and "authorized" in
+    # ordinary prose. Auth exception names (AuthError, OAuthNonInteractiveError) still count.
+    ("auth", (
+        r"\b401\b", "unauthorized", "authentication", r"\bauth\b", r"\b\w*autherror\b",
+        r"\boauth\w*error\b",
+    )),
     ("delivery", ("delivery", "deliver", "delivering")),
     ("config", ("config", "configuration", "validation")),
     ("script", ("script", "no_agent")),

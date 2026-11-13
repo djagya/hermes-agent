@@ -8,6 +8,8 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from cron import incidents
@@ -190,6 +192,19 @@ def test_failure_type_classification(monkeypatch, tmp_path):
     ]
     for error, expected in cases:
         assert inc._classify_failure_type(error) == expected, (error, expected)
+
+
+@pytest.mark.parametrize("error,expected", [
+    ("AuthError: Nous refresh token expired", "auth"),
+    ("OAuthNonInteractiveError: OAuth callback port 8765 is already in use", "auth"),
+    ("auth failed for provider openrouter", "auth"),
+    ("Posted the summary to the OAuth PR thread; nothing else to report", "unknown"),
+    ("Checked the author's changelog: 3 items still open", "unknown"),
+    ("Release notes list two authorized reviewers", "unknown"),
+])
+def test_auth_type_needs_auth_word_not_substring(monkeypatch, tmp_path, error, expected):
+    inc = _point_db(monkeypatch, tmp_path)
+    assert inc._classify_failure_type(error) == expected
 
 
 # ── Lifecycle / ack ────────────────────────────────────────────────────────
