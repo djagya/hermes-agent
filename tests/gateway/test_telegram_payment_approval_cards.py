@@ -204,7 +204,7 @@ async def test_a_card_that_cannot_show_every_fact_is_not_sent():
     assert CartItem("a\u202eb`c\nd", 1).description == "a b c d"  # bidi, backtick, newline removed
 
 
-def _turn_runner(adapter, chat_id, sender=OWNER_ID):
+def _turn_runner(adapter, chat_id, sender=OWNER_ID, chat_type=""):
     import concurrent.futures
     from gateway.run_turn_runner import TurnRunner
 
@@ -223,7 +223,8 @@ def _turn_runner(adapter, chat_id, sender=OWNER_ID):
     runner = object.__new__(TurnRunner)
     runner._ctx = SimpleNamespace(_status_adapter=adapter, _status_chat_id=str(chat_id), session_key=SESSION,
                                   _status_thread_metadata={"thread_id": "5"},
-                                  source=SimpleNamespace(user_id=None if sender is None else str(sender)))
+                                  source=SimpleNamespace(user_id=None if sender is None else str(sender),
+                                                         chat_type=chat_type or ("group" if chat_id < 0 else "dm")))
     runner._approval_owner = None
     runner._schedule = schedule
     return runner
@@ -266,6 +267,26 @@ def test_a_group_card_needs_the_owner_to_have_asked(monkeypatch, sender):
     adapter.send = AsyncMock(return_value=SimpleNamespace(success=True))
     entry = _pending(exact_request=True, approver=OWNER, payment=_facts().to_dict())
     _turn_runner(adapter, GROUP, sender=sender)._approval_notify_sync(dict(entry.data))
+    call = adapter.send_payment_approval.call_args.kwargs
+    assert call["chat_id"] == str(OWNER_ID) and call["metadata"] is None
+    (notice,) = adapter.send.call_args_list
+    assert notice.args[:2] == (str(GROUP), GROUP_NOTICE)
+
+
+@pytest.mark.parametrize("chat_type", ["channel", "dm", None])
+def test_a_negative_chat_that_is_not_a_group_never_gets_the_card(monkeypatch, chat_type):
+    """Peer r2 P3: a channel's direct-messages chat (or any non-group source) has a negative id too; even when the
+    owner sent the turn, the card goes to his private chat and the session's chat gets only the neutral notice."""
+    from tools import approval_context
+    monkeypatch.setattr(approval_context, "payment_approver", lambda: OWNER)
+    adapter = MagicMock(spec=["send_payment_approval", "retire_payment_card", "send", "send_exec_approval"])
+    type(adapter).send_payment_approval = MagicMock()
+    adapter.send_payment_approval = AsyncMock(return_value=SimpleNamespace(success=True, message_id="9"))
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True))
+    entry = _pending(exact_request=True, approver=OWNER, payment=_facts().to_dict())
+    runner = _turn_runner(adapter, GROUP, chat_type="placeholder")
+    runner._ctx.source.chat_type = chat_type
+    runner._approval_notify_sync(dict(entry.data))
     call = adapter.send_payment_approval.call_args.kwargs
     assert call["chat_id"] == str(OWNER_ID) and call["metadata"] is None
     (notice,) = adapter.send.call_args_list

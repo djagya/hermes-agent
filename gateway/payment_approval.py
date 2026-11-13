@@ -82,12 +82,20 @@ def _delivery_probe(adapter):
 
 
 def _notify_expired(turn_runner, adapter, chat_id: str, metadata, probe) -> None:
-    """Best effort: one plain message where the card is that it expired (a card edit alone does not notify)."""
+    """Best effort: one plain message where the card is that it expired (a card edit alone does not notify). In a
+    group it is sent fail-closed (peer r2 P3): a gone topic drops it, never the group's General topic; a group chat
+    whose adapter cannot send that way gets no notice. The owner's private chat keeps the ordinary send."""
     from gateway.run import _interim_metadata
 
     text = EXPIRED_NOTICE_DEGRADED if probe is not None and probe() else EXPIRED_NOTICE
-    turn_runner._schedule(adapter.send(chat_id, text, metadata=_interim_metadata(metadata)),
-                          "payment expiry notice scheduling error")
+    if not str(chat_id).startswith("-"):
+        turn_runner._schedule(adapter.send(chat_id, text, metadata=_interim_metadata(metadata)),
+                              "payment expiry notice scheduling error")
+    elif callable(getattr(type(adapter), "send_payment_notice", None)):
+        turn_runner._schedule(adapter.send_payment_notice(chat_id, text, metadata=metadata),
+                              "payment expiry notice scheduling error")
+    else:
+        logger.info("payment expiry notice not sent: this adapter cannot send it fail-closed in a group")
 
 
 def reminder_text(left_s: float) -> str:
@@ -119,12 +127,17 @@ def _requester_id(ctx) -> str:
     return str(getattr(getattr(ctx, "source", None), "user_id", "") or "")
 
 
+_GROUP_CHAT_TYPES = frozenset({"group", "forum", "supergroup"})  # Telegram sources say "group" for both kinds
+
+
 def _card_route(ctx, user_id: str) -> tuple[str, object, bool]:
     """``(chat_id, thread metadata, other_private_chat)`` for the card: the session's own chat and thread when it
-    is the owner's private chat, or a group AND the owner himself asked in it; every other case (another member,
-    a channel post, an anonymous admin) is the owner's private chat plus a notice in the session's chat."""
+    is the owner's private chat, or a group (a negative id AND a group chat type: a channel's direct-messages chat
+    has a negative id too) AND the owner himself asked in it; every other case (another member, a channel post, an
+    anonymous admin) is the owner's private chat plus a notice in the session's chat."""
     chat = str(ctx._status_chat_id or "")
-    group = chat.startswith("-") and chat[1:].isascii() and chat[1:].isdigit()
+    group = (chat.startswith("-") and chat[1:].isascii() and chat[1:].isdigit()
+             and str(getattr(getattr(ctx, "source", None), "chat_type", "") or "") in _GROUP_CHAT_TYPES)
     if chat == user_id or (group and _requester_id(ctx) == user_id):
         return chat, ctx._status_thread_metadata, False
     return user_id, None, True

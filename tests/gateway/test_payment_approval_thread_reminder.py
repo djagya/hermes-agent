@@ -98,7 +98,7 @@ def _runner(adapter, loop, scheduled):
     runner = object.__new__(TurnRunner)
     runner._ctx = SimpleNamespace(_status_adapter=adapter, _status_chat_id=str(GROUP), session_key=SESSION,
                                   _status_thread_metadata={"thread_id": str(THREAD)},
-                                  source=SimpleNamespace(user_id=str(OWNER_ID)))
+                                  source=SimpleNamespace(user_id=str(OWNER_ID), chat_type="group"))
     runner._approval_owner = None
     runner._schedule = schedule
     approval.register_gateway_notify(SESSION, runner._approval_notify_sync)
@@ -163,11 +163,42 @@ def test_one_reminder_replies_to_the_card_and_the_expiry_notice_lands_in_the_thr
     assert "min left" in reminder["text"] and LABEL not in reminder["text"] and AMOUNT not in reminder["text"]
     worker.join(10)
     assert result["consent"].outcome == "timeout"
-    assert wait_until(lambda: adapter.send.await_count == 1, what="expiry notice")
-    notice = adapter.send.await_args
-    assert notice.args == (str(GROUP), payment_approval.EXPIRED_NOTICE)
-    assert notice.kwargs["metadata"]["thread_id"] == str(THREAD)
-    assert adapter._bot.send_message.await_count == 2  # one reminder, never a second
+    # the expiry notice: in the thread, sent fail-closed (peer r2 P3), never through the generic text path
+    assert wait_until(lambda: adapter._bot.send_message.await_count == 3, what="expiry notice")
+    notice = adapter._bot.send_message.await_args_list[2].kwargs
+    assert notice == {"chat_id": GROUP, "text": payment_approval.EXPIRED_NOTICE, "message_thread_id": THREAD}
+    adapter.send.assert_not_called()
+    assert "reply_to_message_id" not in notice  # one reminder replied to the card, never a second
+
+
+def test_an_expiry_notice_is_dropped_when_the_groups_topic_is_gone(loop):
+    """Peer r2 P3: the topic disappeared while the card waited; the expiry notice is never retried at the group's
+    root (its General topic): one attempt in the thread, then nothing."""
+    class BadRequest(Exception):  # the adapter recognises Telegram's BadRequest by its class name
+        pass
+
+    adapter, scheduled, result = _adapter(), [], {}
+    _runner(adapter, loop, scheduled)
+    posted = adapter._bot.send_message.side_effect
+    gone = threading.Event()
+
+    def send(**kw):
+        if gone.is_set() and kw.get("message_thread_id") is not None:
+            raise BadRequest("Bad Request: message thread not found")
+        return posted(**kw)
+
+    adapter._bot.send_message = AsyncMock(side_effect=send)
+    worker = _ask(result, _facts(), 1)
+    assert wait_until(lambda: adapter._bot.send_message.await_count == 1, what="card sent")
+    gone.set()
+    worker.join(10)
+    assert result["consent"].outcome == "timeout"
+    assert wait_until(lambda: any(name == "send_payment_notice" and fut.done() for name, fut in scheduled),
+                      what="notice attempted")
+    (_card, attempt) = adapter._bot.send_message.await_args_list
+    assert attempt.kwargs["message_thread_id"] == THREAD and attempt.kwargs["text"] == payment_approval.EXPIRED_NOTICE
+    adapter.send.assert_not_called()
+    assert [fut.result() for name, fut in scheduled if name == "send_payment_notice"] == [False]
 
 
 @pytest.mark.parametrize("settle", ["owner_approves", "typed_deny"])

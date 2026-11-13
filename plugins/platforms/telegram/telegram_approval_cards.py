@@ -183,6 +183,25 @@ class TelegramApprovalCardsMixin:
             return False
         return True
 
+    async def send_payment_notice(self, chat_id: str, text: str, metadata: Optional[dict] = None) -> bool:
+        """One fixed payment notice (the card's expiry in a group) in *chat_id* and the thread *metadata* names, sent
+        fail-closed (peer r2 P3): a gone topic drops it, never the group's General topic. False when nothing was
+        sent."""
+        if self._bot is None:
+            return False
+        from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+
+        kwargs = {"chat_id": normalize_telegram_chat_id(chat_id), "text": text}
+        thread = self._metadata_thread_id(metadata)
+        if thread is not None and str(thread).isascii() and str(thread).isdigit():
+            kwargs["message_thread_id"] = int(thread)
+        try:
+            await self._send_message_with_thread_fallback(fail_closed=True, **kwargs)
+        except Exception as exc:  # health: allow BLE001 -- best effort: the card's own edit already says it expired
+            logger.warning("[%s] Payment approval notice failed: %s", self.name, type(exc).__name__)
+            return False
+        return True
+
     def payment_delivery_mark(self) -> int:
         """The polling generation now; :meth:`payment_delivery_disrupted` compares against it."""
         return getattr(self, "_polling_generation", 0)
