@@ -1384,7 +1384,7 @@ BROWSER_VAULT_SCHEMA = {
         "payment_click_uncertain says a press may have landed. Before every press Hermes reads the merchant "
         "checkout page again: payment_total_changed means it no longer shows the approved total (or the checkout "
         "page changed before any press); nothing was pressed, so stop and tell the owner, never retry. A bank or "
-        "3-D Secure page can be clicked only after a first press was admitted. payment_controls and payment_done report "
+        "3-D Secure page can be clicked only after a first press was admitted; a later shop page is checked like the checkout. payment_controls and payment_done report "
         "presses_in_lock (null = unknown): the presses this process started in the lock, an uncertain one included; "
         "once it is 1 (or null), another payment_click is only for a bank or 3-D Secure step the owner asked for, "
         "never a second Pay. A card with no stated total, or whose page check did not match it, says \"fill only\": "
