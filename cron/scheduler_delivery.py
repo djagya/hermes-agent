@@ -1651,7 +1651,10 @@ def _prepare_target_delivery(
     origin = _resolve_origin(job) or {}
     origin_thread = origin.get("thread_id")
     if origin_thread and not thread_id:
-        logger.warning(
+        # Only an origin-resolved target can lose the origin thread. A home channel, explicit
+        # platform:chat_id or broadcast target is a chosen destination: log it at debug.
+        log = logger.warning if target.get("_resolved_from") == "origin" else logger.debug
+        log(
             "Job '%s': origin has thread_id=%s but delivery target lost it (deliver=%s, target=%s)",
             job["id"], origin_thread, job.get("deliver", "local"), target)
     elif thread_id:
