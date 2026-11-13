@@ -87,6 +87,25 @@ const log = input({id: 'log'}); log.held = '';
 els = [month, year, csc, num];
 for (const e of els) e.dispatchEvent = function (ev) { log.held += this.id + ':' + ev.type + ' '; if (ev.type === 'input' && this.oninput) this.oninput(); return true; };
 num.oninput = () => { csc.held = ''; };""",
+    # r2 G3 (Eurowings-like, delayed): every card number `input` schedules a clear of the CVC (30 ms / 300 ms later)
+    "auto_cvc_timer_30": """
+const exp = input({id: 'exp', autocomplete: 'cc-exp'}), csc = input({id: 'csc', autocomplete: 'cc-csc'});
+const num = input({id: 'num', autocomplete: 'cc-number'});
+els = [exp, csc, num];
+num.oninput = () => { setTimeout(() => { csc.held = ''; }, 30); };""",
+    "auto_cvc_timer_300": """
+const exp = input({id: 'exp', autocomplete: 'cc-exp'}), csc = input({id: 'csc', autocomplete: 'cc-csc'});
+const num = input({id: 'num', autocomplete: 'cc-number'});
+els = [exp, csc, num];
+num.oninput = () => { setTimeout(() => { csc.held = ''; }, 300); };""",
+    # r1 F14 kept: the number's write re-mounts the form; the clones carry the values, the CVC's comes back empty
+    "auto_kept_clone": """
+const exp = input({id: 'exp', autocomplete: 'cc-exp'}), csc = input({id: 'csc', autocomplete: 'cc-csc'});
+const num = input({id: 'num', autocomplete: 'cc-number'}), log = input({id: 'log'});
+log.held = '';
+const logged = e => { e.dispatchEvent = function (ev) { log.held += this.id + ':' + ev.type + ' '; if (ev.type === 'input' && this.oninput) this.oninput(); return true; }; return e; };
+els = [exp, csc, num].map(logged);
+num.oninput = () => { for (const e of [exp, csc, num]) { const n = logged(replace(e)); if (e !== csc) n.held = e.held; } };""",
     # a field that changes type (not a label): never accepted in place, inspected again
     "auto_retyped": _FIELDS + """
 csc.oninput = () => { exp.type = 'tel'; };""",
@@ -115,8 +134,9 @@ class _AutoSupervisor(_ClosureSupervisor):
         return fresh, ""
 
 
-def _auto_commit(scenario, tmp_path, monkeypatch, strict=False, parent=False, ownership=None, **checks):
-    """``parent``: the card document sits in an iframe of the merchant page (its owner chain is checked: ``owner``)."""
+def _auto_commit(scenario, tmp_path, monkeypatch, strict=False, parent=False, ownership=None, settle=0, **checks):
+    """``parent``: the card document sits in an iframe of the merchant page (its owner chain is checked: ``owner``).
+    ``settle``: the wait before the retention check (0; the page's own timers need a real one)."""
     from tools.browser_vault_payment import _document_fills
 
     js = _NodeClosure(scenario, tmp_path, _SCENARIOS)
@@ -129,7 +149,7 @@ def _auto_commit(scenario, tmp_path, monkeypatch, strict=False, parent=False, ow
                               time.monotonic() + 60, owner=sup, approval_id="op")
         assert asyncio.run(sup._arm_payment_auto(i)) is True and i.auto is True
         js.call("approve")
-        monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
+        monkeypatch.setattr(sp, "_SETTLE_SECONDS", settle)
         out = asyncio.run(sup._commit_payment_auto(i, _document_fills(i, _SYNTHETIC), None, strict,
                                                    lambda fresh: _document_fills(fresh, _SYNTHETIC), None, ownership))
         return out, js.call("values"), sup.events
@@ -656,15 +676,37 @@ def test_a_first_generation_reviewed_fill_has_no_owner_chain_check_as_before(tmp
 
 
 @pytest.mark.parametrize("scenario, kept", [("auto_kept_events", {"exp", "num"}), ("auto_kept_select", {"month", "year", "num"})])
-def test_a_kept_field_still_gets_the_events_of_a_write(scenario, kept, tmp_path, monkeypatch):
-    """F14 (GLM P3-4): a field that already holds its value is not written again, but the page's own state may not
-    have it (a controlled field re-mounted with the value): input and change are dispatched, selects included."""
+def test_a_kept_field_gets_no_second_events_where_its_element_already_had_them(scenario, kept, tmp_path, monkeypatch):
+    """F14 (GLM P3-4) as r3 G3 keeps it: a field that already holds its value is not written again; the element that
+    got the events of its write in an earlier generation gets none again (they are what made the page clear the CVC),
+    selects included."""
     out, values, _events = _auto_commit(scenario, tmp_path, monkeypatch)
     assert out["success"] is True and out["fill_reinspect"] == {"count": 1, "repairs": 1}, out
     log = values["log"].split()
-    for field in kept:  # once for its write in the first generation, once more, as no-ops, in the repair generation
-        assert log.count(field + ":change") == 2 and log.count(field + ":input") == 2, (field, log)
+    for field in kept:  # once, for its write in the first generation
+        assert log.count(field + ":change") == 1 and log.count(field + ":input") == 1, (field, log)
     assert log.count("csc:change") == 2 and log.count("csc:input") == 2, log  # the cleared one: written again
+
+
+def test_a_re_mounted_clone_that_holds_its_value_still_gets_the_events_of_a_write(tmp_path, monkeypatch):
+    """F14 (GLM P3-4): a controlled field re-mounted with the value holds it in the DOM but maybe not in the page's own
+    state: the new element, which never got the events for its token, gets input and change once."""
+    out, values, _events = _auto_commit("auto_kept_clone", tmp_path, monkeypatch)
+    assert out["success"] is True and out["fill_reinspect"] == {"count": 1, "repairs": 1}, out
+    assert values["exp2"] == "07/35" and values["num2"] == "4111111111111111" and values["csc2"] == "123", values
+    log = values["log"].split()
+    for field in ("exp2", "num2", "csc2"):
+        assert log.count(field + ":change") == 1 and log.count(field + ":input") == 1, (field, log)
+
+
+@pytest.mark.parametrize("delay", ["30", "300"])
+def test_a_cvc_cleared_by_a_timer_on_every_number_input_is_repaired_once(delay, tmp_path, monkeypatch):
+    """G3 (Codex P3, peer P2-1, F14 regression): the page clears the CVC a moment after each card number ``input``. The
+    repair writes the CVC again and must not fire the number's ``input`` again (it already holds its value and got its
+    events): filled after one repair, never ``payment_fields_not_retained``."""
+    out, values, _events = _auto_commit("auto_cvc_timer_" + delay, tmp_path, monkeypatch, settle=0.6)
+    assert out["success"] is True and out["fill_reinspect"] == {"count": 1, "repairs": 1}, out
+    assert values == _FILLED, values
 
 
 @pytest.mark.parametrize("refusal", ["human_has_control", "payment_browser_changed"])
