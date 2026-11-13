@@ -18,14 +18,15 @@ card is still unanswered; the expiry notice goes there too.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 
 logger = logging.getLogger(__name__)
 
 SEND_TIMEOUT_S = 15
 REMINDER_AT_S = 120
-# No reminder when less than this would be left at REMINDER_AT_S (a short window needs none).
-REMINDER_MIN_LEFT_S = 60
+# No reminder unless more than this would be left at REMINDER_AT_S (an effective window of 150 s or less needs none).
+REMINDER_MIN_LEFT_S = 30
 # dlz: the owner's one plain message when a card expires unanswered; never any card or cart detail.
 EXPIRED_NOTICE = "Card approval expired: nothing was filled or paid. Ask Sera to retry if you still want it."
 EXPIRED_NOTICE_DEGRADED = ("Card approval expired while Hermes' Telegram connection was reconnecting, so a tap may "
@@ -101,11 +102,16 @@ async def _wait(seconds: float) -> None:
 async def _remind_later(adapter, request_id: str, text: str, state: dict) -> None:
     """After REMINDER_AT_S: one reply to the card, only while it is unanswered. A settle cancels this task and
     sets ``state["settled"]``; the adapter also sends nothing once the card's record is gone (tapped or retired)."""
-    await _wait(REMINDER_AT_S)
-    if state["settled"]:
-        return
-    sent = await adapter.remind_payment_card(request_id, text)
-    logger.info("Payment approval reminder (request_id=%s, sent=%s)", request_id, bool(sent))
+    try:
+        await _wait(REMINDER_AT_S)
+        if state["settled"]:
+            return
+        sent = await adapter.remind_payment_card(request_id, text)
+        logger.info("Payment approval reminder (request_id=%s, sent=%s)", request_id, bool(sent))
+    except asyncio.CancelledError:  # a settle cancels the reminder: not an error
+        raise
+    except Exception:  # health: allow BLE001 -- best effort: the card itself stays live; the future is never read
+        logger.debug("payment approval reminder failed (request_id=%s)", request_id, exc_info=True)
 
 
 def _requester_id(ctx) -> str:
@@ -143,6 +149,10 @@ def deliver(turn_runner, approval_data: dict) -> None:
         raise PaymentCardUndeliverable("payment approver changed or unset")
     user_id = _approver_user_id(approver)
     facts = PaymentPromptFacts.from_dict(approval_data.get("payment"))
+    # The card's stated expiry is the real one: the wait is cut to approvals.timeout (``timeout_s``), so the card,
+    # the retire time and the reminder all use min(remaining inspection window, approvals.timeout).
+    window_s = min(facts.expires_in_s, int(approval_data.get("timeout_s") or facts.expires_in_s))
+    facts = dataclasses.replace(facts, expires_in_s=max(1, window_s))
     # Class check, not instance: MagicMock adapters invent every attribute.
     if not callable(getattr(type(adapter), "send_payment_approval", None)):
         raise PaymentCardUndeliverable("this session's adapter cannot send the payment card")
@@ -174,7 +184,6 @@ def deliver(turn_runner, approval_data: dict) -> None:
     if not getattr(result, "success", False):
         raise PaymentCardUndeliverable("payment card send failed")
     # Delivery trace: correlation and timing only, never card, cart or amount text.
-    window_s = approval_data.get("timeout_s") or facts.expires_in_s
     logger.info("Payment approval card sent (request_id=%s, chat=%s, message_id=%s, expires_in_s=%s)",
                 request_id, chat_id, getattr(result, "message_id", None), window_s)
     # Settles run on this (the waiting) thread after deliver returns, or inline just below: never concurrently.
@@ -194,7 +203,7 @@ def deliver(turn_runner, approval_data: dict) -> None:
         # Settled while the card was being sent: retire it now.
         retire("resolved")
     left_s = int(window_s) - REMINDER_AT_S
-    if (not reminder["settled"] and left_s >= REMINDER_MIN_LEFT_S
+    if (not reminder["settled"] and left_s > REMINDER_MIN_LEFT_S
             and callable(getattr(type(adapter), "remind_payment_card", None))):
         reminder["future"] = turn_runner._schedule(
             _remind_later(adapter, request_id, reminder_text(left_s), reminder), "payment reminder scheduling error")

@@ -139,7 +139,8 @@ def test_an_answered_card_logs_its_send_and_its_callback(caplog):
     result = {}
     worker = threading.Thread(target=lambda: result.update(consent=_ask(30)[0]))
     worker.start()
-    assert wait_until(lambda: adapter._bot.send_message.call_count == 1, what="card sent")
+    # Armed, not just sent: the card's record is written after the send returns, and a tap before it is refused.
+    assert wait_until(lambda: adapter._bot.send_message.call_count == 1 and adapter._approval_cards, what="card sent")
     kwargs = adapter._bot.send_message.call_args.kwargs
     approve = kwargs["reply_markup"].inline_keyboard[0][0].callback_data
     import asyncio

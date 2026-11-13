@@ -133,7 +133,8 @@ def test_a_group_card_goes_to_its_thread_and_only_the_owners_tap_acts(loop):
     adapter, scheduled, result = _adapter(), [], {}
     _runner(adapter, loop, scheduled)
     worker = _ask(result, _facts(), 30)
-    assert wait_until(lambda: adapter._bot.send_message.await_count == 1, what="card sent")
+    assert wait_until(lambda: adapter._bot.send_message.await_count == 1 and adapter._approval_cards,
+                      what="card sent and armed")
     kwargs, (approve, deny) = _card(adapter)
     assert kwargs["chat_id"] == GROUP and kwargs["message_thread_id"] == THREAD
     assert "presses Pay once for 4321.98 CHF at https://shop.example" in kwargs["text"]
@@ -256,7 +257,8 @@ def test_the_card_states_the_effective_window_and_a_short_one_gets_no_reminder(l
     adapter, scheduled, result = _adapter(), [], {}
     _runner(adapter, loop, scheduled)
     worker = _ask(result, _facts(300), 300)  # the inspection has 300 s left; the config allows less
-    assert wait_until(lambda: adapter._bot.send_message.await_count == 1, what="card sent")
+    assert wait_until(lambda: adapter._bot.send_message.await_count == 1 and adapter._approval_cards,
+                      what="card sent and armed")
     with approval._lock:
         (entry,) = approval._gateway_queues[SESSION]
     assert entry.data["timeout_s"] == stated
@@ -267,3 +269,19 @@ def test_the_card_states_the_effective_window_and_a_short_one_gets_no_reminder(l
     worker.join(10)
     gate.set()
     assert result["consent"].outcome == "accept"
+
+
+def test_a_reminder_that_dies_is_logged_and_never_raises(loop, caplog):
+    """GLM r1 P3-3: the reminder's future is never read, so its body must not let an error vanish unlogged."""
+    import logging
+    caplog.set_level(logging.DEBUG, logger="gateway.payment_approval")
+    adapter = MagicMock()
+    adapter.remind_payment_card = AsyncMock(side_effect=RuntimeError("boom"))
+
+    async def go():
+        with patch.object(payment_approval, "REMINDER_AT_S", 0):
+            await payment_approval._remind_later(adapter, "r" * 32, "text", {"settled": False})
+
+    asyncio.run_coroutine_threadsafe(go(), loop).result(5)  # returns: nothing escapes
+    assert adapter.remind_payment_card.await_count == 1
+    assert any("reminder failed" in r.getMessage() for r in caplog.records)
