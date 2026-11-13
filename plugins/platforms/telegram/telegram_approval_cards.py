@@ -118,10 +118,11 @@ class TelegramApprovalCardsMixin:
         return record, choice, presser
 
     async def send_payment_approval(self, chat_id: str, facts, request_id: str, session_key: str,
-                                    approver: str, metadata: Optional[dict] = None):
+                                    approver: str, metadata: Optional[dict] = None, requester: str = ""):
         """The card-fill approval card in the approver's private chat or a group chat (in the thread
         *metadata* names): every mandatory fact or no card (``SendResult(success=False)``), buttons
-        ``APPROVE_LABEL`` / ``DENY_LABEL``. Any other private chat (someone else's) never gets it."""
+        ``APPROVE_LABEL`` / ``DENY_LABEL``. Any other private chat (someone else's) never gets it, and a group
+        chat only when *requester* (the turn's sender) is the approver himself."""
         from gateway.platforms.base import SendResult
         from tools.payment_consent_prompt import APPROVE_LABEL, DENY_LABEL, PromptIncomplete, render_html
         from plugins.platforms.telegram.adapter import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
@@ -130,7 +131,7 @@ class TelegramApprovalCardsMixin:
         platform, _, user_id = str(approver or "").partition(":")
         target = normalize_telegram_chat_id(chat_id)
         own_chat = isinstance(target, int) and str(target) == user_id
-        group = isinstance(target, int) and target < 0
+        group = isinstance(target, int) and target < 0 and str(requester or "") == user_id
         if (platform != "telegram" or not user_id.isascii() or not user_id.isdigit() or not (own_chat or group)
                 or not request_id):
             return SendResult(success=False,

@@ -201,7 +201,7 @@ async def test_a_card_that_cannot_show_every_fact_is_not_sent():
     assert CartItem("a\u202eb`c\nd", 1).description == "a b c d"  # bidi, backtick, newline removed
 
 
-def _turn_runner(adapter, chat_id):
+def _turn_runner(adapter, chat_id, sender=OWNER_ID):
     import concurrent.futures
     from gateway.run_turn_runner import TurnRunner
 
@@ -219,7 +219,8 @@ def _turn_runner(adapter, chat_id):
 
     runner = object.__new__(TurnRunner)
     runner._ctx = SimpleNamespace(_status_adapter=adapter, _status_chat_id=str(chat_id), session_key=SESSION,
-                                  _status_thread_metadata={"thread_id": "5"})
+                                  _status_thread_metadata={"thread_id": "5"},
+                                  source=SimpleNamespace(user_id=None if sender is None else str(sender)))
     runner._approval_owner = None
     runner._schedule = schedule
     return runner
@@ -248,6 +249,39 @@ def test_card_route_and_never_the_text_fallback(monkeypatch, session_chat):
         assert call["chat_id"] == str(session_chat) and call["metadata"] == {"thread_id": "5"}
         adapter.send.assert_not_called()
     adapter.send_exec_approval.assert_not_called()
+
+
+@pytest.mark.parametrize("sender", [222, None, ""])
+def test_a_group_card_needs_the_owner_to_have_asked(monkeypatch, sender):
+    """Another member, a channel post or an anonymous admin (no user id) never puts the card in the group: it goes to
+    the owner's private chat and the group gets only the neutral notice."""
+    from tools import approval_context
+    monkeypatch.setattr(approval_context, "payment_approver", lambda: OWNER)
+    adapter = MagicMock(spec=["send_payment_approval", "retire_payment_card", "send", "send_exec_approval"])
+    type(adapter).send_payment_approval = MagicMock()
+    adapter.send_payment_approval = AsyncMock(return_value=SimpleNamespace(success=True, message_id="9"))
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True))
+    entry = _pending(exact_request=True, approver=OWNER, payment=_facts().to_dict())
+    _turn_runner(adapter, GROUP, sender=sender)._approval_notify_sync(dict(entry.data))
+    call = adapter.send_payment_approval.call_args.kwargs
+    assert call["chat_id"] == str(OWNER_ID) and call["metadata"] is None
+    (notice,) = adapter.send.call_args_list
+    assert notice.args[:2] == (str(GROUP), GROUP_NOTICE)
+
+
+@pytest.mark.asyncio
+async def test_the_adapter_refuses_a_group_card_unless_the_owner_asked():
+    adapter = _adapter()
+    entry = _pending(exact_request=True, approver=OWNER)
+    rid = entry.data["request_id"]
+    for requester in ("222", "", None):
+        refused = await adapter.send_payment_approval(chat_id=str(GROUP), facts=_facts(), request_id=rid,
+                                                      session_key=SESSION, approver=OWNER, requester=requester)
+        assert not refused.success
+    assert adapter._bot.send_message.call_count == 0
+    sent = await adapter.send_payment_approval(chat_id=str(GROUP), facts=_facts(), request_id=rid,
+                                               session_key=SESSION, approver=OWNER, requester=str(OWNER_ID))
+    assert sent.success and adapter._bot.send_message.call_args.kwargs["chat_id"] == GROUP
 
 
 @pytest.mark.parametrize("case", ["no_card_adapter", "bad_request_id", "send_failed", "approver_changed"])

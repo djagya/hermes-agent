@@ -6,10 +6,11 @@ Called by ``TurnRunner._render_approval_sync`` for approval data carrying ``"pay
 nothing is ever shown shortened.
 
 Where the card goes (owner decision 2026-11-13): a group session (a negative Telegram chat id, e.g. the
-forum topic he talks to Sera in) gets the card in its own chat and thread; the owner's own private chat
-gets it there, in the session's thread. Only the owner's own Telegram user can act on it either way (the
-adapter's presser check); anyone else's tap changes nothing. Any other private chat is not the owner's, so
-the card goes to the owner's private chat as before and that chat gets a fixed notice with no details.
+forum topic he talks to Sera in) gets the card in its own chat and thread only when the OWNER sent the turn;
+the owner's own private chat gets it there, in the session's thread. Only the owner's own Telegram user can act on it either way (the
+adapter's presser check); anyone else's tap changes nothing. Every other case (another member's turn, a channel post, an
+anonymous admin, someone else's private chat) sends the card to the owner's private chat as before and the
+session's chat gets a fixed notice with no details.
 One reminder replying to the card goes to the same place ``REMINDER_AT_S`` after the send, only while the
 card is still unanswered; the expiry notice goes there too.
 """
@@ -107,11 +108,18 @@ async def _remind_later(adapter, request_id: str, text: str, state: dict) -> Non
     logger.info("Payment approval reminder (request_id=%s, sent=%s)", request_id, bool(sent))
 
 
+def _requester_id(ctx) -> str:
+    """The Telegram user id of whoever sent the turn (empty for a channel post or an anonymous admin)."""
+    return str(getattr(getattr(ctx, "source", None), "user_id", "") or "")
+
+
 def _card_route(ctx, user_id: str) -> tuple[str, object, bool]:
     """``(chat_id, thread metadata, other_private_chat)`` for the card: the session's own chat and thread when it
-    is a group or the owner's private chat, else the owner's private chat (the session chat is someone else's)."""
+    is the owner's private chat, or a group AND the owner himself asked in it; every other case (another member,
+    a channel post, an anonymous admin) is the owner's private chat plus a notice in the session's chat."""
     chat = str(ctx._status_chat_id or "")
-    if chat == user_id or (chat.startswith("-") and chat[1:].isascii() and chat[1:].isdigit()):
+    group = chat.startswith("-") and chat[1:].isascii() and chat[1:].isdigit()
+    if chat == user_id or (group and _requester_id(ctx) == user_id):
         return chat, ctx._status_thread_metadata, False
     return user_id, None, True
 
@@ -142,7 +150,8 @@ def deliver(turn_runner, approval_data: dict) -> None:
     probe = _delivery_probe(adapter)  # armed before the send: a reconnect while it is in flight counts too
     fut = turn_runner._schedule(
         adapter.send_payment_approval(chat_id=chat_id, facts=facts, request_id=request_id,
-                                      session_key=session_key, approver=approver, metadata=metadata),
+                                      session_key=session_key, approver=approver, metadata=metadata,
+                                      requester=_requester_id(ctx)),
         "send_payment_approval scheduling error")
     if fut is None:
         raise PaymentCardUndeliverable("gateway loop unavailable")

@@ -97,7 +97,8 @@ def _runner(adapter, loop, scheduled):
 
     runner = object.__new__(TurnRunner)
     runner._ctx = SimpleNamespace(_status_adapter=adapter, _status_chat_id=str(GROUP), session_key=SESSION,
-                                  _status_thread_metadata={"thread_id": str(THREAD)})
+                                  _status_thread_metadata={"thread_id": str(THREAD)},
+                                  source=SimpleNamespace(user_id=str(OWNER_ID)))
     runner._approval_owner = None
     runner._schedule = schedule
     approval.register_gateway_notify(SESSION, runner._approval_notify_sync)
