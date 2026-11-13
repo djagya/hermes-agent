@@ -128,7 +128,8 @@ class PaymentAutoMixin:
 
     async def _remember_roles(self, i: Any, earlier: frozenset) -> str | None:
         """dlz (fill-auto): record, in each card document's isolated world, the role this inspection gave every
-        exposed field (its closure's ``remember``); None when every document did. ``role_changed``: an element an
+        exposed field (its closure's ``remember``; card-free absence witnesses: every role empty); None when every
+        document did. ``role_changed``: an element an
         earlier inspection of this approval classified, still exposed, has another role now (a CVC field turned
         into a promo code, a holder field into the card number). ``role_unproven``: a document in ``earlier`` (the
         ``(frame, loader)`` of the documents already recorded) does not hold the approval's record, or did not
@@ -150,6 +151,20 @@ class PaymentAutoMixin:
                 return "role_changed"
             if (d.frame_id, loaders.get(d.frame_id)) in earlier and not answer["known"]:
                 return "role_unproven"
+        # r3 G1: a card-free document the discovery pass keeps (an absence witness) records its exposed controls'
+        # empty roles too, so an element that held a card role in an earlier reading and is still exposed here under
+        # another one is a changed role. Best effort: the approval's ``free`` set already refuses any later card
+        # field in a document read card-free, whether or not its record could be written.
+        for sid, obj in i.absence:
+            try:
+                answer = _sp()._value(await self._cdp("Runtime.callFunctionOn", {
+                    "objectId": obj, "functionDeclaration": "function(a,r){return this.remember(a,r)}",
+                    "arguments": [{"value": i.approval_id}, {"value": {}}], "returnByValue": True,
+                }, session_id=sid))
+            except Exception:  # health: allow BLE001 -- see above: the free set holds without the record
+                continue
+            if isinstance(answer, dict) and answer.get("moved") is True:
+                return "role_changed"
         return None
 
     def reinspect_payment(self, prior: Any, wait: float | None = None) -> tuple:
@@ -206,8 +221,10 @@ class PaymentAutoMixin:
                     if not refused:
                         loaders = {f[0]: f[1] for f in fresh.tree}
                         prior.approval["documents"] |= {(d.frame_id, loaders.get(d.frame_id)) for d in fresh.documents}
-                        prior.approval["free"] = (prior.approval["free"] | _free_documents(fresh)) \
-                            - prior.approval["documents"]
+                        # r3 G1: every document an adopted reading found card-free stays in ``free`` for the rest of
+                        # the approval, a card document of an earlier reading too (A -> B -> A: A's promo or address
+                        # controls of the middle reading must not come back as its card fields).
+                        prior.approval["free"] = prior.approval["free"] | _free_documents(fresh)
                         prior.approval.pop("seen", None)
                         # The hand-over has no await in it: the fresh inspection owns the shared frame sessions from
                         # here and a cancellation finds one owner. Only the earlier one's objects are left to go.
@@ -365,7 +382,8 @@ def _approval_facts(i: Any) -> dict:
     the tab and its top document (frame, loader, URL, origin), the card field tokens each origin receives, how many
     card documents each origin has and at which paths, the unreviewed origins, the cart readings, the card documents
     whose field roles are recorded so far (``documents``) and the admissible documents that held no card field
-    (``free``: a document that held none may not become card-bearing later)."""
+    (``free``: a document that held none, in this or any adopted reading of the approval, may not become card-bearing
+    later; a card document that an adopted reading found card-free stays in it)."""
     fields: dict = {}
     counts: dict = {}
     paths: dict = {}

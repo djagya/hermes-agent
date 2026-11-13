@@ -780,3 +780,54 @@ def test_an_arming_that_finishes_after_the_caller_gave_up_never_arms(monkeypatch
     assert sup.arm_payment_auto(i) is False and i.auto is False
     assert asyncio.run(pending[0]) is False  # the late finish
     assert i.auto is False and i.approval is None
+
+
+def test_a_card_document_once_seen_card_free_may_not_become_card_bearing_again(monkeypatch):
+    """G1 (Codex P1, F2 partial): approved card document A; the card form moves to B (same path) and A, now holding
+    promo/address controls, is read card-free; then those controls are re-described as the card fields and the form
+    moves back to A. A's card-free reading is part of the approval's history: refused, nothing continues on it."""
+    monkeypatch.setattr(spa, "_REINSPECT_POLL_SECONDS", 0)
+    monkeypatch.setattr(spa, "_REINSPECT_SETTLE_SECONDS", 0)
+    on_a = [(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"), "a")]
+    on_b = [(MERCHANT, ("cc-exp",)), (PSP, ("cc-number", "cc-csc"), "b")]
+    sup = _Loop([lambda p: _reading(on_b, operation="on-b", approval=p.approval, free=[(PSP, "a")])])
+    prior = _reading(on_a, operation="prior")
+    prior.approval = spa._approval_facts(prior)
+    moved, refused = asyncio.run(sup._reinspect(prior, time.monotonic() + 5, 5))
+    assert refused == "" and moved.operation_id == "on-b"  # a re-render onto a sibling at the approved path: continued
+    sup.readings = [lambda p: _reading(on_a, operation="back-on-a", approval=p.approval, free=[(PSP, "b")])]
+    back, refused = asyncio.run(sup._reinspect(moved, time.monotonic() + 5, 5))
+    assert back is None and refused == "role_changed"
+    assert ("a", "La") in prior.approval["free"] and ("a", "La") in prior.approval["documents"]
+    # a reloaded A (another loader: a new document, no element of the old one in it) is inside the binding
+    def reloaded(p):
+        fresh = _reading(on_a, operation="reloaded-a", approval=p.approval)
+        return replace(fresh, tree=tuple((r[0], r[1] + "-2", *r[2:]) if r[0] == "a" else r for r in fresh.tree))
+
+    sup.readings = [reloaded]
+    again, refused = asyncio.run(sup._reinspect(moved, time.monotonic() + 5, 5))
+    assert refused == "" and again.operation_id == "reloaded-a"
+
+
+def test_a_card_free_absence_witness_records_empty_roles_and_a_moved_one_is_refused():
+    """G1: the discovery pass keeps card-free documents as absence witnesses; their exposed controls get the empty
+    role, and one that held a card role before is a changed role. A witness that cannot answer: the free set holds."""
+    calls = []
+
+    class Supervisor(sp.PaymentSupervisionMixin):
+        def __init__(self, witness):
+            self.witness = witness
+
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            calls.append((params["objectId"], params["arguments"][1]["value"]))
+            if params["objectId"] == "o-free":
+                if isinstance(self.witness, Exception):
+                    raise self.witness
+                return {"result": {"result": {"value": self.witness}}}
+            return {"result": {"result": {"value": {"known": False, "moved": False}}}}
+
+    i = _reading(_APPROVED, absence=(("s-free", "o-free"),))
+    assert asyncio.run(Supervisor({"known": False, "moved": False})._remember_roles(i, frozenset())) is None
+    assert ("o-free", {}) in calls
+    assert asyncio.run(Supervisor({"known": True, "moved": True})._remember_roles(i, frozenset())) == "role_changed"
+    assert asyncio.run(Supervisor(RuntimeError("frame gone"))._remember_roles(i, frozenset())) is None
