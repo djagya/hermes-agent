@@ -15,8 +15,9 @@ from types import SimpleNamespace
 import pytest
 
 from agent.vault_payment_policy import PaymentDestinationError, PaymentPolicyError
-from tests.tools.test_browser_payment_repin import (MERCHANT, PSP, _SCENARIOS, _SYNTHETIC, _ClosureSupervisor,
-                                                    _controls, _NodeClosure)
+from tests.tools.test_browser_payment_repin import _SCENARIOS as _REPIN_SCENARIOS
+from tests.tools.test_browser_payment_repin import (MERCHANT, PSP, _SYNTHETIC, _ClosureSupervisor, _controls,
+                                                    _NodeClosure)
 from tools import browser_supervisor_payment as sp
 from tools import browser_supervisor_payment_auto as spa
 from tools.browser_supervisor_payment import PaymentDocument, PaymentInspection
@@ -26,7 +27,7 @@ const exp = input({id: 'exp', autocomplete: 'cc-exp', aria: 'Expiry'}), csc = in
 const num = input({id: 'num', autocomplete: 'cc-number', aria: 'Card number'});
 els = [exp, csc, num];
 const twice = e => { if (e.seen) e.held = 'TWICE'; e.seen = true; };  // a second write of one field shows"""
-_SCENARIOS.update({
+_AUTO_SCENARIOS = {
     # SBB / pay.datatrans.com: every focus and every write re-labels the other fields, and the approval wait one
     "auto_relabel": _FIELDS + """
 let n = 0;
@@ -53,7 +54,9 @@ approve = () => { for (const e of [exp, csc, num]) { const n = replace(e); n.ari
     # a field that changes type (not a label): never accepted in place, inspected again
     "auto_retyped": _FIELDS + """
 csc.oninput = () => { exp.type = 'tel'; };""",
-})
+}
+# the repin test's own table is never touched (both files run in one pytest process)
+_SCENARIOS = {**_REPIN_SCENARIOS, **_AUTO_SCENARIOS}
 _FILLED = {"exp": "07/35", "csc": "123", "num": "4111111111111111"}
 
 
@@ -76,7 +79,7 @@ class _AutoSupervisor(_ClosureSupervisor):
 def _auto_commit(scenario, tmp_path, monkeypatch):
     from tools.browser_vault_payment import _document_fills
 
-    js = _NodeClosure(scenario, tmp_path)
+    js = _NodeClosure(scenario, tmp_path, _SCENARIOS)
     try:
         sup = _AutoSupervisor(js)
         doc = PaymentDocument("card", "s", "o-card", PSP, sp._card_controls(js.call("describe")),
@@ -159,7 +162,7 @@ def test_a_cvc_that_never_keeps_its_value_stops_after_the_one_repair(tmp_path, m
 
 def test_the_unarmed_commit_never_takes_the_armed_path(tmp_path, monkeypatch):
     """vault.payment_fill_auto off (or a supervisor that could not arm): refill is ignored, the base commit runs."""
-    js = _NodeClosure("auto_relabel", tmp_path)
+    js = _NodeClosure("auto_relabel", tmp_path, _SCENARIOS)
     try:
         from tools.browser_vault_payment import _document_fills
 

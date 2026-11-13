@@ -381,7 +381,7 @@ _SYNTHETIC = {"card_number": "4111111111111111", "exp_month": "07", "exp_year": 
 class _NodeClosure:
     """One card document: the real closure over a fake DOM in a Node process, one JSON line per call."""
 
-    def __init__(self, scenario, tmp_path):
+    def __init__(self, scenario, tmp_path, scenarios=None):
         import re
         import shutil
         import subprocess
@@ -390,7 +390,7 @@ class _NodeClosure:
         if not node:
             pytest.skip("Node required for the synthetic commit closure")
         script = tmp_path / "closure.js"
-        values = {"SCENARIO": _SCENARIOS[scenario], "INSPECT": sp._INSPECT}
+        values = {"SCENARIO": (scenarios or _SCENARIOS)[scenario], "INSPECT": sp._INSPECT}
         script.write_text(re.sub(r"\bSCENARIO\b|\bINSPECT\b", lambda m: values[m.group(0)], _DOM))
         self.proc = subprocess.Popen([node, str(script)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True)
