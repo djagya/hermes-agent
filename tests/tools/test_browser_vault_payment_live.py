@@ -1630,7 +1630,9 @@ def test_fill_auto_continues_on_a_re_mounted_field_and_keeps_its_stops(payment_b
     out = _fa_fill(sup, origins, card, caplog)
     states, writes = _fa_top(sup)
     assert out["success"] and out["fill_reinspect"] == {"count": 1, "repairs": 0}, out
-    assert states == _HELD and writes == {"num": 1, "exp": 1, "c3": 1, "c4": 0}, (states, writes)
+    # c3: the write on the old input, then (r1 F14) the no-op input event on its re-mounted clone, which Chromium
+    # clones WITH the value: it is kept, not written again. The page log counts events that changed a value.
+    assert states == _HELD and writes == {"num": 1, "exp": 1, "c3": 2, "c4": 0}, (states, writes)
     for variant, refused in (("relabel_swap", "role_changed"), ("hide", "incomplete"), ("navigate", "navigated")):
         navigate(sup, origins["merchant"] + "/fa/" + variant)
         out = _fa_fill(sup, origins, card, caplog)
