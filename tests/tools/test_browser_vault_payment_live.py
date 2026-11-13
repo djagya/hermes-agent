@@ -153,6 +153,7 @@ _PP_GUEST_FORM = ('<label for="email">E-Mail</label><input id="email" name="emai
 
 
 def _paypal_page(path, origins):
+    path = path.split("?")[0]  # a swapped frame carries a query
     parts = path.split("/")
     if path == "/pp-guest":
         return f'<iframe src="{origins["psp"]}/smart/buttons/g"></iframe>'
