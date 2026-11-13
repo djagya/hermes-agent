@@ -45,6 +45,10 @@ num.oninput = () => { twice(num); csc.held = ''; csc.seen = false; };""",
     # a CVC that never keeps its value
     "auto_cvc_never": _FIELDS + """
 csc.oninput = () => { csc.held = ''; };""",
+    # FlixBus / Payrails: while the approval is open the whole form is built again from fresh elements
+    "auto_remounted": _FIELDS + """
+for (const e of els) e.oninput = () => twice(e);
+approve = () => { for (const e of [exp, csc, num]) { const n = replace(e); n.aria = e.aria; n.oninput = () => twice(n); } };""",
     # a field that changes type (not a label): never accepted in place, inspected again
     "auto_retyped": _FIELDS + """
 csc.oninput = () => { exp.type = 'tel'; };""",
@@ -123,6 +127,17 @@ def test_a_changed_field_set_goes_on_only_on_a_matching_re_inspection(scenario, 
     assert out["error_type"] == "payment_fields_changed" and out["fill_reinspect"]["refused"] == refused, out
     assert out["fill_reinspect"]["count"] == 0 and values.get("gift", "") == "" and values.get("promo", "") == ""
     assert values.get("name", "") == "" and len([v for v in values.values() if v]) == out["filled_fields"], out
+
+
+def test_a_form_re_mounted_before_any_write_is_retried_once_under_the_same_approval(tmp_path, monkeypatch):
+    """11-13 FlixBus (owner: "auto-retry inside approval"): the fill stops on a changed page before any field was
+    written (the commit's own start check: fields_replaced, filled 0); the page is inspected again and the fill runs
+    once on that reading, each field written once, no second approval."""
+    out, values, events = _auto_commit("auto_remounted", tmp_path, monkeypatch)
+    assert out == {"success": True, "filled_fields": 3, "retention_verified": True,
+                   "fill_reinspect": {"count": 1, "repairs": 0}}, out
+    assert {k: v for k, v in values.items() if v} == {"exp2": "07/35", "csc2": "123", "num2": "4111111111111111"}
+    assert events.count("commit") == 2 and events.count("reinspect") == 1, events
 
 
 def test_a_cleared_cvc_gets_one_repair_pass_and_held_fields_are_not_written_again(tmp_path, monkeypatch):

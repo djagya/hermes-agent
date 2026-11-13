@@ -1256,6 +1256,8 @@ def _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=None, auto=True
                     "returnByValue": True}, session_id=fsid), sup._loop, timeout=10)
             finally:
                 _schedule(sup._cdp("Target.detachFromTarget", {"sessionId": fsid}), sup._loop, timeout=10)
+            assert "value" in reply["result"]["result"], (t["url"], reply["result"].get("exceptionDetails", {}).get("text"),
+                                                          reply["result"]["result"].get("description", "")[:200])
             state[t["url"].rsplit("=", 1)[-1]] = reply["result"]["result"]["value"]
     return json.loads(first), second, asked, state, sup
 
