@@ -622,11 +622,18 @@ def _locate_real_git() -> Optional[Path]:
     re-exec git-core, while the real binary at ``mingw64\\libexec\\git-core\\git.exe`` (≈4.4MB) works when
     invoked directly (#87876).
     """
+    bases = (r"C:\Program Files", r"C:\Program Files (x86)")
     candidates = [
         Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
-        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
+        for base in bases
         for arch in ("clangarm64", "mingw64", "mingw32")
-    ] + _portable_git_candidates()
+    ]
+    # The architecture directory is not stable: Git for Windows v2.56.0 moved x64 from MINGW64 to
+    # UCRT64. Glob that one segment after the known names; every hit still has to pass the probe.
+    for base in bases:
+        with suppress(OSError):
+            candidates += sorted((Path(base) / "Git").glob("*/libexec/git-core/git.exe"))
+    candidates = list(dict.fromkeys(candidates + _portable_git_candidates()))
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 
