@@ -38,8 +38,9 @@ def _witness_pin(text, expression):
     node = shutil.which("node")
     if not node:
         pytest.skip("node is required for the amount check")
-    harness = ("const document = {body: {innerText: " + json.dumps(text) + "}}; const location = {href: 'https://shop.test/'};"
-               "\nprocess.stdout.write(JSON.stringify(" + expression + "));")
+    harness = ("const document = {body: {innerText: " + json.dumps(text) + "}};\n"
+               "const location = {href: 'https://shop.test/'};\n"
+               "process.stdout.write(JSON.stringify(" + expression + "));")
     run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
     assert run.returncode == 0, run.stderr
     return json.loads(run.stdout)
@@ -754,9 +755,10 @@ def test_the_total_is_read_after_the_move_right_before_the_press():
     ref = surface.payment_controls(sup)["controls"][0]["ref"]
     assert surface.payment_click(sup, ref)["success"] is True
     methods = [c[0] for c in sup.calls]
-    moved = max(i for i, c in enumerate(sup.calls) if c[0] == "Input.dispatchMouseEvent" and c[1]["type"] == "mouseMoved")
+    mouse = [(i, c[1]["type"]) for i, c in enumerate(sup.calls) if c[0] == "Input.dispatchMouseEvent"]
+    moved = max(i for i, kind in mouse if kind == "mouseMoved")
     read = methods.index("Page.createIsolatedWorld", moved)
-    pressed = next(i for i, c in enumerate(sup.calls) if c[0] == "Input.dispatchMouseEvent" and c[1]["type"] == "mousePressed")
+    pressed = next(i for i, kind in mouse if kind == "mousePressed")
     assert moved < read < pressed
     # the merchant document is read again after the total: a navigation during the read is no match
     assert "Page.getFrameTree" in methods[read:pressed]

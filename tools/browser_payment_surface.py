@@ -884,8 +884,9 @@ class _LockGen:
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
-        # B1: (cents, currency, top frame id, top loader, merchant origin) of the last successful fill in this lock whose card stated
-        # the total and whose page check matched it (record_approved_total); None: no press is covered by the card.
+        # B1: (cents, currency, top frame id, top loader, merchant origin) of the last successful fill in this lock
+        # whose card stated the total and whose page check matched it (record_approved_total); None: no press is
+        # covered by the card.
         self.approved: Optional[tuple] = None
 
 

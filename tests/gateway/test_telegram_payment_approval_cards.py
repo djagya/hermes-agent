@@ -361,8 +361,9 @@ async def test_pay_once_only_when_the_page_check_matched_the_stated_total(state,
     assert ("One tap covers one fill only" in text) is not pays
     adapter = _adapter()
     entry = _pending(exact_request=True, approver=OWNER)
-    result = await adapter.send_payment_approval(chat_id=str(OWNER_ID), facts=facts, request_id=entry.data["request_id"],
-                                                 session_key=SESSION, approver=OWNER)
+    result = await adapter.send_payment_approval(chat_id=str(OWNER_ID), facts=facts,
+                                                 request_id=entry.data["request_id"], session_key=SESSION,
+                                                 approver=OWNER)
     buttons = [b for row in adapter._bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard for b in row]
     assert buttons[0].text == (APPROVE_LABEL if pays else APPROVE_LABEL_FILL_ONLY)
     assert next(iter(adapter._approval_cards.values()))["fill_only"] is not pays
