@@ -1881,3 +1881,15 @@ console.log(JSON.stringify(out));
     assert json.loads(run.stdout) == {"failed": "NATIVE", "answered": True,
                                       "calls": ["native:Place order?", "native-alert:Saved"]}
 
+
+def test_the_tool_text_allows_preparatory_clicks_and_exactly_one_final_pay():
+    """r4 C9 (Codex r3 P3): Continue -> review page -> Place order is supported, so the text must not limit every
+    click after the first one to bank steps; it still allows exactly one final Pay and nothing after an uncertain one."""
+    from tools.browser_vault_tool import BROWSER_VAULT_SCHEMA
+
+    text = " ".join(BROWSER_VAULT_SCHEMA["description"].split())
+    assert "Preparatory clicks of the checkout" in text and "is made exactly once after a successful fill" in text
+    assert "once it is 1 (or null), another payment_click is only for a bank" not in text
+    assert "never again (nor anything else) when payment_click_uncertain" in text
+    for code in ("payment_approval_changed", "payment_total_unbound", "payment_go_required", "payment_total_changed"):
+        assert code in text
