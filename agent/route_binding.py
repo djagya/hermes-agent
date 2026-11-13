@@ -1,7 +1,7 @@
 """Bind a provider route onto a live agent in place, and put the primary route back.
 
 ``bind_route_entry`` is the fallback chain's swap (client, pool, compressor, reasoning,
-extra_body) shared with per-turn routes such as the voice-chat model; ``reinstall_primary_runtime``
+extra_body, static fast tier) shared with per-turn routes such as the voice-chat model; ``reinstall_primary_runtime``
 is the inverse that ``restore_primary_runtime`` runs once its gates pass.
 """
 
@@ -90,7 +90,31 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     _update_fallback_context_compressor(agent)
     _reresolve_fallback_reasoning_config(agent)
     _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+    _rescope_static_fast_tier(agent)
     return old_model, old_provider
+
+
+def _rescope_static_fast_tier(agent: Any) -> None:
+    """Re-resolve a static ``/fast`` tier for the route just bound. The tier is pinned into
+    ``request_overrides`` per route (``speed`` on Anthropic, ``service_tier`` on OpenAI / xAI), so
+    the old route's field must not reach the new one: the Codex Responses preflight rejects
+    ``speed``. Only the values a static tier pins are replaced; ``restore_primary_runtime`` puts the
+    primary's overrides back from its snapshot."""
+    from agent.fast_mode import STATIC_TIERS
+    from hermes_cli.models import resolve_fast_mode_overrides
+    tier = getattr(agent, "service_tier", None)
+    if tier not in STATIC_TIERS:
+        return  # auto/cold windows resolve against the active route per request
+    overrides = dict(getattr(agent, "request_overrides", None) or {})
+    if overrides.get("speed") == "fast":
+        overrides.pop("speed")
+    if overrides.get("service_tier") == tier:
+        overrides.pop("service_tier")
+    base_url = agent.base_url
+    if agent.api_mode == "anthropic_messages":
+        base_url = getattr(agent, "_anthropic_base_url", None) or base_url
+    overrides.update(resolve_fast_mode_overrides(agent.model, provider=agent.provider, base_url=base_url, tier=tier) or {})
+    agent.request_overrides = overrides
 
 
 def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
