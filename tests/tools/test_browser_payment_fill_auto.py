@@ -676,7 +676,7 @@ def test_a_relabel_accepted_silently_inside_the_scope_check_is_followed_by_the_o
         changed = False
 
         async def _payment_tree(self, sid, child_sessions=None):
-            return (top[:2] + (top[2] + ("#next" if self.changed else ""),) + top[3:], card)
+            return (top[:2] + (top[2] + ("/other" if self.changed else ""),) + top[3:], card)  # a path change (fragments are ignored)
 
         async def _cdp(self, method, params=None, session_id=None, timeout=None):
             if params and params.get("objectId") == "o-owner":  # the owner <iframe> hit test in the parent
