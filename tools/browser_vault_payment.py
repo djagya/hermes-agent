@@ -772,6 +772,13 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
     in context, after the page checks, at the commit fence and inside the commit (between documents and on every
     paced resume).
 
+    dlz (fill-auto, 11-13; ``vault.payment_fill_auto``, on by default): the inspection the approval card is built
+    from is armed (``_arm_auto``): the approval binds the tab and top document, the card field tokens per origin,
+    the unreviewed origins and the cart readings, not DOM nodes. A form that re-rendered while the approval was
+    open (``_approved_page``) or re-renders under the fill (``_auto_commit``) is inspected again in full and the
+    fill goes on only on a reading that matches (tools.browser_supervisor_payment_auto); no second approval, no
+    second card read. Not armed, any change stops the fill as before.
+
     Order after consent (design v2 A6): backend context -> item revision -> live ownership -> page freshness
     -> capture guard (for the approved lease only) and local mark -> expiry -> live ownership again -> read the
     card -> its revision -> fills -> commit fence (ownership again, expiry) -> commit with its own per-document
