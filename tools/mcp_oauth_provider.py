@@ -8,6 +8,7 @@ modules keep their own subclass (logger name, disk-watch hooks) on top of it.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import TYPE_CHECKING, Any
@@ -71,6 +72,17 @@ def _with_discovery_context(exc: Exception, failures: list[str]):
 
 class _RefreshCompletedByPeer(Exception):
     """Restart the SDK auth flow: a peer rotated the grant we were about to present."""
+
+
+# OAuth ``error`` codes that mean "try again later" (RFC 6749 §4.1.2.1), not "this grant is dead".
+_REFRESH_TRANSIENT_CODES = frozenset({"temporarily_unavailable", "server_error"})
+
+
+class MCPOAuthRefreshUnavailable(RuntimeError):
+    """The token endpoint gave no definitive answer to a refresh (5xx, 429, a WAF page, an unreadable
+    2xx); the stored tokens are kept. Not an auth error, so the MCP layer retries with backoff
+    instead of starting a fresh authorization for a grant that may still be valid."""
+
 
 class HermesProviderMixin:
     """Token-endpoint fixes layered over the SDK's ``OAuthClientProvider`` (must precede it in
@@ -459,6 +471,9 @@ class HermesProviderMixin:
                     "Recovered a peer-rotated refresh token instead of clearing the session"
                 )
                 return True
+            if not await self._hermes_refresh_rejected(response):
+                raise MCPOAuthRefreshUnavailable(
+                    f"MCP OAuth token refresh failed ({response.status_code}); stored tokens kept")
             self.context.clear_tokens()
             return False
         from httpx import HTTPError
@@ -468,8 +483,11 @@ class HermesProviderMixin:
             token_response = OAuthToken.model_validate_json(await response.aread())
         except (HTTPError, ValidationError):
             self._hermes_logger.warning("Invalid refresh response: %s", response.status_code)
-            self.context.clear_tokens()
-            return False
+            # The endpoint may or may not have rotated the grant; clearing cannot recover a rotated
+            # one, and keeping it lets a non-rotating server work on the next attempt.
+            raise MCPOAuthRefreshUnavailable(
+                f"MCP OAuth token refresh returned an unreadable response ({response.status_code}); "
+                "stored tokens kept") from None
         # RFC 6749 §6: a refresh response may omit refresh_token (AS does not rotate) and scope
         # (unchanged). The SDK's own _handle_refresh_response carries both forward; this override
         # must too, or every non-rotating refresh erases the stored refresh_token and the server
@@ -483,6 +501,20 @@ class HermesProviderMixin:
         await self._store_tokens(token_response)
         return True
 
+    @staticmethod
+    async def _hermes_refresh_rejected(response) -> bool:
+        """True only for an RFC 6749 §5.2 error response: 400/401 with a JSON ``error`` code that is not
+        a try-again-later code. Reads the code only, never logs the body."""
+        if response.status_code not in (400, 401):
+            return False
+        from httpx import HTTPError
+        try:
+            body = json.loads(await response.aread())
+        except (HTTPError, ValueError):
+            return False
+        code = body.get("error") if isinstance(body, dict) else None
+        return isinstance(code, str) and code not in _REFRESH_TRANSIENT_CODES
+
     async def _hermes_reload_tokens_after_refresh_failure(self) -> bool:
         """Re-read tokens from disk after a rejected refresh.
 
@@ -492,9 +524,8 @@ class HermesProviderMixin:
         pre-fence Hermes) having rotated the grant between our read and our
         POST -- a recoverable race, not a dead credential.
 
-        Returns False for the genuinely-expired case (nobody wrote a newer
-        pair), so the caller still clears state and surfaces the reauth
-        prompt.
+        Returns False when nobody wrote a newer pair, so the caller decides
+        from the response whether the grant is dead or the failure transient.
         """
         candidate = await self._hermes_rotated_candidate()
         if candidate is None:

@@ -372,53 +372,6 @@ async def test_manager_token_read_error_does_not_expose_body(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_manager_malformed_201_refresh_response_clears_tokens(
-    tmp_path, monkeypatch, caplog
-):
-    import logging
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    provider = _provider_with_token_endpoint(
-        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
-    )
-    provider.context.current_tokens = object()
-
-    response = _fake_response(
-        201,
-        "https://idp.example.com/oauth/token",
-        b'{"refresh_token": "refresh-secret"}',
-    )
-    with caplog.at_level(logging.WARNING, logger="tools.mcp_oauth_manager"):
-        result = await provider._handle_refresh_response(response)
-
-    assert result is False
-    assert provider.context.current_tokens is None
-    assert "refresh-secret" not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_manager_refresh_read_error_clears_tokens(tmp_path, monkeypatch):
-    import httpx
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    provider = _provider_with_token_endpoint(
-        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
-    )
-    provider.context.current_tokens = object()
-
-    class _ReadErrorResponse:
-        status_code = 201
-
-        async def aread(self):
-            raise httpx.ReadError("body read failed")
-
-    result = await provider._handle_refresh_response(_ReadErrorResponse())
-
-    assert result is False
-    assert provider.context.current_tokens is None
-
-
-@pytest.mark.asyncio
 async def test_refresh_response_without_refresh_token_keeps_stored_one(tmp_path, monkeypatch):
     """RFC 6749 §6: an AS that does not rotate omits refresh_token; the prior one must survive in
     the live provider AND on disk, or the server dies at the next expiry (#62333)."""
@@ -871,3 +824,76 @@ async def test_refresh_400_recovery_rejects_disk_pair_from_another_issuer(tmp_pa
     assert recovered is False
     assert provider.context.current_tokens is None
     assert (await storage.get_tokens()).refresh_token is None, "foreign refresh token must not survive on disk"
+
+
+class _ReadErrorResponse:
+    status_code = 201
+    next_request = None
+
+    async def aread(self):
+        import httpx
+
+        raise httpx.ReadError("refresh-secret")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "grant_dead"),
+    [
+        (503, b"<html>Service Unavailable</html>", False),
+        (429, b"", False),
+        (403, b"<html>Request blocked refresh-secret</html>", False),
+        (400, b'{"error":"temporarily_unavailable"}', False),
+        (401, b"<html>Unauthorized</html>", False),
+        (500, b'{"error":"server_error"}', False),
+        (201, b'{"refresh_token": "refresh-secret"}', False),
+        (201, None, False),
+        (400, b'{"error":"invalid_grant"}', True),
+        (401, b'{"error":"invalid_client"}', True),
+        (400, b'{"error":"refresh_token_reused"}', True),
+    ],
+)
+async def test_refresh_clears_tokens_only_when_the_grant_is_rejected(
+    tmp_path, monkeypatch, caplog, status, body, grant_dead
+):
+    """Only an RFC 6749 §5.2 error response may drop the tokens and fall through to a new login.
+
+    An outage, rate limit, WAF page or unreadable 2xx says nothing about the grant: the
+    flow must stop with a transient (retryable, non-auth) error and keep the pair, instead
+    of sending the MCP request unauthenticated into the 401 -> browser-login branch.
+    """
+    import logging
+
+    from tools.mcp_tool_errors import _classify_mcp_failure
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    endpoint = "https://idp.example.com/oauth/token"
+    provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
+    await provider.context.storage.set_tokens(_token("A1", "R1"))
+    unauthenticated = []
+
+    def responder(request):
+        if request.method == "POST":
+            return _ReadErrorResponse() if body is None else _fake_response(status, endpoint, body)
+        if "authorization" not in request.headers:
+            unauthenticated.append(request)
+        return _fake_response(200, str(request.url), b"{}")
+
+    raised = None
+    with caplog.at_level(logging.DEBUG):
+        try:
+            await _drive_flow(provider, responder)
+        except Exception as exc:
+            raised = exc
+
+    assert "refresh-secret" not in caplog.text
+    assert provider._hermes_fence is None
+    if grant_dead:
+        assert raised is None and provider.context.current_tokens is None
+        return
+    assert raised is not None, "a transient refresh failure must not fall through to re-login"
+    assert _classify_mcp_failure(raised) == "transient"
+    assert "refresh-secret" not in str(raised)
+    assert unauthenticated == []
+    assert provider.context.current_tokens.refresh_token == "R1"
+    assert (await provider.context.storage.get_tokens()).refresh_token == "R1"
