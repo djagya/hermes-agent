@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import queue
 import socket
@@ -26,6 +27,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("cron.network_probe")
 
 PROBE_TARGETS: tuple[tuple[str, int], ...] = (("api.telegram.org", 443), ("github.com", 443))
 CONNECT_TIMEOUT_SECONDS = 3.0
@@ -72,8 +75,10 @@ def _probe_offline() -> bool:
         except Exception:  # health: allow BLE001 -- a broken probe must not silence alerts
             results.put(True)
 
+    from agent.memory_provider import spawn_context_thread
+
     for host, port in PROBE_TARGETS:
-        threading.Thread(target=_run, args=(host, port), daemon=True, name="network-probe").start()
+        spawn_context_thread(_run, name="network-probe", args=(host, port)).start()
     deadline = time.monotonic() + PROBE_DEADLINE_SECONDS
     for _ in PROBE_TARGETS:
         try:
@@ -93,12 +98,12 @@ def _cache_path() -> Path:
 def _read_shared() -> Optional[bool]:
     """The offline answer another process stored less than ``CACHE_SECONDS`` ago, else None."""
     try:
-        data = json.loads(_cache_path().read_text(encoding="utf-8"))
+        data = json.loads(_cache_path().read_text(encoding="utf-8-sig"))
         age = time.time() - float(data["checked_at"])
         if 0 <= age < CACHE_SECONDS:
             return not bool(data["online"])
     except Exception:  # health: allow BLE001 -- missing, torn or foreign file: just probe
-        pass
+        logger.debug("network probe: no usable shared result", exc_info=True)
     return None
 
 
@@ -151,4 +156,4 @@ def reset_cache() -> None:
     try:
         _cache_path().unlink()
     except Exception:  # health: allow BLE001 -- nothing to forget
-        pass
+        logger.debug("network probe: no shared result to remove", exc_info=True)

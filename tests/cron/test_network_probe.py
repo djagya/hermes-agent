@@ -24,8 +24,7 @@ def _raiser(exc):
 
 
 @pytest.mark.parametrize("exc", [
-    ConnectionRefusedError(), ConnectionResetError(), ConnectionAbortedError(), socket.timeout(),
-    TimeoutError(), socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
+    ConnectionRefusedError(), ConnectionResetError(), ConnectionAbortedError(), TimeoutError(), socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
     OSError(errno.EHOSTUNREACH, "no route"), OSError(errno.ENETUNREACH, "net"),
     OSError(errno.ENETDOWN, "down"),
 ])
@@ -72,7 +71,7 @@ def test_one_stalled_target_does_not_stop_the_other_from_answering(monkeypatch):
     def _connect(address, timeout=None):
         if address[0] == network_probe.PROBE_TARGETS[0][0]:
             release.wait(30)
-            return None
+            return
         raise ConnectionRefusedError()  # the other target says unreachable
 
     _fake_connection(monkeypatch, _connect)
