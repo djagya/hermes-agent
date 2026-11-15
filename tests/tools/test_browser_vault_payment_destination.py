@@ -907,7 +907,7 @@ def _two_slow_passes(monkeypatch, strict_s, shown_s, calls):
     async def run(self, origin, bound, allowed, unreviewed, cart, prior, strict, admission):
         calls.append(admission)
         try:
-            await asyncio.sleep(strict_s if admission == "strict" else shown_s)
+            await asyncio.sleep(strict_s if admission == "strict" else shown_s)  # health: allow HX013 -- the pass duration against the budget is the behaviour under test
         except asyncio.CancelledError:
             calls.append("cancelled")
             raise
