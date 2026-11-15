@@ -137,8 +137,11 @@ def graft_npm(node_prefix: Path, npm_entry: Path) -> None:
     for link in bundled.rglob("*"):
         if link.is_symlink() and not link.resolve().is_relative_to(bundled.resolve()):
             raise ValueError(f"grafted npm link escapes its tree: {link}")
-    if json.loads((bundled / "package.json").read_text(encoding="utf-8"))["version"] != \
-            json.loads((source / "package.json").read_text(encoding="utf-8"))["version"]:
+    versions = [
+        json.loads((tree / "package.json").read_text(encoding="utf-8-sig"))["version"]
+        for tree in (bundled, source)
+    ]
+    if versions[0] != versions[1]:
         raise ValueError("grafted npm version differs from the managed npm")
 
 
