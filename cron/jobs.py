@@ -2512,11 +2512,15 @@ def _record_run_outcome(
         job.pop("last_fire_error", None)
         job["failure_streak"] = 0
         job.pop("failing_since", None)
+        job.pop("network_failing_since", None)
     elif not cancelled:
         # Consecutive agent-failure streak; delivery failures do NOT count
         # (scheduler._failure_streak_nudge). A network-class failure (cron/transient_network.py)
-        # does not count either: it must never walk a job toward its alert threshold.
-        if not transient_network:
+        # does not count either: it must never walk a job toward its alert threshold. Its own
+        # clock, network_failing_since, is what ends the silence (transient_network.network_failing_too_long).
+        if transient_network:
+            job.setdefault("network_failing_since", now)
+        else:
             if not int(job.get("failure_streak") or 0):
                 # First failure of a streak: the clock alert_when_stale_minutes measures against.
                 job["failing_since"] = now

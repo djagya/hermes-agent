@@ -12,8 +12,11 @@ which has to answer for one-shot dispatch accounting and mid-run side effects. R
 jobs only: finite one-shots are pre-claimed by ``claim_dispatch`` (at-most-times, #38758)
 and must not regain a consumed dispatch here.
 
-While a retry is pending the failure notice is suppressed (Cowork re-runs silently); a
-run that reaches the model — success or not — resets the ladder. Disable with
+While a retry is pending the failure counts as a network-class failure
+(``scheduler._is_transient_network_run``): ledgered as ``transient_network``, no failure streak,
+no notice (Cowork re-runs silently). Only while ``will_retry`` holds: once the ladder is
+exhausted the failure is an ordinary one and alerts. A run that reaches the model — success or
+not — resets the ladder. Disable with
 ``cron.retry_unreachable: false`` in config.yaml.
 """
 
@@ -90,7 +93,8 @@ def _ladder_instant(job: dict[str, Any], natural_next: Optional[datetime],
 
 def will_retry(job: dict[str, Any]) -> bool:
     """True iff ``plan_retry`` will park a re-run for this flagged failure, so the scheduler
-    may hold the interim notice. Called before ``mark_job_run``."""
+    treats it as a network-class failure (no notice, no streak) instead of alerting. Called
+    before ``mark_job_run``."""
     repeat = job.get("repeat") or {}
     times = repeat.get("times")
     counted = 0 if is_retry_run(job) else 1  # a ladder re-run does not count (``ladder_rung``)

@@ -506,8 +506,9 @@ def dispatch_browser_exec(*, binding_id: str, action: str, code: str, session: s
         return None
     if not binding_id or not action:
         return {"error": "bridge_override_refused"}
-    # A bridge call runs on the held lease by task_id, so a session name and the binding's own identity
-    # are harmless no-ops (an agent habitually passes them); anything else is a real override.
+    # A bridge call runs on the held lease by task_id, so a session name, a timeout and the binding's
+    # own identity are harmless no-ops (an agent habitually passes them; the bridge enforces its own
+    # pinned per-action timeout and never reads ``timeout_s``); anything else is a real override.
     # Names only in the answer, never values: a refused field may hold code or a secret.
     drop = [
         name for name, refused in (
@@ -517,7 +518,6 @@ def dispatch_browser_exec(*, binding_id: str, action: str, code: str, session: s
             ("identity", bool(identity) and not _identity_is_binding_own(binding_id, identity)),
             ("qa_targets", bool(qa_targets)),
             ("on_dialog", on_dialog != "auto"),
-            ("timeout_s", timeout_s != default_timeout_s),
         ) if refused
     ]
     if drop:

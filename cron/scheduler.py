@@ -3117,13 +3117,39 @@ def _record_fire_ownership_lost(
             execution_id, "Fire claim ownership lost; stale result was discarded.")
 
 
-def _is_transient_network_run(job: dict, error: str, agent_declared: bool = False) -> bool:
-    """A failed run that is a network-class failure: the allow-list match, or the run's own
-    never-reached-the-model flag (transient network/DNS error, zero API calls)."""
-    from cron.transient_network import is_transient_network_failure
+def _is_transient_network_run(
+    job: dict, error: str, agent_declared: bool = False, *, crashed: bool = False,
+) -> bool:
+    """A failed run that counts as a network-class failure: ledgered, no streak, no notice.
 
-    return bool(job.get("_model_unreachable")) or is_transient_network_failure(
-        error, agent_declared=agent_declared)
+    Three signals, none of them forever: the never-reached-the-model flag (only while the bounded
+    re-run ladder still has a rung, ``unreachable_retry.will_retry``; exhausted, the failure
+    alerts), the run's error line against the phrase allow-list (``cron.transient_network``), and
+    the tick's box-connectivity probe (``cron.network_probe``), which makes any failure of an
+    offline box network-class whatever its message. An agent's own ``[CRON_FAILURE]`` verdict is
+    prose about the job's subject, so it is never classified. Once ``network_failing_since`` is
+    older than ``cron.failure_repeat_alert_hours`` the failure alerts like any other.
+
+    ``crashed``: the run raised out of ``run_job``. The run's ``_model_unreachable`` flag may then
+    be stale (set before an unrelated bookkeeping crash) and the crash is not evidence the box is
+    offline, so only the error text counts."""
+    from cron.transient_network import is_transient_network_failure, network_failing_too_long
+
+    hours = _failure_repeat_alert_hours()
+    if network_failing_too_long(job, hours if hours > 0 else DEFAULT_FAILURE_REPEAT_ALERT_HOURS):
+        return False
+    if crashed:
+        return is_transient_network_failure(error, agent_declared=agent_declared)
+    if job.get("_model_unreachable"):
+        from cron.unreachable_retry import will_retry
+        if will_retry(job):
+            return True
+    elif is_transient_network_failure(error, agent_declared=agent_declared):
+        return True
+    if agent_declared:
+        return False
+    from cron.network_probe import box_is_offline
+    return box_is_offline()
 
 
 def _transient_mark_kwargs(job: dict) -> dict:
@@ -3314,16 +3340,10 @@ def _save_compose_deliver(
         output_file=output_file, agent_declared=d.agent_declared)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
-    if d.should_deliver and not d.success and job.get("_model_unreachable"):
-        # The model was never reached and a bounded automatic re-run will be scheduled
-        # (cron/unreachable_retry.py): hold the failure notice — the re-run either
-        # delivers the real result or, once the ladder is exhausted, the next failure
-        # alerts normally. Mirrors Cowork's silent 5/15/30-minute re-runs.
-        from cron.unreachable_retry import will_retry
-        if will_retry(job):
-            d.should_deliver = False
-            logger.info(
-                "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])
+    # A never-reached-the-model failure with a re-run still pending was composed as a network-class
+    # failure above (``_is_transient_network_run``): nothing to deliver, the re-run is the answer.
+    # Once the ladder is exhausted it composes as an ordinary failure and alerts.
+
     # Not a substring check: bare "SILENT"/"NO_REPLY" or a report quoting "[SILENT]" must
     # not be swallowed; bracketed-prefix / trailing-line tolerance is kept.
     if d.should_deliver and d.success and _is_cron_silence_response(deliver_content):
@@ -3390,7 +3410,7 @@ def _deliver_crash_failure(
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
-    if _is_transient_network_run(job, err_text):
+    if _is_transient_network_run(job, err_text, crashed=True):
         from cron.transient_network import record_transient_network_incident
         record_transient_network_incident(job, err_text)
         job["_transient_network"] = True

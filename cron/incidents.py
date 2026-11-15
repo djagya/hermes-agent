@@ -174,7 +174,9 @@ def upsert_incident(
 ) -> tuple[str, bool]:
     """Record (or refresh) the incident for ``job_id`` + ``error``; returns ``(incident_id,
     is_new)``. An existing row for the signature refreshes
-    ``last_seen_at``/``error``/``output_file`` and keeps its state — a ``closed`` incident stays
+    ``last_seen_at``/``error``/``output_file`` (and ``failure_type`` when the caller passes one
+    explicitly: the same text can be re-read as a different kind of failure; a keyword-classified
+    type is never re-derived) and keeps its state — a ``closed`` incident stays
     closed, while a ``resolved`` one (job recovered, then broke the same way again) re-opens as
     ``detected`` so the operator is alerted once more. A changed error text mints a new incident."""
     job_id = str(job_id or "")
@@ -182,6 +184,7 @@ def upsert_incident(
     stored_error = _redact_error(error)
     incident_id = _incident_id(job_id, sig)
     now = _hermes_now().isoformat()
+    explicit_failure_type = failure_type
     failure_type = failure_type or _classify_failure_type(error)
     output_file = str(output_file) if output_file is not None else None
 
@@ -194,11 +197,12 @@ def upsert_incident(
             conn.execute(
                 """UPDATE cron_incidents
                    SET last_seen_at=?, error=?, output_file=?,
+                       failure_type=COALESCE(?, failure_type),
                        state=CASE WHEN state='resolved' THEN 'detected' ELSE state END,
                        alerted_at=CASE WHEN state='resolved' THEN NULL ELSE alerted_at END,
                        closed_at=CASE WHEN state='resolved' THEN NULL ELSE closed_at END
                    WHERE id=?""",
-                (now, stored_error, output_file, incident_id),
+                (now, stored_error, output_file, explicit_failure_type, incident_id),
             )
             return incident_id, reopen
         conn.execute(
@@ -273,9 +277,9 @@ def close_incidents_for_recovered_job(job_id: str) -> int:
 
 
 def count_alerted_incidents(job_id: str) -> int:
-    """How many of ``job_id``'s open incidents already pinged the operator (``alerted``). The
-    recovery notice is sent only when this is non-zero: a failure nobody was told about needs no
-    "recovered" message."""
+    """How many of ``job_id``'s open incidents already pinged the operator (``alerted``). A
+    ledger query for operators and tests; there is no recovery notice to gate (a green run only
+    resolves the incidents, see ``close_incidents_for_recovered_job``)."""
     with _transaction() as conn:
         row = conn.execute(
             "SELECT COUNT(*) FROM cron_incidents WHERE job_id=? AND state='alerted'",
