@@ -31,7 +31,7 @@ from tools.browser_supervisor_payment_closure import _INSPECT_TEMPLATE
 from tools.browser_supervisor_payment_repin import MAX_REPINS, located, repin_pins, valid_check, valid_pause
 from tools.browser_supervisor_payment_stop import admission_strict as _admission_strict
 from tools.browser_supervisor_payment_stop import strict_exposure as _strict_exposure
-from tools.browser_supervisor_payment_stop import strict_then_shown
+from tools.browser_supervisor_payment_stop import await_cleanup, release_object, strict_then_shown
 
 
 _MAX_CARD_DOCUMENTS = 4
@@ -95,7 +95,8 @@ _SETTLE_SECONDS = 2.0
 _COMMIT_BUDGET_SECONDS = 20.0
 # dlz: one inspection's life, and so the owner's approval window (owner 2026-11-13: 5 min, was 120 s).
 INSPECTION_WINDOW_S = 300
-_INSPECT_WRAPPER_S, _INSPECT_CLEANUP_RESERVE_S = 25, 12  # r9: discovery's wrapper; cleanup bound (``discard_payment``'s)
+# r9: discovery's wrapper; cleanup bound (``discard_payment``'s); r10: what a pass's cleanup leaves the wrapper
+_INSPECT_WRAPPER_S, _INSPECT_CLEANUP_RESERVE_S, _INSPECT_MARGIN_S = 25, 12, 2
 _RETENTION_STATES = frozenset({"held", "empty", "changed", "replaced"})
 # Card fields a saved card may lack: left empty for the user instead of refusing the whole fill.
 OPTIONAL_CARD_TOKENS = frozenset({"cc-name", "postal-code"})
@@ -557,7 +558,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                         continue
                     finally:
                         if obj:
-                            await self._release_payment_object(parent_sid, obj)
+                            await release_object(self, parent_sid, obj)
                 if not parent:
                     continue
                 expanded += 1
@@ -603,14 +604,16 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         Opus P2-1) an unreviewed inspection, a re-inspection too, chooses its frames by the strict rule first (a hidden
         copy beside the shown form stays out), by the shown rule only when that finds no complete card form."""
         strict = unreviewed and (strict_exposure is True if prior is None else prior.strict_exposure is True)
+        end = None if budget is None else time.monotonic() + budget - _INSPECT_MARGIN_S  # r10: see await_cleanup
         if not unreviewed or strict:
-            return await self._inspect_pass(origin, bound, allowed_frames, unreviewed, cart, prior, strict, "strict")
+            return await self._inspect_pass(origin, bound, allowed_frames, unreviewed, cart, prior, strict, "strict", end)
         return await strict_then_shown(
-            lambda adm: self._inspect_pass(origin, bound, allowed_frames, True, cart, prior, False, adm),
+            lambda adm: self._inspect_pass(origin, bound, allowed_frames, True, cart, prior, False, adm, end),
             budget, _INSPECT_CLEANUP_RESERVE_S)
 
     async def _inspect_pass(self, origin: str, bound: tuple, allowed_frames: tuple, unreviewed: bool, cart: tuple | None,
-                            prior: PaymentInspection | None, strict: bool, admission: str) -> PaymentInspection:
+                            prior: PaymentInspection | None, strict: bool, admission: str,
+                            end: float | None = None) -> PaymentInspection:
         if origin:
             https_origin(origin)
         with self._state_lock:
@@ -691,18 +694,14 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             return inspection
         except BaseException:  # health: allow BLE001 -- released, then re-raised unchanged (cancellation too)
             # dlz (Codex B r3 #4): one release pass of everything pinned so far, as its own task: a cancellation
-            # (the caller's timeout) cannot cut it short, and is re-raised once the pass is under way.
+            # (the caller's timeout) cannot cut it short; r10: waited for only until ``end``, then tracked.
             # dlz (fill-auto): a re-inspection shares the earlier inspection's frame sessions; only its own go.
             # By session, not by frame: a new child frame can share its parent frame's session.
             held = set() if prior is None else set(prior.child_sessions.values())
             own = {k: v for k, v in child_sessions.items() if v not in held}
-            cleanup = asyncio.ensure_future(self._release_found(found, own))
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                if not cleanup.done():
-                    raise  # dlz (Codex B r4 #4): the caller cancelled; the pass finishes behind the shield
-                # The pass itself was cancelled (after attempting every release): the original exception stands.
+            # dlz (Codex B r4 #4): a cancellation while waiting propagates, the release pass goes on; that pass's own
+            # outcome (cancelled after attempting every release) never replaces the original exception.
+            await await_cleanup(self, asyncio.ensure_future(self._release_found(found, own)), end)
             raise
 
     async def _release_found(self, found: dict, child_sessions: dict) -> None:
@@ -1023,7 +1022,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             return False
         finally:
             if obj:
-                await self._release_payment_object(parent_sid, obj)
+                await release_object(self, parent_sid, obj)
         if strict and type(answer) is not bool:
             raise _unverifiable()
         return answer is True

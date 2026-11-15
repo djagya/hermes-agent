@@ -185,3 +185,32 @@ async def strict_then_shown(run: Callable[[str], Awaitable], budget: float | Non
         if not scope.expired():
             raise
     raise refusal
+
+
+def track_cleanup(sup: Any, task: asyncio.Future) -> asyncio.Future:
+    """r10: keep a release task referenced on its supervisor (``_payment_cleanups``) until it ends: the loop holds
+    tasks only weakly. Supervisor shutdown cancels it with every other pending task (``_thread_main``)."""
+    tasks = sup.__dict__.setdefault("_payment_cleanups", set())
+    tasks.add(task)
+    task.add_done_callback(lambda t: (tasks.discard(t), t.cancelled() or t.exception()))
+    return task
+
+
+async def await_cleanup(sup: Any, cleanup: asyncio.Future, end: float | None) -> None:
+    """r10 (Codex, Kimi r9 P2): wait for a refused or cancelled pass's release task until ``end`` (monotonic; None:
+    to its end). Its releases run one after another, each up to the CDP timeout, so a few stalled ones outlast any
+    reserve; past ``end`` it goes on in the background (tracked) and the pass's own exception (a typed refusal, the
+    fallback deadline's cancellation) reaches the caller before the wrapper does. A cancellation of the waiting pass
+    propagates; the task goes on the same way."""
+    track_cleanup(sup, cleanup)
+    await asyncio.wait((cleanup,), timeout=None if end is None else max(0.0, end - time.monotonic()))
+
+
+async def release_object(sup: Any, sid: str, obj: str) -> None:
+    """r10: one pinned object's release from a ``finally``: awaited, except while the pass is being cancelled (the
+    fallback deadline, the wrapper), when it goes on in the background (tracked) instead of holding that up."""
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        track_cleanup(sup, asyncio.ensure_future(sup._release_payment_object(sid, obj)))
+        return
+    await sup._release_payment_object(sid, obj)

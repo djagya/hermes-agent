@@ -904,7 +904,7 @@ def test_a_frame_covered_after_scanning_is_refused_at_the_end_check_under_strict
 def _two_slow_passes(monkeypatch, strict_s, shown_s, calls):
     """``_inspect_pass`` stubbed: the strict pass refuses ``payment_fields_unsupported`` after ``strict_s`` seconds, the
     shown fallback returns ``"shown"`` after ``shown_s``."""
-    async def run(self, origin, bound, allowed, unreviewed, cart, prior, strict, admission):
+    async def run(self, origin, bound, allowed, unreviewed, cart, prior, strict, admission, end=None):
         calls.append(admission)
         try:
             await asyncio.sleep(strict_s if admission == "strict" else shown_s)  # health: allow HX013 -- the pass duration against the budget is the behaviour under test
@@ -947,13 +947,76 @@ def test_the_two_discovery_passes_share_one_deadline_and_end_in_the_typed_refusa
         asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0))
     assert caught.value.error_type == "payment_fields_unsupported" and calls == ["strict", "shown_fallback", "cancelled"]
     # a timeout of the fallback's own (a CDP call) is not the budget running out: it propagates
-    async def own_timeout(self, origin, bound, allowed, unreviewed, cart, prior, strict, admission):
+    async def own_timeout(self, origin, bound, allowed, unreviewed, cart, prior, strict, admission, end=None):
         if admission == "strict":
             raise PaymentDestinationError("payment_fields_unsupported", sp.FIELDS_UNSUPPORTED, {})
         raise TimeoutError("cdp")
     monkeypatch.setattr(sp.PaymentSupervisionMixin, "_inspect_pass", own_timeout)
     with pytest.raises(TimeoutError, match="cdp"):
         asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0))
+
+
+class _StalledFallback(_DiscoveryPage):
+    """r10: the strict pass refuses (the form only shown), the shown fallback stalls at ``stall`` (the card document's
+    describe() or its owner check) until the fallback deadline cancels it; from then on each release takes 0.6 s."""
+
+    def __init__(self, stall):
+        super().__init__(_PAGE, exposed={"ad"}, shown={"kps"}, controls={"kps": _CARD_FORM})
+        self.stall, self.slow, self.done = stall, False, []
+
+    async def _cdp(self, method, params=None, session_id=None, timeout=None):
+        fn, obj = (params or {}).get("functionDeclaration", ""), (params or {}).get("objectId")
+        on_card = obj == "doc-kps" and "describe()" in fn if self.stall == "describe" else \
+            obj == "owner-kps" and sp._EXPOSED not in fn  # the shown rule's owner check: the fallback's only
+        if method == "Runtime.callFunctionOn" and on_card:
+            self.slow = True
+            await asyncio.sleep(10)  # health: allow HX013 -- a stalled CDP call the fallback deadline cancels
+        if method == "Runtime.releaseObject" and self.slow:
+            await asyncio.sleep(0.6)  # health: allow HX013 -- a stalled release: the cleanup's length is under test
+            self.done.append(obj)
+        return await super()._cdp(method, params, session_id, timeout)
+
+    async def refused(self):
+        start = time.monotonic()
+        with pytest.raises(PaymentDestinationError) as caught:
+            await asyncio.wait_for(self._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0), 1.0)
+        assert caught.value.error_type == "payment_fields_unsupported" and time.monotonic() - start < 1.0
+        return set(self._payment_cleanups)
+
+
+@pytest.mark.parametrize("stall", ["describe", "owner"])
+def test_a_cancelled_fallback_cleanup_is_bounded_and_finishes_in_the_background(monkeypatch, stall):
+    """r10 (Codex, Kimi r9 P2): the fallback deadline cancels the shown pass; its real cleanup then releases three
+    pinned documents one after another (or, cancelled inside an owner check, that owner's release first), each stalled
+    past the reserve. Scaled 1:25 (wrapper 1.0 s, reserve 0.48 s, margin 0.08 s): the strict refusal comes back before
+    the wrapper, the releases go on in the background (tracked on the supervisor) and all finish; supervisor shutdown
+    cancels a cleanup still running."""
+    from tools.browser_supervisor import CDPSupervisor
+
+    monkeypatch.setattr(sp, "_INSPECT_CLEANUP_RESERVE_S", 0.48)
+    monkeypatch.setattr(sp, "_INSPECT_MARGIN_S", 0.08)
+    page = _StalledFallback(stall)
+
+    async def go():
+        tracked = await page.refused()
+        assert tracked and not any(t.done() for t in tracked) and len(page.done) < 3
+        await asyncio.wait(tracked, timeout=5)
+        assert page._payment_cleanups == set()
+
+    asyncio.run(go())
+    pinned = {"doc-top", "doc-ad"} | ({"doc-kps"} if stall == "describe" else {"owner-kps"})
+    assert pinned <= set(page.done), page.done
+    if stall == "owner":
+        return
+    # shutdown (CDPSupervisor._thread_main's teardown) cancels the cleanup the refusal left running
+    page, left = _StalledFallback(stall), []
+
+    async def run():
+        left.extend(await page.refused())
+
+    page._run, page._set_active = run, lambda active: None
+    CDPSupervisor._thread_main(page)
+    assert left and all(t.cancelled() for t in left) and page._payment_cleanups == set()
 
 
 def test_a_new_frame_after_the_approval_is_judged_by_the_rule_that_chose_the_frames():
