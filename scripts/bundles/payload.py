@@ -96,6 +96,55 @@ def rehash_tools(root: Path) -> int:
     return count
 
 
+def verify_tools(root: Path) -> int:
+    """Fail when any recorded tool digest no longer matches the realized bytes.
+
+    Run after the last assembler prune and rehash: a stale digest makes
+    `hermes pm doctor` fail and an explicit install reject the baked entry.
+    """
+    from pm.lock import Facts
+    from pm.store import digest_matches
+
+    store = root / "tools"
+    packages = Facts(_payload_file(root, "tools/facts.json"), strict=True)._packages
+    count = 0
+    for name, fact in packages.items():
+        if not isinstance(fact, dict) or "entry" not in fact:
+            continue
+        if not digest_matches(store / fact["entry"], fact.get("digest")):
+            raise ValueError(f"tool bytes do not match the recorded digest: {name}")
+        count += 1
+    if not count:
+        raise ValueError("no payload tools recorded")
+    return count
+
+
+def graft_npm(node_prefix: Path, npm_entry: Path) -> None:
+    """Replace the npm bundled in a Node tree with the managed, verified npm.
+
+    The Node tarball's bundled npm lags the managed one (vendored undici,
+    tar, brace-expansion, ip-address). Replace its contents in place, so
+    node's bin/npm and bin/npx links and pm's `Npm.unpack` (which runs the
+    bundled npm-cli.js) keep working on the managed bytes.
+    """
+    source = npm_entry / "lib" / "node_modules" / "npm"
+    bundled = node_prefix / "lib" / "node_modules" / "npm"
+    for tree in (source, bundled):
+        if not (tree / "bin" / "npm-cli.js").is_file():
+            raise ValueError(f"npm tree missing bin/npm-cli.js: {tree}")
+    shutil.rmtree(bundled)
+    shutil.copytree(source, bundled, symlinks=True)
+    for link in bundled.rglob("*"):
+        if link.is_symlink() and not link.resolve().is_relative_to(bundled.resolve()):
+            raise ValueError(f"grafted npm link escapes its tree: {link}")
+    versions = [
+        json.loads((tree / "package.json").read_text(encoding="utf-8-sig"))["version"]
+        for tree in (bundled, source)
+    ]
+    if versions[0] != versions[1]:
+        raise ValueError("grafted npm version differs from the managed npm")
+
+
 def seal_pm_runtime(root: Path, python: Path) -> dict:
     """Record a resident PM runtime without Windows' CWD-bound redirector.
 

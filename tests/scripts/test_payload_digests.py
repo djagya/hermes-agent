@@ -154,3 +154,45 @@ def test_invalid_tool_evidence_never_partially_rewrites_facts(tmp_path):
     path.unlink()
     assert _rehash(root, tmp_path).returncode != 0
     assert not path.exists()
+
+
+def _npm_tree(prefix, version):
+    package = prefix / "lib/node_modules/npm"
+    (package / "bin").mkdir(parents=True)
+    (package / "bin/npm-cli.js").write_text(f"// npm {version}\n", encoding="utf-8")
+    (package / "package.json").write_text(json.dumps({"name": "npm", "version": version}), encoding="utf-8")
+    return package
+
+
+def test_verify_tools_catches_a_prune_that_skipped_the_rehash(tmp_path):
+    root = _payload(tmp_path)
+    assert payload.verify_tools(root) == 2
+    (root / "tools/uv/tool").unlink()
+    with pytest.raises(ValueError, match="uv"):
+        payload.verify_tools(root)
+    assert payload.rehash_tools(root) == 2
+    assert payload.verify_tools(root) == 2
+
+
+@pytest.mark.platforms("posix")
+def test_graft_npm_replaces_the_bundled_tree_and_keeps_node_links(tmp_path):
+    node, managed = tmp_path / "node", tmp_path / "npm"
+    bundled = _npm_tree(node, "11.20.0")
+    (bundled / "old-vendored-only.js").write_text("", encoding="utf-8")
+    (node / "bin").mkdir()
+    (node / "bin/npm").symlink_to("../lib/node_modules/npm/bin/npm-cli.js")
+    _npm_tree(managed, "12.2.2")
+    payload.graft_npm(node, managed)
+    assert json.loads((bundled / "package.json").read_text())["version"] == "12.2.2"
+    assert not (bundled / "old-vendored-only.js").exists()
+    assert (node / "bin/npm").resolve() == (bundled / "bin/npm-cli.js").resolve()
+    assert (bundled / "bin/npm-cli.js").read_text() == "// npm 12.2.2\n"
+
+
+def test_graft_npm_refuses_a_tree_without_a_cli(tmp_path):
+    node, managed = tmp_path / "node", tmp_path / "npm"
+    _npm_tree(node, "11.20.0")
+    (managed / "lib/node_modules/npm").mkdir(parents=True)
+    with pytest.raises(ValueError, match="npm-cli.js"):
+        payload.graft_npm(node, managed)
+    assert (node / "lib/node_modules/npm/bin/npm-cli.js").is_file()

@@ -478,7 +478,7 @@ RUN /opt/hermes/.venv/bin/python -m docker.build_agent
 # injects axe.min.js into the page and refuses a file whose sha256 differs
 # from AXE_SHA256 in tools/browser_capture_harness.py (bump both together).
 RUN npm install -g --prefix /usr/local --omit=dev \
-        markdownlint-cli2@0.24.0 \
+        markdownlint-cli2@0.24.1 \
         caldav-mcp@0.10.0 \
         axe-core@4.14.0 && \
     test -x /usr/local/bin/markdownlint-cli2 && \
@@ -687,7 +687,19 @@ RUN mkdir -p /opt/data && chmod 0644 /opt/hermes/tools/facts.json && \
 # keep the pinned capture/transcode binaries and their store metadata intact.
 # Prune in the assembler, before the final-stage COPY, not in the published
 # image (a later rm would leave the bytes in an earlier layer).
+# The same RUN replaces the npm bundled inside the Node tarball with the
+# managed, sha-verified npm tree (its vendored undici/tar/brace-expansion/
+# ip-address lag the managed npm). The tree stays in place: pm's npm install
+# runs node's lib/node_modules/npm/bin/npm-cli.js to unpack the pinned npm,
+# and node's bin/npm|npx links point at it. Pruning changes tool bytes after
+# pm recorded their digests, so refresh them once pruning is done and assert
+# they match (a stale digest fails `hermes pm doctor` and rejects the baked
+# entry on an explicit install).
 RUN python3 -c 'from pm import installed_package; p = installed_package("ffmpeg").binary.with_name("ffplay"); p.unlink()' && \
+    python3 -c 'from pm import installed_package; from scripts.bundles.payload import graft_npm; graft_npm(installed_package("node").binary.resolve().parent.parent, installed_package("npm").binary.parent.parent)' && \
+    python3 -c 'from pathlib import Path; from scripts.bundles.payload import rehash_tools, verify_tools; root = Path("/opt/hermes"); rehash_tools(root); print("verified", verify_tools(root), "payload tools")' && \
+    npm --version && \
+    node "$(python3 -c 'from pm import installed_package; print(installed_package("node").binary.resolve().parent.parent / "lib/node_modules/npm/bin/npm-cli.js")')" --version && \
     mkdir -p /runtime-cut && \
     mv /opt/hermes/tools /opt/hermes/.venv /runtime-cut/
 
