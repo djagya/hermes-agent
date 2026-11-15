@@ -3126,6 +3126,11 @@ def _is_transient_network_run(job: dict, error: str, agent_declared: bool = Fals
         error, agent_declared=agent_declared)
 
 
+def _transient_mark_kwargs(job: dict) -> dict:
+    """``mark_job_run`` kwargs for a run composed as a network-class failure (consumes the flag)."""
+    return {"transient_network": True} if job.pop("_transient_network", False) else {}
+
+
 def _compose_run_delivery(
     job: dict, *, success: bool, error, final_response: str, output_file,
     agent_declared: bool = False,
@@ -3692,8 +3697,7 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if contained:
                     mark_kwargs["delivery_error"] = delivery_error
-                if job.pop("_transient_network", False):
-                    mark_kwargs["transient_network"] = True
+                mark_kwargs.update(_transient_mark_kwargs(job))
                 from cron.unreachable_retry import is_retry_run
                 if is_retry_run(job):
                     # A crashed ladder re-run: its occurrence already counted toward repeat.

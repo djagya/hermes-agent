@@ -60,4 +60,5 @@ def record_transient_network_incident(job: dict[str, Any], error: Optional[str],
         upsert_incident(job["id"], str(error or ""), job_name=job.get("name"),
                         failure_type=TRANSIENT_NETWORK_FAILURE_TYPE, output_file=output_file)
     except Exception as exc:
-        logger.debug("Incident store unavailable for job %s (transient network): %s", job.get("id"), exc)
+        logger.warning("Incident store unavailable for job %s (transient network): %s", job.get("id"), exc,
+                       exc_info=True)
