@@ -687,7 +687,13 @@ RUN mkdir -p /opt/data && chmod 0644 /opt/hermes/tools/facts.json && \
 # keep the pinned capture/transcode binaries and their store metadata intact.
 # Prune in the assembler, before the final-stage COPY, not in the published
 # image (a later rm would leave the bytes in an earlier layer).
+# The same RUN drops the npm bundled inside the Node tarball (its vendored
+# undici/tar/brace-expansion/ip-address lag the managed npm). Only pm's npm
+# install used it, to unpack the pinned npm; /usr/local/bin/npm and npx are
+# the managed npm, so the bundled tree and node's own bin/npm|npx links go.
 RUN python3 -c 'from pm import installed_package; p = installed_package("ffmpeg").binary.with_name("ffplay"); p.unlink()' && \
+    python3 -c 'import shutil; from pm import installed_package; node = installed_package("node").binary.resolve().parent; shutil.rmtree(node.parent / "lib/node_modules/npm"); [(node / name).unlink(missing_ok=True) for name in ("npm", "npx")]; assert not (node.parent / "lib/node_modules/npm").exists()' && \
+    npm --version && \
     mkdir -p /runtime-cut && \
     mv /opt/hermes/tools /opt/hermes/.venv /runtime-cut/
 
