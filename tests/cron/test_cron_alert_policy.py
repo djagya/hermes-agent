@@ -1,5 +1,5 @@
 """Per-job alert policy: alert on N failures in a row or once failing for M minutes, not on the
-first blip; keep the 6 h reminder; name the failing step; say when the job recovered.
+first blip; keep the 6 h reminder; name the failing step; no recovery ping.
 
 Field report (2026-10): read-only */10 refresh jobs pinged Telegram 12-14 times a day for single
 transient failures whose last good snapshot was kept anyway, so real outages drowned.
@@ -71,7 +71,7 @@ def store(monkeypatch, tmp_path, cron_owner):
         yield tmp_path
 
 
-def test_streak_threshold_alerts_once_reached_then_reports_recovery(store):
+def test_streak_threshold_alerts_once_reached_then_recovers_silently(store):
     deliveries = []
     cron_jobs.save_jobs([_job(alert_after_consecutive_failures=3)])
     for _ in range(2):
@@ -86,10 +86,9 @@ def test_streak_threshold_alerts_once_reached_then_reports_recovery(store):
     assert len(deliveries) == 1, "the 6 h reminder cooldown still applies"
 
     _tick("alert-policy-test", store, deliveries)
-    recovery, output = deliveries[-2:]
-    assert recovery[1] is True, "recovery goes to the failure lane"
-    assert "recovered after 4 failed runs" in recovery[0]
-    assert output == ("ok", False), "the run's own output is still delivered"
+    assert len(deliveries) == 2, "no recovery notice: only the run's own output follows"
+    assert deliveries[-1] == ("ok", False), "the run's own output is still delivered"
+    assert incidents.count_alerted_incidents("alert-policy-test") == 0, "the incident is still closed"
     stored = next(j for j in cron_jobs.load_jobs() if j["id"] == "alert-policy-test")
     assert stored["failure_streak"] == 0 and "failing_since" not in stored
 

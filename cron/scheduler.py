@@ -522,48 +522,6 @@ def _failure_alert_tail(job: dict, error: Optional[str], notice: str) -> str:
     return tail
 
 
-def _stash_recovery_notice(job: dict) -> None:
-    """On a green run after an alerted failure streak, stash a one-line recovery notice for the
-    failure lane (``job['_recovery_notice']``). Only for jobs with an alert policy, and only when a
-    failure ping actually went out; must run before the incidents are resolved."""
-    after, stale = _job_alert_policy(job)
-    streak = int(job.get("failure_streak") or 0)
-    if (after is None and stale is None) or streak <= 0:
-        return
-    try:
-        from cron.incidents import count_alerted_incidents
-
-        if not count_alerted_incidents(job["id"]):
-            return
-    except Exception as exc:
-        logger.debug("Incident store unavailable for job %s (no recovery notice): %s", job["id"], exc, exc_info=True)
-        return
-    minutes = _failing_minutes(job, streak + 1)
-    span = f", failed for {int(minutes)} min" if minutes else ""
-    job["_recovery_notice"] = (
-        f"✅ Cron '{job.get('name') or job['id']}' recovered after {streak} failed "
-        f"run{'s' if streak != 1 else ''}{span}.")
-
-
-def _deliver_recovery_notice(job: dict, fence: "_FireOwnership", *, adapters, loop) -> None:
-    """Send a stashed recovery notice through the failure lane. Best-effort: it never changes the
-    run's own outcome or delivery bookkeeping."""
-    notice = job.pop("_recovery_notice", None)
-    if not notice or fence.lost():
-        return
-    try:
-        with fence.side_effect_fence() as owns:
-            if not owns:
-                return
-            # dlz: CRON-1 — its own queue key; the execution id belongs to the run's result.
-            error = _deliver_result(job, notice, adapters=adapters, loop=loop, for_failure=True,
-                                    queue_key_suffix=":recovery")
-        if error:
-            logger.warning("Recovery notice for job %s not delivered: %s", job["id"], error)
-    except Exception as exc:
-        logger.warning("Recovery notice for job %s not delivered: %s", job["id"], exc, exc_info=True)
-
-
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the assembled prompt (incl. runtime-loaded skill content,
     unseen by create-time scanning) trips the injection scanner; run_job turns it into a clean
@@ -3163,7 +3121,9 @@ def _compose_run_delivery(
         deliver_content = blocked_config_notice(job.get("name") or job["id"], _pf_text)
     elif success:
         deliver_content = final_response
-        _stash_recovery_notice(job)
+        # No "recovered" ping: the incident ledger closes, the log keeps the streak (owner 2026-11-15).
+        if int(job.get("failure_streak") or 0) > 0:
+            logger.info("Job '%s': recovered after %s failed run(s)", job["id"], job.get("failure_streak"))
         _resolve_incidents_for_recovered_job(job)
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
@@ -3314,7 +3274,6 @@ def _save_compose_deliver(
     ) = _compose_run_delivery(
         job, success=d.success, error=d.error, final_response=final_response,
         output_file=output_file, agent_declared=d.agent_declared)
-    _deliver_recovery_notice(job, fence, adapters=adapters, loop=loop)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
     if d.should_deliver and not d.success and job.get("_model_unreachable"):

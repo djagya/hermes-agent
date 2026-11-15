@@ -1,10 +1,10 @@
-"""CRON-1: in a restart-safe worker the recovery notice and the run's own result are two queue
-rows. The notice used to take the execution id, and the result's INSERT OR IGNORE dropped it."""
+"""A restart-safe worker after an alerted failure streak sends the run's own result and no
+"recovered" notice (owner 2026-11-15; CRON-1 once had the notice share the result's execution id)."""
 from cron import executions, jobs, scheduler
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 
 
-def test_external_worker_delivers_recovery_notice_and_result(tmp_path, monkeypatch):
+def test_external_worker_delivers_the_result_without_a_recovery_notice(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     config = GatewayConfig()
     config.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True)
@@ -35,7 +35,7 @@ def test_external_worker_delivers_recovery_notice_and_result(tmp_path, monkeypat
     monkeypatch.setattr(delivery_queue, "enqueue_and_wait", drain_before_wait)
     scheduler.run_one_job(job)
     scheduler.drain_delivery_queue({}, None)
-    assert len(sent) == 2, sent
-    assert "recovered after 3 failed runs" in sent[0]
-    assert "the real output" in sent[1]
+    assert len(sent) == 1, sent
+    assert "the real output" in sent[0]
+    assert not any("recovered" in text for text in sent)
     assert executions.latest_execution(job["id"])["delivery_outcome"] == "delivered"
