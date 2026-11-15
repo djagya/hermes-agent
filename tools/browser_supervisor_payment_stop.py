@@ -13,10 +13,14 @@ origin, a label or a value) before they go into a result.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import time
+from collections.abc import Awaitable, Callable
 from itertools import islice
 from typing import Any
+
+from agent.vault_payment_policy import PaymentDestinationError
 
 _STAGES = frozenset({"before_write", "after_focus", "between_documents", "in_document", "after_approval"})
 # ``PaymentInspection.stale``: the check under way when a freshness pass refused (``_error``: it raised).
@@ -155,3 +159,29 @@ def _stopped(result: dict, inspection: Any, st: dict) -> dict | None:
         else:
             stage, reason = "in_document", "unknown"
     return stopped_record(stage, reason, exposure_rule(inspection), admission_rule(inspection))
+
+
+async def strict_then_shown(run: Callable[[str], Awaitable], budget: float | None, reserve: float) -> Any:
+    """r9 (Codex r8 P2): an unreviewed inspection's two passes under one deadline. ``run(admission)`` is one full
+    pass. The strict pass goes first; only its typed ``payment_fields_unsupported`` starts the shown-rule fallback, and
+    only when ``budget`` seconds (the caller's own wrapper, counted from now; None: unbounded) still leave more than
+    ``reserve`` (the bound the cleanup of a cancelled pass needs, as ``discard_payment``'s) after the strict pass. A
+    fallback that cannot start, or that outlasts what is left, ends in the strict pass's refusal, never in the
+    wrapper's bare timeout. Any other fallback outcome (a result, its own typed refusal) stands."""
+    until = None if budget is None else time.monotonic() + budget - reserve
+    try:
+        return await run("strict")
+    except PaymentDestinationError as exc:
+        if exc.error_type != "payment_fields_unsupported":
+            raise
+        refusal = exc
+    left = None if until is None else until - time.monotonic()
+    if left is not None and left <= 0:
+        raise refusal
+    try:
+        async with asyncio.timeout(left) as scope:
+            return await run("shown_fallback")
+    except TimeoutError:
+        if not scope.expired():
+            raise
+    raise refusal

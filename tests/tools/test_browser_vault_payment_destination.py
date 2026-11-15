@@ -883,6 +883,71 @@ def test_discovery_chooses_by_the_strict_rule_first_so_a_clipped_copy_stays_out(
     assert caught.value.error_type == "payment_fields_ambiguous"
 
 
+def test_a_frame_covered_after_scanning_is_refused_at_the_end_check_under_strict_admission():
+    """r9 (Codex r8 P3): the strict pass admits the form by the strict rule, then the page covers it before the owner
+    end check (only the shown rule still passes it). The end check judges by the rule that chose the frames, so the
+    covered form refuses ``payment_fields_ambiguous``; a pass that used the shown rule there would accept it."""
+    class Covered(_DiscoveryPage):
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if method == "Runtime.callFunctionOn" and params["functionDeclaration"] in (sp._OWNERS_EXPOSED,
+                                                                                        sp._OWNERS_SHOWN):
+                self.exposed.discard("kps")
+                self.shown.add("kps")
+            return await super()._cdp(method, params, session_id, timeout)
+
+    page = Covered(_PAGE, exposed={"kps", "ad"}, controls={"kps": _CARD_FORM})
+    with pytest.raises(PaymentDestinationError) as caught:
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, cart=(2266, "EUR")))
+    assert caught.value.error_type == "payment_fields_ambiguous"
+
+
+def _two_slow_passes(monkeypatch, strict_s, shown_s, calls):
+    """``_inspect_pass`` stubbed: the strict pass refuses ``payment_fields_unsupported`` after ``strict_s`` seconds, the
+    shown fallback returns ``"shown"`` after ``shown_s``."""
+    async def run(self, origin, bound, allowed, unreviewed, cart, prior, strict, admission):
+        calls.append(admission)
+        try:
+            await asyncio.sleep(strict_s if admission == "strict" else shown_s)
+        except asyncio.CancelledError:
+            calls.append("cancelled")
+            raise
+        if admission == "strict":
+            raise PaymentDestinationError("payment_fields_unsupported", sp.FIELDS_UNSUPPORTED, {})
+        return "shown"
+    monkeypatch.setattr(sp.PaymentSupervisionMixin, "_inspect_pass", run)
+
+
+def test_the_two_discovery_passes_share_one_deadline_and_end_in_the_typed_refusal(monkeypatch):
+    """r9 (Codex r8 P2): two 13 s passes in the 25 s wrapper used to end in a bare TimeoutError at 25 s. Scaled 1:25
+    here (wrapper 1.0 s, cleanup reserve 0.48 s, passes 0.52 s each): the fallback has nothing left to start with, or
+    runs out of what is left, and the strict pass's typed refusal comes back before the wrapper; a fast fallback
+    still succeeds."""
+    monkeypatch.setattr(sp, "_INSPECT_CLEANUP_RESERVE_S", 0.48)
+    page = _DiscoveryPage(_PAGE, exposed=(), controls={})
+    for strict_s, shown_s, outcome in ((0.52, 0.52, "typed"), (0.6, 0.01, "typed"), (0.1, 0.1, "shown")):
+        calls: list = []
+        _two_slow_passes(monkeypatch, strict_s, shown_s, calls)
+        start = time.monotonic()
+
+        async def go():
+            return await asyncio.wait_for(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0), 1.0)
+
+        if outcome == "shown":
+            assert asyncio.run(go()) == "shown" and calls == ["strict", "shown_fallback"]
+            continue
+        with pytest.raises(PaymentDestinationError) as caught:
+            asyncio.run(go())
+        assert caught.value.error_type == "payment_fields_unsupported" and time.monotonic() - start < 1.0
+        # 0.52 s strict leaves 0.0 after the reserve: the fallback never starts; 0.6 s: same.
+        assert calls == ["strict"], calls
+    # a fallback that starts but outlasts what is left is cancelled, and the strict refusal stands
+    calls = []
+    _two_slow_passes(monkeypatch, 0.1, 5.0, calls)
+    with pytest.raises(PaymentDestinationError) as caught:
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0))
+    assert caught.value.error_type == "payment_fields_unsupported" and calls == ["strict", "shown_fallback", "cancelled"]
+
+
 def test_a_new_frame_after_the_approval_is_judged_by_the_rule_that_chose_the_frames():
     """r8: a frame the strict pass would have skipped is no new frame for a strict-chosen fill; for a fill the shown
     rule chose, a newly shown frame on the approved origin withdraws the approval."""
