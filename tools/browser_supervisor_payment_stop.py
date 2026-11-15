@@ -21,7 +21,7 @@ from typing import Any
 _STAGES = frozenset({"before_write", "after_focus", "between_documents", "in_document", "after_approval"})
 # ``PaymentInspection.stale``: the check under way when a freshness pass refused (``_error``: it raised).
 _CHECKS = frozenset({"inactive", "tree", "frames", "frames_top", "frames_card", "frames_new", "document", "absence",
-                     "shown", "owner_hit", "expired", "cart", "policy", "scope_chain", "scope_unpinned", "scope_tree",
+                     "shown", "owner_hit", "owner_shown", "expired", "cart", "policy", "scope_chain", "scope_unpinned", "scope_tree",
                      "scope_frame", "scope_owner", "unknown"})
 _REASONS = _CHECKS | {c + "_error" for c in _CHECKS}
 # Exception classes a re-inspection poll may meet, by name; any other is ``other``.
@@ -29,7 +29,9 @@ _ERRORS = frozenset({"timeouterror", "cancellederror", "runtimeerror", "connecti
                      "connectionclosederror", "oserror", "keyerror", "typeerror", "valueerror", "attributeerror",
                      "indexerror", "other"})
 
-STOPPED_SCHEMA = {"stage": _STAGES, "reason": _REASONS}
+# dlz (11-15, D-0094 "b"): the visibility rule an unreviewed fill's frames were judged by (reviewed fills: no key).
+_EXPOSURES = frozenset({"shown", "strict"})
+STOPPED_SCHEMA = {"stage": _STAGES, "reason": _REASONS, "exposure": _EXPOSURES}
 
 
 @functools.cache
@@ -97,10 +99,26 @@ def clean_window(value: Any) -> dict | None:
     return _clean(value, window_schema())
 
 
-def stopped_record(stage: str, stale: Any) -> dict:
-    """``{stage, reason}`` with both from the fixed vocabulary (``unknown`` for anything else)."""
+def strict_exposure(i: Any) -> bool:
+    """dlz (11-15, D-0094 "b"): whether a fill's frames are judged with the strict exposure rule: an unreviewed fill with
+    vault.payment_consent_strict_exposure on at its discovery. A reviewed fill never is (its rules are unchanged)."""
+    return bool(getattr(i, "unreviewed_origins", ())) and getattr(i, "strict_exposure", False) is True
+
+
+def exposure_rule(i: Any) -> str:
+    """The visibility rule an unreviewed fill ran under, for its stop record: ``strict`` or ``shown``; "" for a reviewed
+    fill (or anything that is not an inspection)."""
+    if not getattr(i, "unreviewed_origins", ()):
+        return ""
+    return "strict" if strict_exposure(i) else "shown"
+
+
+def stopped_record(stage: str, stale: Any, exposure: str = "") -> dict:
+    """``{stage, reason}`` with both from the fixed vocabulary (``unknown`` for anything else), and ``exposure``
+    (``shown`` / ``strict``) when the fill was an unreviewed one."""
     reason = stale if type(stale) is str and stale in _REASONS else "unknown"
-    return {"stage": stage if stage in _STAGES else "in_document", "reason": reason}
+    return {"stage": stage if stage in _STAGES else "in_document", "reason": reason,
+            **({"exposure": exposure} if exposure in _EXPOSURES else {})}
 
 
 def _stopped(result: dict, inspection: Any, st: dict) -> dict | None:
@@ -119,4 +137,4 @@ def _stopped(result: dict, inspection: Any, st: dict) -> dict | None:
             stage, reason = "after_focus", reason[6:]
         else:
             stage, reason = "in_document", "unknown"
-    return stopped_record(stage, reason)
+    return stopped_record(stage, reason, exposure_rule(inspection))

@@ -440,8 +440,8 @@ class _Fresh(sp.PaymentSupervisionMixin):
     async def _payment_tree(self, sid, child_sessions=None):
         return self.current
 
-    async def _chain_exposed(self, fid, by_id, child_sessions, page_sid, cache):
-        return fid in self.exposed
+    async def _chain_judged(self, fid, by_id, child_sessions, page_sid, cache, rule):
+        return fid in self.exposed  # either visibility rule (11-15): the topology binding is what is tested here
 
     async def _cdp(self, method, params=None, session_id=None, timeout=None):
         fn = (params or {}).get("functionDeclaration", "")
@@ -516,8 +516,10 @@ def flow(monkeypatch):
                          "guard": (True, ""), "inspection": _kps_inspection(), "reviewed": None}
 
     class Supervisor:
-        def inspect_payment(self, merchant, *, bound_origins=(), frame_origins=(), unreviewed=False, cart=None):
+        def inspect_payment(self, merchant, *, bound_origins=(), frame_origins=(), unreviewed=False, cart=None,
+                            **extra):
             events.append(("inspect", "discovery" if unreviewed else "reviewed", cart))
+            state.setdefault("extra", []).append(extra)
             if not unreviewed:
                 if state["reviewed"] is not None:
                     raise state["reviewed"]
@@ -656,9 +658,18 @@ def test_the_owner_card_names_the_unreviewed_destination_and_the_fill_runs_stric
     assert order == ["inspect", "inspect", "consent", "current", "cart_current", "mark", "claim", "resolve",
                      "commit"]
     commit = next(e for e in events if isinstance(e, tuple) and e[0] == "commit")
-    assert commit[1] is True  # strict: per-setter hit tests, guard without the rollout exception
+    assert commit[1] is True  # strict in the card's own document, guard without the rollout exception
+    assert run.state["extra"] == [{}, {}]  # 11-15: the discovery call of before, its frames judged as reviewed ones
     # captured at inspection, after accept, in context, after the page checks, at the commit fence
     assert events.count("policy") == 5
+
+
+def test_the_strict_exposure_switch_reaches_the_discovery_inspection_only(flow, monkeypatch):
+    """vault.payment_consent_strict_exposure (11-15, D-0094 "b"): the discovery pass is asked for the strict rule."""
+    run, _events = flow
+    monkeypatch.setattr(bvp, "payment_consent_strict_exposure_enabled", lambda: True)
+    assert run(cart=CART, approve_origins=[KPS])["success"] is True
+    assert run.state["extra"] == [{}, {"strict_exposure": True}]
 
 
 def test_amount_not_found_still_prompts_with_the_warning(flow):

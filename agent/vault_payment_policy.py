@@ -155,7 +155,8 @@ class PaymentDestinationError(PaymentPolicyError):
 # dlz (design v2 B6): the switch for owner-approved fills on unreviewed hosted payment forms, and the config keys
 # whose values form its policy generation (a change to either withdraws a fill waiting on its approval).
 DESTINATION_CONSENT_KEY = "payment_destination_consent"
-_POLICY_KEYS = (DESTINATION_CONSENT_KEY, "payment_providers")
+STRICT_EXPOSURE_KEY = "payment_consent_strict_exposure"
+_POLICY_KEYS = (DESTINATION_CONSENT_KEY, "payment_providers", STRICT_EXPOSURE_KEY)
 DESTINATION_OFF_HINT = ("card fields may be on an unreviewed hosted payment form; owner-approved destinations are "
                         "off (vault.payment_destination_consent)")
 
@@ -198,6 +199,23 @@ def payment_repin_enabled() -> bool:
         config = load_config()
         return not isinstance(config, FailedConfigRead) and cfg_get(config, "vault", "payment_repin", default=None) is True
     except Exception:  # health: allow BLE001 -- unreadable config means the feature is off
+        return False
+
+
+def payment_consent_strict_exposure_enabled() -> bool:
+    """dlz (11-15, D-0094 "b"): ``vault.payment_consent_strict_exposure`` (not in the defaults, so off; a literal ``True``
+    only). Off: the frames of an owner-approved (unreviewed) destination are judged for visibility as a reviewed
+    provider's are (connected, laid out, larger than 2x2 px, not hidden, not transparent: ``_OWNER_VISIBLE``). On: the
+    strict exposure rule of before 11-15 (clip and overflow geometry, the occlusion test at the centre and the
+    per-setter hit test from the parents). Config that cannot be read now counts as off, as for every vault.payment_*
+    switch; it is also part of the destination policy generation, so flipping it withdraws a fill still in flight."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        from hermes_cli.config_read_errors import FailedConfigRead
+        config = load_config()
+        return (not isinstance(config, FailedConfigRead)
+                and cfg_get(config, "vault", STRICT_EXPOSURE_KEY, default=None) is True)
+    except Exception:  # health: allow BLE001 -- unreadable config means the default rule
         return False
 
 

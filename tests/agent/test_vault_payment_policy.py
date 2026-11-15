@@ -165,3 +165,31 @@ def test_fill_auto_is_off_for_anything_present_that_is_not_clearly_on(config, ex
 
     monkeypatch.setattr("hermes_cli.config.load_config", load)
     assert payment_fill_auto_enabled() is expected
+
+
+@pytest.mark.parametrize("config, expected", [
+    ({}, False), ({"vault": {}}, False),                                # absent: the default (reviewed) rule
+    ({"vault": {"payment_consent_strict_exposure": True}}, True),
+    ({"vault": {"payment_consent_strict_exposure": "true"}}, False),    # a literal true only, as payment_repin
+    ({"vault": {"payment_consent_strict_exposure": 1}}, False),
+    (None, False),                                                       # config that cannot be read
+])
+def test_strict_exposure_is_on_for_a_literal_true_only_and_flipping_it_changes_the_policy(config, expected, monkeypatch):
+    """dlz (11-15, D-0094 "b"): and it is part of the destination policy generation, so flipping it withdraws a fill
+    that is waiting on its approval or in progress."""
+    from agent.vault_payment_policy import destination_policy, payment_consent_strict_exposure_enabled
+
+    def load():
+        if config is None:
+            raise OSError("config.yaml unreadable")
+        return config
+
+    monkeypatch.setattr("hermes_cli.config.load_config", load)
+    assert payment_consent_strict_exposure_enabled() is expected
+    if config is not None:
+        on = {"vault": {"payment_destination_consent": True, "payment_consent_strict_exposure": True}}
+        off = {"vault": {"payment_destination_consent": True}}
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: on)
+        strict = destination_policy()
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: off)
+        assert destination_policy()[0] is strict[0] is True and destination_policy()[1] != strict[1]

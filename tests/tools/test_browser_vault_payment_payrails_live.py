@@ -109,7 +109,9 @@ post('READY', {});
 # when the card method is chosen. `remount(late)` is the SDK's unmount + mount (a new element, a new frame);
 # `moved()` moves the mounted frame's element in the DOM (its document loads again, and the SDK, which heard its one
 # READY already, never answers the new one: the frame reports an empty form and collapses); `own()` replaces the hosted
-# form by card inputs of the merchant page itself; `retotal()` changes the total the page shows.
+# form by card inputs of the merchant page itself; `retotal()` changes the total the page shows. `stickyBar()` (11-15)
+# adds a fixed bottom bar and, at the first focus in the card frame, the scroll a focus makes to a field below the
+# fold: the frame's bottom edge onto the viewport's, under the bar; `covered()`: the bar is at the frame's centre.
 _MERCHANT = """<meta charset="utf-8"><style>body{margin:0;font-family:sans-serif}
 .hdr{position:sticky;top:0;height:64px;background:#fff;border-bottom:1px solid #ccc;z-index:10}
 .sec{padding:24px;max-width:720px;margin:0 auto}</style>
@@ -155,6 +157,12 @@ window.moved = () => { document.getElementById('other').appendChild(current.el);
 window.own = () => { current.off(); current.el.remove();
   document.getElementById('mount').innerHTML = '<input id="n" autocomplete="cc-number"><input id="e" autocomplete="cc-exp">' +
     '<input id="c" autocomplete="cc-csc"><input id="h" autocomplete="cc-name">'; };
+window.stickyBar = () => { const bar = document.createElement('div'); bar.id = 'bar';
+  bar.style.cssText = 'position:fixed;left:0;right:0;bottom:0;height:90px;background:#fff;border-top:1px solid #ccc;z-index:20';
+  bar.textContent = 'Weiter'; document.body.appendChild(bar);
+  window.onFocusOnce = () => { const r = current.f.getBoundingClientRect(); scrollBy(0, r.bottom - innerHeight); }; };
+window.covered = () => { const r = current.f.getBoundingClientRect();
+  return document.elementFromPoint((r.left + r.right) / 2, (r.top + r.bottom) / 2) !== current.f; };
 window.retotal = () => { document.getElementById('total').textContent = 'Gesamtbetrag 59,47 €'; };
 </script>"""
 
@@ -289,7 +297,7 @@ def test_a_payrails_form_that_does_not_come_back_stops_with_its_stage_and_window
     again = out["fill_reinspect"]
     assert out["error_type"] == "payment_page_changed" and not out.get("filled_fields"), out
     assert (again["count"], again["refused"], again["seen"]) == (0, "incomplete", {"unreviewed_frames_inspected": 1}), again
-    assert again["stopped"] == {"stage": "before_write", "reason": "frames_card"}, again
+    assert again["stopped"] == {"stage": "before_write", "reason": "frames_card", "exposure": "shown"}, again
     window = again["window"]
     assert window["codes"] == {"incomplete": window["polls"]} and window["polls"] >= 2 and window["ms"] >= 2500, window
     assert set(again) == {"count", "repairs", "refused", "seen", "stopped", "window"}, out
@@ -333,3 +341,47 @@ def test_a_first_inspection_of_a_collapsed_payrails_frame_refuses_as_before(paym
     print("RECEIPT payrails-real first-refusal", json.dumps(out, sort_keys=True))
     assert out["error_type"] == "payment_fields_unsupported" and out["unreviewed_frames_inspected"] == 1, out
     assert "fill_reinspect" not in out and "inspection" not in out, out
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_a_sticky_bottom_bar_over_the_card_frame_after_the_focus_scroll(payment_browser, tmp_path, monkeypatch, caplog,
+                                                                       strict):
+    """dlz (11-15, D-0094 "b"), the leading guess for the stops of 11-14: the first focus scrolls the card frame under
+    the merchant's sticky bottom bar. The tap-approved frame is judged as a reviewed provider's is (shown: laid out,
+    visible, not transparent), so the fill writes each field once. With vault.payment_consent_strict_exposure the
+    strict rule calls it covered: the stop of 11-14 (payment_page_changed, nothing written, the re-inspection sees only
+    the observer frame), now with ``exposure: strict`` in its record."""
+    from tools.browser_supervisor import _schedule
+
+    sup, origins, card = _setup(payment_browser, tmp_path, monkeypatch, wait=3.0)
+    monkeypatch.setattr("tools.browser_vault_payment.payment_consent_strict_exposure_enabled", lambda: strict)
+    _choose_card(sup, True)
+    sup.evaluate_runtime("window.stickyBar()")
+    # Headless Chrome fires no focus events in an unfocused page; a real foreground tab does (the FOCUS the SDK hears).
+    _schedule(sup._cdp("Page.bringToFront", {}, session_id=sup._page_session_id), sup._loop, timeout=10)
+    _schedule(sup._cdp("Emulation.setFocusEmulationEnabled", {"enabled": True}, session_id=sup._page_session_id),
+              sup._loop, timeout=10)
+    wait_until(lambda: sup.evaluate_runtime("current.f.getBoundingClientRect().height")["result"] > 60,
+               what="the card frame took its size")
+    assert sup.evaluate_runtime("window.covered()")["result"] is False  # in view and clear when the fill starts
+    first = _fa_fill(sup, origins, card, caplog)
+    assert first["error_type"] == "payment_destination_approval_required", first
+    out = _fa_fill(sup, origins, card, caplog, cart=_CART, approve_origins=[origins["psp"]])
+    print("RECEIPT payrails-real sticky-bar", "strict" if strict else "shown",
+          json.dumps({k: out.get(k) for k in _RECEIPT}, sort_keys=True))
+    assert sup.evaluate_runtime("window.covered()")["result"] is True  # the focus scroll put the bar over it
+    assert sup.evaluate_runtime("window.card.focus")["result"] >= 1
+    states, writes = _frame_values(sup)
+    if not strict:
+        assert out["success"] and out["filled_fields"] == 3 and "fill_reinspect" not in out, out
+        assert states == {"CARDHOLDER_NAME": "empty", "CARD_NUMBER": "held", "EXPIRATION_DATE": "held",
+                          "CVV": "held"}, states
+        assert writes == {"CARDHOLDER_NAME": 0, "CARD_NUMBER": 1, "EXPIRATION_DATE": 1, "CVV": 1}, writes
+        return
+    again = out["fill_reinspect"]
+    assert out["error_type"] == "payment_page_changed" and not out.get("filled_fields"), out
+    assert (again["count"], again["refused"], again["seen"]) == (0, "incomplete", {"unreviewed_frames_inspected": 1}), again
+    assert again["stopped"] == {"stage": "after_focus", "reason": "shown", "exposure": "strict"}, again
+    assert set(states.values()) == {"empty"} and not any(writes.values()), (states, writes)
+    window = again["window"]
+    assert window["codes"] == {"incomplete": window["polls"]} and window["polls"] >= 2, window

@@ -17,12 +17,13 @@ from agent.vault_payment_policy import (
     PaymentPolicyError,
     destination_policy,
     effective_frame_origins,
+    payment_consent_strict_exposure_enabled,
     payment_fill_auto_enabled,
     payment_repin_enabled,
 )
 from agent.vault_store import PAYMENT_FIELDS, revision_binding
 from tools.browser_supervisor_payment import _COVERAGE_REFUSALS, OPTIONAL_CARD_TOKENS
-from tools.browser_supervisor_payment_stop import clean_window, stopped_record
+from tools.browser_supervisor_payment_stop import clean_window, exposure_rule, stopped_record
 
 logger = logging.getLogger(__name__)
 
@@ -571,8 +572,11 @@ def _discover(supervisor, vault, reviewed: PaymentPolicyError, merchant_origin: 
         return {"success": False, "error_type": "payment_destination_requires_managed_browser",
                 "error": _REQUIRES_MANAGED}
     try:
+        # dlz (11-15, D-0094 "b"): the approved destination's frames are judged as reviewed providers' are, unless
+        # vault.payment_consent_strict_exposure restores the strict exposure rule (the call is then today's plus it).
+        strict = {"strict_exposure": True} if payment_consent_strict_exposure_enabled() else {}
         inspected = supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
-                                               unreviewed=True, **witness)
+                                               unreviewed=True, **witness, **strict)
     except PaymentDestinationError as found:
         coverage = getattr(reviewed, "coverage", "")
         if found.error_type == "payment_fields_unsupported" and coverage:
@@ -709,7 +713,7 @@ def _reinspect_stop(code: str, inspected=None, locked: bool = False) -> dict:
     approval = getattr(inspected, "approval", None) or {}
     seen, window = approval.get("seen"), clean_window(approval.get("window"))
     # dlz (11-14): where it stopped and how the re-inspection window was spent (both from what the fill path holds).
-    stopped = stopped_record("after_approval", getattr(inspected, "stale", ""))
+    stopped = stopped_record("after_approval", getattr(inspected, "stale", ""), exposure_rule(inspected))
     logger.warning("card fill stopped before any write: the checkout changed after it was inspected; "
                    "re-inspection refused (%s); it saw %s", _code(code), _seen_text(seen))
     cart = code == "cart_changed"
