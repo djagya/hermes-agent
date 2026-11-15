@@ -946,6 +946,14 @@ def test_the_two_discovery_passes_share_one_deadline_and_end_in_the_typed_refusa
     with pytest.raises(PaymentDestinationError) as caught:
         asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0))
     assert caught.value.error_type == "payment_fields_unsupported" and calls == ["strict", "shown_fallback", "cancelled"]
+    # a timeout of the fallback's own (a CDP call) is not the budget running out: it propagates
+    async def own_timeout(self, origin, bound, allowed, unreviewed, cart, prior, strict, admission):
+        if admission == "strict":
+            raise PaymentDestinationError("payment_fields_unsupported", sp.FIELDS_UNSUPPORTED, {})
+        raise TimeoutError("cdp")
+    monkeypatch.setattr(sp.PaymentSupervisionMixin, "_inspect_pass", own_timeout)
+    with pytest.raises(TimeoutError, match="cdp"):
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0))
 
 
 def test_a_new_frame_after_the_approval_is_judged_by_the_rule_that_chose_the_frames():
