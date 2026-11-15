@@ -158,6 +158,38 @@ def test_a_card_frame_moved_to_another_origin_after_the_approval_writes_nothing(
     assert out == {"success": False, "error_type": "payment_page_changed"} and page.writes == [], out
 
 
+class _Probed(_Checkout):
+    """``_Checkout`` with one page-side function answered by hand: ``fn`` -> ``answer(call params)``."""
+
+    def __init__(self, *args, fn, answer, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fn, self.answer = fn, answer
+
+    async def _cdp(self, method, params=None, session_id=None, timeout=None):
+        if method == "Runtime.callFunctionOn" and (params or {}).get("functionDeclaration") == self.fn:
+            return _v(self.answer(params))
+        return await super()._cdp(method, params, session_id, timeout)
+
+
+def test_a_card_field_covered_at_its_centre_stops_a_strict_fill_but_not_the_default_one():
+    """r11 (Opus final review): the frame's centre is clear (shown and exposed), but a merchant bar lies over the focused
+    field's own centre. The per-setter check's hit test (``_OWNER_HIT``) refuses it under the strict switch, before any
+    write; the default rule maps the point without a hit test (``_OWNER_AT``) and fills."""
+    def covered(params):
+        return None
+
+    page = _Probed({"observer": "hidden", "card": "ok"}, fn=sp._OWNER_HIT, answer=covered)
+    i = _inspect(page, strict=True)
+    out = _fill(page, i)
+    assert out == {"success": False, "error_type": "payment_page_changed", "filled_fields": 0,
+                   "partially_filled": False}, out
+    assert page.writes == [] and i.stale == "focus_owner_hit"
+    page = _Probed({"observer": "hidden", "card": "ok"}, fn=sp._OWNER_HIT, answer=covered)
+    out = _fill(page, _inspect(page, strict=False))
+    assert out == {"success": True, "filled_fields": len(_KPS_SET), "retention_verified": True}, out
+    assert page.writes == list(_KPS_SET)
+
+
 @pytest.mark.parametrize("on_focus", [None, "covered"])
 def test_a_visible_form_beside_a_clipped_same_origin_copy_fills_the_visible_one(on_focus):
     """r8 (Opus P2-1, the KPS shape): a copy of the approved form on the same origin that the user cannot see (a

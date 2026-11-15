@@ -24,6 +24,7 @@ from tools import browser_supervisor_payment as sp
 from tools import browser_use_cli
 from tools import browser_vault_payment as bvp
 from tools.browser_supervisor_payment import PaymentDocument, PaymentInspection
+from tools.browser_supervisor_payment_stop import strict_then_shown
 
 MERCHANT = "https://shop.example"
 KPS = "https://kps.example"  # synthetic unreviewed hosted form (secure.kps-payment.de shape)
@@ -918,34 +919,37 @@ def _two_slow_passes(monkeypatch, strict_s, shown_s, calls):
 
 
 def test_the_two_discovery_passes_share_one_deadline_and_end_in_the_typed_refusal(monkeypatch):
-    """r9 (Codex r8 P2): two 13 s passes in the 25 s wrapper used to end in a bare TimeoutError at 25 s. Scaled 1:25
-    here (wrapper 1.0 s, cleanup reserve 0.48 s, passes 0.52 s each): the fallback has nothing left to start with, or
-    runs out of what is left, and the strict pass's typed refusal comes back before the wrapper; a fast fallback
+    """r9 (Codex r8 P2): two 13 s passes in the 25 s wrapper used to end in a bare TimeoutError at 25 s. Scaled 1:8.3
+    here (wrapper 3.0 s, cleanup reserve 1.0 s, so the fallback may start until 2.0 s; windows and margins >= 0.5 s,
+    tests/AGENTS.md): a strict pass that ends after that leaves the fallback nothing to start with, one that outlasts
+    what is left is cancelled, and the strict pass's typed refusal comes back before the wrapper; a fast fallback
     still succeeds."""
-    monkeypatch.setattr(sp, "_INSPECT_CLEANUP_RESERVE_S", 0.48)
+    monkeypatch.setattr(sp, "_INSPECT_CLEANUP_RESERVE_S", 1.0)
     page = _DiscoveryPage(_PAGE, exposed=(), controls={})
-    for strict_s, shown_s, outcome in ((0.52, 0.52, "typed"), (0.6, 0.01, "typed"), (0.1, 0.1, "shown")):
+    for strict_s, shown_s, outcome in ((2.5, 2.5, "typed"), (2.5, 0.01, "typed"), (0.5, 0.5, "shown")):
         calls: list = []
         _two_slow_passes(monkeypatch, strict_s, shown_s, calls)
         start = time.monotonic()
 
         async def go():
-            return await asyncio.wait_for(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0), 1.0)
+            return await asyncio.wait_for(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=3.0), 3.0)
 
         if outcome == "shown":
             assert asyncio.run(go()) == "shown" and calls == ["strict", "shown_fallback"]
             continue
         with pytest.raises(PaymentDestinationError) as caught:
             asyncio.run(go())
-        assert caught.value.error_type == "payment_fields_unsupported" and time.monotonic() - start < 1.0
-        # 0.52 s strict leaves 0.0 after the reserve: the fallback never starts; 0.6 s: same.
+        assert caught.value.error_type == "payment_fields_unsupported" and time.monotonic() - start < 3.0
+        # a strict pass that ends 0.5 s past the 2.0 s mark leaves the fallback no time: it never starts, however fast.
         assert calls == ["strict"], calls
     # a fallback that starts but outlasts what is left is cancelled, and the strict refusal stands
     calls = []
-    _two_slow_passes(monkeypatch, 0.1, 5.0, calls)
+    _two_slow_passes(monkeypatch, 0.5, 8.0, calls)
+    start = time.monotonic()
     with pytest.raises(PaymentDestinationError) as caught:
-        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0))
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=3.0))
     assert caught.value.error_type == "payment_fields_unsupported" and calls == ["strict", "shown_fallback", "cancelled"]
+    assert time.monotonic() - start < 3.0
     # a timeout of the fallback's own (a CDP call) is not the budget running out: it propagates
     async def own_timeout(self, origin, bound, allowed, unreviewed, cart, prior, strict, admission, end=None):
         if admission == "strict":
@@ -953,7 +957,23 @@ def test_the_two_discovery_passes_share_one_deadline_and_end_in_the_typed_refusa
         raise TimeoutError("cdp")
     monkeypatch.setattr(sp.PaymentSupervisionMixin, "_inspect_pass", own_timeout)
     with pytest.raises(TimeoutError, match="cdp"):
-        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0))
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=3.0))
+
+
+@pytest.mark.parametrize("code", ["payment_page_unverifiable", "payment_fields_ambiguous"])
+def test_only_unsupported_fields_start_the_shown_fallback(code):
+    """r11 (Opus final review): the strict pass's refusal other than ``payment_fields_unsupported`` is final: a page that
+    cannot be verified or whose fields are ambiguous is not retried under the weaker shown rule. The refusal comes back
+    unchanged after exactly one pass."""
+    calls: list = []
+
+    async def run(admission):
+        calls.append(admission)
+        raise PaymentDestinationError(code, "x", {"n": 1})
+
+    with pytest.raises(PaymentDestinationError) as caught:
+        asyncio.run(strict_then_shown(run, 25, 12))
+    assert caught.value.error_type == code and caught.value.detail == {"n": 1} and calls == ["strict"], calls
 
 
 class _StalledFallback(_DiscoveryPage):
