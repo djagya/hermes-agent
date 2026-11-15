@@ -34,9 +34,10 @@ def _v(value):
 
 class _Checkout(_DiscoveryPage):
     """A tap-approved card frame behind a sticky bar. ``owners``: per frame "ok", "covered" (laid out and visible, but
-    a merchant element lies over its centre: only the strict rule's hit tests see that) or "hidden" (zero-size,
-    display:none, visibility:hidden or opacity:0: each is a case of the Node table below). ``on_focus``: the owner
-    state the card frame takes at the first focus (the focus scroll). The closure pauses after each focus (paced)."""
+    a merchant element lies over its centre, or r8 an ancestor clips it away, as a collapsed accordion does: only the
+    strict rule sees that) or "hidden" (zero-size, display:none, visibility:hidden or opacity:0: each is a case of the
+    Node table below). ``on_focus``: the owner state the card frame takes at the first focus (the focus scroll). The
+    closure pauses after each focus (paced)."""
 
     def __init__(self, owners, on_focus=None, frames=_FRAMES, controls=None):
         super().__init__(frames, exposed=(), controls=controls or {"card": _CARD_FORM})
@@ -98,12 +99,14 @@ def _no_settle(monkeypatch):
 
 @pytest.mark.parametrize("on_focus", [None, "covered"])
 def test_a_covered_card_frame_fills_under_the_default_rule(on_focus):
-    """Covered from the start (discovery) or from the first focus on (the freshness and per-setter checks): the
-    approved frame is still the one the user sees, so every field is written. The observer frame stays out."""
+    """Covered from the start (discovery: the strict pass finds no card form, the shown rule then chooses) or from the
+    first focus on (the freshness and per-setter checks): the approved frame is still the one the user sees, so every
+    field is written. The observer frame stays out."""
     page = _Checkout({"observer": "hidden", "card": "ok" if on_focus else "covered"}, on_focus=on_focus)
     i = _inspect(page, strict=False)
     assert [d.frame_id for d in i.documents] == ["card"] and i.unreviewed_origins == (KPS,)
     assert stop.exposure_rule(i) == "shown"
+    assert stop.admission_rule(i) == ("strict" if on_focus else "shown_fallback")
     out = _fill(page, i)
     assert out == {"success": True, "filled_fields": len(_KPS_SET), "retention_verified": True}, out
     assert page.writes == list(_KPS_SET)
@@ -125,7 +128,8 @@ def test_with_the_strict_switch_a_covered_card_frame_is_refused_as_before():
     assert out == {"success": False, "error_type": "payment_page_changed", "filled_fields": 0,
                    "partially_filled": False}, out
     assert page.writes == [] and i.stale == "focus_shown"
-    assert stop._stopped(out, i, {}) == {"stage": "after_focus", "reason": "shown", "exposure": "strict"}
+    assert stop._stopped(out, i, {}) == {"stage": "after_focus", "reason": "shown", "exposure": "strict",
+                                         "admission": "strict"}
 
 
 @pytest.mark.parametrize("at_focus", [False, True])
@@ -141,7 +145,8 @@ def test_a_hidden_card_frame_is_still_refused_under_the_default_rule(at_focus):
     i = _inspect(page, strict=False)
     out = _fill(page, i)
     assert out["error_type"] == "payment_page_changed" and out["filled_fields"] == 0 and page.writes == [], out
-    assert stop._stopped(out, i, {}) == {"stage": "after_focus", "reason": "shown", "exposure": "shown"}
+    assert stop._stopped(out, i, {}) == {"stage": "after_focus", "reason": "shown", "exposure": "shown",
+                                         "admission": "strict"}
 
 
 def test_a_card_frame_moved_to_another_origin_after_the_approval_writes_nothing():
@@ -153,24 +158,59 @@ def test_a_card_frame_moved_to_another_origin_after_the_approval_writes_nothing(
     assert out == {"success": False, "error_type": "payment_page_changed"} and page.writes == [], out
 
 
-def test_a_second_unreviewed_origin_is_refused_even_when_covered():
-    """One unreviewed origin per fill: a card form on a second one is ambiguous. Under the default rule a covered copy
-    counts as shown (the strict rule skipped it), so it refuses rather than picking one."""
+@pytest.mark.parametrize("on_focus", [None, "covered"])
+def test_a_visible_form_beside_a_clipped_same_origin_copy_fills_the_visible_one(on_focus):
+    """r8 (Opus P2-1, the KPS shape): a copy of the approved form on the same origin that the user cannot see (a
+    collapsed accordion keeps its iframe laid out at 300x150; or under an overlay) passes the shown rule but not the
+    strict one. The strict pass finds the visible form, so the copy is no candidate (not ambiguous) and is never a new
+    frame later, also when the focus scroll covers the approved frame."""
+    frames = _FRAMES + (("copy", "L3", _KPS_URL + "?copy", KPS, "top"),)
+    page = _Checkout({"observer": "hidden", "copy": "covered"}, on_focus=on_focus, frames=frames,
+                     controls={"card": _CARD_FORM, "copy": _CARD_FORM})
+    i = _inspect(page, strict=False)
+    assert [d.frame_id for d in i.documents] == ["card"] and stop.admission_rule(i) == "strict"
+    out = _fill(page, i)
+    assert out == {"success": True, "filled_fields": len(_KPS_SET), "retention_verified": True}, out
+    assert page.writes == list(_KPS_SET)
+
+
+def test_a_covered_form_beside_a_clipped_copy_is_ambiguous():
+    """r8: when the strict pass finds no form, the shown rule sees the covered form and the clipped copy: two candidates,
+    so the fill refuses rather than picking one."""
+    frames = _FRAMES + (("copy", "L3", _KPS_URL + "?copy", KPS, "top"),)
+    page = _Checkout({"observer": "hidden", "card": "covered", "copy": "covered"}, frames=frames,
+                     controls={"card": _CARD_FORM, "copy": _CARD_FORM})
+    with pytest.raises(PaymentDestinationError) as caught:
+        _inspect(page, strict=False)
+    assert caught.value.error_type == "payment_fields_ambiguous"
+
+
+def test_a_second_unreviewed_origin_is_refused_unless_the_strict_pass_skips_it():
+    """One unreviewed origin per fill: a shown card form on a second one is ambiguous, under either rule. A covered one
+    the strict pass skips (r8, as before 11-15), unless the approved form is covered too and the shown rule chooses."""
     frames = _FRAMES + (("decoy", "L4", OTHER + "/customer/wallet/pc/WalletInput.jsp", OTHER, "top"),)
     controls = {"card": _CARD_FORM, "decoy": _CARD_FORM}
-    for decoy, strict in (("ok", False), ("covered", False), ("ok", True)):
+    for owners, strict in (({"decoy": "ok"}, False), ({"decoy": "ok"}, True),
+                           ({"decoy": "covered", "card": "covered"}, False)):
         with pytest.raises(PaymentDestinationError) as caught:
-            _inspect(_Checkout({"observer": "hidden", "decoy": decoy}, frames=frames, controls=controls), strict)
-        assert caught.value.error_type == "payment_fields_ambiguous", (decoy, strict)
-    page = _Checkout({"observer": "hidden", "decoy": "covered"}, frames=frames, controls=controls)
-    assert [d.origin for d in _inspect(page, strict=True).documents] == [KPS]  # strict: the covered copy is skipped
+            _inspect(_Checkout({"observer": "hidden", **owners}, frames=frames, controls=controls), strict)
+        assert caught.value.error_type == "payment_fields_ambiguous", (owners, strict)
+    for strict in (False, True):
+        page = _Checkout({"observer": "hidden", "decoy": "covered"}, frames=frames, controls=controls)
+        assert [d.origin for d in _inspect(page, strict=strict).documents] == [KPS]
 
 
-def test_a_re_inspection_keeps_the_rule_of_its_approval():
-    page = _Checkout({"observer": "hidden", "card": "covered"})
+def test_a_re_inspection_chooses_its_frames_strict_first_and_keeps_the_switch():
+    """r8: a re-inspection chooses its frames as the discovery did (strict first, the shown rule only when that finds
+    no form), so an approved frame covered by now is read again; vault.payment_consent_strict_exposure stays as the
+    approval had it."""
+    page = _Checkout({"observer": "hidden", "card": "ok"})
     prior = _inspect(page, strict=False)
+    assert prior.admission == "strict"
+    page.owners["card"] = "covered"
     again = asyncio.run(page._inspect_payment("", (), (STRIPE,), True, (2266, "EUR"), prior=prior))
     assert again.strict_exposure is False and [d.frame_id for d in again.documents] == ["card"]
+    assert again.admission == "shown_fallback"
     prior.strict_exposure = True
     with pytest.raises(PaymentDestinationError):
         asyncio.run(page._inspect_payment("", (), (STRIPE,), True, (2266, "EUR"), prior=prior))

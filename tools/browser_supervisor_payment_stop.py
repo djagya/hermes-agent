@@ -29,9 +29,11 @@ _ERRORS = frozenset({"timeouterror", "cancellederror", "runtimeerror", "connecti
                      "connectionclosederror", "oserror", "keyerror", "typeerror", "valueerror", "attributeerror",
                      "indexerror", "other"})
 
-# dlz (11-15, D-0094 "b"): the visibility rule an unreviewed fill's frames were judged by (reviewed fills: no key).
+# dlz (11-15, D-0094 "b"): the visibility rule an unreviewed fill's frames were judged by (reviewed fills: no key),
+# and (r8) the rule that chose them: the strict one, or the shown one when the strict one found no complete card form.
 _EXPOSURES = frozenset({"shown", "strict"})
-STOPPED_SCHEMA = {"stage": _STAGES, "reason": _REASONS, "exposure": _EXPOSURES}
+_ADMISSIONS = frozenset({"strict", "shown_fallback"})
+STOPPED_SCHEMA = {"stage": _STAGES, "reason": _REASONS, "exposure": _EXPOSURES, "admission": _ADMISSIONS}
 
 
 @functools.cache
@@ -105,6 +107,20 @@ def strict_exposure(i: Any) -> bool:
     return bool(getattr(i, "unreviewed_origins", ())) and getattr(i, "strict_exposure", False) is True
 
 
+def admission_strict(i: Any) -> bool:
+    """dlz (11-15 r8, Opus P2-1): whether an unreviewed inspection's frames were chosen, and its new frames are judged,
+    by the strict exposure rule: anything but a recorded ``shown_fallback`` is (the strict rule is the safe default)."""
+    return bool(getattr(i, "unreviewed_origins", ())) and (
+        strict_exposure(i) or getattr(i, "admission", "strict") != "shown_fallback")
+
+
+def admission_rule(i: Any) -> str:
+    """``strict`` or ``shown_fallback`` for an unreviewed fill's stop record; "" for a reviewed one."""
+    if not getattr(i, "unreviewed_origins", ()):
+        return ""
+    return "strict" if admission_strict(i) else "shown_fallback"
+
+
 def exposure_rule(i: Any) -> str:
     """The visibility rule an unreviewed fill ran under, for its stop record: ``strict`` or ``shown``; "" for a reviewed
     fill (or anything that is not an inspection)."""
@@ -113,12 +129,13 @@ def exposure_rule(i: Any) -> str:
     return "strict" if strict_exposure(i) else "shown"
 
 
-def stopped_record(stage: str, stale: Any, exposure: str = "") -> dict:
+def stopped_record(stage: str, stale: Any, exposure: str = "", admission: str = "") -> dict:
     """``{stage, reason}`` with both from the fixed vocabulary (``unknown`` for anything else), and ``exposure``
-    (``shown`` / ``strict``) when the fill was an unreviewed one."""
+    (``shown`` / ``strict``) and ``admission`` (``strict`` / ``shown_fallback``) when the fill was an unreviewed one."""
     reason = stale if type(stale) is str and stale in _REASONS else "unknown"
     return {"stage": stage if stage in _STAGES else "in_document", "reason": reason,
-            **({"exposure": exposure} if exposure in _EXPOSURES else {})}
+            **({"exposure": exposure} if exposure in _EXPOSURES else {}),
+            **({"admission": admission} if admission in _ADMISSIONS else {})}
 
 
 def _stopped(result: dict, inspection: Any, st: dict) -> dict | None:
@@ -137,4 +154,4 @@ def _stopped(result: dict, inspection: Any, st: dict) -> dict | None:
             stage, reason = "after_focus", reason[6:]
         else:
             stage, reason = "in_document", "unknown"
-    return stopped_record(stage, reason, exposure_rule(inspection))
+    return stopped_record(stage, reason, exposure_rule(inspection), admission_rule(inspection))

@@ -224,6 +224,7 @@ _KPS_FORM = (
 
 
 def _kps_page(path, origins):
+    path = path.split("?")[0]  # every form frame carries a ?ref= query (r8: it used to miss and serve the FIELDS page)
     if path == "/customer/wallet/pc/WalletInput.jsp":
         return _KPS_FORM
     if path == "/kps-merchant":
@@ -1243,7 +1244,7 @@ def _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=None, auto=True
     monkeypatch.setattr("tools.browser_use_cli.vault_route", lambda task_id: {"lease": "live", "token": "t"})
     monkeypatch.setattr("tools.browser_control_route.set_capture_guard", lambda lease, token: (True, ""))
     monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface", lambda s, i: None)
-    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live"))
+    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live", False))
     monkeypatch.setattr("tools.browser_vault_payment.payment_fill_auto_enabled", lambda: auto)
     asked = []
 
@@ -1694,7 +1695,7 @@ def test_fill_auto_unreviewed_form_re_rendered_during_the_approval(payment_brows
     monkeypatch.setattr("tools.browser_use_cli.vault_route", lambda task_id: {"lease": "live", "token": "t"})
     monkeypatch.setattr("tools.browser_control_route.set_capture_guard", lambda lease, token: (True, ""))
     monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface", lambda s, i: None)
-    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live"))
+    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live", False))
     navigate(sup, origins["merchant"] + "/fa-payrails")
 
     def rerender():

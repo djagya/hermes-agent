@@ -214,7 +214,7 @@ def _setup(payment_browser, tmp_path, monkeypatch, wait=10.0):
     monkeypatch.setattr("tools.browser_use_cli.vault_route", lambda task_id: {"lease": "live", "token": "t"})
     monkeypatch.setattr("tools.browser_control_route.set_capture_guard", lambda lease, token: (True, ""))
     monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface", lambda s, i: None)
-    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live"))
+    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live", False))
     navigate(sup, origins["merchant"] + "/pr-checkout")
     return sup, origins, card
 
@@ -297,7 +297,8 @@ def test_a_payrails_form_that_does_not_come_back_stops_with_its_stage_and_window
     again = out["fill_reinspect"]
     assert out["error_type"] == "payment_page_changed" and not out.get("filled_fields"), out
     assert (again["count"], again["refused"], again["seen"]) == (0, "incomplete", {"unreviewed_frames_inspected": 1}), again
-    assert again["stopped"] == {"stage": "before_write", "reason": "frames_card", "exposure": "shown"}, again
+    assert again["stopped"] == {"stage": "before_write", "reason": "frames_card", "exposure": "shown",
+                                "admission": "strict"}, again  # r8: the strict pass chose the (then visible) form
     window = again["window"]
     assert window["codes"] == {"incomplete": window["polls"]} and window["polls"] >= 2 and window["ms"] >= 2500, window
     assert set(again) == {"count", "repairs", "refused", "seen", "stopped", "window"}, out
@@ -350,11 +351,12 @@ def test_a_sticky_bottom_bar_over_the_card_frame_after_the_focus_scroll(payment_
     the merchant's sticky bottom bar. The tap-approved frame is judged as a reviewed provider's is (shown: laid out,
     visible, not transparent), so the fill writes each field once. With vault.payment_consent_strict_exposure the
     strict rule calls it covered: the stop of 11-14 (payment_page_changed, nothing written, the re-inspection sees only
-    the observer frame), now with ``exposure: strict`` in its record."""
+    the observer frame), now with ``exposure: strict`` in its record. r8: the bar is clear at discovery, so the strict
+    pass chooses the frame under either setting (``admission: strict``)."""
     from tools.browser_supervisor import _schedule
 
     sup, origins, card = _setup(payment_browser, tmp_path, monkeypatch, wait=3.0)
-    monkeypatch.setattr("tools.browser_vault_payment.payment_consent_strict_exposure_enabled", lambda: strict)
+    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live", strict))
     _choose_card(sup, True)
     sup.evaluate_runtime("window.stickyBar()")
     # Headless Chrome fires no focus events in an unfocused page; a real foreground tab does (the FOCUS the SDK hears).
@@ -381,7 +383,33 @@ def test_a_sticky_bottom_bar_over_the_card_frame_after_the_focus_scroll(payment_
     again = out["fill_reinspect"]
     assert out["error_type"] == "payment_page_changed" and not out.get("filled_fields"), out
     assert (again["count"], again["refused"], again["seen"]) == (0, "incomplete", {"unreviewed_frames_inspected": 1}), again
-    assert again["stopped"] == {"stage": "after_focus", "reason": "shown", "exposure": "strict"}, again
+    assert again["stopped"] == {"stage": "after_focus", "reason": "shown", "exposure": "strict",
+                                "admission": "strict"}, again
     assert set(states.values()) == {"empty"} and not any(writes.values()), (states, writes)
     window = again["window"]
     assert window["codes"] == {"incomplete": window["polls"]} and window["polls"] >= 2, window
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_a_card_frame_already_under_the_sticky_bar_at_discovery(payment_browser, tmp_path, monkeypatch, caplog, strict):
+    """r8 (Opus P2-1): the bar is over the card frame's centre before the first call. The strict pass finds no card form,
+    so the reviewed providers' rule chooses the frame (the only one shown besides the 1px observer) and the fill writes
+    each field once. With vault.payment_consent_strict_exposure there is no second pass: the form is not found."""
+    sup, origins, card = _setup(payment_browser, tmp_path, monkeypatch, wait=3.0)
+    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live", strict))
+    _choose_card(sup, True)
+    wait_until(lambda: sup.evaluate_runtime("current.f.getBoundingClientRect().height")["result"] > 60,
+               what="the card frame took its size")
+    sup.evaluate_runtime("window.stickyBar(); window.onFocusOnce = null;"
+                         "scrollBy(0, current.f.getBoundingClientRect().bottom - innerHeight)")
+    assert sup.evaluate_runtime("window.covered()")["result"] is True
+    first = _fa_fill(sup, origins, card, caplog)
+    if strict:
+        assert first["error_type"] == "payment_fields_unsupported", first
+        return
+    assert first["error_type"] == "payment_destination_approval_required", first
+    out = _fa_fill(sup, origins, card, caplog, cart=_CART, approve_origins=[origins["psp"]])
+    print("RECEIPT payrails-real covered-at-discovery", json.dumps({k: out.get(k) for k in _RECEIPT}, sort_keys=True))
+    _states, writes = _frame_values(sup)
+    assert out["success"] and out["filled_fields"] == 3 and "fill_reinspect" not in out, out
+    assert writes == {"CARDHOLDER_NAME": 0, "CARD_NUMBER": 1, "EXPIRATION_DATE": 1, "CVV": 1}, writes

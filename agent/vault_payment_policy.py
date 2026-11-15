@@ -161,11 +161,19 @@ DESTINATION_OFF_HINT = ("card fields may be on an unreviewed hosted payment form
                         "off (vault.payment_destination_consent)")
 
 
-def destination_policy() -> tuple[bool, str]:
-    """``(enabled, generation)``: enabled only for a literal ``True`` in ``vault.payment_destination_consent``;
-    ``generation`` is a digest of that key and ``vault.payment_providers``. Unreadable config is ``(False, "")``, also
-    when the loader falls back to a last-known-good copy.
-    The switch only lets the discovery inspection and the owner's prompt be offered: it admits no origin."""
+def destination_policy() -> tuple[bool, str, bool]:
+    """``(enabled, generation, strict_exposure)`` from one config read: enabled only for a literal ``True`` in
+    ``vault.payment_destination_consent``; ``generation`` is a digest of the three policy keys (that one,
+    ``vault.payment_providers`` and ``vault.payment_consent_strict_exposure``), so a change to any of them withdraws a
+    fill waiting on its approval or in progress. Unreadable config is ``(False, "", False)``, also when the loader
+    falls back to a last-known-good copy.
+    The switch only lets the discovery inspection and the owner's prompt be offered: it admits no origin.
+    dlz (11-15, D-0094 "b"): ``strict_exposure``, a literal ``True`` in ``vault.payment_consent_strict_exposure`` (not
+    in the defaults, so off): the strict exposure rule of before 11-15 for every frame of an owner-approved
+    (unreviewed) destination (clip and overflow geometry, the occlusion test at the centre and the per-setter hit test
+    from the parents). Off: a frame bound by the approval is judged as a reviewed provider's is (connected, laid out,
+    larger than 2x2 px, not hidden, not transparent: ``_OWNER_VISIBLE``); its frames are chosen by the strict rule
+    first and by the reviewed one only when the strict rule finds no complete card form."""
     import hashlib
     import json
 
@@ -176,12 +184,12 @@ def destination_policy() -> tuple[bool, str]:
         if isinstance(config, FailedConfigRead):
             # dlz: the loader serves last-known-good (or defaults) for a config.yaml it cannot read now: that is
             # not the operator's current choice, so the feature is off until the file reads again.
-            return False, ""
+            return False, "", False
         values = {key: cfg_get(config, "vault", key, default=None) for key in _POLICY_KEYS}
         generation = hashlib.sha256(json.dumps(values, sort_keys=True, default=repr).encode()).hexdigest()
     except Exception:  # health: allow BLE001 -- unreadable config means the feature is off
-        return False, ""
-    return values[DESTINATION_CONSENT_KEY] is True, generation
+        return False, "", False
+    return values[DESTINATION_CONSENT_KEY] is True, generation, values[STRICT_EXPOSURE_KEY] is True
 
 
 def destination_consent_enabled() -> bool:
@@ -199,23 +207,6 @@ def payment_repin_enabled() -> bool:
         config = load_config()
         return not isinstance(config, FailedConfigRead) and cfg_get(config, "vault", "payment_repin", default=None) is True
     except Exception:  # health: allow BLE001 -- unreadable config means the feature is off
-        return False
-
-
-def payment_consent_strict_exposure_enabled() -> bool:
-    """dlz (11-15, D-0094 "b"): ``vault.payment_consent_strict_exposure`` (not in the defaults, so off; a literal ``True``
-    only). Off: the frames of an owner-approved (unreviewed) destination are judged for visibility as a reviewed
-    provider's are (connected, laid out, larger than 2x2 px, not hidden, not transparent: ``_OWNER_VISIBLE``). On: the
-    strict exposure rule of before 11-15 (clip and overflow geometry, the occlusion test at the centre and the
-    per-setter hit test from the parents). Config that cannot be read now counts as off, as for every vault.payment_*
-    switch; it is also part of the destination policy generation, so flipping it withdraws a fill still in flight."""
-    try:
-        from hermes_cli.config import cfg_get, load_config
-        from hermes_cli.config_read_errors import FailedConfigRead
-        config = load_config()
-        return (not isinstance(config, FailedConfigRead)
-                and cfg_get(config, "vault", STRICT_EXPOSURE_KEY, default=None) is True)
-    except Exception:  # health: allow BLE001 -- unreadable config means the default rule
         return False
 
 

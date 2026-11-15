@@ -431,17 +431,19 @@ _TREE = (("top", "L0", MERCHANT + "/checkout", MERCHANT, ""),
 
 
 class _Fresh(sp.PaymentSupervisionMixin):
-    """The real _payment_is_current over a stubbed tree walk, exposure test and CDP answers."""
+    """The real _payment_is_current over a stubbed tree walk, exposure test and CDP answers. ``exposed``: frames that
+    pass either visibility rule; ``shown`` (r8): frames only the shown rule passes (clipped away or covered)."""
 
-    def __init__(self, current, exposed=(), scan=()):
+    def __init__(self, current, exposed=(), scan=(), shown=()):
         self.current, self.exposed, self.scan, self.calls = current, set(exposed), list(scan), []
+        self.shown = set(shown)
         self._state_lock, self._active, self._page_session_id = threading.Lock(), True, "page"
 
     async def _payment_tree(self, sid, child_sessions=None):
         return self.current
 
     async def _chain_judged(self, fid, by_id, child_sessions, page_sid, cache, rule):
-        return fid in self.exposed  # either visibility rule (11-15): the topology binding is what is tested here
+        return fid in self.exposed or (rule != sp._EXPOSED and fid in self.shown)
 
     async def _cdp(self, method, params=None, session_id=None, timeout=None):
         fn = (params or {}).get("functionDeclaration", "")
@@ -556,7 +558,7 @@ def flow(monkeypatch):
 
     def policy():
         events.append("policy")
-        return state["policy"].pop(0) if state["policy"] else (True, "g1")
+        return state["policy"].pop(0) if state["policy"] else (True, "g1", state.get("strict", False))
 
     def resolve(handle):
         events.append("resolve")
@@ -592,7 +594,7 @@ def _inspects(events):
 
 def test_switch_off_keeps_the_reviewed_refusal_with_a_hint_and_no_discovery(flow):
     run, events = flow
-    run.state["policy"] = [(False, "g0")]
+    run.state["policy"] = [(False, "g0", False)]
     out = run(cart=CART, approve_origins=[KPS])
     assert out["error_type"] == "payment_policy_refused" and "vault.payment_destination_consent" in out["error"]
     assert _inspects(events) == ["reviewed"] and "consent" not in events and "resolve" not in events
@@ -667,7 +669,7 @@ def test_the_owner_card_names_the_unreviewed_destination_and_the_fill_runs_stric
 def test_the_strict_exposure_switch_reaches_the_discovery_inspection_only(flow, monkeypatch):
     """vault.payment_consent_strict_exposure (11-15, D-0094 "b"): the discovery pass is asked for the strict rule."""
     run, _events = flow
-    monkeypatch.setattr(bvp, "payment_consent_strict_exposure_enabled", lambda: True)
+    run.state["strict"] = True  # read with the policy (r8: one config read)
     assert run(cart=CART, approve_origins=[KPS])["success"] is True
     assert run.state["extra"] == [{}, {"strict_exposure": True}]
 
@@ -702,7 +704,7 @@ def test_switching_off_withdraws_a_fill_in_progress(flow, off_at, read):
     """B6: off (or a changed policy generation) after the accept, in context, after the page checks (Codex B r1:
     those are asynchronous), or at the commit fence."""
     run, events = flow
-    run.state["policy"] = [(True, "g1")] * off_at + [(False, "g2")]
+    run.state["policy"] = [(True, "g1", False)] * off_at + [(False, "g2", False)]
     out = run(cart=CART, approve_origins=[KPS])
     assert out["error_type"] == "payment_destination_disabled"
     assert ("resolve" in events) is read
@@ -712,7 +714,7 @@ def test_switching_off_withdraws_a_fill_in_progress(flow, off_at, read):
 
 def test_a_changed_policy_generation_also_withdraws(flow):
     run, events = flow
-    run.state["policy"] = [(True, "g1"), (True, "g2")]
+    run.state["policy"] = [(True, "g1", False), (True, "g2", False)]
     assert run(cart=CART, approve_origins=[KPS])["error_type"] == "payment_destination_disabled"
     assert "resolve" not in events
 
@@ -766,7 +768,7 @@ def test_no_card_value_reaches_a_result_or_the_log(flow, caplog):
     run, _events = flow
     caplog.set_level(logging.DEBUG)
     outs = [run(cart=CART, approve_origins=[KPS])]
-    run.state["policy"] = [(True, "g1")] * 4 + [(False, "g2")]  # read, then withdrawn at the commit fence
+    run.state["policy"] = [(True, "g1", False)] * 4 + [(False, "g2", False)]  # read, then withdrawn at the commit fence
     outs.append(run(cart=CART, approve_origins=[KPS]))
     assert outs[0]["success"] is True and outs[1]["error_type"] == "payment_destination_disabled"
     blob = json.dumps(outs) + caplog.text
@@ -789,11 +791,17 @@ def test_list_reports_the_destination_switch(monkeypatch):
 # ------------------------------------------------------------------ the discovery inspection over a fake CDP
 
 class _DiscoveryPage(sp.PaymentSupervisionMixin):
-    """A KPS-like checkout: frames, which owner <iframe>s are exposed, and what each document describes."""
+    """A KPS-like checkout: frames, which owner <iframe>s are exposed (pass either rule), which are only shown (r8:
+    clipped away or covered, so only ``_OWNER_VISIBLE`` passes them, ``_EXPOSED`` does not), and what each document
+    describes."""
 
-    def __init__(self, frames, exposed, controls):
+    def __init__(self, frames, exposed, controls, shown=()):
         self.frames, self.exposed, self.controls, self.evaluated = frames, set(exposed), controls, []
+        self.shown = set(shown)
         self._state_lock, self._active, self._page_session_id = threading.Lock(), True, "page"
+
+    def _passes(self, fid, fn):
+        return fid in self.exposed or (sp._EXPOSED not in fn and fid in self.shown)
 
     async def _cdp(self, method, params=None, session_id=None, timeout=None):
         params = params or {}
@@ -821,10 +829,10 @@ class _DiscoveryPage(sp.PaymentSupervisionMixin):
         if method == "Runtime.callFunctionOn":
             obj, fn = params["objectId"], params["functionDeclaration"]
             if fn in (sp._OWNERS_EXPOSED, sp._OWNERS_SHOWN):
-                return {"result": {"result": {"value": [a["objectId"][6:] in self.exposed
+                return {"result": {"result": {"value": [self._passes(a["objectId"][6:], fn)
                                                         for a in params["arguments"]]}}}
             if obj.startswith("owner-"):
-                return {"result": {"result": {"value": obj[6:] in self.exposed}}}
+                return {"result": {"result": {"value": self._passes(obj[6:], fn)}}}
             if "describe()" in fn:
                 return {"result": {"result": {"value": self.controls.get(obj[4:], [])}}}
             if "pin()" in fn:
@@ -855,6 +863,34 @@ def test_discovery_admits_the_exposed_unreviewed_form_and_pins_the_rest():
     assert [(fid, discovery) for kind, fid, discovery in page.evaluated if kind == "doc"] == [
         ("top", True), ("ad", True), ("kps", True)]
     assert "doc-ad" in page.released and "doc-top" not in page.released
+
+
+def test_discovery_chooses_by_the_strict_rule_first_so_a_clipped_copy_stays_out():
+    """r8 (Opus P2-1): a same-origin copy the strict rule skips but the shown rule passes (clipped away in a collapsed
+    accordion, or under an overlay). The strict pass finds the form, so the copy is no candidate, as before 11-15. Only
+    a strict pass without a complete card form falls back to the shown rule, which then sees every copy."""
+    both = {"kps": _CARD_FORM, "copy": _CARD_FORM}
+    page = _DiscoveryPage(_PAGE, exposed={"kps", "ad"}, shown={"copy"}, controls=both)
+    i = asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, cart=(2266, "EUR")))
+    assert [d.frame_id for d in i.documents] == ["kps"] and i.admission == "strict"
+    assert "copy" not in [fid for _kind, fid, _ in page.evaluated]
+    page = _DiscoveryPage(_PAGE, exposed={"ad"}, shown={"kps"}, controls=both)  # the form covered, the copy hidden
+    i = asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, cart=(2266, "EUR")))
+    assert [d.frame_id for d in i.documents] == ["kps"] and i.admission == "shown_fallback"
+    page = _DiscoveryPage(_PAGE, exposed={"ad"}, shown={"kps", "copy"}, controls=both)  # both only shown: no pick
+    with pytest.raises(PaymentDestinationError) as caught:
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True))
+    assert caught.value.error_type == "payment_fields_ambiguous"
+
+
+def test_a_new_frame_after_the_approval_is_judged_by_the_rule_that_chose_the_frames():
+    """r8: a frame the strict pass would have skipped is no new frame for a strict-chosen fill; for a fill the shown
+    rule chose, a newly shown frame on the approved origin withdraws the approval."""
+    tree = _TREE + (("k2", "L5", KPS + "/again", KPS, "top"),)
+    for admission, current in (("strict", True), ("shown_fallback", False)):
+        i = _unreviewed_inspection()
+        i.owner, i.admission = _Fresh(tree, shown={"k2"}), admission
+        assert asyncio.run(i.owner._payment_is_current(i)) is current, admission
 
 
 def test_the_reviewed_pass_never_inspects_an_unreviewed_frame():
@@ -1004,6 +1040,21 @@ def test_switching_off_part_way_stops_the_fill_and_says_what_was_written():
     cart = {"success": False, "error_type": "payment_cart_changed", "filled_fields": 1, "partially_filled": True}
     bvp._commit_text(cart)
     assert "some card fields were written" in cart["error"]
+
+
+def test_switching_off_before_the_first_setter_names_the_lock_and_payment_close():
+    """r8 (Codex P2, Kimi P2): flipped after the commit fence, at the first paced check: nothing written, the lock held
+    (a managed browser claimed it before the card read), so the text names the lock and payment_close."""
+    reads = iter([True, False])  # the commit's pass, then off at the first focus
+    sup = _Filling(99)
+    out = _two_document_fill(sup, policy=lambda: next(reads))
+    assert out["error_type"] == "payment_destination_disabled" and out.get("filled_fields", 0) == 0, out
+    assert sup.writes == []
+    locked, plain = dict(out), dict(out)
+    bvp._commit_text(locked, locked=True)
+    bvp._commit_text(plain)
+    assert locked["error"] == bvp._DESTINATION_DISABLED_LOCKED and "payment_close" in locked["error"]
+    assert plain["error"] == bvp._DESTINATION_DISABLED + bvp._READ_NOT_WRITTEN
 
 
 def test_typed_unsupported_result_carries_no_page_path(flow):

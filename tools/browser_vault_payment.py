@@ -17,13 +17,12 @@ from agent.vault_payment_policy import (
     PaymentPolicyError,
     destination_policy,
     effective_frame_origins,
-    payment_consent_strict_exposure_enabled,
     payment_fill_auto_enabled,
     payment_repin_enabled,
 )
 from agent.vault_store import PAYMENT_FIELDS, revision_binding
 from tools.browser_supervisor_payment import _COVERAGE_REFUSALS, OPTIONAL_CARD_TOKENS
-from tools.browser_supervisor_payment_stop import clean_window, exposure_rule, stopped_record
+from tools.browser_supervisor_payment_stop import admission_rule, clean_window, exposure_rule, stopped_record
 
 logger = logging.getLogger(__name__)
 
@@ -572,9 +571,9 @@ def _discover(supervisor, vault, reviewed: PaymentPolicyError, merchant_origin: 
         return {"success": False, "error_type": "payment_destination_requires_managed_browser",
                 "error": _REQUIRES_MANAGED}
     try:
-        # dlz (11-15, D-0094 "b"): the approved destination's frames are judged as reviewed providers' are, unless
-        # vault.payment_consent_strict_exposure restores the strict exposure rule (the call is then today's plus it).
-        strict = {"strict_exposure": True} if payment_consent_strict_exposure_enabled() else {}
+        # dlz (11-15, D-0094 "b"): vault.payment_consent_strict_exposure (read with the policy: r8, one config read)
+        # restores the strict exposure rule for every frame; the call is then today's plus it.
+        strict = {"strict_exposure": True} if policy[2] is True else {}
         inspected = supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
                                                unreviewed=True, **witness, **strict)
     except PaymentDestinationError as found:
@@ -631,7 +630,9 @@ _LOCKED_TEXTS = {"payment_page_changed": _PAGE_CHANGED_LOCKED, "payment_fields_c
                  "payment_cart_changed": _CART_CHANGED_LOCKED, "payment_consent_expired": _CONSENT_EXPIRED_LOCKED,
                  "payment_expiry_option_unmatched": _EXPIRY_UNMATCHED_LOCKED,
                  "payment_fields_incomplete": _FIELDS_INCOMPLETE_LOCKED,
-                 "payment_browser_changed": _BROWSER_CHANGED_LOCKED, "human_has_control": _BROWSER_CHANGED_LOCKED}
+                 "payment_browser_changed": _BROWSER_CHANGED_LOCKED, "human_has_control": _BROWSER_CHANGED_LOCKED,
+                 # r8 (Codex P2): the switch or the policy changed mid-fill, before the first setter
+                 "payment_destination_disabled": _DESTINATION_DISABLED_LOCKED}
 
 
 def _locally_locked(supervisor) -> bool:
@@ -713,7 +714,8 @@ def _reinspect_stop(code: str, inspected=None, locked: bool = False) -> dict:
     approval = getattr(inspected, "approval", None) or {}
     seen, window = approval.get("seen"), clean_window(approval.get("window"))
     # dlz (11-14): where it stopped and how the re-inspection window was spent (both from what the fill path holds).
-    stopped = stopped_record("after_approval", getattr(inspected, "stale", ""), exposure_rule(inspected))
+    stopped = stopped_record("after_approval", getattr(inspected, "stale", ""), exposure_rule(inspected),
+                             admission_rule(inspected))
     logger.warning("card fill stopped before any write: the checkout changed after it was inspected; "
                    "re-inspection refused (%s); it saw %s", _code(code), _seen_text(seen))
     cart = code == "cart_changed"
@@ -998,7 +1000,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         frame_origins = effective_frame_origins(meta.payment_frame_origins)
         stated = _stated_cart(cart) if cart is not None else None
         witness = {"cart": _cents(stated)} if stated is not None else {}
-        policy = None  # (enabled, generation) captured for the discovery inspection (B6)
+        policy = None  # (enabled, generation, strict) captured for the discovery inspection (B6)
         try:
             inspected = supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
                                                    **witness)
@@ -1111,8 +1113,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                     out["error"] += _READ_NOT_WRITTEN
                     return json.dumps(out)
                 if unreviewed and destination_policy() != policy:  # B6, A6 step 16: the commit fence
-                    return json.dumps(_lock_aware(_disabled(after_read=True), _post_claim_locked(vault, supervisor),
-                                                  _DESTINATION_DISABLED_LOCKED))
+                    return json.dumps(_lock_aware(_disabled(after_read=True), _post_claim_locked(vault, supervisor)))
                 window.committing()  # from here a card value may be in the page: only control's unlock releases it
             result = _commit(vault, supervisor, inspected, fills, strict, secret, unreviewed, auto, refreshed,
                              task_id, lease)
