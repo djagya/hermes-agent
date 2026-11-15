@@ -40,12 +40,13 @@ _SIGNATURES = (
     "tls handshake timeout", "ssl handshake timeout", "handshake operation timed out",
     "connection timed out", "connect timeout",
 )
-# Exception class names, only where they lead the line as ``[pkg.mod.]Type:`` / ``Type(``.
+# Exception class names, only where they lead the line as ``[pkg.mod.]Type:`` / ``Type(``, behind
+# at most one ``WrapperError: `` prefix (the scheduler writes ``RuntimeError: <message>``).
 _EXCEPTION_NAMES = (
     "ConnectError", "ConnectTimeout", "APIConnectionError", "ClientConnectorError",
     "ClientConnectorDNSError", "RemoteDisconnected", "NewConnectionError",
 )
-_NAME_RE = re.compile(r"^\s*(?:\w+\.)*(?:" + "|".join(_EXCEPTION_NAMES) + r")(?=\s*[:(])")
+_NAME_RE = re.compile(r"^\s*(?:\w+(?:\.\w+)*:\s+)?(?:\w+\.)*(?:" + "|".join(_EXCEPTION_NAMES) + r")(?=\s*[:(])")
 _STDERR_RE = re.compile(r"(?:^|\n)stderr:\n(.*?)(?:\nstdout:\n|\Z)", re.DOTALL)
 _ERROR_LINE_RE = re.compile(
     r"error|fail|exception|traceback|denied|refused|unreachable|timed? ?out|fatal|exit", re.IGNORECASE)
