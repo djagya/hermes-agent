@@ -1566,7 +1566,12 @@ def _dynamic_schema_overrides() -> dict:
         }
         props["bridge"] = {
             "type": "string",
-            "description": "Operator-installed pinned bridge id. Supply only bridge and action; no code or route overrides.",
+            "description": (
+                "Operator-installed pinned bridge id. Supply bridge and action only: the bridge runs on the held "
+                "lease. `session` and the binding's own `identity` are ignored; any other field (code, mode, "
+                "local, qa_targets, on_dialog, timeout_s, a different identity) is refused with "
+                "bridge_usage_error and a `drop` list naming the fields to remove."
+            ),
         }
         props["action"] = {
             "type": "string",

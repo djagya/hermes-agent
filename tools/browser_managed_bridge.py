@@ -504,11 +504,28 @@ def dispatch_browser_exec(*, binding_id: str, action: str, code: str, session: s
     """Dispatch the narrow browser_exec bridge surface, or decline ordinary code."""
     if not binding_id and not action:
         return None
-    overrides = (
-        not binding_id or not action or bool(code and code.strip()) or bool(session) or local
-        or bool(mode) or bool(identity) or bool(qa_targets) or on_dialog != "auto"
-        or timeout_s != default_timeout_s
-    )
-    if overrides:
+    if not binding_id or not action:
         return {"error": "bridge_override_refused"}
+    # A bridge call runs on the held lease by task_id, so a session name and the binding's own identity
+    # are harmless no-ops (an agent habitually passes them); anything else is a real override.
+    # Names only in the answer, never values: a refused field may hold code or a secret.
+    drop = [
+        name for name, refused in (
+            ("code", bool(code and code.strip())),
+            ("local", bool(local)),
+            ("mode", bool(mode)),
+            ("identity", bool(identity) and not _identity_is_binding_own(binding_id, identity)),
+            ("qa_targets", bool(qa_targets)),
+            ("on_dialog", on_dialog != "auto"),
+            ("timeout_s", timeout_s != default_timeout_s),
+        ) if refused
+    ]
+    if drop:
+        return {"error": "bridge_usage_error", "drop": drop}
     return run_managed_bridge(binding_id, action, task_id=task_id)
+
+
+def _identity_is_binding_own(binding_id: str, identity: str) -> bool:
+    """True only when the named binding exists and pins exactly this identity."""
+    binding = _load_bindings().get(binding_id)
+    return isinstance(binding, dict) and isinstance(binding.get("identity"), str) and binding["identity"] == identity

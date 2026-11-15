@@ -254,7 +254,7 @@ def test_browser_exec_dispatches_pinned_bridge_and_refuses_overrides(monkeypatch
     refused = json.loads(registry.dispatch("browser_exec", {
         "bridge": "synthetic", "action": "route", "code": "print('arbitrary')",
     }, task_id="task-1"))
-    assert refused["error"] == "bridge_override_refused"
+    assert refused == {"error": "bridge_usage_error", "drop": ["code"]}
     assert len(calls) == 1
 
 
@@ -445,16 +445,46 @@ def test_handoff_minted_during_vault_call_refuses_the_fill(monkeypatch):
     assert calls == []
 
 
-@pytest.mark.parametrize("override", [
-    {"code": "print(1)"}, {"session": "s"}, {"local": True}, {"mode": "qa"}, {"identity": "other"},
-    {"qa_targets": ["https://x.example"]}, {"on_dialog": "accept"}, {"timeout_s": 5},
-])
-def test_bridge_refuses_every_route_override(override):
+def _dispatch_args(**changes) -> dict[str, Any]:
     args: dict[str, Any] = dict(binding_id="synthetic", action="route", code="", session="", timeout_s=60,
                                 default_timeout_s=60, local=False, mode="", identity="", qa_targets=None,
                                 on_dialog="auto", task_id="task-1")
-    args.update(override)
-    assert bridge.dispatch_browser_exec(**args) == {"error": "bridge_override_refused"}
+    args.update(changes)
+    return args
+
+
+@pytest.mark.parametrize("override, drop", [
+    ({"code": "print(1)"}, ["code"]), ({"local": True}, ["local"]), ({"mode": "qa"}, ["mode"]),
+    ({"identity": "shopping"}, ["identity"]), ({"qa_targets": ["https://x.example"]}, ["qa_targets"]),
+    ({"on_dialog": "accept"}, ["on_dialog"]), ({"timeout_s": 5}, ["timeout_s"]),
+    ({"code": "x", "timeout_s": 5, "identity": "shopping"}, ["code", "identity", "timeout_s"]),
+])
+def test_bridge_refuses_every_route_override_naming_only_fields(monkeypatch, override, drop):
+    monkeypatch.setattr(bridge, "run_managed_bridge", lambda *a, **k: pytest.fail("override reached the bridge"))
+    result = bridge.dispatch_browser_exec(**_dispatch_args(**override))
+    assert result == {"error": "bridge_usage_error", "drop": drop}
+    assert "shopping" not in json.dumps(result) and "print(1)" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("binding_id, action", [("", "route"), ("synthetic", "")])
+def test_bridge_missing_binding_or_action_is_refused(binding_id, action):
+    assert bridge.dispatch_browser_exec(**_dispatch_args(binding_id=binding_id, action=action)) == {
+        "error": "bridge_override_refused"}
+
+
+def test_bridge_accepts_own_identity_and_a_session_as_noops(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bridge, "run_managed_bridge",
+                        lambda *args, **kwargs: calls.append((args, kwargs)) or {"success": True})
+    result = bridge.dispatch_browser_exec(**_dispatch_args(action="fill", identity="sensitive", session="fin4u-sync"))
+    assert result == {"success": True}
+    assert calls == [(("synthetic", "fill"), {"task_id": "task-1"})]
+
+
+def test_bridge_identity_of_an_unknown_binding_is_not_accepted(monkeypatch):
+    monkeypatch.setattr(bridge, "run_managed_bridge", lambda *a, **k: pytest.fail("override reached the bridge"))
+    result = bridge.dispatch_browser_exec(**_dispatch_args(binding_id="nope", identity="sensitive"))
+    assert result == {"error": "bridge_usage_error", "drop": ["identity"]}
 
 
 @pytest.mark.parametrize("key", ["accessToken", "refresh-token", "Set-Cookie", "sessionId", "apiKey"])
