@@ -24,16 +24,16 @@ fetch() {
 
 case "$arch" in
   amd64)
-    gh_url="https://github.com/cli/cli/releases/download/v2.103.0/gh_2.103.0_linux_amd64.tar.gz"
-    gh_sha="fdd768eb70f6409f80fcfa9f3a1c0adf0fc98d827ab3ce0bed2ac22762c5d786"
-    op_url="https://cache.agilebits.com/dist/1P/op2/pkg/v2.41.1/op_linux_amd64_v2.41.1.zip"
-    op_sha="e52476700cba9202ac7469bdfb2648ecdbf3438ac85822010f77230139e74966"
+    gh_url="https://github.com/cli/cli/releases/download/v2.104.0/gh_2.104.0_linux_amd64.tar.gz"
+    gh_sha="98cb101ad87dbbd3f6b2f2bfcbd43197ccd07643140121d8a9cfaa91eadbc24e"
+    op_url="https://cache.agilebits.com/dist/1P/op2/pkg/v2.42.0/op_linux_amd64_v2.42.0.zip"
+    op_sha="261fe3844a43e7e83a3d85e8a9f36411729436a1d3add1dc7dd46cbbceebe9e5"
     ;;
   arm64)
-    gh_url="https://github.com/cli/cli/releases/download/v2.103.0/gh_2.103.0_linux_arm64.tar.gz"
-    gh_sha="7f322df34e624d14f5ec0c4acb121fd6dfa14392fdbbd1066aa8e0a05ac3721e"
-    op_url="https://cache.agilebits.com/dist/1P/op2/pkg/v2.41.1/op_linux_arm64_v2.41.1.zip"
-    op_sha="89abd60c17d5c614066c20e6abed816449eb018c5e0679ed63d57071c7bee85e"
+    gh_url="https://github.com/cli/cli/releases/download/v2.104.0/gh_2.104.0_linux_arm64.tar.gz"
+    gh_sha="cb34cefc6f4e77b90731374a2b737516bb8f3033c6ca46aa949e5344f68069e3"
+    op_url="https://cache.agilebits.com/dist/1P/op2/pkg/v2.42.0/op_linux_arm64_v2.42.0.zip"
+    op_sha="e56c379fabafb393ce699258e484694abe464870fb41f35ce1b5c3f17868ba61"
     ;;
   *)
     echo "unsupported TARGETARCH=${arch}" >&2
