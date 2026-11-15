@@ -1490,11 +1490,11 @@ def _cron_box_probe_online(monkeypatch):
     """The scheduler's per-tick connectivity probe (``cron.network_probe``) resolves real hosts,
     which the fence above refuses: every test would see an offline box and every failed cron run
     would turn into a silent network-class failure. Tests start online; the probe's own tests and
-    the offline-box cron tests patch ``_probe_offline`` themselves."""
+    the offline-box cron tests patch ``_probe_offline`` (or ``_reachable``) themselves."""
     from cron import network_probe
 
     network_probe.reset_cache()
-    monkeypatch.setattr(network_probe, "_probe_offline", lambda: False)
+    monkeypatch.setattr(network_probe, "_reachable", lambda host, port: True)
 
 
 @pytest.fixture

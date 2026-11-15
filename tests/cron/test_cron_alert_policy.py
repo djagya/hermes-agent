@@ -51,7 +51,9 @@ def _tick(job_id, tmp_path, deliveries, *, error=None, answer="ok"):
          patch("run_agent.AIAgent") as agent_cls:
         agent = MagicMock()
         if error:
-            agent.run_conversation.side_effect = RuntimeError(error)
+            agent.session_api_calls = 0  # never reached the model (cron.unreachable_retry)
+            agent.run_conversation.side_effect = (
+                error if isinstance(error, BaseException) else RuntimeError(error))
         else:
             agent.run_conversation.return_value = {"final_response": answer}
         agent_cls.return_value = agent
@@ -183,6 +185,18 @@ def test_transient_network_signatures_match(text):
 @pytest.mark.parametrize("text", [
     "", "mail provider 503", "RuntimeError: boom", "401 Unauthorized", "Script timed out after 60s: x.sh",
     "KeyError: 'connection'",
+    # Credential, git and bundler messages that merely contain "failed to resolve".
+    "RuntimeError: Failed to resolve a Nous inference API key",
+    "fatal: Failed to resolve 'HEAD' as a valid ref",
+    'error during build: Rollup failed to resolve import "x" from "y"',
+    # An exception name that is not in exception-prefix position.
+    "ImportError: cannot import name ConnectError from adapter",
+    "RuntimeError: ImportError: cannot import name ConnectError",
+    # A script's stdout is its own report, never the reason the run failed.
+    "Script exited with code 1\nstderr:\nKeyError: 'x'\nstdout:\nconnection reset by peer\nConnectError: x",
+    "Script exited with code 1\nstdout:\nCould not resolve host: a.invalid",
+    # Earlier chatter in stderr does not hide the fatal last line.
+    "Script exited with code 1\nstderr:\nretrying after connection refused\nRuntimeError: dead\nstdout:\n",
 ])
 def test_non_network_text_does_not_match(text):
     from cron.transient_network import is_transient_network_failure
@@ -260,3 +274,144 @@ def test_report_that_quotes_a_refusal_notice_stays_a_report(store):
     text = "Summary: the assistant said 'Your request was not processed.' once last night."
     _tick("alert-policy-test", store, deliveries, answer=text)
     assert deliveries == [(text, False)]
+
+
+def test_script_keyerror_with_network_stdout_alerts_normally(store):
+    deliveries = []
+    cron_jobs.save_jobs([_job()])
+    _tick("alert-policy-test", store, deliveries,
+          error="Script exited with code 1\nstderr:\nKeyError: 'x'\nstdout:\nconnection reset by peer\n")
+    assert len(deliveries) == 1 and deliveries[0][1] is True
+    assert incidents.list_incidents()[0]["failure_type"] != "transient_network"
+
+
+# Tick-level outage check (cron.network_probe): an offline box makes any failure network-class.
+_OFFLINE_SHAPES = [
+    "push refused (HTTP no answer)", "refresh failed (exit 1)",
+    "Script timed out after 180s: /opt/data/scripts/vigil.sh",
+]
+
+
+@pytest.mark.parametrize("message", _OFFLINE_SHAPES)
+def test_offline_box_makes_any_failure_network_class(store, monkeypatch, message):
+    from cron import network_probe
+
+    monkeypatch.setattr(network_probe, "_probe_offline", lambda: True)
+    deliveries = []
+    cron_jobs.save_jobs([_job(alert_after_consecutive_failures=1)])
+    _tick("alert-policy-test", store, deliveries, error=message)
+    assert deliveries == []
+    stored = next(j for j in cron_jobs.load_jobs() if j["id"] == "alert-policy-test")
+    assert int(stored.get("failure_streak") or 0) == 0 and "failing_since" not in stored
+    assert stored["last_status"] == "error" and stored["network_failing_since"]
+    assert {inc["failure_type"] for inc in incidents.list_incidents()} == {"transient_network"}
+
+
+@pytest.mark.parametrize("message", _OFFLINE_SHAPES)
+def test_online_box_alerts_for_the_same_messages(store, message):
+    deliveries = []
+    cron_jobs.save_jobs([_job()])
+    _tick("alert-policy-test", store, deliveries, error=message)
+    assert len(deliveries) == 1 and deliveries[0][1] is True
+    stored = next(j for j in cron_jobs.load_jobs() if j["id"] == "alert-policy-test")
+    assert "network_failing_since" not in stored
+
+
+def test_probe_runs_once_for_a_tick_of_failing_jobs(store, monkeypatch):
+    from cron import network_probe
+
+    probes = []
+    monkeypatch.setattr(network_probe, "_probe_offline", lambda: probes.append(1) or True)
+    deliveries = []
+    ids = [f"probe-job-{i}" for i in range(14)]
+    cron_jobs.save_jobs([_job(id=i, name=i) for i in ids])
+    for job_id in ids:
+        _tick(job_id, store, deliveries, error="refresh failed (exit 1)")
+    assert deliveries == [] and len(probes) == 1
+
+
+def test_probe_is_offline_only_when_no_target_answers(monkeypatch):
+    from cron import network_probe
+
+    answers = {"api.telegram.org": False, "github.com": True}
+    monkeypatch.setattr(network_probe, "_reachable", lambda host, port: answers[host])
+    assert network_probe.box_is_offline() is False, "one reachable target is online"
+    network_probe.reset_cache()
+    answers["github.com"] = False
+    assert network_probe.box_is_offline() is True
+    answers["github.com"] = True
+    assert network_probe.box_is_offline() is True, "the answer is cached for the tick"
+    network_probe.reset_cache()
+    assert network_probe.box_is_offline() is False
+
+
+def test_agent_declared_failure_is_not_classified_by_the_probe(monkeypatch):
+    from cron import network_probe
+
+    monkeypatch.setattr(network_probe, "_probe_offline", lambda: True)
+    assert sched._is_transient_network_run({"id": "j"}, "refresh failed (exit 1)")
+    assert not sched._is_transient_network_run({"id": "j"}, "the portal is down", agent_declared=True)
+
+
+def test_seven_hours_of_network_failures_alert_exactly_once(store):
+    deliveries = []
+    cron_jobs.save_jobs([_job()])
+    err = "Could not resolve host: x.invalid"
+    _tick("alert-policy-test", store, deliveries, error=err)
+    assert deliveries == []
+    stored = next(j for j in cron_jobs.load_jobs() if j["id"] == "alert-policy-test")
+    assert stored["network_failing_since"], "the first network-class failure stamps the clock"
+    for _ in range(3):
+        _tick("alert-policy-test", store, deliveries, error=err)
+    assert deliveries == [], "inside the window: silent"
+    jobs = cron_jobs.load_jobs()
+    for j in jobs:
+        j["network_failing_since"] = (_hermes_now() - timedelta(hours=7)).isoformat()
+    cron_jobs.save_jobs(jobs)
+    for _ in range(3):
+        _tick("alert-policy-test", store, deliveries, error=err)
+    assert len(deliveries) == 1 and deliveries[0][1] is True, "one ping, then the incident cooldown holds"
+    stored = next(j for j in cron_jobs.load_jobs() if j["id"] == "alert-policy-test")
+    assert stored["failure_streak"] == 3, "past the window the failures count like any other"
+    _tick("alert-policy-test", store, deliveries)
+    stored = next(j for j in cron_jobs.load_jobs() if j["id"] == "alert-policy-test")
+    assert "network_failing_since" not in stored and stored["failure_streak"] == 0
+
+
+def test_exhausted_unreachable_ladder_alerts_but_a_pending_rung_does_not(store):
+    import socket
+
+    deliveries = []
+    err = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    cron_jobs.save_jobs([_job()])
+    _tick("alert-policy-test", store, deliveries, error=err)
+    assert deliveries == [], "a re-run is pending: the notice is held, nothing counts"
+    stored = next(j for j in cron_jobs.load_jobs() if j["id"] == "alert-policy-test")
+    assert int(stored.get("failure_streak") or 0) == 0
+
+    cron_jobs.save_jobs([_job(unreachable_retry={"attempt": 3, "at": None, "expr": None})])
+    _tick("alert-policy-test", store, deliveries, error=err)
+    assert len(deliveries) == 1 and deliveries[0][1] is True, "ladder exhausted: an ordinary alert"
+
+
+def test_crash_path_is_not_silenced_by_a_stale_unreachable_flag(store):
+    sent = []
+    job = _job(_model_unreachable=True)
+    with patch.object(sched, "_deliver_result", side_effect=lambda jb, content, **kw: sent.append(content)):
+        err, outcome = sched._deliver_crash_failure(
+            dict(job), "OperationalError: database is locked", adapters={}, loop=None)
+        assert outcome != "suppressed" and len(sent) == 1
+        err, outcome = sched._deliver_crash_failure(
+            dict(job, id="other"), "ConnectError: all connection attempts failed", adapters={}, loop=None)
+        assert (err, outcome) == (None, "suppressed") and len(sent) == 1
+
+
+def test_explicit_failure_type_updates_an_existing_incident(store):
+    incident_id, _ = incidents.upsert_incident("job-1", "boom 503")
+    kept = incidents.get_incident(incident_id)["failure_type"]
+    incidents.upsert_incident("job-1", "boom 503")
+    assert incidents.get_incident(incident_id)["failure_type"] == kept, "no explicit type: unchanged"
+    incidents.upsert_incident("job-1", "boom 503", failure_type="transient_network")
+    assert incidents.get_incident(incident_id)["failure_type"] == "transient_network"
+    incidents.upsert_incident("job-1", "boom 503")
+    assert incidents.get_incident(incident_id)["failure_type"] == "transient_network"
