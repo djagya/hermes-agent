@@ -34,6 +34,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from agent.vault_payment_policy import PaymentDestinationError, PaymentPolicyError
+from tools.browser_supervisor_payment_stop import ReinspectLog, _stopped, clean_window
 
 
 def _sp():
@@ -193,6 +194,8 @@ class PaymentAutoMixin:
         # other origin is the fixed word `other` and a count: a page chooses its origins, and values are in the page
         # by now), or the discovery's own count of frames it looked into.
         prior.approval.pop("seen", None)
+        prior.approval.pop("window", None)
+        log = ReinspectLog()  # dlz (11-14): how the window was spent, for the stop record
         while time.monotonic() < deadline:
             fresh = None
             adopted = False
@@ -206,8 +209,9 @@ class PaymentAutoMixin:
                     prior.approval["seen"] = _seen_detail(exc.detail, prior.approval)
                 except PaymentPolicyError as exc:
                     refused = _reinspect_refusal(str(exc))
-                except Exception:  # health: allow BLE001 -- a page that cannot be read now may be read a moment later
+                except Exception as exc:  # health: allow BLE001 -- a page that cannot be read now may be read a moment later
                     refused = "unavailable"
+                    log.error(exc)
                 if fresh is not None:
                     refused = _approval_mismatch(prior.approval, fresh) or ""
                     prior.approval["seen"] = _seen_fields(prior.approval, fresh)
@@ -243,9 +247,14 @@ class PaymentAutoMixin:
                     fresh.consumed = True
                     fresh.child_sessions = {k: v for k, v in fresh.child_sessions.items() if v not in owned}
                     await self._release_once(fresh)
+            log.note(refused)
             if refused in _REINSPECT_FINAL:
-                return None, refused
+                break
             await asyncio.sleep(_REINSPECT_POLL_SECONDS)
+        # dlz (11-14): no reading continued the fill. How the window was spent goes into the stop record (counts and
+        # fixed codes, from what this loop already holds: no call to the browser).
+        prior.approval["window"] = log.record(
+            int((time.monotonic() - prior.expires_at + _sp().INSPECTION_WINDOW_S) * 1000))
         return None, refused
 
     async def _ownership_stop(self, i: Any, ownership) -> str | None:
@@ -283,12 +292,15 @@ class PaymentAutoMixin:
                                                               st["reinspections"] > 0, st)
                 if not again:
                     return _auto_result(result, st)
+                # dlz (11-14): where this generation stopped, and on what (read from the inspection's own record)
+                st["stopped"] = _stopped(result, current, st) or {}
                 if st["reinspections"] >= _MAX_REINSPECTIONS or (again == "repair" and st["repairs"] >= _MAX_REPAIRS):
                     st["refused"] = "budget"
                     return _auto_result(result, st)
                 fresh, st["refused"] = await self._reinspect(current, stop, _REINSPECT_WAIT_SECONDS)
                 if fresh is None:
                     st["seen"] = current.approval.get("seen")
+                    st["window"] = current.approval.get("window")
                     return _auto_result(result, st)
                 current = fresh
                 st["reinspections"] += 1
@@ -324,6 +336,7 @@ class PaymentAutoMixin:
             return "", later({"success": False, "error_type": "payment_consent_expired"})
         if not await self._payment_is_current(i):
             i.consumed = True
+            st["stage"] = "before_write"  # dlz (11-14): for fill_reinspect.stopped
             return "changed", later({"success": False, "error_type": "payment_page_changed"})
         if i.witnesses and not await self._cart_current(i):
             i.consumed = True
@@ -350,6 +363,8 @@ class PaymentAutoMixin:
                 st["wrote"] = max(st["wrote"], filled + (count if type(count) is int else 0),
                                   1 if result.get("write_uncertain") else 0)
                 if not result.get("success"):
+                    if state.get("stage"):  # dlz (11-14): a check between documents refused (see _commit_step)
+                        st["stage"] = state["stage"]
                     result = later(_sp()._partial(result, filled))
                     retry = result.get("error_type") in _REINSPECTABLE and not result.get("write_uncertain")
                     return ("changed" if retry else ""), result
@@ -483,7 +498,11 @@ def _auto_result(result: dict, st: dict) -> dict:
         refused = st["refused"] if st["refused"] in _REINSPECT_FINAL | _REINSPECT_RETRIED else ""
         out["fill_reinspect"] = {"count": st["reinspections"], "repairs": st["repairs"],
                                  **({"refused": refused} if refused else {}),
-                                 **({"seen": st["seen"]} if refused and st.get("seen") else {})}
+                                 **({"seen": st["seen"]} if refused and st.get("seen") else {}),
+                                 # dlz (11-14): where the last generation stopped, and how the window of the
+                                 # re-inspection that gave up was spent (counts and fixed codes only)
+                                 **({"stopped": st["stopped"]} if refused and st.get("stopped") else {}),
+                                 **({"window": window} if refused and (window := clean_window(st.get("window"))) else {})}
     return out
 
 

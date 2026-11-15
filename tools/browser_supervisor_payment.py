@@ -163,6 +163,7 @@ class PaymentInspection:
     approval: Any = field(default=None, repr=False, compare=False)
     approval_id: str = ""
     merchant_match: str = "not_checked"  # approval-qol r4 C6: the merchant page's own result (Pay is gated on it)
+    stale: str = ""  # dlz (11-14): the part of the approved page the last freshness check found changed (a fixed code)
 
     @property
     def controls(self) -> tuple:
@@ -1027,25 +1028,34 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             or (i.consumed and not during_fill)
             or time.monotonic() >= i.expires_at
         ):
+            i.stale = "inactive"
             return False
         try:
+            # dlz (11-14): ``stale`` names the check under way, so the one that refuses (or raises) is on record.
+            i.stale = "tree"
             current = await self._payment_tree(i.page_session, i.child_sessions)
+            i.stale = "frames"
             if i.unreviewed_origins:
                 # dlz (B4): the relevant chains, no new admissible frame; frames on other origins may churn.
                 if not await self._relevant_unchanged(i, current):
                     return False
             elif current != i.tree:
                 return False
+            i.stale = "document"
             for d in i.documents:
                 if not await self._document_valid(i, d):
                     return False
             if i.unreviewed_origins:
+                i.stale = "absence"
                 if not await self._absence_holds(i):
                     return False
+                i.stale = "shown"
                 if await self._shown_documents(i) != {d.frame_id for d in i.documents}:
                     return False
+            i.stale = ""
             return True
         except Exception:  # health: allow BLE001 -- any CDP failure means the approved page is not current; fail closed
+            i.stale += "_error"
             return False
 
     async def _document_valid(self, i: PaymentInspection, d: PaymentDocument) -> bool:
@@ -1068,12 +1078,15 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         present but hidden at inspection and is revealed now, withdraw the approval; (3, in ``_absence_holds``)
         every pinned card-free document stays card-free. Frames on other origins (ads, widgets) may appear,
         navigate or disappear."""
+        i.stale = "frames_top"
         if not current or not i.tree or current[0] != i.tree[0]:
             return False
         old = {f[0]: f for f in i.tree}
         now = {f[0]: f for f in current}
+        i.stale = "frames_card"
         if any(now.get(fid) != old.get(fid) for fid in _relevant_frames(i)):
             return False
+        i.stale = "frames_new"
         approved = {i.merchant_origin, *i.target_origins}
         bound = _relevant_frames(i) | set(i.absence_frames)
         cache: dict = {}
@@ -1261,11 +1274,13 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         # approved chain is checked again against the pinned state (bounded: no OOPIF rediscovery), and
         # each document written so far must still be the one that received its fields.
         if written and not await self._payment_scope_current(i, [d for d, _f in written] + [document]):
+            state["stage"] = "between_documents"  # dlz (11-14): for fill_reinspect.stopped
             return {"success": False, "error_type": "payment_page_changed"}
         # dlz (Codex B r1 #1): an unreviewed fill also re-binds the cart, the absence witnesses, the candidate
         # topology and the policy before each later document, on the consumed inspection.
         verdict = await self._fill_scope_verdict(i) if written and i.unreviewed_origins else None
         if verdict:
+            state["stage"] = "between_documents"
             return {"success": False, "error_type": verdict}
         # dlz: strict fills in a frame pause after each focus for the owner-chain check from the parents
         # (a cross-origin parent's blur handler is out of the frame's reach); an unreviewed fill pauses in
@@ -1328,9 +1343,11 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         - every parent document on any card chain is still at its inspected URL and origin, and all its
           pinned owner <iframe>s are connected and shown (one call per parent, in the parent's pinned world:
           a new parent document destroys that world and the call fails).
-        Frames off the card chains (ads) are ignored. Any failure to answer counts as changed."""
+        Frames off the card chains (ads) are ignored. Any failure to answer counts as changed.
+        dlz (11-14 r2): each refusal leaves its fixed code in ``i.stale`` (``scope_*``), for fill_reinspect.stopped."""
         by_id = {f[0]: f for f in i.tree}
         framed: set = set()
+        i.stale = "scope_chain"
         for d in i.documents:
             fid, hops = d.frame_id, 0
             while fid in by_id and by_id[fid][4] and hops < 16:
@@ -1338,10 +1355,12 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 fid, hops = by_id[fid][4], hops + 1
             if fid not in by_id or by_id[fid][4]:
                 return False
+        i.stale = "scope_unpinned"
         pinned = {fid for _sid, items in i.frame_owners.values() for fid, _obj in items}
         if not framed <= pinned or any(p not in by_id for p in i.frame_owners):
             return False
         leaves = list(dict.fromkeys(d.frame_id for d in receiving))
+        i.stale = "scope_tree"
         try:
             seen: dict = {}
             for sid in dict.fromkeys(i.child_sessions.get(fid, i.page_session) for fid in leaves):
@@ -1356,10 +1375,12 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
 
                 walk((await self._cdp("Page.getFrameTree", session_id=sid))["result"]["frameTree"])
                 seen[sid] = frames
+            i.stale = "scope_frame"
             for fid in leaves:
                 sid = i.child_sessions.get(fid, i.page_session)
                 if seen[sid].get(fid) != tuple(by_id[fid][1:4]):
                     return False
+            i.stale = "scope_owner"
             scope = _OWNERS_SCOPE_EXPOSED if i.unreviewed_origins else _OWNERS_SCOPE
             for parent, (psid, items) in i.frame_owners.items():
                 answer = _value(await self._cdp("Runtime.callFunctionOn", {
@@ -1370,8 +1391,10 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 }, session_id=psid))
                 if not (isinstance(answer, list) and len(answer) == len(items) and all(a is True for a in answer)):
                     return False
+            i.stale = ""
             return True
         except Exception:  # health: allow BLE001 -- an unreadable page is not the approved page; fail closed
+            i.stale += "_error"
             return False
 
     async def _fill_scope_verdict(self, i: PaymentInspection) -> str | None:
@@ -1379,12 +1402,17 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         topology/absence/exposure bindings and every receiving document's ``valid()`` (Codex B r2 #1), the cart
         witnesses, and last (after the asynchronous checks) the destination policy."""
         if time.monotonic() >= i.expires_at:
+            i.stale = "expired"  # dlz (11-14 r2): the fixed code of each refusal, for fill_reinspect.stopped
             return "payment_consent_expired"
         if not await self._payment_is_current(i, during_fill=True):
             return "payment_page_changed"
         if i.witnesses and not await self._cart_current(i):
+            i.stale = "cart"
             return "payment_cart_changed"
-        return None if _policy_holds(i) else "payment_destination_disabled"
+        if _policy_holds(i):
+            return None
+        i.stale = "policy"
+        return "payment_destination_disabled"
 
     async def _paced_check(self, i: PaymentInspection, d: PaymentDocument, point) -> bool | str:
         """After a strict fill's focus, before the setter: True, or the error type that stops the document."""
@@ -1393,9 +1421,12 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         # parent-chain check, which is the last word before the setter, must come after it.
         verdict = await self._fill_scope_verdict(i) if i.unreviewed_origins else None
         if verdict:
+            i.stale = "focus_" + i.stale  # dlz (11-14): for fill_reinspect.stopped: the check after a focus refused
             return verdict
+        i.stale = "focus_owner_hit"
         if _has_parent(i, d) and not await self._owner_chain_current(i, d, point):
             return "payment_page_changed"
+        i.stale = ""
         return True
 
     async def _owner_chain_current(self, i: PaymentInspection, d: PaymentDocument, point) -> bool:
