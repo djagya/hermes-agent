@@ -110,3 +110,66 @@ def test_unwritable_home_falls_back_to_the_process_cache(monkeypatch):
     assert network_probe.box_is_offline() is True
     assert network_probe.box_is_offline() is True
     assert probes == [1]
+
+
+def _write_cache(text):
+    path = network_probe._cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    network_probe._cached = None
+
+
+@pytest.mark.parametrize("online", ["null", "0", '""', "[]", '"false"', "1"])
+def test_shared_result_needs_a_json_bool_online(monkeypatch, online):
+    probes = []
+    monkeypatch.setattr(network_probe, "_probe_offline", lambda: probes.append(1) or False)
+    _write_cache('{"checked_at": %s, "online": %s}' % (time.time(), online))
+    assert network_probe.box_is_offline() is False
+    assert probes == [1], "a non-bool online value must not be trusted as an offline answer"
+
+
+@pytest.mark.parametrize("stamp", ["NaN", "Infinity", "null", '"now"', "true", "%s" % (time.time() + 3600)])
+def test_shared_result_needs_a_finite_past_checked_at(monkeypatch, stamp):
+    probes = []
+    monkeypatch.setattr(network_probe, "_probe_offline", lambda: probes.append(1) or False)
+    _write_cache('{"checked_at": %s, "online": false}' % stamp)
+    assert network_probe.box_is_offline() is False
+    assert probes == [1]
+
+
+def test_oversized_shared_file_is_ignored(monkeypatch):
+    probes = []
+    monkeypatch.setattr(network_probe, "_probe_offline", lambda: probes.append(1) or False)
+    _write_cache('{"checked_at": %s, "online": false, "pad": "%s"}' % (time.time(), "x" * 8192))
+    assert network_probe.box_is_offline() is False
+    assert probes == [1]
+
+
+def test_fifo_at_the_cache_path_does_not_hang(monkeypatch):
+    import os
+
+    probes = []
+    monkeypatch.setattr(network_probe, "_probe_offline", lambda: probes.append(1) or False)
+    path = network_probe._cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(path)
+    network_probe._cached = None
+    started = time.monotonic()
+    assert network_probe.box_is_offline() is False
+    assert time.monotonic() - started < 3.0
+    assert probes == [1]
+
+
+def test_shared_result_keeps_its_original_checked_at(monkeypatch):
+    probes = []
+    monkeypatch.setattr(network_probe, "_probe_offline", lambda: probes.append(1) or False)
+    clock = {"mono": 1000.0, "wall": 5000.0}
+    monkeypatch.setattr(network_probe.time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(network_probe.time, "time", lambda: clock["wall"])
+    _write_cache('{"checked_at": %s, "online": false}' % (clock["wall"] - 59))
+    assert network_probe.box_is_offline() is True  # 59 s old offline answer: shared
+    assert probes == []
+    clock["mono"] += 1.5
+    clock["wall"] += 1.5  # 60.5 s after the original probe
+    assert network_probe.box_is_offline() is False, "expires at checked_at + 60 s, not now + 60 s"
+    assert probes == [1]

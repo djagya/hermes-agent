@@ -19,9 +19,11 @@ from __future__ import annotations
 import errno
 import json
 import logging
+import math
 import os
 import queue
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -34,6 +36,8 @@ PROBE_TARGETS: tuple[tuple[str, int], ...] = (("api.telegram.org", 443), ("githu
 CONNECT_TIMEOUT_SECONDS = 3.0
 PROBE_DEADLINE_SECONDS = 5.0
 CACHE_SECONDS = 60.0
+_CLOCK_SKEW_SECONDS = 5.0  # a stamp this far ahead of our clock is still accepted
+_MAX_CACHE_BYTES = 4096
 _CACHE_FILE = ("cron", ".network_probe.json")
 
 # Only these mean "the network is not there"; any other failure is a local problem, not an outage.
@@ -95,15 +99,34 @@ def _cache_path() -> Path:
     return get_hermes_home().joinpath(*_CACHE_FILE)
 
 
-def _read_shared() -> Optional[bool]:
-    """The offline answer another process stored less than ``CACHE_SECONDS`` ago, else None."""
+def _read_shared() -> Optional[tuple[bool, float]]:
+    """``(offline, age_seconds)`` of the answer another process stored less than ``CACHE_SECONDS``
+    ago, else None. Never blocks (non-blocking open, regular files only, tiny read cap) and accepts
+    only a JSON bool ``online`` plus a finite ``checked_at`` that is not in the future."""
+    fd = None
     try:
-        data = json.loads(_cache_path().read_text(encoding="utf-8-sig"))
-        age = time.time() - float(data["checked_at"])
-        if 0 <= age < CACHE_SECONDS:
-            return not bool(data["online"])
+        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(_cache_path(), flags)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        raw = os.read(fd, _MAX_CACHE_BYTES + 1)
+        if len(raw) > _MAX_CACHE_BYTES:
+            return None
+        data = json.loads(raw.decode("utf-8-sig"))
+        online, checked_at = data["online"], data["checked_at"]
+        if type(online) is not bool or type(checked_at) not in (int, float) or not math.isfinite(checked_at):
+            return None
+        age = time.time() - checked_at
+        if -_CLOCK_SKEW_SECONDS <= age < CACHE_SECONDS:
+            return (not online, max(age, 0.0))
     except Exception:  # health: allow BLE001 -- missing, torn or foreign file: just probe
         logger.debug("network probe: no usable shared result", exc_info=True)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     return None
 
 
@@ -135,9 +158,10 @@ def box_is_offline() -> bool:
             return _cached[1]
     shared = _read_shared()
     if shared is not None:
+        offline, age = shared
         with _lock:
-            _cached = (now, shared)
-        return shared
+            _cached = (now - age, offline)  # expires at the original checked_at + CACHE_SECONDS
+        return offline
     try:
         offline = _probe_offline()
     except Exception:  # health: allow BLE001 -- a broken probe must not silence alerts
