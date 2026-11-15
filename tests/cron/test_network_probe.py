@@ -123,7 +123,7 @@ def _write_cache(text):
 def test_shared_result_needs_a_json_bool_online(monkeypatch, online):
     probes = []
     monkeypatch.setattr(network_probe, "_probe_offline", lambda: probes.append(1) or False)
-    _write_cache('{"checked_at": %s, "online": %s}' % (time.time(), online))
+    _write_cache(f'{{"checked_at": {time.time()}, "online": {online}}}')
     assert network_probe.box_is_offline() is False
     assert probes == [1], "a non-bool online value must not be trusted as an offline answer"
 
@@ -132,7 +132,7 @@ def test_shared_result_needs_a_json_bool_online(monkeypatch, online):
 def test_shared_result_needs_a_finite_past_checked_at(monkeypatch, stamp):
     probes = []
     monkeypatch.setattr(network_probe, "_probe_offline", lambda: probes.append(1) or False)
-    _write_cache('{"checked_at": %s, "online": false}' % stamp)
+    _write_cache(f'{{"checked_at": {stamp}, "online": false}}')
     assert network_probe.box_is_offline() is False
     assert probes == [1]
 
@@ -140,7 +140,7 @@ def test_shared_result_needs_a_finite_past_checked_at(monkeypatch, stamp):
 def test_oversized_shared_file_is_ignored(monkeypatch):
     probes = []
     monkeypatch.setattr(network_probe, "_probe_offline", lambda: probes.append(1) or False)
-    _write_cache('{"checked_at": %s, "online": false, "pad": "%s"}' % (time.time(), "x" * 8192))
+    _write_cache(f'{{"checked_at": {time.time()}, "online": false, "pad": "{"x" * 8192}"}}')
     assert network_probe.box_is_offline() is False
     assert probes == [1]
 

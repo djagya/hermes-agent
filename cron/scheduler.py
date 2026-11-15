@@ -3126,6 +3126,7 @@ def _quiet_network_failures() -> bool:
         cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
         return isinstance(cron_cfg, dict) and cron_cfg.get("quiet_network_failures") is True
     except Exception:
+        logger.debug("cron.quiet_network_failures unreadable; network quieting stays off", exc_info=True)
         return False
 
 

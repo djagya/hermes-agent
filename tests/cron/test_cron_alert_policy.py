@@ -485,7 +485,7 @@ def test_switch_off_crash_and_worker_paths_alert(store, quieting_off):
         for i, text in enumerate(("ConnectError: all connection attempts failed",
                                   "Restart-safe cron worker dispatch failed: refresh failed")):
             job = _job(id=f"crash-{i}")
-            err, outcome = sched._deliver_crash_failure(job, text, adapters={}, loop=None)
+            _err, outcome = sched._deliver_crash_failure(job, text, adapters={}, loop=None)
             assert outcome != "suppressed" and len(sent) == i + 1
             assert "_transient_network" not in job
     assert quieting_off == []
