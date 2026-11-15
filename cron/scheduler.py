@@ -3100,6 +3100,15 @@ def _record_fire_ownership_lost(
             execution_id, "Fire claim ownership lost; stale result was discarded.")
 
 
+def _is_transient_network_run(job: dict, error: str, agent_declared: bool = False) -> bool:
+    """A failed run that is a network-class failure: the allow-list match, or the run's own
+    never-reached-the-model flag (transient network/DNS error, zero API calls)."""
+    from cron.transient_network import is_transient_network_failure
+
+    return bool(job.get("_model_unreachable")) or is_transient_network_failure(
+        error, agent_declared=agent_declared)
+
+
 def _compose_run_delivery(
     job: dict, *, success: bool, error, final_response: str, output_file,
     agent_declared: bool = False,
@@ -3125,6 +3134,13 @@ def _compose_run_delivery(
         if int(job.get("failure_streak") or 0) > 0:
             logger.info("Job '%s': recovered after %s failed run(s)", job["id"], job.get("failure_streak"))
         _resolve_incidents_for_recovered_job(job)
+    elif _is_transient_network_run(job, err, agent_declared):
+        # DNS / connection-class failure (cron/transient_network.py): ledger row, no streak, no
+        # notice. ``_transient_network`` tells the bookkeeping tail to leave the streak alone.
+        from cron.transient_network import record_transient_network_incident
+        record_transient_network_incident(job, err, output_file)
+        job["_transient_network"] = True
+        deliver_content = ""
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
@@ -3352,6 +3368,11 @@ def _deliver_crash_failure(
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
+    if _is_transient_network_run(job, err_text):
+        from cron.transient_network import record_transient_network_incident
+        record_transient_network_incident(job, err_text)
+        job["_transient_network"] = True
+        return None, "suppressed"
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
         return None, "suppressed_acked"
@@ -3654,6 +3675,8 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if contained:
                     mark_kwargs["delivery_error"] = delivery_error
+                if job.pop("_transient_network", False):
+                    mark_kwargs["transient_network"] = True
                 from cron.unreachable_retry import is_retry_run
                 if is_retry_run(job):
                     # A crashed ladder re-run: its occurrence already counted toward repeat.

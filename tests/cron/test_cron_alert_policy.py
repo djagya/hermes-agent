@@ -159,3 +159,75 @@ def test_cli_edit_sets_and_clears_policy(store):
     stored = next(j for j in cron_jobs.load_jobs() if j["id"] == "alert-policy-test")
     assert stored.get("alert_after_consecutive_failures") is None
     assert stored["alert_when_stale_minutes"] == 30
+
+
+# Network-class failures (cron/transient_network.py): recorded, never counted, never pinged.
+_DNS_ERRORS = [
+    "curl: (6) Could not resolve host: api.example.invalid",
+    "Script exited with code 1\nstderr:\nssh: Temporary failure in name resolution\nstdout:\n",
+    "ConnectError: [Errno -2] Name or service not known",
+    "httpx.ConnectError: all connection attempts failed",
+    "ConnectionResetError: [Errno 104] Connection reset by peer",
+    "OSError: [Errno 111] Connection refused",
+    "net/http: TLS handshake timeout",
+]
+
+
+@pytest.mark.parametrize("text", _DNS_ERRORS)
+def test_transient_network_signatures_match(text):
+    from cron.transient_network import is_transient_network_failure
+
+    assert is_transient_network_failure(text)
+
+
+@pytest.mark.parametrize("text", [
+    "", "mail provider 503", "RuntimeError: boom", "401 Unauthorized", "Script timed out after 60s: x.sh",
+    "KeyError: 'connection'",
+])
+def test_non_network_text_does_not_match(text):
+    from cron.transient_network import is_transient_network_failure
+
+    assert not is_transient_network_failure(text)
+
+
+def test_agent_declared_failure_prose_is_never_network_class():
+    from cron.transient_network import is_transient_network_failure
+
+    assert not is_transient_network_failure("the portal said connection refused", agent_declared=True)
+
+
+def test_fourteen_dns_failures_in_one_tick_deliver_nothing_and_leave_no_streak(store):
+    deliveries = []
+    ids = [f"dns-job-{i}" for i in range(14)]
+    cron_jobs.save_jobs([_job(id=i, name=i) for i in ids])
+    for job_id in ids:
+        _tick(job_id, store, deliveries, error="ConnectError: [Errno -2] Name or service not known")
+    assert deliveries == []
+    stored = {j["id"]: j for j in cron_jobs.load_jobs()}
+    assert all(int(stored[i].get("failure_streak") or 0) == 0 for i in ids)
+    assert all("failing_since" not in stored[i] for i in ids)
+    assert stored[ids[0]]["last_status"] == "error"
+    kinds = {inc["failure_type"] for inc in incidents.list_incidents()}
+    assert kinds == {"transient_network"}
+    assert incidents.count_incidents() == 14
+
+
+def test_network_failures_do_not_walk_a_job_toward_its_alert_threshold(store):
+    deliveries = []
+    cron_jobs.save_jobs([_job(alert_after_consecutive_failures=2)])
+    for _ in range(5):
+        _tick("alert-policy-test", store, deliveries, error="Could not resolve host: x.invalid")
+    assert deliveries == []
+    # A real failure still counts from zero and alerts at its own threshold.
+    _tick("alert-policy-test", store, deliveries, error="mail provider 503")
+    assert deliveries == []
+    _tick("alert-policy-test", store, deliveries, error="mail provider 503")
+    assert len(deliveries) == 1 and deliveries[0][1] is True
+
+
+def test_non_network_failure_still_alerts_exactly_as_before(store):
+    deliveries = []
+    cron_jobs.save_jobs([_job()])
+    _tick("alert-policy-test", store, deliveries, error="mail provider 503")
+    assert len(deliveries) == 1 and deliveries[0][1] is True
+    assert incidents.list_incidents()[0]["failure_type"] != "transient_network"
