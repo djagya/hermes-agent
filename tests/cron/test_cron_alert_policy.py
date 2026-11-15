@@ -64,6 +64,16 @@ def _tick(job_id, tmp_path, deliveries, *, error=None, answer="ok"):
         sched.drain_delivery_queue(adapters={}, loop=None)
 
 
+_REAL_QUIET_SWITCH = sched._quiet_network_failures
+
+
+@pytest.fixture(autouse=True)
+def _quiet_network_on(monkeypatch):
+    """The network quieting under test is experimental and off by default (``cron.quiet_network_failures``);
+    these tests exercise it, so they turn it on. The switch-off tests below turn it off again."""
+    monkeypatch.setattr(sched, "_quiet_network_failures", lambda: True)
+
+
 @pytest.fixture
 def store(monkeypatch, tmp_path, cron_owner):
     monkeypatch.setattr(incidents, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
@@ -429,3 +439,62 @@ def test_explicit_failure_type_updates_an_existing_incident(store):
     assert incidents.get_incident(incident_id)["failure_type"] == "transient_network"
     incidents.upsert_incident("job-1", "boom 503")
     assert incidents.get_incident(incident_id)["failure_type"] == "transient_network"
+
+
+# cron.quiet_network_failures off (the default): failures alert exactly as before the feature.
+
+@pytest.fixture
+def quieting_off(monkeypatch):
+    monkeypatch.setattr(sched, "_quiet_network_failures", _REAL_QUIET_SWITCH)  # real config reader
+    from cron import network_probe
+
+    probes = []
+    monkeypatch.setattr(network_probe, "_probe_offline", lambda: probes.append(1) or True)
+    return probes
+
+
+def test_switch_reads_only_a_literal_true(store, monkeypatch):
+    monkeypatch.setattr(sched, "_quiet_network_failures", _REAL_QUIET_SWITCH)
+    for text, expected in (("", False), ("quiet_network_failures: true", True),
+                           ("quiet_network_failures: false", False), ('quiet_network_failures: "true"', False),
+                           ("quiet_network_failures: 1", False)):
+        (store / "config.yaml").write_text("cron:\n  preflight: false\n  " + text + "\n", encoding="utf-8")
+        assert sched._quiet_network_failures() is expected, text
+
+
+def test_switch_off_dns_failure_and_offline_probe_alert_through_the_main_path(store, quieting_off):
+    deliveries = []
+    spent = {"attempt": 3, "at": None, "expr": None}  # base's own re-run hold is not under test
+    cron_jobs.save_jobs([_job(id="dns", unreachable_retry=dict(spent)),
+                         _job(id="odd", name="odd", unreachable_retry=dict(spent))])
+    _tick("dns", store, deliveries, error="ConnectError: [Errno -2] Name or service not known")
+    _tick("odd", store, deliveries, error="refresh failed (exit 1)")  # offline probe says True
+    assert [d[1] for d in deliveries] == [True, True], "both alert"
+    assert quieting_off == [], "no probe is ever called while the switch is off"
+    stored = {j["id"]: j for j in cron_jobs.load_jobs()}
+    assert all(int(j.get("failure_streak") or 0) == 1 for j in stored.values())
+    assert all("network_failing_since" not in j for j in stored.values())
+    assert "transient_network" not in {inc["failure_type"] for inc in incidents.list_incidents()}
+
+
+def test_switch_off_crash_and_worker_paths_alert(store, quieting_off):
+    sent = []
+    with patch.object(sched, "_deliver_result", side_effect=lambda jb, content, **kw: sent.append(content)):
+        # _deliver_crash_failure serves the crash path, record_unknown_worker_outcome and the
+        # pre-handoff dispatch failure alike.
+        for i, text in enumerate(("ConnectError: all connection attempts failed",
+                                  "Restart-safe cron worker dispatch failed: refresh failed")):
+            job = _job(id=f"crash-{i}")
+            err, outcome = sched._deliver_crash_failure(job, text, adapters={}, loop=None)
+            assert outcome != "suppressed" and len(sent) == i + 1
+            assert "_transient_network" not in job
+    assert quieting_off == []
+
+
+def test_switch_off_keeps_the_pending_rerun_hold_and_ignores_it_when_crashed(store, quieting_off):
+    flagged = _job(_model_unreachable=True)
+    assert sched._is_transient_network_run(dict(flagged), "boom") is True
+    assert sched._is_transient_network_run(dict(flagged), "ConnectError: x", crashed=True) is False
+    exhausted = _job(_model_unreachable=True, unreachable_retry={"attempt": 3, "at": None, "expr": None})
+    assert sched._is_transient_network_run(exhausted, "boom") is False
+    assert quieting_off == []

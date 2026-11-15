@@ -3117,6 +3117,18 @@ def _record_fire_ownership_lost(
             execution_id, "Fire claim ownership lost; stale result was discarded.")
 
 
+def _quiet_network_failures() -> bool:
+    """``cron.quiet_network_failures``: experimental, default OFF; only a literal ``true`` turns on
+    the message and probe based network-class quieting of ``_is_transient_network_run``."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return isinstance(cron_cfg, dict) and cron_cfg.get("quiet_network_failures") is True
+    except Exception:
+        return False
+
+
 def _is_transient_network_run(
     job: dict, error: str, agent_declared: bool = False, *, crashed: bool = False,
 ) -> bool:
@@ -3132,9 +3144,18 @@ def _is_transient_network_run(
 
     ``crashed``: the run raised out of ``run_job``. The run's ``_model_unreachable`` flag may then
     be stale (set before an unrelated bookkeeping crash) and the crash is not evidence the box is
-    offline, so only the error text counts."""
+    offline, so only the error text counts.
+
+    ``cron.quiet_network_failures`` (default off, experimental): while off, only the
+    never-reached-the-model hold above applies (as before this feature); no error text is
+    classified, no probe runs, nothing else is quieted."""
     from cron.transient_network import is_transient_network_failure, network_failing_too_long
 
+    if not _quiet_network_failures():
+        if crashed or not job.get("_model_unreachable"):
+            return False
+        from cron.unreachable_retry import will_retry
+        return bool(will_retry(job))
     hours = _failure_repeat_alert_hours()
     if network_failing_too_long(job, hours if hours > 0 else DEFAULT_FAILURE_REPEAT_ALERT_HOURS):
         return False

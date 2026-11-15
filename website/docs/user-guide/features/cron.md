@@ -625,9 +625,21 @@ repeat) or `closed` (acknowledged; terminal for that signature). Stored error
 text is secret-redacted and truncated before it is written.
 
 
-### Network outages do not alert (until they last)
+### Network outages do not alert (experimental, off by default)
 
-When the host loses DNS or its uplink, every job that runs in that window fails,
+This is experimental and **off by default**. Enable it with a literal `true`:
+
+```yaml
+cron:
+  quiet_network_failures: true   # default false; any other value leaves it off
+```
+
+While it is off, no error text is classified as a network failure and the
+connectivity probe never runs: every failure alerts as described above. The
+only quieting that remains is the bounded automatic re-run of a run that never
+reached the model (while a re-run is still pending).
+
+With it on, when the host loses DNS or its uplink, every job that runs in that window fails,
 and one ping per job would bury the real failures. A failed run is treated as a
 network-class failure, with no failure notice and no step on the job's failure
 streak, when either:
@@ -646,7 +658,7 @@ The failure is still recorded in the incident ledger (`hermes cron incidents`,
 type `transient_network`) and in the run history. A job's own `[CRON_FAILURE]`
 verdict is never classified as a network failure.
 
-This never silences a job for good. The first such failure stamps
+With the switch on, the quieting is bounded, not permanent. The first such failure stamps
 `network_failing_since` on the job (cleared by a successful run). Once it is older
 than `cron.failure_repeat_alert_hours` (default 6), the next failure takes the
 normal path: it counts, and it alerts once per reminder window.
