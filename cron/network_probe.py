@@ -1,61 +1,154 @@
-"""Is this host offline right now? One cached answer per scheduler tick.
+"""Is this host offline right now? One shared answer per minute.
 
 The message classifier (``cron.transient_network``) knows the network phrases, but the failures
 an outage really produces are often worded by the job itself ("push refused (HTTP no answer)",
 "refresh failed (exit 1)", "Script timed out after 180s"). When a run fails the scheduler asks
-here once: resolve and TCP-connect to a few well-known HTTPS endpoints with a short timeout. Host
-offline means every probe target is unreachable; one reachable target means the host is online,
-so a single remote service being down never silences anything. The answer is cached for
-``CACHE_SECONDS`` so 14 jobs failing in one tick cost one probe, not 14.
+here: resolve and TCP-connect to a few well-known HTTPS endpoints, all at once, under one overall
+deadline (DNS included). Host offline means every probe target answered "unreachable" with a
+connectivity error before the deadline; one reachable target means the host is online, so a single
+remote service being down never silences anything. The answer is cached for ``CACHE_SECONDS`` in
+the process and in a small JSON file under ``HERMES_HOME`` (managed jobs run in separate worker
+processes, so 14 jobs failing in one tick still cost one probe, not 14).
 
-Fails open: any unexpected error says "online", i.e. the normal alert path.
+Fails open: a deadline, a local resource error (EMFILE, EACCES, ...) or any other unexpected error
+says "online", i.e. the normal alert path. No lock is held across network I/O.
 """
 
 from __future__ import annotations
 
+import errno
+import json
+import os
+import queue
 import socket
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 PROBE_TARGETS: tuple[tuple[str, int], ...] = (("api.telegram.org", 443), ("github.com", 443))
 CONNECT_TIMEOUT_SECONDS = 3.0
+PROBE_DEADLINE_SECONDS = 5.0
 CACHE_SECONDS = 60.0
+_CACHE_FILE = ("cron", ".network_probe.json")
 
-_lock = threading.Lock()
+# Only these mean "the network is not there"; any other failure is a local problem, not an outage.
+_CONNECTIVITY_ERRNOS = frozenset(
+    getattr(errno, name) for name in ("EHOSTUNREACH", "ENETUNREACH", "ENETDOWN") if hasattr(errno, name))
+_CONNECTIVITY_ERRORS = (
+    ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError, socket.timeout, TimeoutError,
+    socket.gaierror,
+)
+
+_lock = threading.Lock()  # guards ``_cached`` only, never held across network or file I/O
 _cached: Optional[tuple[float, bool]] = None  # (monotonic stamp, offline)
 
 
+def _is_connectivity_error(exc: BaseException) -> bool:
+    return isinstance(exc, _CONNECTIVITY_ERRORS) or (
+        isinstance(exc, OSError) and exc.errno in _CONNECTIVITY_ERRNOS)
+
+
 def _reachable(host: str, port: int) -> bool:
-    """Resolve *host* and open a TCP connection to it; any failure is "not reachable"."""
+    """Resolve *host* and open a TCP connection to it. False only for a connectivity error; any
+    other failure (descriptor exhaustion, permissions, ...) is not evidence of an outage, so True."""
     try:
         with socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_SECONDS):
             return True
-    except OSError:
-        return False
+    except Exception as exc:  # health: allow BLE001 -- only connectivity errors count as unreachable
+        return not _is_connectivity_error(exc)
 
 
 def _probe_offline() -> bool:
-    return not any(_reachable(host, port) for host, port in PROBE_TARGETS)
+    """Probe every target concurrently (daemon threads: DNS ignores socket timeouts) and wait at
+    most ``PROBE_DEADLINE_SECONDS`` overall. Offline only when every target reported unreachable in
+    time; a reachable target, a missed deadline or a failing probe thread means online."""
+    results: queue.Queue[bool] = queue.Queue()
+
+    def _run(host: str, port: int) -> None:
+        try:
+            results.put(bool(_reachable(host, port)))
+        except Exception:  # health: allow BLE001 -- a broken probe must not silence alerts
+            results.put(True)
+
+    for host, port in PROBE_TARGETS:
+        threading.Thread(target=_run, args=(host, port), daemon=True, name="network-probe").start()
+    deadline = time.monotonic() + PROBE_DEADLINE_SECONDS
+    for _ in PROBE_TARGETS:
+        try:
+            if results.get(timeout=max(deadline - time.monotonic(), 0.0)):
+                return False
+        except queue.Empty:
+            return False
+    return True
+
+
+def _cache_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home().joinpath(*_CACHE_FILE)
+
+
+def _read_shared() -> Optional[bool]:
+    """The offline answer another process stored less than ``CACHE_SECONDS`` ago, else None."""
+    try:
+        data = json.loads(_cache_path().read_text(encoding="utf-8"))
+        age = time.time() - float(data["checked_at"])
+        if 0 <= age < CACHE_SECONDS:
+            return not bool(data["online"])
+    except Exception:  # health: allow BLE001 -- missing, torn or foreign file: just probe
+        pass
+    return None
+
+
+def _write_shared(offline: bool) -> None:
+    """Best-effort atomic write; an unwritable HERMES_HOME leaves only the in-process cache."""
+    tmp_name = None
+    try:
+        path = _cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".network_probe.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"checked_at": time.time(), "online": not offline}, handle)
+        os.replace(tmp_name, path)
+        tmp_name = None
+    except Exception:  # health: allow BLE001 -- the shared cache is an optimisation only
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 
 def box_is_offline() -> bool:
-    """True when no probe target is reachable. Cached for ``CACHE_SECONDS``."""
+    """True when every probe target is unreachable. Cached for ``CACHE_SECONDS`` (process + file)."""
     global _cached
+    now = time.monotonic()
     with _lock:
-        now = time.monotonic()
         if _cached is not None and now - _cached[0] < CACHE_SECONDS:
             return _cached[1]
-        try:
-            offline = _probe_offline()
-        except Exception:  # health: allow BLE001 -- a broken probe must not silence alerts
-            offline = False
-        _cached = (now, offline)
-        return offline
+    shared = _read_shared()
+    if shared is not None:
+        with _lock:
+            _cached = (now, shared)
+        return shared
+    try:
+        offline = _probe_offline()
+    except Exception:  # health: allow BLE001 -- a broken probe must not silence alerts
+        offline = False
+    with _lock:
+        _cached = (time.monotonic(), offline)
+    _write_shared(offline)
+    return offline
 
 
 def reset_cache() -> None:
-    """Forget the cached answer (tests)."""
+    """Forget the cached answer, in process and on disk (tests)."""
     global _cached
     with _lock:
         _cached = None
+    try:
+        _cache_path().unlink()
+    except Exception:  # health: allow BLE001 -- nothing to forget
+        pass

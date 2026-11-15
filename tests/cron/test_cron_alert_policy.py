@@ -195,6 +195,8 @@ def test_transient_network_signatures_match(text):
     # A script's stdout is its own report, never the reason the run failed.
     "Script exited with code 1\nstderr:\nKeyError: 'x'\nstdout:\nconnection reset by peer\nConnectError: x",
     "Script exited with code 1\nstdout:\nCould not resolve host: a.invalid",
+    # Long stdout ending in a network phrase cannot push the real stderr error out of view.
+    "Script exited with code 1\nstderr:\nKeyError: 'x'\nstdout:\n" + "report line\n" * 1000 + "connection reset by peer",
     # Earlier chatter in stderr does not hide the fatal last line.
     "Script exited with code 1\nstderr:\nretrying after connection refused\nRuntimeError: dead\nstdout:\n",
 ])
@@ -392,6 +394,18 @@ def test_exhausted_unreachable_ladder_alerts_but_a_pending_rung_does_not(store):
     cron_jobs.save_jobs([_job(unreachable_retry={"attempt": 3, "at": None, "expr": None})])
     _tick("alert-policy-test", store, deliveries, error=err)
     assert len(deliveries) == 1 and deliveries[0][1] is True, "ladder exhausted: an ordinary alert"
+
+
+def test_exhausted_unreachable_ladder_alerts_even_when_the_box_is_offline(store, monkeypatch):
+    import socket
+    from cron import network_probe
+
+    monkeypatch.setattr(network_probe, "_probe_offline", lambda: True)
+    deliveries = []
+    err = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    cron_jobs.save_jobs([_job(unreachable_retry={"attempt": 3, "at": None, "expr": None})])
+    _tick("alert-policy-test", store, deliveries, error=err)
+    assert len(deliveries) == 1 and deliveries[0][1] is True, "exhausted: the offline probe is not consulted"
 
 
 def test_crash_path_is_not_silenced_by_a_stale_unreachable_flag(store):

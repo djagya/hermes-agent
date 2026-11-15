@@ -3142,9 +3142,9 @@ def _is_transient_network_run(
         return is_transient_network_failure(error, agent_declared=agent_declared)
     if job.get("_model_unreachable"):
         from cron.unreachable_retry import will_retry
-        if will_retry(job):
-            return True
-    elif is_transient_network_failure(error, agent_declared=agent_declared):
+        # Flagged: the retry decision is final. Exhausted, it alerts; the probe is not consulted.
+        return bool(will_retry(job))
+    if is_transient_network_failure(error, agent_declared=agent_declared):
         return True
     if agent_declared:
         return False

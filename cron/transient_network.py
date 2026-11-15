@@ -56,12 +56,13 @@ def _error_lines(error: str) -> list[str]:
     """The lines that name the failing step. A script failure (``Script exited with code N`` then
     ``stderr:`` / ``stdout:``) contributes its stderr only; the script's stdout is its own report
     and never evidence of why the run failed."""
-    text = error[-_MAX_SCANNED_CHARS:]
-    match = _STDERR_RE.search(text)
+    match = _STDERR_RE.search(error)  # split first: a long stdout must not push stderr out of view
     if match:
-        text = match.group(1)
-    elif text.lstrip().startswith("Script exited with code"):
+        text = match.group(1)[-_MAX_SCANNED_CHARS:]
+    elif error.lstrip().startswith("Script exited with code"):
         return []
+    else:
+        text = error[-_MAX_SCANNED_CHARS:]
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not lines:
         return []
