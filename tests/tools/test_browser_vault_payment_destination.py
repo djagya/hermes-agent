@@ -958,7 +958,7 @@ def test_the_two_discovery_passes_share_one_deadline_and_end_in_the_typed_refusa
 
 class _StalledFallback(_DiscoveryPage):
     """r10: the strict pass refuses (the form only shown), the shown fallback stalls at ``stall`` (the card document's
-    describe() or its owner check) until the fallback deadline cancels it; from then on each release takes 0.6 s."""
+    describe() or its owner check) until the fallback deadline cancels it; from then on each release takes 1.5 s."""
 
     def __init__(self, stall):
         super().__init__(_PAGE, exposed={"ad"}, shown={"kps"}, controls={"kps": _CARD_FORM})
@@ -972,15 +972,15 @@ class _StalledFallback(_DiscoveryPage):
             self.slow = True
             await asyncio.sleep(10)  # health: allow HX013 -- a stalled CDP call the fallback deadline cancels
         if method == "Runtime.releaseObject" and self.slow:
-            await asyncio.sleep(0.6)  # health: allow HX013 -- a stalled release: the cleanup's length is under test
+            await asyncio.sleep(1.5)  # health: allow HX013 -- a stalled release: the cleanup's length is under test
             self.done.append(obj)
         return await super()._cdp(method, params, session_id, timeout)
 
     async def refused(self):
         start = time.monotonic()
         with pytest.raises(PaymentDestinationError) as caught:
-            await asyncio.wait_for(self._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0), 1.0)
-        assert caught.value.error_type == "payment_fields_unsupported" and time.monotonic() - start < 1.0
+            await asyncio.wait_for(self._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=2.5), 2.5)
+        assert caught.value.error_type == "payment_fields_unsupported" and time.monotonic() - start < 2.5
         return set(self._payment_cleanups)
 
 
@@ -988,19 +988,19 @@ class _StalledFallback(_DiscoveryPage):
 def test_a_cancelled_fallback_cleanup_is_bounded_and_finishes_in_the_background(monkeypatch, stall):
     """r10 (Codex, Kimi r9 P2): the fallback deadline cancels the shown pass; its real cleanup then releases three
     pinned documents one after another (or, cancelled inside an owner check, that owner's release first), each stalled
-    past the reserve. Scaled 1:25 (wrapper 1.0 s, reserve 0.48 s, margin 0.08 s): the strict refusal comes back before
+    past the reserve. Scaled 1:10 (wrapper 2.5 s, reserve 1.2 s, margin 0.5 s; tests/AGENTS.md wants >= 2 s windows): the strict refusal comes back before
     the wrapper, the releases go on in the background (tracked on the supervisor) and all finish; supervisor shutdown
     cancels a cleanup still running."""
     from tools.browser_supervisor import CDPSupervisor
 
-    monkeypatch.setattr(sp, "_INSPECT_CLEANUP_RESERVE_S", 0.48)
-    monkeypatch.setattr(sp, "_INSPECT_MARGIN_S", 0.08)
+    monkeypatch.setattr(sp, "_INSPECT_CLEANUP_RESERVE_S", 1.2)
+    monkeypatch.setattr(sp, "_INSPECT_MARGIN_S", 0.5)
     page = _StalledFallback(stall)
 
     async def go():
         tracked = await page.refused()
         assert tracked and not any(t.done() for t in tracked) and len(page.done) < 3
-        await asyncio.wait(tracked, timeout=5)
+        await asyncio.wait(tracked, timeout=12)
         assert page._payment_cleanups == set()
 
     asyncio.run(go())
