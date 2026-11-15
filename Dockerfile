@@ -687,13 +687,19 @@ RUN mkdir -p /opt/data && chmod 0644 /opt/hermes/tools/facts.json && \
 # keep the pinned capture/transcode binaries and their store metadata intact.
 # Prune in the assembler, before the final-stage COPY, not in the published
 # image (a later rm would leave the bytes in an earlier layer).
-# The same RUN drops the npm bundled inside the Node tarball (its vendored
-# undici/tar/brace-expansion/ip-address lag the managed npm). Only pm's npm
-# install used it, to unpack the pinned npm; /usr/local/bin/npm and npx are
-# the managed npm, so the bundled tree and node's own bin/npm|npx links go.
+# The same RUN replaces the npm bundled inside the Node tarball with the
+# managed, sha-verified npm tree (its vendored undici/tar/brace-expansion/
+# ip-address lag the managed npm). The tree stays in place: pm's npm install
+# runs node's lib/node_modules/npm/bin/npm-cli.js to unpack the pinned npm,
+# and node's bin/npm|npx links point at it. Pruning changes tool bytes after
+# pm recorded their digests, so refresh them once pruning is done and assert
+# they match (a stale digest fails `hermes pm doctor` and rejects the baked
+# entry on an explicit install).
 RUN python3 -c 'from pm import installed_package; p = installed_package("ffmpeg").binary.with_name("ffplay"); p.unlink()' && \
-    python3 -c 'import shutil; from pm import installed_package; node = installed_package("node").binary.resolve().parent; shutil.rmtree(node.parent / "lib/node_modules/npm"); [(node / name).unlink(missing_ok=True) for name in ("npm", "npx")]; assert not (node.parent / "lib/node_modules/npm").exists()' && \
+    python3 -c 'from pm import installed_package; from scripts.bundles.payload import graft_npm; graft_npm(installed_package("node").binary.resolve().parent.parent, installed_package("npm").binary.parent.parent)' && \
+    python3 -c 'from pathlib import Path; from scripts.bundles.payload import rehash_tools, verify_tools; root = Path("/opt/hermes"); rehash_tools(root); print("verified", verify_tools(root), "payload tools")' && \
     npm --version && \
+    node "$(python3 -c 'from pm import installed_package; print(installed_package("node").binary.resolve().parent.parent / "lib/node_modules/npm/bin/npm-cli.js")')" --version && \
     mkdir -p /runtime-cut && \
     mv /opt/hermes/tools /opt/hermes/.venv /runtime-cut/
 
