@@ -33,8 +33,8 @@ def _job(**overrides):
     return job
 
 
-def _tick(job_id, tmp_path, deliveries, *, error=None):
-    """One real run_one_job tick; the agent raises ``error`` or answers "ok"."""
+def _tick(job_id, tmp_path, deliveries, *, error=None, answer="ok"):
+    """One real run_one_job tick; the agent raises ``error`` or answers ``answer``."""
     def fake_deliver(jb, content, adapters=None, loop=None, **kwargs):
         deliveries.append((content, kwargs.get("for_failure", False)))
 
@@ -53,7 +53,7 @@ def _tick(job_id, tmp_path, deliveries, *, error=None):
         if error:
             agent.run_conversation.side_effect = RuntimeError(error)
         else:
-            agent.run_conversation.return_value = {"final_response": "ok"}
+            agent.run_conversation.return_value = {"final_response": answer}
         agent_cls.return_value = agent
         sched.run_one_job(dict(job))
         # dlz: since v0.23.0 a run with an execution id queues its result and failure notice
@@ -231,3 +231,32 @@ def test_non_network_failure_still_alerts_exactly_as_before(store):
     _tick("alert-policy-test", store, deliveries, error="mail provider 503")
     assert len(deliveries) == 1 and deliveries[0][1] is True
     assert incidents.list_incidents()[0]["failure_type"] != "transient_network"
+
+
+_REFUSALS = [
+    "Your request was not processed. Send it again if you still want me to carry it out.",
+    "  This turn did not complete. Some actions may already have run; verify their effects before resending.\n",
+    "This message was refused by the model's safety filter — try a different query.",
+]
+
+
+@pytest.mark.parametrize("answer", _REFUSALS)
+def test_refusal_notice_as_final_response_is_a_failed_run_never_the_message(store, answer):
+    deliveries = []
+    cron_jobs.save_jobs([_job(alert_after_consecutive_failures=2)])
+    _tick("alert-policy-test", store, deliveries, answer=answer)
+    stored = next(j for j in cron_jobs.load_jobs() if j["id"] == "alert-policy-test")
+    assert stored["last_status"] == "error" and stored["failure_streak"] == 1
+    assert not any(answer.strip() in content for content, _ in deliveries), "the refusal is not the message"
+    assert deliveries == [], "below the threshold: nothing delivered"
+    _tick("alert-policy-test", store, deliveries, answer=answer)
+    assert len(deliveries) == 1 and deliveries[0][1] is True, "thresholds apply: the failure lane alerts"
+    assert "provider refusal" in deliveries[0][0], "it reads as a failure notice, not as the job's message"
+
+
+def test_report_that_quotes_a_refusal_notice_stays_a_report(store):
+    deliveries = []
+    cron_jobs.save_jobs([_job()])
+    text = "Summary: the assistant said 'Your request was not processed.' once last night."
+    _tick("alert-policy-test", store, deliveries, answer=text)
+    assert deliveries == [(text, False)]

@@ -2189,6 +2189,16 @@ def _run_agent_with_watchdog(
     return result
 
 
+def _is_refusal_boundary_text(text: str) -> bool:
+    """True when *text* is exactly one of the Hermes-authored refusal / failed-turn notices."""
+    from agent.turn_failure_copy import CONTENT_REFUSED_NOTICE, untyped_failed_turn_display_kind
+
+    stripped = str(text or "").strip()
+    return bool(stripped) and (
+        untyped_failed_turn_display_kind("assistant", stripped) is not None
+        or stripped == CONTENT_REFUSED_NOTICE)
+
+
 def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgent) -> str:
     """Deliverable final response from a ``run_conversation`` result. Raises RuntimeError on
     `failed=True`/`completed=False`: the error text may sit in `final_response` and would otherwise
@@ -2210,6 +2220,13 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
             job_name)
 
     final_response = result.get("final_response", "") or ""
+    # A provider refusal or failed-turn boundary notice is a failed run, never the job's message
+    # (11-11: "Your request was not processed..." was delivered as a cron result). Exact text only,
+    # like ``untyped_failed_turn_display_kind``: a real report quoting the notice stays a report.
+    if _is_refusal_boundary_text(final_response):
+        raise RuntimeError(
+            "The model's turn ended in a provider refusal or failed-turn notice instead of a reply: "
+            + final_response.strip()[:120])
     # Repair model-mangled computer_use media paths before delivery (fail-open, as in gateway).
     if final_response:
         from gateway.media_repair import repair_explicit_computer_use_media_paths
