@@ -29,6 +29,9 @@ from agent.vault_payment_policy import (
 from tools.browser_supervisor_payment_auto import AUTO_BUDGET_SECONDS, PaymentAutoMixin
 from tools.browser_supervisor_payment_closure import _INSPECT_TEMPLATE
 from tools.browser_supervisor_payment_repin import MAX_REPINS, located, repin_pins, valid_check, valid_pause
+from tools.browser_supervisor_payment_stop import admission_strict as _admission_strict
+from tools.browser_supervisor_payment_stop import strict_exposure as _strict_exposure
+from tools.browser_supervisor_payment_stop import await_cleanup, release_object, strict_then_shown
 
 
 _MAX_CARD_DOCUMENTS = 4
@@ -92,6 +95,8 @@ _SETTLE_SECONDS = 2.0
 _COMMIT_BUDGET_SECONDS = 20.0
 # dlz: one inspection's life, and so the owner's approval window (owner 2026-11-13: 5 min, was 120 s).
 INSPECTION_WINDOW_S = 300
+# r9: discovery's wrapper; cleanup bound (``discard_payment``'s); r10: what a pass's cleanup leaves the wrapper
+_INSPECT_WRAPPER_S, _INSPECT_CLEANUP_RESERVE_S, _INSPECT_MARGIN_S = 25, 12, 2
 _RETENTION_STATES = frozenset({"held", "empty", "changed", "replaced"})
 # Card fields a saved card may lack: left empty for the user instead of refusing the whole fill.
 OPTIONAL_CARD_TOKENS = frozenset({"cc-name", "postal-code"})
@@ -163,6 +168,15 @@ class PaymentInspection:
     approval: Any = field(default=None, repr=False, compare=False)
     approval_id: str = ""
     merchant_match: str = "not_checked"  # approval-qol r4 C6: the merchant page's own result (Pay is gated on it)
+    stale: str = ""  # dlz (11-14): the part of the approved page the last freshness check found changed (a fixed code)
+    # dlz (11-15, D-0094 "b"): config ``vault.payment_consent_strict_exposure`` at the discovery inspection (a re-inspection
+    # carries it over). False (the default): the frames of an unreviewed fill are judged with the reviewed providers'
+    # visibility rule (``_OWNER_VISIBLE``); True: with the strict exposure rule (``_EXPOSED``, ``_OWNER_HIT``). Only
+    # read when ``unreviewed_origins`` is set (``_strict_exposure``). That rule judges the frames bound after approval.
+    strict_exposure: bool = False
+    # dlz (11-15 r8): the rule that chose its frames, "strict" or "shown_fallback" (the strict pass found no complete
+    # card form): its end check and new-frame checks (``_relevant_unchanged``) use the same (``_admission_strict``).
+    admission: str = "strict"
 
     @property
     def controls(self) -> tuple:
@@ -438,15 +452,18 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         frame_origins: tuple = PAYMENT_PSP_ORIGINS,
         unreviewed: bool = False,
         cart: tuple | None = None,
+        strict_exposure: bool = False,
     ) -> PaymentInspection:
         """``unreviewed``: the discovery inspection (v1 §3, v2 B1-B5) that also admits unreviewed hosted frames by
-        structure. ``cart``: ``(cents, currency)`` of the stated total, for the page check (B5)."""
+        structure. ``cart``: ``(cents, currency)`` of the stated total, for the page check (B5). ``strict_exposure``
+        (discovery only; config ``vault.payment_consent_strict_exposure``): the strict exposure rule for its frames."""
         from tools.browser_supervisor import _schedule
 
         return _schedule(
-            self._inspect_payment(merchant_origin, bound_origins, frame_origins, unreviewed, cart),
+            self._inspect_payment(merchant_origin, bound_origins, frame_origins, unreviewed, cart,
+                                  strict_exposure=strict_exposure, budget=_INSPECT_WRAPPER_S),
             self._loop,
-            timeout=25,
+            timeout=_INSPECT_WRAPPER_S,
         )
 
     async def _payment_tree(
@@ -541,7 +558,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                         continue
                     finally:
                         if obj:
-                            await self._release_payment_object(parent_sid, obj)
+                            await release_object(self, parent_sid, obj)
                 if not parent:
                     continue
                 expanded += 1
@@ -577,11 +594,26 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
 
     async def _inspect_payment(
         self, origin: str, bound: tuple, allowed_frames: tuple, unreviewed: bool = False,
-        cart: tuple | None = None, prior: PaymentInspection | None = None,
+        cart: tuple | None = None, prior: PaymentInspection | None = None, strict_exposure: bool = False,
+        budget: float | None = None,
     ) -> PaymentInspection:
         """``prior`` (dlz, fill-auto): a re-inspection inside ``prior``'s approval: the same page session (never a
         tab search), its frame sessions reused, its approval window and bindings carried over; the inspect closures
-        go into the approval's isolated world, where the role record of the earlier inspections lives."""
+        go into the approval's isolated world, where the role record of the earlier inspections lives.
+        ``strict_exposure`` (11-15): the strict exposure rule for every frame (a re-inspection: ``prior``'s). Else (r8,
+        Opus P2-1) an unreviewed inspection, a re-inspection too, chooses its frames by the strict rule first (a hidden
+        copy beside the shown form stays out), by the shown rule only when that finds no complete card form."""
+        strict = unreviewed and (strict_exposure is True if prior is None else prior.strict_exposure is True)
+        end = None if budget is None else time.monotonic() + budget - _INSPECT_MARGIN_S  # r10: see await_cleanup
+        if not unreviewed or strict:
+            return await self._inspect_pass(origin, bound, allowed_frames, unreviewed, cart, prior, strict, "strict", end)
+        return await strict_then_shown(
+            lambda adm: self._inspect_pass(origin, bound, allowed_frames, True, cart, prior, False, adm, end),
+            budget, _INSPECT_CLEANUP_RESERVE_S)
+
+    async def _inspect_pass(self, origin: str, bound: tuple, allowed_frames: tuple, unreviewed: bool, cart: tuple | None,
+                            prior: PaymentInspection | None, strict: bool, admission: str,
+                            end: float | None = None) -> PaymentInspection:
         if origin:
             https_origin(origin)
         with self._state_lock:
@@ -609,7 +641,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 # The tab itself is a provider's non-card page (PayPal wallet or login), not a checkout.
                 raise PaymentPolicyError("Merchant origin mismatch")
             unreviewed_frames = await self._inspect_frames(tree, merchant, allowed_frames, unreviewed, sid,
-                                                           child_sessions, world, found)
+                                                           child_sessions, world, found, admission == "strict")
             candidates, absence = found["candidates"], found["absence"]
             if unreviewed:
                 documents = _discovery_documents(candidates, merchant, allowed_frames, unreviewed_frames)
@@ -646,13 +678,15 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 absence_frames=tuple(fid for _fsid, _obj, _origin, fid in absence),
                 free_frames=tuple(found["free"]),
                 approval_id=world,
+                strict_exposure=strict,
+                admission=admission,
             )
             if prior is not None:
                 inspection.auto, inspection.approval, inspection.policy_check = \
                     prior.auto, prior.approval, prior.policy_check
             if inspection.unreviewed_origins and \
-                    await self._shown_documents(inspection) != {d.frame_id for d in documents}:
-                # v1 §3.2: a card form the user cannot see, by the strict test over the whole owner chain.
+                    await self._shown_documents(inspection, admission=True) != {d.frame_id for d in documents}:
+                # v1 §3.2: a card form the user cannot see, over the whole owner chain, by the rule that chose it.
                 raise PaymentDestinationError("payment_fields_ambiguous", FIELDS_AMBIGUOUS,
                                               {"receiving_origins": _receiving(candidates, merchant, allowed_frames)})
             if cart is not None:
@@ -660,18 +694,14 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             return inspection
         except BaseException:  # health: allow BLE001 -- released, then re-raised unchanged (cancellation too)
             # dlz (Codex B r3 #4): one release pass of everything pinned so far, as its own task: a cancellation
-            # (the caller's timeout) cannot cut it short, and is re-raised once the pass is under way.
+            # (the caller's timeout) cannot cut it short; r10: waited for only until ``end``, then tracked.
             # dlz (fill-auto): a re-inspection shares the earlier inspection's frame sessions; only its own go.
             # By session, not by frame: a new child frame can share its parent frame's session.
             held = set() if prior is None else set(prior.child_sessions.values())
             own = {k: v for k, v in child_sessions.items() if v not in held}
-            cleanup = asyncio.ensure_future(self._release_found(found, own))
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                if not cleanup.done():
-                    raise  # dlz (Codex B r4 #4): the caller cancelled; the pass finishes behind the shield
-                # The pass itself was cancelled (after attempting every release): the original exception stands.
+            # dlz (Codex B r4 #4): a cancellation while waiting propagates, the release pass goes on; that pass's own
+            # outcome (cancelled after attempting every release) never replaces the original exception.
+            await await_cleanup(self, asyncio.ensure_future(self._release_found(found, own)), end)
             raise
 
     async def _release_found(self, found: dict, child_sessions: dict) -> None:
@@ -741,19 +771,23 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         return sid
 
     async def _frame_inspectable(self, record: tuple, by_id: dict, merchant: str, allowed_frames: tuple,
-                                 unreviewed: bool, child_sessions: dict, sid: str, exposed: dict) -> str:
+                                 unreviewed: bool, child_sessions: dict, sid: str, exposed: dict,
+                                 strict: bool = False) -> str:
         """Whether a frame gets the inspect closure: "reviewed" (admitted by the reviewed rules), "unreviewed"
-        (discovery: an exposed unreviewed hosted frame) or "" (skipped)."""
+        (discovery: a shown unreviewed hosted frame) or "" (skipped). ``strict``: the strict exposure rule (the
+        admission's: ``_inspect_payment``), else the reviewed providers' visibility rule (11-15, D-0094 "b")."""
         fid, parent = record[0], record[4]
+        rule = _EXPOSED if strict else _OWNER_VISIBLE
         if not _frame_admitted(record, by_id, merchant, allowed_frames):
             if not (unreviewed and _unreviewed_admitted(record, by_id, merchant, allowed_frames)):
                 return ""
-            # dlz (B2): only an exposed frame counts against the bound, so hidden copies cannot exhaust it.
-            return "unreviewed" if await self._chain_exposed(fid, by_id, child_sessions, sid, exposed) else ""
+            # dlz (B2): only a shown frame counts against the bound, so hidden copies cannot exhaust it.
+            return "unreviewed" if await self._chain_judged(fid, by_id, child_sessions, sid, exposed, rule) else ""
         if unreviewed:
-            # dlz (B2): discovery judges every owner <iframe> up to the page with the strict exposure test
-            # before the frame can hold a candidate: a clipped, covered or transparent copy is no candidate.
-            if parent and not await self._chain_exposed(fid, by_id, child_sessions, sid, exposed):
+            # dlz (B2): discovery judges every owner <iframe> up to the page (strict: with the exposure test)
+            # before the frame can hold a candidate: a hidden or transparent copy (strict: also clipped or covered)
+            # is no candidate.
+            if parent and not await self._chain_judged(fid, by_id, child_sessions, sid, exposed, rule):
                 return ""
         # A PSP field frame the page keeps hidden (Shopify's Maestro-only issue date and
         # number) looks visible from inside its own document; judge its iframe element.
@@ -762,7 +796,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         return "reviewed"
 
     async def _inspect_frames(self, tree: tuple, merchant: str, allowed_frames: tuple, unreviewed: bool, sid: str,
-                              child_sessions: dict, operation: str, found: dict) -> int:
+                              child_sessions: dict, operation: str, found: dict, strict: bool = False) -> int:
         """Pin the inspect closure in every inspectable frame: ``found["candidates"]`` gets each document with card
         controls, ``found["absence"]`` (discovery) each card-free one. Returns the unreviewed frames inspected."""
         by_id = {f[0]: f for f in tree}
@@ -772,7 +806,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         for record in tree:
             fid, frame_origin = record[0], record[3]
             kind = await self._frame_inspectable(record, by_id, merchant, allowed_frames, unreviewed,
-                                                 child_sessions, sid, exposed)
+                                                 child_sessions, sid, exposed, strict)
             if not kind:
                 continue
             if kind == "unreviewed":
@@ -884,13 +918,13 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             for _fid, obj in items:
                 await self._release_payment_object(psid, obj)
 
-    async def _shown_documents(self, i: PaymentInspection) -> set:
+    async def _shown_documents(self, i: PaymentInspection, admission: bool = False) -> set:
         """dlz: frame ids of the card documents the user still sees: every pinned owner <iframe> from the
         document up to the page is connected, laid out, visible and not transparent (ancestors included).
-        One call per parent document; any failure counts as not shown."""
+        One call per parent document; any failure counts as not shown. ``admission``: the end of an inspection, by
+        the rule that chose its frames; otherwise (bound frames, after it) by the fill's (11-15, D-0094 "b")."""
         shown: dict = {}
-        # dlz (B2): an unreviewed inspection judges its owners with the strict exposure test.
-        check = _OWNERS_EXPOSED if i.unreviewed_origins else _OWNERS_SHOWN
+        check = _OWNERS_EXPOSED if (_admission_strict(i) if admission else _strict_exposure(i)) else _OWNERS_SHOWN
         for psid, items in i.frame_owners.values():
             try:
                 answer = _value(await self._cdp("Runtime.callFunctionOn", {
@@ -917,10 +951,11 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         """Whether the iframe element hosting ``fid`` is laid out and visible in its parent document."""
         return await self._owner_check(fid, parent, parent_sid, _OWNER_RENDERED)
 
-    async def _chain_exposed(self, fid: str, by_id: dict, child_sessions: dict, page_sid: str, cache: dict) -> bool:
-        """dlz (B2): every owner <iframe> from ``fid`` up to the page passes ``_EXPOSED`` in its parent document
-        (``cache`` keeps each owner's answer for one pass). A chain that does not reach the top is not exposed; an
-        owner whose exposure cannot be read or judged raises ``payment_page_unverifiable`` (Codex B r1 #4)."""
+    async def _chain_judged(self, fid: str, by_id: dict, child_sessions: dict, page_sid: str, cache: dict,
+                            rule: str) -> bool:
+        """dlz (B2): every owner <iframe> from ``fid`` up to the page passes ``rule`` (``_EXPOSED`` or ``_OWNER_VISIBLE``)
+        in its parent document (``cache``: each owner's answer for one pass of one rule). A chain not reaching the top
+        fails; an owner that cannot be read or judged raises ``payment_page_unverifiable`` (Codex B r1 #4)."""
         hops = 0
         while fid in by_id and by_id[fid][4]:
             parent = by_id[fid][4]
@@ -929,7 +964,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 return False
             if fid not in cache:
                 cache[fid] = await self._owner_check(fid, parent, child_sessions.get(parent, page_sid),
-                                                     "function(){return (" + _EXPOSED + ")(this)}", strict=True)
+                                                     "function(){return (" + rule + ")(this)}", strict=True)
             if cache[fid] is not True:
                 return False
             fid = parent
@@ -987,7 +1022,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             return False
         finally:
             if obj:
-                await self._release_payment_object(parent_sid, obj)
+                await release_object(self, parent_sid, obj)
         if strict and type(answer) is not bool:
             raise _unverifiable()
         return answer is True
@@ -1027,25 +1062,34 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             or (i.consumed and not during_fill)
             or time.monotonic() >= i.expires_at
         ):
+            i.stale = "inactive"
             return False
         try:
+            # dlz (11-14): ``stale`` names the check under way, so the one that refuses (or raises) is on record.
+            i.stale = "tree"
             current = await self._payment_tree(i.page_session, i.child_sessions)
+            i.stale = "frames"
             if i.unreviewed_origins:
                 # dlz (B4): the relevant chains, no new admissible frame; frames on other origins may churn.
                 if not await self._relevant_unchanged(i, current):
                     return False
             elif current != i.tree:
                 return False
+            i.stale = "document"
             for d in i.documents:
                 if not await self._document_valid(i, d):
                     return False
             if i.unreviewed_origins:
+                i.stale = "absence"
                 if not await self._absence_holds(i):
                     return False
+                i.stale = "shown"
                 if await self._shown_documents(i) != {d.frame_id for d in i.documents}:
                     return False
+            i.stale = ""
             return True
         except Exception:  # health: allow BLE001 -- any CDP failure means the approved page is not current; fail closed
+            i.stale += "_error"
             return False
 
     async def _document_valid(self, i: PaymentInspection, d: PaymentDocument) -> bool:
@@ -1068,15 +1112,19 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         present but hidden at inspection and is revealed now, withdraw the approval; (3, in ``_absence_holds``)
         every pinned card-free document stays card-free. Frames on other origins (ads, widgets) may appear,
         navigate or disappear."""
+        i.stale = "frames_top"
         if not current or not i.tree or current[0] != i.tree[0]:
             return False
         old = {f[0]: f for f in i.tree}
         now = {f[0]: f for f in current}
+        i.stale = "frames_card"
         if any(now.get(fid) != old.get(fid) for fid in _relevant_frames(i)):
             return False
+        i.stale = "frames_new"
         approved = {i.merchant_origin, *i.target_origins}
         bound = _relevant_frames(i) | set(i.absence_frames)
         cache: dict = {}
+        rule = _EXPOSED if _admission_strict(i) else _OWNER_VISIBLE  # 11-15 r8: by the rule that chose the frames
         for record in current[1:]:
             if (record[0] in bound and old.get(record[0]) == record) or record[3] not in approved:
                 continue
@@ -1085,7 +1133,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                               or _unreviewed_admitted(record, now, i.merchant_origin, i.allowed_frames))
             except PaymentPolicyError:
                 admissible = True  # an approved-origin frame under an unapproved ancestry is not provably harmless
-            if admissible and await self._chain_exposed(record[0], now, i.child_sessions, i.page_session, cache):
+            if admissible and await self._chain_judged(record[0], now, i.child_sessions, i.page_session, cache, rule):
                 return False
         return True
 
@@ -1261,11 +1309,13 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         # approved chain is checked again against the pinned state (bounded: no OOPIF rediscovery), and
         # each document written so far must still be the one that received its fields.
         if written and not await self._payment_scope_current(i, [d for d, _f in written] + [document]):
+            state["stage"] = "between_documents"  # dlz (11-14): for fill_reinspect.stopped
             return {"success": False, "error_type": "payment_page_changed"}
         # dlz (Codex B r1 #1): an unreviewed fill also re-binds the cart, the absence witnesses, the candidate
         # topology and the policy before each later document, on the consumed inspection.
         verdict = await self._fill_scope_verdict(i) if written and i.unreviewed_origins else None
         if verdict:
+            state["stage"] = "between_documents"
             return {"success": False, "error_type": verdict}
         # dlz: strict fills in a frame pause after each focus for the owner-chain check from the parents
         # (a cross-origin parent's blur handler is out of the frame's reach); an unreviewed fill pauses in
@@ -1328,9 +1378,11 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         - every parent document on any card chain is still at its inspected URL and origin, and all its
           pinned owner <iframe>s are connected and shown (one call per parent, in the parent's pinned world:
           a new parent document destroys that world and the call fails).
-        Frames off the card chains (ads) are ignored. Any failure to answer counts as changed."""
+        Frames off the card chains (ads) are ignored. Any failure to answer counts as changed.
+        dlz (11-14 r2): each refusal leaves its fixed code in ``i.stale`` (``scope_*``), for fill_reinspect.stopped."""
         by_id = {f[0]: f for f in i.tree}
         framed: set = set()
+        i.stale = "scope_chain"
         for d in i.documents:
             fid, hops = d.frame_id, 0
             while fid in by_id and by_id[fid][4] and hops < 16:
@@ -1338,10 +1390,12 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 fid, hops = by_id[fid][4], hops + 1
             if fid not in by_id or by_id[fid][4]:
                 return False
+        i.stale = "scope_unpinned"
         pinned = {fid for _sid, items in i.frame_owners.values() for fid, _obj in items}
         if not framed <= pinned or any(p not in by_id for p in i.frame_owners):
             return False
         leaves = list(dict.fromkeys(d.frame_id for d in receiving))
+        i.stale = "scope_tree"
         try:
             seen: dict = {}
             for sid in dict.fromkeys(i.child_sessions.get(fid, i.page_session) for fid in leaves):
@@ -1356,11 +1410,13 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
 
                 walk((await self._cdp("Page.getFrameTree", session_id=sid))["result"]["frameTree"])
                 seen[sid] = frames
+            i.stale = "scope_frame"
             for fid in leaves:
                 sid = i.child_sessions.get(fid, i.page_session)
                 if seen[sid].get(fid) != tuple(by_id[fid][1:4]):
                     return False
-            scope = _OWNERS_SCOPE_EXPOSED if i.unreviewed_origins else _OWNERS_SCOPE
+            i.stale = "scope_owner"
+            scope = _OWNERS_SCOPE_EXPOSED if _strict_exposure(i) else _OWNERS_SCOPE
             for parent, (psid, items) in i.frame_owners.items():
                 answer = _value(await self._cdp("Runtime.callFunctionOn", {
                     "objectId": items[0][1], "functionDeclaration": scope,
@@ -1370,8 +1426,10 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 }, session_id=psid))
                 if not (isinstance(answer, list) and len(answer) == len(items) and all(a is True for a in answer)):
                     return False
+            i.stale = ""
             return True
         except Exception:  # health: allow BLE001 -- an unreadable page is not the approved page; fail closed
+            i.stale += "_error"
             return False
 
     async def _fill_scope_verdict(self, i: PaymentInspection) -> str | None:
@@ -1379,12 +1437,17 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         topology/absence/exposure bindings and every receiving document's ``valid()`` (Codex B r2 #1), the cart
         witnesses, and last (after the asynchronous checks) the destination policy."""
         if time.monotonic() >= i.expires_at:
+            i.stale = "expired"  # dlz (11-14 r2): the fixed code of each refusal, for fill_reinspect.stopped
             return "payment_consent_expired"
         if not await self._payment_is_current(i, during_fill=True):
             return "payment_page_changed"
         if i.witnesses and not await self._cart_current(i):
+            i.stale = "cart"
             return "payment_cart_changed"
-        return None if _policy_holds(i) else "payment_destination_disabled"
+        if _policy_holds(i):
+            return None
+        i.stale = "policy"
+        return "payment_destination_disabled"
 
     async def _paced_check(self, i: PaymentInspection, d: PaymentDocument, point) -> bool | str:
         """After a strict fill's focus, before the setter: True, or the error type that stops the document."""
@@ -1393,17 +1456,25 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         # parent-chain check, which is the last word before the setter, must come after it.
         verdict = await self._fill_scope_verdict(i) if i.unreviewed_origins else None
         if verdict:
+            i.stale = "focus_" + i.stale  # dlz (11-14): for fill_reinspect.stopped: the check after a focus refused
             return verdict
+        # dlz (11-15, D-0094 "b"): an unreviewed fill under the default rule keeps the freshness half above and the
+        # owner chain's place and visibility (``_OWNER_AT``), without the hit test at the field's centre.
+        i.stale = "focus_owner_shown" if i.unreviewed_origins and not _strict_exposure(i) else "focus_owner_hit"
         if _has_parent(i, d) and not await self._owner_chain_current(i, d, point):
             return "payment_page_changed"
+        i.stale = ""
         return True
 
     async def _owner_chain_current(self, i: PaymentInspection, d: PaymentDocument, point) -> bool:
         """dlz: strict fills, after the focus and before each setter (Codex A2 r3 #1): from the card document up
         to the page, each parent document is still at its inspected URL and origin, the pinned owner <iframe>
         is connected, shown and not transparent, and the focused field's centre, mapped into the parent, hits
-        that <iframe> (nothing of the merchant's covers it). One call per parent; unprovable = False."""
+        that <iframe> (nothing of the merchant's covers it). One call per parent; unprovable = False.
+        dlz (11-15, D-0094 "b"): an unreviewed fill under the default rule maps the point without the hit test
+        (``_OWNER_AT``); a reviewed fill (strict or adopted) and the strict rule keep ``_OWNER_HIT``."""
         by_id = {f[0]: f for f in i.tree}
+        probe = _OWNER_AT if i.unreviewed_origins and not _strict_exposure(i) else _OWNER_HIT
         if not (isinstance(point, (list, tuple)) and len(point) == 2
                 and all(type(v) in (int, float) and math.isfinite(v) for v in point)):
             return False
@@ -1418,7 +1489,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 if parent not in by_id or owner is None or hops > 16:
                     return False
                 answer = _value(await self._cdp("Runtime.callFunctionOn", {
-                    "objectId": owner, "functionDeclaration": _OWNER_HIT,
+                    "objectId": owner, "functionDeclaration": probe,
                     "arguments": [{"value": by_id[parent][2]}, {"value": by_id[parent][3]},
                                   {"value": x}, {"value": y}],
                     "returnByValue": True,
@@ -1618,6 +1689,13 @@ _OWNER_HIT = ("function(href,origin,x,y){" + _PARENT_AT + "const e=this;"
               "py=r.top+e.clientTop+(parseFloat(s.paddingTop)||0)+y;"
               "const n=e.getRootNode&&e.getRootNode(),root=n&&typeof n.elementFromPoint==='function'?n:document;"
               "return root.elementFromPoint(px,py)===e?[px,py]:null}")
+# dlz (11-15, D-0094 "b"): as _OWNER_HIT without the hit test (no pointer-events or elementFromPoint): the parent is at
+# its URL, the owner is its own and shown (_OWNER_VISIBLE); the point is only mapped for the next parent.
+_OWNER_AT = ("function(href,origin,x,y){" + _PARENT_AT + "const e=this;"
+             "if(e.ownerDocument!==document||!(" + _OWNER_VISIBLE + ")(e))return null;"
+             "const r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+             "return [r.left+e.clientLeft+(parseFloat(s.paddingLeft)||0)+x,"
+             "r.top+e.clientTop+(parseFloat(s.paddingTop)||0)+y]}")
 
 
 # The reviewed path's owner check (unchanged): the <iframe> is laid out and not visibility:hidden.

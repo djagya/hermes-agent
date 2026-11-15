@@ -224,6 +224,7 @@ _KPS_FORM = (
 
 
 def _kps_page(path, origins):
+    path = path.split("?")[0]  # every form frame carries a ?ref= query (r8: it used to miss and serve the FIELDS page)
     if path == "/customer/wallet/pc/WalletInput.jsp":
         return _KPS_FORM
     if path == "/kps-merchant":
@@ -1243,7 +1244,7 @@ def _kps_fill(payment_browser, tmp_path, monkeypatch, on_consent=None, auto=True
     monkeypatch.setattr("tools.browser_use_cli.vault_route", lambda task_id: {"lease": "live", "token": "t"})
     monkeypatch.setattr("tools.browser_control_route.set_capture_guard", lambda lease, token: (True, ""))
     monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface", lambda s, i: None)
-    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live"))
+    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live", False))
     monkeypatch.setattr("tools.browser_vault_payment.payment_fill_auto_enabled", lambda: auto)
     asked = []
 
@@ -1646,7 +1647,9 @@ def test_fill_auto_continues_on_a_re_mounted_field_and_keeps_its_stops(payment_b
         again = out["fill_reinspect"]  # `seen`: the card field tokens per origin of the refused reading, when it got one
         assert out["filled_fields"] == 1 and (again["count"], again["repairs"], again["refused"]) == (0, 0, refused), \
             (variant, out)
-        assert set(again) <= {"count", "repairs", "refused", "seen"} and set(again.get("seen", {})) <= {origins["merchant"]}
+        # dlz (11-14): `window`: how the re-inspection that gave up spent its window (counts and fixed codes)
+        assert set(again) <= {"count", "repairs", "refused", "seen", "window"} and set(again.get("seen", {})) <= {origins["merchant"]}
+        assert "http" not in json.dumps(again.get("window", {})) and again["window"]["polls"] >= 1, (variant, again)
         # The one field written before the change keeps its value; the card number (last) and the promo field
         # never get one (relabel_swap: the CVC went into its field before that field's label became the promo's).
         assert sorted(states.values()) == ["empty", "empty", "empty", "held"], (variant, states)
@@ -1664,7 +1667,10 @@ def test_fill_auto_card_fields_on_another_origin_after_the_approval_stop(payment
     out = _fa_fill(sup, origins, card, caplog, on_consent=lambda: sup.evaluate_runtime(moved))
     assert out["error_type"] == "payment_page_changed" and not out.get("partially_filled"), out
     # r1 F1: the origin the card fields moved to is page-chosen and not in the approval: only counted, never named
-    assert out["fill_reinspect"] == {"count": 0, "repairs": 0, "refused": "origin_changed", "seen": {"other": 1}}, out
+    again = dict(out["fill_reinspect"])
+    # dlz (11-14): where the stop fell and how the window was spent, in counts and fixed codes (no origin in either)
+    assert again.pop("stopped") == {"stage": "after_approval", "reason": "frames"} and again.pop("window")["polls"] == 1, out
+    assert again == {"count": 0, "repairs": 0, "refused": "origin_changed", "seen": {"other": 1}}, out
     assert origins["merchant"] not in json.dumps(out) and "it saw other 1" in caplog.text
     assert set(_fa_top(sup)[0].values()) == {"empty"} and "re-inspection refused (origin_changed)" in caplog.text
     # The same form left alone fills (the hosted frame is the approved destination).
@@ -1689,7 +1695,7 @@ def test_fill_auto_unreviewed_form_re_rendered_during_the_approval(payment_brows
     monkeypatch.setattr("tools.browser_use_cli.vault_route", lambda task_id: {"lease": "live", "token": "t"})
     monkeypatch.setattr("tools.browser_control_route.set_capture_guard", lambda lease, token: (True, ""))
     monkeypatch.setattr("tools.browser_payment_surface.claim_payment_surface", lambda s, i: None)
-    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live"))
+    monkeypatch.setattr("tools.browser_vault_payment.destination_policy", lambda: (True, "live", False))
     navigate(sup, origins["merchant"] + "/fa-payrails")
 
     def rerender():

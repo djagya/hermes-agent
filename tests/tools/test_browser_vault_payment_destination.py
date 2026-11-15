@@ -431,17 +431,19 @@ _TREE = (("top", "L0", MERCHANT + "/checkout", MERCHANT, ""),
 
 
 class _Fresh(sp.PaymentSupervisionMixin):
-    """The real _payment_is_current over a stubbed tree walk, exposure test and CDP answers."""
+    """The real _payment_is_current over a stubbed tree walk, exposure test and CDP answers. ``exposed``: frames that
+    pass either visibility rule; ``shown`` (r8): frames only the shown rule passes (clipped away or covered)."""
 
-    def __init__(self, current, exposed=(), scan=()):
+    def __init__(self, current, exposed=(), scan=(), shown=()):
         self.current, self.exposed, self.scan, self.calls = current, set(exposed), list(scan), []
+        self.shown = set(shown)
         self._state_lock, self._active, self._page_session_id = threading.Lock(), True, "page"
 
     async def _payment_tree(self, sid, child_sessions=None):
         return self.current
 
-    async def _chain_exposed(self, fid, by_id, child_sessions, page_sid, cache):
-        return fid in self.exposed
+    async def _chain_judged(self, fid, by_id, child_sessions, page_sid, cache, rule):
+        return fid in self.exposed or (rule != sp._EXPOSED and fid in self.shown)
 
     async def _cdp(self, method, params=None, session_id=None, timeout=None):
         fn = (params or {}).get("functionDeclaration", "")
@@ -516,8 +518,10 @@ def flow(monkeypatch):
                          "guard": (True, ""), "inspection": _kps_inspection(), "reviewed": None}
 
     class Supervisor:
-        def inspect_payment(self, merchant, *, bound_origins=(), frame_origins=(), unreviewed=False, cart=None):
+        def inspect_payment(self, merchant, *, bound_origins=(), frame_origins=(), unreviewed=False, cart=None,
+                            **extra):
             events.append(("inspect", "discovery" if unreviewed else "reviewed", cart))
+            state.setdefault("extra", []).append(extra)
             if not unreviewed:
                 if state["reviewed"] is not None:
                     raise state["reviewed"]
@@ -554,7 +558,7 @@ def flow(monkeypatch):
 
     def policy():
         events.append("policy")
-        return state["policy"].pop(0) if state["policy"] else (True, "g1")
+        return state["policy"].pop(0) if state["policy"] else (True, "g1", state.get("strict", False))
 
     def resolve(handle):
         events.append("resolve")
@@ -590,7 +594,7 @@ def _inspects(events):
 
 def test_switch_off_keeps_the_reviewed_refusal_with_a_hint_and_no_discovery(flow):
     run, events = flow
-    run.state["policy"] = [(False, "g0")]
+    run.state["policy"] = [(False, "g0", False)]
     out = run(cart=CART, approve_origins=[KPS])
     assert out["error_type"] == "payment_policy_refused" and "vault.payment_destination_consent" in out["error"]
     assert _inspects(events) == ["reviewed"] and "consent" not in events and "resolve" not in events
@@ -656,9 +660,18 @@ def test_the_owner_card_names_the_unreviewed_destination_and_the_fill_runs_stric
     assert order == ["inspect", "inspect", "consent", "current", "cart_current", "mark", "claim", "resolve",
                      "commit"]
     commit = next(e for e in events if isinstance(e, tuple) and e[0] == "commit")
-    assert commit[1] is True  # strict: per-setter hit tests, guard without the rollout exception
+    assert commit[1] is True  # strict in the card's own document, guard without the rollout exception
+    assert run.state["extra"] == [{}, {}]  # 11-15: the discovery call of before, its frames judged as reviewed ones
     # captured at inspection, after accept, in context, after the page checks, at the commit fence
     assert events.count("policy") == 5
+
+
+def test_the_strict_exposure_switch_reaches_the_discovery_inspection_only(flow, monkeypatch):
+    """vault.payment_consent_strict_exposure (11-15, D-0094 "b"): the discovery pass is asked for the strict rule."""
+    run, _events = flow
+    run.state["strict"] = True  # read with the policy (r8: one config read)
+    assert run(cart=CART, approve_origins=[KPS])["success"] is True
+    assert run.state["extra"] == [{}, {"strict_exposure": True}]
 
 
 def test_amount_not_found_still_prompts_with_the_warning(flow):
@@ -691,7 +704,7 @@ def test_switching_off_withdraws_a_fill_in_progress(flow, off_at, read):
     """B6: off (or a changed policy generation) after the accept, in context, after the page checks (Codex B r1:
     those are asynchronous), or at the commit fence."""
     run, events = flow
-    run.state["policy"] = [(True, "g1")] * off_at + [(False, "g2")]
+    run.state["policy"] = [(True, "g1", False)] * off_at + [(False, "g2", False)]
     out = run(cart=CART, approve_origins=[KPS])
     assert out["error_type"] == "payment_destination_disabled"
     assert ("resolve" in events) is read
@@ -701,7 +714,7 @@ def test_switching_off_withdraws_a_fill_in_progress(flow, off_at, read):
 
 def test_a_changed_policy_generation_also_withdraws(flow):
     run, events = flow
-    run.state["policy"] = [(True, "g1"), (True, "g2")]
+    run.state["policy"] = [(True, "g1", False), (True, "g2", False)]
     assert run(cart=CART, approve_origins=[KPS])["error_type"] == "payment_destination_disabled"
     assert "resolve" not in events
 
@@ -755,7 +768,7 @@ def test_no_card_value_reaches_a_result_or_the_log(flow, caplog):
     run, _events = flow
     caplog.set_level(logging.DEBUG)
     outs = [run(cart=CART, approve_origins=[KPS])]
-    run.state["policy"] = [(True, "g1")] * 4 + [(False, "g2")]  # read, then withdrawn at the commit fence
+    run.state["policy"] = [(True, "g1", False)] * 4 + [(False, "g2", False)]  # read, then withdrawn at the commit fence
     outs.append(run(cart=CART, approve_origins=[KPS]))
     assert outs[0]["success"] is True and outs[1]["error_type"] == "payment_destination_disabled"
     blob = json.dumps(outs) + caplog.text
@@ -778,11 +791,17 @@ def test_list_reports_the_destination_switch(monkeypatch):
 # ------------------------------------------------------------------ the discovery inspection over a fake CDP
 
 class _DiscoveryPage(sp.PaymentSupervisionMixin):
-    """A KPS-like checkout: frames, which owner <iframe>s are exposed, and what each document describes."""
+    """A KPS-like checkout: frames, which owner <iframe>s are exposed (pass either rule), which are only shown (r8:
+    clipped away or covered, so only ``_OWNER_VISIBLE`` passes them, ``_EXPOSED`` does not), and what each document
+    describes."""
 
-    def __init__(self, frames, exposed, controls):
+    def __init__(self, frames, exposed, controls, shown=()):
         self.frames, self.exposed, self.controls, self.evaluated = frames, set(exposed), controls, []
+        self.shown = set(shown)
         self._state_lock, self._active, self._page_session_id = threading.Lock(), True, "page"
+
+    def _passes(self, fid, fn):
+        return fid in self.exposed or (sp._EXPOSED not in fn and fid in self.shown)
 
     async def _cdp(self, method, params=None, session_id=None, timeout=None):
         params = params or {}
@@ -810,10 +829,10 @@ class _DiscoveryPage(sp.PaymentSupervisionMixin):
         if method == "Runtime.callFunctionOn":
             obj, fn = params["objectId"], params["functionDeclaration"]
             if fn in (sp._OWNERS_EXPOSED, sp._OWNERS_SHOWN):
-                return {"result": {"result": {"value": [a["objectId"][6:] in self.exposed
+                return {"result": {"result": {"value": [self._passes(a["objectId"][6:], fn)
                                                         for a in params["arguments"]]}}}
             if obj.startswith("owner-"):
-                return {"result": {"result": {"value": obj[6:] in self.exposed}}}
+                return {"result": {"result": {"value": self._passes(obj[6:], fn)}}}
             if "describe()" in fn:
                 return {"result": {"result": {"value": self.controls.get(obj[4:], [])}}}
             if "pin()" in fn:
@@ -844,6 +863,170 @@ def test_discovery_admits_the_exposed_unreviewed_form_and_pins_the_rest():
     assert [(fid, discovery) for kind, fid, discovery in page.evaluated if kind == "doc"] == [
         ("top", True), ("ad", True), ("kps", True)]
     assert "doc-ad" in page.released and "doc-top" not in page.released
+
+
+def test_discovery_chooses_by_the_strict_rule_first_so_a_clipped_copy_stays_out():
+    """r8 (Opus P2-1): a same-origin copy the strict rule skips but the shown rule passes (clipped away in a collapsed
+    accordion, or under an overlay). The strict pass finds the form, so the copy is no candidate, as before 11-15. Only
+    a strict pass without a complete card form falls back to the shown rule, which then sees every copy."""
+    both = {"kps": _CARD_FORM, "copy": _CARD_FORM}
+    page = _DiscoveryPage(_PAGE, exposed={"kps", "ad"}, shown={"copy"}, controls=both)
+    i = asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, cart=(2266, "EUR")))
+    assert [d.frame_id for d in i.documents] == ["kps"] and i.admission == "strict"
+    assert "copy" not in [fid for _kind, fid, _ in page.evaluated]
+    page = _DiscoveryPage(_PAGE, exposed={"ad"}, shown={"kps"}, controls=both)  # the form covered, the copy hidden
+    i = asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, cart=(2266, "EUR")))
+    assert [d.frame_id for d in i.documents] == ["kps"] and i.admission == "shown_fallback"
+    page = _DiscoveryPage(_PAGE, exposed={"ad"}, shown={"kps", "copy"}, controls=both)  # both only shown: no pick
+    with pytest.raises(PaymentDestinationError) as caught:
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True))
+    assert caught.value.error_type == "payment_fields_ambiguous"
+
+
+def test_a_frame_covered_after_scanning_is_refused_at_the_end_check_under_strict_admission():
+    """r9 (Codex r8 P3): the strict pass admits the form by the strict rule, then the page covers it before the owner
+    end check (only the shown rule still passes it). The end check judges by the rule that chose the frames, so the
+    covered form refuses ``payment_fields_ambiguous``; a pass that used the shown rule there would accept it."""
+    class Covered(_DiscoveryPage):
+        async def _cdp(self, method, params=None, session_id=None, timeout=None):
+            if method == "Runtime.callFunctionOn" and params["functionDeclaration"] in (sp._OWNERS_EXPOSED,
+                                                                                        sp._OWNERS_SHOWN):
+                self.exposed.discard("kps")
+                self.shown.add("kps")
+            return await super()._cdp(method, params, session_id, timeout)
+
+    page = Covered(_PAGE, exposed={"kps", "ad"}, controls={"kps": _CARD_FORM})
+    with pytest.raises(PaymentDestinationError) as caught:
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, cart=(2266, "EUR")))
+    assert caught.value.error_type == "payment_fields_ambiguous"
+
+
+def _two_slow_passes(monkeypatch, strict_s, shown_s, calls):
+    """``_inspect_pass`` stubbed: the strict pass refuses ``payment_fields_unsupported`` after ``strict_s`` seconds, the
+    shown fallback returns ``"shown"`` after ``shown_s``."""
+    async def run(self, origin, bound, allowed, unreviewed, cart, prior, strict, admission, end=None):
+        calls.append(admission)
+        try:
+            await asyncio.sleep(strict_s if admission == "strict" else shown_s)  # health: allow HX013 -- the pass duration against the budget is the behaviour under test
+        except asyncio.CancelledError:
+            calls.append("cancelled")
+            raise
+        if admission == "strict":
+            raise PaymentDestinationError("payment_fields_unsupported", sp.FIELDS_UNSUPPORTED, {})
+        return "shown"
+    monkeypatch.setattr(sp.PaymentSupervisionMixin, "_inspect_pass", run)
+
+
+def test_the_two_discovery_passes_share_one_deadline_and_end_in_the_typed_refusal(monkeypatch):
+    """r9 (Codex r8 P2): two 13 s passes in the 25 s wrapper used to end in a bare TimeoutError at 25 s. Scaled 1:25
+    here (wrapper 1.0 s, cleanup reserve 0.48 s, passes 0.52 s each): the fallback has nothing left to start with, or
+    runs out of what is left, and the strict pass's typed refusal comes back before the wrapper; a fast fallback
+    still succeeds."""
+    monkeypatch.setattr(sp, "_INSPECT_CLEANUP_RESERVE_S", 0.48)
+    page = _DiscoveryPage(_PAGE, exposed=(), controls={})
+    for strict_s, shown_s, outcome in ((0.52, 0.52, "typed"), (0.6, 0.01, "typed"), (0.1, 0.1, "shown")):
+        calls: list = []
+        _two_slow_passes(monkeypatch, strict_s, shown_s, calls)
+        start = time.monotonic()
+
+        async def go():
+            return await asyncio.wait_for(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0), 1.0)
+
+        if outcome == "shown":
+            assert asyncio.run(go()) == "shown" and calls == ["strict", "shown_fallback"]
+            continue
+        with pytest.raises(PaymentDestinationError) as caught:
+            asyncio.run(go())
+        assert caught.value.error_type == "payment_fields_unsupported" and time.monotonic() - start < 1.0
+        # 0.52 s strict leaves 0.0 after the reserve: the fallback never starts; 0.6 s: same.
+        assert calls == ["strict"], calls
+    # a fallback that starts but outlasts what is left is cancelled, and the strict refusal stands
+    calls = []
+    _two_slow_passes(monkeypatch, 0.1, 5.0, calls)
+    with pytest.raises(PaymentDestinationError) as caught:
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0))
+    assert caught.value.error_type == "payment_fields_unsupported" and calls == ["strict", "shown_fallback", "cancelled"]
+    # a timeout of the fallback's own (a CDP call) is not the budget running out: it propagates
+    async def own_timeout(self, origin, bound, allowed, unreviewed, cart, prior, strict, admission, end=None):
+        if admission == "strict":
+            raise PaymentDestinationError("payment_fields_unsupported", sp.FIELDS_UNSUPPORTED, {})
+        raise TimeoutError("cdp")
+    monkeypatch.setattr(sp.PaymentSupervisionMixin, "_inspect_pass", own_timeout)
+    with pytest.raises(TimeoutError, match="cdp"):
+        asyncio.run(page._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=1.0))
+
+
+class _StalledFallback(_DiscoveryPage):
+    """r10: the strict pass refuses (the form only shown), the shown fallback stalls at ``stall`` (the card document's
+    describe() or its owner check) until the fallback deadline cancels it; from then on each release takes 1.5 s."""
+
+    def __init__(self, stall):
+        super().__init__(_PAGE, exposed={"ad"}, shown={"kps"}, controls={"kps": _CARD_FORM})
+        self.stall, self.slow, self.done = stall, False, []
+
+    async def _cdp(self, method, params=None, session_id=None, timeout=None):
+        fn, obj = (params or {}).get("functionDeclaration", ""), (params or {}).get("objectId")
+        on_card = obj == "doc-kps" and "describe()" in fn if self.stall == "describe" else \
+            obj == "owner-kps" and sp._EXPOSED not in fn  # the shown rule's owner check: the fallback's only
+        if method == "Runtime.callFunctionOn" and on_card:
+            self.slow = True
+            await asyncio.sleep(10)  # health: allow HX013 -- a stalled CDP call the fallback deadline cancels
+        if method == "Runtime.releaseObject" and self.slow:
+            await asyncio.sleep(1.5)  # health: allow HX013 -- a stalled release: the cleanup's length is under test
+            self.done.append(obj)
+        return await super()._cdp(method, params, session_id, timeout)
+
+    async def refused(self):
+        start = time.monotonic()
+        with pytest.raises(PaymentDestinationError) as caught:
+            await asyncio.wait_for(self._inspect_payment("", (), (STRIPE,), unreviewed=True, budget=2.5), 2.5)
+        assert caught.value.error_type == "payment_fields_unsupported" and time.monotonic() - start < 2.5
+        return set(self._payment_cleanups)
+
+
+@pytest.mark.parametrize("stall", ["describe", "owner"])
+def test_a_cancelled_fallback_cleanup_is_bounded_and_finishes_in_the_background(monkeypatch, stall):
+    """r10 (Codex, Kimi r9 P2): the fallback deadline cancels the shown pass; its real cleanup then releases three
+    pinned documents one after another (or, cancelled inside an owner check, that owner's release first), each stalled
+    past the reserve. Scaled 1:10 (wrapper 2.5 s, reserve 1.2 s, margin 0.5 s; tests/AGENTS.md wants >= 2 s windows): the strict refusal comes back before
+    the wrapper, the releases go on in the background (tracked on the supervisor) and all finish; supervisor shutdown
+    cancels a cleanup still running."""
+    from tools.browser_supervisor import CDPSupervisor
+
+    monkeypatch.setattr(sp, "_INSPECT_CLEANUP_RESERVE_S", 1.2)
+    monkeypatch.setattr(sp, "_INSPECT_MARGIN_S", 0.5)
+    page = _StalledFallback(stall)
+
+    async def go():
+        tracked = await page.refused()
+        assert tracked and not any(t.done() for t in tracked) and len(page.done) < 3
+        await asyncio.wait(tracked, timeout=12)
+        assert page._payment_cleanups == set()
+
+    asyncio.run(go())
+    pinned = {"doc-top", "doc-ad"} | ({"doc-kps"} if stall == "describe" else {"owner-kps"})
+    assert pinned <= set(page.done), page.done
+    if stall == "owner":
+        return
+    # shutdown (CDPSupervisor._thread_main's teardown) cancels the cleanup the refusal left running
+    page, left = _StalledFallback(stall), []
+
+    async def run():
+        left.extend(await page.refused())
+
+    page._run, page._set_active = run, lambda active: None
+    CDPSupervisor._thread_main(page)
+    assert left and all(t.cancelled() for t in left) and page._payment_cleanups == set()
+
+
+def test_a_new_frame_after_the_approval_is_judged_by_the_rule_that_chose_the_frames():
+    """r8: a frame the strict pass would have skipped is no new frame for a strict-chosen fill; for a fill the shown
+    rule chose, a newly shown frame on the approved origin withdraws the approval."""
+    tree = _TREE + (("k2", "L5", KPS + "/again", KPS, "top"),)
+    for admission, current in (("strict", True), ("shown_fallback", False)):
+        i = _unreviewed_inspection()
+        i.owner, i.admission = _Fresh(tree, shown={"k2"}), admission
+        assert asyncio.run(i.owner._payment_is_current(i)) is current, admission
 
 
 def test_the_reviewed_pass_never_inspects_an_unreviewed_frame():
@@ -993,6 +1176,21 @@ def test_switching_off_part_way_stops_the_fill_and_says_what_was_written():
     cart = {"success": False, "error_type": "payment_cart_changed", "filled_fields": 1, "partially_filled": True}
     bvp._commit_text(cart)
     assert "some card fields were written" in cart["error"]
+
+
+def test_switching_off_before_the_first_setter_names_the_lock_and_payment_close():
+    """r8 (Codex P2, Kimi P2): flipped after the commit fence, at the first paced check: nothing written, the lock held
+    (a managed browser claimed it before the card read), so the text names the lock and payment_close."""
+    reads = iter([True, False])  # the commit's pass, then off at the first focus
+    sup = _Filling(99)
+    out = _two_document_fill(sup, policy=lambda: next(reads))
+    assert out["error_type"] == "payment_destination_disabled" and out.get("filled_fields", 0) == 0, out
+    assert sup.writes == []
+    locked, plain = dict(out), dict(out)
+    bvp._commit_text(locked, locked=True)
+    bvp._commit_text(plain)
+    assert locked["error"] == bvp._DESTINATION_DISABLED_LOCKED and "payment_close" in locked["error"]
+    assert plain["error"] == bvp._DESTINATION_DISABLED + bvp._READ_NOT_WRITTEN
 
 
 def test_typed_unsupported_result_carries_no_page_path(flow):

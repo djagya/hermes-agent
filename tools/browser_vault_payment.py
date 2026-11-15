@@ -22,6 +22,7 @@ from agent.vault_payment_policy import (
 )
 from agent.vault_store import PAYMENT_FIELDS, revision_binding
 from tools.browser_supervisor_payment import _COVERAGE_REFUSALS, OPTIONAL_CARD_TOKENS
+from tools.browser_supervisor_payment_stop import admission_rule, clean_window, exposure_rule, stopped_record
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,23 @@ _CONSENT_MESSAGES = {
 # dlz: once a field was written, "nothing was submitted" is not something Hermes can promise for the page.
 _SUBMITTED_NOTHING = ("Hermes submitted nothing; page scripts may have acted on the filled fields. Check the page "
                       "before anything else.")
+# dlz (11-14): the same under the payment lock (a managed browser: claimed before the card was read, held after any
+# stop). The page cannot be read then, and payment_close ends the lock by closing the tab: it reads and clicks
+# nothing and cannot tell whether Pay was pressed, so after a write it waits for the user's look.
+_SUBMITTED_NOTHING_LOCKED = (
+    "Hermes submitted nothing, but page scripts may have acted on the filled fields, so an order may exist. The "
+    "browser is now locked for this payment, so the page cannot be read or checked from here. Ask the user to look at "
+    "the payment tab themselves (a handoff) and to check the merchant's order status, the confirmation email and the "
+    "bank for any order or charge, before anything else. Call browser_vault payment_close (it closes the payment tab "
+    "and ends the lock) only after the user has looked."
+)
+# r6 P2: the same after a write when the browser is no longer Hermes's (lease ended, human took over): no payment_close.
+_SUBMITTED_NOTHING_LOCKED_LOST = (
+    "Hermes submitted nothing, but page scripts may have acted on the filled fields, so an order may exist. This "
+    "browser is no longer the one Hermes controls, so it cannot be read, checked or closed from here: do not call "
+    "payment_close on it. Ask the user to look at the payment tab themselves and to check the merchant's order status, "
+    "the confirmation email and the bank for any order or charge, before anything else."
+)
 _NOT_RETAINED = (
     "Card fields were written, but after the page settled at least one no longer held its value "
     "(field_retention names which; states and lengths only). This is not a bank or issuer response. "
@@ -188,10 +206,30 @@ _PAGE_CHANGED = (
     "field was written and nothing was submitted. Check the page, then call fill once more; it shows a new "
     "approval prompt."
 )
+# dlz (11-14): the same stop from inside the commit on a managed browser. The payment lock was claimed before the card
+# was read and stays (zero writes do not release it), so "check the page" is not something the agent can do there.
+_LOCKED_NEXT = (
+    "The browser is now locked for this payment, so the page cannot be read or checked: call browser_vault "
+    "payment_close (it closes the payment tab and ends the lock), open the checkout again, then call fill once more; "
+    "it shows a new approval prompt. If the fill stops like this a second time, stop and tell the user."
+)
+_PAGE_CHANGED_LOCKED = (
+    "The checkout changed after it was inspected (navigation, re-render or a different frame), so no card "
+    "field was written and nothing was submitted. " + _LOCKED_NEXT
+)
 _CONSENT_EXPIRED = (
     "The approval arrived (or the fill reached the page) after the 5-minute inspection window closed, so no "
     "card field was written and nothing was submitted. Ask the user again: call fill once more for a new "
     "prompt and approve it in time."
+)
+
+
+# dlz (11-14 r2): the same expiry with the payment lock held (claimed before the card was read; zero writes keep it).
+_CONSENT_EXPIRED_LOCKED = (
+    "The 5-minute inspection window closed before any card field could be written (the fill may have reached the "
+    "page and focused a field, but wrote nothing), so no card field was written and nothing was submitted. The browser is now locked for this payment, so the page cannot be read or checked: call "
+    "browser_vault payment_close (it closes the payment tab and ends the lock), open the checkout again, then call "
+    "fill once more for a new approval prompt and ask the user to approve it in time."
 )
 
 
@@ -230,6 +268,24 @@ _BROWSER_CHANGED = (
 )
 
 
+# dlz (11-14): the zero-write stops after the claim (the lock is held) have no page to check either.
+_LOCKED_STOP = (
+    " The browser is now locked for this payment, so the page cannot be read or checked. Tell the user; do not retry "
+    "on your own. Once the user has been told, browser_vault payment_close closes the payment tab and ends the lock."
+)
+_EXPIRY_UNMATCHED_LOCKED = (
+    "The expiry month or year list on this checkout has no single option matching the saved card, so no card "
+    "field was written and nothing was submitted." + _LOCKED_STOP + " Ask the user to check the saved expiry or to "
+    "fill the card by hand."
+)
+_FIELDS_INCOMPLETE = (
+    "The saved card has no value for a card field this checkout requires (only the holder name and the billing "
+    "postcode are optional), so no card field was written and nothing was submitted. Do not retry; tell the user."
+)
+_FIELDS_INCOMPLETE_LOCKED = (
+    "The saved card has no value for a card field this checkout requires (only the holder name and the billing "
+    "postcode are optional), so no card field was written and nothing was submitted." + _LOCKED_STOP
+)
 _ITEM_CHANGED = (
     "The saved card changed before the fill. Nothing was resolved or written; list the vault and request "
     "fresh consent."
@@ -243,6 +299,15 @@ _ITEM_CHANGED_ON_READ = (
 )
 
 
+_ITEM_CHANGED_ON_READ_LOCKED = (
+    "The saved card read for this fill is not the revision the approval was shown for (it was edited meanwhile), so "
+    "it was dropped and no card field was written. Nothing was submitted. List the vault to see the card as it is "
+    "now. " + _LOCKED_NEXT
+)
+_REVISION_UNAVAILABLE_ON_READ_LOCKED = (
+    "The saved card read for this fill carried no revision comparable with the one the approval was shown for, so it "
+    "was dropped and no card field was written. Nothing was submitted." + _LOCKED_STOP
+)
 _REVISION_UNAVAILABLE = (
     "The password manager did not report a revision for this saved card (no version or update time), so an "
     "edit between the approval and the fill could not be detected. Nothing was read or written. Tell the "
@@ -257,6 +322,12 @@ _REVISION_UNAVAILABLE_ON_READ = (
 )
 
 
+_BROWSER_CHANGED_LOCKED = (
+    "The browser this approval was for is no longer the one Hermes controls for this task (the lease ended, a "
+    "human took over, or the browser connection was replaced), so no card field was written and nothing was "
+    "submitted. If it is still locked for this payment, it cannot be read or changed from here: do not retry and do "
+    "not call payment_close on it, tell the user. Another fill needs a new approval."
+)
 _REQUIRES_MANAGED = (
     "A card fill on an unreviewed payment destination needs the managed browser, where browser-control locks "
     "capture; this browser is not managed. Nothing was read or written. Tell the user; do not retry on another "
@@ -285,10 +356,23 @@ _DESTINATION_DISABLED = (
     "Owner-approved card fills on unreviewed payment forms were switched off, or their policy changed, while this "
     "fill was in progress, so no card field was written and nothing was submitted. Do not retry; tell the user."
 )
+# dlz (11-14): the same stop after the card was read (the commit fence), with the lock held.
+_DESTINATION_DISABLED_LOCKED = (
+    _DESTINATION_DISABLED + _READ_NOT_WRITTEN + " The browser is now locked for this payment, so the page cannot be read "
+    "or checked. Do not retry; tell the user. Once the user has been told, browser_vault payment_close closes the "
+    "payment tab and ends the lock."
+)
 _CART_CHANGED = (
     "The checkout's total text changed after the approval card was built (Hermes' page check no longer reads the "
     "same), so no card field was written and nothing was submitted. Check the cart, then call fill again with the "
     "current cart; it shows a new approval."
+)
+_CART_CHANGED_LOCKED = (
+    "The checkout's total text changed after the approval card was built (Hermes' page check no longer reads the "
+    "same), so no card field was written and nothing was submitted. The browser is now locked for this payment, so "
+    "the page cannot be read or checked: call browser_vault payment_close (it closes the payment tab and ends the "
+    "lock), open the checkout again, then call fill once more with the cart as the page shows it now; it shows a new "
+    "approval prompt. If the fill stops like this a second time, stop and tell the user."
 )
 _CART_INVALID = (
     "cart must be {items: [{description: 1-80 characters, quantity: 1-99}] (1-8 items), total: a decimal with two "
@@ -487,8 +571,11 @@ def _discover(supervisor, vault, reviewed: PaymentPolicyError, merchant_origin: 
         return {"success": False, "error_type": "payment_destination_requires_managed_browser",
                 "error": _REQUIRES_MANAGED}
     try:
+        # dlz (11-15, D-0094 "b"): vault.payment_consent_strict_exposure (read with the policy: r8, one config read)
+        # restores the strict exposure rule for every frame; the call is then today's plus it.
+        strict = {"strict_exposure": True} if policy[2] is True else {}
         inspected = supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
-                                               unreviewed=True, **witness)
+                                               unreviewed=True, **witness, **strict)
     except PaymentDestinationError as found:
         coverage = getattr(reviewed, "coverage", "")
         if found.error_type == "payment_fields_unsupported" and coverage:
@@ -538,6 +625,42 @@ _COMMIT_TEXTS = {
 }
 
 
+# dlz (11-14): the nothing-written stops whose usual text says "check the page" or "check the cart", under the lock.
+_LOCKED_TEXTS = {"payment_page_changed": _PAGE_CHANGED_LOCKED, "payment_fields_changed": _PAGE_CHANGED_LOCKED,
+                 "payment_cart_changed": _CART_CHANGED_LOCKED, "payment_consent_expired": _CONSENT_EXPIRED_LOCKED,
+                 "payment_expiry_option_unmatched": _EXPIRY_UNMATCHED_LOCKED,
+                 "payment_fields_incomplete": _FIELDS_INCOMPLETE_LOCKED,
+                 "payment_browser_changed": _BROWSER_CHANGED_LOCKED, "human_has_control": _BROWSER_CHANGED_LOCKED,
+                 # r8 (Codex P2): the switch or the policy changed mid-fill, before the first setter
+                 "payment_destination_disabled": _DESTINATION_DISABLED_LOCKED}
+
+
+def _locally_locked(supervisor) -> bool:
+    """dlz (11-14 r2): whether this slot's payment lock is held or being claimed, by the process' own record
+    (``browser_payment_surface.locally_locked``: no status read, no wait). False when it cannot say."""
+    try:
+        from tools.browser_payment_surface import locally_locked
+
+        return bool(locally_locked(supervisor))
+    except Exception:  # health: allow BLE001 -- an unhashable test double or a torn-down slot: not locked
+        return False
+
+
+def _lock_aware(result: dict, locked: bool, text: str = "") -> dict:
+    """A zero-write stop with the lock-aware text when ``locked`` (nothing else changes): ``text``, else the one for its
+    error type."""
+    text = text or _LOCKED_TEXTS.get(result.get("error_type"), "")
+    if locked and text and not _wrote(result):
+        result["error"] = text
+    return result
+
+
+def _post_claim_locked(vault, supervisor) -> bool:
+    """Whether the payment lock is held at a stop after the claim (a managed browser claims it before the card is
+    read), or by the process' own record."""
+    return bool(vault._is_managed() or _locally_locked(supervisor))
+
+
 def _wrote(result: dict) -> bool:
     """dlz (Codex B r3 #1): whether a stopped commit wrote anything: its partial flag or any counted field."""
     count = result.get("filled_fields")
@@ -584,17 +707,23 @@ def _arm_auto(supervisor, inspected) -> bool:
     return callable(arm) and payment_fill_auto_enabled() and arm(inspected) is True
 
 
-def _reinspect_stop(code: str, inspected=None) -> dict:
+def _reinspect_stop(code: str, inspected=None, locked: bool = False) -> dict:
     """The stop when the checkout changed after the inspection and a re-inspection (``code``: its fixed reason) found
     no complete card form matching the approval. Nothing was read or written. ``seen``: what its last reading held
     (card field tokens per origin, or a count of frames), when it got that far."""
-    seen = (getattr(inspected, "approval", None) or {}).get("seen")
+    approval = getattr(inspected, "approval", None) or {}
+    seen, window = approval.get("seen"), clean_window(approval.get("window"))
+    # dlz (11-14): where it stopped and how the re-inspection window was spent (both from what the fill path holds).
+    stopped = stopped_record("after_approval", getattr(inspected, "stale", ""), exposure_rule(inspected),
+                             admission_rule(inspected))
     logger.warning("card fill stopped before any write: the checkout changed after it was inspected; "
                    "re-inspection refused (%s); it saw %s", _code(code), _seen_text(seen))
     cart = code == "cart_changed"
-    return {"success": False, "error_type": "payment_cart_changed" if cart else "payment_page_changed",
-            "error": _CART_CHANGED if cart else _PAGE_CHANGED,
-            "fill_reinspect": {"count": 0, "repairs": 0, "refused": _code(code), **({"seen": seen} if seen else {})}}
+    return _lock_aware({"success": False, "error_type": "payment_cart_changed" if cart else "payment_page_changed",
+                        "error": _CART_CHANGED if cart else _PAGE_CHANGED,
+                        "fill_reinspect": {"count": 0, "repairs": 0, "refused": _code(code),
+                                           **({"seen": seen} if seen else {}), "stopped": stopped,
+                                           **({"window": window} if window else {})}}, locked)
 
 
 def _seen_text(seen) -> str:
@@ -618,7 +747,7 @@ def _approved_page(vault, task_id: str, supervisor, inspected, lease: str, unrev
     if auto and not supervisor.payment_is_current(inspected):
         fresh, code = supervisor.reinspect_payment(inspected)
         if fresh is None:
-            return inspected, 0, _reinspect_stop(code, inspected)
+            return inspected, 0, _reinspect_stop(code, inspected, _locally_locked(supervisor))
         inspected, refreshed = fresh, 1
         logger.info("card fill: the checkout was re-inspected after the approval (form re-rendered)")
     return inspected, refreshed, _page_refusal(supervisor, inspected, unreviewed, policy)
@@ -668,18 +797,27 @@ def _repin_argument(unreviewed: bool) -> dict:
     return {"repin": True} if not unreviewed and payment_repin_enabled() else {}
 
 
-def _commit_text(result: dict) -> None:
+def _commit_text(result: dict, locked: bool = False) -> None:
     """Set the fixed text for a stopped commit; a partial stop always says that fields were written. dlz (Codex B r2
-    #2): a write whose outcome is unknown (lost, failed or malformed answer) always says fields may hold values."""
+    #2): a write whose outcome is unknown (lost, failed or malformed answer) always says fields may hold values.
+    dlz (11-14): ``locked`` (a managed browser: the payment lock was claimed before the card was read): a stop with
+    nothing written that would send the agent to look at the page names the lock and ``payment_close`` instead."""
     error_type = result.get("error_type")
     if not result.get("success") and result.get("write_uncertain"):
         result["error"] = _TRANSPORT_UNCERTAIN
     elif error_type == "payment_fields_not_retained":
         result["error"] = _NOT_RETAINED
+    elif locked and error_type in _LOCKED_TEXTS and not result.get("success") and not _wrote(result):
+        result["error"] = _LOCKED_TEXTS[error_type]  # r2: an expiry too (call payment_close, then a new approval)
     elif error_type in _COMMIT_TEXTS:
         result["error"] = _COMMIT_TEXTS[error_type][1 if _wrote(result) else 0]
     elif not result.get("success") and _wrote(result):
         result["error"] = _PARTIAL_STOPPED
+    if locked and not result.get("success") and isinstance(result.get("error"), str):
+        # Fields may hold values and the page cannot be read under the lock: the check goes to the user (r6 P2).
+        lost = error_type in ("payment_browser_changed", "human_has_control")
+        result["error"] = result["error"].replace(
+            _SUBMITTED_NOTHING, _SUBMITTED_NOTHING_LOCKED_LOST if lost else _SUBMITTED_NOTHING_LOCKED)
 
 
 def _describe_result(result: dict, backend, inspected, fills: list, prompt: dict, bound_revision: str,
@@ -710,11 +848,15 @@ def _describe_result(result: dict, backend, inspected, fills: list, prompt: dict
 def _page_refusal(supervisor, inspected, unreviewed: bool, policy) -> dict | None:
     """Inside the fill context, right before the capture guard: the page, the cart witnesses and (dlz, after
     those asynchronous checks) the destination policy still hold. None = may proceed."""
+    # dlz (11-14 r2): before the claim the slot is normally unlocked ("check the page" holds); a lock still held from
+    # an earlier fill (no payment_close since) gets the lock-aware text.
     if not supervisor.payment_is_current(inspected):
-        return {"success": False, "error_type": "payment_page_changed", "error": _PAGE_CHANGED}
+        return _lock_aware({"success": False, "error_type": "payment_page_changed", "error": _PAGE_CHANGED},
+                           _locally_locked(supervisor))
     # dlz (B5): the page check's pinned reading (total-labelled amounts, occurrences) is unchanged.
     if getattr(inspected, "witnesses", ()) and not supervisor.payment_cart_current(inspected):
-        return {"success": False, "error_type": "payment_cart_changed", "error": _CART_CHANGED}
+        return _lock_aware({"success": False, "error_type": "payment_cart_changed", "error": _CART_CHANGED},
+                           _locally_locked(supervisor))
     if unreviewed and destination_policy() != policy:
         return _disabled()
     return None
@@ -790,15 +932,16 @@ def _claim_and_readmit(vault, task_id: str, supervisor, inspected, lease: str) -
             return refused
         # dlz (Codex A3 r1 #7): the claim's verification can take seconds; the approval window is
         # checked again right after it, before the re-admission and any secret is resolved.
+        # dlz (11-14 r2): the lock is held from here: an expiry names payment_close.
         if time.monotonic() >= inspected.expires_at:
-            return _expired()
+            return _lock_aware(_expired(), True)
     # dlz (Codex A2 r3 #3): re-admit right before the card is read: the lease the guard was set for must
     # still be the live owner; a route replaced meanwhile refuses here, before any card byte is read.
     refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
     if refused:
         return refused
     # dlz (Codex A3 r2 #2): the re-admission's status call can outlast the window too.
-    return _expired() if time.monotonic() >= inspected.expires_at else None
+    return _lock_aware(_expired(), vault._is_managed()) if time.monotonic() >= inspected.expires_at else None
 
 
 def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, strict: bool = False,
@@ -857,7 +1000,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         frame_origins = effective_frame_origins(meta.payment_frame_origins)
         stated = _stated_cart(cart) if cart is not None else None
         witness = {"cart": _cents(stated)} if stated is not None else {}
-        policy = None  # (enabled, generation) captured for the discovery inspection (B6)
+        policy = None  # (enabled, generation, strict) captured for the discovery inspection (B6)
         try:
             inspected = supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
                                                    **witness)
@@ -933,11 +1076,13 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             # Never resolve at inspection/list time, on decline or on stale consent.
             raw, verdict = _resolve_card(backend, meta, bound_revision)
             if raw is None:
+                locked = _post_claim_locked(vault, supervisor)
                 if verdict == "changed":
-                    return json.dumps({"success": False, "error_type": "payment_item_changed",
-                                       "error": _ITEM_CHANGED_ON_READ})
-                return json.dumps({"success": False, "error_type": "payment_item_revision_unavailable",
-                                   "error": _REVISION_UNAVAILABLE_ON_READ})
+                    return json.dumps(_lock_aware({"success": False, "error_type": "payment_item_changed",
+                                                   "error": _ITEM_CHANGED_ON_READ}, locked, _ITEM_CHANGED_ON_READ_LOCKED))
+                return json.dumps(_lock_aware({"success": False, "error_type": "payment_item_revision_unavailable",
+                                               "error": _REVISION_UNAVAILABLE_ON_READ}, locked,
+                                              _REVISION_UNAVAILABLE_ON_READ_LOCKED))
             secret = validate_card(raw)
             with _UnwrittenWindow(secret, supervisor) as window:  # dlz: taken back by every return before the commit
                 from tools.browser_payment_done import register_dialog_card_values
@@ -946,33 +1091,35 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
                 try:
                     fills = _document_fills(inspected, secret)
                 except ExpiryOptionUnmatched:
-                    return json.dumps({
+                    return json.dumps(_lock_aware({
                         "success": False,
                         "error_type": "payment_expiry_option_unmatched",
                         "error": _EXPIRY_UNMATCHED,
-                    })
+                    }, _post_claim_locked(vault, supervisor)))
                 if fills is None:
-                    return json.dumps({
+                    return json.dumps(_lock_aware({
                         "success": False,
                         "error_type": "payment_fields_incomplete",
-                    })
+                        "error": _FIELDS_INCOMPLETE,
+                    }, _post_claim_locked(vault, supervisor)))
                 # Commit fence: a takeover or lease loss while the card was read stops here, before any write.
                 refused = _ownership_refusal(vault, task_id, supervisor, inspected, lease)
                 if refused:
+                    _lock_aware(refused, _post_claim_locked(vault, supervisor))
                     refused["error"] += _READ_NOT_WRITTEN
                     return json.dumps(refused)
                 if time.monotonic() >= inspected.expires_at:
-                    out = _expired()
+                    out = _lock_aware(_expired(), _post_claim_locked(vault, supervisor))
                     out["error"] += _READ_NOT_WRITTEN
                     return json.dumps(out)
                 if unreviewed and destination_policy() != policy:  # B6, A6 step 16: the commit fence
-                    return json.dumps(_disabled(after_read=True))
+                    return json.dumps(_lock_aware(_disabled(after_read=True), _post_claim_locked(vault, supervisor)))
                 window.committing()  # from here a card value may be in the page: only control's unlock releases it
             result = _commit(vault, supervisor, inspected, fills, strict, secret, unreviewed, auto, refreshed,
                              task_id, lease)
             _bind_approved_total(supervisor, inspected, stated, facts, result)
             _log_commit(result)
-            _commit_text(result)
+            _commit_text(result, locked=_post_claim_locked(vault, supervisor))
             return json.dumps(_describe_result(result, backend, inspected, fills, prompt, bound_revision,
                                                unreviewed, stated))
     except BackendError as exc:

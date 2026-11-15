@@ -114,13 +114,14 @@ def test_an_unreadable_config_turns_destination_consent_off_through_the_real_loa
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     config_mod._LOAD_CONFIG_CACHE.clear()
     path = tmp_path / "config.yaml"
-    path.write_text("vault:\n  payment_destination_consent: true\n", encoding="utf-8")
-    enabled, generation = destination_policy()
-    assert enabled is True and generation
+    path.write_text("vault:\n  payment_destination_consent: true\n  payment_consent_strict_exposure: true\n",
+                    encoding="utf-8")
+    enabled, generation, strict = destination_policy()
+    assert enabled is True and generation and strict is True
     broken = tmp_path / ".config.yaml.new"
     broken.write_text("vault: [unclosed\n", encoding="utf-8")
     os.replace(broken, path)  # a new inode: the cache sees a changed file
-    assert destination_policy() == (False, "")
+    assert destination_policy() == (False, "", False)  # the strict switch too: last-known-good is not current
 
 
 def test_an_unreadable_config_drops_opt_in_providers_through_the_real_loader(tmp_path, monkeypatch):
@@ -165,3 +166,31 @@ def test_fill_auto_is_off_for_anything_present_that_is_not_clearly_on(config, ex
 
     monkeypatch.setattr("hermes_cli.config.load_config", load)
     assert payment_fill_auto_enabled() is expected
+
+
+@pytest.mark.parametrize("config, expected", [
+    ({}, False), ({"vault": {}}, False),                                # absent: the default (reviewed) rule
+    ({"vault": {"payment_consent_strict_exposure": True}}, True),
+    ({"vault": {"payment_consent_strict_exposure": "true"}}, False),    # a literal true only, as payment_repin
+    ({"vault": {"payment_consent_strict_exposure": 1}}, False),
+    (None, False),                                                       # config that cannot be read
+])
+def test_strict_exposure_is_on_for_a_literal_true_only_and_flipping_it_changes_the_policy(config, expected, monkeypatch):
+    """dlz (11-15, D-0094 "b"): and it is part of the destination policy generation, so flipping it withdraws a fill
+    that is waiting on its approval or in progress."""
+    from agent.vault_payment_policy import destination_policy
+
+    def load():
+        if config is None:
+            raise OSError("config.yaml unreadable")
+        return config
+
+    monkeypatch.setattr("hermes_cli.config.load_config", load)
+    assert destination_policy()[2] is expected  # r8: read with the policy, from the same config read
+    if config is not None:
+        on = {"vault": {"payment_destination_consent": True, "payment_consent_strict_exposure": True}}
+        off = {"vault": {"payment_destination_consent": True}}
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: on)
+        strict = destination_policy()
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: off)
+        assert destination_policy()[0] is strict[0] is True and destination_policy()[1] != strict[1]
