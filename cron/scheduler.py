@@ -3125,7 +3125,7 @@ def _quiet_network_failures() -> bool:
         cfg = load_config() or {}
         cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
         return isinstance(cron_cfg, dict) and cron_cfg.get("quiet_network_failures") is True
-    except Exception:
+    except (Exception, ConfigBackendUnavailable):  # the config plane being down keeps quieting off
         logger.debug("cron.quiet_network_failures unreadable; network quieting stays off", exc_info=True)
         return False
 
@@ -3147,16 +3147,15 @@ def _is_transient_network_run(
     be stale (set before an unrelated bookkeeping crash) and the crash is not evidence the box is
     offline, so only the error text counts.
 
-    ``cron.quiet_network_failures`` (default off, experimental): while off, only the
-    never-reached-the-model hold above applies (as before this feature); no error text is
-    classified, no probe runs, nothing else is quieted."""
+    ``cron.quiet_network_failures`` (default off, experimental): while off, nothing is
+    network-class here; the never-reached-the-model notice hold stays in ``_save_compose_deliver``
+    exactly as before this feature (streak and failing clock still count)."""
     from cron.transient_network import is_transient_network_failure, network_failing_too_long
 
     if not _quiet_network_failures():
-        if crashed or not job.get("_model_unreachable"):
-            return False
-        from cron.unreachable_retry import will_retry
-        return bool(will_retry(job))
+        # Off: no failure is network-class. The never-reached-the-model re-run hold stays the
+        # base behaviour in ``_save_compose_deliver`` (notice held, streak and clock still count).
+        return False
     hours = _failure_repeat_alert_hours()
     if network_failing_too_long(job, hours if hours > 0 else DEFAULT_FAILURE_REPEAT_ALERT_HOURS):
         return False
@@ -3362,9 +3361,15 @@ def _save_compose_deliver(
         output_file=output_file, agent_declared=d.agent_declared)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
-    # A never-reached-the-model failure with a re-run still pending was composed as a network-class
-    # failure above (``_is_transient_network_run``): nothing to deliver, the re-run is the answer.
-    # Once the ladder is exhausted it composes as an ordinary failure and alerts.
+    if d.should_deliver and not d.success and job.get("_model_unreachable") and not _quiet_network_failures():
+        # The model was never reached and a bounded automatic re-run will be scheduled
+        # (cron/unreachable_retry.py): hold the failure notice; the failure still counts toward the
+        # streak and the failing clock. Once the ladder is exhausted the next failure alerts normally.
+        # Switch-off only: with ``cron.quiet_network_failures`` on, a pending rung composed "" above
+        # and a rung past the 6 h clock must alert.
+        from cron.unreachable_retry import will_retry
+        if will_retry(job):
+            d.should_deliver = False
 
     # Not a substring check: bare "SILENT"/"NO_REPLY" or a report quoting "[SILENT]" must
     # not be swallowed; bracketed-prefix / trailing-line tolerance is kept.

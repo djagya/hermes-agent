@@ -12,10 +12,11 @@ which has to answer for one-shot dispatch accounting and mid-run side effects. R
 jobs only: finite one-shots are pre-claimed by ``claim_dispatch`` (at-most-times, #38758)
 and must not regain a consumed dispatch here.
 
-While a retry is pending the failure counts as a network-class failure
-(``scheduler._is_transient_network_run``): ledgered as ``transient_network``, no failure streak,
-no notice (Cowork re-runs silently). Only while ``will_retry`` holds: once the ladder is
-exhausted the failure is an ordinary one and alerts. A run that reaches the model — success or
+While a retry is pending the failure notice is held (``scheduler._save_compose_deliver``); the
+failure still counts toward the streak and the failing clock (Cowork re-runs silently). Only while
+``will_retry`` holds: once the ladder is exhausted the next failure alerts normally. With the
+experimental ``cron.quiet_network_failures`` on, a pending rung is also ledgered as
+``transient_network`` (``scheduler._is_transient_network_run``). A run that reaches the model — success or
 not — resets the ladder. Disable with
 ``cron.retry_unreachable: false`` in config.yaml.
 """
