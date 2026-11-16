@@ -31,6 +31,28 @@ logger = logging.getLogger(__name__)
 CORE_RUNTIME_KEYS: dict[str, str] = {
     "computer_use.backend": "plugins/computer_use/__init__.py configured_backend_name() (unset = cua)",
     "dashboard.kanban": "plugins/kanban/dashboard/plugin_api.py (bundled dashboard tab preferences)",
+    "dashboard.font": "hermes_cli/web_routers/dashboard_ui.py get_dashboard_font() (unset = theme)",
+    "dashboard.hidden_plugins": "hermes_cli/web_routers/dashboard_ui.py get_dashboard_plugins() (unset = none)",
+    "agent.prefill_messages_file": "gateway/run_config_loaders.py _load_prefill_messages() (unset = none)",
+    "agent.system_prompt": "hermes_cli/cli_commands_mixin.py _handle_personality_command() (unset = empty)",
+    "database.synchronous": "hermes_state_wal.py apply_database_pragmas() (unset = the built-in pragma)",
+    "display.busy_text_mode": "gateway/run_config_loaders.py _busy_modes_from_config() (unset = fallback)",
+    "display.tool_progress": "hermes_cli/setup.py, gateway/session_tui_config.py (unset = per-platform default)",
+    "gateway.standalone": "hermes_cli/profiles.py profile_is_standalone() (unset = not standalone)",
+    "terminal.credential_files": "tools/credential_files.py _load_config_files() (unset = none)",
+    # dlz: fork-owned keys DEFAULT_CONFIG leaves unseeded (config_defaults.py is at its line cap). Absent keeps
+    # each reader's own default, so listing them here changes no runtime behaviour.
+    "cron.quiet_network_failures": "cron/scheduler.py _quiet_network_failures() (unset = off; literal true only)",
+    "cron.retry_unreachable": "cron/unreachable_retry.py retry_enabled() (unset = on; literal false only)",
+    "cron.cleanup_timeout_seconds": "cron/scheduler.py _cron_cleanup_timeout_seconds() (unset = 10)",
+    "cron.misfire_grace_minutes": "cron/scheduler_provider.py _misfire_grace_minutes() (unset = 10)",
+    "cron.standalone_send_timeout_seconds": "cron/scheduler_delivery.py (unset = 60)",
+    "vault.payment_pay_once": "tools/payment_consent_prompt.py payment_pay_once_enabled() (unset = on)",
+    "vault.payment_fill_auto": "agent/vault_payment_policy.py payment_fill_auto_enabled() (unset = on)",
+    "vault.payment_repin": "agent/vault_payment_policy.py payment_repin_enabled() (unset = off; literal true only)",
+    "vault.payment_providers": "agent/vault_payment_policy.py enabled_providers() (unset = the default providers)",
+    "vault.payment_consent_strict_exposure": "agent/vault_payment_policy.py destination_policy() (unset = off)",
+    "vault.letter_intake": "agent/vault_letter.py _intake_cfg() (unset = intake off)",
 }
 
 

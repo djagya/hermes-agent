@@ -199,3 +199,47 @@ def test_enabled_project_plugin_declares_its_config_keys(hermes_home, tmp_path, 
     assert _set_notice("display.widget.size", "3", capsys)  # project plugins are opt-in
     monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
     assert not _set_notice("display.widget.size", "4", capsys)
+
+
+_FORK_KEYS = [  # dlz: fork-owned keys the runtime reads but DEFAULT_CONFIG leaves unseeded (its line cap)
+    ("cron.quiet_network_failures", "true"), ("cron.retry_unreachable", "false"),
+    ("cron.cleanup_timeout_seconds", "5"), ("cron.misfire_grace_minutes", "20"),
+    ("cron.standalone_send_timeout_seconds", "30"), ("vault.payment_pay_once", "false"),
+    ("vault.payment_fill_auto", "false"), ("vault.payment_repin", "true"),
+    ("vault.payment_providers", "[]"), ("vault.payment_consent_strict_exposure", "true"),
+    ("vault.letter_intake.enabled", "true"),
+]
+
+
+def test_fork_runtime_keys_unset_keep_each_readers_default(hermes_home):
+    from agent.vault_payment_policy import payment_fill_auto_enabled, payment_repin_enabled
+    from cron.scheduler import _quiet_network_failures
+    from cron.unreachable_retry import retry_enabled
+    from tools.payment_consent_prompt import payment_pay_once_enabled
+
+    _write_config(hermes_home, {})
+    assert (payment_pay_once_enabled(), payment_fill_auto_enabled(), payment_repin_enabled()) == (True, True, False)
+    assert (_quiet_network_failures(), retry_enabled()) == (False, True)
+
+
+@pytest.mark.parametrize("key,value", _FORK_KEYS)
+def test_fork_runtime_keys_set_without_notice(key, value, hermes_home, capsys):
+    assert not _set_notice(key, value, capsys)
+
+
+def test_fork_runtime_keys_set_is_what_the_readers_read(hermes_home, capsys):
+    from agent.vault_payment_policy import payment_fill_auto_enabled, payment_repin_enabled
+    from cron.scheduler import _quiet_network_failures
+    from tools.payment_consent_prompt import payment_pay_once_enabled
+
+    for key, value in (("cron.quiet_network_failures", "true"), ("vault.payment_pay_once", "false"),
+                       ("vault.payment_fill_auto", "false"), ("vault.payment_repin", "true")):
+        assert not _set_notice(key, value, capsys), key
+    assert (_quiet_network_failures(), payment_repin_enabled()) == (True, True)
+    assert (payment_pay_once_enabled(), payment_fill_auto_enabled()) == (False, False)
+
+
+@pytest.mark.parametrize("typo", ["vault.payment_pay_onse", "cron.quiet_network_failure", "vault.payment_repins"])
+def test_fork_runtime_key_typos_still_notice(typo, hermes_home, monkeypatch, capsys):
+    monkeypatch.setattr("hermes_cli.config_runtime_keys.plugin_declared_config_keys", frozenset)
+    assert _set_notice(typo, "true", capsys)
