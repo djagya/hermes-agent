@@ -3361,11 +3361,12 @@ def _save_compose_deliver(
         output_file=output_file, agent_declared=d.agent_declared)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
-    if d.should_deliver and not d.success and job.get("_model_unreachable"):
+    if d.should_deliver and not d.success and job.get("_model_unreachable") and not _quiet_network_failures():
         # The model was never reached and a bounded automatic re-run will be scheduled
         # (cron/unreachable_retry.py): hold the failure notice; the failure still counts toward the
         # streak and the failing clock. Once the ladder is exhausted the next failure alerts normally.
-        # With ``cron.quiet_network_failures`` on, a pending rung already composed "" above.
+        # Switch-off only: with ``cron.quiet_network_failures`` on, a pending rung composed "" above
+        # and a rung past the 6 h clock must alert.
         from cron.unreachable_retry import will_retry
         if will_retry(job):
             d.should_deliver = False

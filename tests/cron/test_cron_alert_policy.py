@@ -365,6 +365,19 @@ def test_agent_declared_failure_is_not_classified_by_the_probe(monkeypatch):
     assert not sched._is_transient_network_run({"id": "j"}, "the portal is down", agent_declared=True)
 
 
+def test_switch_on_a_pending_rerun_past_the_six_hour_clock_alerts(store):
+    """Quieting on (r5 confirmation review P2): the restored base notice hold is switch-off only, so a
+    never-reached-the-model failure with a re-run pending still alerts once its network clock has expired."""
+    deliveries = []
+    stale = (_hermes_now() - timedelta(hours=7)).isoformat()
+    daily = {"kind": "interval", "minutes": 1440, "display": "every 1440m"}
+    cron_jobs.save_jobs([_job(network_failing_since=stale, schedule=daily)])
+    _tick("alert-policy-test", store, deliveries, error=ConnectError("all connection attempts failed"))
+    stored = next(j for j in cron_jobs.load_jobs() if j["id"] == "alert-policy-test")
+    assert stored.get("unreachable_retry", {}).get("attempt"), "a re-run rung is pending"
+    assert len(deliveries) == 1 and deliveries[0][1] is True
+
+
 def test_seven_hours_of_network_failures_alert_exactly_once(store):
     deliveries = []
     cron_jobs.save_jobs([_job()])
@@ -520,7 +533,8 @@ def test_switch_off_rerun_ladder_holds_only_the_notice_and_still_counts_the_stre
     pending holds its notice, but each failure still steps the streak and the failing clock, so a policy job
     alerts as soon as its threshold is met."""
     deliveries = []
-    cron_jobs.save_jobs([_job(alert_after_consecutive_failures=2)])
+    daily = {"kind": "interval", "minutes": 1440, "display": "every 1440m"}  # long enough for the re-run ladder
+    cron_jobs.save_jobs([_job(alert_after_consecutive_failures=2, schedule=daily)])
     _tick("alert-policy-test", store, deliveries, error=ConnectError("all connection attempts failed"))
     stored = cron_jobs.load_jobs()[0]
     assert deliveries == [] and int(stored.get("failure_streak") or 0) == 1 and stored.get("failing_since")
@@ -528,6 +542,7 @@ def test_switch_off_rerun_ladder_holds_only_the_notice_and_still_counts_the_stre
     _tick("alert-policy-test", store, deliveries, error=ConnectError("all connection attempts failed"))
     stored = cron_jobs.load_jobs()[0]
     assert int(stored.get("failure_streak") or 0) == 2 and "network_failing_since" not in stored
+    assert deliveries == [], "threshold met, but a re-run is pending: base holds only the notice"
     assert quieting_off == []
 
 
