@@ -185,6 +185,37 @@ def test_a_split_fill_stop_between_documents_names_the_check_that_refused():
                          {"stage": "between_documents"}) == {"stage": "between_documents", "reason": "scope_frame"}
 
 
+def test_a_split_fill_checks_the_owner_scope_with_the_exposure_rule_only_under_the_strict_switch():
+    """r11 (Opus final review): between the documents of an unreviewed split fill, the strict switch
+    (``vault.payment_consent_strict_exposure``) asks each parent for the owner <iframe>'s scope with the exposure test
+    (``_OWNERS_SCOPE_EXPOSED``); the default rule asks without it (``_OWNERS_SCOPE``). An owner that is shown but not
+    exposed stops the strict fill at ``scope_owner`` and passes the default one."""
+    from tools.browser_supervisor_payment import PaymentDocument, PaymentInspection
+
+    card = ("card", "L1", PAY + "/form", PAY, "top")
+    asked: list = []
+
+    class Page(sp.PaymentSupervisionMixin):
+        async def _cdp(self, method, params=None, session_id=None, timeout=10.0):
+            if method == "Page.getFrameTree":
+                return {"result": {"frameTree": {"frame": {"id": "card", "loaderId": "L1",
+                                                           "url": PAY + "/form", "securityOrigin": PAY}}}}
+            fn = params["functionDeclaration"]
+            asked.append(fn)
+            return {"result": {"result": {"value": [fn != sp._OWNERS_SCOPE_EXPOSED]}}}  # shown, but not exposed
+
+    def scope(strict):
+        d = PaymentDocument("card", "s-card", "o", PAY, ())
+        i = PaymentInspection("op", "page", "tab", SHOP, (d,), (_TOP, card), time.monotonic() + 60,
+                              child_sessions={"card": "s-card"}, frame_owners={"top": ("page", (("card", "pin"),))},
+                              unreviewed_origins=(PAY,), strict_exposure=strict)
+        asked.clear()
+        return asyncio.run(Page()._payment_scope_current(i, [d])), i.stale
+
+    assert scope(True) == (False, "scope_owner") and asked == [sp._OWNERS_SCOPE_EXPOSED]
+    assert scope(False) == (True, "") and asked == [sp._OWNERS_SCOPE]
+
+
 def test_a_page_stop_before_the_claim_names_payment_close_only_when_the_slot_is_locked(monkeypatch):
     """Before the claim the slot is normally unlocked ("check the page" stays); a lock still held from an earlier fill
     (``locally_locked``, no status read) gets the lock-aware text. An object the lock record cannot hold is not locked."""
