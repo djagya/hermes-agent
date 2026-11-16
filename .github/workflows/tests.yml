@@ -189,12 +189,6 @@ jobs:
           # standard 4-core host keep each slice moving without the pathological
           # contention caused by hard-coding the upstream fleet's 96 workers.
           HERMES_TEST_WORKERS: 8
-          # dlz: the duration cache that scales a slow file's cap (3x its last healthy run) is
-          # saved only by pushes to main, and the fork has none, so every file gets the flat cap.
-          # A full-scope run doubles each slice's load, and the two largest files
-          # (tests/agent/test_run_agent.py, tests/ci/test_update_ci_routing.py; 250s on a scoped
-          # run) were killed at 300s on three runs in a row. 600s still bounds a hung file.
-          HERMES_TEST_FILE_TIMEOUT: "600"
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

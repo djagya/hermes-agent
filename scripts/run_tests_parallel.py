@@ -143,7 +143,13 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # files that finish in ~100s on a quiet box. The Docker build matrix jobs
 # take 7-10 min anyway, so this headroom costs nothing on total CI wall
 # time while keeping a genuinely hung file bounded.
-_DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
+#
+# dlz: 600s on the fork. The scaler below raises a slow file's cap from the duration cache, but
+# that cache is saved only by pushes to main and the fork has none, so every file gets this flat
+# cap. A full-scope CI run doubles each slice's load and killed the two largest files
+# (tests/agent/test_run_agent.py, tests/ci/test_update_ci_routing.py) at 300s on three runs in a
+# row. Set here, not in tests.yml: any .github edit forces every CI lane.
+_DEFAULT_FILE_TIMEOUT_SECONDS = 600.0
 
 # One-shot retry of failing test FILES. A file that exits non-zero is re-run
 # once in a fresh subprocess; if the re-run passes, the file counts as passed
