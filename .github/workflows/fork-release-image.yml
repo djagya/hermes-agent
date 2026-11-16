@@ -183,12 +183,16 @@ jobs:
 
       # The version is derived, never hand-kept: the nearest upstream release tag in
       # this tree sets the base, commits past it the distance (scripts/fork-release-version.sh).
-      # Upstream tags are fetched so a sync never reports an older release.
+      # Upstream tags are fetched so a sync never reports an older release: the CalVer
+      # tags (v2*) and the semver ones (v0.*). Without the semver fetch the base comes
+      # from whichever vX.Y.Z tags were pushed to the fork, so a line carrying upstream
+      # v0.23.1 still derived 0.23.0 (the fork had no v0.23.1 tag).
       - name: Derive release version
         id: version
         run: |
           set -euo pipefail
-          git fetch --quiet --no-tags https://github.com/NousResearch/hermes-agent.git '+refs/tags/v2*:refs/tags/v2*'
+          git fetch --quiet --no-tags https://github.com/NousResearch/hermes-agent.git \
+            '+refs/tags/v2*:refs/tags/v2*' '+refs/tags/v0.*:refs/tags/v0.*'
           scripts/fork-release-version.sh --check >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
 
