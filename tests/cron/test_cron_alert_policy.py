@@ -546,3 +546,22 @@ def test_switch_off_rerun_ladder_holds_only_the_notice_and_still_counts_the_stre
     assert quieting_off == []
 
 
+
+
+def test_switch_off_held_rungs_count_so_the_exhausted_failure_alerts_with_the_full_streak(store, quieting_off):
+    """r5 confirmation review: with no alert policy the silence of rungs 1-3 comes from the re-run hold alone, and the
+    failure that exhausts the ladder alerts with every held failure counted (base behaviour, switch off)."""
+    deliveries = []
+    daily = {"kind": "interval", "minutes": 1440, "display": "every 1440m"}
+    cron_jobs.save_jobs([_job(schedule=daily)])
+    for rung in (1, 2, 3):
+        _tick("alert-policy-test", store, deliveries, error=ConnectError("all connection attempts failed"))
+        stored = cron_jobs.load_jobs()[0]
+        assert deliveries == [], f"rung {rung} pending: the notice is held"
+        assert stored["unreachable_retry"]["attempt"] == rung and int(stored["failure_streak"]) == rung
+    _tick("alert-policy-test", store, deliveries, error=ConnectError("all connection attempts failed"))
+    stored = cron_jobs.load_jobs()[0]
+    assert len(deliveries) == 1 and deliveries[0][1] is True, "ladder exhausted: the failure alerts"
+    assert int(stored["failure_streak"]) == 4 and "unreachable_retry" not in stored
+    assert "transient_network" not in {inc["failure_type"] for inc in incidents.list_incidents()}
+    assert quieting_off == []
