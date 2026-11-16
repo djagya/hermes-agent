@@ -53,7 +53,7 @@ updates:
   # files if those hunks would fight the next upstream sync.
   - package-ecosystem: "github-actions"
     directory: "/"
-    target-branch: "release/v0.21.5-dlz"
+    target-branch: "release/v0.23.1-dlz"
     schedule:
       interval: "weekly"
       day: "monday"
