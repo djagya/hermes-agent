@@ -71,6 +71,8 @@ class Package:
         (upstream ships no artifact). Everything else is available.
     on_demand: targets where a package that is otherwise required is optional,
         with the reason. It stays available there; nothing requires it up front.
+    on_demand_distributions: the same by the install stamp's ``distribution``
+        (dlz: a Docker image ships prebuilt frontends, so it never runs pnpm).
     """
 
     name: str = ""
@@ -82,6 +84,7 @@ class Package:
     url: str = ""
     gaps: dict[str, str] = {}
     on_demand: dict[str, str] = {}
+    on_demand_distributions: dict[str, str] = {}
     # How the lockfile `version` field labels this package for `pm update`:
     #   "semver" — one shared version across targets (node 26.7.0, uv 0.12.3).
     #   "minor"  — the version label is major.minor; each target's exact
@@ -97,7 +100,13 @@ class Package:
         return self.gaps.get(target)
 
     def is_optional(self, target: str) -> bool:
-        return self.optional or target in self.on_demand
+        if self.optional or target in self.on_demand:
+            return True
+        if not self.on_demand_distributions:
+            return False
+        from pm.paths import install_distribution
+
+        return install_distribution() in self.on_demand_distributions
 
     def latest_versions(self, target: str, locked: Optional[str] = None) -> list[str]:
         """Newest-first candidate versions for `target` — the "how do I find

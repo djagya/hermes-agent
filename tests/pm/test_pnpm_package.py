@@ -82,6 +82,35 @@ def test_pm_doctor_on_termux_does_not_fail_on_the_pnpm_it_fetches_on_demand(tmp_
     assert lines == ["✗ node: not installed", "? pnpm: not installed"]
 
 
+@pytest.mark.parametrize("distribution,required", [(None, True), ("docker", False), ("nix", True)])
+def test_a_docker_image_does_not_require_the_pnpm_it_never_runs(distribution, required, tmp_path, monkeypatch):
+    """dlz: the runtime image ships prebuilt frontends and no pnpm, so every `hermes` launch in it printed
+    "install out of sync (pnpm: not installed or outdated)". Its stamp's distribution makes pnpm on demand
+    there; an unstamped checkout and other distributions still require it."""
+    import pm.install
+
+    lock = json.loads(paths.lockfile_path().read_text(encoding="utf-8"))
+    lock["packages"] = {name: lock["packages"][name] for name in ("node", "pnpm")}
+    (tmp_path / "lock.json").write_text(json.dumps(lock), encoding="utf-8")
+    (tmp_path / "facts.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(pm.install, "_lockfile", lambda: Lockfile(tmp_path / "lock.json"))
+    monkeypatch.setattr(pm.install, "_facts", dict)
+    monkeypatch.setattr(paths, "facts_path", lambda: tmp_path / "facts.json")
+    monkeypatch.setattr(pm.install, "current_target", lambda: "linux-x64")
+    # The image records node (and the rest of its tools), never pnpm.
+    monkeypatch.setattr(pm.install, "_installed_location",
+                        lambda package, _lock, _target: (None, None) if package.name == "node" else None)
+    image = tmp_path / "image"
+    image.mkdir()
+    if distribution:
+        stamp = {"schemaVersion": 2, "distribution": distribution, "updateMechanism": "external"}
+        (image / "install-stamp.json").write_text(json.dumps(stamp), encoding="utf-8")
+    monkeypatch.setenv("HERMES_INSTALL_ROOT", str(image))
+
+    assert pm.install.check(include_venv=False) == (["pnpm: not installed or outdated"] if required else [])
+    assert get_package("pnpm").is_optional("linux-x64") is not required
+
+
 @pytest.mark.parametrize("target", ["linux-x64", "win32-x64", "linux-arm64-bionic"])
 def test_pnpm_entry_holds_the_executable_and_the_launchers_dist(tmp_path, target):
     package = get_package("pnpm")

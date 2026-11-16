@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -32,6 +33,17 @@ def install_stamp_path(project_root: Path) -> Path:
     if root.resolve() == repo_root():
         root = install_root()
     return root / "install-stamp.json"
+
+
+def install_distribution() -> str | None:
+    """dlz: the executing tree's install stamp ``distribution`` (``docker``, ``nix``, ...); None for an
+    unstamped checkout or a stamp that cannot be read (a malformed stamp is reported by its own readers)."""
+    try:
+        stamp = json.loads(install_stamp_path(repo_root()).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    value = stamp.get("distribution") if isinstance(stamp, dict) else None
+    return value if isinstance(value, str) else None
 
 
 def lockfile_path() -> Path:
