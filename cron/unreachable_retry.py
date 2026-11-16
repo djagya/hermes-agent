@@ -93,9 +93,9 @@ def _ladder_instant(job: dict[str, Any], natural_next: Optional[datetime],
 
 
 def will_retry(job: dict[str, Any]) -> bool:
-    """True iff ``plan_retry`` will park a re-run for this flagged failure, so the scheduler
-    treats it as a network-class failure (no notice, no streak) instead of alerting. Called
-    before ``mark_job_run``."""
+    """True iff ``plan_retry`` will park a re-run for this flagged failure, so the scheduler holds
+    the failure notice instead of alerting. With ``cron.quiet_network_failures`` off the failure
+    still counts toward the streak and the failing clock. Called before ``mark_job_run``."""
     repeat = job.get("repeat") or {}
     times = repeat.get("times")
     counted = 0 if is_retry_run(job) else 1  # a ladder re-run does not count (``ladder_rung``)

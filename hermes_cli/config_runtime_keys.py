@@ -52,7 +52,8 @@ CORE_RUNTIME_KEYS: dict[str, str] = {
     "vault.payment_repin": "agent/vault_payment_policy.py payment_repin_enabled() (unset = off; literal true only)",
     "vault.payment_providers": "agent/vault_payment_policy.py enabled_providers() (unset = the default providers)",
     "vault.payment_consent_strict_exposure": "agent/vault_payment_policy.py destination_policy() (unset = off)",
-    "vault.letter_intake": "agent/vault_letter.py _intake_cfg() (unset = intake off)",
+    "vault.letter_intake.enabled": "agent/vault_letter.py letter_intake_enabled() (unset = intake off)",
+    "vault.letter_intake.ttl_hours": "agent/vault_letter.py _ttl_seconds() (unset = the default TTL)",
 }
 
 

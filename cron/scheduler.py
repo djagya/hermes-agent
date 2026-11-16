@@ -3370,6 +3370,8 @@ def _save_compose_deliver(
         from cron.unreachable_retry import will_retry
         if will_retry(job):
             d.should_deliver = False
+            logger.info(
+                "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])
 
     # Not a substring check: bare "SILENT"/"NO_REPLY" or a report quoting "[SILENT]" must
     # not be swallowed; bracketed-prefix / trailing-line tolerance is kept.

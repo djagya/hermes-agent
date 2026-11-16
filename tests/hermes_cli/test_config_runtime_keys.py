@@ -239,7 +239,8 @@ def test_fork_runtime_keys_set_is_what_the_readers_read(hermes_home, capsys):
     assert (payment_pay_once_enabled(), payment_fill_auto_enabled()) == (False, False)
 
 
-@pytest.mark.parametrize("typo", ["vault.payment_pay_onse", "cron.quiet_network_failure", "vault.payment_repins"])
+@pytest.mark.parametrize("typo", ["vault.payment_pay_onse", "cron.quiet_network_failure", "vault.payment_repins",
+                                  "vault.letter_intake.enabeld", "vault.letter_intake.ttl_hour"])
 def test_fork_runtime_key_typos_still_notice(typo, hermes_home, monkeypatch, capsys):
     monkeypatch.setattr("hermes_cli.config_runtime_keys.plugin_declared_config_keys", frozenset)
     assert _set_notice(typo, "true", capsys)
