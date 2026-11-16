@@ -635,9 +635,10 @@ cron:
 ```
 
 While it is off, no error text is classified as a network failure and the
-connectivity probe never runs: every failure alerts as described above. The
-only quieting that remains is the bounded automatic re-run of a run that never
-reached the model (while a re-run is still pending).
+connectivity probe never runs: every failure alerts as described above. As
+before this feature, a run that never reached the model holds only its notice
+while a bounded automatic re-run is pending; the failure still counts toward the
+job's streak and failing clock.
 
 With it on, when the host loses DNS or its uplink, every job that runs in that window fails,
 and one ping per job would bury the real failures. A failed run is treated as a

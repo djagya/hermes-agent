@@ -1866,6 +1866,9 @@ DEFAULT_CONFIG = {
         # silences a signature for good. 0 = re-alert on every failing run. Keep in sync with
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
+        # Experimental, off: network-class failures (offline box, network error line) are ledgered
+        # instead of alerted until they outlast failure_repeat_alert_hours. Only literal true enables.
+        "quiet_network_failures": False,
         # Hours finished runs stay in cron/executions.db (`hermes cron runs`); below 48 or non-finite
         # is ignored, above ten years capped, 100k rows max. Sync: cron.executions.TERMINAL_RETENTION_HOURS.
         "executions_retention_hours": 48,

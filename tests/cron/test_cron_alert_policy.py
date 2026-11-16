@@ -462,6 +462,19 @@ def test_switch_reads_only_a_literal_true(store, monkeypatch):
         assert sched._quiet_network_failures() is expected, text
 
 
+def test_switch_stays_off_when_the_config_plane_is_down(store, monkeypatch):
+    from hermes_cli import config as hermes_config
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+
+    monkeypatch.setattr(sched, "_quiet_network_failures", _REAL_QUIET_SWITCH)
+
+    def down(*_a, **_k):
+        raise ConfigBackendUnavailable("remote config unavailable")
+
+    monkeypatch.setattr(hermes_config, "load_config", down)
+    assert sched._quiet_network_failures() is False
+
+
 def test_switch_off_dns_failure_and_offline_probe_alert_through_the_main_path(store, quieting_off):
     deliveries = []
     spent = {"attempt": 3, "at": None, "expr": None}  # base's own re-run hold is not under test
@@ -493,8 +506,28 @@ def test_switch_off_crash_and_worker_paths_alert(store, quieting_off):
 
 def test_switch_off_keeps_the_pending_rerun_hold_and_ignores_it_when_crashed(store, quieting_off):
     flagged = _job(_model_unreachable=True)
-    assert sched._is_transient_network_run(dict(flagged), "boom") is True
+    assert sched._is_transient_network_run(dict(flagged), "boom") is False, "off: nothing is network-class"
     assert sched._is_transient_network_run(dict(flagged), "ConnectError: x", crashed=True) is False
-    exhausted = _job(_model_unreachable=True, unreachable_retry={"attempt": 3, "at": None, "expr": None})
-    assert sched._is_transient_network_run(exhausted, "boom") is False
     assert quieting_off == []
+
+
+class ConnectError(Exception):
+    """Named like httpx's: the never-reached-the-model classifier keys on the class name."""
+
+
+def test_switch_off_rerun_ladder_holds_only_the_notice_and_still_counts_the_streak(store, quieting_off):
+    """Base behaviour while the switch is off (r5 review P2): a never-reached-the-model failure with a re-run
+    pending holds its notice, but each failure still steps the streak and the failing clock, so a policy job
+    alerts as soon as its threshold is met."""
+    deliveries = []
+    cron_jobs.save_jobs([_job(alert_after_consecutive_failures=2)])
+    _tick("alert-policy-test", store, deliveries, error=ConnectError("all connection attempts failed"))
+    stored = cron_jobs.load_jobs()[0]
+    assert deliveries == [] and int(stored.get("failure_streak") or 0) == 1 and stored.get("failing_since")
+    assert "transient_network" not in {inc["failure_type"] for inc in incidents.list_incidents()}
+    _tick("alert-policy-test", store, deliveries, error=ConnectError("all connection attempts failed"))
+    stored = cron_jobs.load_jobs()[0]
+    assert int(stored.get("failure_streak") or 0) == 2 and "network_failing_since" not in stored
+    assert quieting_off == []
+
+
