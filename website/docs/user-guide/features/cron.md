@@ -625,6 +625,45 @@ repeat) or `closed` (acknowledged; terminal for that signature). Stored error
 text is secret-redacted and truncated before it is written.
 
 
+### Network outages do not alert (experimental, off by default)
+
+This is experimental and **off by default**. Enable it with a literal `true`:
+
+```yaml
+cron:
+  quiet_network_failures: true   # default false; any other value leaves it off
+```
+
+While it is off, no error text is classified as a network failure and the
+connectivity probe never runs: every failure alerts as described above. As
+before this feature, a run that never reached the model holds only its notice
+while a bounded automatic re-run is pending; the failure still counts toward the
+job's streak and failing clock.
+
+With it on, when the host loses DNS or its uplink, every job that runs in that window fails,
+and one ping per job would bury the real failures. A failed run is treated as a
+network-class failure, with no failure notice and no step on the job's failure
+streak, when either:
+
+- the run's own error line (the script's stderr line that names the failing step,
+  never its stdout) is one of an allow-list of network phrases or exception names
+  (`Could not resolve host`, `Temporary failure in name resolution`,
+  `Connection refused`, `httpx.ConnectError: ...`, a TLS handshake timeout, and
+  so on), or the model was never reached and an automatic re-run is still pending
+  (see above); or
+- the box fails a connectivity probe (it cannot reach `api.telegram.org:443` or
+  `github.com:443`; one answer is cached for about a minute per tick), whatever
+  the job's own error message says.
+
+The failure is still recorded in the incident ledger (`hermes cron incidents`,
+type `transient_network`) and in the run history. A job's own `[CRON_FAILURE]`
+verdict is never classified as a network failure.
+
+With the switch on, the quieting is bounded, not permanent. The first such failure stamps
+`network_failing_since` on the job (cleared by a successful run). Once it is older
+than `cron.failure_repeat_alert_hours` (default 6), the next failure takes the
+normal path: it counts, and it alerts once per reminder window.
+
 ### Alert after a streak or a stale window (per job)
 
 A job that refreshes data and keeps its last good copy does not need a ping for
@@ -641,10 +680,11 @@ With both set, whichever is reached first alerts. Below the threshold the run
 is still recorded (`hermes cron runs`, the incident ledger, `failure_streak`);
 only the ping waits. Once it alerts, the alert says how many runs failed in a
 row, for how long, and quotes the failing step's error line from the script's
-stderr. The `failure_repeat_alert_hours` reminder applies as before. When the
-job is green again after an alert, one "recovered" message goes to the failure
-lane. Jobs without a threshold behave as described above: the first failure of
-a signature alerts and there is no recovery message.
+stderr. The `failure_repeat_alert_hours` reminder applies as before. There is no
+"recovered" message: when the job is green again the incident is marked
+`resolved` in the ledger and the job's next result is delivered as usual. Jobs
+without a threshold behave as described above: the first failure of a signature
+alerts.
 
 Both thresholds are checked when a run finishes. A job that stops running
 altogether (paused, wedged, or the scheduler itself is down) never reaches

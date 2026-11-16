@@ -2486,7 +2486,7 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
 
 def _record_run_outcome(
     job: dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
-    status: Optional[str], now: str,
+    status: Optional[str], now: str, *, transient_network: bool = False,
 ) -> None:
     """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
     job["last_run_at"] = now
@@ -2512,13 +2512,19 @@ def _record_run_outcome(
         job.pop("last_fire_error", None)
         job["failure_streak"] = 0
         job.pop("failing_since", None)
+        job.pop("network_failing_since", None)
     elif not cancelled:
         # Consecutive agent-failure streak; delivery failures do NOT count
-        # (scheduler._failure_streak_nudge).
-        if not int(job.get("failure_streak") or 0):
-            # First failure of a streak: the clock alert_when_stale_minutes measures against.
-            job["failing_since"] = now
-        job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
+        # (scheduler._failure_streak_nudge). A network-class failure (cron/transient_network.py)
+        # does not count either: it must never walk a job toward its alert threshold. Its own
+        # clock, network_failing_since, is what ends the silence (transient_network.network_failing_too_long).
+        if transient_network:
+            job.setdefault("network_failing_since", now)
+        else:
+            if not int(job.get("failure_streak") or 0):
+                # First failure of a streak: the clock alert_when_stale_minutes measures against.
+                job["failing_since"] = now
+            job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
         # Sticky last-failure stamp (#118354): the next success resets last_status and
         # failure_streak, which erases the only job-level trace that a run ever failed —
         # a monitor sampling jobs.json then sees a permanently green job. last_failure
@@ -2598,6 +2604,7 @@ def mark_job_run(
     ladder_rung: bool = False,
     quota_hold_seconds: Optional[float] = None,
     recover_consumed_fire: bool = False,
+    transient_network: bool = False,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached. A manual run
@@ -2614,6 +2621,9 @@ def mark_job_run(
     (Cowork-style; see cron/unreachable_retry.py). ``ladder_rung``: this run IS one of those
     re-runs (``is_retry_run``); its occurrence already counted, so ``repeat.completed`` is not
     bumped again.
+
+    ``transient_network``: a DNS / connection-class failure; the failed run leaves
+    ``failure_streak`` and ``failing_since`` as they were (cron/transient_network.py).
 
     ``quota_hold_seconds``: the provider said it stays closed for this long (a quota 429 with
     ``retry after <N>s``). Recurring jobs are parked through the window instead of re-firing into
@@ -2634,7 +2644,8 @@ def mark_job_run(
         now = _hermes_now().isoformat()
         extra = extra_fire.is_extra(job)  # read before the outcome clears the claim
         held = extra_fire.held_markers(job) if extra else {}
-        _record_run_outcome(job, success, error, delivery_error, status, now)
+        _record_run_outcome(job, success, error, delivery_error, status, now,
+                            transient_network=transient_network)
         job.update(held)  # a run-now queued mid-run is its own fire, not this one
         if execution_id is not None:  # retire ids recovery can no longer replay; latest stays last
             from cron.scheduler_authority import replayable_completions as live

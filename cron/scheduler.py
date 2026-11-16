@@ -522,48 +522,6 @@ def _failure_alert_tail(job: dict, error: Optional[str], notice: str) -> str:
     return tail
 
 
-def _stash_recovery_notice(job: dict) -> None:
-    """On a green run after an alerted failure streak, stash a one-line recovery notice for the
-    failure lane (``job['_recovery_notice']``). Only for jobs with an alert policy, and only when a
-    failure ping actually went out; must run before the incidents are resolved."""
-    after, stale = _job_alert_policy(job)
-    streak = int(job.get("failure_streak") or 0)
-    if (after is None and stale is None) or streak <= 0:
-        return
-    try:
-        from cron.incidents import count_alerted_incidents
-
-        if not count_alerted_incidents(job["id"]):
-            return
-    except Exception as exc:
-        logger.debug("Incident store unavailable for job %s (no recovery notice): %s", job["id"], exc, exc_info=True)
-        return
-    minutes = _failing_minutes(job, streak + 1)
-    span = f", failed for {int(minutes)} min" if minutes else ""
-    job["_recovery_notice"] = (
-        f"✅ Cron '{job.get('name') or job['id']}' recovered after {streak} failed "
-        f"run{'s' if streak != 1 else ''}{span}.")
-
-
-def _deliver_recovery_notice(job: dict, fence: "_FireOwnership", *, adapters, loop) -> None:
-    """Send a stashed recovery notice through the failure lane. Best-effort: it never changes the
-    run's own outcome or delivery bookkeeping."""
-    notice = job.pop("_recovery_notice", None)
-    if not notice or fence.lost():
-        return
-    try:
-        with fence.side_effect_fence() as owns:
-            if not owns:
-                return
-            # dlz: CRON-1 — its own queue key; the execution id belongs to the run's result.
-            error = _deliver_result(job, notice, adapters=adapters, loop=loop, for_failure=True,
-                                    queue_key_suffix=":recovery")
-        if error:
-            logger.warning("Recovery notice for job %s not delivered: %s", job["id"], error)
-    except Exception as exc:
-        logger.warning("Recovery notice for job %s not delivered: %s", job["id"], exc, exc_info=True)
-
-
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the assembled prompt (incl. runtime-loaded skill content,
     unseen by create-time scanning) trips the injection scanner; run_job turns it into a clean
@@ -2231,6 +2189,16 @@ def _run_agent_with_watchdog(
     return result
 
 
+def _is_refusal_boundary_text(text: str) -> bool:
+    """True when *text* is exactly one of the Hermes-authored refusal / failed-turn notices."""
+    from agent.turn_failure_copy import CONTENT_REFUSED_NOTICE, untyped_failed_turn_display_kind
+
+    stripped = str(text or "").strip()
+    return bool(stripped) and (
+        untyped_failed_turn_display_kind("assistant", stripped) is not None
+        or stripped == CONTENT_REFUSED_NOTICE)
+
+
 def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgent) -> str:
     """Deliverable final response from a ``run_conversation`` result. Raises RuntimeError on
     `failed=True`/`completed=False`: the error text may sit in `final_response` and would otherwise
@@ -2252,6 +2220,13 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
             job_name)
 
     final_response = result.get("final_response", "") or ""
+    # A provider refusal or failed-turn boundary notice is a failed run, never the job's message
+    # (11-11: "Your request was not processed..." was delivered as a cron result). Exact text only,
+    # like ``untyped_failed_turn_display_kind``: a real report quoting the notice stays a report.
+    if _is_refusal_boundary_text(final_response):
+        raise RuntimeError(
+            "The model's turn ended in a provider refusal or failed-turn notice instead of a reply: "
+            + final_response.strip()[:120])
     # Repair model-mangled computer_use media paths before delivery (fail-open, as in gateway).
     if final_response:
         from gateway.media_repair import repair_explicit_computer_use_media_paths
@@ -3142,6 +3117,67 @@ def _record_fire_ownership_lost(
             execution_id, "Fire claim ownership lost; stale result was discarded.")
 
 
+def _quiet_network_failures() -> bool:
+    """``cron.quiet_network_failures``: experimental, default OFF; only a literal ``true`` turns on
+    the message and probe based network-class quieting of ``_is_transient_network_run``."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return isinstance(cron_cfg, dict) and cron_cfg.get("quiet_network_failures") is True
+    except (Exception, ConfigBackendUnavailable):  # the config plane being down keeps quieting off
+        logger.debug("cron.quiet_network_failures unreadable; network quieting stays off", exc_info=True)
+        return False
+
+
+def _is_transient_network_run(
+    job: dict, error: str, agent_declared: bool = False, *, crashed: bool = False,
+) -> bool:
+    """A failed run that counts as a network-class failure: ledgered, no streak, no notice.
+
+    Three signals, none of them forever: the never-reached-the-model flag (only while the bounded
+    re-run ladder still has a rung, ``unreachable_retry.will_retry``; exhausted, the failure
+    alerts), the run's error line against the phrase allow-list (``cron.transient_network``), and
+    the tick's box-connectivity probe (``cron.network_probe``), which makes any failure of an
+    offline box network-class whatever its message. An agent's own ``[CRON_FAILURE]`` verdict is
+    prose about the job's subject, so it is never classified. Once ``network_failing_since`` is
+    older than ``cron.failure_repeat_alert_hours`` the failure alerts like any other.
+
+    ``crashed``: the run raised out of ``run_job``. The run's ``_model_unreachable`` flag may then
+    be stale (set before an unrelated bookkeeping crash) and the crash is not evidence the box is
+    offline, so only the error text counts.
+
+    ``cron.quiet_network_failures`` (default off, experimental): while off, nothing is
+    network-class here; the never-reached-the-model notice hold stays in ``_save_compose_deliver``
+    exactly as before this feature (streak and failing clock still count)."""
+    from cron.transient_network import is_transient_network_failure, network_failing_too_long
+
+    if not _quiet_network_failures():
+        # Off: no failure is network-class. The never-reached-the-model re-run hold stays the
+        # base behaviour in ``_save_compose_deliver`` (notice held, streak and clock still count).
+        return False
+    hours = _failure_repeat_alert_hours()
+    if network_failing_too_long(job, hours if hours > 0 else DEFAULT_FAILURE_REPEAT_ALERT_HOURS):
+        return False
+    if crashed:
+        return is_transient_network_failure(error, agent_declared=agent_declared)
+    if job.get("_model_unreachable"):
+        from cron.unreachable_retry import will_retry
+        # Flagged: the retry decision is final. Exhausted, it alerts; the probe is not consulted.
+        return bool(will_retry(job))
+    if is_transient_network_failure(error, agent_declared=agent_declared):
+        return True
+    if agent_declared:
+        return False
+    from cron.network_probe import box_is_offline
+    return box_is_offline()
+
+
+def _transient_mark_kwargs(job: dict) -> dict:
+    """``mark_job_run`` kwargs for a run composed as a network-class failure (consumes the flag)."""
+    return {"transient_network": True} if job.pop("_transient_network", False) else {}
+
+
 def _compose_run_delivery(
     job: dict, *, success: bool, error, final_response: str, output_file,
     agent_declared: bool = False,
@@ -3163,8 +3199,17 @@ def _compose_run_delivery(
         deliver_content = blocked_config_notice(job.get("name") or job["id"], _pf_text)
     elif success:
         deliver_content = final_response
-        _stash_recovery_notice(job)
+        # No "recovered" ping: the incident ledger closes, the log keeps the streak (owner 2026-11-15).
+        if int(job.get("failure_streak") or 0) > 0:
+            logger.info("Job '%s': recovered after %s failed run(s)", job["id"], job.get("failure_streak"))
         _resolve_incidents_for_recovered_job(job)
+    elif _is_transient_network_run(job, err, agent_declared):
+        # DNS / connection-class failure (cron/transient_network.py): ledger row, no streak, no
+        # notice. ``_transient_network`` tells the bookkeeping tail to leave the streak alone.
+        from cron.transient_network import record_transient_network_incident
+        record_transient_network_incident(job, err, output_file)
+        job["_transient_network"] = True
+        deliver_content = ""
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
@@ -3314,19 +3359,18 @@ def _save_compose_deliver(
     ) = _compose_run_delivery(
         job, success=d.success, error=d.error, final_response=final_response,
         output_file=output_file, agent_declared=d.agent_declared)
-    _deliver_recovery_notice(job, fence, adapters=adapters, loop=loop)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
-    if d.should_deliver and not d.success and job.get("_model_unreachable"):
+    if d.should_deliver and not d.success and job.get("_model_unreachable") and not _quiet_network_failures():
         # The model was never reached and a bounded automatic re-run will be scheduled
-        # (cron/unreachable_retry.py): hold the failure notice — the re-run either
-        # delivers the real result or, once the ladder is exhausted, the next failure
-        # alerts normally. Mirrors Cowork's silent 5/15/30-minute re-runs.
+        # (cron/unreachable_retry.py): hold the failure notice; the failure still counts toward the
+        # streak and the failing clock. Once the ladder is exhausted the next failure alerts normally.
+        # Switch-off only: with ``cron.quiet_network_failures`` on, a pending rung composed "" above
+        # and a rung past the 6 h clock must alert.
         from cron.unreachable_retry import will_retry
         if will_retry(job):
             d.should_deliver = False
-            logger.info(
-                "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])
+
     # Not a substring check: bare "SILENT"/"NO_REPLY" or a report quoting "[SILENT]" must
     # not be swallowed; bracketed-prefix / trailing-line tolerance is kept.
     if d.should_deliver and d.success and _is_cron_silence_response(deliver_content):
@@ -3393,6 +3437,11 @@ def _deliver_crash_failure(
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
+    if _is_transient_network_run(job, err_text, crashed=True):
+        from cron.transient_network import record_transient_network_incident
+        record_transient_network_incident(job, err_text)
+        job["_transient_network"] = True
+        return None, "suppressed"
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
         return None, "suppressed_acked"
@@ -3695,6 +3744,7 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if contained:
                     mark_kwargs["delivery_error"] = delivery_error
+                mark_kwargs.update(_transient_mark_kwargs(job))
                 from cron.unreachable_retry import is_retry_run
                 if is_retry_run(job):
                     # A crashed ladder re-run: its occurrence already counted toward repeat.

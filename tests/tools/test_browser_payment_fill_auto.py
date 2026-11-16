@@ -420,7 +420,9 @@ def test_fill_payment_re_inspects_before_the_card_is_read_or_refuses(switch, arm
     out = json.loads(bvp.fill_payment(backend, meta, "task"))
     assert out["error_type"] == expected and out["success"] is False and CARD["card_number"] not in json.dumps(out)
     assert calls == (["arm"] if switch else []) + (["reinspect"] if code else []) + ["discard"], calls
-    assert out.get("fill_reinspect") == ({"count": 0, "repairs": 0, "refused": code} if code else None)
+    # dlz (11-14): the stop names its stage; this stub supervisor reports no reason for it
+    assert out.get("fill_reinspect") == ({"count": 0, "repairs": 0, "refused": code, "stopped": {
+        "stage": "after_approval", "reason": "unknown"}} if code else None)
 
 
 # -- Round 2 (r1 review findings F1-F9) --
