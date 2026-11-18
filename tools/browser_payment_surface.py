@@ -52,8 +52,9 @@ from tools.browser_payment_press_kind import (  # build F: which press is the Pa
     pay_node,
     prep_args,
     prep_verdict,
+    left_since,
+    prep_refused,
     watch_leave,
-    watch_left,
     preparatory,
 )
 
@@ -1180,10 +1181,6 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         watch = await watch_leave(sup, sid, arr) if prep is not None else None
         if prep is not None and watch is None:  # build F r3: unwatched: the Pay press
             prep, pay_like = None, True
-        if pay_like and await _prep_left(sup, gate.gen):  # build F r5: the taken-back confirm submitted after all
-            with _LOCK:
-                gate.gen.paid, gate.gen.provisional = True, False
-                return _already_pressed(gate.gen)
         # build C r4: the dialogs open in the merchant document right before this approval's Pay press
         dialogs = (await _open_dialogs(sup, sid, element) if pay_like and after is None and not card
                    and gate.gen is not None and not gate.gen.paid else None)
@@ -1195,9 +1192,9 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
                                        sup, gate, gate.approved is not None, pay_like, progress, after=after,
                                        unnamed=not _named_pay(control["role"], control["text"]),
                                        caption=control["text"], node=node, prep=prep is not None,
-                                       dialogs=(fid, loader, dialogs, control["text"]) if dialogs is not None
-                                       else None),
-                                   gate.approved is not None)
+                                       dialogs=None if dialogs is None else (fid, loader, dialogs, control["text"])),
+                                   gate.approved is not None, last=(lambda: prep_refused(sup, gate)) if pay_like
+                                   else None)
         if refused:
             return refused
         effect = await _bounded_effect(sup, page_sid, element, sid, before, control["role"], deadline)
@@ -1247,7 +1244,7 @@ async def _baseline(sup: Any, page_sid: str, element: str, sid: str) -> Optional
 
 
 async def _press_now(sup: Any, deadline: float, doc: tuple, point: tuple, top: Optional[tuple], book,
-                     checked: bool) -> Optional[dict]:
+                     checked: bool, last=None) -> Optional[dict]:
     """r4 C2/C3: from here to the press no claim can start (the claim lock is held), and everything the gate's awaits
     could have let change is read once more: the document, the hit target, the owner chain and point, the top
     document the gate judged, and (last, with no await before the press, ``book``: ``_book_press``) the claim
@@ -1263,6 +1260,8 @@ async def _press_now(sup: Any, deadline: float, doc: tuple, point: tuple, top: O
             return refused
         if top is not None and (await _top_frame(sup, page_sid))[:2] != top[:2]:
             return _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT) if checked else _changed()
+        if last is not None and (refused := await last()):  # build F r6: the last await before the press
+            return refused
         # Nothing awaits between these checks and the dispatch: past the deadline the caller may already have
         # reported "nothing was clicked", so the press must not start.
         if time.monotonic() >= deadline:
@@ -1412,7 +1411,7 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
         gen = gate.gen
         if prep and (gen is None or gen.paid or gen.prep_used):
             return _changed()
-        if pay_press and gen is not None and not gen.paid and gen.prep_at is not None and _left_since(sup, gen.prep_at):
+        if pay_press and gen is not None and not gen.paid and gen.prep_at is not None and left_since(sup, gen.prep_at):
             # build F r4 (Codex P1): the taken-back preparatory press started a navigation after its verdict: it was
             # the Pay press after all
             gen.paid, gen.provisional = True, False
@@ -1434,22 +1433,6 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             elif pay_press and after == "dialog":
                 gen.followup_used = True
     return None
-
-
-async def _prep_left(sup: Any, gen: Any) -> bool:
-    """build F r5: a purchase press after a taken-back preparatory press: whether that confirm submitted or navigated
-    since (its watch state read now, Chrome's navigation-start record). Not applicable: False."""
-    if gen is None or gen.paid or gen.prep_at is None:
-        return False
-    if _left_since(sup, gen.prep_at):
-        return True
-    return gen.prep_watch is None or await watch_left(sup, *gen.prep_watch)
-
-
-def _left_since(sup: Any, at: tuple) -> bool:
-    """build F r4: Chrome started a navigation of frame ``at[0]`` at or after ``at[1]`` (no record: True)."""
-    seen = getattr(sup, "load_started_since", None)
-    return seen is None or bool(seen(*at))
 
 
 _BOOKED = object()  # in ``progress``: the press was booked at its dispatch

@@ -284,3 +284,31 @@ async def pay_node(sup: Any, sid: str, element: str, clicked: tuple) -> tuple:
         logger.info("payment_click: pressed control's node not read (%s)", type(exc).__name__)
         node = None
     return clicked[0], clicked[1], node, _checkout_key(clicked[2])
+
+
+async def prep_left(sup: Any, gen: Any) -> bool:
+    """build F r5: a purchase press after a taken-back preparatory press: whether that confirm submitted or navigated
+    since (its watch state read now, Chrome's navigation-start record). Not applicable: False."""
+    if gen is None or gen.paid or gen.prep_at is None:
+        return False
+    if left_since(sup, gen.prep_at):
+        return True
+    return gen.prep_watch is None or await watch_left(sup, *gen.prep_watch)
+
+
+def left_since(sup: Any, at: tuple) -> bool:
+    """build F r4: Chrome started a navigation of frame ``at[0]`` at or after ``at[1]`` (no record: True)."""
+    seen = getattr(sup, "load_started_since", None)
+    return seen is None or bool(seen(*at))
+
+
+async def prep_refused(sup: Any, gate: Any) -> Optional[dict]:
+    """build F r6 (Codex delta 4): the last await before a Pay press books it: a taken-back preparatory confirm that
+    submitted or navigated since (``prep_left``) makes this press the second one: refused, the confirm booked as Pay."""
+    from tools import browser_payment_surface as surface
+
+    if not await prep_left(sup, gate.gen):
+        return None
+    with surface._LOCK:
+        gate.gen.paid, gate.gen.provisional = True, False
+        return surface._already_pressed(gate.gen)
