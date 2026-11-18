@@ -271,7 +271,9 @@ def test_the_closure_reports_blank_fields_by_index_and_a_fixed_validity_code(att
     assert out["blanks"] == [0, 1]  # the user's typed field is not blank; indexes only
     assert "typed by the user" not in raw
     assert out["result"]["success"] is True
-    assert [(r["token"], r["state"], r["validity"]) for r in out["retained"]] == [
+    *states, marker = out["retained"]
+    assert marker == {"revealed": []}  # B final: no field appeared during the fill (descriptors only, never a value)
+    assert [(r["token"], r["state"], r["validity"]) for r in states] == [
         ("cc-number", "held", "valid"), ("cc-csc", "held", code)]
 
 
