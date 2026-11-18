@@ -120,7 +120,9 @@ def test_with_the_strict_switch_a_covered_card_frame_is_refused_as_before():
     with pytest.raises(PaymentDestinationError) as caught:
         _inspect(page, strict=True)
     assert caught.value.error_type == "payment_fields_unsupported"
-    assert caught.value.detail == {"unreviewed_frames_inspected": 0}
+    # 11-18: the refusal also carries what the inspection saw (counts and card field tokens only)
+    detail = dict(caught.value.detail)
+    assert detail.pop("inspection")["documents"] == 0 and detail == {"unreviewed_frames_inspected": 0}
     page = _Checkout({"observer": "hidden", "card": "ok"}, on_focus="covered")
     i = _inspect(page, strict=True)
     assert stop.exposure_rule(i) == "strict"

@@ -965,7 +965,8 @@ def _meta_relisted(backend: Any, handle: str) -> Any:
 @plugin_errors_as_refusal
 def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_origin: str = "",
                        purpose: str = "login", cart: Any = None, approve_origins: Any = None, *,
-                       with_identifier: bool = False) -> str:
+                       with_identifier: bool = False, holder_name: Any = None,
+                       billing_postal_code: Any = None) -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -1021,7 +1022,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, merchant_orig
         from tools.browser_vault_payment import fill_payment
 
         return fill_payment(backend, meta, effective_task_id, merchant_origin, cart=cart,
-                            approve_origins=approve_origins)
+                            approve_origins=approve_origins, holder_name=holder_name,
+                            billing_postal_code=billing_postal_code)
     # dlz (payment lockdown): a login/address fill reads and writes the page.
     return _outside_payment_lock(effective_task_id, lambda: _fill_non_card(backend, handle, meta, effective_task_id,
                                                                            purpose, with_identifier))
@@ -1600,6 +1602,14 @@ BROWSER_VAULT_SCHEMA = {
                      "required": ["items", "total", "currency"]},
             "approve_origins": {"type": "array", "items": {"type": "string"}, "description":
                                 "fill, card only: exactly the approval_origins of payment_destination_approval_required."},
+            "holder_name": {"type": "string", "maxLength": 60, "description":
+                "fill, card only, optional: the cardholder name as printed on the card, for the form's name field, "
+                "used only when the saved card has no holder name (the saved one wins). 2-60 characters: letters, "
+                "spaces and ' - . / only. Not a secret; the approval card says Sera supplied it."},
+            "billing_postal_code": {"type": "string", "maxLength": 10, "description":
+                "fill, card only, optional: the billing postcode, for the form's postcode field, used only when the "
+                "saved card has no postcode (the saved one wins). 3-10 characters: letters, digits, spaces and - "
+                "only. Not a secret; the approval card says Sera supplied it."},
             "code": {"type": "string", "maxLength": 16,
                      "description": "enter_code only: a one-time code Hermes obtained through its own authorized workflow (e.g. read "
                                     "from the user's mail) or a one-time code the user sent in chat for this page (SMS/2FA/"
@@ -1835,7 +1845,8 @@ def _handle_vault_inner(args: dict[str, Any], **kwargs) -> str:
                                            merchant_origin=str(args.get("merchant_origin") or ""),
                                            purpose=str(args.get("purpose") or "login"),
                                            # dlz (Track B): card fills only; passed only when given.
-                                           **{k: args[k] for k in ("cart", "approve_origins") if k in args}),
+                                           **{k: args[k] for k in ("cart", "approve_origins", "holder_name", "billing_postal_code")
+                                              if k in args}),
         "save_login": lambda: _outside_payment_lock(tid, lambda: browser_vault_save_login(label=label, task_id=tid)),
         "enter_code": lambda: _outside_payment_lock(tid, lambda: browser_vault_enter_code(
             handle=handle, task_id=tid, code=str(args.get("code") or ""),

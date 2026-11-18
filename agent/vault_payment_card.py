@@ -6,6 +6,15 @@ import re
 from datetime import date
 
 
+class CardInvalid(ValueError):
+    """dlz (11-18): a saved card the fill cannot use, with a fixed code (``card_fields_invalid``, ``card_expired``,
+    ``card_number_invalid``) the refusal may name. Carries no value."""
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def validate_card(secret: dict[str, str]) -> dict[str, str]:
     number = re.sub(r"[ -]", "", str(secret.get("card_number", "")))
     cvc = str(secret.get("cvc", ""))
@@ -17,10 +26,10 @@ def validate_card(secret: dict[str, str]) -> dict[str, str]:
         and re.fullmatch(r"[0-9]{1,2}", month)
         and re.fullmatch(r"[0-9]{4}", year)
     ):
-        raise ValueError("Invalid card fields")
+        raise CardInvalid("Invalid card fields", "card_fields_invalid")
     today = date.today()
     if not 1 <= int(month) <= 12 or (int(year), int(month)) < (today.year, today.month):
-        raise ValueError("Invalid card expiry")
+        raise CardInvalid("Invalid card expiry", "card_expired")
     digits = [int(n) for n in number[::-1]]
     if (
         sum(
@@ -29,7 +38,7 @@ def validate_card(secret: dict[str, str]) -> dict[str, str]:
         )
         % 10
     ):
-        raise ValueError("Invalid card number")
+        raise CardInvalid("Invalid card number", "card_number_invalid")
     out = {
         "card_number": number,
         "cvc": cvc,
@@ -38,7 +47,42 @@ def validate_card(secret: dict[str, str]) -> dict[str, str]:
     }
     if secret.get("cardholder_name"):
         out["cardholder_name"] = str(secret["cardholder_name"])
+    # dlz (D-0359 a, 2026-11-18): the billing postcode is filled like the holder when the item has one; not a
+    # secret on its own (never in the payment window). A value that is not postcode-shaped is left out (the fill
+    # then reports the field as skipped), never a reason to refuse the card.
+    postcode = billing_postcode(secret.get("billing_postal_code"))
+    if postcode:
+        out["billing_postal_code"] = postcode
     return out
+
+
+_POSTCODE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9 -]{0,10}[A-Za-z0-9])?")
+
+
+def billing_postcode(value) -> str:
+    """A billing postcode as the card form takes it (2-12 letters, digits, inner spaces or dashes), or ``""``."""
+    text = " ".join(str(value or "").split())
+    return text if len(text) >= 2 and _POSTCODE.fullmatch(text) else ""
+
+
+# 1Password's Credit Card template has no postcode field: a custom field on the item carries it. Labels it may have
+# (lower case, spaces and punctuation folded to one space).
+_OP_POSTCODE_LABELS = frozenset({
+    "billing postal code", "billing postcode", "billing post code", "billing zip", "billing zip code",
+    "postal code", "postcode", "post code", "zip", "zip code", "plz", "postleitzahl",
+})
+
+
+def _op_postcode(fields: list) -> str:
+    """The item's one billing postcode field (by id ``billing_postal_code`` or a label above), or ``""`` when it
+    has none or two different ones (the fill then skips the field and says so)."""
+    found = set()
+    for field in fields:
+        label = " ".join(re.sub(r"[^a-z0-9]+", " ", str(field.get("label") or "").lower()).split())
+        if field.get("id") == "billing_postal_code" or label in _OP_POSTCODE_LABELS:
+            if isinstance(field.get("value"), str) and field["value"].strip():
+                found.add(billing_postcode(field["value"]))
+    return found.pop() if len(found) == 1 else ""
 
 
 def parse_onepassword_card(
@@ -67,4 +111,5 @@ def parse_onepassword_card(
         "exp_year": expiry[:4],
         "exp_month": expiry[4:],
         "cardholder_name": fields.get("cardholder", ""),
+        "billing_postal_code": _op_postcode(item.get("fields") or []),
     })

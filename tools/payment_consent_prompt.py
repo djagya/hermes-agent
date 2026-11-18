@@ -181,6 +181,8 @@ class PaymentPromptFacts:
     unreviewed: bool = False
     # r4 S: ``vault.payment_pay_once`` as read when these facts were made (the card and the binding both need it on).
     pay_once_on: bool = field(default_factory=lambda: payment_pay_once_enabled())
+    # dlz (D-0360 a, 11-18): the non-secret card fields the agent supplied for this fill (names only, never values).
+    supplied_fields: tuple = ()
 
     def __post_init__(self):
         if not isinstance(self.ref, str) or not _REF_RE.fullmatch(self.ref):
@@ -206,6 +208,10 @@ class PaymentPromptFacts:
             raise FactsInvalid("unreviewed must match the receiving origins")
         if type(self.pay_once_on) is not bool:
             raise FactsInvalid("pay_once_on must be a bool")
+        supplied = tuple(self.supplied_fields or ())
+        if any(name not in SUPPLIED_FIELD_NAMES for name in supplied):
+            raise FactsInvalid("supplied fields must be holder_name or billing_postal_code")
+        object.__setattr__(self, "supplied_fields", tuple(n for n in SUPPLIED_FIELD_NAMES if n in supplied))
 
     def to_dict(self) -> dict:
         return {
@@ -218,6 +224,7 @@ class PaymentPromptFacts:
             "page_match": {"state": self.page_match.state, "where": self.page_match.where},
             "unreviewed": self.unreviewed,
             "pay_once_on": self.pay_once_on,
+            "supplied_fields": list(self.supplied_fields),
         }
 
     @classmethod
@@ -226,9 +233,10 @@ class PaymentPromptFacts:
             raise FactsInvalid("payment facts must be a mapping")
         expected = {"ref", "card_label", "merchant_origin", "receiving", "expires_in_s", "cart", "page_match",
                     "unreviewed", "pay_once_on"}
-        if set(data) != expected:
+        if set(data) - {"supplied_fields"} != expected:
             raise FactsInvalid("payment facts have missing or unknown keys")
-        return cls(**{**data, "receiving": tuple(data["receiving"] or ())})
+        return cls(**{**data, "receiving": tuple(data["receiving"] or ()),
+                      "supplied_fields": tuple(data.get("supplied_fields") or ())})
 
 
 def _check_origins(facts: PaymentPromptFacts) -> None:
@@ -293,6 +301,21 @@ def scope_line(facts: PaymentPromptFacts) -> str:
             f"at {facts.merchant_origin}.")
 
 
+# dlz (D-0360 a): the agent-supplied non-secret fields the card names, in the order it reads them.
+SUPPLIED_FIELD_NAMES = ("holder_name", "billing_postal_code")
+_SUPPLIED_LABELS = {"holder_name": "Holder name", "billing_postal_code": "postcode"}
+
+
+def supplied_line(facts: PaymentPromptFacts) -> str:
+    """The card line for fields Sera supplied (no values): empty when she supplied none."""
+    names = [_SUPPLIED_LABELS[n] for n in facts.supplied_fields]
+    if not names:
+        return ""
+    both = " and ".join(names)
+    return (f"{both[0].upper()}{both[1:]} supplied by Sera (written only where the saved card has no value for "
+            f"{'it' if len(names) == 1 else 'them'}).")
+
+
 def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
     """The card body, one fact per line, in the order the owner reads it."""
     lines = [bold("Approve card payment?"), ""]
@@ -305,6 +328,8 @@ def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
               "Card fields go to:"]
     for r in facts.receiving:
         lines.append(f"• {code(r.origin)} ({r.status}): {esc(', '.join(r.fields))}")
+    if supplied := supplied_line(facts):
+        lines.append(esc(supplied))
     lines.append("")
     if facts.cart is None:
         lines.append(PAGE_MATCH_LINES["not_checked"])
@@ -407,7 +432,8 @@ def _page_check(inspected) -> PageMatch:
     return PageMatch(state, where)
 
 
-def facts_for_inspection(inspected, *, card_label: str, cart: Optional[StatedCart] = None) -> PaymentPromptFacts:
+def facts_for_inspection(inspected, *, card_label: str, cart: Optional[StatedCart] = None,
+                         supplied: tuple = ()) -> PaymentPromptFacts:
     """Facts for a fill: the inspected documents' origins and fields. dlz (Track B): with ``cart`` (Sera's stated
     cart), the page check the inspection pinned (``inspected.page_match``: state and where it looked) goes with it;
     without one the card says no cart was stated."""
@@ -427,4 +453,4 @@ def facts_for_inspection(inspected, *, card_label: str, cart: Optional[StatedCar
         expires_in_s=max(1, min(600, int(inspected.expires_at - time.monotonic()))),
         cart=cart,
         page_match=_page_check(inspected) if cart is not None else PageMatch(),
-        unreviewed=any(r.status == "UNREVIEWED" for r in receiving))
+        unreviewed=any(r.status == "UNREVIEWED" for r in receiving), supplied_fields=tuple(supplied))

@@ -1396,10 +1396,17 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
     # browser_vault fill registers injected values with this forced model-egress
     # boundary. Preserve raw stdout only for screenshot-path detection below.
+    # dlz (D-0367 b): the output is the slot's own (the route this call ran on): a payment window released on
+    # another slot does not mask it.
+    from agent.redact_vault import browser_result_slot
+
+    result_slot = str(env.get("HERMES_BROWSER_SLOT_ID") or "")
+    with browser_result_slot(result_slot):
+        output = redact_sensitive_text(proc.stdout, force=True, vault="browser")
     result = {
         "success": proc.returncode == 0,
         "exit_code": proc.returncode,
-        "output": redact_sensitive_text(proc.stdout, force=True, vault="browser"),
+        "output": output,
     }
     if workspace:
         result["workspace"] = workspace
@@ -1407,7 +1414,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         result["session"] = session
     result.update(_take_real_profile_note(route_key))
     result.update({"dialogs": dialogs} if dialogs else {})
-    stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True, vault="browser")
+    with browser_result_slot(result_slot):
+        stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True, vault="browser")
     failure = _managed_connect_failure(stderr) if managed and never_started else ""
     if failure == "gate":
         stderr = _GATE_REFUSED_HINT + "\n" + stderr
