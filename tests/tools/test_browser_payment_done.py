@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools import browser_payment_done as done
+from tools import browser_payment_order_evidence as evidence
 from tools import browser_payment_surface as surface
 
 SHOP = "https://shop.test"
@@ -81,6 +82,9 @@ class FakeSup:
                 return {"result": {"type": "object", "value": dict(self.pin)}}
             if params.get("returnByValue") and params["expression"].startswith("(" + surface._pay_js("page")):
                 return {"result": {"type": "object", "value": {"ok": True, "why": "ok"}}}  # r4 C1: the Pay check
+            if params["expression"] == evidence.SCAN_JS:  # build F r2: the order/failure wording scan (booleans)
+                full = getattr(self, "full_text", None) or self.page["text"]  # the whole text, past the excerpt
+                return {"result": {"type": "object", "value": evidence.wording(self.page["title"], full)}}
             if params["expression"] != done.SNAPSHOT_JS:  # the payment_controls lister
                 return {"result": {"objectId": "arr"}}
             return {"result": {"type": "object", "value": self.page}}
@@ -233,7 +237,9 @@ def test_no_handover_until_a_safe_confirmation_and_the_lock_stays(tree, snapshot
     out = done.payment_done(sup)
     assert out["error_type"] == "payment_confirmation_not_reached" and out["success"] is False
     assert out["lock_released"] is False and set(out) == {"success", "error_type", "error", "url", "title",
-                                                          "lock_released"}
+                                                          "reason", "lock_released"}
+    # build F r2: a fixed code for what the tab showed last (never page text)
+    assert out["reason"] == ("not_shop_page" if snapshot is None else "loading")
     # still locked: the tab's site only, never its title or path (exfil via document.title / location)
     assert out["url"] == done._url_origin(tree[0][2]) and out["title"] == ""
     assert not sup.sent("Target.createTarget") and not sup.sent("Target.closeTarget")
@@ -271,12 +277,21 @@ def test_lock_released_only_when_status_proves_it(status, released):
     assert bool(sup.sent("attach_page")) is released
 
 
-def test_single_page_shop_confirmation_once_the_card_frames_are_gone():
+@pytest.mark.parametrize("rows, reached", [
+    (None, False),  # the original fixture: "Pay 22.66 EUR" still listed and enabled on the checkout's own document
+    ([{"i": 0, "role": "button", "text": "Pay 22.66 EUR", "disabled": True}], True),  # the Pay button disabled
+    ([{"i": 0, "role": "link", "text": "Continue shopping", "disabled": False}], True),
+])
+def test_single_page_shop_confirmation_once_the_card_frames_are_gone(rows, reached):
     sup = _paid([CHECKOUT, SAME_DOC])
     sup.page.update(url=SHOP + "/thanks")
-    # build F: the checkout's own document needs order wording ("Order 77 confirmed") and no purchase control listed
-    sup.rows = [{"i": 0, "role": "link", "text": "Continue shopping", "disabled": False}]
+    sup.rows = rows
     out = done.payment_done(sup)
+    # build F: the checkout's own document needs order wording ("Order 77 confirmed") and no enabled purchase button
+    if not reached:
+        assert out["error_type"] == "payment_confirmation_not_reached" and out["reason"] == "purchase_button_shown"
+        assert out["lock_released"] is False and not sup.sent("Target.closeTarget")
+        return
     assert out["success"] is True and out["url"] == SHOP + "/thanks" and out["order_evidence"] == "confirmation_text"
     assert {c[3] for c in sup.sent("Runtime.evaluate")} == {SAME_DOC}
     # the same document never counts when the merchant page itself received a card field

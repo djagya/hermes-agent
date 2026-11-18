@@ -2,15 +2,20 @@
 ``browser_payment_surface``), and (build F, 2026-11-18 Sunday live retry) when a press whose caption only confirms
 is a preparatory step instead: Unzer's payment-method modal has "BESTÄTIGEN" (it confirms the card and closes the
 modal) while the page's "JETZT KAUFEN" places the order. Counting that confirm as the Pay press used the approval's
-one press and refused the real one. Read by ``browser_payment_surface`` (``_click``) and ``browser_payment_done``
-(the Pay caption still listed on a confirmation candidate). Only booleans leave the page.
+one press and refused the real one.
+
+build F round 2 (reviews: geometry let a real order press pass as preparatory): only on positive evidence. The
+confirm's box is the nearest ancestor holding the owner ``<iframe>`` of a card frame this fill claimed (resolved by
+frame id into the controls' isolated world, never found by geometry or ``src``); a purchase button (``purchase_button``)
+of the same listing lies outside it. Read by ``browser_payment_surface`` (``_click``) and
+``browser_payment_order_evidence`` (a purchase button still listed). Only booleans leave the page.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger("tools.browser_payment_surface")
 
@@ -30,9 +35,14 @@ _PAY_WORDS = re.compile(rf"\b({_STRONG}|{_CONFIRM})\b", re.IGNORECASE)
 _STRONG_WORDS = re.compile(rf"\b({_STRONG})\b", re.IGNORECASE)
 _CONFIRM_WORDS = re.compile(rf"\b({_CONFIRM})\b", re.IGNORECASE)
 # A confirm word next to one of these names the purchase ("Zahlung bestätigen", "confirm order", "Kauf abschließen").
+# build F r2: reservations, registrations, subscriptions, checkouts, donations and tickets are purchases too
+# ("Confirm reservation", "Complete checkout", "Reservierung bestätigen", "Confirm subscription").
 _PAY_NOUNS = re.compile(
     r"\b(payment|zahlung|paiement|pago|pagamento|order|bestellung|commande|pedido|ordine|bestelling|purchase|kauf|"
-    r"achat|compra|acquisto|booking|buchung|réservation|reserva|prenotazione)\b", re.IGNORECASE)
+    r"achat|compra|acquisto|booking|bookings|buchung|buchungen|réservation|reservation|reservations|reservierung|"
+    r"prenotazione|reserva|reservering|registration|anmeldung|registrierung|inscription|inscripción|iscrizione|"
+    r"enrollment|enrolment|subscription|abonnement|abo|suscripción|abbonamento|checkout|kasse|donation|spende|"
+    r"donación|donazione|ticket|tickets|billet|billets|entrada|entradas|biglietto|biglietti)\b", re.IGNORECASE)
 # ... but not the payment method or card details ("Confirm payment method", "confirmer le moyen de paiement").
 _METHOD_PHRASE = re.compile(
     r"\b(payment|card)\s+(method|methods|details|option|options|type|info|information)\b|"
@@ -79,61 +89,150 @@ def confirm_only(caption: Any) -> bool:
             and not strong_pay(caption))
 
 
-def same_caption(a: Any, b: Any) -> bool:
-    """Two captions read as the same control text (case and spacing aside)."""
-    return isinstance(a, str) and isinstance(b, str) and " ".join(a.casefold().split()) == \
-        " ".join(b.casefold().split())
+# build F r2: wallet, pay-later and gift-card buttons name a purchase but never the checkout's own order button
+# ("Buy with Apple Pay" above a card form is no reason to read the form's "Submit" as a step).
+_WALLET = re.compile(
+    r"apple\s*pay|google\s*pay|\bg\s*pay\b|amazon\s*pay|samsung\s*pay|pay\s*pal|\bshop\s*pay\b|klarna|"
+    r"\bpay\s*later\b|später\s*bezahlen|\bsofort\b|afterpay|clearpay|\baffirm\b|venmo|ratenkauf|\braten\b|"
+    r"gutschein|geschenkkarte|geschenkgutschein|gift\s*cards?|gift\s*voucher|voucher|e-?gift|carte\s*cadeau|"
+    r"bon\s*cadeau|tarjeta\s*regalo|buono\s*regalo|cadeaubon|cadeaukaart", re.IGNORECASE)
 
 
-# On the pressed control (the controls' isolated world of its document): the box it confirms in is the dialog it sits
-# in, else the nearest ancestor below <body> that holds a card iframe (a provider's card frame: ``origins``), else the
-# nearest fixed-position ancestor (an overlay modal). True when
-# such a box exists and one of the listed purchase controls (``arr[i]`` for ``i`` in ``idx``) lies outside it.
-_PREP_CHECK = r"""function(arr, idx, origins){
-  const top = [document.body, document.documentElement];
-  const cardBox = el => {
-    for (let n = el.parentElement; n && !top.includes(n); n = n.parentElement) {
-      for (const f of n.querySelectorAll('iframe')) {
-        let o = ''; try { o = new URL(f.getAttribute('src') || '', location.href).origin; } catch (e) { o = ''; }
-        if (origins.includes(o)) return n;
-      }
-    }
-    return null;
-  };
-  // a modal that is a plain fixed-position overlay (no dialog role, card iframes whose src is set later)
-  const overlayBox = el => {
-    for (let n = el.parentElement; n && !top.includes(n); n = n.parentElement) {
-      try { if (getComputedStyle(n).position === 'fixed') return n; } catch (e) { return null; }
-    }
-    return null;
-  };
-  const box = this.closest('__DIALOG__') || cardBox(this) || overlayBox(this);
-  if (!box || top.includes(box)) return false;
-  return idx.some(i => { const el = arr[i]; return !!el && el !== this && el.isConnected && !box.contains(el); }); }"""
-
-
-def _prep_check() -> str:
-    from tools.browser_payment_surface_after_pay import _DIALOG_SEL
-
-    return _PREP_CHECK.replace("__DIALOG__", _DIALOG_SEL)
+def purchase_button(control: dict) -> bool:
+    """build F r2: a listed control that places the checkout's order: a button (not a link, checkbox or radio),
+    enabled, whose caption names the purchase (``strong_pay``) and no wallet, pay-later or gift card."""
+    text = control.get("text")
+    return (control.get("role") == "button" and not control.get("disabled") and strong_pay(text)
+            and not _WALLET.search(text))
 
 
 def purchase_indices(controls: list, pressed: dict) -> list:
-    """The listing indices of the other enabled controls in the pressed control's document that name the purchase."""
-    return [c["_i"] for c in controls if c is not pressed and not c["disabled"] and strong_pay(c["text"])]
+    """The listing indices of the other purchase buttons (``purchase_button``) in the pressed control's document."""
+    return [c["_i"] for c in controls if c is not pressed and purchase_button(c)]
 
 
-async def preparatory(sup: Any, sid: str, element: str, arr: str, idx: list, origins: list) -> bool:
-    """build F: the pressed control confirms inside a dialog or the card's method box while a purchase control of the
-    same document stays outside it (``_PREP_CHECK``). Any failure: False (the press stays the Pay press)."""
-    if not idx:
+_MAX_OWNERS = 8  # card frames whose owner <iframe> the box check takes (a checkout has a handful)
+
+# On the pressed control (the controls' isolated world of its document): its box is the nearest ancestor below <body>
+# that contains one of ``owners`` (the owner <iframe> elements of this fill's card frames). True when such a box
+# exists and one of the listed purchase buttons (``arr[i]`` for ``i`` in ``idx``) is connected and outside it.
+PREP_CHECK = r"""function(arr, idx, ...owners){
+  const top = [document.body, document.documentElement];
+  const live = owners.filter(o => !!o && o.isConnected);
+  let box = null;
+  for (let n = this.parentElement; n && !top.includes(n); n = n.parentElement) {
+    if (live.some(o => n.contains(o))) { box = n; break; }
+  }
+  if (!box) return false;
+  return idx.some(i => { const el = arr[i]; return !!el && el !== this && el.isConnected && !box.contains(el); }); }"""
+# On the listing array: every element at ``idx`` is still listed (connected, laid out, visible) and enabled.
+STILL_LISTED = r"""function(idx){ return idx.every(i => { const el = this[i];
+  if (!el || !el.isConnected) return false;
+  const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
+  return r.width >= 1 && r.height >= 1 && st.visibility === 'visible' && st.display !== 'none'
+    && !el.disabled && el.getAttribute('aria-disabled') !== 'true'; }); }"""
+
+
+def _top_children(tree: tuple, frames: frozenset) -> list:
+    """For each claimed card frame in ``tree`` (rows ``(id, loader, url, origin, parent)``, the top first): the frame
+    on its chain whose parent is the top document (its owner <iframe> is an element of the top document)."""
+    parents = {row[0]: row[4] for row in tree}
+    top, out = tree[0][0], []
+    for fid in sorted(frames):
+        hops = 0
+        while fid in parents and parents[fid] and parents[fid] != top and hops < len(tree):
+            fid, hops = parents[fid], hops + 1
+        if parents.get(fid) == top and fid not in out:
+            out.append(fid)
+    return out[:_MAX_OWNERS]
+
+
+async def card_owners(sup: Any, sid: str, ctx: Any, tree: tuple, frames: frozenset, into: list) -> None:
+    """Resolve the owner <iframe> of each claimed card frame below the top document into the controls' isolated world
+    ``ctx`` of the top document (session ``sid``), appending the object ids to ``into`` (the caller releases them).
+    A frame whose owner does not resolve is left out (fewer owners: less is preparatory)."""
+    if type(ctx) is not int:
+        return
+    for fid in _top_children(tree, frames):
+        try:
+            owner = (await sup._cdp("DOM.getFrameOwner", {"frameId": fid}, session_id=sid))["result"]
+            obj = (await sup._cdp("DOM.resolveNode", {"backendNodeId": owner["backendNodeId"],
+                                                      "executionContextId": ctx}, session_id=sid))["result"]
+            into.append(obj["object"]["objectId"])
+        except Exception as exc:  # health: allow BLE001 -- no owner: this frame gives no box (fails closed)
+            logger.info("payment_click: card frame owner not resolved (%s)", type(exc).__name__)
+
+
+async def preparatory(sup: Any, sid: str, element: str, arr: str, idx: list, owners: list) -> bool:
+    """build F r2: the pressed control sits in the box of a claimed card frame's owner while a purchase button of the
+    same listing lies outside it (``PREP_CHECK``). Any failure: False (the press stays the Pay press)."""
+    if not idx or not owners:
         return False
     try:
         reply = await sup._cdp("Runtime.callFunctionOn", {
-            "objectId": element, "functionDeclaration": _prep_check(),
-            "arguments": [{"objectId": arr}, {"value": idx}, {"value": origins}], "returnByValue": True},
-            session_id=sid)
+            "objectId": element, "functionDeclaration": PREP_CHECK,
+            "arguments": [{"objectId": arr}, {"value": idx}, *({"objectId": o} for o in owners)],
+            "returnByValue": True}, session_id=sid)
     except Exception as exc:  # health: allow BLE001 -- unread: the press stays the approval's Pay press
         logger.info("payment_click: preparatory confirm not read (%s)", type(exc).__name__)
         return False
     return ((reply.get("result") or {}).get("result") or {}).get("value") is True
+
+
+async def still_listed(sup: Any, sid: str, arr: str, idx: list) -> bool:
+    """build F r2: after a preparatory press, every purchase button listed before it is still listed and enabled.
+    Unread: False (the press is re-booked as the Pay press)."""
+    try:
+        reply = await sup._cdp("Runtime.callFunctionOn", {"objectId": arr, "functionDeclaration": STILL_LISTED,
+                                                          "arguments": [{"value": idx}], "returnByValue": True},
+                               session_id=sid)
+    except Exception as exc:  # health: allow BLE001 -- unread: the preparatory press counts as the Pay press
+        logger.info("payment_click: purchase buttons not read after the confirm (%s)", type(exc).__name__)
+        return False
+    return ((reply.get("result") or {}).get("result") or {}).get("value") is True
+
+
+
+
+async def prep_args(sup: Any, gen: Any, clicked: tuple, control: dict, doc_controls: list, at: tuple,
+                    held: list) -> Optional[tuple]:
+    """build F r2: whether a Pay-like press is the approval's one preparatory press instead: its caption only confirms
+    (``confirm_only``), it is on the merchant's top document (``clicked[3]``), the approval has a lock record with no
+    Pay press and no preparatory press yet, and ``preparatory`` holds. Returns ``(purchase indices, owner objects)``
+    to read it again before the press and after it, or None (the Pay press: fails closed). ``at``: ``(session,
+    element, listing array, frame tree)``; ``held``: receives the resolved owner objects (the caller releases them)."""
+    if not (clicked[3] and confirm_only(control["text"])) or gen is None or gen.paid or gen.prep_used:
+        return None
+    from tools.browser_payment_done import card_frame_ids
+
+    sid, element, arr, tree = at
+    idx = purchase_indices(doc_controls, control)
+    if not idx:
+        return None
+    await card_owners(sup, sid, control.get("_ctx"), tree, card_frame_ids(sup), held)
+    return (idx, list(held)) if await preparatory(sup, sid, element, arr, idx, held) else None
+
+
+async def prep_verdict(sup: Any, sid: str, arr: str, prep: tuple, effect: Optional[dict]) -> Optional[str]:
+    """build F r2: after a preparatory press, why it counts as the Pay press after all (``navigated``: the top
+    document changed; ``purchase_button_gone``: a purchase button listed before it is gone or disabled;
+    ``effect_unread``), or None: it stays a preparatory step."""
+    if not isinstance(effect, dict):
+        return "effect_unread"
+    if effect.get("navigated") is not False:
+        return "navigated"
+    return None if await still_listed(sup, sid, arr, prep[0]) else "purchase_button_gone"
+
+
+async def pay_node(sup: Any, sid: str, element: str, clicked: tuple) -> tuple:
+    """build F r2: ``(frame id, loader, backendNodeId or None, origin + path)`` of the control a Pay (or preparatory)
+    press goes to, kept on the lock record for payment_done."""
+    from tools.browser_payment_done import _checkout_key
+    from tools.browser_payment_surface_after_pay import _backend_id
+
+    try:
+        node = await _backend_id(sup, sid, element)
+    except Exception as exc:  # health: allow BLE001 -- unread: payment_done cannot tell this element by identity
+        logger.info("payment_click: pressed control's node not read (%s)", type(exc).__name__)
+        node = None
+    return clicked[0], clicked[1], node, _checkout_key(clicked[2])

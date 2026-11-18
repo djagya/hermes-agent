@@ -9,9 +9,11 @@ runtime's way out after the Pay click, on the supervisor's own (native) socket:
    card origin, with none of this payment's card documents and no card-field frame in its tree,
    fully loaded and unchanged over two polls. Payment-provider and 3-D Secure pages in between are
    waited through. A single-page shop's checkout document counts too once it never held a card
-   field and every claimed card frame is gone, but (build F) that document, or any document at the
-   checkout's URL, only with order wording in its title or text; and no document counts while a listed
-   control still carries the Pay press's caption (``order_evidence`` in the result).
+   field and every claimed card frame is gone. build F r2 (``browser_payment_order_evidence``): never
+   a document whose full text has failure wording, or that still shows the pressed Pay element itself;
+   a checkout-like document (the checkout's or the Pay press's own document, or one at either's
+   origin + path) only with order wording and no enabled purchase button listed (``order_evidence`` in
+   the result; ``reason`` in ``payment_confirmation_not_reached``).
 2. Snapshot that document in an isolated world: title, URL, visible text (bounded) and http(s)
    links (bounded). Form controls, editable regions and frames are skipped: no input value is ever
    read, and nothing is captured as pixels.
@@ -47,8 +49,9 @@ from tools.browser_payment_card_values import (
     register_dialog_card_values,
     slot_of,
 )
+from tools.browser_payment_order_evidence import order_evidence
 # parse_lock_status is re-exported: the one lock-state reader lives in browser_payment_surface.
-from tools.browser_payment_surface import _wait, lock_status, parse_lock_status
+from tools.browser_payment_surface import _wait, lock_status, parse_lock_status, pay_press
 
 logger = logging.getLogger(__name__)
 
@@ -422,9 +425,13 @@ _ORIGIN_INVALID = ("expected_origin must be the shop's exact HTTPS origin (schem
 _ORIGIN_REQUIRED = ("This checkout ran on a payment provider's own page, so the shop's origin is not known. Nothing "
                     "was done. Call payment_done again with expected_origin set to the shop's HTTPS origin where "
                     "the order confirmation will show.")
-_NOT_REACHED = ("No order confirmation was reached on the payment tab within the wait: it still shows a checkout, "
-                "payment provider or bank (3-D Secure) page, a page on another site, or a page that is still "
-                "loading. The browser stays locked; nothing was clicked, closed or retried. Do not press Pay again. "
+_NOT_REACHED = ("No order confirmation was reached on the payment tab within the wait. reason says what the tab "
+                "showed last: pay_control_shown (the pressed Pay control is still on the page), failure_wording (the "
+                "page says the payment or order failed or was declined), no_order_wording (a page at the checkout "
+                "with no order wording), purchase_button_shown (a page at the checkout still offers a purchase "
+                "button), not_shop_page (a payment provider, bank (3-D Secure) or other site's page, or a card "
+                "form), loading (a page still loading or changing), page_unread (the page could not be read). "
+                "The browser stays locked; nothing was clicked, closed or retried. Do not press Pay again. "
                 "url shows the site the tab is on (origin only while locked). If a bank check is waiting, ask the "
                 "user to finish it, then call payment_done again; otherwise ask the user (payment_close closes the "
                 "payment tab and ends the lock, without a confirmation snapshot).")
@@ -544,16 +551,17 @@ async def _probe(sup: Any, payment: _Payment, expected: str, previous: Optional[
         except PaymentPolicyError:  # too many frames or nesting: never judged safe
             return "wait", seen, None
         if not _safe_top(tree, payment, expected):
-            return "wait", seen, None
+            return "wait", {**seen, "reason": "not_shop_page"}, None
         key = (tree[0][0], tree[0][1])
         if key != previous:
-            return "settling", seen, key
+            return "settling", {**seen, "reason": "loading"}, key
         page = _valid_snapshot(await _snapshot(sup, sid, tree[0][0]), expected)
         if page is None or await sup._payment_tree(sid, child_sessions) != tree:
-            return "wait", seen, None
-        evidence = await _order_evidence(sup, sid, tree[0], payment, page)
-        if evidence is None:  # build F: the checkout itself, or the Pay caption still listed: look again
-            return "settling", seen, key
+            return "wait", {**seen, "reason": "loading"}, None
+        pay = pay_press(sup)
+        evidence, reason = await order_evidence(sup, sid, tree[0], _checkout_like(tree[0], payment, page, pay), pay)
+        if evidence is None:  # build F: no order evidence on this document yet: look again
+            return "settling", {**seen, "reason": reason}, key
         page["browser_context"] = tab.get("browserContextId")
         page["order_evidence"] = evidence
         return "ready", page, key
@@ -563,47 +571,12 @@ async def _probe(sup: Any, payment: _Payment, expected: str, previous: Optional[
             await sup._release_payment_sessions({"tab": sid})
 
 
-# build F (Sunday live retry): what only an order confirmation says (EN/DE/FR/ES/IT/NL), read on the checkout's own
-# document or URL, where the page alone proves nothing
-_CONFIRMATION = re.compile(
-    r"\b(thank you|thanks for your (order|purchase)|order (number|confirmed|confirmation|received|placed|complete)|"
-    r"your order (has been|was|is) (placed|confirmed|received)|danke|vielen dank|"
-    r"bestellung (ist )?(eingegangen|bestätigt|erhalten|aufgegeben|abgeschlossen)|bestellnummer|bestellbestätigung|"
-    r"auftragsbestätigung|merci|commande (confirmée|validée|enregistrée|reçue)|numéro de commande|gracias|"
-    r"pedido (confirmado|realizado|recibido)|número de pedido|grazie|ordine (confermato|ricevuto|completato)|"
-    r"numero d'ordine|bedankt|bestelling (is )?(geplaatst|ontvangen|bevestigd)|bestelnummer)", re.IGNORECASE)
-
-
-async def _top_captions(sup: Any, sid: str, row: tuple) -> list:
-    """The captions of the controls listed on the candidate's top document (payment_controls' own listing: buttons
-    and links, never an input's value; redacted as for the model)."""
-    from tools.browser_payment_surface import _listing
-
-    arr, controls = await _listing(sup, row[0], sid, f"{row[0]}|{row[1]}", row[1], True, "")
-    await sup._release_payment_object(sid, arr)
-    return [c["text"] for c in controls]
-
-
-async def _order_evidence(sup: Any, sid: str, row: tuple, payment: _Payment, page: dict) -> Optional[str]:
-    """build F: why a safe, settled document is the order confirmation, or None (keep waiting). Never while a listed
-    control still carries the Pay press's caption. The checkout's own document (single-page shop) or a document at
-    the checkout's URL needs confirmation wording in its title or text (``confirmation_text``) and, when the Pay
-    caption is not known, no listed purchase control at all; any other document is ``new_document``."""
-    from tools.browser_payment_press_kind import same_caption, strong_pay
-    from tools.browser_payment_surface import pay_caption
-
-    pressed = pay_caption(sup)
-    checkout = row[1] == payment.loader or _checkout_key(page["url"]) in payment.checkouts
-    if not checkout and pressed is None:
-        return "new_document"
-    captions = await _top_captions(sup, sid, row)
-    if pressed is not None and any(same_caption(c, pressed) for c in captions):
-        return None
-    if not checkout:
-        return "new_document"
-    if pressed is None and any(strong_pay(c) for c in captions):
-        return None
-    return "confirmation_text" if _CONFIRMATION.search(page["title"] + "\n" + page["text"]) else None
+def _checkout_like(row: tuple, payment: _Payment, page: dict, pay: Optional[dict]) -> bool:
+    """build F r2: the candidate is the checkout's own document or the Pay press's (``pay``: ``pay_press``), or sits
+    at the origin + path of either (a document there proves nothing by itself)."""
+    loaders = {payment.loader} | ({pay["loader"]} if pay else set())
+    keys = payment.checkouts | ({pay["key"]} if pay and pay["key"] else set())
+    return row[1] in loaders or _checkout_key(page["url"]) in keys
 
 
 async def _open_tab(sup: Any, url: str, context: Any) -> str:
@@ -948,6 +921,7 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     deadline = time.monotonic() + _WAIT_S
     previous: Optional[tuple] = None
     seen: dict = {}
+    reason = "not_shop_page"  # build F r2: what the tab showed last (a fixed code)
     page: Optional[dict] = None
     while page is None:
         left = deadline - time.monotonic()
@@ -963,6 +937,7 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
             _forget(supervisor, payment.tab)
             return _refusal("payment_tab_gone", _TAB_GONE, lock_released=_released(supervisor))
         seen = {k: info[k] for k in ("url", "title") if k in info} or seen
+        reason = info.get("reason") or reason
         report = _dialog_report(supervisor)
         if "dialog_pending" in report:  # a held dialog blocks the payment tab: hand it over now, not after the wait
             return _refusal("payment_dialog_pending", _DIALOG_PENDING, url=_shown_origin(seen.get("url", "")),
@@ -976,7 +951,7 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
         # The tab is still locked: like browser-control for every agent connection, report its site only
         # (a locked page's title and path could carry what a planted script copied there).
         return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=_shown_origin(seen.get("url", "")),
-                        title="", lock_released=False, **told, **_dialog_report(supervisor))
+                        title="", reason=reason, lock_released=False, **told, **_dialog_report(supervisor))
     context = page.pop("browser_context", None)
     raw_url = page["url"]  # the tab must open exactly this; only what is returned to the model is scrubbed
     page = _redacted_page(page)  # dlz: while the payment window is still open, before the release below
