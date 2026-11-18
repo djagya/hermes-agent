@@ -317,9 +317,11 @@ def _unzer_frames(holder=_UNZER_HOLDER, extra=()):
 
 
 def _unzer_candidates(frames, origins=None):
+    """Candidates as the inspection collects them: only a document with card controls is one."""
     origins = origins or {}
-    return [(f"f-{k}", f"s-{k}", f"o-{k}", origins.get(k, _UNZER), sp._card_controls(sp._bounded_description(raw)))
-            for k, raw in frames.items()]
+    out = [(f"f-{k}", f"s-{k}", f"o-{k}", origins.get(k, _UNZER), sp._card_controls(sp._bounded_description(raw)))
+           for k, raw in frames.items()]
+    return [c for c in out if c[4]]
 
 
 class _PerFrameSupervisor(_FakeSupervisor):
