@@ -26,6 +26,8 @@ ROWS = [
     {"i": 1, "role": "link", "text": "Terms", "disabled": False},
     {"i": 2, "role": "checkbox", "text": "Save this card", "disabled": True},
 ]
+# build C r2 (P1): ROWS[0] is a Pay press (one per approval); ROWS[1], a link without a pay word, is preparatory
+PREP = 1
 
 
 # B1: the approved total _claimed binds (EUR 100.00) and the page check that matches it
@@ -168,6 +170,7 @@ def _bump(sup):
 def _unmanaged(monkeypatch):
     # unknown status means locked only on a managed browser; these fakes run as a browser without control
     monkeypatch.setattr(surface, "_managed", lambda: False)
+    monkeypatch.setattr(surface, "_SETTLE_S", 0.02)  # build C3: the post-click settle (bounded; its own tests)
 
 
 def _claimed(sup=None, approved=APPROVED):
@@ -531,7 +534,11 @@ def test_presses_in_lock_counts_every_press_including_an_uncertain_one(outcome):
     surface.payment_click(sup, listing["controls"][0]["ref"])
     again = surface.payment_controls(sup)
     assert again["presses_in_lock"] == 1  # a fresh listing hands out fresh refs, but the count stays
-    surface.payment_click(sup, again["controls"][0]["ref"])
+    surface.payment_click(sup, again["controls"][PREP]["ref"])  # r2 P1: a preparatory press after Pay
+    listing = surface.payment_controls(sup)
+    assert listing["presses_in_lock"] == 2
+    # r2 P1: a second Pay press of this approval is refused before anything is read or pressed
+    assert surface.payment_click(sup, listing["controls"][0]["ref"])["error_type"] == "payment_already_pressed"
     assert surface.payment_controls(sup)["presses_in_lock"] == 2
 
 
@@ -658,8 +665,11 @@ def test_payment_control_captions_never_carry_card_values():
 def test_payment_click_is_one_trusted_click_at_the_hit_tested_centre():
     sup = _claimed()
     ref = surface.payment_controls(sup)["controls"][0]["ref"]
-    assert surface.payment_click(sup, ref) == {"success": True, "clicked": ref, "role": "button",
-                                               "text": "Pay with card •••• •••• •••• ••••"}
+    out = surface.payment_click(sup, ref)
+    effect = out.pop("effect")  # build C3: the structural effect (its own tests: test_browser_payment_surface_honesty)
+    assert out.pop("pay_pressed") is True and out.pop("next") == surface.PAY_PRESSED_NEXT  # r2 P3: a Pay press
+    assert out == {"success": True, "clicked": ref, "role": "button", "text": "Pay with card •••• •••• •••• ••••"}
+    assert effect is None or set(effect) >= {"navigated", "control_listed", "control_hit", "unchanged"}
     clicks = sup.sent("Input.dispatchMouseEvent")
     assert [c[1]["type"] for c in clicks] == ["mouseMoved", "mousePressed", "mouseReleased"]
     # Quad centre (20, 20) in the card frame plus its iframe's content box (100, 200) on the page.
@@ -768,7 +778,7 @@ def test_every_press_reads_the_total_again_and_owner_go_never_overrides_it():
     sup.page_text = "Gesamtbetrag 100,00 €"
     assert surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])["success"] is True
     sup.page_text = "Gesamtbetrag 120,00 €"  # changed after the first press
-    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"], owner_go=True)
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][PREP]["ref"], owner_go=True)
     assert out["error_type"] == "payment_total_changed" and len(_presses(sup)) == 1
 
 
@@ -840,7 +850,7 @@ def test_a_bank_page_is_pressed_only_after_an_admitted_press(admitted_first):
         assert surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])["success"] is True
     sup.tree = (("PAGE", "LB", "https://acs.bank.test/challenge", "https://acs.bank.test", ""), TREE[1])
     reads = len(_total_reads(sup))
-    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][PREP]["ref"])
     assert len(_total_reads(sup)) == reads  # no merchant total on a bank page: nothing read there
     if admitted_first:
         assert out["success"] is True and len(_presses(sup)) == 2
@@ -854,10 +864,11 @@ def test_a_later_merchant_page_after_an_admitted_press_is_checked_like_the_check
     admitted press ("Continue"): the final "Place order" there reads the approved total in that page too."""
     sup = _claimed()
     sup.page_text = "Gesamtsumme 100,00 €"
-    assert surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])["success"] is True
+    # r2 P1: the first press is the preparatory "Continue" (a press checked against the approval, not its Pay)
+    assert surface.payment_click(sup, surface.payment_controls(sup)["controls"][PREP]["ref"])["success"] is True
     sup.tree = (("PAGE", "LR", "https://shop.test/review", "https://shop.test", ""), TREE[1])
     sup.page_text = page
-    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])  # Place order
     assert len(_total_reads(sup)) == 2
     if admitted:
         assert out["success"] is True and len(_presses(sup)) == 2
@@ -996,7 +1007,7 @@ def test_only_a_page_on_another_site_skips_the_total_after_an_admitted_press(top
     sup = _claimed()
     _admitted(sup)
     sup.tree, sup.page_text = (top, TREE[1]), "Order total 120.00 EUR"
-    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][PREP]["ref"])
     assert len(_total_reads(sup)) == 1 + int(read)
     assert (out.get("success") is True) is not read and len(_presses(sup)) == 1 + int(not read)
 
@@ -1007,7 +1018,7 @@ def test_a_bank_page_in_another_tab_is_never_exempt():
     _admitted(sup)
     sup.tree = (("OTHER", "LB", "https://acs.bank.test/challenge", "https://acs.bank.test", ""),
                 ("CARD", "L1", "https://psp.test/f", "https://psp.test", "OTHER"))
-    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][PREP]["ref"])
     assert out["error_type"] == "payment_total_changed" and len(_presses(sup)) == 1
 
 
@@ -1038,7 +1049,7 @@ def test_a_bank_challenge_that_replaced_a_card_frame_is_pressed_after_an_admitte
     sup.tree = sup.listed = (TREE[0], frame)
     sup.page_text = "Thank you, please confirm with your bank"
     reads = len(_total_reads(sup))
-    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][PREP]["ref"])
     if case == "admitted":
         assert out["success"] is True and len(_total_reads(sup)) == reads and len(_presses(sup)) == 2
     else:

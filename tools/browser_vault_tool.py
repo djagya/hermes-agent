@@ -1376,7 +1376,20 @@ BROWSER_VAULT_SCHEMA = {
         "card frames and of the payment tab's own page (the merchant checkout, or a bank's 3-D Secure page it "
         "was redirected to) unless that page is a card form; payment_click (ref) makes one trusted click on a "
         "listed control, so the Pay button is clicked there; refs die when the page changes, when you list again, and after one press (successful or uncertain): "
-        "a second press needs a new payment_controls. "
+        "a second press needs a new payment_controls. A successful payment_click carries effect, read after a short "
+        "settle (counts and yes/no only: navigated, control_listed, control_hit, control_state_changed (the "
+        "control's disabled / busy / checked state); overlays_before / overlays_after, card_frames_before / "
+        "card_frames_after and toggled for a checkbox only when no page in the lock can read the card; unchanged; "
+        "null = not read): for a preparatory click effect.unchanged means it made no visible progress; list controls "
+        "again before Pay. A Pay press answers pay_pressed true with effect.unchanged null: a Pay press's effect "
+        "never means Pay failed; do not press Pay again; call payment_done. "
+        "payment_control_covered names the occluder class when Hermes may read it (occluder: dialog | "
+        "fixed_overlay | other; nothing clicked): deal with that dialog or overlay first. payment_click_busy: "
+        "another payment_click on this browser is still running; wait for it, then list again. payment_native_lost means Hermes "
+        "lost its own browser "
+        "connection during the lock: Pay state unknown, press nothing, tell the owner to check the order and e-mail, "
+        "and call payment_close only after he has looked. payment_lock_foreign: another connection holds a payment "
+        "lock on this browser; press nothing, tell the owner, and do not close it unless he says so. "
         "The owner's Approve on a card-fill approval card that stated the cart total and whose page check matched it "
         "(the button says \"fill + Pay once\") is the go for pressing Pay once "
         "for that checkout (the card says so; no separate chat go is needed). Preparatory clicks of the checkout "
@@ -1392,9 +1405,19 @@ BROWSER_VAULT_SCHEMA = {
         "A bank or 3-D Secure page (another site in the payment tab, or a bank challenge in place of the card form) "
         "can be clicked only after a press checked against this approval; a later page of the shop's own site is "
         "checked like the checkout. payment_controls and payment_done report "
-        "presses_in_lock (null = unknown): the presses this process started in the lock, an uncertain one included; "
-        "count your own presses: after the final Pay press, another payment_click is only for a bank or 3-D Secure "
-        "step, never a second Pay. A card with no stated total, or whose page check did not match it, or with "
+        "presses_in_lock (null = unknown): the presses this process started in the lock, an uncertain one included. "
+        "Hermes enforces one Pay press per Pay-once approval: after it, every further press that may place the order (any "
+        "button but a clearly preparatory one such as Continue or Review, a checkbox or radio) is refused "
+        "payment_already_pressed with nothing pressed; then call payment_done (or payment_dialog), never press Pay "
+        "again: a new attempt needs a new approval. Two exceptions: a bank's own step after Pay (a 3-D Secure or "
+        "issuer challenge page: another site in the payment tab, never a payment provider's site, or a challenge in "
+        "place of the card form) stays pressable, and one confirm press in a dialog the Pay press opened on the "
+        "shop's page (Place order, then \"Confirm purchase\") goes once; a retry after an error is never one. A "
+        "control with no pay word in its caption (an icon-only button, an unreadable caption) "
+        "counts as the Pay press too: when payment_already_pressed says the press was used by such a control, hand "
+        "over to the owner and do not look for another way to press Pay. The same one press and the same two "
+        "exceptions hold for owner_go presses. A card with no stated total, or whose page check did not match "
+        "it, or with "
         "Pay-once switched off, says \"fill only\": "
         "its Approve is not a go for Pay, so do not press Pay until the owner says to in chat; then every "
         "payment_click needs owner_go true (payment_go_required otherwise; nothing pressed). Page dialogs while locked: alerts are accepted and "
@@ -1525,11 +1548,12 @@ def _payment_lock_refusal(task_id: Optional[str]) -> Optional[str]:
     """dlz (payment lockdown): ``payment_surface_locked`` for a non-card page operation while a card payment
     locks the task's slot. Only the native payment actions (card fill, payment_controls / payment_click,
     payment_done) work on a locked slot; a slot this process never attached a supervisor to holds no claim."""
-    from tools.browser_payment_surface import locked_refusal
+    from tools.browser_payment_surface import vault_lock_refusal
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id or "default")
-    refused = locked_refusal(supervisor) if supervisor is not None else None
+    # build C5: an unknown lock state with no claim or lock of this process is browser_connection_unavailable
+    refused = vault_lock_refusal(supervisor) if supervisor is not None else None
     return json.dumps(refused) if refused else None
 
 

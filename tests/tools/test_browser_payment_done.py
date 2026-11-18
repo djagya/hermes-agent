@@ -87,7 +87,8 @@ class FakeSup:
         if method == "Runtime.callFunctionOn":
             fn = params["functionDeclaration"]
             if fn == surface._DESCRIBE:
-                return {"result": {"value": [{"i": 0, "role": "button", "text": "Pay 22.66 EUR", "disabled": False}]}}
+                return {"result": {"value": getattr(self, "rows", None)
+                                   or [{"i": 0, "role": "button", "text": "Pay 22.66 EUR", "disabled": False}]}}
             if fn in (surface._HIT, surface._pay_js("caption")):  # r4 C1: the caption check
                 return {"result": {"value": True}}
             return {"result": {"objectId": "el"}}
@@ -147,6 +148,7 @@ def _fast(monkeypatch):
     monkeypatch.setattr(done, "_WAIT_S", 0.4)
     monkeypatch.setattr(done, "_RELEASE_WAIT_S", 0.2)
     monkeypatch.setattr(done, "_RELEASE_POLL_S", 0.01)
+    monkeypatch.setattr(surface, "_SETTLE_S", 0.02)  # build C3: the post-click settle
     from agent import redact
 
     from tools import browser_payment_card_values as card_values
@@ -470,7 +472,18 @@ def test_a_3ds_page_is_clicked_only_after_the_checkouts_pay_was_admitted(first):
     assert out["success"] is True and len(presses()) == 1
     sup.trees = [ACS]  # redirected to the bank's challenge page
     _top_controls(sup)
+    # r2 P1 / r3 Q1: one Pay press per approval, but the bank's own step on its challenge page is pressed whatever
+    # its caption says (the issuer's confirmation, not a second charge) ...
     assert surface.payment_click(sup, _top_ref(sup, ACS))["success"] is True and len(presses()) == 2
+    sup.rows = [{"i": 0, "role": "button", "text": "Continue", "disabled": False}]
+    _top_controls(sup)
+    assert surface.payment_click(sup, _top_ref(sup, ACS))["success"] is True and len(presses()) == 3
+    # ... and a Pay-like control on the merchant's own checkout document is refused
+    sup.rows = [{"i": 0, "role": "button", "text": "Pay 22.66 EUR", "disabled": False}]
+    sup.trees = [CHECKOUT]
+    _top_controls(sup)
+    assert surface.payment_click(sup, _top_ref(sup, CHECKOUT))["error_type"] == "payment_already_pressed"
+    assert len(presses()) == 3
 
 
 def test_a_top_document_ref_dies_with_its_document():

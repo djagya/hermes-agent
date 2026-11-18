@@ -37,10 +37,21 @@ import time
 import weakref
 from typing import Any, NamedTuple, Optional
 
+from tools.browser_payment_surface_after_pay import (  # build C r4: site rules and confirmation dialogs
+    _DIALOG_SEL,
+    _RETRY_WORDS,
+    _new_dialog,
+    _open_dialogs,
+    _provider_site,
+    cross_site,
+)
+
 logger = logging.getLogger(__name__)
 
 CLAIM_METHOD = "Hermes.claimPaymentSurface"
 STATUS_METHOD = "Hermes.paymentSurfaceStatus"
+# dlz (build C1): control names the tab-type holders of the latest native claim (additive; old control: blocked)
+HOLDERS_METHOD = "Hermes.paymentSurfaceHolders"
 UNAVAILABLE = "payment_surface_unavailable"
 LOCKED = "payment_surface_locked"
 # control-v1 ``cdp_methods.locked.commands`` (exact names); allowed only without a sessionId.
@@ -70,6 +81,8 @@ _LOCK = threading.Lock()
 _HELD: weakref.WeakSet = weakref.WeakSet()
 # Supervisors control last reported locked (read by loop-side checks that cannot wait for a status).
 _KNOWN_LOCKED: weakref.WeakSet = weakref.WeakSet()
+# build C4: supervisors control last reported locked with their socket not the lock's native connection.
+_NOT_NATIVE: weakref.WeakSet = weakref.WeakSet()
 # Claims on the wire per supervisor (a count, so no completion clears another claim's mark).
 _CLAIMING: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 # One claim, dialog answer or recovery call at a time per supervisor (claims are serialized).
@@ -137,17 +150,38 @@ def parse_lock_status(result: Any) -> tuple[str, frozenset]:
     ``("unknown", ∅)``. The one reader of the lock state. Exactly ``{locked, native, tabs, unverified}``:
     three bools and the sorted owning tab ids; ``locked`` must equal ``tabs or unverified`` and ``native``
     implies ``locked``. Any other shape, type or combination is unknown, never unlocked."""
+    return parse_lock_status_native(result)[:2]
+
+
+def parse_lock_status_native(result: Any) -> tuple[str, frozenset, Optional[bool]]:
+    """:func:`parse_lock_status` plus control's ``native`` (whether the asking connection is the lock's native
+    one): a bool when the state is ``locked``, else None."""
     if not isinstance(result, dict) or set(result) != {"locked", "native", "tabs", "unverified"}:
-        return "unknown", frozenset()
+        return "unknown", frozenset(), None
     locked, native, tabs, unverified = result["locked"], result["native"], result["tabs"], result["unverified"]
     if not (type(locked) is bool and type(native) is bool and type(unverified) is bool):
-        return "unknown", frozenset()
+        return "unknown", frozenset(), None
     if not (isinstance(tabs, list) and len(tabs) <= _MAX_STATUS_TABS and all(_valid_id(t) for t in tabs)
             and len(set(tabs)) == len(tabs)):
-        return "unknown", frozenset()
+        return "unknown", frozenset(), None
     if locked is not (bool(tabs) or unverified) or (native and not locked):
-        return "unknown", frozenset()
-    return ("locked", frozenset(tabs)) if locked else ("unlocked", frozenset())
+        return "unknown", frozenset(), None
+    return ("locked", frozenset(tabs), native) if locked else ("unlocked", frozenset(), None)
+
+
+def parse_holders(result: Any, tab: str, owned: Any) -> Optional[frozenset]:
+    """dlz (build C1): ``Hermes.paymentSurfaceHolders`` as the holder ids of the claim of ``tab``, or None (not
+    answered, another claim, any other shape). Exactly ``{tabs: [tab], holders}``, holders distinct well-formed
+    ids, none the claimed tab, every one in the claim reply's owning set ``owned``."""
+    if not isinstance(result, dict) or set(result) != {"tabs", "holders"} or result["tabs"] != [tab]:
+        return None
+    holders = result["holders"]
+    if not (isinstance(holders, list) and len(holders) <= _MAX_STATUS_TABS and all(_valid_id(h) for h in holders)
+            and len(set(holders)) == len(holders)):
+        return None
+    if tab in holders or not set(holders) <= set(owned):
+        return None
+    return frozenset(holders)
 
 
 def _claim_lock(supervisor: Any) -> threading.Lock:
@@ -189,11 +223,13 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
     gen = None
     with _LOCK:
         held_before = supervisor in _HELD
+        old = _GENS.get(supervisor) if held_before else None
+        pressing_at_start = _PRESSING_N > 0
         if not held_before:  # a new lock of this process (pressed_in_lock)
-            gen = _GENS[supervisor] = _LockGen(known=_PRESSING_N == 0 and supervisor not in _KNOWN_LOCKED)
-        elif _GENS.get(supervisor) is not None:  # B1: a new fill is a new approval; only its success binds a total
-            _GENS[supervisor].approved = None
-            _GENS[supervisor].admitted = False  # r4 C7: and no press of it was admitted yet
+            gen = _GENS[supervisor] = _LockGen(known=not pressing_at_start and supervisor not in _KNOWN_LOCKED)
+        elif old is not None:  # B1: a new fill is a new approval; only its success binds a total
+            old.approved = None
+            old.admitted = False  # r4 C7: and no press of it was admitted yet
         _HELD.add(supervisor)
         _CLAIMING[supervisor] = _CLAIMING.get(supervisor, 0) + 1
         _EPOCHS[supervisor] = _EPOCHS.get(supervisor, 0) + 1
@@ -205,9 +241,6 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
         result = reply.get("result") if isinstance(reply, dict) else None
         if not parse_claim_result(result, [tab]) or getattr(supervisor, "_ws", None) is not ws:
             raise SurfaceRefused("claim not confirmed")
-        if gen is not None and set(result["tabs"]) != {tab}:  # control's lock already held other tabs
-            with _LOCK:
-                gen.known = False
     except Exception as exc:  # health: allow BLE001 -- CDP/transport text is not surfaced; fixed type only
         if _control_refused(exc) and not held_before:
             # Only control's own refusal proves nothing changed; any other failure keeps the lock here,
@@ -226,11 +259,91 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
                 _CLAIMING[supervisor] = left
             else:
                 _CLAIMING.pop(supervisor, None)
+    owned = frozenset(result["tabs"])
+    others = owned - {tab}
+    if others:  # build C1: control's own holder of the claimed page is part of this claim, not another page
+        holders = _claim_holders(supervisor, loop, tab, owned, ws)
+        others = others - holders if holders is not None else others
+    _start_record(supervisor, gen, old, held_before, pressing_at_start, owned, bool(others), ws,
+                  _merchant_identity(inspected))
     # dlz (lockdown §2): the payment tab and its card documents, for browser_vault payment_done.
     from tools.browser_payment_done import record_payment
 
     record_payment(supervisor, inspected)
     return None
+
+
+def _claim_holders(supervisor: Any, loop: Any, tab: str, owned: frozenset, ws: Any) -> Optional[frozenset]:
+    """dlz (build C1): the tab-type holders control recorded with this claim (``HOLDERS_METHOD``), or None when it
+    cannot say (an older control answers ``cdp_method_blocked``; a timeout, another socket): the extra ids then
+    count as other tabs in the lock, as before (fail closed)."""
+    try:
+        reply = _wait(supervisor._cdp(HOLDERS_METHOD, {}, timeout=5), loop, timeout=7)
+    except Exception as exc:  # health: allow BLE001 -- old control or no answer: unknown, fail closed
+        logger.info("payment lock holders not named by control (%s)", type(exc).__name__)
+        return None
+    if getattr(supervisor, "_ws", None) is not ws:
+        return None
+    return parse_holders(reply.get("result") if isinstance(reply, dict) else None, tab, owned)
+
+
+def _start_record(supervisor: Any, gen: Any, old: Any, held_before: bool, pressing_at_start: bool,
+                  owned: frozenset, others: bool, ws: Any, merchant: Optional[tuple] = None) -> None:
+    """After a confirmed claim: the lock record this fill presses in. A claim while this process held no lock keeps
+    the record it started before the claim was sent (``gen``). Build C2: a claim while it held one (a new fill after
+    an unproven release, or a re-fill) starts a fresh record, so presses of an earlier record never carry over; that
+    record is unknown when the old lock may still be held (control's owning set still names one of its tabs, or the
+    old record never had a confirmed claim) or a click was running when the claim began; build C r2 (P7): when the old
+    lock still holds and its record was known, the new record carries its presses instead. Either is unknown when
+    the owning set holds a page that is not this claim's tab or its holder (``others``). build C r4: ``merchant``
+    (``_merchant_identity``) is kept with the record."""
+    global _RECORD_SEQ
+    with _LOCK:
+        if not held_before:
+            if gen is None or _GENS.get(supervisor) is not gen:
+                return  # the lock ended (or was replaced) while the claim was on the wire
+            if others:
+                gen.known = False
+            rec, replaced = gen, None
+        else:
+            if _GENS.get(supervisor) is not old:
+                return  # another claim's record already replaced it
+            still_held = old is None or old.owned is None or bool(owned & old.owned)
+            # build C r2 (P7): a re-fill while the old lock still holds carries the old count when the old record
+            # was known (its presses are presses in this lock); an unknown old record stays unknown
+            carry = (still_held and old is not None and old.owned is not None and old.known
+                     and bool(owned & old.owned))
+            rec = _GENS[supervisor] = _LockGen(known=not (pressing_at_start or others or (still_held and not carry)))
+            if carry:
+                rec.presses, rec.pressed = old.presses, old.pressed
+            replaced = old.serial if old is not None else 0
+        rec.owned, rec.ws, rec.merchant = owned, ws, merchant
+        _RECORD_SEQ += 1
+        if rec.serial == 0:
+            rec.serial = _RECORD_SEQ
+        known, serial, n = rec.known, rec.serial, len(owned)
+    if replaced is None:
+        logger.info("payment lock record %d started (owning ids %d, presses known %s)", serial, n, known)
+    else:
+        logger.info("payment lock record %d replaces record %d (owning ids %d, presses known %s)",
+                    serial, replaced, n, known)
+
+
+def _valid_checkout(top: Any, merchant: Any) -> bool:
+    """``top`` is a ``(frame id, loader)`` pair and ``merchant`` an https origin."""
+    return (isinstance(top, tuple) and len(top) == 2 and _valid_id(top[0]) and isinstance(top[1], str)
+            and _ID_RE.fullmatch(top[1]) is not None and isinstance(merchant, str) and merchant.startswith("https://")
+            and _origin_of(merchant) == merchant)
+
+
+def _merchant_identity(inspected: Any) -> Optional[tuple]:
+    """build C r4: ``(top frame id, loader, merchant origin)`` of the checkout a claim is for (the inspection the fill
+    runs on), or None when it cannot be read."""
+    try:
+        top, merchant = tuple(inspected.tree[0][:2]), inspected.merchant_origin
+    except (AttributeError, IndexError, TypeError):
+        return None
+    return (*top, merchant) if _valid_checkout(top, merchant) else None
 
 
 def _note_claim(supervisor: Any) -> None:
@@ -273,9 +386,10 @@ def lock_status(supervisor: Any) -> str:
     bound = _slot_bound(supervisor)
     with _LOCK:
         start, busy = _EPOCHS.get(supervisor, 0), _claiming(supervisor)
+    native = None
     try:
         reply = _wait(supervisor._cdp(STATUS_METHOD, {}, timeout=5), supervisor._loop, timeout=7)
-        state, _tabs = parse_lock_status(reply.get("result") if isinstance(reply, dict) else None)
+        state, _tabs, native = parse_lock_status_native(reply.get("result") if isinstance(reply, dict) else None)
     except Exception:  # health: allow BLE001 -- an unanswered status proves nothing
         state = "unknown"
     unlocked = saw_lock = False
@@ -287,8 +401,16 @@ def lock_status(supervisor: Any) -> str:
             _HELD.discard(supervisor)
             _GENS.pop(supervisor, None)  # the lock ended
             _KNOWN_LOCKED.discard(supervisor)
+            _NOT_NATIVE.discard(supervisor)
         elif state == "locked":
             _KNOWN_LOCKED.add(supervisor)
+            if native is False:  # build C4: the lock is held, by another connection than this socket
+                _NOT_NATIVE.add(supervisor)
+                gen = _GENS.get(supervisor) if supervisor in _HELD else None
+                if gen is not None and gen.owned is not None:
+                    gen.native_lost = True
+            else:
+                _NOT_NATIVE.discard(supervisor)
     # dlz: the confirmed release narrows the payment window to browser results (card_values)
     if unlocked and (saw_lock or (bound and _slot_bound(supervisor))):
         try:
@@ -314,15 +436,24 @@ def slot_locked(supervisor: Any) -> bool:
     a claim from this process is not proven released, when control says locked, and on a managed
     browser whenever control's answer is unknown. A browser without browser-control (no lock exists)
     is unlocked unless this process claimed it."""
+    return _lock_verdict(supervisor) != "unlocked"
+
+
+def _lock_verdict(supervisor: Any) -> str:
+    """:func:`slot_locked` as ``locked`` | ``unlocked`` | ``unknown`` (build C5): ``unknown`` only when control's
+    answer is unknown on a managed browser and this process holds no claim and saw no lock on this supervisor, so
+    nothing says a payment is running; it still refuses every model-reachable call."""
     start = epoch(supervisor)
     state = lock_status(supervisor)
     with _LOCK:
         if _claiming(supervisor) or _EPOCHS.get(supervisor, 0) != start:
-            return True
-        held = supervisor in _HELD
+            return "locked"
+        held, seen = supervisor in _HELD, supervisor in _KNOWN_LOCKED
     if state == "unknown":
-        return held or _managed()
-    return state == "locked"
+        if held or seen:
+            return "locked"
+        return "unknown" if _managed() else "unlocked"
+    return state
 
 
 def locally_locked(supervisor: Any) -> bool:
@@ -330,6 +461,83 @@ def locally_locked(supervisor: Any) -> bool:
     a claim not proven released, or control's last answer locked."""
     with _LOCK:
         return _claiming(supervisor) or supervisor in _HELD or supervisor in _KNOWN_LOCKED
+
+
+NATIVE_LOST = "payment_native_lost"
+NATIVE_LOST_TEXT = (
+    "Hermes lost its own browser connection while this card payment held the lock (the connection the card fill "
+    "claimed the payment tab on was replaced), so it can no longer list, click or read the payment tab, and whether "
+    "Pay went through is unknown. Do not press anything, do not fill the card again and do not pay again. Tell the "
+    "owner (Danil) to check the order, the shop's e-mail and his bank. Call browser_vault payment_close only after "
+    "he has looked: it closes the payment tab and ends the lock.")
+
+
+def claim_socket_changed(supervisor: Any) -> bool:
+    """build C4 (loop-safe, local state only): this supervisor holds a lock record whose confirmed claim went out on
+    another socket than its current one. Control's native connection is the claim's socket, so a redialled socket
+    is never native while that lock holds."""
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        return (gen is not None and gen.owned is not None and gen.ws is not None
+                and getattr(supervisor, "_ws", None) is not gen.ws)
+
+
+def lock_status_seen(supervisor: Any, native: bool) -> None:
+    """r2 P5 (loop side): control's status, read by the supervisor on a fresh socket that holds no claim of this
+    process, said locked (``native``: whether this socket is the lock's native connection)."""
+    with _LOCK:
+        if supervisor in _HELD or _claiming(supervisor):
+            return  # a claim of this process: only lock_status books its state
+        _KNOWN_LOCKED.add(supervisor)
+        if native is False:
+            _NOT_NATIVE.add(supervisor)
+
+
+def mark_native_lost(supervisor: Any) -> None:
+    """build C4: control named this lock held by another connection than this supervisor's socket."""
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        if gen is not None and gen.owned is not None:
+            gen.native_lost = True
+
+
+def native_lost_refusal(supervisor: Any) -> Optional[dict]:
+    """build C4: ``payment_native_lost`` for a native payment action (payment_controls / payment_click /
+    payment_done / payment_dialog) when its lock can no longer be served on this socket, else None:
+    - this process's lock record says so (its claim socket was replaced, or control reported the lock held by
+      another connection) and control does not prove the slot unlocked; or
+    - build C r2 (P6): this process holds no claim on this supervisor (a replaced supervisor, a restarted gateway)
+      and control reports the slot locked with this socket not native: ``payment_lock_foreign`` instead.
+    An unlocked slot is never "lost": the action then answers as it does without a payment."""
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        recorded = gen is not None and gen.owned is not None
+        flagged = recorded and gen.native_lost
+    if recorded and not flagged and not claim_socket_changed(supervisor):
+        return None
+    if not recorded:
+        from tools.browser_payment_done import has_payment
+
+        if has_payment(supervisor):  # a payment this process recorded on this supervisor: not a foreign lock
+            return None
+    state = lock_status(supervisor)
+    if state == "unlocked":
+        return None
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        if recorded:
+            if gen is not None and gen.owned is not None:
+                gen.native_lost = True
+            return _refusal(NATIVE_LOST, NATIVE_LOST_TEXT)
+        foreign = state == "locked" and supervisor in _NOT_NATIVE and gen is None
+    return _refusal(LOCK_FOREIGN, LOCK_FOREIGN_TEXT) if foreign else None
+
+
+LOCK_FOREIGN = "payment_lock_foreign"
+LOCK_FOREIGN_TEXT = (
+    "Another connection holds a card-payment lock on this browser (not a payment this Hermes task started or knows), "
+    "so nothing was read or pressed. Do not press anything and do not close it unless Danil says so: tell him "
+    "(it may be a payment still waiting for its confirmation).")
 
 
 def fenced_native(supervisor: Any, op) -> dict:
@@ -367,12 +575,29 @@ def fenced_dispatch(supervisor: Any, before: int, call) -> tuple:
     try:
         if epoch(supervisor) != before:
             return "refused", locked_withheld()
-        refused = locked_refusal(supervisor)
+        refused = vault_lock_refusal(supervisor)
         if refused:
             return "refused", refused
         return "ok", call()
     finally:
         lock.release()
+
+
+CONNECTION_UNAVAILABLE = "browser_connection_unavailable"
+_CONNECTION_UNAVAILABLE_TEXT = (
+    "Hermes could not read the browser's payment-lock state (browser control did not answer), and no card payment "
+    "of this Hermes process is open on it, so nothing was read or written. Retry this once; if it fails again, "
+    "report it to the user. This is not a payment lock: do not call payment_close for it.")
+
+
+def vault_lock_refusal(supervisor: Any) -> Optional[dict]:
+    """build C5: the refusal for a non-card vault page operation (login, signup, code fills), else None.
+    ``payment_surface_locked`` while the slot is locked; ``browser_connection_unavailable`` (retry once) when the
+    lock state is unknown and this process holds no claim and saw no lock. Either way nothing is dispatched."""
+    verdict = _lock_verdict(supervisor)
+    if verdict == "unknown":
+        return _refusal(CONNECTION_UNAVAILABLE, _CONNECTION_UNAVAILABLE_TEXT)
+    return _refusal(LOCKED, LOCKED_TEXT) if verdict == "locked" else None
 
 
 def locked_refusal(supervisor: Any, method: str = "", session_id: Optional[str] = None) -> Optional[dict]:
@@ -490,6 +715,222 @@ _DESCRIBE = r"""function(){ return this.map((el, i) => {
 _HIT = r"""function(){ this.scrollIntoView({block: 'center', inline: 'center'});
   const r = this.getBoundingClientRect(); const x = r.left + r.width / 2, y = r.top + r.height / 2;
   const hit = document.elementFromPoint(x, y); return !!hit && (hit === this || this.contains(hit)); }"""
+
+
+# build C3: structural, count-only reads around a press (nothing but bools, counts and a class word leaves the world).
+_OCCLUDER_JS = r"""const occluderClass = el => {
+  if (!el) return 'other';
+  if (el.closest && el.closest('__DIALOG__')) return 'dialog';
+  for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+    const p = getComputedStyle(n).position; if (p === 'fixed' || p === 'sticky') return 'fixed_overlay';
+  }
+  return 'other';
+};""".replace("__DIALOG__", _DIALOG_SEL)
+# On the control (its own document): the class of what sits at its centre.
+_OCCLUDER = ("function(){ " + _OCCLUDER_JS + r"""
+  const r = this.getBoundingClientRect();
+  return occluderClass(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)); }""")
+# In the payment tab's top document, at page coordinates (an element over a card iframe).
+_OCCLUDER_AT = "((x, y) => { " + _OCCLUDER_JS + " return occluderClass(document.elementFromPoint(x, y)); })"
+# On the pressed control: still listed (connected, laid out, visible), still hit at its centre, its checked state.
+_CONTROL_STATE = r"""function(){ const r = this.getBoundingClientRect(); const st = getComputedStyle(this);
+  const listed = this.isConnected && r.width >= 1 && r.height >= 1 && st.visibility === 'visible' && st.display !== 'none';
+  let hit = false;
+  if (listed) { const h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+                hit = !!h && (h === this || this.contains(h)); }
+  return {listed, hit, checked: !!this.checked || this.getAttribute('aria-checked') === 'true',
+          disabled: !!this.disabled || this.getAttribute('aria-disabled') === 'true',
+          busy: this.getAttribute('aria-busy') === 'true'}; }"""
+# The top document's open dialogs and large fixed overlays (a count, at most 50 + 5).
+_OVERLAYS = r"""(() => {
+  const vis = el => { const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
+    return r.width >= 1 && r.height >= 1 && st.visibility === 'visible' && st.display !== 'none' && st.opacity !== '0'; };
+  let n = 0;
+  for (const el of document.querySelectorAll('__DIALOG__')) { if (vis(el) && ++n >= 50) break; }
+  const W = innerWidth, H = innerHeight, seen = new Set();
+  for (const [fx, fy] of [[.5, .5], [.25, .25], [.75, .25], [.25, .75], [.75, .75]]) {
+    for (let el = document.elementFromPoint(W * fx, H * fy); el && el !== document.body && el !== document.documentElement;
+         el = el.parentElement) {
+      if (getComputedStyle(el).position !== 'fixed') continue;
+      const r = el.getBoundingClientRect();
+      if (r.width * r.height >= 0.25 * W * H && !el.matches('__DIALOG__')) seen.add(el);
+      break;
+    }
+  }
+  return n + seen.size;
+})()""".replace("__DIALOG__", _DIALOG_SEL)
+_OCCLUDER_CLASSES = ("dialog", "fixed_overlay", "other")
+_SETTLE_S = 1.5  # build C3: the longest a click waits after its release before it reads the effect
+_SETTLE_POLL_S = 0.25
+_EFFECT_BUDGET_S = 3.0  # settle plus the effect reads; the press margin leaves the caller more than this
+
+
+def _covered_text(occluder: str) -> str:
+    what = {"dialog": "a dialog", "fixed_overlay": "a fixed overlay"}.get(occluder, "another element")
+    return f"Another element covers that control ({what}); nothing was clicked."
+
+
+def _covered(occluder: Optional[str]) -> dict:
+    """``payment_control_covered`` with the occluder's class only (``dialog`` | ``fixed_overlay`` | ``other``); None:
+    without a class (build C r2 P4: a document in the lock could read the filled card values)."""
+    if occluder is None:
+        return _refusal("payment_control_covered", "Another element covers that control; nothing was clicked.")
+    occluder = occluder if occluder in _OCCLUDER_CLASSES else "other"
+    return {**_refusal("payment_control_covered", _covered_text(occluder)), "occluder": occluder}
+
+
+async def _covered_at(sup: Any, sid: str, element: str, page_sid: str, tree: tuple, child_sessions: dict,
+                      card: bool = False) -> dict:
+    """build C r2 (P4): ``payment_control_covered``; the occluder class is read only when no document in the lock can
+    read the filled card values (:func:`detail_safe` on the listing's frame tree), else not read at all. build C r4
+    (Codex low 3): never for a control inside a hosted card frame (``card``): the provider's document could encode a
+    card-derived bit in what covers its own control."""
+    if card or not detail_safe(sup, [(r[0], r[2], r[3]) for r in tree]):
+        return _covered(None)
+    return _covered(await _occluder(sup, sid, element, page_sid, tree, child_sessions))
+
+
+def detail_safe(sup: Any, frames: list) -> bool:
+    """build C r2 (P4, Codex P1): whether page-controlled metadata (overlay and card-frame counts, the occluder class)
+    may leave the payment tab. ``frames``: ``(frame id, url, security origin)`` of the payment tab, the top document
+    first. Only when every card document of this supervisor's payments lives in a hosted frame cross-origin to the
+    top document (no merchant card field, every card frame in the tree on another origin) and the top document is
+    not a card document (not one of their frames, not on a provider or card-receiving origin). Otherwise a document
+    that can read the filled values could encode them in counts or classes. A card frame missing from ``frames`` is
+    an out-of-process frame, cross-site to the top by site isolation; one listed without a readable origin is a doubt.
+    Any doubt: False."""
+    try:
+        from tools import browser_payment_done as done
+
+        with done._LOCK:
+            payments = list((done._PAYMENTS.get(sup) or {}).values())
+        if not payments or not frames or any(p.merchant_fields for p in payments):
+            return False
+
+        def origin(row: tuple) -> str:
+            return row[2] if isinstance(row[2], str) and row[2] else _origin_of(row[1])
+
+        top = origin(frames[0])
+        cards = {fid for p in payments for fid in p.frame_ids}
+        if not top or frames[0][0] in cards or any(top in done._card_origins(p) for p in payments):
+            return False
+        return all(origin(row) not in ("", top) for row in frames[1:] if row[0] in cards)
+    except Exception as exc:  # health: allow BLE001 -- unknown: no page-controlled metadata
+        logger.info("payment effect detail withheld (%s)", type(exc).__name__)
+        return False
+
+
+def _tree_rows(tree: Any) -> list:
+    """``Page.getFrameTree``'s ``frameTree`` as ``(frame id, url, security origin)`` rows, the top first."""
+    rows, stack = [], [tree]
+    while stack:
+        node = stack.pop(0)
+        frame = node.get("frame") or {}
+        rows.append((frame.get("id"), frame.get("url"), frame.get("securityOrigin") or ""))
+        stack.extend(node.get("childFrames") or [])
+    return rows
+
+
+async def _occluder(sup: Any, sid: str, element: str, page_sid: str, tree: tuple, child_sessions: dict) -> str:
+    """build C3: the class of what covers the control: read in the control's own document first, else (a page element
+    over its card iframe) in the payment tab's top document at the control's page point. Any failure: ``other``."""
+    try:
+        own = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _OCCLUDER,
+                                                         "returnByValue": True}, session_id=sid))["result"]["result"]
+        hit = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _HIT,
+                                                         "returnByValue": True}, session_id=sid))["result"]["result"]
+        if hit.get("value") is not True or sid == page_sid:
+            return own.get("value") if own.get("value") in _OCCLUDER_CLASSES else "other"
+        x, y, _outer = await _page_point(sup, sid, element, page_sid, tree, child_sessions)
+        ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": tree[0][0], "worldName": "hermes-payment-effect"},
+                              session_id=page_sid))["result"]["executionContextId"]
+        at = (await sup._cdp("Runtime.evaluate", {"expression": f"{_OCCLUDER_AT}({float(x)!r}, {float(y)!r})",
+                                                  "contextId": ctx, "returnByValue": True},
+                             session_id=page_sid))["result"]["result"]
+        return at.get("value") if at.get("value") in _OCCLUDER_CLASSES else "other"
+    except Exception as exc:  # health: allow BLE001 -- an unread class is "other"; the refusal stands
+        logger.info("payment_control_covered: occluder not classified (%s)", type(exc).__name__)
+        return "other"
+
+
+async def _structure(sup: Any, page_sid: str, element: str, sid: str) -> dict:
+    """build C3: the counts and states an effect compares (top document, the control, and only when
+    :func:`detail_safe`, overlays and card frames; build C r2 P4: never read otherwise)."""
+    from tools.browser_payment_done import card_frame_ids
+
+    tree = (await sup._cdp("Page.getFrameTree", session_id=page_sid))["result"]["frameTree"]
+    rows = _tree_rows(tree)
+    top = (tree.get("frame") or {}).get("id"), (tree.get("frame") or {}).get("loaderId")
+    out: dict = {"top": tuple(top), "safe": detail_safe(sup, rows), "overlays": None, "card_frames": None}
+    try:
+        state = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _CONTROL_STATE,
+                                                           "returnByValue": True}, session_id=sid))["result"]["result"]
+        value = state.get("value") if isinstance(state.get("value"), dict) else {}
+    except Exception:  # health: allow BLE001 -- the control's document is gone: not listed, not hit
+        value = {}
+    out.update(listed=value.get("listed") is True, hit=value.get("hit") is True,
+               state=tuple(value.get(k) is True for k in ("checked", "disabled", "busy")))
+    if not out["safe"]:
+        return out
+    ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": top[0], "worldName": "hermes-payment-effect"},
+                          session_id=page_sid))["result"]["executionContextId"]
+    n = (await sup._cdp("Runtime.evaluate", {"expression": _OVERLAYS, "contextId": ctx, "returnByValue": True},
+                        session_id=page_sid))["result"]["result"].get("value")
+    if tuple((await _top_frame(sup, page_sid))[:2]) != out["top"]:  # another document answered: not judged safe
+        out["safe"] = False
+        return out
+    out["overlays"] = n if type(n) is int and 0 <= n <= 1000 else None
+    frames = {row[0] for row in rows}
+    infos = (await sup._cdp("Target.getTargets"))["result"]["targetInfos"]
+    frames |= {t.get("targetId") for t in infos if isinstance(t, dict) and t.get("type") == "iframe"}
+    out["card_frames"] = len(card_frame_ids(sup) & frames)
+    return out
+
+
+async def _effect(sup: Any, page_sid: str, element: str, sid: str, before: Optional[dict], role: str) -> Optional[dict]:
+    """build C3: what the click visibly did, counts and yes/no only, read after a bounded settle (at most
+    ``_SETTLE_S``; earlier once the top document changed). None when it cannot be read."""
+    if before is None:
+        return None
+    end = time.monotonic() + _SETTLE_S
+    while time.monotonic() < end:
+        await asyncio.sleep(min(_SETTLE_POLL_S, max(0.0, end - time.monotonic())))
+        try:
+            if tuple((await _top_frame(sup, page_sid))[:2]) != before["top"]:
+                break
+        except Exception:  # health: allow BLE001 -- a navigating page may not answer yet; keep settling
+            continue
+    after = await _structure(sup, page_sid, element, sid)
+    navigated = after["top"] != before["top"]
+    # build C r2 (P3): the clicked control's own checked / disabled / aria-busy state, before vs after
+    changed = after["state"] != before["state"]
+    effect = {"navigated": navigated, "control_listed": after["listed"], "control_hit": after["hit"],
+              "control_state_changed": changed}
+    still = not navigated and after["listed"] and after["hit"] and not changed
+    if before["safe"] and after["safe"]:  # build C r2 (P4): page-controlled counts only from safe documents
+        overlays = before["overlays"], after["overlays"]
+        effect.update(overlays_before=overlays[0], overlays_after=overlays[1],
+                      card_frames_before=before["card_frames"], card_frames_after=after["card_frames"])
+        if role in {"checkbox", "radio"}:
+            effect["toggled"] = after["state"][0] != before["state"][0]
+        still = (still and None not in overlays and overlays[0] == overlays[1]
+                 and before["card_frames"] == after["card_frames"])
+    effect["unchanged"] = still
+    return effect
+
+
+async def _bounded_effect(sup: Any, page_sid: str, element: str, sid: str, before: Optional[dict], role: str,
+                          deadline: float) -> Optional[dict]:
+    """The effect read within ``_EFFECT_BUDGET_S`` and well before the caller's own timeout; a read that fails or
+    runs out is None (the click's success stands: it was pressed)."""
+    budget = min(_EFFECT_BUDGET_S, deadline + _PRESS_MARGIN_S - 1.5 - time.monotonic())
+    if budget <= 0:
+        return None
+    try:
+        return await asyncio.wait_for(_effect(sup, page_sid, element, sid, before, role), timeout=budget)
+    except Exception as exc:  # health: allow BLE001 -- unread effect: None, never an uncertain click
+        logger.info("payment_click: effect not read (%s)", type(exc).__name__)
+        return None
 
 
 def _mask(text: str) -> str:
@@ -694,79 +1135,184 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         fid, sid, arr, control, loader = found[0]
         if control["disabled"]:
             return _refusal("payment_control_disabled", "That control is disabled; nothing was clicked.")
-        element = (await sup._cdp("Runtime.callFunctionOn", {
-            "objectId": arr, "functionDeclaration": "function(i){return this[i]}",
-            "arguments": [{"value": control["_i"]}], "returnByValue": False}, session_id=sid))["result"]["result"].get(
-                "objectId")
-        if not element:
-            raise SurfaceRefused("control gone")
-        hit = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _HIT,
-                                                         "returnByValue": True}, session_id=sid))["result"]["result"]
-        if hit.get("value") is not True:
-            return _refusal("payment_control_covered", "Another element covers that control; nothing was clicked.")
-        x, y, outer = await _target_point(sup, sid, element, page_sid, tree, child_sessions)
-        if x is None:
-            return _refusal("payment_control_covered", "Another element covers that control; nothing was clicked.")
+        # build C r2 (P1): a press through the pay gate that may place the order (not a checkbox, radio or a clearly
+        # preparatory caption) is this approval's one Pay press. P3: any such press (owner_go too) never reads as
+        # "unchanged".
+        pay_like = _pay_press(control["role"], control["text"])
+        row = next((r for r in tree if r[0] == fid), None)
+        clicked = (fid, loader, row[2] if row else "", fid == tree[0][0])
+        after = await _after_pay(sup, gate, pay_like, clicked, page_sid, control["text"])
+        if isinstance(after, dict):  # nothing was moved or read for the total
+            return after
+        element = await _element(sup, sid, arr, control["_i"])
+        card = not clicked[3]  # build C r4: a control in a hosted card frame never names its occluder's class
+        refused, x, y, outer = await _aim(sup, sid, element, page_sid, tree, child_sessions, card)
+        if refused:
+            return refused
         # The move first (hover handlers may re-render or navigate), then everything is read again: the
         # document, the hit target, the owner chain and the point. Any change: no press.
         await sup._cdp("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}, session_id=page_sid)
         await _same_document(sup, sid, fid, loader)
-        refused, x2, y2, outer2 = await _target_holds(sup, sid, element, page_sid, tree, child_sessions, (x, y, outer))
+        refused, x2, y2, outer2 = await _target_holds(sup, sid, element, page_sid, tree, child_sessions, (x, y, outer),
+                                                      card=card)
         if refused:
             return refused
         await _same_document(sup, sid, fid, loader)
-        top = None
-        if gate.approved is not None:  # B1: the approved total, read after the move
-            row = next((r for r in tree if r[0] == fid), None)
-            clicked = (fid, loader, row[2] if row else "", fid == tree[0][0])
-            refused, top = await _pay_gate(sup, page_sid, gate, clicked, element, sid)
-            if refused:
-                return refused
-        # r4 C2/C3: from here to the press no claim can start (the claim lock is held), and everything the gate's
-        # awaits could have let change is read once more: the document, the hit target, the owner chain and point,
-        # the top document the gate judged, and (last, with no await before the press) the claim generation.
-        fence = await _fence(sup, deadline)
-        try:
-            await _same_document(sup, sid, fid, loader)
-            refused, _x, _y, _o = await _target_holds(sup, sid, element, page_sid, tree, child_sessions, (x2, y2, outer2))
-            if refused:
-                return refused
-            if top is not None and (await _top_frame(sup, page_sid))[:2] != top[:2]:
-                return _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT)
-            if not _admission_holds(sup, gate):
-                return _refusal(APPROVAL_CHANGED, _APPROVAL_CHANGED_TEXT)
-            for kind in ("mousePressed", "mouseReleased"):
-                if kind == "mousePressed":
-                    # Nothing awaits between this check and the dispatch: past the deadline the caller may
-                    # already have reported "nothing was clicked", so the press must not start.
-                    if time.monotonic() >= deadline:
-                        raise SurfaceRefused("the action ran out of time before the click")
-                    # From here a failure cannot promise the click did not land (duplicate-submit risk).
-                    progress.append("checked" if top is not None else "go")
-                await sup._cdp("Input.dispatchMouseEvent", {"type": kind, "x": x2, "y": y2, "button": "left",
-                                                            "clickCount": 1}, session_id=page_sid)
-        finally:
-            fence.release()
-        return {"success": True, "role": control["role"], "text": _caption(control["text"], sup)}
+        refused, top, after = await _gate_press(sup, page_sid, gate, clicked, (element, sid, control["text"]), after)
+        if refused:
+            return refused
+        # build C r4: the dialogs open in the merchant document right before this approval's Pay press
+        dialogs = (await _open_dialogs(sup, sid, element) if pay_like and after is None and not card
+                   and gate.gen is not None and not gate.gen.paid else None)
+        before = await _baseline(sup, page_sid, element, sid)
+        refused = await _press_now(sup, deadline, (page_sid, sid, fid, loader, element, tree, child_sessions),
+                                   (x2, y2, outer2), top, lambda: _book_press(
+                                       sup, gate, gate.approved is not None, pay_like, progress, after=after,
+                                       unnamed=not _named_pay(control["role"], control["text"]),
+                                       dialogs=(fid, loader, dialogs, control["text"]) if dialogs is not None
+                                       else None),
+                                   gate.approved is not None)
+        if refused:
+            return refused
+        effect = await _bounded_effect(sup, page_sid, element, sid, before, control["role"], deadline)
+        return _clicked_answer(sup, control, effect, pay_like)
     finally:
         if element:
             await sup._release_payment_object(sid, element)
         await _release(sup, child_sessions, listed)
 
 
-async def _target_holds(sup: Any, sid: str, element: str, page_sid: str, tree: tuple, child_sessions: dict,
-                        point: tuple) -> tuple:
-    """``(refusal or None, x, y, outer)``: the control is still the element at its hit-tested centre and the point and
-    its OOPIF owner are the ones measured before (``point``), within a pixel."""
+async def _element(sup: Any, sid: str, arr: str, index: int) -> str:
+    """The listed control's element (by its index in the listing's array, in the controls' isolated world)."""
+    element = (await sup._cdp("Runtime.callFunctionOn", {
+        "objectId": arr, "functionDeclaration": "function(i){return this[i]}",
+        "arguments": [{"value": index}], "returnByValue": False}, session_id=sid))["result"]["result"].get("objectId")
+    if not element:
+        raise SurfaceRefused("control gone")
+    return element
+
+
+async def _aim(sup: Any, sid: str, element: str, page_sid: str, tree: tuple, child_sessions: dict,
+               card: bool) -> tuple:
+    """``(refusal or None, x, y, outer)``: the control is hit at its centre and nothing in its frame chain covers
+    that point."""
     hit = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _HIT,
                                                      "returnByValue": True}, session_id=sid))["result"]["result"]
     if hit.get("value") is not True:
-        return _refusal("payment_control_covered", "Another element covers that control; nothing was clicked."), 0, 0, 0
+        return await _covered_at(sup, sid, element, page_sid, tree, child_sessions, card), 0, 0, 0
+    x, y, outer = await _target_point(sup, sid, element, page_sid, tree, child_sessions)
+    if x is None:
+        return await _covered_at(sup, sid, element, page_sid, tree, child_sessions, card), 0, 0, 0
+    return None, x, y, outer
+
+
+async def _baseline(sup: Any, page_sid: str, element: str, sid: str) -> Optional[dict]:
+    """build C3: what the effect is compared with (counts and states only; never a reason to refuse)."""
+    try:
+        return await _structure(sup, page_sid, element, sid)
+    except Exception as exc:  # health: allow BLE001 -- no baseline: the click goes on, its effect is null
+        logger.info("payment_click: structure before the press not read (%s)", type(exc).__name__)
+        return None
+
+
+async def _press_now(sup: Any, deadline: float, doc: tuple, point: tuple, top: Optional[tuple], book,
+                     checked: bool) -> Optional[dict]:
+    """r4 C2/C3: from here to the press no claim can start (the claim lock is held), and everything the gate's awaits
+    could have let change is read once more: the document, the hit target, the owner chain and point, the top
+    document the gate judged, and (last, with no await before the press, ``book``: ``_book_press``) the claim
+    generation. ``doc``: ``(page session, session, frame id, loader, element, tree, child sessions)``; ``checked``: the
+    press was checked against an approved total (else an owner_go press). A refusal means nothing was pressed."""
+    page_sid, sid, fid, loader, element, tree, child_sessions = doc
+    fence = await _fence(sup, deadline)
+    try:
+        await _same_document(sup, sid, fid, loader)
+        refused, _x, _y, _o = await _target_holds(sup, sid, element, page_sid, tree, child_sessions, point,
+                                                  card=fid != tree[0][0])
+        if refused:
+            return refused
+        if top is not None and (await _top_frame(sup, page_sid))[:2] != top[:2]:
+            return _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT) if checked else _changed()
+        # Nothing awaits between these checks and the dispatch: past the deadline the caller may already have
+        # reported "nothing was clicked", so the press must not start.
+        if time.monotonic() >= deadline:
+            raise SurfaceRefused("the action ran out of time before the click")
+        # build C r2 (P2): admission re-checked and the press booked in one step under _LOCK, at dispatch: a listing
+        # from now on counts it. From here a failure cannot promise the click did not land (duplicate-submit risk).
+        refused = book()
+        if refused:
+            return refused
+        for kind in ("mousePressed", "mouseReleased"):
+            await sup._cdp("Input.dispatchMouseEvent", {"type": kind, "x": point[0], "y": point[1], "button": "left",
+                                                        "clickCount": 1}, session_id=page_sid)
+    finally:
+        fence.release()
+    return None
+
+
+def _clicked_answer(sup: Any, control: dict, effect: Optional[dict], pay_like: bool) -> dict:
+    out = {"success": True, "role": control["role"], "text": _caption(control["text"], sup), "effect": effect}
+    if pay_like:  # build C r2 (P3): what a Pay press's page did never reads as "Pay failed"
+        if effect is not None:
+            effect["unchanged"] = None
+        out.update(pay_pressed=True, next=PAY_PRESSED_NEXT)
+    return out
+
+
+async def _after_pay(sup: Any, gate: _Gate, pay_like: bool, clicked: tuple, page_sid: str, caption: str) -> Any:
+    """build C r3 (Q1) / r4: None when this is not a Pay-like press after this approval's Pay press (approved total or
+    owner_go). Otherwise only the top document is read (nothing moved, no total read): the press may only be a bank's
+    own step (``"bank"``, ``_bank_step``) or the one confirmation in a dialog that opened after the Pay press
+    (``"dialog"``, the dialog told apart on the control after the move); anything else is
+    ``payment_already_pressed``."""
+    gen = gate.gen
+    if not pay_like or gen is None or not gen.paid:
+        return None
+    top = await _top_frame(sup, page_sid)
+    if _bank_step(sup, gate, clicked, top):
+        return "bank"
+    if _confirm_possible(sup, gate, clicked, top, caption):
+        return "dialog"
+    return _already_pressed(gen)
+
+
+async def _gate_press(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, pressed: tuple, after: Any) -> tuple:
+    """``(refusal or None, top, after)``, read after the move: B1's pay gate on the approved total (``top``: the top
+    document it judged), then ``after`` (``_after_pay``) once more on that top document; an owner_go press after its
+    Pay press reads the top document only (no total to read). ``after`` None from here: the press meets the one-press
+    refusal. ``pressed``: ``(element, session, caption)``."""
+    element, sid, caption = pressed
+    top = None
+    if gate.approved is not None:
+        refused, top = await _pay_gate(sup, page_sid, gate, clicked, element, sid)
+        if refused:
+            return refused, top, after
+    elif after is not None:
+        top = await _top_frame(sup, page_sid)
+    if after == "bank":
+        return None, top, after if _bank_step(sup, gate, clicked, top) else None
+    if after == "dialog" and _confirm_possible(sup, gate, clicked, top, caption):
+        return None, top, after if await _new_dialog(sup, gate.gen, sid, element) else None
+    return None, top, None
+
+
+async def _target_holds(sup: Any, sid: str, element: str, page_sid: str, tree: tuple, child_sessions: dict,
+                        point: tuple, *, card: bool = False) -> tuple:
+    """``(refusal or None, x, y, outer)``: the control is still the element at its hit-tested centre and the point and
+    its OOPIF owner are the ones measured before (``point``), within a pixel. ``card``: the control is in a hosted card
+    frame (``_covered_at``)."""
+    hit = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _HIT,
+                                                     "returnByValue": True}, session_id=sid))["result"]["result"]
+    if hit.get("value") is not True:
+        return await _covered_at(sup, sid, element, page_sid, tree, child_sessions, card), 0, 0, 0
     x, y, outer = await _target_point(sup, sid, element, page_sid, tree, child_sessions)
     if x is None or outer != point[2] or abs(x - point[0]) > 1 or abs(y - point[1]) > 1:
-        return _refusal("payment_control_changed", "The control moved or changed just before the click; nothing was "
-                                                   "pressed. Call payment_controls again."), 0, 0, 0
+        return _changed(), 0, 0, 0
     return None, x, y, outer
+
+
+def _changed() -> dict:
+    return _refusal("payment_control_changed", "The control moved or changed just before the click; nothing was "
+                                               "pressed. Call payment_controls again.")
 
 
 # r4 C2: how long a click waits for the claim lock (a claim, dialog answer or recovery call running) before it
@@ -787,13 +1333,104 @@ async def _fence(sup: Any, deadline: float) -> threading.Lock:
 
 def _admission_holds(sup: Any, gate: _Gate) -> bool:
     """r4 C2: no claim (a new fill, so a new approval) started since the click was admitted, and the lock and the
-    approval it was admitted under are still the current ones."""
+    approval it was admitted under are still the current ones. Must hold ``_LOCK``."""
+    if _EPOCHS.get(sup, 0) != gate.epoch or _claiming(sup) or _CLOSING_N > 0:
+        return False
+    if gate.gen is None:  # no lock of this process at admission (owner_go): a claim since would show above
+        return True
+    return sup in _HELD and _GENS.get(sup) is gate.gen and gate.gen.approved is gate.approved
+
+
+def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress: list, *, after: Any = None,
+                unnamed: bool = False, dialogs: Optional[tuple] = None) -> Optional[dict]:
+    """build C r2 (P1, P2): right before mousePressed, in one step under ``_LOCK``: the admission still holds (r4 C2),
+    and a Pay press finds no earlier Pay press of this approval (``payment_already_pressed``); then the press is
+    booked in its lock record (``presses``, ``pressed``, r4 C7 ``admitted``, ``paid``), so a listing during the
+    press or its settle already counts it. A refusal (nothing booked) means nothing is pressed. build C r3/r4:
+    ``after`` (``_after_pay``) ``"bank"``: the press is a bank's own step after the Pay press (``_bank_step``), so it
+    does not meet the one-press refusal; ``"dialog"``: the one confirmation press in a dialog opened after the Pay
+    press, once per approval (``followup_used``). ``unnamed`` (Q2): a Pay press whose caption has no pay word (it only
+    counts as Pay because Hermes cannot tell it from one). ``dialogs``: ``(frame id, loader, node ids, caption)``: the
+    Pay press's document, the dialogs open in it before the press and the Pay control's caption, kept with the Pay
+    press. The owner_go path is held to the same
+    one press (``gen`` is None when this process saw no lock of this supervisor: nothing to count then)."""
     with _LOCK:
-        if _EPOCHS.get(sup, 0) != gate.epoch or _claiming(sup) or _CLOSING_N > 0:
-            return False
-        if gate.gen is None:  # no lock of this process at admission (owner_go): a claim since would show above
-            return True
-        return sup in _HELD and _GENS.get(sup) is gate.gen and gate.gen.approved is gate.approved
+        if not _admission_holds(sup, gate):
+            return _refusal(APPROVAL_CHANGED, _APPROVAL_CHANGED_TEXT)
+        gen = gate.gen
+        if pay_press and gen is not None and gen.paid and not (
+                after == "bank" or (after == "dialog" and not gen.followup_used)):
+            return _already_pressed(gen)
+        progress.extend(("checked" if checked else "go", _BOOKED))
+        if gen is not None:  # the admission above proved it is still this supervisor's current record
+            gen.pressed = True
+            gen.presses += 1
+            if checked:  # r4 C7: a press checked against this approval (not owner_go)
+                gen.admitted = True
+            if pay_press and not gen.paid:
+                gen.paid, gen.paid_unnamed, gen.pay_dialogs = True, unnamed, dialogs
+            elif pay_press and after == "dialog":
+                gen.followup_used = True
+    return None
+
+
+_BOOKED = object()  # in ``progress``: the press was booked at its dispatch
+ALREADY_PRESSED = "payment_already_pressed"
+_ALREADY_PRESSED_TEXT = (
+    "Pay was pressed once for this approval, so nothing was pressed now. Call payment_done (or payment_dialog for a "
+    "confirm it reports) to see where the payment went; never press Pay again: a new attempt needs a new approval "
+    "from the owner (Danil).")
+_UNNAMED_PRESS_TEXT = (
+    " The press this approval allowed was used by a control Hermes could not tell from Pay (its caption had no pay "
+    "word or could not be read, so it counts as the Pay press). Do not look for another way to press Pay: hand "
+    "over. Tell the owner (Danil) which control was pressed and what the page shows.")
+
+
+def _already_pressed(gen: Any) -> dict:
+    """``payment_already_pressed``; build C r3 (Q2): says so when the press budget went to an unnamed control."""
+    named = not getattr(gen, "paid_unnamed", False)
+    return _refusal(ALREADY_PRESSED, _ALREADY_PRESSED_TEXT + ("" if named else _UNNAMED_PRESS_TEXT))
+
+
+PAY_PRESSED_NEXT = (
+    "This was a Pay press. A Pay press's effect never means Pay failed (effect.unchanged is null): do not press Pay "
+    "again; call payment_done.")
+CLICK_BUSY = "payment_click_busy"
+_CLICK_BUSY_TEXT = (
+    "Another payment_click is still running (its press, or the short wait after it), so nothing was pressed. Wait "
+    "for its result, then call payment_controls again.")
+# build C r2 (P1): which presses through the pay gate count as the approval's one Pay press. A checkbox or radio
+# never does; a button whose caption names a preparatory step (and no pay word) does not, nor does a link without a
+# pay word. Everything else does, an unknown or withheld caption included (fails closed: at worst the real Pay is
+# refused and handed to payment_done, never pressed twice).
+_PAY_WORDS = re.compile(
+    r"\b(pay|payer|pagar|paga|pague|buy|purchase|order now|place (?:your )?order|submit|confirm|complete|finish|"
+    r"book|reserve|bezahlen|zahlen|zahlungspflichtig|kostenpflichtig|kaufen|bestellen|buchen|bestätigen|"
+    r"abschließen|absenden|commander|acheter|valider|confirmer|comprar|confirmar|acquista|ordina|conferma)\b",
+    re.IGNORECASE)
+_PREP_WORDS = re.compile(
+    r"\b(continue|next|weiter|review|prüfen|überprüfen|back|zurück|edit|change|ändern|bearbeiten|show|hide|"
+    r"anzeigen|details|more|mehr|less|weniger|close|schließen|accept|akzeptieren|agree|zustimmen|apply|einlösen|"
+    r"select|auswählen|wählen|add|hinzufügen|proceed|fortfahren|suivant|continuer|siguiente|continuar|avanti|"
+    r"continua|cookies?)\b", re.IGNORECASE)
+
+
+def _named_pay(role: str, caption: str) -> bool:
+    """build C r3 (Q2): the caption itself names a pay step (a pay word, a readable caption)."""
+    return role not in {"checkbox", "radio"} and isinstance(caption, str) and caption != CAPTION_WITHHELD \
+        and bool(_PAY_WORDS.search(caption))
+
+
+def _pay_press(role: str, caption: str) -> bool:
+    """build C r2 (P1): whether a press through the pay gate is the approval's one Pay press (see ``_PAY_WORDS``)."""
+    if role in {"checkbox", "radio"}:
+        return False
+    text = caption if isinstance(caption, str) else ""
+    if _PAY_WORDS.search(text):
+        return True
+    if role == "link":
+        return False
+    return not (text != CAPTION_WITHHELD and _PREP_WORDS.search(text))
 
 
 TOTAL_CHANGED = "payment_total_changed"
@@ -939,9 +1576,7 @@ def record_approved_total(supervisor: Any, cents: Any, currency: Any, top: Any, 
     without a lock of this process; a malformed value binds ``UNBOUND`` (r4 C8: every press refused). True when the
     total was bound."""
     good = (type(cents) is int and 0 <= cents < 10**9 and isinstance(currency, str)
-            and re.fullmatch(r"[A-Z]{3}", currency) is not None and isinstance(top, tuple) and len(top) == 2
-            and _valid_id(top[0]) and isinstance(top[1], str) and _ID_RE.fullmatch(top[1]) is not None
-            and isinstance(merchant, str) and merchant.startswith("https://") and _origin_of(merchant) == merchant)
+            and re.fullmatch(r"[A-Z]{3}", currency) is not None and _valid_checkout(top, merchant))
     with _LOCK:
         gen = _GENS.get(supervisor) if supervisor in _HELD else None
         if gen is None:
@@ -1040,10 +1675,58 @@ async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, elemen
     return None, top
 
 
+def _merchant_doc(gate: _Gate) -> Optional[tuple]:
+    """build C r4: ``(top frame id, loader, merchant origin)`` of the checkout a bank step is told apart against, after
+    this approval's Pay press: the approved total's own (after an admitted press), or for an owner_go press the lock's
+    merchant identity, kept from the claim apart from any approved amount (``_LockGen.merchant``, after its Pay
+    press). None: no bank step can be told apart."""
+    if isinstance(gate.approved, tuple):
+        return gate.approved[2:] if gate.admitted else None
+    gen = gate.gen
+    if gate.approved is None and gate.owner_go and gen is not None and gen.paid:
+        return gen.merchant
+    return None
+
+
+def _bank_step(sup: Any, gate: _Gate, clicked: tuple, top: Optional[tuple]) -> bool:
+    """build C r3 (Q1): the pressed document is a bank's own step after the Pay press, by the same two
+    classifications ``_pay_gate`` exempts from the merchant total (r4 C4, C5): a bank challenge in place of a card
+    document, or (the payment tab's top document changed to) a document on another site than the merchant, in the
+    same top frame. Never a document on a payment provider's site (build C r4: any host of a recorded provider
+    origin's site, a hosted payment page included): that stays under the one-press refusal. A document on an
+    unrecorded other site cannot be told from a bank's: it counts as one (the caption check and the same top frame
+    still hold). build C r4: the same after an owner_go Pay press (``_merchant_doc``)."""
+    doc = _merchant_doc(gate)
+    if doc is None or top is None or top[0] != doc[0]:
+        return False
+    _fid, loader, merchant = doc
+    if top[1] == loader:
+        return _bank_challenge(sup, clicked, merchant)
+    return cross_site(top[2], merchant) and not _provider_site(sup, top[2])
+
+
+def _confirm_possible(sup: Any, gate: _Gate, clicked: tuple, top: Optional[tuple], caption: str) -> bool:
+    """build C r4 (Opus L3): after the Pay press, the one press this approval allows in a confirmation dialog
+    ("Place order" -> "Confirm purchase"): not used yet, a pay-worded caption that names no retry and is not the Pay
+    control's own (a checkout re-rendered after an error shows its Pay again: a retry), on the top
+    document the Pay was pressed in (same frame and loader, whose dialogs were read before that press), on the
+    merchant's site (not another site, not a provider's). Whether the control sits in a dialog that was not open
+    then is read on the control (``_new_dialog``)."""
+    gen, doc = gate.gen, _merchant_doc(gate)
+    if gen is None or doc is None or gen.pay_dialogs is None or gen.followup_used or top is None:
+        return False
+    pay_doc = gen.pay_dialogs[:2]
+    return (clicked[3] and tuple(clicked[:2]) == pay_doc and tuple(top[:2]) == pay_doc
+            and not cross_site(top[2], doc[2]) and not _provider_site(sup, top[2])
+            and _named_pay("button", caption) and not _RETRY_WORDS.search(caption)
+            and " ".join(caption.lower().split()) != " ".join(str(gen.pay_dialogs[3]).lower().split()))
+
+
 def _bank_challenge(sup: Any, clicked: tuple, merchant: str) -> bool:
     """r4 C5: the pressed document is a bank challenge in place of a card document: a frame that held one of this
     payment's card documents now shows another document (new loader) on a site that is not the merchant's, and not on
-    a payment provider's or card-receiving origin (a provider's own next page keeps the merchant total check)."""
+    a payment provider's or card-receiving origin's site (build C r4; a provider's own next page keeps the merchant
+    total check)."""
     fid, loader, url, is_top = clicked
     if is_top:
         return False
@@ -1052,52 +1735,16 @@ def _bank_challenge(sup: Any, clicked: tuple, merchant: str) -> bool:
     with done._LOCK:
         payments = list((done._PAYMENTS.get(sup) or {}).values())
     documents = {d for p in payments for d in p.documents}
-    providers = {o for p in payments for o in done._card_origins(p)}
     return (fid in {d[0] for d in documents} and (fid, loader) not in documents and cross_site(url, merchant)
-            and _origin_of(url) not in providers)
-
-
-# r4 C4: public suffixes with two labels, so ``shop.co.uk`` is one site and ``bank.co.uk`` another. A suffix not
-# listed makes two shops under it one site: their pages are read for the total (fails closed), never exempt.
-_TWO_LABEL_SUFFIXES = frozenset("""
-ac.uk co.uk gov.uk ltd.uk me.uk net.uk org.uk plc.uk sch.uk
-com.au edu.au gov.au net.au org.au asn.au id.au
-co.nz net.nz org.nz govt.nz ac.nz
-co.jp ne.jp or.jp ac.jp go.jp ed.jp gr.jp lg.jp
-co.kr or.kr ne.kr go.kr ac.kr
-com.br net.br org.br gov.br
-com.mx org.mx gob.mx com.ar com.co com.pe com.uy com.ve com.ec com.py com.bo
-com.cn net.cn org.cn gov.cn com.hk org.hk com.tw org.tw com.sg org.sg com.my com.ph com.vn com.pk com.bd
-co.in net.in org.in gen.in firm.in co.id or.id ac.id co.th in.th ac.th co.il org.il ac.il
-co.za org.za com.tr org.tr com.sa com.eg com.ua com.pl net.pl org.pl com.gr com.cy com.mt
-co.at or.at gv.at ac.at co.ke co.ug co.tz com.ng com.gh
-""".split())
-
-
-def _site(url: Any) -> Optional[str]:
-    """The registrable domain of an https URL's host (last two labels, three under a listed two-label suffix), or
-    None when it cannot be told (another scheme, an IP address, a single-label host)."""
-    origin = _origin_of(url)
-    if not origin.startswith("https://"):
-        return None
-    host = origin[len("https://"):].split(":")[0].rstrip(".").lower()
-    labels = host.split(".")
-    if host.startswith("[") or len(labels) < 2 or all(part.isdigit() for part in labels) or not all(labels):
-        return None
-    keep = 3 if len(labels) >= 3 and ".".join(labels[-2:]) in _TWO_LABEL_SUFFIXES else 2
-    return ".".join(labels[-keep:])
-
-
-def cross_site(url: Any, merchant: Any) -> bool:
-    """Whether ``url`` is on another site than ``merchant``: both sites known and different. Same site, or either
-    unknown: False (the page is then read for the total)."""
-    a, b = _site(url), _site(merchant)
-    return a is not None and b is not None and a != b
+            and not _provider_site(sup, url))
 
 
 def _run(supervisor: Any, coro_factory, progress: list | None = None) -> dict:
     from tools.browser_payment_done import has_payment
 
+    lost = native_lost_refusal(supervisor)  # build C4: before anything is read or pressed
+    if lost:
+        return lost
     if not has_payment(supervisor):
         return _refusal("payment_surface_none", "No card payment by Hermes is open on this browser connection: "
                                                 "use the browser tools as usual.")
@@ -1140,8 +1787,11 @@ def payment_controls(supervisor: Any) -> dict:
 
 # dlz (Codex r3 P1, r4 P1): payment_click / payment_close admission, process-wide under _LOCK (not per supervisor:
 # a supervisor replaced after a reconnect drives the same browser slot). A close is admitted only with no click
-# running anywhere in this process, and a click only with no close admitted anywhere.
+# running anywhere in this process, and a click only with no close admitted anywhere. build C r3 (Q3): a click is
+# refused ``payment_click_busy`` only by another click on the same supervisor (``_PRESSING``).
 _PRESSING_N = 0  # payment_click calls running (their press may be on the wire)
+# build C r3 (Q3): the same, per supervisor (one browser slot): two tasks on two browsers never refuse each other
+_PRESSING: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _CLOSING_N = 0  # payment_close calls admitted and not yet returned
 
 
@@ -1152,10 +1802,19 @@ class _LockGen:
     press may have landed in it), when control already reported the slot locked, or when control's lock already
     held other tabs. Read and written under ``_LOCK``."""
 
-    __slots__ = ("admitted", "approved", "known", "pressed", "presses")
+    __slots__ = ("admitted", "approved", "followup_used", "known", "merchant", "native_lost", "owned", "paid",
+                 "paid_unnamed", "pay_dialogs", "pressed", "presses", "serial", "ws")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
+        # build C2: control's owning set at this record's confirmed claim (None: no confirmed claim yet), and a
+        # process-local serial for the log (ids only)
+        self.owned: Optional[frozenset] = None
+        self.serial = 0
+        # build C4: the supervisor socket the claim went out on (control's native connection), and whether control
+        # has since reported this lock held by another connection (``native: false``)
+        self.ws: Any = None
+        self.native_lost = False
         # B1: (cents, currency, top frame id, top loader, merchant origin) of the last successful fill in this lock
         # whose card stated the total and whose page check matched it (record_approved_total); None: no press is
         # covered by the card. r4 C8: ``UNBOUND`` when such a card covered Pay but its total could not be bound.
@@ -1163,10 +1822,24 @@ class _LockGen:
         # r4 C7: a press checked against ``approved`` (the total read, or a bank step after such a press) started
         # since that approval was bound. Reset with ``approved`` by every claim; owner_go presses never set it.
         self.admitted = False
+        # build C r2 (P1, owner rule: one Pay press per approval): a Pay press (``_pay_press``) checked against
+        # ``approved`` was dispatched. Every later Pay press through the pay gate in this record is refused
+        # (``payment_already_pressed``); a new fill starts a new record (a new approval).
+        self.paid = False
+        self.paid_unnamed = False  # build C r3 (Q2): that press was a control no pay word names (icon-only, unknown)
+        # build C r4: (top frame id, loader, merchant origin) of the checkout this record's claim was for, kept apart
+        # from ``approved`` (an owner_go Pay's bank step is told apart against it); None: not known
+        self.merchant: Optional[tuple] = None
+        # build C r4 (confirmation dialog): (frame id, loader, dialog node ids, caption) of the Pay press's document,
+        # the dialogs open in it before that press and the Pay control's caption (None: not read), and whether the
+        # one press in a dialog opened since was used
+        self.pay_dialogs: Optional[tuple] = None
+        self.followup_used = False
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
 _GENS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_RECORD_SEQ = 0  # build C2: lock record serials (log only)
 _CLICK_CLOSING = ("payment_close is closing the payment tab on this browser, so nothing was pressed. Wait for its "
                   "result; if the payment goes on, call payment_controls again afterwards.")
 
@@ -1225,11 +1898,16 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
     with _LOCK:  # dlz (Codex r3/r4 P1): one step admits the click against a payment_close running anywhere
         if _CLOSING_N > 0:  # the ref stays in its listing
             return _refusal("payment_close_busy", _CLICK_CLOSING)
+        if _PRESSING.get(supervisor, 0) > 0:  # build C r2 (P2, r3 Q3): one click at a time per browser, its settle
+            return _refusal(CLICK_BUSY, _CLICK_BUSY_TEXT)  # included; the ref stays
         issued = _ISSUED.get(supervisor)
         spec = issued.pop(ref, None) if isinstance(ref, str) and _REF_RE.fullmatch(ref) and issued else None
         if spec is not None:  # dlz (Opus r2): payment_close does not close the tab under a press still running
+            # the lock this press belongs to; build C r3/r4: owner_go is held to the one Pay press too, its bank step
+            # and confirmation dialog told apart in _click (_after_pay) as after an approved total's Pay
+            gen = _GENS.get(supervisor) if supervisor in _HELD else None
             _PRESSING_N += 1
-            gen = _GENS.get(supervisor) if supervisor in _HELD else None  # the lock this press belongs to
+            _PRESSING[supervisor] = _PRESSING.get(supervisor, 0) + 1
             # r4 C2: the approval and the claim generation it belongs to, re-checked right before the press
             gate = _Gate(gen.approved if gen is not None else None, gen is not None and gen.admitted,
                          owner_go is True, _EPOCHS.get(supervisor, 0), gen)
@@ -1241,15 +1919,12 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
         out = _with_dialog(supervisor, _run(
             supervisor, lambda deadline: _click(supervisor, spec, progress, deadline, gate), progress))
     finally:
-        with _LOCK:
-            if progress and gen is not None and _GENS.get(supervisor) is gen:  # never a later lock
-                gen.pressed = True
+        with _LOCK:  # build C r2 (P2): the press itself was booked at its dispatch (_book_press)
+            if progress and _BOOKED not in progress and gen is not None and _GENS.get(supervisor) is gen:
+                gen.pressed = True  # a press marked outside _book_press still counts (never admits, never pays)
                 gen.presses += 1
-                # r4 C7: a press checked against this approval (not owner_go, not one from before a new fill)
-                if (progress[0] == "checked" and gen.approved is gate.approved
-                        and _EPOCHS.get(supervisor, 0) == gate.epoch):
-                    gen.admitted = True
             _PRESSING_N = max(0, _PRESSING_N - 1)
+            _PRESSING[supervisor] = max(0, _PRESSING.get(supervisor, 0) - 1)
     if out.get("success"):
         out["clicked"] = ref
     elif not progress:  # nothing was pressed: the ref stays usable, if its listing is still the latest
