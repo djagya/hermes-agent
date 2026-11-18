@@ -1403,6 +1403,11 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
         gen = gate.gen
         if prep and (gen is None or gen.paid or gen.prep_used):
             return _changed()
+        if pay_press and gen is not None and not gen.paid and gen.prep_at is not None and _left_since(sup, gen.prep_at):
+            # build F r4 (Codex P1): the taken-back preparatory press started a navigation after its verdict: it was
+            # the Pay press after all
+            gen.paid, gen.provisional = True, False
+            return _already_pressed(gen)
         if pay_press and gen is not None and gen.paid and not (
                 after == "bank" or (after == "dialog" and not gen.followup_used)):
             return _already_pressed(gen)
@@ -1415,9 +1420,17 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             if (pay_press or prep) and not gen.paid:
                 gen.paid, gen.paid_unnamed, gen.pay_dialogs, gen.pay_caption = True, unnamed, dialogs, caption
                 gen.pay_node, gen.provisional, gen.prep_used = node, prep, gen.prep_used or prep
+                if prep and node:
+                    gen.prep_at = (node[0], time.monotonic())
             elif pay_press and after == "dialog":
                 gen.followup_used = True
     return None
+
+
+def _left_since(sup: Any, at: tuple) -> bool:
+    """build F r4: Chrome started a navigation of frame ``at[0]`` at or after ``at[1]`` (no record: True)."""
+    seen = getattr(sup, "load_started_since", None)
+    return seen is None or bool(seen(*at))
 
 
 _BOOKED = object()  # in ``progress``: the press was booked at its dispatch
@@ -1822,7 +1835,7 @@ class _LockGen:
     held other tabs. Read and written under ``_LOCK``."""
 
     __slots__ = ("admitted", "approved", "followup_used", "known", "merchant", "native_lost", "owned", "paid",
-                 "paid_unnamed", "pay_caption", "pay_dialogs", "pay_node", "prep_used", "pressed", "presses",
+                 "paid_unnamed", "pay_caption", "pay_dialogs", "pay_node", "prep_at", "prep_used", "pressed", "presses",
                  "provisional", "serial", "ws")
 
     def __init__(self, known: bool):
@@ -1861,6 +1874,7 @@ class _LockGen:
         # used; that press is booked as the Pay press until its effect is read
         self.pay_node: Optional[tuple] = None
         self.prep_used = self.provisional = False
+        self.prep_at: Optional[tuple] = None  # build F r4: (top frame id, monotonic) of the preparatory press
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)

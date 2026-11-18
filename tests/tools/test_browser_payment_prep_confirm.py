@@ -204,6 +204,17 @@ def test_a_navigation_chrome_saw_start_after_the_confirm_rebooks_it_as_pay():
     assert len(_mouse_presses(sup)) == 1
 
 
+def test_a_navigation_that_starts_after_the_verdict_refuses_the_purchase():
+    """F r4 (Codex P1): the confirm was taken back, then Chrome saw its submit start navigating: the purchase press is
+    refused (the confirm was the Pay press after all) and nothing more is pressed."""
+    sup = _sunday()
+    first = _click(sup, TOP_CONFIRM)
+    assert first["pay_pressed"] is False
+    sup.started_navigating = True
+    assert _click(sup, TOP_BUY)["error_type"] == surface.ALREADY_PRESSED
+    assert len(_mouse_presses(sup)) == 1 and surface.pay_press(sup) is not None
+
+
 def test_navigation_start_events_are_recorded_except_same_document_ones():
     from tools.browser_supervisor_frames import FrameTrackingMixin
     import threading

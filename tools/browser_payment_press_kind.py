@@ -248,9 +248,11 @@ async def prep_verdict(sup: Any, sid: str, arr: str, prep: tuple, effect: Option
     # build F r3 (Codex P1): Chrome's own navigation-start events (``started`` = (top frame id, press time)): a submit
     # still in flight at the read, which a page script could hide from the in-page leave watch
     seen = getattr(sup, "load_started_since", None)
+    listed = await still_listed(sup, sid, arr, prep[0])
+    # read after the page read (Codex r4 P1): a navigation that started while it ran counts too
     if started is not None and (seen is None or seen(*started)):
         return "navigated"
-    return None if await still_listed(sup, sid, arr, prep[0]) else "purchase_button_gone"
+    return None if listed else "purchase_button_gone"
 
 
 async def pay_node(sup: Any, sid: str, element: str, clicked: tuple) -> tuple:
