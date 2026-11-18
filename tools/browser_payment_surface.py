@@ -42,8 +42,17 @@ from tools.browser_payment_surface_after_pay import (  # build C r4: site rules 
     _RETRY_WORDS,
     _new_dialog,
     _open_dialogs,
+    _providers,
     _provider_site,
     cross_site,
+)
+from tools.browser_payment_press_kind import (  # build F: which press is the Pay press, and a preparatory confirm
+    CAPTION_WITHHELD,
+    _named_pay,
+    _pay_press,
+    confirm_only,
+    preparatory,
+    purchase_indices,
 )
 
 logger = logging.getLogger(__name__)
@@ -937,9 +946,6 @@ def _mask(text: str) -> str:
     return re.sub(r"\d{4,}", lambda m: "•" * len(m.group(0)), text)[:_MAX_TEXT]
 
 
-CAPTION_WITHHELD = "[caption withheld]"
-
-
 def _caption(text: str, sup: Any) -> str:
     """A control caption (text/aria-label/title — anything ``_DESCRIBE`` reads) for the model: the
     supervisor-scoped dialog redactor first, so every 3+ digit run, date-like group and amount but an
@@ -1129,10 +1135,11 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
     element = None
     sid = ""
     try:
-        found = [(fid, sid, arr, c, loader) for fid, sid, arr, cs, loader in listed for c in cs if c["_spec"] == spec]
+        found = [(fid, sid, arr, c, loader, cs) for fid, sid, arr, cs, loader in listed for c in cs
+                 if c["_spec"] == spec]
         if len(found) != 1:
             return _refusal("payment_control_unknown", "That control is not listed now; call payment_controls again.")
-        fid, sid, arr, control, loader = found[0]
+        fid, sid, arr, control, loader, doc_controls = found[0]
         if control["disabled"]:
             return _refusal("payment_control_disabled", "That control is disabled; nothing was clicked.")
         # build C r2 (P1): a press through the pay gate that may place the order (not a checkbox, radio or a clearly
@@ -1145,6 +1152,8 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         if isinstance(after, dict):  # nothing was moved or read for the total
             return after
         element = await _element(sup, sid, arr, control["_i"])
+        prep = await _preparatory(sup, gate, clicked, (sid, element, arr), control, doc_controls) if pay_like else None
+        pay_like = pay_like and prep is None
         card = not clicked[3]  # build C r4: a control in a hosted card frame never names its occluder's class
         refused, x, y, outer = await _aim(sup, sid, element, page_sid, tree, child_sessions, card)
         if refused:
@@ -1161,6 +1170,8 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         refused, top, after = await _gate_press(sup, page_sid, gate, clicked, (element, sid, control["text"]), after)
         if refused:
             return refused
+        if prep is not None and not await preparatory(sup, sid, element, arr, *prep):  # build F: read again
+            return _changed()
         # build C r4: the dialogs open in the merchant document right before this approval's Pay press
         dialogs = (await _open_dialogs(sup, sid, element) if pay_like and after is None and not card
                    and gate.gen is not None and not gate.gen.paid else None)
@@ -1169,13 +1180,14 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
                                    (x2, y2, outer2), top, lambda: _book_press(
                                        sup, gate, gate.approved is not None, pay_like, progress, after=after,
                                        unnamed=not _named_pay(control["role"], control["text"]),
+                                       caption=control["text"],
                                        dialogs=(fid, loader, dialogs, control["text"]) if dialogs is not None
                                        else None),
                                    gate.approved is not None)
         if refused:
             return refused
         effect = await _bounded_effect(sup, page_sid, element, sid, before, control["role"], deadline)
-        return _clicked_answer(sup, control, effect, pay_like)
+        return _clicked_answer(sup, control, effect, pay_like, prep is not None)
     finally:
         if element:
             await sup._release_payment_object(sid, element)
@@ -1249,13 +1261,29 @@ async def _press_now(sup: Any, deadline: float, doc: tuple, point: tuple, top: O
     return None
 
 
-def _clicked_answer(sup: Any, control: dict, effect: Optional[dict], pay_like: bool) -> dict:
+def _clicked_answer(sup: Any, control: dict, effect: Optional[dict], pay_like: bool, prep: bool = False) -> dict:
     out = {"success": True, "role": control["role"], "text": _caption(control["text"], sup), "effect": effect}
     if pay_like:  # build C r2 (P3): what a Pay press's page did never reads as "Pay failed"
         if effect is not None:
             effect["unchanged"] = None
         out.update(pay_pressed=True, next=PAY_PRESSED_NEXT)
+    elif prep:  # build F: a confirm inside a dialog or the card's box, the purchase control outside it
+        out.update(pay_pressed=False, next=PREP_CONFIRM_NEXT)
     return out
+
+
+async def _preparatory(sup: Any, gate: _Gate, clicked: tuple, at: tuple, control: dict,
+                       doc_controls: list) -> Optional[tuple]:
+    """build F (Sunday live retry): a press whose caption only confirms (``confirm_only``) on the merchant's top
+    document, before this approval's Pay press, that sits in a dialog or the card's method box while a listed purchase
+    control of that document lies outside it, is a preparatory step, not the Pay press. Returns the arguments of
+    ``preparatory`` to read it again right before the press, or None (the press stays a Pay press: fails closed).
+    ``at``: ``(session, element, listing array)``."""
+    if not (clicked[3] and confirm_only(control["text"])) or (gate.gen is not None and gate.gen.paid):
+        return None
+    sid, element, arr = at
+    args = (purchase_indices(doc_controls, control), sorted(_providers(sup)))
+    return args if await preparatory(sup, sid, element, arr, *args) else None
 
 
 async def _after_pay(sup: Any, gate: _Gate, pay_like: bool, clicked: tuple, page_sid: str, caption: str) -> Any:
@@ -1342,7 +1370,7 @@ def _admission_holds(sup: Any, gate: _Gate) -> bool:
 
 
 def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress: list, *, after: Any = None,
-                unnamed: bool = False, dialogs: Optional[tuple] = None) -> Optional[dict]:
+                unnamed: bool = False, dialogs: Optional[tuple] = None, caption: str = "") -> Optional[dict]:
     """build C r2 (P1, P2): right before mousePressed, in one step under ``_LOCK``: the admission still holds (r4 C2),
     and a Pay press finds no earlier Pay press of this approval (``payment_already_pressed``); then the press is
     booked in its lock record (``presses``, ``pressed``, r4 C7 ``admitted``, ``paid``), so a listing during the
@@ -1368,7 +1396,7 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             if checked:  # r4 C7: a press checked against this approval (not owner_go)
                 gen.admitted = True
             if pay_press and not gen.paid:
-                gen.paid, gen.paid_unnamed, gen.pay_dialogs = True, unnamed, dialogs
+                gen.paid, gen.paid_unnamed, gen.pay_dialogs, gen.pay_caption = True, unnamed, dialogs, caption
             elif pay_press and after == "dialog":
                 gen.followup_used = True
     return None
@@ -1392,6 +1420,9 @@ def _already_pressed(gen: Any) -> dict:
     return _refusal(ALREADY_PRESSED, _ALREADY_PRESSED_TEXT + ("" if named else _UNNAMED_PRESS_TEXT))
 
 
+PREP_CONFIRM_NEXT = (
+    "This confirmed a step (its caption only confirms, inside a dialog or the card form, with the purchase button "
+    "outside it), so it was not the Pay press. Call payment_controls and press the purchase button once.")
 PAY_PRESSED_NEXT = (
     "This was a Pay press. A Pay press's effect never means Pay failed (effect.unchanged is null): do not press Pay "
     "again; call payment_done.")
@@ -1399,40 +1430,6 @@ CLICK_BUSY = "payment_click_busy"
 _CLICK_BUSY_TEXT = (
     "Another payment_click is still running (its press, or the short wait after it), so nothing was pressed. Wait "
     "for its result, then call payment_controls again.")
-# build C r2 (P1): which presses through the pay gate count as the approval's one Pay press. A checkbox or radio
-# never does; a button whose caption names a preparatory step (and no pay word) does not, nor does a link without a
-# pay word. Everything else does, an unknown or withheld caption included (fails closed: at worst the real Pay is
-# refused and handed to payment_done, never pressed twice).
-_PAY_WORDS = re.compile(
-    r"\b(pay|payer|pagar|paga|pague|buy|purchase|order now|place (?:your )?order|submit|confirm|complete|finish|"
-    r"book|reserve|bezahlen|zahlen|zahlungspflichtig|kostenpflichtig|kaufen|bestellen|buchen|bestätigen|"
-    r"abschließen|absenden|commander|acheter|valider|confirmer|comprar|confirmar|acquista|ordina|conferma)\b",
-    re.IGNORECASE)
-_PREP_WORDS = re.compile(
-    r"\b(continue|next|weiter|review|prüfen|überprüfen|back|zurück|edit|change|ändern|bearbeiten|show|hide|"
-    r"anzeigen|details|more|mehr|less|weniger|close|schließen|accept|akzeptieren|agree|zustimmen|apply|einlösen|"
-    r"select|auswählen|wählen|add|hinzufügen|proceed|fortfahren|suivant|continuer|siguiente|continuar|avanti|"
-    r"continua|cookies?)\b", re.IGNORECASE)
-
-
-def _named_pay(role: str, caption: str) -> bool:
-    """build C r3 (Q2): the caption itself names a pay step (a pay word, a readable caption)."""
-    return role not in {"checkbox", "radio"} and isinstance(caption, str) and caption != CAPTION_WITHHELD \
-        and bool(_PAY_WORDS.search(caption))
-
-
-def _pay_press(role: str, caption: str) -> bool:
-    """build C r2 (P1): whether a press through the pay gate is the approval's one Pay press (see ``_PAY_WORDS``)."""
-    if role in {"checkbox", "radio"}:
-        return False
-    text = caption if isinstance(caption, str) else ""
-    if _PAY_WORDS.search(text):
-        return True
-    if role == "link":
-        return False
-    return not (text != CAPTION_WITHHELD and _PREP_WORDS.search(text))
-
-
 TOTAL_CHANGED = "payment_total_changed"
 GO_REQUIRED = "payment_go_required"
 TOTAL_UNBOUND = "payment_total_unbound"
@@ -1803,7 +1800,7 @@ class _LockGen:
     held other tabs. Read and written under ``_LOCK``."""
 
     __slots__ = ("admitted", "approved", "followup_used", "known", "merchant", "native_lost", "owned", "paid",
-                 "paid_unnamed", "pay_dialogs", "pressed", "presses", "serial", "ws")
+                 "paid_unnamed", "pay_caption", "pay_dialogs", "pressed", "presses", "serial", "ws")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
@@ -1835,6 +1832,7 @@ class _LockGen:
         # one press in a dialog opened since was used
         self.pay_dialogs: Optional[tuple] = None
         self.followup_used = False
+        self.pay_caption = ""  # build F: the Pay press's caption (payment_done: no success while it is still listed)
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
@@ -1862,6 +1860,14 @@ def admit_close(supervisor: Any) -> tuple[bool, Optional[bool]]:
         _CLOSING_N += 1
         gen = _GENS.get(supervisor) if supervisor in _HELD else None
         return True, (gen.pressed if gen is not None and gen.known else None)
+
+
+def pay_caption(supervisor: Any) -> Optional[str]:
+    """build F: the caption of the Pay press in this supervisor's current lock (as listed: redacted), or None when no
+    Pay press of this process is recorded in it."""
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        return gen.pay_caption if gen is not None and gen.paid and gen.pay_caption else None
 
 
 def presses_in_lock(supervisor: Any) -> Optional[int]:

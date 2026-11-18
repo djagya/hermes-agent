@@ -9,7 +9,9 @@ runtime's way out after the Pay click, on the supervisor's own (native) socket:
    card origin, with none of this payment's card documents and no card-field frame in its tree,
    fully loaded and unchanged over two polls. Payment-provider and 3-D Secure pages in between are
    waited through. A single-page shop's checkout document counts too once it never held a card
-   field and every claimed card frame is gone.
+   field and every claimed card frame is gone, but (build F) that document, or any document at the
+   checkout's URL, only with order wording in its title or text; and no document counts while a listed
+   control still carries the Pay press's caption (``order_evidence`` in the result).
 2. Snapshot that document in an isolated world: title, URL, visible text (bounded) and http(s)
    links (bounded). Form controls, editable regions and frames are skipped: no input value is ever
    read, and nothing is captured as pixels.
@@ -80,6 +82,9 @@ class _Payment:
     # amount a dialog's text may show unmasked.
     amount: str = ""
     currency: str = ""
+    # build F: origin + path of the checkout's top document at each fill (``_checkout_key``): a document there is not
+    # a confirmation by itself
+    checkouts: frozenset = frozenset()
 
     @property
     def frame_ids(self) -> frozenset:
@@ -119,6 +124,14 @@ def _url_origin(url: Any) -> str:
     return f"{parts.scheme}://{authority}" + (f":{port}" if port not in (None, default) else "")
 
 
+def _checkout_key(url: Any) -> str:
+    """build F: ``origin + path`` of an http(s) URL (query and fragment ignored, a trailing slash too), else ''."""
+    origin = _url_origin(url)
+    if not origin:
+        return ""
+    return origin + (urlsplit(url).path.rstrip("/") or "/")
+
+
 def record_payment(supervisor: Any, inspected: Any, adopted: bool = False) -> None:
     """Called once control confirmed a claim: remember the payment tab and its card documents for
     ``payment_done``. Never raises; an inspection it cannot read records nothing (payment_done then
@@ -138,6 +151,7 @@ def record_payment(supervisor: Any, inspected: Any, adopted: bool = False) -> No
             receiving=frozenset(d.origin for d in hosted)
             | frozenset(getattr(inspected, "unreviewed_origins", ()) or ()),
             merchant_fields=len(hosted) != len(docs),
+            checkouts=frozenset({_checkout_key(tree[0][2])} - {""}),
         )
         if not (_valid_id(payment.tab) and isinstance(payment.loader, str) and payment.loader):
             raise ValueError("payment tab or loader unknown")
@@ -150,7 +164,8 @@ def record_payment(supervisor: Any, inspected: Any, adopted: bool = False) -> No
         if old is not None:  # a second fill on the same tab: every card document of both counts
             payment = _Payment(payment.tab, payment.merchant, payment.loader, old.documents | payment.documents,
                                old.receiving | payment.receiving, old.merchant_fields or payment.merchant_fields,
-                               *((old.amount, old.currency) if adopted is True else ()))
+                               *((old.amount, old.currency) if adopted is True else ()),
+                               checkouts=old.checkouts | payment.checkouts)
         tabs[payment.tab] = payment
 
 
@@ -422,6 +437,10 @@ _NO_NEW_TAB = ("The confirmation was read, but a new tab could not be opened, so
                "the browser stays locked. Use text and links; call payment_close or ask the user to end the lock.")
 _CLOSE_FAILED = ("The confirmation was read and a new tab opened, but closing the payment tab failed, and browser "
                  "control has not confirmed the unlock. Call payment_close or ask the user.")
+# build F (Sunday live retry): browser_exec's harness stays attached to its own tab; once the payment tab it was on
+# closes, it re-attaches to its dedicated tab (about:blank), never to the tab payment_done opened
+_NEW_TAB_NEXT = ("The confirmation is open in the tab new_tab. browser_exec does not follow it (after the payment tab "
+                 "closed it is on its own blank tab): call switch_tab(new_tab) in browser_exec before reading it.")
 _UNPROVEN = ("The confirmation was read, the new tab opened and the payment tab closed, but browser control has not "
              "yet confirmed the unlock. Use text and links; if browser actions are still refused, ask the user.")
 
@@ -532,12 +551,59 @@ async def _probe(sup: Any, payment: _Payment, expected: str, previous: Optional[
         page = _valid_snapshot(await _snapshot(sup, sid, tree[0][0]), expected)
         if page is None or await sup._payment_tree(sid, child_sessions) != tree:
             return "wait", seen, None
+        evidence = await _order_evidence(sup, sid, tree[0], payment, page)
+        if evidence is None:  # build F: the checkout itself, or the Pay caption still listed: look again
+            return "settling", seen, key
         page["browser_context"] = tab.get("browserContextId")
+        page["order_evidence"] = evidence
         return "ready", page, key
     finally:
         await sup._release_payment_sessions(child_sessions)
         if temporary:
             await sup._release_payment_sessions({"tab": sid})
+
+
+# build F (Sunday live retry): what only an order confirmation says (EN/DE/FR/ES/IT/NL), read on the checkout's own
+# document or URL, where the page alone proves nothing
+_CONFIRMATION = re.compile(
+    r"\b(thank you|thanks for your (order|purchase)|order (number|confirmed|confirmation|received|placed|complete)|"
+    r"your order (has been|was|is) (placed|confirmed|received)|danke|vielen dank|"
+    r"bestellung (ist )?(eingegangen|bestätigt|erhalten|aufgegeben|abgeschlossen)|bestellnummer|bestellbestätigung|"
+    r"auftragsbestätigung|merci|commande (confirmée|validée|enregistrée|reçue)|numéro de commande|gracias|"
+    r"pedido (confirmado|realizado|recibido)|número de pedido|grazie|ordine (confermato|ricevuto|completato)|"
+    r"numero d'ordine|bedankt|bestelling (is )?(geplaatst|ontvangen|bevestigd)|bestelnummer)", re.IGNORECASE)
+
+
+async def _top_captions(sup: Any, sid: str, row: tuple) -> list:
+    """The captions of the controls listed on the candidate's top document (payment_controls' own listing: buttons
+    and links, never an input's value; redacted as for the model)."""
+    from tools.browser_payment_surface import _listing
+
+    arr, controls = await _listing(sup, row[0], sid, f"{row[0]}|{row[1]}", row[1], True, "")
+    await sup._release_payment_object(sid, arr)
+    return [c["text"] for c in controls]
+
+
+async def _order_evidence(sup: Any, sid: str, row: tuple, payment: _Payment, page: dict) -> Optional[str]:
+    """build F: why a safe, settled document is the order confirmation, or None (keep waiting). Never while a listed
+    control still carries the Pay press's caption. The checkout's own document (single-page shop) or a document at
+    the checkout's URL needs confirmation wording in its title or text (``confirmation_text``) and, when the Pay
+    caption is not known, no listed purchase control at all; any other document is ``new_document``."""
+    from tools.browser_payment_press_kind import same_caption, strong_pay
+    from tools.browser_payment_surface import pay_caption
+
+    pressed = pay_caption(sup)
+    checkout = row[1] == payment.loader or _checkout_key(page["url"]) in payment.checkouts
+    if not checkout and pressed is None:
+        return "new_document"
+    captions = await _top_captions(sup, sid, row)
+    if pressed is not None and any(same_caption(c, pressed) for c in captions):
+        return None
+    if not checkout:
+        return "new_document"
+    if pressed is None and any(strong_pay(c) for c in captions):
+        return None
+    return "confirmation_text" if _CONFIRMATION.search(page["title"] + "\n" + page["text"]) else None
 
 
 async def _open_tab(sup: Any, url: str, context: Any) -> str:
@@ -920,6 +986,7 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     except Exception as exc:  # health: allow BLE001 -- fixed text; the payment tab stays open and locked
         logger.info("payment_done: new tab failed (%s)", type(exc).__name__)
         return {**result, "note": _NO_NEW_TAB}
+    result["next"] = _NEW_TAB_NEXT
     on_tab = False
     try:
         on_tab = _wait(_close_tab(supervisor, payment.tab), loop, timeout=10)

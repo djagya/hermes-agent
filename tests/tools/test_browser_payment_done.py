@@ -183,6 +183,8 @@ def test_waits_through_3ds_and_provider_pages_then_hands_over():
     assert out["success"] is True and out["lock_released"] is True and out["payment_tab_closed"] is True
     assert (out["url"], out["title"], out["text"]) == (SHOP + "/thanks?order=77", "Thank you", "Order 77 confirmed")
     assert out["links"] == SNAPSHOT["links"] and out["new_tab"] == "NEWTAB" and "note" not in out
+    # build F: why this is the confirmation, and which tab holds it (browser_exec does not follow it)
+    assert out["order_evidence"] == "new_document" and "switch_tab(new_tab)" in out["next"]
     # the snapshot was read only from the confirmation, never from the checkout, 3-D Secure or provider page
     assert {c[3] for c in sup.sent("Runtime.evaluate")} == {CONFIRM}
     # the new tab is opened (same browser context, same URL) before the payment tab is closed
@@ -272,8 +274,10 @@ def test_lock_released_only_when_status_proves_it(status, released):
 def test_single_page_shop_confirmation_once_the_card_frames_are_gone():
     sup = _paid([CHECKOUT, SAME_DOC])
     sup.page.update(url=SHOP + "/thanks")
+    # build F: the checkout's own document needs order wording ("Order 77 confirmed") and no purchase control listed
+    sup.rows = [{"i": 0, "role": "link", "text": "Continue shopping", "disabled": False}]
     out = done.payment_done(sup)
-    assert out["success"] is True and out["url"] == SHOP + "/thanks"
+    assert out["success"] is True and out["url"] == SHOP + "/thanks" and out["order_evidence"] == "confirmation_text"
     assert {c[3] for c in sup.sent("Runtime.evaluate")} == {SAME_DOC}
     # the same document never counts when the merchant page itself received a card field
     for merchant_fields in (True, "subframe"):
@@ -288,7 +292,7 @@ def test_new_tab_failure_never_closes_the_payment_tab():
     sup.fail.add("Target.createTarget")
     out = done.payment_done(sup)
     assert out["success"] is True and out["new_tab"] is None and out["lock_released"] is False
-    assert out["text"] == "Order 77 confirmed" and "note" in out
+    assert out["text"] == "Order 77 confirmed" and "note" in out and "next" not in out
     assert not sup.sent("Target.closeTarget")
 
 
