@@ -579,6 +579,7 @@ def test_a_holder_cue_on_a_zip_field_never_plans_the_holder_name_there():
     # D-0359 a (11-18): the ZIP is the card's billing postcode field now, never the holder's
     assert [c.token for c in controls] == ["cc-number", "cc-exp", "cc-csc", "postal-code"]
     docs = _card_documents([("f", "s", "o", MERCHANT, controls)], MERCHANT)
+    docs[0].blank = frozenset({3})  # the ZIP field was empty at inspection (a merchant postcode is written only then)
     fills = bvp._document_fills(_inspection(*docs), CARD)
     assert sorted(f["token"] for f in fills) == ["cc-csc", "cc-exp", "cc-number"]
     assert all(f["index"] != 3 for f in fills)

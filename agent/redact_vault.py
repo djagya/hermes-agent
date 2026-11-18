@@ -352,11 +352,12 @@ def redact_registered_vault_values(text: str, *, nondigit_only: bool = False, au
         text = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", CARD_PLACEHOLDER, text, flags=re.IGNORECASE)
     if nondigit_only or audience == "authored":
         return text
-    lengths = {n for digit_lengths, _names, released in windows if not released or audience == "log"
+    declared = _BROWSER_SLOT.get() is not None  # a result that declares no slot keeps the full masking
+    lengths = {n for digit_lengths, _names, released in windows if not released or audience == "log" or not declared
                for n in digit_lengths}
     lengths |= {len(v) for v, e in bucket.items() if e.mask_until > now and _ALL_DIGITS.fullmatch(v)}
     # dlz (D-0367 b): a released window in a browser result: its CVC length spares currency amounts
-    narrowed = {n for digit_lengths, _names, released in windows if released and audience != "log"
+    narrowed = {n for digit_lengths, _names, released in windows if released and audience != "log" and declared
                 for n in digit_lengths}
     lengths_all = lengths | narrowed
     if lengths_all:

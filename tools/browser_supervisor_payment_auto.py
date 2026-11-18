@@ -87,7 +87,10 @@ class PaymentAutoMixin:
             rows = _sp()._bounded_description(raw) if i.unreviewed_origins else raw
             if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
                 return False
-            if _roles(_sp()._card_controls(rows, d.origin == i.merchant_origin)) != _roles(d.controls):
+            now = _sp()._card_controls(rows, d.origin == i.merchant_origin)
+            if not any(c.token == "postal-code" for c in d.controls):  # one the inspection dropped (two documents)
+                now = tuple(c for c in now if c.token != "postal-code")
+            if _roles(now) != _roles(d.controls):
                 return False
             return _sp()._value(await self._cdp("Runtime.callFunctionOn", {
                 "objectId": d.object_id, "functionDeclaration": "function(){return this.accept()}",
@@ -321,6 +324,7 @@ class PaymentAutoMixin:
                     st["refused"] = "fills"
                     return _auto_result(result, st)
         finally:
+            i.settled = (current, current_fills)  # what the result's form report describes (a re-inspection's own)
             if current is not i:
                 current.consumed = True
                 await self._release_once(current)
@@ -381,6 +385,8 @@ class PaymentAutoMixin:
             after = await self._shown_documents(i)
             result = _sp()._retention_result([(f, a if d.frame_id in before and d.frame_id in after else None)
                                         for d, f, a in answers])
+            if result.get("success"):
+                await self._refresh_blanks(i)
             if await self._top_navigated(i):
                 result["navigated_after_fill"] = True
                 return "", result
@@ -518,7 +524,7 @@ _FOUND_COUNTS = ("frames", "documents", "tokens_duplicated", "frames_inspected",
 
 
 def clean_found(found: Any) -> dict | None:
-    """dlz (11-18): an incomplete reading's record (``browser_supervisor_payment._summary``), only its exact shape:
+    """dlz (11-18): an incomplete reading's record (``browser_supervisor_payment_results._summary``), only its exact shape:
     the card field tokens it found (sorted) and its counts per drop reason. Anything else: None."""
     if not isinstance(found, dict) or set(found) != {"tokens", *_FOUND_COUNTS}:
         return None

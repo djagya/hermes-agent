@@ -18,6 +18,7 @@ import pytest
 
 from agent.vault_login_classifier import LoginControl, classify_checkout_control
 from tools import browser_supervisor_payment as sp
+from tools import browser_supervisor_payment_results as rs
 from tools.browser_supervisor_payment import PaymentDocument, PaymentInspection, _card_documents
 
 MERCHANT = "https://shop.example"
@@ -75,6 +76,7 @@ def test_a_card_document_keeps_its_one_postcode_field_and_fills_it_from_the_card
     controls = sp._card_controls(rows, merchant_doc=True)
     assert [c.token for c in controls] == ["cc-number", "cc-exp", "cc-csc", "postal-code"]
     docs = _card_documents([("f", "s", "o", MERCHANT, controls)], MERCHANT)
+    docs[0].blank = frozenset({3})  # the postcode field was empty at inspection
     fills = bvp._document_fills(_inspection(*docs), {**CARD, "billing_postal_code": "10115"})
     assert [(f["index"], f["value"]) for f in fills if f["token"] == "postal-code"] == [(3, "10115")]
     # a saved card without one: the field is skipped (optional), the card fields are still written
@@ -109,7 +111,7 @@ def test_postcode_fields_in_two_card_documents_are_dropped_instead_of_refusing_t
     candidates = [a, b]
     with pytest.raises(sp.PaymentPolicyError, match="Incomplete or ambiguous"):
         _card_documents(candidates, MERCHANT)  # what the duplicate would do
-    sp._one_postcode(candidates)
+    rs._one_postcode(candidates)
     docs = _card_documents(candidates, MERCHANT)
     assert all("postal-code" not in [c.token for c in d.controls] for d in docs)
 
@@ -128,9 +130,9 @@ def test_the_re_pin_reads_the_postcode_the_inspection_made_a_card_field():
 
 
 def _document(rows, origin=MERCHANT, blank=None):
-    classified = sp._classified(rows)
-    controls = sp._card_of(classified, origin == MERCHANT)
-    return PaymentDocument("f", "s", "o", origin, controls, left_for_user=sp._left_for_user(
+    classified = rs._classified(rows)
+    controls = rs._card_of(classified, origin == MERCHANT)
+    return PaymentDocument("f", "s", "o", origin, controls, left_for_user=rs._left_for_user(
         classified, controls, origin == MERCHANT), blank=blank)
 
 
@@ -282,7 +284,7 @@ def test_an_unsupported_discovery_reading_carries_its_inspection_summary():
     holder = sp._card_controls([_row(0, "holder", "Name on card", form=None)])
     candidates = [("f", "s", "o", PSP, holder)]
     found = {"stats": {"frames_inspected": 3, "frames_cardless": 1, "inputs_unrecognised": 2}}
-    summary = sp._summary(((), (), ()), candidates, found)
+    summary = rs._summary(((), (), ()), candidates, found)
     with pytest.raises(PaymentDestinationError) as caught:
         sp._discovery_documents(candidates, MERCHANT, (), 2, summary)
     assert caught.value.error_type == "payment_fields_unsupported"
@@ -322,10 +324,10 @@ def test_the_re_inspection_stop_result_and_log_line_carry_the_record(caplog):
 def test_an_ambiguous_page_check_logs_reason_codes_and_counts_never_amounts():
     pins = [("merchant page", {"state": "ambiguous", "labelled": [32765, 1999], "stated": 2, "unclear": False}),
             ("payment form", {"state": "ambiguous", "labelled": [], "stated": 1, "unclear": True})]
-    assert sp._page_match_reasons(pins, 32765) == {"reasons": ["unclear", "other_total"], "labelled": 2, "other": 1,
+    assert rs._page_match_reasons(pins, 32765) == {"reasons": ["unclear", "other_total"], "labelled": 2, "other": 1,
                                                    "stated": 3, "documents": 2}
     only_stated = [("merchant page", {"state": "ambiguous", "labelled": [], "stated": 1, "unclear": False})]
-    assert sp._page_match_reasons(only_stated, 32765)["reasons"] == ["unlabelled"]
+    assert rs._page_match_reasons(only_stated, 32765)["reasons"] == ["unlabelled"]
 
 
 def test_payment_fill_refused_names_the_step_and_the_card_check():

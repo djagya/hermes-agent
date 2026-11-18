@@ -145,12 +145,19 @@ class ExpiryOptionUnmatched(Exception):
 
 def _document_fills(inspected, secret: dict) -> list | None:
     """Fills tagged with their card document, or None when a required field cannot be filled. An
-    optional field (holder name, billing postcode) the saved card has no value for is skipped. An
+    optional field (holder name, billing postcode) the saved card has no value for is skipped, and so is a
+    postcode field on the merchant's own page that was not blank at inspection. An
     expiry ``<select>`` takes the value of its one matching option; zero or several matching options
     in ANY document raise ExpiryOptionUnmatched before anything is written anywhere."""
     fills = []
     for k, document in enumerate(inspected.documents):
         document_fills = select_checkout_fills(list(document.controls), secret, PAYMENT_FIELDS)
+        if document.origin == inspected.merchant_origin:
+            # The merchant's own page may already hold a postcode (the user's, or a shipping one): written only into
+            # one that was blank at inspection; a reading that cannot say is not a blank.
+            blank = getattr(document, "blank", None)
+            document_fills = [f for f in document_fills
+                              if f["token"] != "postal-code" or (blank is not None and f["index"] in blank)]
         filled = {f["index"] for f in document_fills}
         if any(c.control.index not in filled and c.token not in OPTIONAL_CARD_TOKENS for c in document.controls):
             return None
@@ -1000,10 +1007,23 @@ def _form_report(result: dict, inspected, fills: list, locked: bool) -> dict:
     return out
 
 
+def _settled(inspected, fills: list) -> tuple:
+    """The inspection and fills of the commit generation that finished: an armed fill that continued on a
+    re-inspection (the form re-rendered) leaves them on the inspection it was given; otherwise the ones it got."""
+    settled = getattr(inspected, "settled", None)
+    if isinstance(settled, tuple) and len(settled) == 2 and isinstance(settled[1], list):
+        return settled
+    return inspected, fills
+
+
 def _describe_result(result: dict, backend, inspected, fills: list, prompt: dict, bound_revision: str,
                      unreviewed: bool, stated, locked: bool = False, from_agent: frozenset = frozenset()) -> dict:
+    # An armed fill that continued on a re-inspection: the form report and origins are the finishing generation's;
+    # the fields are those of every generation (a field an earlier one wrote is kept, not planned again).
+    inspected, final = _settled(inspected, fills)
+    fills = final + [f for f in fills if f["token"] not in {g["token"] for g in final}]
     try:
-        report = _form_report(result, inspected, fills, locked)
+        report = _form_report(result, inspected, final, locked)
     except Exception:  # health: allow BLE001 -- nothing after the commit may raise; an unreadable report is incomplete
         report = {"form_complete": False, "next": _FORM_INCOMPLETE_LOCKED_NEXT if locked else _FORM_INCOMPLETE_NEXT} \
             if result.get("success") else {}

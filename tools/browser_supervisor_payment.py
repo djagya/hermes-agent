@@ -34,16 +34,7 @@ from tools.browser_supervisor_payment_amount import (  # re-exported: callers im
 from tools.browser_supervisor_payment_auto import AUTO_BUDGET_SECONDS, PaymentAutoMixin
 from tools.browser_supervisor_payment_closure import _INSPECT_TEMPLATE
 from tools.browser_supervisor_payment_repin import MAX_REPINS, located, repin_pins, valid_check, valid_pause
-from tools.browser_supervisor_payment_results import (  # re-exported: callers and tests import these from here
-    _SUMMARY_COUNTS,
-    _blank_indexes,
-    _card_of,
-    _classified,
-    _left_for_user,
-    _one_postcode,
-    _page_match_reasons,
-    _summary,
-)
+from tools import browser_supervisor_payment_results as _results
 from tools.browser_supervisor_payment_stop import admission_strict as _admission_strict
 from tools.browser_supervisor_payment_stop import strict_exposure as _strict_exposure
 from tools.browser_supervisor_payment_stop import await_cleanup, release_object, strict_then_shown
@@ -204,6 +195,9 @@ class PaymentInspection:
     # field; and what the inspection saw (``_summary``: counts and tokens only).
     cardless_frames: int = 0
     summary: dict = field(default_factory=dict)
+    # dlz (D-0358 a): set by an armed commit on the inspection it was given: ``(inspection, fills)`` of the generation
+    # that finished it (a re-inspection after a re-render), the one the result's form report describes.
+    settled: Any = field(default=None, repr=False, compare=False)
 
     @property
     def controls(self) -> tuple:
@@ -438,7 +432,7 @@ def _take_probe(owner_nodes: dict, key: tuple) -> bool:
 
 
 def _card_controls(raw: list, merchant_doc: bool = False) -> tuple:
-    return _card_of(_classified(raw), merchant_doc)
+    return _results._card_of(_results._classified(raw), merchant_doc)
 
 
 def _relevant_frames(i: PaymentInspection) -> set:
@@ -677,8 +671,11 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             unreviewed_frames = await self._inspect_frames(tree, merchant, allowed_frames, unreviewed, sid,
                                                            child_sessions, world, found, admission == "strict")
             candidates, absence = found["candidates"], found["absence"]
-            _one_postcode(candidates)
-            summary = _summary(tree, candidates, found)
+            left = found.get("left") or {}
+            for key in _results._one_postcode(candidates):  # a dropped postcode is left for the user: counted, not lost
+                rows, blank, where = left[key[:2]]
+                left[key[:2]] = ((*rows, key[2]), blank, where)
+            summary = _results._summary(tree, candidates, found)
             if unreviewed:
                 documents = _discovery_documents(candidates, merchant, allowed_frames, unreviewed_frames, summary)
                 # dlz (B4): card-free documents on the merchant or a receiving origin stay pinned as absence
@@ -691,13 +688,12 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                     raise _page_too_large()
             else:
                 documents = _explained_card_documents(candidates, merchant, tree, allowed_frames, summary)
-            left = found.get("left") or {}
             for d in documents:
                 d.clock_anchor = found["anchors"].get((d.frame_session, d.object_id))
                 d.left_for_user, d.blank = left.get((d.frame_session, d.object_id), ((), None))[:2]
             pinned = {(d.frame_session, d.object_id) for d in documents}
             hosted_origins = {d.origin for d in documents if d.origin != merchant}
-            cardless = sum(1 for key, (rows, blank, where) in left.items() if key not in pinned
+            cardless = sum(1 for key, (rows, blank, where) in left.items() if key not in pinned and rows
                            and where in hosted_origins and (blank is None or any(n in blank for n in rows)))
             if await self._payment_tree(sid, child_sessions) != tree:
                 raise PaymentPolicyError("Payment page changed during inspection")
@@ -903,15 +899,17 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             )
             rows = _bounded_description(raw) if unreviewed else raw
             merchant_doc = frame_origin == merchant
-            classified = _classified(rows)  # a reading that is no list raises here, as it always did
-            controls = _card_of(classified, merchant_doc)
+            classified = _results._classified(rows)  # a reading that is no list raises here, as it always did
+            controls = _results._card_of(classified, merchant_doc)
             # dlz (D-0358 a, 11-18): what the fill will not write here, as counts (inspection summary, result).
-            stats = found.setdefault("stats", dict.fromkeys(_SUMMARY_COUNTS, 0))
+            stats = found.setdefault("stats", dict.fromkeys(_results._SUMMARY_COUNTS, 0))
             stats["frames_inspected"] += 1
             stats["inputs_unrecognised"] += sum(c is None for _r, c in classified)
             # A hosted frame with fields and no card field is left for the user whole (Payrails' holder frame).
-            left = _left_for_user(classified, controls, merchant_doc) if controls or not merchant_doc else ()
-            if left:
+            left = _results._left_for_user(classified, controls, merchant_doc) if controls or not merchant_doc else ()
+            # The blank state is also read for a holder or postcode field the fill may not write (one the card has no
+            # value for): a holder already typed is not one Hermes left empty.
+            if left or any(c.token in OPTIONAL_CARD_TOKENS for c in controls):
                 found.setdefault("left", {})[(fsid, obj)] = (left, await self._blanks(fsid, obj), frame_origin)
             if classified and not controls and not merchant_doc:
                 stats["frames_cardless"] += 1
@@ -929,11 +927,19 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 found["free"].append(fid)
         return unreviewed_frames
 
+    async def _refresh_blanks(self, i: PaymentInspection) -> None:
+        """dlz (D-0358 a): after a fill that kept every value, read again which of each document's fields the fill
+        leaves hold no value: what a page script or the user put there (or took out) since the inspection counts,
+        not the inspection's reading. Unreadable: unknown, every such field counts as empty."""
+        for d in i.documents:
+            if d.left_for_user or any(c.token in OPTIONAL_CARD_TOKENS for c in d.controls):
+                d.blank = await self._blanks(d.frame_session, d.object_id)
+
     async def _blanks(self, fsid: str, obj: str) -> frozenset | None:
         """dlz (D-0358 a): the exposed fields of a pinned document that hold no value (indexes only; a field the user
         already typed into is not one Hermes left empty), or None when the document cannot say."""
         try:
-            return _blank_indexes(_value(await self._cdp("Runtime.callFunctionOn", {
+            return _results._blank_indexes(_value(await self._cdp("Runtime.callFunctionOn", {
                 "objectId": obj, "functionDeclaration": "function(){return this.blanks()}", "returnByValue": True},
                 session_id=fsid)), _DISCOVERY_LIMITS["inputs"])
         except Exception:  # health: allow BLE001 -- unknown: every such field counts as empty (reported, not hidden)
@@ -951,7 +957,7 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         inspection.witnesses = tuple(witnesses)
         inspection.page_match = _page_match(pins, cart[0])
         if inspection.page_match[0] == "ambiguous":
-            why = _page_match_reasons(pins, cart[0])
+            why = _results._page_match_reasons(pins, cart[0])
             logger.info("card fill page check ambiguous: %s; labelled amounts %d (other %d), stated total seen %d "
                         "time(s), %d document(s)", ",".join(why["reasons"]) or "-", why["labelled"], why["other"],
                         why["stated"], why["documents"])
@@ -1368,6 +1374,8 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             after = await self._shown_documents(i)
             result = _retention_result([(f, a if d.frame_id in before and d.frame_id in after else None)
                                         for d, f, a in answers])
+            if result.get("success"):
+                await self._refresh_blanks(i)
             if await self._top_navigated(i):
                 result["navigated_after_fill"] = True
             return _repins(result, state)

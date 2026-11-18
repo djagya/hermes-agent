@@ -49,6 +49,7 @@ import json
 from typing import Any
 
 from agent.vault_login_classifier import LoginControl, classify_checkout_control
+from tools.browser_supervisor_payment_results import shipping_field
 
 # The closure's own bound (MAX_REPINS in browser_supervisor_payment_closure); also bounds the answers per document.
 MAX_REPINS = 3
@@ -157,10 +158,11 @@ def repin_pins(controls: tuple, fill_tokens: list, answer: Any, written: list, n
             return None, "unreadable"
         previous = row["index"]
     rows = {row["index"]: LoginControl.from_dict(row) for row in fields}
-    # dlz (D-0359 a): the billing postcode is a card field here only when the inspection made it one.
+    # dlz (D-0359 a): the billing postcode is a card field here only when the inspection made it one (one the
+    # inspection dropped, two documents, stays out; a shipping one never is), the inspection's own rule (``_card_of``).
     postal = any(c.token == "postal-code" for c in controls)
     found = [c for r in rows.values() if (c := classify_checkout_control(r))
-             and (c.token.startswith("cc-") or (postal and c.token == "postal-code"))]
+             and (c.token.startswith("cc-") or (postal and c.token == "postal-code" and not shipping_field(c.control)))]
     tokens = [c.token for c in found]
     if len(tokens) != len(set(tokens)):
         return None, "token_twice"

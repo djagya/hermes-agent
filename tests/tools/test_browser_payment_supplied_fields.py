@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools import browser_supervisor_payment as sp
+from tools import browser_supervisor_payment_results as rs
 from tools import browser_vault_payment as bvp
 from tools.browser_supervisor_payment import PaymentDocument, PaymentInspection
 
@@ -32,10 +33,10 @@ _NAME, _ZIP = _row(3, "holder", "Name on card"), _row(4, "zip", "Postal code")
 
 
 def _inspection(rows, blank=None):
-    classified = sp._classified(rows)
-    controls = sp._card_of(classified, True)
+    classified = rs._classified(rows)
+    controls = rs._card_of(classified, True)
     document = PaymentDocument("f", "s", "o", MERCHANT, controls,
-                               left_for_user=sp._left_for_user(classified, controls, True), blank=blank)
+                               left_for_user=rs._left_for_user(classified, controls, True), blank=blank)
     return PaymentInspection("op", "page", "target", MERCHANT, (document,), (), 1e12)
 
 
@@ -43,7 +44,8 @@ class Flow:
     """One card fill over fakes: what the owner's card showed, what was written, what the card read and the window saw."""
 
     def __init__(self, monkeypatch, rows=None, card=None):
-        self.inspection = _inspection(rows or _FORM + [_NAME, _ZIP])
+        rows = rows or _FORM + [_NAME, _ZIP]
+        self.inspection = _inspection(rows, blank=frozenset(r["index"] for r in rows))  # an empty form
         self.card, self.reads, self.written, self.prompts, self.windows = dict(CARD, **(card or {})), 0, [], [], []
         flow = self
 
