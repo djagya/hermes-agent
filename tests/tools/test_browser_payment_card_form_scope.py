@@ -39,6 +39,20 @@ def test_a_formless_checkout_counts_its_formless_fields_as_the_card_form():
     assert _report(_document(rows), CARD)["form_complete"] is False
 
 
+@pytest.mark.parametrize("name,label,kind", [("q", "Search", "text"), ("s", "", "search"), ("coupon", "Coupon code", "text"),
+                                             ("giftCard", "Gift card", "text"), ("nl", "Newsletter e-mail", "email"),
+                                             ("gutschein", "Gutscheincode", "text")])
+def test_formless_page_chrome_is_not_left_for_the_user(name, label, kind):
+    """Owner direction ("make it all work"): with no <form> around the card, an empty search, coupon, gift-card or
+    newsletter box beside it is page chrome, not checkout: it does not hold Pay. A real empty field still does."""
+    chrome = dict(_row(3, name, label, form=None), type=kind)
+    document = _document([*_FORMLESS, chrome], blank=frozenset({3}))
+    assert document.left_for_user == ()
+    assert _report(document, CARD) == {"form_complete": True}
+    real = _document([*_FORMLESS, chrome, _row(4, "lastName", "Last name", form=None)], blank=frozenset({3, 4}))
+    assert real.left_for_user == (4,)
+
+
 def test_a_formless_billing_postcode_joins_formless_card_fields_but_not_a_form_beside_them():
     assert [c.token for c in sp._card_controls([*_FORMLESS, _row(3, "zip", "Billing ZIP", form=None)], True)][-1] \
         == "postal-code"

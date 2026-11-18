@@ -84,8 +84,24 @@ def _left_for_user(classified: list, card: tuple, merchant_doc: bool) -> tuple:
             form = _as_form(row.get("formIndex"))
             if not (form in forms if form is not None else formless):
                 continue
+            if form is None and _page_chrome(row):
+                continue
         out.append(index)
     return tuple(out)
+
+
+# A formless field that is page chrome, not checkout: a search box, a coupon/voucher/gift-card or newsletter box.
+# Without a <form> around the card these sit in the same scope; counting them would hold Pay on every such page.
+_CHROME = re.compile(r"\b(?:search\w*|query|q|suche\w*|recherche\w*|buscar|cerca|zoeken|coupon\w*|promo\w*|voucher\w*|"
+                     r"gutschein\w*|rabatt\w*|discount\w*|gift\w*|geschenk\w*|newsletter\w*)\b")
+
+
+def _page_chrome(row: dict) -> bool:
+    if str(row.get("type") or "").lower() == "search":
+        return True
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", f"{row.get('name') or ''} {row.get('label') or ''}")
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
+    return bool(_CHROME.search(re.sub(r"[^a-z0-9]+", " ", text)))
 
 
 def _one_postcode(candidates: list) -> list:
