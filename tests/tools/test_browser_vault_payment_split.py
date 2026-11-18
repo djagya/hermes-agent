@@ -280,6 +280,153 @@ def test_localized_and_provider_labels(control, token):
     assert (c.token if c else None) == token
 
 
+# Unzer UI v1's hosted holder input as the inspection closure describes it (name + " " + id, the placeholder as the
+# only label text; the parent page's "Karteninhaber" label is outside the frame). It was classified None, so the
+# fill left the holder frame out and did not list it as skipped.
+_UNZER_HOLDER = {"index": 0, "autocomplete": "off", "name": " card-holder", "label": "  Max Mustermann",
+                 "type": "text", "formIndex": None, "maxLength": 60}
+
+
+@pytest.mark.parametrize("control, token", [
+    (_UNZER_HOLDER, "cc-name"),
+    ({"name": "card_holder"}, "cc-name"), ({"label": "Card Holder Name"}, "cc-name"), ({"name": "cardholder"}, "cc-name"),
+    ({"name": "cardHolder"}, "cc-name"), ({"label": "Karteninhaber"}, "cc-name"),
+    # Generic contact names, an e-mail and login inputs stay out, separated spelling or not.
+    ({"name": "customer-name"}, None), ({"label": "Full name"}, None), ({"label": "First name"}, None),
+    ({"label": "Last name"}, None), ({"name": "CARDHOLDER_EMAIL"}, None), ({"label": "card holder email"}, None),
+    ({"name": "card-holder", "type": "email"}, None), ({"name": "username"}, None),
+    ({"name": "password", "type": "password"}, None),
+    ({"name": "card-holder", "type": "password"}, None),  # a masked input is only ever the CVC
+    ({"name": "card-holder", "type": "select"}, None),  # a select is never the holder
+])
+def test_a_separated_card_holder_name_is_the_holder(control, token):
+    c = classify_checkout_control(LoginControl.from_dict({"index": 0, "autocomplete": "off", "type": "text", **control}))
+    assert (c.token if c else None) == token
+
+
+_UNZER = "https://payment.unzer.com"
+
+
+def _unzer_frames(holder=_UNZER_HOLDER, extra=()):
+    """Four Unzer UI v1 cardframe documents, one input each, as raw inspection rows; ``extra``: more holder rows."""
+    rows = {"number": [{**_UNZER_HOLDER, "name": " card-number", "label": " ", "maxLength": 23}],
+            "expiry": [{**_UNZER_HOLDER, "name": " card-expiry-date", "label": "  MM / YY", "maxLength": 7}],
+            "cvc": [{**_UNZER_HOLDER, "name": " card-ccv", "label": " ", "maxLength": 4}],
+            "holder": [holder, *({**holder, "index": n} for n, _ in enumerate(extra, 1))]}
+    return rows
+
+
+def _unzer_candidates(frames, origins=None):
+    origins = origins or {}
+    return [(f"f-{k}", f"s-{k}", f"o-{k}", origins.get(k, _UNZER), sp._card_controls(sp._bounded_description(raw)))
+            for k, raw in frames.items()]
+
+
+class _PerFrameSupervisor(_FakeSupervisor):
+    """_FakeSupervisor keyed by frame, not origin: every Unzer UI v1 document is on the same origin."""
+
+    async def _commit_payment_document(self, d, fills, deadline_ms=None, strict=False, paced=None, **_kw):
+        self.by_frame = {**getattr(self, "by_frame", {}), d.frame_id: fills}
+        return await super()._commit_payment_document(d, fills, deadline_ms, strict, paced, **_kw)
+
+    async def _payment_retention(self, i, d):
+        answer = [{"token": f.get("token", ""), "state": self.retained.get(f.get("token"), "held"),
+                   "length": 0 if self.retained.get(f.get("token")) == "empty" else len(f["value"])}
+                  for f in self.by_frame[d.frame_id]]
+        self.checked = getattr(self, "checked", []) + [a["token"] for a in answer]
+        return answer
+
+
+def test_four_unzer_frames_plan_the_holder_once_and_check_that_it_held():
+    docs = _card_documents(_unzer_candidates(_unzer_frames()), MERCHANT)
+    inspection = _inspection(*docs)
+    assert [[c.token for c in d.controls] for d in docs] == [["cc-number"], ["cc-exp"], ["cc-csc"], ["cc-name"]]
+    assert inspection.prompt()["fields"] == ["cc-csc", "cc-exp", "cc-name", "cc-number"]
+
+    from tools import browser_vault_payment as bvp
+
+    fills = bvp._document_fills(inspection, CARD)
+    holder = [f for f in fills if f["token"] == "cc-name"]
+    assert holder == [{"index": 0, "token": "cc-name", "value": "Ada Lovelace", "document": 3}]
+    assert sorted(f["token"] for f in fills) == ["cc-csc", "cc-exp", "cc-name", "cc-number"]
+
+    sup = _PerFrameSupervisor([{"success": True, "filled_fields": 1}] * 4)
+    assert asyncio.run(sup._commit_payment(inspection, fills)) == {"success": True, "filled_fields": 4,
+                                                                    "retention_verified": True}
+    assert sorted(sup.checked) == ["cc-csc", "cc-exp", "cc-name", "cc-number"]  # the holder's retention was read
+    assert [fill["token"] for _o, w in sup.writes for fill in w].count("cc-name") == 1
+
+    # A holder the provider cleared after settling fails the fill like any other field.
+    sup = _PerFrameSupervisor([{"success": True, "filled_fields": 1}] * 4, retained={"cc-name": "empty"})
+    out = asyncio.run(sup._commit_payment(_inspection(*_card_documents(_unzer_candidates(_unzer_frames()), MERCHANT)),
+                                          fills))
+    assert out["error_type"] == "payment_fields_not_retained" and out["field_retention"]["cc-name"] == "empty"
+
+
+@pytest.mark.parametrize("frames, origins, message", [
+    # two holder inputs in the holder frame
+    (_unzer_frames(extra=[1]), None, "Incomplete or ambiguous card fields"),
+    # the holder in a frame from another hosted origin
+    (_unzer_frames(), {"holder": "https://other-psp.example"}, "split across payment providers"),
+    # a second holder on the merchant page: five documents, over Unzer UI v1's four
+    ({**_unzer_frames(), "page": [_UNZER_HOLDER]}, {"page": MERCHANT}, "Missing, ambiguous or split"),
+])
+def test_an_ambiguous_or_foreign_unzer_holder_is_refused(frames, origins, message):
+    with pytest.raises(PaymentPolicyError, match=message):
+        _card_documents(_unzer_candidates(frames, origins), MERCHANT)
+
+
+def _fill_unzer(monkeypatch, card):
+    from tools import browser_vault_payment as bvp
+
+    inspection = _inspection(*_card_documents(_unzer_candidates(_unzer_frames()), MERCHANT))
+    committed = []
+
+    class Supervisor:
+        def inspect_payment(self, *a, **k):
+            return inspection
+
+        def payment_is_current(self, i):
+            return True
+
+        def commit_payment(self, i, fills, strict=False):
+            committed.extend(fills)
+            return asyncio.run(_PerFrameSupervisor([{"success": True, "filled_fields": 1}] * 4)._commit_payment(i, fills))
+
+        def discard_payment(self, i):
+            pass
+
+    monkeypatch.setattr("tools.browser_vault_tool._ensure_supervisor", lambda task_id: Supervisor())
+    monkeypatch.setattr("tools.browser_vault_tool._bot_desktop_browser_session", lambda task_id: False)
+    monkeypatch.setattr("tools.browser_payment_privacy.mark_payment_session", lambda task_id, surface=None: None)
+    monkeypatch.setattr("tools.approval_prompt.request_elicitation_consent", lambda *args, **k: "accept")
+    from agent import vault_payment_policy as policy
+
+    unzer = next(p for p in policy.OPT_IN_PROVIDERS if p.name == "unzer-ui-v1")
+    monkeypatch.setattr(policy, "enabled_providers", lambda: policy.DEFAULT_PROVIDERS + (unzer,))
+    meta = SimpleNamespace(id="h", kind="payment", label="Card", allowed_origins=(), origin=None,
+                           payment_scope="confirmed_page", payment_frame_origins=())
+    backend = SimpleNamespace(name="local", resolve_secret=lambda handle: dict(card), get_meta=lambda handle: meta)
+    return json.loads(bvp.fill_payment(backend, meta, "task")), committed
+
+
+def test_the_unzer_fill_reports_the_holder_it_wrote(monkeypatch):
+    out, committed = _fill_unzer(monkeypatch, CARD)
+    assert out["success"] and out["retention_verified"] and out["filled_fields"] == 4, out
+    assert out["fields"] == ["cc-csc", "cc-exp", "cc-name", "cc-number"] and out["skipped_optional"] == []
+    assert [(f["document"], f["token"]) for f in committed if f["token"] == "cc-name"] == [(3, "cc-name")]
+
+
+def test_an_unzer_holder_the_saved_card_has_no_name_for_is_reported_skipped(monkeypatch):
+    """The holder input was found but the card has no holder name: the other fields are filled and the result says
+    the holder was not (the provider may still require it), instead of omitting it as an unrecognised frame did."""
+    card = {k: v for k, v in CARD.items() if k != "cardholder_name"}
+    out, committed = _fill_unzer(monkeypatch, card)
+    assert out["success"] and out["filled_fields"] == 3, out
+    assert out["fields"] == ["cc-csc", "cc-exp", "cc-number"] and out["skipped_optional"] == ["cc-name"]
+    assert sorted(f["document"] for f in committed) == [0, 1, 2]  # the holder document is not written
+
+
 def test_expiry_fits_the_field_length():
     from agent.vault_login_classifier import select_checkout_fills
     from agent.vault_store import PAYMENT_FIELDS
