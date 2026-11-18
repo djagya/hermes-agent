@@ -44,9 +44,24 @@ _INSPECT_TEMPLATE = r"""(() => {
   const isSelect = e => e.tagName === 'SELECT';
   // A select's options (months, years: never a secret) are part of the description, so a list that
   // is re-populated after consent fails valid() like any other changed field.
+  // The text of the elements aria-labelledby names (in the field's own root first, as the login inspection reads
+  // it), each capped; metadata only, never a value.
+  const labelledBy = e => {
+    try {
+      const ids = String(e.getAttribute('aria-labelledby')||'').split(/\s+/).filter(Boolean).slice(0, 8);
+      if (!ids.length) return '';
+      const root = typeof e.getRootNode === 'function' ? e.getRootNode() : null;
+      return ids.map(id => {
+        const n = (root && typeof root.getElementById === 'function' ? root.getElementById(id) : null) ||
+          (typeof doc.getElementById === 'function' ? doc.getElementById(id) : null);
+        return n ? String(n.textContent||'').slice(0, 200) : '';
+      }).join(' ');
+    } catch (_) { return ''; }
+  };
   const describeOne = (e,index) => ({index, autocomplete:cut(e.autocomplete),
     name:cut(e.name+' '+e.id), label:cut((e.labels?Array.from(e.labels,l=>l.textContent).join(' '):'')+' '+
-      (e.getAttribute('aria-label')||'')+' '+(e.placeholder||'')),
+      (e.getAttribute('aria-label')||'')+' '+labelledBy(e)+' '+(e.placeholder||'')+' '+
+      String(e.getAttribute('title')||'').slice(0, 200)),
     type:isSelect(e)?(e.multiple?'select-multiple':'select'):e.type,
     formIndex:e.form?Array.from(doc.forms).indexOf(e.form):null,
     maxLength:e.maxLength>0?e.maxLength:null,
