@@ -45,6 +45,7 @@ _TIMEOUT = 30.0
 LIST_CACHE_TTL_S = 60.0
 _list_cache_lock = threading.Lock()
 _list_cache: dict[tuple, tuple[float, list]] = {}
+_skipped_cache: dict[tuple, tuple] = {}  # same keys: items the listing skipped (title + reason)
 
 # Lower-cased ``op`` stderr fragments -> typed failure. Checked in this order.
 _RATE_MARKERS = ("rate limit", "too many requests", "daily limit", "request limit", "quota")
@@ -61,6 +62,7 @@ _NETWORK_MARKERS = ("dial tcp", "no such host", "connection refused", "connectio
 def clear_list_cache() -> None:
     with _list_cache_lock:
         _list_cache.clear()
+        _skipped_cache.clear()
 
 
 class OnePasswordLoginBackend(LoginBackend):
@@ -174,13 +176,20 @@ class OnePasswordLoginBackend(LoginBackend):
                 if meta.kind == "login":
                     vault_id, item_id = _split_handle(meta.id, self.prefix)
                     self._item_vaults[item_id] = vault_id or ""
+            with _list_cache_lock:
+                self.skipped = _skipped_cache.get(key, ())
             return list(hit[1])
         items = self._list_items_uncached()
         with _list_cache_lock:
             if len(_list_cache) > 32:
                 _list_cache.clear()
+                _skipped_cache.clear()
             _list_cache[key] = (now, list(items))
+            _skipped_cache[key] = tuple(self.skipped)
         return items
+
+    def invalidate_listing(self) -> None:
+        clear_list_cache()
 
     def _list_items_uncached(self) -> list[VaultItemMeta]:
         args = ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]
@@ -189,6 +198,7 @@ class OnePasswordLoginBackend(LoginBackend):
             args += ["--vault", configured_vault]
         raw = json.loads(self._run(*args) or "[]")
         out: list[VaultItemMeta] = []
+        skipped: list[dict] = []
         self._item_vaults = {}
         for item in raw if isinstance(raw, list) else []:
             if item.get("category") == "CREDIT_CARD":
@@ -207,6 +217,8 @@ class OnePasswordLoginBackend(LoginBackend):
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origins = _all_origins(urls)
             if not origins:
+                if urls:  # a website the fill cannot bind (unparseable): say so instead of hiding it
+                    skipped.append({"title": str(item.get("title") or "")[:120], "reason": "website_unreadable"})
                 continue
             item_id = str(item.get("id") or "").strip()
             if not item_id:
@@ -221,6 +233,7 @@ class OnePasswordLoginBackend(LoginBackend):
                 origin=origins[0], created_at=str(item.get("created_at") or ""),
                 identifier_type="username" if username else None, identifier=username,
                 allowed_origins=_web_origins(origins)))
+        self.skipped = tuple(skipped[:50])
         return out
 
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
@@ -259,6 +272,31 @@ class OnePasswordLoginBackend(LoginBackend):
         except ValueError:
             raise BackendError(self.display_name, "op item get returned no JSON item") from None
         return _login_password(item, self.display_name)
+
+    def resolve_recovery_codes(self, handle: str, field: str) -> list[str]:
+        """D-0365: the codes in the Login item's field (or section) named ``field``; [] when none match;
+        ``RecoveryFieldNotCodes`` when the match is the password / username / TOTP field or has no code wording."""
+        from agent.vault_recovery_codes import pick_code_values
+
+        vault_id, item_id = self._resolve_handle(handle)
+        args = ["item", "get", item_id]
+        if vault_id:
+            args += ["--vault", vault_id]
+        try:
+            item = json.loads(self._run(*args, "--format", "json", "--reveal"))
+        except ValueError:
+            raise BackendError(self.display_name, "op item get returned no JSON item") from None
+        fields = item.get("fields") if isinstance(item, dict) else None
+        entries = []
+        for f in fields if isinstance(fields, list) else []:
+            if not isinstance(f, dict) or not isinstance(f.get("value"), str):
+                continue
+            section = f.get("section") if isinstance(f.get("section"), dict) else {}
+            # The login's own password, username and TOTP field are never codes, whatever their label says.
+            protected = (str(f.get("purpose") or "").upper() in ("PASSWORD", "USERNAME")
+                         or str(f.get("type") or "").upper() == "OTP" or str(f.get("id") or "") == "password")
+            entries.append((str(f.get("label") or ""), str(section.get("label") or ""), f["value"], protected))
+        return pick_code_values(field, entries)
 
     def resolve_secret(self, handle: str) -> dict[str, str]:
         """Reveal a single card only inside the trusted native filler, never in tool output."""
@@ -387,6 +425,9 @@ def _all_origins(urls: list[str]) -> list[str]:
     """
     out: list[str] = []
     for u in urls:
+        u = u.strip()
+        if u and "://" not in u:
+            u = "https://" + u  # dlz (11-18): "pypi.org" is read as https://pypi.org, as 1Password itself does
         try:
             origin = normalize_origin(u)
         except Exception:

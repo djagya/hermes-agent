@@ -105,6 +105,21 @@ class LoginBackend(ABC):
     def resolve_password(self, handle: str) -> str:
         """Server-side only; raises ``UnlockRequired`` when locked."""
 
+    # Items the last listing could not offer (title + fixed reason, never a value), e.g. a website saved
+    # without a scheme. Reported by ``browser_vault list``.
+    skipped: tuple = ()
+
+    def invalidate_listing(self) -> None:
+        """Drop any cached listing so the next ``get_meta``/``list_items`` reads the manager again (a fill whose
+        handle missed the cache retries once). No-op for backends without a cache."""
+
+    def resolve_recovery_codes(self, handle: str, field: str) -> list[str]:
+        """D-0365: the recovery/backup codes stored on a login item in the field labelled ``field``, in stored
+        order. Server-side only. A backend that cannot store them returns []. A field that matches but is the
+        login's password / identifier / TOTP field, or carries no recovery-code wording, raises
+        ``agent.vault_recovery_codes.RecoveryFieldNotCodes`` (use ``pick_code_values``)."""
+        return []
+
     def resolve_otp(self, handle: str) -> Optional[str]:
         """Current one-time code for a login that stores a TOTP seed, else None (the user is asked).
         Server-side only, like resolve_password."""

@@ -189,7 +189,8 @@ _RE_EXCLUDED_PASSWORD = re.compile(
 _RE_EXCLUDED_PASSWORD_SQUASHED = re.compile(
     r"(?:new|confirm|create|repeat|retype|reenter|verify)pass|pass(?:word)?(?:confirm|repeat|again|retype|verify)")
 _RE_EMAIL = re.compile(r"\b(?:e[\s-]?mail|email address)\b")
-_RE_TEL = re.compile(r"\b(?:phone|telephone|mobile)\b")
+# "mobile" alone is a layout word (mobile-search, mobile menu): a phone field only next to number/phone.
+_RE_TEL = re.compile(r"\b(?:phone|telephone)\b|\bmobile\s*(?:number|no|phone|tel)\b|\b(?:number|phone)\s*mobile\b")
 _RE_USERNAME = re.compile(
     r"\b(?:user\s*name|username|login|account|member|membership|mileageplus)\b"
 )
@@ -241,6 +242,14 @@ class LoginControl:
     # from the field's own name/label/placeholder. It may classify a field whose own text is silent and names no
     # other purpose, never override or promote one whose own evidence says otherwise (classify_checkout_control).
     hint: str = ""
+    # Field choice (select_password_fill_detailed): the element at the field's centre is the field (or its label);
+    # None = not measurable (off screen, older inspection). ``modal``: inside an open <dialog>, an aria-modal
+    # container or the URL's :target. ``readonly``: a readonly-until-focus password (listed since 11-18).
+    # ``search``: a search box (type=search, inside role=search, or named q/search/query): never a login field.
+    topmost: Optional[bool] = None
+    modal: Optional[bool] = None
+    readonly: bool = False
+    search: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
@@ -261,6 +270,10 @@ class LoginControl:
             context=_bounded_context(raw.get("context")),
             visible=raw.get("visible") if isinstance(raw.get("visible"), bool) else None,
             hint=str(raw.get("hint") or ""),
+            topmost=raw.get("topmost") if isinstance(raw.get("topmost"), bool) else None,
+            modal=raw.get("modal") if isinstance(raw.get("modal"), bool) else None,
+            readonly=raw.get("readonly") is True,
+            search=raw.get("search") is True,
         )
 
 
@@ -292,6 +305,8 @@ def _excluded_password(control: LoginControl) -> bool:
 
 def classify_login_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
     """Classify one control, or return None if it is not a login fill target."""
+    if control.search:
+        return None  # a search box is never an identifier, whatever its autocomplete or name says
     autocomplete_tokens = [
         t for t in control.autocomplete.lower().split() if t
     ]
@@ -322,10 +337,54 @@ def classify_login_control(control: LoginControl) -> Optional[ClassifiedLoginCon
     return None
 
 
+# D-0361 (owner, 2026-11-18): a re-auth step that names its only password "confirm password" (PyPI's step-up
+# dialog, ``confirm_password``) asks for the CURRENT password. Only confirm / verify / re-enter wording; a
+# new/create/repeat field, or any field with a partner password in its form, stays excluded.
+_RE_LONE_CONFIRM = re.compile(r"\b(?:confirm\w*|verify|re ?enter)\s*(?:your\s+)?password\b"
+                              r"|\bpassword\s*(?:confirm\w*|verify\w*)\b")
+_RE_NOT_LONE_CONFIRM = re.compile(r"\b(?:new|create|repeat|again|choose|set)\b")
+LONE_CONFIRM_SCORE = 80  # below an explicit current-password (100) and a plain password (90)
+
+
+def _lone_confirm(control: LoginControl, controls: list[LoginControl]) -> bool:
+    if control.type != "password" or control.search:
+        return False
+    if {"new-password", "one-time-code"} & set(control.autocomplete.lower().split()):
+        return False
+    text = _camel_text(control)
+    if not _RE_LONE_CONFIRM.search(text) or _RE_NOT_LONE_CONFIRM.search(text):
+        return False
+    return not any(o is not control and o.type == "password" and o.form_index == control.form_index
+                   for o in controls)
+
+
+def classify_login_controls(controls: list[LoginControl]) -> list[ClassifiedLoginControl]:
+    """:func:`classify_login_control` per control, plus D-0361: a lone confirm/verify/re-enter password (the
+    only password in its form, no new-password partner) is a current-password target at ``LONE_CONFIRM_SCORE``."""
+    out: list[ClassifiedLoginControl] = []
+    for c in controls:
+        result = classify_login_control(c)
+        if result is None and _lone_confirm(c, controls):
+            result = ClassifiedLoginControl(c, LONE_CONFIRM_SCORE, "current-password")
+        if result is not None:
+            out.append(result)
+    return out
+
+
 _RE_OTP = re.compile(
     r"\b(?:one[\s-]?time|verification|security|auth(?:entication|enticator)?|2fa|two[\s-]?factor|mfa|totp|otp|"
     r"passcode|sms)\b.*\b(?:code|pin|token)\b|\b(?:otp|totp|2fa|mfa|verification\s*code|passcode)\b"
+    # German, French, Dutch, Spanish and Italian code words, after _normalize_text (accents folded, "ä" -> "a";
+    # field names also spell it "ae").
+    r"|\b(?:best(?:a|ae)tigungs?code|verifizierungs?code|sicherheitscode|einmal(?:kennwort|passwort|code)|tan|"
+    r"code\s*de\s*(?:verification|confirmation)|verificatiecode|bevestigingscode|"
+    r"codigo\s*de\s*verificacion|codice\s*di\s*verifica)\b"
 )
+# Recovery / backup codes (D-0365): typed only by enter_code with code_source=recovery.
+_RE_RECOVERY_CODE = re.compile(r"\b(?:recovery|backup)\s*(?:code|key)s?\b|\brecovery\s*code\s*value\b")
+# A field that looks like it takes a code (counted, never classified): code words in its own text, or a short
+# text/tel/number box.
+_RE_CODEISH = re.compile(r"\b(?:code|codes|otp|pin|token|digit|tan|codigo|codice)\b|code\b")
 
 
 # A bare "code" field (Google/Microsoft email-verification pages: ``<input type=tel name=code
@@ -410,6 +469,30 @@ def classify_otp_controls_detailed(controls: list[LoginControl]) -> tuple[list[C
     return [], ""
 
 
+def count_codeish_controls(controls: list[LoginControl]) -> int:
+    """How many listed inputs look like a code box (no classification, no values): code words in the field's
+    own text, or a text/tel/number input with a maxlength of 1-8. Feeds ``code_field_unrecognised``."""
+    n = 0
+    for c in controls:
+        if c.type not in ("text", "tel", "number", "password", "") or c.search:
+            continue
+        if _RE_NOT_OTP_CODE.search(_field_text(c)) or _RE_NOT_OTP_CODE.search(_normalize_text(c.context)):
+            continue  # a promo / gift / postal / order code is not an unrecognised one-time-code box
+        if _RE_CODEISH.search(_field_text(c)) or (c.type != "password" and c.max_length is not None
+                                                  and 1 <= c.max_length <= 8):
+            n += 1
+    return n
+
+
+def classify_recovery_code_controls(controls: list[LoginControl]) -> list[ClassifiedLoginControl]:
+    """D-0365: the field that takes a recovery/backup code ("Enter recovery code"), else the page's one-time-code
+    field (some sites take either in one box)."""
+    named = [ClassifiedLoginControl(c, 90, "recovery-code") for c in controls
+             if c.type in ("text", "tel", "number", "password", "") and not c.search
+             and _RE_RECOVERY_CODE.search(_field_text(c))]
+    return named or classify_otp_controls(controls)
+
+
 def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginControl]:
     """The controls that take a second-factor code. ``autocomplete=one-time-code`` is authoritative;
     otherwise a text/tel/number input whose name/label says code/OTP/2FA/verification. Some sites split
@@ -464,53 +547,162 @@ def _signup_forbidden(control: LoginControl) -> bool:
 _signup_intent_text = _camel_text
 
 
-def select_signup_targets(controls: list[LoginControl]) -> Optional[SignupTargets]:
-    """Conservative, separate signup intent: one explicit new password, optionally paired with ONE
-    explicitly labelled confirmation field (confirm/repeat/retype/re-enter/verify/again in its name,
-    id, label, aria text or placeholder). Two indistinguishable password inputs are never a pair.
+# Registration words (D-0362), matched on normalised route text (path, query, fragment of the page and the form
+# action), on the primary field's name/id, and on its form's rendered text: English, German, French, Dutch,
+# Spanish and Italian.
+_RE_REGISTER_WORDS = re.compile(
+    r"\b(?:register|registration|signup|sign up|join|create (?:an )?account|new account|create your account|"
+    r"registrieren|registrierung|konto erstellen|konto anlegen|neues konto|"
+    r"inscription|s inscrire|inscrire|creer (?:un )?compte|"
+    r"registreren|registratie|account aanmaken|"
+    r"registro|registrarse|registrate|crear (?:una )?cuenta|"
+    r"registrazione|registrati|crea (?:un )?account)\b")
+_RE_REGISTER_SQUASHED = re.compile(r"signup|register|registration|newaccount|createaccount|registrier|inscription")
+_RE_RECOVERY_ROUTE = re.compile(r"reset|recover|forgot|(?:change|edit|update)password|password(?:change|edit|update)")
+_RE_LOGIN_ROUTE = re.compile(r"\b(?:change|update|edit|security|settings|login|log in|signin|sign in)\b")
+# D-0364: a choose / set / reset-a-new-password page (emailed links, activations, invitations).
+_RE_RESET_ROUTE = re.compile(r"reset|recover|forgot|setpassword|newpassword|choosepassword|activat|invit|"
+                             r"passwor(?:t|d)(?:reset|neu)|wachtwoord|motdepasse|contrasena")
+_RE_RESET_LABEL = re.compile(
+    r"\b(?:new|choose|set|create)\s+(?:a\s+|your\s+)?password\b|\bneues\s+passwort\b|\bnouveau\s+mot\s+de\s+passe\b"
+    r"|\bnieuw\s+wachtwoord\b|\bnueva\s+contrasena\b|\bnuova\s+password\b|\bpassword\s+reset\b")
+# Old/current password wording: a change-password form, never a reset target (the old password is not ours to set).
+_RESET_OLD_RE = r"\b(?:old|current|existing|previous)\s*password\b|(?:old|current|existing)pass"
 
-    Require a registration route and a real form; refuse recovery/change routes, a third password,
-    OTP, mixed login forms and unrelated credential forms anywhere on the page.
-    This never relaxes the ordinary login classifier's exclusions.
-    """
+
+def _route_text(*urls: str) -> str:
     from urllib.parse import unquote, urlsplit
+
+    return " ".join(unquote(urlsplit(u).path + "?" + urlsplit(u).query + "#" + urlsplit(u).fragment)
+                    for u in urls if u)
+
+
+def select_signup_targets_detailed(controls: list[LoginControl],
+                                   purpose: str = "signup") -> tuple[Optional[SignupTargets], str]:
+    """``(targets, "")`` or ``(None, reason)``, a fixed reason code. ``purpose`` is ``signup`` or ``reset``.
+
+    One new password, optionally paired with ONE explicitly labelled confirmation field (confirm/repeat/
+    retype/re-enter/verify/again in its name, id, label, aria text or placeholder) in the same form (or both
+    outside any form, an SPA). Two indistinguishable password inputs are never a pair; a third password on the
+    page, a code field, a current-password autocomplete or a page posting to another origin refuse.
+
+    Signup (D-0362, widened 11-18): any autocomplete but current-password; registration evidence in the route
+    (several languages), the field's name or its form's text; recovery routes refuse (use purpose=reset), and
+    a login/settings route only without registration words in the route. Reset (D-0364): evidence of a
+    choose-a-new-password page (route, label or autocomplete=new-password); old/current-password fields refuse.
+    """
+    from urllib.parse import urlsplit
 
     passwords = [c for c in controls if c.type == "password" or
                  {"current-password", "new-password"}.intersection(c.autocomplete.lower().split())]
-    if len(passwords) not in (1, 2) or classify_otp_controls(controls):
-        return None
+    if not passwords:
+        return None, "no_password_field"
+    if len(passwords) > 2:
+        return None, "too_many_password_fields"
+    if classify_otp_controls(controls):
+        return None, "code_field_present"
     for c in passwords:
-        if (c.type != "password" or c.form_index is None or c.autocomplete.lower().split() != ["new-password"]
-                or c.rendered is not True or _signup_forbidden(c)):
-            return None
+        if c.type != "password":
+            return None, "field_not_password_type"
+        if c.rendered is not True:
+            return None, "field_not_rendered"
+        if "current-password" in c.autocomplete.lower().split():
+            return None, "field_is_current_password"
+        if purpose == "signup" and _signup_forbidden(c):
+            return None, "field_names_other_password_role"
+        if purpose == "reset" and (re.search(_RESET_OLD_RE, _camel_words(c.name + " " + c.label))
+                                   or re.search(_RESET_OLD_RE, _camel_words(c.name).replace(" ", ""))):
+            return None, "field_is_old_password"
     confirms = [c for c in passwords if re.search(_SIGNUP_CONFIRM_RE, _signup_intent_text(c))]
     primaries = [c for c in passwords if c not in confirms]
     if len(primaries) != 1 or len(confirms) != len(passwords) - 1:
-        return None
+        return None, "password_pair_unclear"
     target, confirm = primaries[0], (confirms[0] if confirms else None)
     # Either DOM order: the roles are explicit (CSS may place the confirmation first in the markup).
     if confirm is not None and (confirm.form_index != target.form_index or
                                 (confirm.page_url, confirm.form_action) != (target.page_url, target.form_action)):
-        return None
-    page, action = urlsplit(target.page_url), urlsplit(target.form_action)
-    if (page.scheme != "https" or not page.netloc or
-            (page.scheme, page.netloc) != (action.scheme, action.netloc)):
-        return None
-    routes = " ".join(unquote(urlsplit(u).path + "?" + urlsplit(u).query + "#" + urlsplit(u).fragment)
-                      for u in (target.page_url, target.form_action))
-    route_words = _normalize_text(routes)
-    if (re.search(r"reset|recover|forgot|(?:change|edit|update)password|password(?:change|edit|update)",
-                  route_words.replace(" ", "")) or
-            re.search(r"\b(?:change|update|edit|security|settings|login|log in|signin|sign in)\b", route_words)):
-        return None
-    page_path = _normalize_text(unquote(page.path))
-    if not re.search(r"\b(?:register|registration|signup|sign up|create account)\b", page_path):
-        return None
-    # Other visible login/identifier controls must belong to the target's form.
-    for control in controls:
-        if classify_login_control(control) is not None and control.form_index != target.form_index:
-            return None
-    return SignupTargets(target, confirm)
+        return None, "confirm_in_other_form"
+    page = urlsplit(target.page_url)
+    action = urlsplit(target.form_action) if target.form_action else page
+    if page.scheme != "https" or not page.netloc:
+        return None, "page_not_https"
+    if (page.scheme, page.netloc) != (action.scheme, action.netloc):
+        return None, "form_posts_elsewhere"
+    route_words = _normalize_text(_route_text(target.page_url, target.form_action))
+    squashed = route_words.replace(" ", "")
+    if purpose == "reset":
+        if not (_RE_RESET_ROUTE.search(squashed) or _RE_RESET_LABEL.search(_camel_words(target.label + " " + target.name))
+                or "new-password" in target.autocomplete.lower().split()):
+            return None, "no_reset_evidence"
+        return SignupTargets(target, confirm), ""
+    if _RE_RECOVERY_ROUTE.search(squashed):
+        return None, "recovery_route"
+    # A login/settings PATH refuses unless the path itself also names registration ("/login?next=/signup" is a
+    # login page); registration words in the query or fragment count only on a path that names no login.
+    path_words = _normalize_text(" ".join(urlsplit(u).path for u in (target.page_url, target.form_action) if u))
+    path_register = bool(_RE_REGISTER_WORDS.search(path_words) or _RE_REGISTER_SQUASHED.search(path_words.replace(" ", "")))
+    if _RE_LOGIN_ROUTE.search(path_words) and not path_register:
+        return None, "login_route"
+    route_register = bool(_RE_REGISTER_WORDS.search(route_words) or _RE_REGISTER_SQUASHED.search(squashed))
+    field_register = bool(_RE_REGISTER_SQUASHED.search(_camel_words(target.name).replace(" ", "")))
+    form_register = bool(_RE_REGISTER_WORDS.search(_normalize_text(target.context)))
+    if not (route_register or field_register or form_register):
+        return None, "no_registration_evidence"
+    return SignupTargets(target, confirm), ""
+
+
+def select_signup_targets(controls: list[LoginControl]) -> Optional[SignupTargets]:
+    """Signup targets or None; see :func:`select_signup_targets_detailed` (which also names the reason).
+    This never relaxes the ordinary login classifier's exclusions."""
+    return select_signup_targets_detailed(controls)[0]
+
+
+PASSWORD_FIELD_AMBIGUOUS = "password_field_ambiguous"
+PASSWORD_OUTSIDE_DIALOG = "password_outside_open_dialog"
+NO_PASSWORD_FIELD = "no_password_field"
+
+
+def _shown_rank(c: ClassifiedLoginControl) -> tuple:
+    """Lower is better: rendered + visible first, then the field that is on top at its centre (None, not
+    measurable, sits between a field on top and a covered one), then the classifier score."""
+    ctl = c.control
+    shown = 0 if (ctl.visible is True and ctl.rendered is True) else 1
+    top = {True: 0, None: 1, False: 2}[ctl.topmost]
+    return shown, top, -c.score
+
+
+def choose_password_control(classified: list[ClassifiedLoginControl],
+                            controls: Optional[list[LoginControl]] = None) -> tuple[Optional[ClassifiedLoginControl], str]:
+    """``(the current-password control to fill, "")`` or ``(None, reason)``.
+
+    An open dialog (``<dialog open>``, ``aria-modal``, the URL's ``:target``) that holds a password input is
+    what the user sees: only password fields inside it count (PyPI's step-up dialog over the change-password
+    form). A dialog without one (a newsletter box with an e-mail field) does not hide the page's login form.
+    Then rendered + visible + topmost fields win, then the score; among equal best candidates the first in the
+    DOM is filled (a header quick-login and the main form, as before 11-18). Equal best candidates in different
+    documents (frames, origins) are ``password_field_ambiguous``: nothing is written rather than a guess."""
+    passwords = [c for c in classified if c.token == "current-password"]
+    if not passwords:
+        return None, NO_PASSWORD_FIELD
+    pool = controls if controls is not None else [c.control for c in classified]
+    if any(c.modal is True and c.type == "password" for c in pool):
+        passwords = [c for c in passwords if c.control.modal is True]
+        if not passwords:
+            return None, PASSWORD_OUTSIDE_DIALOG
+    best = min(_shown_rank(c) for c in passwords)
+    tied = sorted((c for c in passwords if _shown_rank(c) == best), key=lambda c: c.control.index)
+    if len({c.control.page_url for c in tied}) > 1:
+        return None, PASSWORD_FIELD_AMBIGUOUS
+    return tied[0], ""
+
+
+def select_password_fill_detailed(classified: list[ClassifiedLoginControl], password: str,
+                                  controls: Optional[list[LoginControl]] = None) -> tuple[list[dict[str, Any]], str]:
+    """``(fills, reason)``: one current-password fill, or ``([], reason)`` (see :func:`choose_password_control`)."""
+    target, reason = choose_password_control(classified, controls)
+    if target is None or not password:
+        return [], reason or NO_PASSWORD_FIELD
+    return [{"index": target.control.index, "token": "current-password", "value": password}], ""
 
 
 def select_password_fill(
@@ -520,22 +712,12 @@ def select_password_fill(
     """Select the single best current-password control to fill.
 
     The vault fill path is password-only: the identifier is agent-visible
-    metadata and is typed by the agent via normal input tools. This picks
-    the highest-scoring ``current-password`` control (ties broken by DOM
-    order) and returns ``[{"index": int, "token": "current-password",
-    "value": password}]`` or ``[]`` when no password field exists.
+    metadata and is typed by the agent via normal input tools. Returns
+    ``[{"index": int, "token": "current-password", "value": password}]`` or
+    ``[]`` when no password field exists or the choice is ambiguous (see
+    :func:`select_password_fill_detailed` for the reason).
     """
-    passwords = [c for c in classified if c.token == "current-password"]
-    if not passwords or not password:
-        return []
-    best_password = min(passwords, key=lambda c: (-c.score, c.control.index))
-    return [
-        {
-            "index": best_password.control.index,
-            "token": "current-password",
-            "value": password,
-        }
-    ]
+    return select_password_fill_detailed(classified, password)[0]
 
 
 _SELECT_CARD_TOKENS = frozenset({"cc-exp-month", "cc-exp-year"})
@@ -843,19 +1025,25 @@ def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict
 INSPECTION_STAMP_ATTR = "data-hermes-vault-slot"
 
 
-def build_otp_fills(otp_controls: list[ClassifiedLoginControl], code: str) -> list[dict[str, Any]]:
+def build_otp_fills(otp_controls: list[ClassifiedLoginControl], code: str,
+                    listed: Optional[list[LoginControl]] = None) -> list[dict[str, Any]]:
     """One fill per box. Default: the single best-scoring code field takes the whole code.
 
     Per-digit entry only when the page unmistakably uses it: exactly len(code) OTP controls that are all
     ``maxlength=1``, all in the same form, and adjacent in DOM order (the classic N-box widget). Anything
     looser (several code-like inputs scattered over a page) gets ONE field, never a digit sprayed across
     unrelated inputs. A whole code is never written into a control whose ``maxlength`` is below the code
-    length: that returns no fills (refusal, nothing written)."""
+    length: that returns no fills (refusal, nothing written).
+
+    Adjacency is counted over ``listed`` (the inspection's listed inputs, in DOM order) when given: hidden helper
+    inputs between the boxes (GitHub's eight boxes) do not break the widget; a listed field in between does."""
     best = max(otp_controls, key=lambda c: c.score)
-    boxes = sorted((c for c in otp_controls if c.control.max_length == 1), key=lambda c: c.control.index)
+    position = ({c.index: i for i, c in enumerate(listed)} if listed is not None else None)
+    where = (lambda c: position.get(c.control.index, -10**6)) if position is not None else (lambda c: c.control.index)
+    boxes = sorted((c for c in otp_controls if c.control.max_length == 1), key=where)
     if (len(boxes) == len(code)
             and len({b.control.form_index for b in boxes}) == 1
-            and all(b.control.index - a.control.index == 1 for a, b in itertools.pairwise(boxes))):
+            and all(where(b) - where(a) == 1 for a, b in itertools.pairwise(boxes))):
         return [{"index": b.control.index, "token": "one-time-code", "value": ch, **({"strict": True} if b.strict else {})}
                 for b, ch in zip(boxes, code)]
     if best.control.max_length is not None and best.control.max_length < len(code):
@@ -889,7 +1077,7 @@ def build_inspection_js(nonce: str, bind: str = "") -> str:
     return (_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
             .replace("__REGISTRY__", json.dumps(registry_name(nonce) if bind else ""))
             .replace("__BIND__", json.dumps(bind)).replace("__REGISTER__", _REGISTER_JS)
-            .replace("__VISIBLE__", _VISIBLE_JS).replace("__RENDERED__", _RENDERED_JS))
+            .replace("__VISIBLE__", _VISIBLE_JS).replace("__RENDERED__", _RENDERED_JS).replace("__FRAME__", _FRAME_JS))
 
 
 # Strict geometry shared by inspection (``rendered``) and the signup writer: a real box of at least 2x2 px,
@@ -920,6 +1108,33 @@ _VISIBLE_JS = """((e) => {
     return e.isConnected !== false;
   })""".replace("__RENDERED__", _RENDERED_JS)
 
+# A same-origin child document (iframe/frame) the inspection, the login writer and the signup writer descend
+# into, or null (cross-origin, not loaded, or no access). Cross-origin frames are reported by
+# ``FRAME_PROBE_JS`` instead (``form_in_frame``).
+_FRAME_JS = """((e) => {
+    try {
+      if (e.tagName !== "IFRAME" && e.tagName !== "FRAME") return null;
+      const d = e.contentDocument;
+      return d && d.location && d.location.origin === window.location.origin ? d : null;
+    } catch (_) { return null; }
+  })"""
+
+# Non-secret probe: the origins of the page's child frames that the inspection could NOT enter (cross-origin),
+# deduplicated, at most 20. Read only when a fill found no field (``form_in_frame``).
+FRAME_PROBE_JS = """(() => {
+  const out = [];
+  try {
+    for (const f of document.querySelectorAll("iframe, frame")) {
+      let entered = false;
+      try { entered = !!(f.contentDocument && f.contentDocument.location.origin === window.location.origin); } catch (_) { entered = false; }
+      if (entered) continue;
+      try { const o = new URL(f.src || "about:blank", document.baseURI).origin; if (o && o !== "null" && !out.includes(o)) out.push(o); } catch (_) {}
+      if (out.length >= 20) break;
+    }
+  } catch (_) {}
+  return JSON.stringify(out);
+})()"""
+
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   "use strict";  // a page function we call cannot read this script (and its bind secret) through .caller
   const nonce = __NONCE__;
@@ -930,11 +1145,14 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   // would leave its controls ungrouped (formIndex null) and merge split OTP boxes across forms.
   const elements = [];
   const forms = [];
+  const sameOriginFrame = __FRAME__;
   (function walk(root) {
     for (const e of root.querySelectorAll("*")) {
       if (e.tagName === "INPUT" || e.tagName === "SELECT") elements.push(e);
       else if (e.tagName === "FORM") forms.push(e);
       if (e.shadowRoot) walk(e.shadowRoot);
+      const sub = sameOriginFrame(e);  // a login form in a same-origin iframe is inspected like the page's own
+      if (sub) walk(sub);
     }
   })(document);
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
@@ -978,8 +1196,42 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     return { context: t !== null && t.length <= BLOCK_MAX ? t : "" };
   };
   const visible = __VISIBLE__;
+  // Field choice inputs (never values): is the field itself on top at its centre (null: not measurable), is it
+  // inside an open dialog / aria-modal container / the URL's :target, is it a search box.
+  const topmost = (e) => {
+    try {
+      const r = e.getBoundingClientRect();
+      const x = r.left + r.width / 2, y = r.top + r.height / 2;
+      const view = (e.ownerDocument && e.ownerDocument.defaultView) || window;
+      if (!(x >= 0 && y >= 0 && x < (view.innerWidth || 0) && y < (view.innerHeight || 0))) return null;
+      const root = e.getRootNode ? e.getRootNode() : null;
+      const at = (root && typeof root.elementFromPoint === "function" ? root : e.ownerDocument).elementFromPoint(x, y);
+      if (!at) return null;
+      if (at === e || (e.contains && e.contains(at))) return true;
+      return Array.from(e.labels || []).some((l) => l === at || (l.contains && l.contains(at)));
+    } catch (_) { return null; }
+  };
+  const modal = (e) => {
+    try {
+      let n = e;
+      for (let up = 0; n && up < 200; up++) {
+        if (n.tagName === "DIALOG" && n.open) return true;
+        if (n.getAttribute && n.getAttribute("aria-modal") === "true") return true;
+        if (n.matches && n.matches(":target")) return true;
+        n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null;
+      }
+      return false;
+    } catch (_) { return null; }
+  };
+  const search = (e) => {
+    try {
+      return e.type === "search" || /^(?:q|search|query)$/i.test(e.name || "") ||
+        !!(e.closest && e.closest("[role=search]"));
+    } catch (_) { return false; }
+  };
   const out = elements.flatMap((element, index) => {
-    if (element.disabled || element.readOnly) return [];
+    // A readonly password is listed: many logins set readonly until focus to stop browser autofill.
+    if (element.disabled || (element.readOnly && element.type !== "password")) return [];
     if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
     const style = getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || element.getClientRects().length === 0) return [];
@@ -1005,9 +1257,13 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       ].join(" "),
       name: [element.name, element.id].join(" "),
       type: element.tagName === "SELECT" ? "select" : (element.type || ""),
-      ...(["text", "tel", "number"].includes(element.type) ? (() => { try { return contextOf(element); } catch (_) { return {}; } })() : {}),
+      ...(["text", "tel", "number", "password"].includes(element.type) ? (() => { try { return contextOf(element); } catch (_) { return {}; } })() : {}),
       visible: (() => { try { return visible(element); } catch (_) { return false; } })(),
       rendered: (() => { try { return rendered(element); } catch (_) { return false; } })(),
+      topmost: topmost(element),
+      modal: modal(element),
+      readonly: element.readOnly === true,
+      search: search(element),
     }];
   });
   return JSON.stringify(out);
@@ -1034,7 +1290,7 @@ def new_signup_outcome_tokens() -> dict[str, str]:
 
 
 def build_signup_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str, target: SignupTargets, *,
-                         bind: str, tokens: dict[str, str]) -> str:
+                         bind: str, tokens: dict[str, str], purpose: str = "signup") -> str:
     """The signup write: the new-password field, then its confirmation field if approved, same value.
 
     The approved set is the inspection's own element and form REFERENCES, fetched once from its closure
@@ -1045,18 +1301,18 @@ def build_signup_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonc
     (no array iteration on that path). Immediately before EACH setter (no ``focus()``, so no page event runs in between), after the
     writes and again after the settle, the whole set is revalidated with the inspection's own traversal (open
     shadow roots included) and predicates: identity, form, action, no ``formaction`` override, rendered size,
-    roles, exactly these password inputs on the page, no OTP field, no login control outside the form. A
-    changed set stops before the next write and is never retried. No value is ever returned: see
-    ``SIGNUP_OUTCOMES``. Only the existing secret transport may evaluate this expression.
+    roles, exactly these password inputs on the page, no OTP field (an identifier outside the form no longer
+    refuses: D-0362). A form-less (SPA) pair is bound to "no form" on both fields. ``purpose=reset`` (D-0364)
+    swaps the other-role name check for the old/current-password check. A changed set stops before the next
+    write and is never retried. No value is ever returned: see ``SIGNUP_OUTCOMES``. Only the existing secret
+    transport may evaluate this expression.
     """
     controls = target.controls
     if ([f.get("index") for f in fills] != [c.index for c in controls] or len({f.get("value") for f in fills}) != 1
-            or not bind or set(tokens) != set(SIGNUP_OUTCOMES)):
+            or not bind or set(tokens) != set(SIGNUP_OUTCOMES) or purpose not in ("signup", "reset")):
         raise ValueError("signup fills do not match the approved targets")
     patterns = {"confirm": _SIGNUP_CONFIRM_RE, "nameForbidden": _SIGNUP_NAME_FORBIDDEN_RE,
-                "labelForbidden": _SIGNUP_LABEL_FORBIDDEN_RE, "otp": _RE_OTP.pattern,
-                "email": _RE_EMAIL.pattern, "tel": _RE_TEL.pattern, "username": _RE_USERNAME.pattern,
-                "excluded": _RE_EXCLUDED_PASSWORD.pattern, "excludedSquashed": _RE_EXCLUDED_PASSWORD_SQUASHED.pattern}
+                "labelForbidden": _SIGNUP_LABEL_FORBIDDEN_RE, "otp": _RE_OTP.pattern, "old": _RESET_OLD_RE}
     values = {
         "__ORIGIN__": json.dumps(expected_origin),
         "__TOKENS__": json.dumps(tokens),
@@ -1065,8 +1321,10 @@ def build_signup_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonc
                                  "indices": [c.index for c in controls], "form": target.primary.form_index,
                                  "stamps": [f"{nonce}:{c.index}" for c in controls]}),
         "__COUNT__": str(len(controls)),
+        "__MODE__": json.dumps(purpose),
         "__PATTERNS__": json.dumps(patterns),
         "__RENDERED__": _RENDERED_JS,
+        "__FRAME__": _FRAME_JS,
         "__SETTLE_MS__": str(int(SIGNUP_SETTLE_MS)),
         "__VALUE__": json.dumps(fills[0]["value"]),
     }
@@ -1088,10 +1346,11 @@ _SIGNUP_FILL_JS_TEMPLATE = """(async () => {
   const N = __COUNT__;
   const P = __PATTERNS__;
   const rx = (k) => new RegExp(P[k]);
+  const mode = __MODE__;
   const reConfirm = rx("confirm"), reNameForbidden = rx("nameForbidden"), reLabelForbidden = rx("labelForbidden"),
-    reOtp = rx("otp"), reEmail = rx("email"), reTel = rx("tel"), reUser = rx("username"), reExcluded = rx("excluded"),
-    reSquashed = rx("excludedSquashed");
+    reOtp = rx("otp"), reOld = rx("old");
   const rendered = __RENDERED__;
+  const sameOriginFrame = __FRAME__;
   // Same text and normalisation as the Python classifier (name/id; labels, aria text, placeholder, title).
   const norm = (raw, camel) => {
     let t = String(raw || "");
@@ -1118,12 +1377,14 @@ _SIGNUP_FILL_JS_TEMPLATE = """(async () => {
       for (const e of root.querySelectorAll("*")) {
         if (e.tagName === "INPUT" || e.tagName === "SELECT") out.push(e);
         if (e.shadowRoot) walk(e.shadowRoot);
+        const sub = sameOriginFrame(e);
+        if (sub) walk(sub);
       }
     })(document);
     return out;
   };
   const listed = (e) => {
-    if (e.disabled || e.readOnly) return false;
+    if (e.disabled || (e.readOnly && e.type !== "password")) return false;  // readonly-until-focus passwords count
     if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(e.type)) return false;
     const st = getComputedStyle(e);
     return !(st.display === "none" || st.visibility === "hidden" || e.getClientRects().length === 0);
@@ -1131,17 +1392,9 @@ _SIGNUP_FILL_JS_TEMPLATE = """(async () => {
   const isPassword = (e) => kind(e) === "password" || ac(e).some((t) => t === "current-password" || t === "new-password");
   const isOtp = (e) => ac(e).includes("one-time-code") ||  // classify_otp_controls
     (["text", "tel", "number", "password", ""].includes(kind(e)) && reOtp.test(norm(describe(e), false)));
-  const excluded = (e) => { const t = norm(describe(e), true); return reExcluded.test(t) || reSquashed.test(t.replace(/ /g, "")); };
-  const isLogin = (e) => {  // classify_login_control
-    const t = ac(e);
-    if (t.includes("new-password") || t.includes("one-time-code")) return false;
-    if (["username", "email", "tel", "current-password"].some((x) => t.includes(x))) return true;
-    if (excluded(e)) return false;
-    if (["password", "email", "tel"].includes(kind(e))) return true;
-    const s = norm(describe(e), false);
-    return reEmail.test(s) || reTel.test(s) || reUser.test(s);
-  };
-  const forbidden = (e) => reNameForbidden.test(norm(describeName(e), true)) || reLabelForbidden.test(norm(describeLabel(e), true));
+  const forbidden = (e) => (mode === "reset"
+    ? reOld.test(norm(describeName(e) + " " + describeLabel(e), true)) || reOld.test(norm(describeName(e), true).replace(/ /g, ""))
+    : reNameForbidden.test(norm(describeName(e), true)) || reLabelForbidden.test(norm(describeLabel(e), true)));
   const unstamp = () => { try { collect().forEach((e) => e.removeAttribute("data-hermes-vault-slot")); } catch (_) { /* best effort */ } };
   const own = (proto, key, part) => { const d = Object.getOwnPropertyDescriptor(proto, key); return d && typeof d[part] === "function" ? d[part] : null; };
   let valueGet = null, valueSet = null, connected = null, formGet = null, actionGet = null, dispatch = null;
@@ -1154,7 +1407,7 @@ _SIGNUP_FILL_JS_TEMPLATE = """(async () => {
   const read = (f, self) => apply(f, self, []);
   // The approved set: the inspection's own references by fixed index, in records no page prototype reaches.
   const set = { __proto__: null };
-  let form = null;
+  let form;  // undefined: not proven; null: a form-less (SPA) pair, bound as such at inspection
   try {
     const gate = window[bound.registry];
     const refs = typeof gate === "function" ? gate(bound.secret) : null;
@@ -1163,20 +1416,21 @@ _SIGNUP_FILL_JS_TEMPLATE = """(async () => {
       const e = refs.elements[bound.indices[i]];
       if (e && e.getAttribute("data-hermes-vault-slot") === bound.stamps[i]) { set[i] = e; found += 1; }
     }
-    if (refs && found === N) form = refs.forms[bound.form] || null;
-  } catch (_) { form = null; }
-  if (!form) { unstamp(); return stop(); }
+    if (refs && found === N) form = bound.form === null ? null : (refs.forms[bound.form] || undefined);
+  } catch (_) { form = undefined; }
+  if (form === undefined) { unstamp(); return stop(); }
   const valid = () => {
     if (window.location.origin !== expectedOrigin || window.location.href !== bound.url) return false;
-    if (read(formGet, set[0]) !== form || read(actionGet, form) !== bound.action ||
-        Array.from(form.elements || []).some((x) => x.hasAttribute && x.hasAttribute("formaction"))) return false;
+    if (read(formGet, set[0]) !== form) return false;
+    if (form !== null && (read(actionGet, form) !== bound.action ||
+        Array.from(form.elements || []).some((x) => x.hasAttribute && x.hasAttribute("formaction")))) return false;
     const shown = collect().filter(listed);
     const passwords = shown.filter(isPassword);
-    if (passwords.length !== N || shown.some(isOtp) || shown.some((x) => isLogin(x) && x.form !== form)) return false;
+    if (passwords.length !== N || shown.some(isOtp)) return false;
     for (let i = 0; i < N; i++) {
       const e = set[i];
       if (!passwords.includes(e) || e.tagName !== "INPUT" || kind(e) !== "password" ||
-          ac(e).join(" ") !== "new-password" || read(formGet, e) !== form || !rendered(e) || forbidden(e) ||
+          ac(e).includes("current-password") || read(formGet, e) !== form || !rendered(e) || forbidden(e) ||
           reConfirm.test(norm(describe(e), true)) !== (i > 0)) return false;
     }
     return true;
@@ -1208,8 +1462,14 @@ _SIGNUP_FILL_JS_TEMPLATE = """(async () => {
 })()"""
 
 
-def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "", refusal_tag: str = "") -> str:
-    """Build a JS expression that fills the selected controls and reports only a count. The
+# Per-field outcome codes the login writer reports (fixed strings; anything else is unverifiable).
+FILL_REASONS = ("written", "field_missing", "not_password", "detached", "origin_changed", "not_visible",
+                "value_rejected", "no_option", "write_error", "mask_failed")
+
+
+def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "", refusal_tag: str = "",
+                  settle_ms: int = 0) -> str:
+    """Build a JS expression that fills the selected controls and reports only counts and fixed codes. The
     returned expression never echoes the values back.
 
     ``expected_origin`` is asserted against ``window.location.origin`` synchronously inside the SAME
@@ -1223,10 +1483,21 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     write, so the caller can tell a real no-write refusal from one a page forged after a write. The page's
     current origin is not reported (a forged ``found`` could carry an encoded value). ``focus()`` runs page
     handlers, so the target is re-checked after it, immediately before the value is set.
+
+    The answer is ``{"filled": n, "reasons": [one FILL_REASONS code per fill]}``. With ``settle_ms`` (the login
+    password fill) the script then waits that long, like the signup writer, and adds ``"retained"``: how many
+    written fields still hold their value (a framework that resets a controlled input clears it). A page that
+    starts to navigate away during the settle (``beforeunload`` / ``pagehide``: the site auto-submitted) answers
+    at once with ``"navigated": true`` and no ``retained``.
+
+    A fill with ``"mask": True`` (a recovery code in a plain text box) hides the field's pixels BEFORE the value
+    lands: ``-webkit-text-security: disc`` where the engine supports it, else the input becomes
+    ``type=password``. If neither takes, nothing is written to that field (``mask_failed``).
     """
     payload = json.dumps(
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"],
-          **({"strict": True} if f.get("strict") else {})} for f in fills]
+          **({"strict": True} if f.get("strict") else {}), **({"mask": True} if f.get("mask") else {})}
+         for f in fills]
     )
     # One pass: a chained .replace() would rescan the already-spliced fill values, so a secret
     # containing "__NONCE__" (or any later placeholder) got JSON spliced into its string literal.
@@ -1236,34 +1507,47 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
         "__NONCE__": json.dumps(nonce),
         "__TAG__": json.dumps(refusal_tag),
         "__VISIBLE__": _VISIBLE_JS,
+        "__FRAME__": _FRAME_JS,
+        "__SETTLE_MS__": str(max(0, int(settle_ms))),
     }
     return _FILL_JS_PLACEHOLDER_RE.sub(lambda m: values[m.group(0)], _FILL_JS_TEMPLATE)
 
 
-_FILL_JS_PLACEHOLDER_RE = re.compile(r"__EXPECTED_ORIGIN__|__FILLS__|__NONCE__|__TAG__|__VISIBLE__")
+_FILL_JS_PLACEHOLDER_RE = re.compile(r"__EXPECTED_ORIGIN__|__FILLS__|__NONCE__|__TAG__|__VISIBLE__|__FRAME__|__SETTLE_MS__")
 
 
 _FILL_JS_TEMPLATE = """(() => {
   "use strict";  // a page function we call (a hooked dispatchEvent) cannot read the fill values through .caller
-  // Captured before a write's events run page code; Python still accepts only a small integer count.
+  // Captured before a write's events run page code; Python still accepts only small integer counts and fixed codes.
   const stringify = JSON.stringify;
+  const P0 = Promise, wait = setTimeout;
   const expectedOrigin = __EXPECTED_ORIGIN__;
   if (window.location.origin !== expectedOrigin) {
     return stringify({ refused: "origin_changed", tag: __TAG__ });
   }
   const fills = __FILLS__;
   const nonce = __NONCE__;
-  // Stamped controls may live inside a shadow root (see the inspection script's walk): collect the
-  // document and every open shadow root once, then look each stamp up in those roots.
+  const settleMs = __SETTLE_MS__;
+  // Stamped controls may live inside a shadow root or a same-origin frame (see the inspection script's walk):
+  // collect the document and every open shadow root / same-origin frame document once, then look each stamp up.
+  const sameOriginFrame = __FRAME__;
   const roots = [];
   (function walk(root) {
     roots.push(root);
-    for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
+    for (const e of root.querySelectorAll("*")) {
+      if (e.shadowRoot) walk(e.shadowRoot);
+      const sub = sameOriginFrame(e);
+      if (sub) walk(sub);
+    }
   })(document);
   const find = (selector) => roots.flatMap((r) => Array.from(r.querySelectorAll(selector)));
   let filled = 0;
+  const reasons = [];
+  const kept = [];  // [element, value] of each written text field, for the retention read-back
   const norm = (t) => String(t || "").trim().toLowerCase();
   const visible = __VISIBLE__;
+  let valueGet = null;
+  try { const d = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value"); valueGet = d && d.get; } catch (_) { valueGet = null; }
   // Plain-"code" fallback targets (strict): rendered and visible, checked for ALL of them before anything is
   // written; a failure writes nothing.
   for (const f of fills) {
@@ -1278,29 +1562,73 @@ _FILL_JS_TEMPLATE = """(() => {
   }
   for (const f of fills) {
     const el = find('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]')[0];
-    if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+    if (!el) { reasons.push("field_missing"); continue; }
+    if (f.token === "current-password" && el.type !== "password") { reasons.push("not_password"); continue; }
     try {
       if (el.tagName === "SELECT") {
         const want = norm(f.value);
         const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
-        if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true, composed: true })); filled += 1; }
+        if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true, composed: true })); filled += 1; reasons.push("written"); }
+        else reasons.push("no_option");
         continue;
       }
       el.focus();
       // focus handlers are page code: re-check the target before the value lands.
-      if (!el.isConnected || window.location.origin !== expectedOrigin ||
-          (f.token === "current-password" && el.type !== "password") || (f.strict === true && !visible(el))) continue;
+      if (!el.isConnected) { reasons.push("detached"); continue; }
+      if (window.location.origin !== expectedOrigin) { reasons.push("origin_changed"); continue; }
+      if (f.token === "current-password" && el.type !== "password") { reasons.push("not_password"); continue; }
+      if (f.strict === true && !visible(el)) { reasons.push("not_visible"); continue; }
+      if (f.mask === true && !maskField(el)) { reasons.push("mask_failed"); continue; }
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
       // composed: a component listening on its shadow host must see the value change too.
       el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-      if (el.value.length > 0) filled += 1;
-    } catch (e) { /* skip */ }
+      if (el.value.length > 0) { filled += 1; reasons.push("written"); kept.push([el, f.value]); }
+      else reasons.push("value_rejected");
+    } catch (e) { reasons.push("write_error"); }
   }
   clearStamps();
-  return stringify({ filled });
-  // (a hoisted declaration, so the early no-write refusal above can use it too)
+  if (settleMs <= 0) return stringify({ filled, reasons });
+  // Same settle as the signup writer: frameworks reset controlled inputs on a later tick. A site that submits
+  // on its own navigates now: answer before the document goes, the write itself already landed.
+  return new P0((resolve) => {
+    let done = false;
+    const left = (e) => {  // a page-dispatched (untrusted) event is not a navigation
+      if (done || (e && e.isTrusted === false)) return;
+      done = true;
+      resolve(stringify({ filled, reasons, navigated: true }));
+    };
+    try { window.addEventListener("beforeunload", left, true); window.addEventListener("pagehide", left, true); } catch (_) {}
+    wait(() => {
+      if (done) return;
+      let retained = 0;
+      try {
+        for (let i = 0; i < kept.length; i++) {  // by index: no page-reachable array iterator on this path
+          const el = kept[i][0];
+          const now = valueGet ? valueGet.call(el) : el.value;
+          if (el.isConnected && now === kept[i][1]) retained += 1;
+        }
+      } catch (_) { retained = -1; }
+      done = true;
+      resolve(stringify(window.location.origin === expectedOrigin ? { filled, reasons, retained }
+                                                                  : { filled, reasons, navigated: true }));
+    }, settleMs);
+  });
+  // (hoisted declarations, so the early no-write refusal above can use them too)
   function clearStamps() { find("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot")); }
+  // Pixels first: a screenshot taken while the field holds a recovery code shows discs, never the code.
+  function maskField(el) {
+    try {
+      let css = false;
+      try { css = typeof CSS !== "undefined" && CSS.supports("-webkit-text-security", "disc"); } catch (_) { css = false; }
+      if (css) {
+        el.style.setProperty("-webkit-text-security", "disc", "important");
+        if (el.style.getPropertyValue("-webkit-text-security") === "disc") return true;
+      }
+      el.type = "password";
+      return el.type === "password";
+    } catch (_) { return false; }
+  }
 })()"""

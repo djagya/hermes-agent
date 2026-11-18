@@ -209,8 +209,9 @@ def test_unlock_uses_vendor_passwordenv_contract_then_fill_routes_by_prefix(fake
                  {"filled": 1})}) as secret_eval:
             out = json.loads(browser_vault_fill("bw:abc", task_id="t"))
             out.pop("next")
+            # retention_verified False: the fake writer answers the old shape (no read-back).
             assert out == {"success": True, "filled_fields": 1, "backend": "bitwarden", "kind": "login",
-                           "origin": "https://example.com"}
+                           "origin": "https://example.com", "retention_verified": False}
             assert prompts == [("bitwarden", "Bitwarden")]
             # Now unlocked: listing exposes metadata only, never the password.
             listed = json.loads(browser_vault_list())

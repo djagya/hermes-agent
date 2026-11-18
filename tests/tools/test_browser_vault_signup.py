@@ -145,8 +145,7 @@ BAD_CONTROLS = [
     [field(), field(index=2, autocomplete="current-password")],
     [field(), field(index=2, autocomplete="one-time-code", type="text")],
     [field(), field(index=2, autocomplete="", name="otp", type="text")],
-    [field(), field(index=2, autocomplete="email", type="email", formIndex=1)],
-    [field(autocomplete="current-password")], [field(type="text")], [field(formIndex=None)],
+    [field(autocomplete="current-password")], [field(type="text")],
     [field(label="Confirm password")], [field(pageUrl=ORIGIN + "/reset-password")],
     [field(pageUrl=ORIGIN + "/account-recovery")],
     [field(pageUrl=ORIGIN + "/change-password")],
@@ -154,8 +153,7 @@ BAD_CONTROLS = [
     [field(formAction=ORIGIN + "/reset-password")],
     [field(formAction="https://other.test/register")],
     [field(pageUrl=ORIGIN + "/login", formAction=ORIGIN + "/login")],
-    [field(pageUrl=ORIGIN + "/login?next=/signup")],
-    [field(pageUrl=ORIGIN + "/login/after-signup", formAction=ORIGIN + "/login")],
+    [field(pageUrl=ORIGIN + "/login?next=/signup", formAction=ORIGIN + "/login?next=/signup")],
     [field(pageUrl=ORIGIN + "/signup/resetpassword", formAction=ORIGIN + "/signup/resetpassword")],
     [field(pageUrl=ORIGIN + "/register/changepassword", formAction=ORIGIN + "/register/changepassword")],
     [field(name="password_confirmation")], [field(label="Retype password")],
@@ -165,11 +163,10 @@ BAD_CONTROLS = [
     [field(), confirm(formAction=ORIGIN + "/register/other")],
     [field(), confirm(), field(index=3, name="pw3")],
     [field(), confirm(), field(index=3, autocomplete="current-password")],
-    [field(), confirm(autocomplete="")], [field(), confirm(type="text")],
+    [field(), confirm(type="text")],
     [field(label="Current password"), confirm()], [field(), confirm(name="change-password-confirm")],
     [field(pageUrl=ORIGIN + "/reset-password"), confirm(pageUrl=ORIGIN + "/reset-password")],
     [field(), confirm(), field(index=3, autocomplete="one-time-code", type="text")],
-    [field(), confirm(), field(index=3, autocomplete="email", type="email", formIndex=1)],
     # change/old/update intent in any spelling; a target the inspection did not see rendered.
     [field(name="updatePassword"), confirm(name="confirmPassword", label="")], [field(name="oldpassword")],
     [field(name="changepassword")], [field(label="Existing password")], [field(), confirm(rendered=False)],
@@ -179,6 +176,24 @@ BAD_CONTROLS = [
     [field(pageUrl=ORIGIN + "/register/password/edit", formAction=ORIGIN + "/register/password/edit"),
      confirm(pageUrl=ORIGIN + "/register/password/edit", formAction=ORIGIN + "/register/password/edit")],
 ]
+
+
+# Owner decision D-0362 (2026-11-18, widen signup reach under the same approval): these shapes were refused
+# before and now fill after the signup approval: an identifier in another form, a form-less (SPA) field, a page
+# whose path names both login and signup, a confirmation without autocomplete=new-password.
+NOW_SUPPORTED = [
+    [field(), field(index=2, autocomplete="email", type="email", formIndex=1)], [field(formIndex=None)],
+    [field(pageUrl=ORIGIN + "/login/after-signup", formAction=ORIGIN + "/login/after-signup")],
+    [field(), confirm(autocomplete="")],
+    [field(), confirm(), field(index=3, autocomplete="email", type="email", formIndex=1)],
+]
+
+
+@pytest.mark.parametrize("controls", NOW_SUPPORTED)
+def test_widened_signup_shapes_fill_after_the_approval(core, controls):
+    core.inspect.return_value["result"] = json.dumps(controls)
+    assert fill()["success"] is True
+    assert core.events[0] == "consent"
 
 
 @pytest.mark.parametrize("controls", BAD_CONTROLS)
@@ -199,7 +214,7 @@ def test_non_login_items_rejected(core, kind):
     core.write.assert_not_called()
 
 
-@pytest.mark.parametrize("purpose", ["reset", "", None, 1, ["signup"]])
+@pytest.mark.parametrize("purpose", ["recover", "", None, 1, ["signup"]])  # reset is a purpose since D-0364
 def test_unknown_purpose_rejected(core, purpose):
     assert json.loads(vault.browser_vault_fill(HANDLE, purpose=purpose))["error_type"] == "invalid_purpose"
     core.backend.get_meta.assert_not_called()
@@ -254,7 +269,7 @@ def test_page_forged_answers_are_never_trusted(core, answer):
 @pytest.mark.parametrize("purpose", ["signup", "login", None])
 def test_schema_and_handler_preserve_purpose_and_fence(monkeypatch, purpose):
     spec = vault.BROWSER_VAULT_SCHEMA["parameters"]["properties"]["purpose"]
-    assert spec["enum"] == ["login", "signup"] and spec["default"] == "login"
+    assert spec["enum"] == ["login", "signup", "reset"] and spec["default"] == "login"
     fence = Mock(side_effect=lambda tid, fn: fn())
     target = Mock(return_value='{"success": false}')
     monkeypatch.setattr(vault, "_fenced_page_op", fence)
@@ -479,12 +494,14 @@ ADD = "light.push(make({index: 3, formIndex: 0, formAction: spec.url, %s}));"
     ("", "mask:11"),
     ("window.location.origin = 'https://wrong.example.test';", "origin"),
     ("window.location.href += '/reset';", "none"),
-    ("byIdx[2].readOnly = true;", "none"), ("byIdx[2].disabled = true;", "none"), ("byIdx[2].shown = false;", "none"),
+    # A readonly(-until-focus) password is listed and written since 11-18; a disabled one never.
+    ("byIdx[2].readOnly = true;", "mask:11"), ("byIdx[2].disabled = true;", "none"), ("byIdx[2].shown = false;", "none"),
     ("byIdx[2].rect.width = 0;", "none"), ("byIdx[2].rect.left = -9999;", "none"), ("byIdx[2].transparent = true;", "none"),
     (ADD % "type: 'password', autocomplete: 'new-password', name: 'pw3', label: 'Password'", "none"),
     ("shadow.push(make({index: 3, formIndex: 0, formAction: spec.url, type: 'password', name: 'pw3'}));", "none"),
     (ADD % "type: 'text', autocomplete: '', name: 'otp', label: ''", "none"),
-    ("light.push(make({index: 3, formIndex: 1, formAction: spec.url, type: 'email', autocomplete: 'email', name: 'email'}));", "none"),
+    # D-0362: an identifier in another form no longer refuses (it holds no password or code field).
+    ("light.push(make({index: 3, formIndex: 1, formAction: spec.url, type: 'email', autocomplete: 'email', name: 'email'}));", "mask:11"),
     ("byIdx[2].name = 'pw'; byIdx[2].attrs.placeholder = 'Password'; byIdx[1].attrs.placeholder = 'Confirm password';", "none"),
     ("const f = new Form(spec.url); byIdx[1].form = f; byIdx[2].form = f;", "none"),  # re-parented, same action
     ("light = light.map(clone);", "none"),  # clones carrying the unique stamps
@@ -530,7 +547,6 @@ def test_supported_shapes_fill_end_to_end_in_the_page(quick_settle, controls):
     field(index=3, name="pw3"), field(index=3, autocomplete="current-password"),
     field(index=3, type="text", autocomplete="", name="otp", label=""),
     field(index=3, type="text", autocomplete="one-time-code", name="code", label=""),
-    field(index=3, type="email", autocomplete="", name="email", label="", formIndex=1),
 ])
 def test_page_census_refuses_what_the_classifier_refuses(quick_settle, extra):
     """Parity: a shape Python refuses is refused by the page gate on its own, before any write."""
@@ -608,7 +624,7 @@ def test_login_writer_rechecks_its_target_after_focus():
     controls = [field(autocomplete="current-password")]
     script = build_fill_js([{"index": 1, "token": "current-password", "value": SECRET}], ORIGIN, "nonce")
     observed = _run(script, controls, "byIdx[1].on('focus', () => { byIdx[1].type = 'text'; });")
-    assert observed["writes"] == [] and json.loads(observed["raw"]) == {"filled": 0}
+    assert observed["writes"] == [] and json.loads(observed["raw"]) == {"filled": 0, "reasons": ["not_password"]}
 
 
 @pytest.mark.parametrize("value", [
@@ -677,7 +693,7 @@ def test_page_hooks_cannot_read_the_script_source_through_caller(quick_settle, w
         controls = [field(autocomplete="current-password")]
         script = build_fill_js([{"index": 1, "token": "current-password", "value": SECRET}], ORIGIN, "nonce")
         observed = _run(vault._secret_wrapped(script), controls, _CALLER_SNOOP)
-        assert json.loads(observed["raw"]) == {"filled": 1}
+        assert json.loads(observed["raw"]) == {"filled": 1, "reasons": ["written"]}
 
 
 @pytest.mark.parametrize("primary,accepted", [

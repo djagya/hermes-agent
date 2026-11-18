@@ -62,10 +62,14 @@ def not_given(error_type: str, what: str, outcome: str) -> str:
                    consent_outcome=outcome)
 
 
+WRITER_PURPOSES = ("signup", "reset")  # the purposes the new-password writer serves (each with its own approval)
+
+
 def kind_refusal(purpose: str, kind: str) -> Optional[str]:
-    """Signup creates an account with a saved login; any other item kind fails closed."""
-    if purpose == "signup" and kind != "login":
-        return _refuse("signup_login_required", "Signup requires a saved login item. Nothing was written.")
+    """Signup creates an account with a saved login (reset sets a saved login's password); any other item kind
+    fails closed."""
+    if purpose in WRITER_PURPOSES and kind != "login":
+        return _refuse(f"{purpose}_login_required", f"purpose={purpose} requires a saved login item. Nothing was written.")
     return None
 
 
@@ -82,25 +86,54 @@ def confirm_signup_fill(handle: str, label: str, origin: str, paired: bool = Fal
         surface="vault-signup", title="Confirm signup password fill?")
 
 
+def confirm_reset_fill(handle: str, label: str, origin: str, paired: bool = False) -> str:
+    """D-0364: its own native approval for a choose/reset-a-new-password form; returns the outcome."""
+    scope = ("into TWO fields: the new password and its confirmation (the same password in both)" if paired
+             else "into exactly one new-password field")
+    return ask_consent(
+        f"Set the password on {origin} to saved login '{label}' (handle: {handle})?",
+        f"Approve entering this saved password {scope} of a choose/reset-password form on this exact origin. The "
+        "site will then expect this saved password; if it should be a new password, the vault item is updated "
+        "first. The password never enters the conversation. Nothing will be submitted.",
+        surface="vault-reset", title="Confirm password reset fill?")
+
+
+_UNSUPPORTED = {
+    "signup": ("Signup needs one new-password input on a registration form (or that input plus ONE explicitly "
+               "labelled confirm-password input in the same form). reason names what did not fit. Nothing was "
+               "written."),
+    "reset": ("A password reset needs one new-password input on a choose/reset-password form (or that input plus "
+              "ONE explicitly labelled confirmation in the same form). reason names what did not fit. Nothing was "
+              "written."),
+}
+_HINTS = {
+    "recovery_route": "This is a password reset or recovery page: call fill with purpose=reset.",
+    "login_route": "This is a sign-in page: call fill with purpose=login.",
+    "field_is_current_password": "The field asks for the current password: call fill with purpose=login.",
+    "too_many_password_fields": "The page has more than two password fields (a change-password form?): ask the user.",
+    "code_field_present": "The page asks for a code: call enter_code first.",
+}
+
+
 def gate(purpose: str, raw_controls: list[Any], handle: str, label: str, page_origin: str,
          current_origin: Callable[[], str]) -> tuple[Any, Optional[str]]:
-    """``(targets, refusal)``. Login: ``(None, None)``. Signup: the approved
-    :class:`~agent.vault_login_classifier.SignupTargets`, or a refusal; the password has not been resolved
-    either way."""
-    if purpose != "signup":
+    """``(targets, refusal)``. Login: ``(None, None)``. Signup / reset: the approved
+    :class:`~agent.vault_login_classifier.SignupTargets`, or a refusal with a fixed ``reason`` code; the password
+    has not been resolved either way."""
+    if purpose not in WRITER_PURPOSES:
         return None, None
-    from agent.vault_login_classifier import LoginControl, select_signup_targets
+    from agent.vault_login_classifier import LoginControl, select_signup_targets_detailed
 
-    target = select_signup_targets([LoginControl.from_dict(raw) for raw in raw_controls if isinstance(raw, dict)])
+    target, reason = select_signup_targets_detailed(
+        [LoginControl.from_dict(raw) for raw in raw_controls if isinstance(raw, dict)], purpose)
     if target is None:
-        return None, _refuse("signup_target_unsupported",
-                             "Signup requires exactly one explicit new-password input on a registration form, "
-                             "optionally with ONE explicitly labelled confirm-password input in the same form; "
-                             "ambiguous password pairs, a third password, mixed login, OTP and recovery forms are "
-                             "unsupported. Nothing was written.")
-    outcome = outcome_of(confirm_signup_fill(handle, label, page_origin, paired=target.confirm is not None))
+        extra = {"next": _HINTS[reason]} if reason in _HINTS else {}
+        return None, _refuse(f"{purpose}_target_unsupported", _UNSUPPORTED[purpose], reason=reason, **extra)
+    ask = confirm_signup_fill if purpose == "signup" else confirm_reset_fill
+    outcome = outcome_of(ask(handle, label, page_origin, paired=target.confirm is not None))
     if outcome != "accepted":
-        return None, not_given("signup_declined", "Signup password fill", outcome)
+        return None, not_given(f"{purpose}_declined", "Signup password fill" if purpose == "signup"
+                               else "Password reset fill", outcome)
     if current_origin() != page_origin:
         return None, _refuse("origin_changed", "The page origin changed during approval. Nothing was written.")
     return target, None
@@ -120,12 +153,15 @@ def password_fills(target: Any, classified: list[Any], password: str) -> list[di
 
 
 def fill_expression(fills: list[dict[str, Any]], page_origin: str, nonce: str, target: Any, *, bind: str = "",
-                    tokens: Optional[dict[str, str]] = None, refusal_tag: str = "") -> str:
+                    tokens: Optional[dict[str, str]] = None, refusal_tag: str = "", settle_ms: int = 0,
+                    purpose: str = "signup") -> str:
     from agent.vault_login_classifier import build_fill_js, build_signup_fill_js
 
     if target is None:
-        return build_fill_js(fills, expected_origin=page_origin, nonce=nonce, refusal_tag=refusal_tag)
-    return build_signup_fill_js(fills, page_origin, nonce, target, bind=bind, tokens=tokens or {})
+        return build_fill_js(fills, expected_origin=page_origin, nonce=nonce, refusal_tag=refusal_tag,
+                             settle_ms=settle_ms)
+    return build_signup_fill_js(fills, page_origin, nonce, target, bind=bind, tokens=tokens or {},
+                                purpose=purpose)
 
 
 def outcome_tokens() -> dict[str, str]:
@@ -152,24 +188,26 @@ _ROLES = ("new-password", "confirm-password")
 
 
 def _failure(error_type: str, base: dict[str, Any], **extra: Any) -> str:
-    return json.dumps({"success": False, "error_type": error_type, "error": _FAILURES[error_type],
-                       "partially_filled": True, **extra, **base})
+    # The signup texts serve reset too; the error_type names the purpose (reset_fill_partial, ...).
+    purpose = base.get("purpose", "signup")
+    return json.dumps({"success": False, "error_type": error_type.replace("signup_", purpose + "_", 1),
+                       "error": _FAILURES[error_type], "partially_filled": True, **extra, **base})
 
 
-def _base(backend_name: str, kind: str, page_origin: str) -> dict[str, Any]:
-    return {"backend": backend_name, "kind": kind, "origin": page_origin, "purpose": "signup"}
+def _base(backend_name: str, kind: str, page_origin: str, purpose: str = "signup") -> dict[str, Any]:
+    return {"backend": backend_name, "kind": kind, "origin": page_origin, "purpose": purpose}
 
 
-def uncertain(target: Any, backend_name: str, kind: str, page_origin: str) -> Optional[str]:
+def uncertain(target: Any, backend_name: str, kind: str, page_origin: str, purpose: str = "signup") -> Optional[str]:
     """For a signup target, the result when the native write failed or never answered: a write may have
     happened, so never "Nothing was written". None for a login fill (its own handling)."""
     if target is None:
         return None
-    return _failure("signup_fill_uncertain", _base(backend_name, kind, page_origin))
+    return _failure("signup_fill_uncertain", _base(backend_name, kind, page_origin, purpose))
 
 
 def finish(raw: Any, backend_name: str, kind: str, page_origin: str, target: Any,
-           tokens: dict[str, str]) -> str:
+           tokens: dict[str, str], purpose: str = "signup") -> str:
     """Result of a signup write that the native transport ran: states only, never submitted, never a value.
 
     ``raw`` is the script's answer: one of this fill's outcome tokens, or anything else (garbled or forged by
@@ -181,10 +219,10 @@ def finish(raw: Any, backend_name: str, kind: str, page_origin: str, target: Any
         except ValueError:
             pass
     outcome = {token: name for name, token in tokens.items()}.get(raw) if isinstance(raw, str) else None
-    base = _base(backend_name, kind, page_origin)
+    base = _base(backend_name, kind, page_origin, purpose)
     fields = list(_ROLES[:len(target.controls)])
     if outcome == "none":
-        return _refuse("signup_target_changed", "The approved signup target changed. Nothing was written.")
+        return _refuse(f"{purpose}_target_changed", f"The approved {purpose} target changed. Nothing was written.")
     if outcome == "origin":
         return _refuse("origin_changed", "The page navigated away from the approved origin before the fill. "
                                          "Nothing was written.")
@@ -200,6 +238,7 @@ def finish(raw: Any, backend_name: str, kind: str, page_origin: str, target: Any
                else "Password filled only; nothing submitted. ")
         return json.dumps({"success": True, "filled_fields": len(fields), "retention_verified": True,
                            "fields": fields, **base,
-                           "next": nxt + "Review the account-creation form before submitting."})
+                           "next": nxt + ("Review the account-creation form before submitting." if purpose == "signup"
+                                          else "Submit the form; the site then uses the saved password.")})
     return _failure("signup_fields_not_retained", base, filled_fields=bits.count("1"),
                     field_retention={f: ("held" if b == "1" else "lost") for f, b in zip(fields, bits)})

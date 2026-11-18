@@ -453,6 +453,8 @@ class TestBrowserVaultTools:
             "backend": "local",
             "kind": "login",
             "origin": "https://example.com",
+            # The fake writer answers the old shape (no read-back), so retention is reported as not verified.
+            "retention_verified": False,
         }
         assert "s3cret-pw" not in raw
         # The secret expression only ever goes through the secret eval path,
@@ -1169,7 +1171,8 @@ class TestExplicitCodeMode:
             browser_vault_tool._handle_vault(
                 {"action": "enter_code", "handle": "h", "code": "042172", "expected_origin": self.PAGE_ORIGIN}, task_id="t")
         assert fence.call_count == 1
-        assert seen == {"handle": "h", "task_id": "t", "code": "042172", "expected_origin": self.PAGE_ORIGIN}
+        assert seen == {"handle": "h", "task_id": "t", "code": "042172", "expected_origin": self.PAGE_ORIGIN,
+                        "code_source": "", "field": ""}
 
     def test_handler_passes_merchant_origin_to_card_fill(self):
         from tools import browser_vault_tool

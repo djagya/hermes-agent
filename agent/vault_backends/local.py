@@ -7,6 +7,9 @@ from typing import Dict, List, Optional
 from agent.vault_backends.base import LoginBackend
 from agent.vault_store import VaultItemMeta
 
+# Keys of a local login secret that are never recovery codes (review E, 11-18).
+_NOT_CODE_KEYS = frozenset({"password", "otp_secret", "identifier", "identifier_type", "email", "phone", "username"})
+
 
 def _store():
     # Late import: tests and callers patch ``agent.vault_store.get_vault_store``; binding it here
@@ -34,6 +37,14 @@ class LocalLoginBackend(LoginBackend):
         from agent.vault_store import totp_now
         seed = str(_store().resolve_secret(handle).get("otp_secret") or "")
         return totp_now(seed) if seed else None
+
+    def resolve_recovery_codes(self, handle: str, field: str) -> list[str]:
+        """D-0365: codes stored on the item under a key named like ``field`` ("recovery_codes"). The password,
+        the TOTP seed and the identifier keys are never read as codes."""
+        from agent.vault_recovery_codes import pick_code_values
+
+        secret = _store().resolve_secret(handle)
+        return pick_code_values(field, ((str(k), "", str(v), str(k) in _NOT_CODE_KEYS) for k, v in secret.items()))
 
     def resolve_secret(self, handle: str) -> dict[str, str]:
         return {k: str(v) for k, v in _store().resolve_secret(handle).items()}

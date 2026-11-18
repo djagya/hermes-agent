@@ -348,7 +348,7 @@ def page(*nodes: str) -> str:
 
 def test_probe_google_shape_is_accepted_and_written():
     res = probe(page(form(p("Verify your email address"), p("Enter the code we sent to a@b.test"), field())))
-    assert res["fill"] == {"filled": 1} and res["written"] == {"real": CODE}
+    assert res["fill"] == {"filled": 1, "reasons": ["written"]} and res["written"] == {"real": CODE}
 
 
 def test_probe_microsoft_shape_without_a_form_is_accepted_and_written():
@@ -473,7 +473,7 @@ def test_probe_fill_script_rechecks_visibility_and_writes_nothing_when_it_fails(
 def test_probe_regular_path_fill_is_not_subject_to_the_new_visibility_recheck():
     res = probe(page(form(field(name="otp", id="otp", aria="Verification code", ref="real"))),
                 between="refs.real.style.opacity = '0';")
-    assert res["fill"] == {"filled": 1}
+    assert res["fill"] == {"filled": 1, "reasons": ["written"]}
 
 
 def test_inspection_context_is_rendered_form_text_and_never_includes_the_title_or_headings_elsewhere():
