@@ -472,11 +472,18 @@ def test_a_3ds_page_is_clicked_only_after_the_checkouts_pay_was_admitted(first):
     assert out["success"] is True and len(presses()) == 1
     sup.trees = [ACS]  # redirected to the bank's challenge page
     _top_controls(sup)
-    # r2 P1: one Pay press per approval: a Pay-like control there is refused; the bank's own step is pressed
-    assert surface.payment_click(sup, _top_ref(sup, ACS))["error_type"] == "payment_already_pressed"
+    # r2 P1 / r3 Q1: one Pay press per approval, but the bank's own step on its challenge page is pressed whatever
+    # its caption says (the issuer's confirmation, not a second charge) ...
+    assert surface.payment_click(sup, _top_ref(sup, ACS))["success"] is True and len(presses()) == 2
     sup.rows = [{"i": 0, "role": "button", "text": "Continue", "disabled": False}]
     _top_controls(sup)
-    assert surface.payment_click(sup, _top_ref(sup, ACS))["success"] is True and len(presses()) == 2
+    assert surface.payment_click(sup, _top_ref(sup, ACS))["success"] is True and len(presses()) == 3
+    # ... and a Pay-like control on the merchant's own checkout document is refused
+    sup.rows = [{"i": 0, "role": "button", "text": "Pay 22.66 EUR", "disabled": False}]
+    sup.trees = [CHECKOUT]
+    _top_controls(sup)
+    assert surface.payment_click(sup, _top_ref(sup, CHECKOUT))["error_type"] == "payment_already_pressed"
+    assert len(presses()) == 3
 
 
 def test_a_top_document_ref_dies_with_its_document():

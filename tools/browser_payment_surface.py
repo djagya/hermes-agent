@@ -1109,7 +1109,14 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         # preparatory caption) is this approval's one Pay press. P3: any such press (owner_go too) never reads as
         # "unchanged".
         pay_like = _pay_press(control["role"], control["text"])
-        pay_press = gate.approved is not None and pay_like
+        if pay_like and gate.gen is not None and gate.gen.paid and gate.approved is not None:
+            # build C r3 (Q1): after the approval's Pay press only a bank's own step (a 3-D Secure / issuer
+            # challenge document) may be pressed; the one-press refusal stands for every other document. Nothing is
+            # moved or read for the total before this answer.
+            top0 = await _top_frame(sup, page_sid)
+            row0 = next((r for r in tree if r[0] == fid), None)
+            if not _bank_step(sup, gate, (fid, loader, row0[2] if row0 else "", fid == tree[0][0]), top0):
+                return _already_pressed(gate.gen)
         element = (await sup._cdp("Runtime.callFunctionOn", {
             "objectId": arr, "functionDeclaration": "function(i){return this[i]}",
             "arguments": [{"value": control["_i"]}], "returnByValue": False}, session_id=sid))["result"]["result"].get(
@@ -1132,12 +1139,14 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
             return refused
         await _same_document(sup, sid, fid, loader)
         top = None
+        bank = False
         if gate.approved is not None:  # B1: the approved total, read after the move
             row = next((r for r in tree if r[0] == fid), None)
             clicked = (fid, loader, row[2] if row else "", fid == tree[0][0])
             refused, top = await _pay_gate(sup, page_sid, gate, clicked, element, sid)
             if refused:
                 return refused
+            bank = _bank_step(sup, gate, clicked, top)  # build C r3 (Q1): read once more, on the gate's own top
         try:  # build C3: what the effect is compared with (counts and states only; never a reason to refuse)
             before = await _structure(sup, page_sid, element, sid)
         except Exception as exc:  # health: allow BLE001 -- no baseline: the click goes on, its effect is null
@@ -1163,7 +1172,8 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
                     # build C r2 (P2): admission re-checked and the press booked in one step under _LOCK, at
                     # dispatch: a listing from now on counts it. From here a failure cannot promise the click
                     # did not land (duplicate-submit risk).
-                    refused = _book_press(sup, gate, top is not None, pay_press, progress)
+                    refused = _book_press(sup, gate, top is not None, pay_like, progress, bank=bank,
+                                          unnamed=not _named_pay(control["role"], control["text"]))
                     if refused:
                         return refused
                 await sup._cdp("Input.dispatchMouseEvent", {"type": kind, "x": x2, "y": y2, "button": "left",
@@ -1224,25 +1234,30 @@ def _admission_holds(sup: Any, gate: _Gate) -> bool:
     return sup in _HELD and _GENS.get(sup) is gate.gen and gate.gen.approved is gate.approved
 
 
-def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress: list) -> Optional[dict]:
+def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress: list, *, bank: bool = False,
+                unnamed: bool = False) -> Optional[dict]:
     """build C r2 (P1, P2): right before mousePressed, in one step under ``_LOCK``: the admission still holds (r4 C2),
     and a Pay press finds no earlier Pay press of this approval (``payment_already_pressed``); then the press is
     booked in its lock record (``presses``, ``pressed``, r4 C7 ``admitted``, ``paid``), so a listing during the
-    press or its settle already counts it. A refusal (nothing booked) means nothing is pressed."""
+    press or its settle already counts it. A refusal (nothing booked) means nothing is pressed. build C r3: ``bank``
+    (Q1): the press is a bank challenge's own step after the Pay press (``_bank_step``), so it does not meet the
+    one-press refusal; ``unnamed`` (Q2): a Pay press whose caption has no pay word (it only counts as Pay because
+    Hermes cannot tell it from one). The owner_go path is held to the same one press (``gen`` is None when this
+    process saw no lock of this supervisor: nothing to count then)."""
     with _LOCK:
         if not _admission_holds(sup, gate):
             return _refusal(APPROVAL_CHANGED, _APPROVAL_CHANGED_TEXT)
         gen = gate.gen
-        if pay_press and gen is not None and gen.paid:
-            return _refusal(ALREADY_PRESSED, _ALREADY_PRESSED_TEXT)
+        if pay_press and gen is not None and gen.paid and not bank:
+            return _already_pressed(gen)
         progress.extend(("checked" if checked else "go", _BOOKED))
         if gen is not None:  # the admission above proved it is still this supervisor's current record
             gen.pressed = True
             gen.presses += 1
             if checked:  # r4 C7: a press checked against this approval (not owner_go)
                 gen.admitted = True
-            if pay_press:
-                gen.paid = True
+            if pay_press and not gen.paid:
+                gen.paid, gen.paid_unnamed = True, unnamed
     return None
 
 
@@ -1252,6 +1267,18 @@ _ALREADY_PRESSED_TEXT = (
     "Pay was pressed once for this approval, so nothing was pressed now. Call payment_done (or payment_dialog for a "
     "confirm it reports) to see where the payment went; never press Pay again: a new attempt needs a new approval "
     "from the owner (Danil).")
+_UNNAMED_PRESS_TEXT = (
+    " The press this approval allowed was used by a control Hermes could not tell from Pay (its caption had no pay "
+    "word or could not be read, so it counts as the Pay press). Do not look for another way to press Pay: hand "
+    "over. Tell the owner (Danil) which control was pressed and what the page shows.")
+
+
+def _already_pressed(gen: Any) -> dict:
+    """``payment_already_pressed``; build C r3 (Q2): says so when the press budget went to an unnamed control."""
+    named = not getattr(gen, "paid_unnamed", False)
+    return _refusal(ALREADY_PRESSED, _ALREADY_PRESSED_TEXT + ("" if named else _UNNAMED_PRESS_TEXT))
+
+
 PAY_PRESSED_NEXT = (
     "This was a Pay press. A Pay press's effect never means Pay failed (effect.unchanged is null): do not press Pay "
     "again; call payment_done.")
@@ -1273,6 +1300,12 @@ _PREP_WORDS = re.compile(
     r"anzeigen|details|more|mehr|less|weniger|close|schließen|accept|akzeptieren|agree|zustimmen|apply|einlösen|"
     r"select|auswählen|wählen|add|hinzufügen|proceed|fortfahren|suivant|continuer|siguiente|continuar|avanti|"
     r"continua|cookies?)\b", re.IGNORECASE)
+
+
+def _named_pay(role: str, caption: str) -> bool:
+    """build C r3 (Q2): the caption itself names a pay step (a pay word, a readable caption)."""
+    return role not in {"checkbox", "radio"} and isinstance(caption, str) and caption != CAPTION_WITHHELD \
+        and bool(_PAY_WORDS.search(caption))
 
 
 def _pay_press(role: str, caption: str) -> bool:
@@ -1531,6 +1564,29 @@ async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, elemen
     return None, top
 
 
+def _providers(sup: Any) -> frozenset:
+    from tools import browser_payment_done as done
+
+    with done._LOCK:
+        payments = list((done._PAYMENTS.get(sup) or {}).values())
+    return frozenset(o for p in payments for o in done._card_origins(p))
+
+
+def _bank_step(sup: Any, gate: _Gate, clicked: tuple, top: tuple) -> bool:
+    """build C r3 (Q1): the pressed document is a bank's own step after an admitted press, by the same two
+    classifications ``_pay_gate`` exempts from the merchant total (r4 C4, C5): a bank challenge in place of a card
+    document, or (the payment tab's top document changed to) a document on another site than the merchant. Never a
+    document on a payment provider's origin (a hosted payment page): that stays under the one-press refusal. A
+    document on an unrecorded other site cannot be told from a bank's: it counts as one (the caption check and the
+    same top frame still hold)."""
+    if not gate.admitted or gate.approved is None or gate.approved is UNBOUND:
+        return False
+    _cents, _currency, _fid, loader, merchant = gate.approved
+    if top[1] == loader:
+        return _bank_challenge(sup, clicked, merchant)
+    return cross_site(top[2], merchant) and _origin_of(top[2]) not in _providers(sup)
+
+
 def _bank_challenge(sup: Any, clicked: tuple, merchant: str) -> bool:
     """r4 C5: the pressed document is a bank challenge in place of a card document: a frame that held one of this
     payment's card documents now shows another document (new loader) on a site that is not the merchant's, and not on
@@ -1543,7 +1599,7 @@ def _bank_challenge(sup: Any, clicked: tuple, merchant: str) -> bool:
     with done._LOCK:
         payments = list((done._PAYMENTS.get(sup) or {}).values())
     documents = {d for p in payments for d in p.documents}
-    providers = {o for p in payments for o in done._card_origins(p)}
+    providers = _providers(sup)
     return (fid in {d[0] for d in documents} and (fid, loader) not in documents and cross_site(url, merchant)
             and _origin_of(url) not in providers)
 
@@ -1634,8 +1690,11 @@ def payment_controls(supervisor: Any) -> dict:
 
 # dlz (Codex r3 P1, r4 P1): payment_click / payment_close admission, process-wide under _LOCK (not per supervisor:
 # a supervisor replaced after a reconnect drives the same browser slot). A close is admitted only with no click
-# running anywhere in this process, and a click only with no close admitted anywhere.
+# running anywhere in this process, and a click only with no close admitted anywhere. build C r3 (Q3): a click is
+# refused ``payment_click_busy`` only by another click on the same supervisor (``_PRESSING``).
 _PRESSING_N = 0  # payment_click calls running (their press may be on the wire)
+# build C r3 (Q3): the same, per supervisor (one browser slot): two tasks on two browsers never refuse each other
+_PRESSING: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _CLOSING_N = 0  # payment_close calls admitted and not yet returned
 
 
@@ -1646,7 +1705,7 @@ class _LockGen:
     press may have landed in it), when control already reported the slot locked, or when control's lock already
     held other tabs. Read and written under ``_LOCK``."""
 
-    __slots__ = ("admitted", "approved", "known", "native_lost", "owned", "paid", "pressed", "presses", "serial", "ws")
+    __slots__ = ("admitted", "approved", "known", "native_lost", "owned", "paid", "paid_unnamed", "pressed", "presses", "serial", "ws")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
@@ -1669,6 +1728,7 @@ class _LockGen:
         # ``approved`` was dispatched. Every later Pay press through the pay gate in this record is refused
         # (``payment_already_pressed``); a new fill starts a new record (a new approval).
         self.paid = False
+        self.paid_unnamed = False  # build C r3 (Q2): that press was a control no pay word names (icon-only, unknown)
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
@@ -1732,17 +1792,18 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
     with _LOCK:  # dlz (Codex r3/r4 P1): one step admits the click against a payment_close running anywhere
         if _CLOSING_N > 0:  # the ref stays in its listing
             return _refusal("payment_close_busy", _CLICK_CLOSING)
-        if _PRESSING_N > 0:  # build C r2 (P2): one click at a time, its settle included; the ref stays
-            return _refusal(CLICK_BUSY, _CLICK_BUSY_TEXT)
+        if _PRESSING.get(supervisor, 0) > 0:  # build C r2 (P2, r3 Q3): one click at a time per browser, its settle
+            return _refusal(CLICK_BUSY, _CLICK_BUSY_TEXT)  # included; the ref stays
         issued = _ISSUED.get(supervisor)
         spec = issued.pop(ref, None) if isinstance(ref, str) and _REF_RE.fullmatch(ref) and issued else None
         if spec is not None:  # dlz (Opus r2): payment_close does not close the tab under a press still running
             gen = _GENS.get(supervisor) if supervisor in _HELD else None  # the lock this press belongs to
-            if (gen is not None and gen.paid and gen.approved is not None
-                    and _pay_press(spec[2], spec[3])):  # build C r2 (P1): nothing is read on the page
-                issued[ref] = spec
-                return _refusal(ALREADY_PRESSED, _ALREADY_PRESSED_TEXT)
+            if (gen is not None and gen.paid and gen.approved is None and owner_go is True
+                    and _pay_press(spec[2], spec[3])):  # build C r3: owner_go is held to the one press too; nothing is
+                issued[ref] = spec  # read on the page (an approved total's bank step is told apart in _click)
+                return _already_pressed(gen)
             _PRESSING_N += 1
+            _PRESSING[supervisor] = _PRESSING.get(supervisor, 0) + 1
             # r4 C2: the approval and the claim generation it belongs to, re-checked right before the press
             gate = _Gate(gen.approved if gen is not None else None, gen is not None and gen.admitted,
                          owner_go is True, _EPOCHS.get(supervisor, 0), gen)
@@ -1759,6 +1820,7 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
                 gen.pressed = True  # a press marked outside _book_press still counts (never admits, never pays)
                 gen.presses += 1
             _PRESSING_N = max(0, _PRESSING_N - 1)
+            _PRESSING[supervisor] = max(0, _PRESSING.get(supervisor, 0) - 1)
     if out.get("success"):
         out["clicked"] = ref
     elif not progress:  # nothing was pressed: the ref stays usable, if its listing is still the latest

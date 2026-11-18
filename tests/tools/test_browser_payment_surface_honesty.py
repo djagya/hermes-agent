@@ -491,7 +491,11 @@ def test_a_second_pay_press_in_one_approval_is_refused_before_dispatch():
         second = surface.payment_click(sup, listing["controls"][0]["ref"], owner_go=owner_go)
         assert second == {"success": False, "error_type": surface.ALREADY_PRESSED, "error": surface._ALREADY_PRESSED_TEXT}
         assert "never press Pay again" in second["error"] and "payment_done" in second["error"]
-        assert sup.calls[calls:] == [] or all(c[0] == "Hermes.paymentSurfaceStatus" for c in sup.calls[calls:])
+        # r3 Q1: the page is read (the document it is, to tell a bank's step from a Pay), never moved over or pressed,
+        # and no total is read
+        assert not [c for c in sup.calls[calls:] if c[0] == "Input.dispatchMouseEvent"]
+        assert not [c for c in sup.calls[calls:] if c[0] == "Page.createIsolatedWorld"
+                    and c[1]["worldName"] == "hermes-payment-total"]
     assert len(_mouse_presses(sup)) == 1 and surface.presses_in_lock(sup) == 1
 
 
@@ -680,3 +684,171 @@ def test_detail_safe_reads_every_card_frame_against_the_top(frames, safe):
     assert surface.claim_payment_surface(sup, _hosted()) is None
     assert surface.detail_safe(sup, frames) is safe
     assert surface.detail_safe(FakeSup(), frames[:1]) is False, "no payment: never"
+
+
+# ------------------------------------------------------------------ round 3 (owner corrections to round 2)
+
+
+class _RowsSup(FakeSup):
+    """A FakeSup whose listed controls are ``rows`` (change ``rows`` between listings)."""
+
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def default(self, method, params, session):
+        if method == "Runtime.callFunctionOn" and params["functionDeclaration"] == surface._DESCRIBE:
+            return {"result": {"value": self.rows}}
+        return super().default(method, params, session)
+
+
+def _row(text, role="button", i=0):
+    return {"i": i, "role": role, "text": text, "disabled": False}
+
+
+def _pay_then(rows_after, tree, listed=None):
+    """A claimed approval whose Pay was pressed once; then the page shows ``tree`` with ``rows_after`` controls."""
+    from tests.tools.test_browser_payment_surface import _claimed
+
+    sup = _claimed(_RowsSup([_row("Pay now")]))
+    assert surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])["success"] is True
+    sup.rows = rows_after
+    sup.tree, sup.listed = tree, listed or tree
+    return sup
+
+
+def _again(sup, index=0):
+    from tests.tools.test_browser_payment_surface import _total_reads
+
+    reads = len(_total_reads(sup))
+    mouse = len(_mouse_presses(sup))
+    out = surface.payment_click(sup, surface.payment_controls(sup)["controls"][index]["ref"])
+    return out, len(_total_reads(sup)) - reads, len(_mouse_presses(sup)) - mouse
+
+
+BANK_FRAME = ("CARD", "L9", "https://acs.bank.test/challenge", "https://acs.bank.test", "PAGE")
+BANK_TOP = ("PAGE", "LB", "https://acs.bank.test/challenge", "https://acs.bank.test", "")
+PROVIDER_FRAME = ("CARD", "L9", "https://psp.test/confirm", "https://psp.test", "PAGE")
+PROVIDER_TOP = ("PAGE", "LB", "https://psp.test/hosted", "https://psp.test", "")
+
+
+@pytest.mark.parametrize("top_case", [False, True], ids=["challenge in the card frame", "bank page as top document"])
+def test_after_pay_a_bank_challenge_is_pressed_whatever_its_button_says(top_case):
+    """r3 Q1: Pay was pressed once; the issuer's 3-D Secure document (a challenge replacing the card frame, or the
+    payment tab's top document on another site) has its own "Confirm" / "Pay", the issuer's confirmation and not a
+    second charge: pressed, with no merchant total to read."""
+    from tests.tools.test_browser_payment_surface import TREE
+
+    for caption in ("Confirm", "Submit", "Pay 100.00 EUR"):
+        sup = _pay_then([_row(caption)], (BANK_TOP, TREE[1]) if top_case else (TREE[0], BANK_FRAME))
+        out, total_reads, pressed = _again(sup)
+        assert out["success"] is True and pressed == 1 and total_reads == 0, (top_case, caption)
+        assert surface.presses_in_lock(sup) == 2
+        # ... but still only that bank step: the next Pay-like press on the merchant document is refused
+        sup.tree = sup.listed = TREE
+        out, _reads, pressed = _again(sup)
+        assert out["error_type"] == surface.ALREADY_PRESSED and pressed == 0, (top_case, caption)
+
+
+@pytest.mark.parametrize("where", ["provider_frame", "provider_top", "merchant", "merchant_review"])
+def test_after_pay_the_one_press_stays_refused_off_the_bank(where):
+    """r3 Q1: Pay on the merchant document, on the payment provider's documents (a hosted page or a card frame) and
+    on a same-site review page is refused with nothing pressed or moved; a bank page in another tab is no bank step."""
+    from tests.tools.test_browser_payment_surface import TREE
+
+    tree = {"provider_frame": (TREE[0], PROVIDER_FRAME), "provider_top": (PROVIDER_TOP, TREE[1]), "merchant": TREE,
+            "merchant_review": (("PAGE", "LR", "https://checkout.shop.test/review", "https://checkout.shop.test", ""),
+                                TREE[1])}[where]
+    sup = _pay_then([_row("Pay now")], tree)
+    calls = len(sup.calls)
+    out, total_reads, pressed = _again(sup)
+    assert out["error_type"] == surface.ALREADY_PRESSED and total_reads == 0 and pressed == 0
+    assert not [c for c in sup.calls[calls:] if c[0] == "Input.dispatchMouseEvent"]
+    assert surface.presses_in_lock(sup) == 1
+
+
+def test_a_bank_page_before_any_press_is_still_a_pay_press():
+    """r3 Q1: the exemption is for a press after the Pay press only; before it the bank page rule is unchanged (it
+    needs an admitted press) and the control counts as the approval's Pay press."""
+    from tests.tools.test_browser_payment_surface import TREE, _claimed
+
+    sup = _claimed(_RowsSup([_row("Continue")]))
+    assert surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])["success"] is True
+    sup.rows = [_row("Confirm")]
+    sup.tree = sup.listed = (BANK_TOP, TREE[1])
+    assert _again(sup)[0]["success"] is True  # admitted by Continue, so the bank step goes; it is Pay (none yet)
+    sup.tree = sup.listed = TREE
+    assert _again(sup)[0]["error_type"] == surface.ALREADY_PRESSED  # ... and that was the one Pay press
+
+
+def test_two_supervisors_do_not_refuse_each_others_clicks(monkeypatch):
+    """r3 Q3: payment_click_busy is per browser: with one supervisor's click held in its settle, another supervisor's
+    click goes through, and the first one's own second click is still refused."""
+    import threading
+
+    from tests.tools.test_browser_payment_surface import _claimed
+    from tests.waiting import wait_until
+
+    release, original = threading.Event(), surface._bounded_effect
+    first, second = _claimed(_RowsSup([_row("Pay now"), _row("Continue", i=1)])), _claimed(_RowsSup([_row("Pay now")]))
+
+    async def paused(sup, *args, **kwargs):
+        while sup is first and not release.is_set():
+            await asyncio.sleep(0.01)
+        return await original(sup, *args, **kwargs)
+
+    monkeypatch.setattr(surface, "_bounded_effect", paused)
+    refs = [c["ref"] for c in surface.payment_controls(first)["controls"]]
+    out = {}
+    worker = threading.Thread(target=lambda: out.setdefault("first", surface.payment_click(first, refs[0])),
+                              daemon=True)
+    worker.start()
+    try:
+        wait_until(lambda: len(_mouse_presses(first)) == 1, what="the first press dispatched")
+        assert surface.payment_click(first, refs[1])["error_type"] == surface.CLICK_BUSY
+        other = surface.payment_click(second, surface.payment_controls(second)["controls"][0]["ref"])
+        assert other["success"] is True and len(_mouse_presses(second)) == 1
+    finally:
+        release.set()
+        worker.join(timeout=10)
+    assert out["first"]["success"] is True
+    assert surface.payment_click(first, refs[1])["success"] is True  # the busy refusal kept the ref
+
+
+def test_owner_go_is_held_to_one_pay_press_per_approval():
+    """r3: a fill-only card pressed with the owner's go in chat: its Pay press is the only one; a second Pay-like
+    press (with the go again) is refused before anything is read, a preparatory press still goes, and a new fill
+    starts a new approval."""
+    from tests.tools.test_browser_payment_surface import _claimed
+
+    sup = _claimed(_RowsSup([_row("Pay now"), _row("Terms", role="link", i=1)]), approved=None)
+    refs = lambda: [c["ref"] for c in surface.payment_controls(sup)["controls"]]
+    first = surface.payment_click(sup, refs()[0], owner_go=True)
+    assert first["success"] is True and first["pay_pressed"] is True
+    ref = refs()[0]
+    calls = len(sup.calls)
+    second = surface.payment_click(sup, ref, owner_go=True)
+    assert second == {"success": False, "error_type": surface.ALREADY_PRESSED, "error": surface._ALREADY_PRESSED_TEXT}
+    assert not [c for c in sup.calls[calls:] if c[0] not in {"Hermes.paymentSurfaceStatus"}]
+    assert surface.payment_click(sup, refs()[1], owner_go=True)["success"] is True
+    assert len(_mouse_presses(sup)) == 2
+    assert surface.claim_payment_surface(sup, _inspected()) is None  # a new fill: a new approval
+    assert surface.payment_click(sup, refs()[0], owner_go=True)["success"] is True
+
+
+def test_an_unnamed_control_that_used_the_press_says_so_and_hands_over():
+    """r3 Q2: an icon-only (or unreadable) button before Pay counts as the Pay press (fail closed); the refusal that
+    follows says the press was used by an unnamed control and to hand over."""
+    from tests.tools.test_browser_payment_surface import _claimed
+
+    sup = _claimed(_RowsSup([_row(""), _row("Pay now", i=1)]))
+    refs = [c["ref"] for c in surface.payment_controls(sup)["controls"]]
+    assert surface.payment_click(sup, refs[0])["pay_pressed"] is True
+    refused = surface.payment_click(sup, surface.payment_controls(sup)["controls"][1]["ref"])
+    assert refused["error_type"] == surface.ALREADY_PRESSED
+    assert "could not tell from Pay" in refused["error"] and "hand over" in refused["error"]
+    assert refused["error"].startswith(surface._ALREADY_PRESSED_TEXT)
+    named = _claimed(_RowsSup([_row("Pay now"), _row("Pay now", i=1)]))
+    surface.payment_click(named, surface.payment_controls(named)["controls"][0]["ref"])
+    again = surface.payment_click(named, surface.payment_controls(named)["controls"][1]["ref"])
+    assert again["error"] == surface._ALREADY_PRESSED_TEXT
