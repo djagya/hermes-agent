@@ -270,6 +270,16 @@ _INSPECT_TEMPLATE = r"""(() => {
     // dlz (D-0358 a, 11-18): the inspection indexes of the exposed fields that hold no value now (indexes only).
     blanks: () => entries.filter(x => { try { return !String(x.e.value == null ? '' : x.e.value).trim(); }
                                         catch (_) { return true; } }).map(x => x.index),
+    // dlz (B final, Codex P1): how many fields exposed now were not exposed at inspection and hold no value (a
+    // field a card input's handler revealed during the fill); -1 when the document cannot say. A count only.
+    revealed: () => {
+      try {
+        if (document !== doc || location.href !== href) return -1;
+        return allInputs().filter(e => { const n = elements.indexOf(e);
+          return !(n >= 0 && selected.has(n)) && exposure(e) === true && !String(e.value == null ? '' : e.value).trim();
+        }).length;
+      } catch (_) { return -1; }
+    },
     // dlz (B4, discovery only): the fields shown now, for a card-free document's absence check; null once the
     // document or its URL changed.
     scan: () => {

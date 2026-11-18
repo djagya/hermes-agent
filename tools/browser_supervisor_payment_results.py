@@ -93,7 +93,7 @@ def _left_for_user(classified: list, card: tuple, merchant_doc: bool) -> tuple:
 # A formless field that is page chrome, not checkout: a search box, a coupon/voucher/gift-card or newsletter box.
 # Without a <form> around the card these sit in the same scope; counting them would hold Pay on every such page.
 _CHROME = re.compile(r"\b(?:search\w*|query|q|suche\w*|recherche\w*|buscar|cerca|zoeken|coupon\w*|promo\w*|voucher\w*|"
-                     r"gutschein\w*|rabatt\w*|discount\w*|gift\w*|geschenk\w*|newsletter\w*)\b")
+                     r"gutschein\w*|rabatt\w*|discount\w*|gift ?card\w*|gift ?code|geschenkkarte\w*|newsletter\w*)\b")
 
 
 def _page_chrome(row: dict) -> bool:

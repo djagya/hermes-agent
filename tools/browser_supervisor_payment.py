@@ -127,6 +127,8 @@ class PaymentDocument:
     # those of its exposed fields that held no value at inspection (None: unknown, every such field counts as empty).
     left_for_user: tuple = ()
     blank: Any = None
+    # dlz (B final): empty fields exposed after the fill that were not exposed at inspection (counted, not written).
+    revealed: int = 0
 
 
 @dataclass
@@ -934,6 +936,18 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         for d in i.documents:
             if d.left_for_user or any(c.token in OPTIONAL_CARD_TOKENS for c in d.controls):
                 d.blank = await self._blanks(d.frame_session, d.object_id)
+            d.revealed = await self._revealed(d.frame_session, d.object_id)
+
+    async def _revealed(self, fsid: str, obj: str) -> int:
+        """dlz (B final, Codex P1): empty fields a page script exposed during the fill (a card input's handler adding a
+        billing postcode). 0 when the document cannot say: unknown is not a field seen empty."""
+        try:
+            n = _value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": obj, "functionDeclaration": "function(){return this.revealed()}", "returnByValue": True},
+                session_id=fsid))
+        except Exception:  # health: allow BLE001 -- unknown: no field is claimed seen empty
+            return 0
+        return n if type(n) is int and 0 < n <= _DISCOVERY_LIMITS["inputs"] else 0
 
     async def _blanks(self, fsid: str, obj: str) -> frozenset | None:
         """dlz (D-0358 a): the exposed fields of a pinned document that hold no value (indexes only; a field the user

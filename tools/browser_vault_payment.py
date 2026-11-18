@@ -979,7 +979,8 @@ def _form_report(result: dict, inspected, fills: list, locked: bool) -> dict:
         def empty(index, blank=blank):
             return blank is None or index in blank
 
-        by_document.append(sum(1 for n in getattr(d, "left_for_user", ()) if empty(n)))
+        by_document.append(sum(1 for n in getattr(d, "left_for_user", ()) if empty(n))
+                           + int(getattr(d, "revealed", 0) or 0))
         for c in d.controls:
             if c.token not in OPTIONAL_CARD_TOKENS:
                 continue

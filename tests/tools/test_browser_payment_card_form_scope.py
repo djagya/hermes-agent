@@ -245,6 +245,43 @@ approve = () => { holder.held = 'Grace Hopper'; };  // the user types it after t
         js.close()
 
 
+def test_a_field_revealed_by_the_fill_makes_the_form_incomplete(tmp_path, monkeypatch):
+    """B final (Codex P1): the card number's input handler adds an empty billing postcode while the fill runs. The
+    fill succeeds, but the result must not say complete: the new empty field is counted."""
+    from tests.tools.test_browser_payment_repin import MERCHANT as _M
+    from tests.tools.test_browser_payment_repin import _SYNTHETIC, _ClosureSupervisor, _NodeClosure
+
+    scenarios = {"reveals_zip": """
+const exp = input({id: 'exp', autocomplete: 'cc-exp'}), csc = input({id: 'csc', autocomplete: 'cc-csc'});
+const num = input({id: 'num', autocomplete: 'cc-number'});
+els = [num, exp, csc];
+let added = false;
+num.oninput = () => { if (!added) { added = true; els.push(input({id: 'zip', autocomplete: 'postal-code'})); } };"""}
+    js = _NodeClosure("reveals_zip", tmp_path, scenarios)
+    try:
+        controls = sp._card_controls(js.call("describe"))
+        doc = PaymentDocument("card", "s", "o-card", PSP, controls, clock_anchor=time.monotonic(), blank=frozenset())
+        i = PaymentInspection("op", "s", "tab", _M, (doc,), (("card", "L", PSP + "/card", PSP, ""),),
+                              time.monotonic() + 60)
+        fills = bvp._document_fills(i, _SYNTHETIC)
+        monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
+        out = asyncio.run(_ClosureSupervisor(js)._commit_payment_once(i, fills, None))
+        assert out["success"] is True, out
+        assert doc.revealed == 1
+        report = bvp._form_report(out, i, fills, locked=False)
+        assert report["form_complete"] is False and report["fields_left_empty"]["other_fields"] == 1
+        assert js.call("revealed") in (0, 1)  # a count only, never a value
+    finally:
+        js.close()
+
+
+def test_gift_recipient_fields_still_count_on_a_formless_checkout():
+    """B final (Codex P2): a gift-card redemption box is page chrome; the recipient's name or e-mail is checkout."""
+    for name, label in (("giftRecipientEmail", "Recipient e-mail"), ("giftRecipientName", "Gift recipient name")):
+        document = _document([*_FORMLESS, _row(3, name, label, form=None)], blank=frozenset({3}))
+        assert document.left_for_user == (3,), name
+
+
 # --- 5: masking of results that name no slot ----------------------------------------------------------------------
 
 
