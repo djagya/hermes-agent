@@ -35,6 +35,13 @@ class LocalLoginBackend(LoginBackend):
         seed = str(_store().resolve_secret(handle).get("otp_secret") or "")
         return totp_now(seed) if seed else None
 
+    def resolve_recovery_codes(self, handle: str, field: str) -> list[str]:
+        """D-0365: codes stored on the item under a key named like ``field`` ("recovery_codes")."""
+        from agent.vault_recovery_codes import field_matches, parse_codes
+
+        secret = _store().resolve_secret(handle)
+        return parse_codes(str(v) for k, v in secret.items() if field_matches(field, str(k)))
+
     def resolve_secret(self, handle: str) -> dict[str, str]:
         return {k: str(v) for k, v in _store().resolve_secret(handle).items()}
 
