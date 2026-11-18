@@ -169,7 +169,7 @@ def _load(path: Path) -> Optional[dict]:
     """The ledger, or None when it does not exist yet. An existing ledger that does not parse (or lacks its
     key) raises :class:`RecoveryLedgerUnreadable`: a fresh key would forget every spent code."""
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return None
     except OSError:
