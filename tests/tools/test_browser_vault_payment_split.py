@@ -1845,6 +1845,15 @@ _M2_SEPARATED_LABELS = [
     # ... and the explicit document purposes still veto.
     ({"label": "Residence permit valid until"}, None), ({"name": "f1 ", "label": "Passport expiry"}, None),
     ({"label": "Driver's license expiry"}, None), ({"label": "Identity card valid until"}, None),
+    ({"name": "documentExpiryDate ", "label": "Expiry date"}, None), ({"name": "docExpiry ", "label": "Expiry date"}, None),
+    ({"name": "idExpiry ", "label": "Expiry date"}, None), ({"name": " expiry", "label": "Passport expiry"}, None),
+    # A hint naming another purpose beside the card role names nothing.
+    ({"name": " ", "hint": "Card number or phone"}, None), ({"name": " ", "hint": "Card number (ID number for business)"}, None),
+    ({"name": " ", "hint": "Name on card or billing address"}, None),
+    # A label naming another name beside a separated holder attribute; a recognised token with another purpose.
+    ({"name": "card-holder", "label": "Maiden name"}, None), ({"name": "card-holder", "label": "Nickname"}, None),
+    ({"name": "card-holder", "label": "Display name"}, None), ({"name": "card-holder", "label": "Firstname Lastname"}, "cc-name"),
+    ({"name": "cardholder ", "label": "Name on card", "autocomplete": "nickname"}, None),
 ])
 def test_round_4_new_reach_needs_positive_evidence(control, token):
     assert _token(**control) == token
