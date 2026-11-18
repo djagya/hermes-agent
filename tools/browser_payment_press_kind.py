@@ -126,7 +126,17 @@ PREP_CHECK = r"""function(arr, idx, ...owners){
   if (!box) return false;
   return idx.some(i => { const el = arr[i]; return !!el && el !== this && el.isConnected && !box.contains(el); }); }"""
 # On the listing array: every element at ``idx`` is still listed (connected, laid out, visible) and enabled.
-STILL_LISTED = r"""function(idx){ return idx.every(i => { const el = this[i];
+# build F r3 (Opus final M1): installed on the listing array right before a preparatory press, in the controls' world:
+# any form submit, unload or navigation that STARTS after the press marks it, so an order still in flight at the read
+# (the new document not committed yet) re-books the press as the Pay press. Window/document events reach this world.
+WATCH_LEAVE = r"""function(){ const s = {left: false}; const mark = () => { s.left = true; };
+  window.addEventListener('beforeunload', mark, true); window.addEventListener('pagehide', mark, true);
+  document.addEventListener('submit', mark, true);
+  try { if (window.navigation) window.navigation.addEventListener('navigate', mark); } catch (e) {}
+  this.__hermesPrepLeave = s; return true; }"""
+
+STILL_LISTED = r"""function(idx){ const s = this.__hermesPrepLeave; if (!s || s.left) return false;
+  return idx.every(i => { const el = this[i];
   if (!el || !el.isConnected) return false;
   const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
   return r.width >= 1 && r.height >= 1 && st.visibility === 'visible' && st.display !== 'none'
@@ -213,10 +223,23 @@ async def prep_args(sup: Any, gen: Any, clicked: tuple, control: dict, doc_contr
     return (idx, list(held)) if await preparatory(sup, sid, element, arr, idx, held) else None
 
 
+async def watch_leave(sup: Any, sid: str, arr: str) -> bool:
+    """build F r3: install ``WATCH_LEAVE`` before a preparatory press. False: not installed (the caller keeps the press
+    the Pay press: an unwatched submit cannot be taken back)."""
+    try:
+        reply = await sup._cdp("Runtime.callFunctionOn", {"objectId": arr, "functionDeclaration": WATCH_LEAVE,
+                                                          "returnByValue": True}, session_id=sid)
+    except Exception as exc:  # health: allow BLE001 -- unwatched: the preparatory press stays the Pay press
+        logger.info("payment_click: leave watch not installed (%s)", type(exc).__name__)
+        return False
+    return ((reply.get("result") or {}).get("result") or {}).get("value") is True
+
+
 async def prep_verdict(sup: Any, sid: str, arr: str, prep: tuple, effect: Optional[dict]) -> Optional[str]:
     """build F r2: after a preparatory press, why it counts as the Pay press after all (``navigated``: the top
     document changed; ``purchase_button_gone``: a purchase button listed before it is gone or disabled;
-    ``effect_unread``), or None: it stays a preparatory step."""
+    ``effect_unread``; a submit, unload or navigation that started after the press also reads as
+    ``purchase_button_gone`` via ``STILL_LISTED``), or None: it stays a preparatory step."""
     if not isinstance(effect, dict):
         return "effect_unread"
     if effect.get("navigated") is not False:

@@ -52,6 +52,7 @@ from tools.browser_payment_press_kind import (  # build F: which press is the Pa
     pay_node,
     prep_args,
     prep_verdict,
+    watch_leave,
     preparatory,
 )
 
@@ -1175,6 +1176,8 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
             return refused
         if prep is not None and not await preparatory(sup, sid, element, arr, *prep):  # build F: read again
             return _changed()
+        if prep is not None and not await watch_leave(sup, sid, arr):  # build F r3: unwatched: the Pay press
+            prep, pay_like = None, True
         # build C r4: the dialogs open in the merchant document right before this approval's Pay press
         dialogs = (await _open_dialogs(sup, sid, element) if pay_like and after is None and not card
                    and gate.gen is not None and not gate.gen.paid else None)

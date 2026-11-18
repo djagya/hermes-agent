@@ -54,9 +54,17 @@ _NUMBER = (r"bestellnummer|auftragsnummer|buchungsnummer|order number|order no\.
 ORDER_SRC = (rf"(?<!%L%)(?:(?:{_NOUN})(?:\s+(?:{_FILL})){{0,4}}\s+(?:{_VERB})|{_THANKS}|{_NUMBER})(?!%L%)")
 FAILURE_SRC = (
     r"(?<!%L%)(?:fehlgeschlagen|abgelehnt|abgebrochen|zahlungsfehler|keine bestellung|"
-    r"nicht\s+(?:%L%+\s+){0,2}?(?:erfolgreich|aufgegeben|abgeschlossen|durchgeführt|ausgeführt|bearbeitet|bestätigt|"
-    r"möglich)|failed|declined|unsuccessful|not\s+(?:been\s+)?(?:placed|completed|complete|processed|successful|"
-    r"confirmed|accepted)|no order|error|échoué|échouée|échec|refusé|refusée|n['’]a pas abouti|fallido|fallida|"
+    r"nicht\s+(?:%L%+\s+){0,2}?(?:erfolgreich|aufgegeben|abgeschlossen|durchgeführt|ausgeführt|bearbeitet|bestätigt"
+    r")|"
+    # build F r3 (Opus final M2): the bare English words need a payment or order word nearby ("If you notice an error
+    # in your order, contact us" on a real thank-you page is not a failure)
+    r"(?:payment|transaction|card|order|purchase|checkout)\s+(?:%L%+\s+){0,3}?(?:failed|declined|unsuccessful|"
+    r"was not (?:placed|completed|processed|successful|accepted))|"
+    r"(?:failed|declined|unsuccessful)\s+(?:%L%+\s+){0,2}?(?:payment|transaction|order|purchase)|"
+    r"(?:payment|order|transaction)\s+(?:%L%+\s+){0,2}?error|an error (?:has )?occurred|"
+    r"no order (?:was|has been) (?:created|placed)|"
+    r"not\s+(?:been\s+)?(?:placed|completed|processed|accepted)|"
+    r"échoué|échouée|échec|refusé|refusée|n['’]a pas abouti|fallido|fallida|"
     r"rechazado|rechazada|non\s+(?:è\s+)?(?:riuscito|riuscita|andato a buon fine)|rifiutato|rifiutata|mislukt|"
     r"geweigerd|niet gelukt)(?!%L%)")
 

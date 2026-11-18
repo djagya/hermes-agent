@@ -146,6 +146,9 @@ class SundaySup(DialogSup, EffectSup):
             if isinstance(answer, Exception):
                 raise answer
             return {"result": {"value": answer}}
+        if method == "Runtime.callFunctionOn" and fn == kind.WATCH_LEAVE:
+            self.watched = getattr(self, "watched", 0) + 1
+            return {"result": {"value": getattr(self, "watch", True)}}
         if method == "Runtime.callFunctionOn" and fn == kind.STILL_LISTED:
             if isinstance(self.still, Exception):
                 raise self.still
@@ -172,6 +175,17 @@ def _sunday(rows=None, prep=(True,)):
 
 def _click(sup, index):
     return surface.payment_click(sup, surface.payment_controls(sup)["controls"][index]["ref"])
+
+
+def test_an_unwatched_confirm_stays_the_pay_press():
+    """F r3: when the leave watch cannot be installed, a submit that starts after the press could not be seen: the
+    confirm stays the approval's Pay press and the purchase is refused."""
+    sup = _sunday()
+    sup.watch = False
+    first = _click(sup, TOP_CONFIRM)
+    assert first["pay_pressed"] is True and sup.watched == 1
+    assert _click(sup, TOP_BUY)["error_type"] == surface.ALREADY_PRESSED
+    assert len(_mouse_presses(sup)) == 1
 
 
 def test_sunday_the_method_confirm_is_preparatory_and_the_purchase_is_the_one_pay_press():
@@ -470,6 +484,42 @@ def test_bare_thanks_and_checkout_words_are_no_order_wording(text):
 @pytest.mark.parametrize("text", FAILURE_PHRASES)
 def test_failure_phrases(text):
     assert evidence.wording("", text)["failure"] is True
+
+
+@pytest.mark.parametrize("text", [
+    "Vielen Dank für Ihre Bestellung! Bestellnummer 10023. Eine Änderung der Bestellung ist leider nicht mehr möglich.",
+    "Thank you for your order! If you notice an error in your order, please contact us.",
+    "Thank you for your order. No order confirmation email? Check your spam folder.",
+])
+def test_service_text_on_a_real_thank_you_page_is_no_failure(text):
+    """F r3 (Opus final M2): ordinary service text is not failure wording; the order wording still counts."""
+    assert evidence.wording("", text) == {"order": True, "failure": False}
+
+
+def test_a_submit_that_started_after_the_preparatory_press_rebooks_it(tmp_path):
+    """F r3 (Opus final M1): the leave watch marks a submit, unload or navigation that starts after the press, so an
+    order still in flight when the effect is read re-books the confirm as the Pay press (STILL_LISTED answers False)."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required to run the page script")
+    harness = (
+        "const listeners = {}; const on = (k) => (t, f) => { (listeners[k + t] = listeners[k + t] || []).push(f); };\n"
+        "const window = {addEventListener: on('w')}; const document = {addEventListener: on('d')};\n"
+        "const getComputedStyle = () => ({visibility: 'visible', display: 'block'});\n"
+        "const buy = {isConnected: true, disabled: false, getAttribute: () => null,\n"
+        "  getBoundingClientRect: () => ({width: 10, height: 10})};\n"
+        "const arr = [null, buy];\n"
+        f"const still = {kind.STILL_LISTED};\n"
+        f"const before = still.call(arr, [1]);\n"
+        f"({kind.WATCH_LEAVE}).call(arr);\n"
+        "const quiet = still.call(arr, [1]);\n"
+        "for (const f of listeners['dsubmit'] || []) f();\n"
+        "const after = still.call(arr, [1]);\n"
+        "process.stdout.write(JSON.stringify([before, quiet, after]));")
+    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
+    assert run.returncode == 0, run.stderr
+    # unwatched: counts as Pay; watched and quiet: still preparatory; a submit started: the Pay press after all
+    assert json.loads(run.stdout) == [False, True, False]
 
 
 _SCAN_DOM = r"""

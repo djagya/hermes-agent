@@ -427,7 +427,8 @@ _ORIGIN_REQUIRED = ("This checkout ran on a payment provider's own page, so the 
                     "the order confirmation will show.")
 _NOT_REACHED = ("No order confirmation was reached on the payment tab within the wait. reason says what the tab "
                 "showed last: pay_control_shown (the pressed Pay control is still on the page), failure_wording (the "
-                "page says the payment or order failed or was declined), no_order_wording (a page at the checkout "
+                "page shows failure or error wording; this can also appear on a real confirmation, so check the shop's "
+                "order history before any new attempt), no_order_wording (a page at the checkout "
                 "with no order wording), purchase_button_shown (a page at the checkout still offers a purchase "
                 "button), not_shop_page (a payment provider, bank (3-D Secure) or other site's page, or a card "
                 "form), loading (a page still loading or changing), page_unread (the page could not be read). "
