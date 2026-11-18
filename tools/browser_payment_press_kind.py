@@ -86,7 +86,8 @@ def same_caption(a: Any, b: Any) -> bool:
 
 
 # On the pressed control (the controls' isolated world of its document): the box it confirms in is the dialog it sits
-# in, else the nearest ancestor below <body> that holds a card iframe (a provider's card frame: ``origins``). True when
+# in, else the nearest ancestor below <body> that holds a card iframe (a provider's card frame: ``origins``), else the
+# nearest fixed-position ancestor (an overlay modal). True when
 # such a box exists and one of the listed purchase controls (``arr[i]`` for ``i`` in ``idx``) lies outside it.
 _PREP_CHECK = r"""function(arr, idx, origins){
   const top = [document.body, document.documentElement];
@@ -99,7 +100,14 @@ _PREP_CHECK = r"""function(arr, idx, origins){
     }
     return null;
   };
-  const box = this.closest('__DIALOG__') || cardBox(this);
+  // a modal that is a plain fixed-position overlay (no dialog role, card iframes whose src is set later)
+  const overlayBox = el => {
+    for (let n = el.parentElement; n && !top.includes(n); n = n.parentElement) {
+      try { if (getComputedStyle(n).position === 'fixed') return n; } catch (e) { return null; }
+    }
+    return null;
+  };
+  const box = this.closest('__DIALOG__') || cardBox(this) || overlayBox(this);
   if (!box || top.includes(box)) return false;
   return idx.some(i => { const el = arr[i]; return !!el && el !== this && el.isConnected && !box.contains(el); }); }"""
 

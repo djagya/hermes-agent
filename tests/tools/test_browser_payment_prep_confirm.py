@@ -60,6 +60,7 @@ const E = (tag, kids = [], o = {}) => {
   return el;
 };
 const location = {href: 'https://www.sunday.test/checkout/'};
+const getComputedStyle = n => ({position: n.fixed ? 'fixed' : 'static'});
 const card = () => E('iframe', [], {src: 'https://payment.unzer.test/card'});
 const confirm = E('button'), buy = E('button');
 """
@@ -72,6 +73,11 @@ _LAYOUTS = {
     "no box below body": ("[confirm, buy, card()]", False),
     "another site's iframe": ("[E('main', [buy]), E('section', [E('iframe', [], {src: 'https://ads.test/x'}), "
                               "confirm])]", False),
+    # a plain fixed overlay modal whose card iframes carry no src yet (set by the provider's script later)
+    "fixed overlay, no dialog, src-less frames": (
+        "[E('main', [buy]), E('div', [E('div', [E('iframe'), E('iframe')]), E('div', [confirm])], {fixed: true})]",
+        True),
+    "fixed overlay holding the purchase too": ("[E('div', [E('iframe'), confirm, buy], {fixed: true})]", False),
 }
 
 
