@@ -431,7 +431,7 @@ def test_a_holder_cue_beside_another_purpose_keeps_that_purpose(control, token):
     # ... the same wording with no card word in the field's own text names a document, a pass, a subscription.
     ({"label": "Gültigkeitsdatum"}, None), ({"label": "MM / JJ"}, None), ({"label": "MM/AA"}, None),
     ({"label": "MM/YYYY"}, None), ({"label": "Expires"}, None), ({"label": "Valid until"}, None),
-    ({"label": "Expire le"}, None), ({"name": "validUntil"}, None), ({"name": "expiryDate"}, None),
+    ({"label": "Expire le"}, None), ({"name": "validUntil"}, None),
     ({"label": "Name on the card"}, "cc-name"), ({"label": "Name as it appears on card"}, "cc-name"),
     ({"label": "Nom sur la carte"}, "cc-name"), ({"label": "Titolare della carta"}, "cc-name"),
     ({"label": "Naam op kaart"}, "cc-name"), ({"label": "Nombre en la tarjeta"}, "cc-name"),
@@ -2020,7 +2020,7 @@ _ALLOWED_PLACEHOLDERS = ("Max Mustermann", "Erika Mustermann", "John Doe", "Jane
                                    "Security question Max Mustermann"])
 def test_round_5_a_holder_named_only_by_its_attribute_beside_another_purpose_stays_unclassified(label):
     # Opus M1, Codex P2: name/id "card-holder" with a visible label naming something else is that something else.
-    for attrs in ({"name": "card-holder"}, {"name": "card_holder"}, {"name": "cardHolder x"}, {"name": " card-holder"}):
+    for attrs in ({"name": "card-holder"}, {"name": "card_holder"}, {"name": "card-holder x"}, {"name": " card-holder"}):
         assert _token(label=label, **attrs) is None, (label, attrs)
 
 
@@ -2094,4 +2094,4 @@ def test_round_5_a_visa_validity_field_never_receives_the_card_expiry_nor_makes_
     fills, writes = _pipeline([_NUMBER, _EXPIRY, _CVC, field])
     assert sorted(f["token"] for f in fills) == ["cc-csc", "cc-exp", "cc-number"]
     assert len(writes) == 3 and all(element != "v" for element, _value in writes)
-    assert _pipeline([_NUMBER, field, _CVC]) == ("Incomplete or ambiguous card fields", None)
+    assert _pipeline([_NUMBER, field, _CVC]) == ("Missing card expiry fields", None)

@@ -147,7 +147,7 @@ _RE_DOCUMENT_PURPOSE = re.compile(
     r"(?:id|identity|identification)\s*card|national\s*id|driv(?:er|ing)\w*(?:\s*s)?\s*licen[cs]e|"
     r"fuhrerschein\w*|residence\s*permit|aufenthalts\w*)\b")
 _RE_DOCUMENT_WORD = re.compile(r"\b(?:document\w*|dokument\w*|docs?|id\s*(?:exp\w*|valid\w*|gultig\w*|ablauf\w*))\b")
-_RE_ATTRIBUTE_CARD_WORD = re.compile(r"\b(?:card\w*|\w*karte\w*|cc|credit|kredit\w*)\b")
+_RE_ATTRIBUTE_CARD_WORD = re.compile(r"\b(?:card\w*|\w*karte\w*|carte|tarjeta|carta|kaart|cc|credit|debit|kredit\w*)\b")
 _RE_VISA = re.compile(r"\bvisa\b")
 _RE_VISA_TRAVEL = re.compile(r"\b(?:passport\w*|reisepass\w*|travel\w*|entry|einreise\w*|immigration)\b")
 # A date of birth shares the expiry's MM/YY shape ("Date of birth (MM/YY)", "Geburtsdatum MM/JJ"): the expiry rows
