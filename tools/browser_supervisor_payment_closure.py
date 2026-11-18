@@ -265,21 +265,24 @@ _INSPECT_TEMPLATE = r"""(() => {
       return 'valid';
     } catch (_) { return 'unknown'; }
   };
+  // dlz (B final, Codex P1): the fields exposed now that were not exposed at inspection and hold no value (a field a
+  // card input's handler revealed during the fill), described like describe() (no value); null when the document
+  // cannot say. The supervisor applies the card-form scope and page-chrome rules to them.
+  const revealedRows = () => {
+    try {
+      if (document !== doc || location.href !== href) return null;
+      const fresh = allInputs().filter(e => { const n = elements.indexOf(e);
+        return !(n >= 0 && selected.has(n)) && exposure(e) === true && !String(e.value == null ? '' : e.value).trim();
+      });
+      return bounded(fresh.map((e, k) => describeOne(e, -1 - k)), false);
+    } catch (_) { return null; }
+  };
   return {
     describe:()=>bounded(describe().filter(x=>selected.has(x.index)), unknown), valid,
     // dlz (D-0358 a, 11-18): the inspection indexes of the exposed fields that hold no value now (indexes only).
     blanks: () => entries.filter(x => { try { return !String(x.e.value == null ? '' : x.e.value).trim(); }
                                         catch (_) { return true; } }).map(x => x.index),
-    // dlz (B final, Codex P1): how many fields exposed now were not exposed at inspection and hold no value (a
-    // field a card input's handler revealed during the fill); -1 when the document cannot say. A count only.
-    revealed: () => {
-      try {
-        if (document !== doc || location.href !== href) return -1;
-        return allInputs().filter(e => { const n = elements.indexOf(e);
-          return !(n >= 0 && selected.has(n)) && exposure(e) === true && !String(e.value == null ? '' : e.value).trim();
-        }).length;
-      } catch (_) { return -1; }
-    },
+    revealed: () => revealedRows(),
     // dlz (B4, discovery only): the fields shown now, for a card-free document's absence check; null once the
     // document or its URL changed.
     scan: () => {
@@ -348,13 +351,15 @@ _INSPECT_TEMPLATE = r"""(() => {
       written = null;
       if (!w) return null;
       const page = document === doc && location.href === href;
-      return w.filter(f => f.done !== false).map(f => {
+      const states = w.filter(f => f.done !== false).map(f => {
         const el = f.index === -1 ? null : elements[f.index];
         // dlz: a field the provider hid in favour of a fresh input is not the one the user sees.
         if (!page || !el || !live(el) || !shown(el)) return {token:f.token,state:'replaced',length:0};
         return {token:f.token,state:same(el.value,f.value)?'held':el.value?'changed':'empty',length:el.value.length,
                 validity:validity(el)};
       });
+      // dlz (B final): one trailing marker names the empty fields the fill revealed, in the same round trip.
+      return states.concat([{revealed: revealedRows()}]);
     },
     // dlz: `repin` (config vault.payment_repin, reviewed destinations; a literal true only): the commit may pause
     // for a re-pin or a deferral. Without it this is the commit as it was before re-pinning existed: any change of

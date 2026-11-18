@@ -270,9 +270,46 @@ num.oninput = () => { if (!added) { added = true; els.push(input({id: 'zip', aut
         assert doc.revealed == 1
         report = bvp._form_report(out, i, fills, locked=False)
         assert report["form_complete"] is False and report["fields_left_empty"]["other_fields"] == 1
-        assert js.call("revealed") in (0, 1)  # a count only, never a value
+        rows = js.call("revealed")
+        assert [r["autocomplete"] for r in rows] == ["postal-code"] and all("value" not in r for r in rows)
     finally:
         js.close()
+
+
+def test_a_search_box_revealed_in_another_form_does_not_hold_pay(tmp_path, monkeypatch):
+    """B final (Codex delta P2): what the fill reveals is held to the card form's scope and the page-chrome rules: an
+    empty search box that appears in an unrelated form on the merchant page leaves the form complete."""
+    from tests.tools.test_browser_payment_repin import _SYNTHETIC, _ClosureSupervisor, _NodeClosure
+
+    scenarios = {"reveals_search": """
+const exp = input({id: 'exp', autocomplete: 'cc-exp'}), csc = input({id: 'csc', autocomplete: 'cc-csc'});
+const num = input({id: 'num', autocomplete: 'cc-number'});
+els = [num, exp, csc];
+let added = false;
+num.oninput = () => { if (!added) { added = true; els.push(input({id: 'q', name: 'q', type: 'search'})); } };"""}
+    js = _NodeClosure("reveals_search", tmp_path, scenarios)
+    try:
+        controls = sp._card_controls(js.call("describe"), True)
+        doc = PaymentDocument("top", "s", "o-card", MERCHANT, controls, clock_anchor=time.monotonic(), blank=frozenset())
+        i = PaymentInspection("op", "s", "tab", MERCHANT, (doc,), (("top", "L", MERCHANT + "/pay", MERCHANT, ""),),
+                              time.monotonic() + 60)
+        fills = bvp._document_fills(i, _SYNTHETIC)
+        monkeypatch.setattr(sp, "_SETTLE_SECONDS", 0)
+        out = asyncio.run(_ClosureSupervisor(js)._commit_payment_once(i, fills, None))
+        assert out["success"] is True, out
+        assert doc.revealed == 0
+        assert bvp._form_report(out, i, fills, locked=False) == {"form_complete": True}
+    finally:
+        js.close()
+
+
+def test_revealed_rows_follow_the_inspection_scope():
+    card = sp._card_controls(_FORM, True)
+    other_form = dict(_row(-1, "first", "First name", form=1))
+    same_form = dict(_row(-2, "zip", "Billing postcode", form=0))
+    assert rs._revealed_left([other_form, same_form], card, True) == 1
+    assert rs._revealed_left([other_form], card, False) == 1  # a hosted document: all of it is the card's
+    assert rs._revealed_left(None, card, True) == 0 and rs._revealed_left({"overflow": True}, card, True) == 1
 
 
 def test_gift_recipient_fields_still_count_on_a_formless_checkout():

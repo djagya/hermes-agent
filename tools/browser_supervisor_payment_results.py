@@ -90,6 +90,18 @@ def _left_for_user(classified: list, card: tuple, merchant_doc: bool) -> tuple:
     return tuple(out)
 
 
+def _revealed_left(rows: Any, card: tuple, merchant_doc: bool) -> int:
+    """dlz (B final, Codex P1): how many fields the fill revealed (the closure's ``revealed()`` rows, empty, not
+    exposed at inspection) belong to the card's form by the inspection's rules (``_left_for_user``: form scope,
+    formless page chrome). Unreadable: 0 (unknown is not a field seen empty)."""
+    if rows == {"overflow": True}:
+        return 1  # more revealed fields than a reading holds: not complete
+    if not isinstance(rows, list):
+        return 0
+    rows = [r for r in rows[:200] if isinstance(r, dict) and type(r.get("index")) is int and r["index"] < 0]
+    return len(_left_for_user([(r, None) for r in rows], card, merchant_doc))
+
+
 # A formless field that is page chrome, not checkout: a search box, a coupon/voucher/gift-card or newsletter box.
 # Without a <form> around the card these sit in the same scope; counting them would hold Pay on every such page.
 _CHROME = re.compile(r"\b(?:search\w*|query|q|suche\w*|recherche\w*|buscar|cerca|zoeken|coupon\w*|promo\w*|voucher\w*|"

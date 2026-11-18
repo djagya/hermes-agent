@@ -936,18 +936,6 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
         for d in i.documents:
             if d.left_for_user or any(c.token in OPTIONAL_CARD_TOKENS for c in d.controls):
                 d.blank = await self._blanks(d.frame_session, d.object_id)
-            d.revealed = await self._revealed(d.frame_session, d.object_id)
-
-    async def _revealed(self, fsid: str, obj: str) -> int:
-        """dlz (B final, Codex P1): empty fields a page script exposed during the fill (a card input's handler adding a
-        billing postcode). 0 when the document cannot say: unknown is not a field seen empty."""
-        try:
-            n = _value(await self._cdp("Runtime.callFunctionOn", {
-                "objectId": obj, "functionDeclaration": "function(){return this.revealed()}", "returnByValue": True},
-                session_id=fsid))
-        except Exception:  # health: allow BLE001 -- unknown: no field is claimed seen empty
-            return 0
-        return n if type(n) is int and 0 < n <= _DISCOVERY_LIMITS["inputs"] else 0
 
     async def _blanks(self, fsid: str, obj: str) -> frozenset | None:
         """dlz (D-0358 a): the exposed fields of a pinned document that hold no value (indexes only; a field the user
@@ -1728,6 +1716,9 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             }, session_id=d.frame_session))
         except Exception:  # health: allow BLE001 -- a gone document is a failed retention check, never a value
             return None
+        if isinstance(states, list) and states and isinstance(states[-1], dict) and set(states[-1]) == {"revealed"}:
+            # B final: the answer's trailing marker names the empty fields the fill revealed (described, no value)
+            d.revealed = _results._revealed_left(states.pop()["revealed"], d.controls, d.origin == i.merchant_origin)
         if not isinstance(states, list):
             return None
         return states
