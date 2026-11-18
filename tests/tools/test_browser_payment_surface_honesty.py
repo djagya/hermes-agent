@@ -122,12 +122,23 @@ def test_a_new_fill_after_an_unproven_release_starts_a_fresh_record(caplog):
     assert all("shop.test" not in r.getMessage() for r in caplog.records), "ids and counts only"
 
 
-def test_a_refill_while_the_old_lock_still_holds_is_unknown_never_zero():
+def test_a_refill_while_the_old_lock_still_holds_carries_a_known_count():
+    """r2 P7 (Opus LOW5): the same tab, still in control's lock: the old record was known, so its press stays visible
+    (never zero); the new fill is a new approval."""
     sup = HolderSup()
     assert surface.claim_payment_surface(sup, _inspected()) is None
     surface.record_approved_total(sup, *APPROVED)
     _press(sup)
-    assert surface.claim_payment_surface(sup, _inspected()) is None  # the same tab, still in control's lock
+    assert surface.claim_payment_surface(sup, _inspected()) is None
+    assert surface.presses_in_lock(sup) == 1 and surface.approved_total(sup) is None
+
+
+def test_a_refill_of_an_unknown_record_stays_unknown():
+    sup = HolderSup(lock_extra={"POPUP"})  # another page in the lock: the first record is unknown
+    assert surface.claim_payment_surface(sup, _inspected()) is None
+    assert surface.presses_in_lock(sup) is None
+    sup.lock = {"PAGE", HOLDER}  # the popup closed; the old lock still holds the tab
+    assert surface.claim_payment_surface(sup, _inspected()) is None
     assert surface.presses_in_lock(sup) is None
 
 
@@ -145,13 +156,30 @@ def test_a_fill_after_an_unconfirmed_claim_is_unknown():
 # ------------------------------------------------------------------ C3
 
 
+ROWS_PREP = [
+    {"i": 0, "role": "button", "text": "Continue", "disabled": False},
+    {"i": 1, "role": "button", "text": "Pay now", "disabled": False},
+    {"i": 2, "role": "checkbox", "text": "I accept the terms", "disabled": False},
+]
+CONTINUE, PAY, TERMS = 0, 1, 2
+
+
+def _hosted(page="PAGE"):
+    """A payment whose only card document is the provider's hosted frame (cross-origin to the shop): no document in
+    the lock but that frame can read the card, so page-controlled counts may leave (r2 P4)."""
+    inspected = _inspected(page)
+    inspected.documents = inspected.documents[:1]
+    return inspected
+
+
 class EffectSup(FakeSup):
     """Answers the structural reads: the control's state, the overlay count, the top document; ``after`` (applied at
-    the press release) changes them."""
+    the press release) changes them. ``rows``: the listed controls."""
 
-    def __init__(self):
+    def __init__(self, rows=None):
         super().__init__()
-        self.state = {"listed": True, "hit": True, "checked": False}
+        self.rows = rows or ROWS_PREP
+        self.state = {"listed": True, "hit": True, "checked": False, "disabled": False, "busy": False}
         self.overlays, self.loader, self.occluder = 0, "LP", "dialog"
         self.after = {}
 
@@ -159,6 +187,8 @@ class EffectSup(FakeSup):
         if method == "Input.dispatchMouseEvent" and params.get("type") == "mouseReleased":
             for key, value in self.after.items():
                 setattr(self, key, value)
+        if method == "Runtime.callFunctionOn" and params["functionDeclaration"] == surface._DESCRIBE:
+            return {"result": {"value": self.rows}}
         if method == "Runtime.callFunctionOn" and params["functionDeclaration"] == surface._CONTROL_STATE:
             return {"result": {"value": dict(self.state)}}
         if method == "Runtime.callFunctionOn" and params["functionDeclaration"] == surface._OCCLUDER:
@@ -173,23 +203,27 @@ class EffectSup(FakeSup):
         return super().default(method, params, session)
 
 
-def _claimed_effect(sup):
-    assert surface.claim_payment_surface(sup, _inspected()) is None
+def _claimed_effect(sup, inspected=None):
+    assert surface.claim_payment_surface(sup, inspected or _hosted()) is None
     surface.record_approved_total(sup, *APPROVED)
     return sup
 
 
-def _ref(sup, index=0):
+def _ref(sup, index=CONTINUE):
     return surface.payment_controls(sup)["controls"][index]["ref"]
+
+
+def _mouse_presses(sup):
+    return [c for c in sup.calls if c[0] == "Input.dispatchMouseEvent" and c[1].get("type") == "mousePressed"]
 
 
 def test_a_click_that_changed_nothing_says_unchanged():
     sup = _claimed_effect(EffectSup())
     out = surface.payment_click(sup, _ref(sup))
-    assert out["success"] is True
-    assert out["effect"] == {"navigated": False, "control_listed": True, "control_hit": True, "overlays_before": 0,
-                             "overlays_after": 0, "card_frames_before": 1, "card_frames_after": 1,
-                             "unchanged": True}
+    assert out["success"] is True and "pay_pressed" not in out
+    assert out["effect"] == {"navigated": False, "control_listed": True, "control_hit": True,
+                             "control_state_changed": False, "overlays_before": 0, "overlays_after": 0,
+                             "card_frames_before": 1, "card_frames_after": 1, "unchanged": True}
 
 
 @pytest.mark.parametrize("after, field, value", [
@@ -197,6 +231,9 @@ def test_a_click_that_changed_nothing_says_unchanged():
     ({"overlays": 1}, "overlays_after", 1),
     ({"state": {"listed": False, "hit": False, "checked": False}}, "control_listed", False),
     ({"state": {"listed": True, "hit": False, "checked": False}}, "control_hit", False),
+    # r2 P3: a control that only goes disabled or busy made progress too
+    ({"state": {"listed": True, "hit": True, "checked": False, "disabled": True}}, "control_state_changed", True),
+    ({"state": {"listed": True, "hit": True, "checked": False, "busy": True}}, "control_state_changed", True),
 ])
 def test_a_click_with_a_visible_effect_is_not_unchanged(after, field, value):
     sup = _claimed_effect(EffectSup())
@@ -227,16 +264,33 @@ def test_an_unreadable_effect_is_null_and_the_click_still_succeeded():
     assert out["success"] is True and out["effect"] is None and surface.presses_in_lock(sup) == 1
 
 
+class _Clock:
+    """A monotonic clock that advances ``step`` s per read: the settle's bound without any wall-clock assertion."""
+
+    def __init__(self, step):
+        self.now, self.step = 1000.0, step
+
+    def monotonic(self):
+        self.now += self.step
+        return self.now
+
+
 def test_the_settle_is_bounded(monkeypatch):
-    monkeypatch.setattr(surface, "_SETTLE_S", 0.3)
+    """r2 P8 (Codex P3): bounded by the settle's own clock, not by elapsed wall time: a top document that never
+    changes ends the settle after at most _SETTLE_S of clock (here 1.5 s at 0.125 s per read), never later."""
+    monkeypatch.setattr(surface, "_SETTLE_S", 1.5)
+    monkeypatch.setattr(surface, "_SETTLE_POLL_S", 0.001)
     sup = _claimed_effect(EffectSup())
+    monkeypatch.setattr(surface, "time", _Clock(0.125))
     loop = asyncio.new_event_loop()
     try:
-        start = loop.time()
-        before = {"top": ("PAGE", "LP"), "listed": True, "hit": True, "checked": False, "overlays": 0,
-                  "card_frames": 1}
+        polls = len(sup.sent("Page.getFrameTree"))
+        before = {"top": ("PAGE", "LP"), "safe": True, "listed": True, "hit": True, "state": (False, False, False),
+                  "overlays": 0, "card_frames": 1}
         effect = loop.run_until_complete(surface._effect(sup, "S-page", "el", "S-card", before, "button"))
-        assert loop.time() - start < 1.0 and effect["unchanged"] is True
+        # each settle round reads the clock twice (loop test, sleep length): 1.5 s of clock = 6 polls; then the
+        # structure read after the settle (frame tree, and the top again around the overlay count)
+        assert len(sup.sent("Page.getFrameTree")) - polls == 6 + 2 and effect["unchanged"] is True
     finally:
         loop.close()
 
@@ -249,7 +303,7 @@ def test_a_covered_control_names_only_the_occluder_class(cls, expected):
     out = surface.payment_click(sup, _ref(sup))
     assert out["error_type"] == "payment_control_covered" and out["occluder"] == expected
     assert set(out) == {"success", "error_type", "error", "occluder"} and "Cookie" not in out["error"]
-    assert not [c for c in sup.calls if c[0] == "Input.dispatchMouseEvent" and c[1].get("type") == "mousePressed"]
+    assert not _mouse_presses(sup)
 
 
 def test_an_overlay_over_the_card_iframe_is_classified_on_the_page():
@@ -299,33 +353,50 @@ def test_control_naming_another_native_connection_is_lost_on_the_same_socket():
     assert surface.native_lost_refusal(sup)["error_type"] == surface.NATIVE_LOST
 
 
-def test_a_supervisor_without_a_claim_on_a_foreign_lock_is_lost_not_none():
+def test_a_supervisor_without_a_claim_on_a_foreign_lock_is_lock_foreign_not_none():
+    """r2 P6 (Opus LOW4): no record of this process on a slot another connection locked: its own type and text."""
     sup = EffectSup()  # a replaced supervisor or a restarted gateway: no claim of this process
     sup.status = {"locked": True, "native": False, "tabs": ["PAGE"], "unverified": False}
-    assert surface.payment_controls(sup)["error_type"] == surface.NATIVE_LOST
+    out = surface.payment_controls(sup)
+    assert out["error_type"] == surface.LOCK_FOREIGN and "do not close it unless Danil says so" in out["error"]
+    assert surface.payment_click(sup, "c0-0123456789")["error_type"] == "payment_control_unknown"  # no listing
     sup.status = dict(UNLOCKED)
     assert surface.payment_controls(sup)["error_type"] == "payment_surface_none"
 
 
-def test_the_supervisor_does_not_reattach_a_lost_native_socket():
+def test_a_redial_after_a_known_socket_change_is_status_only_whatever_status_says():
+    """r2 P5 (Codex P2): a lock record whose claim socket was replaced decides alone: no status answer (timeout,
+    malformed, even locked-native) makes the supervisor attach again."""
     from tools.browser_supervisor import CDPSupervisor
 
     sup = _claimed_effect(EffectSup())
     sup.task_id = "t"
     sup._ws = object()
-    sup.status = {"locked": True, "native": False, "tabs": ["PAGE"], "unverified": False}
-    run = asyncio.run_coroutine_threadsafe(CDPSupervisor._payment_native_lost(sup), sup._loop)
-    assert run.result(timeout=10) is True
-    assert surface.native_lost_refusal(sup)["error_type"] == surface.NATIVE_LOST
-    for status in (dict(UNLOCKED), {"locked": True, "native": True, "tabs": ["PAGE"], "unverified": False},
-                   RuntimeError("no answer")):
+    for status in (RuntimeError("no answer"), {"bogus": True},
+                   {"locked": True, "native": True, "tabs": ["PAGE"], "unverified": False}):
         sup.status = status
-        run = asyncio.run_coroutine_threadsafe(CDPSupervisor._payment_native_lost(sup), sup._loop)
-        assert run.result(timeout=10) is False, status
-    fresh = FakeSup()  # no lock record: never a status read on redial
-    fresh.task_id = "t"
-    assert asyncio.run_coroutine_threadsafe(CDPSupervisor._payment_native_lost(fresh), fresh._loop).result(10) is False
-    assert not fresh.sent("Hermes.paymentSurfaceStatus")
+        run = asyncio.run_coroutine_threadsafe(CDPSupervisor._payment_recovery(sup), sup._loop)
+        assert run.result(timeout=10) == "lost", status
+    assert not sup.sent("Hermes.paymentSurfaceStatus"), "known locally: no status is needed to stay status-only"
+    sup.status = {"locked": True, "native": False, "tabs": ["PAGE"], "unverified": False}
+    assert surface.native_lost_refusal(sup)["error_type"] == surface.NATIVE_LOST
+
+
+@pytest.mark.parametrize("managed, status, expected", [
+    (True, {"locked": True, "native": False, "tabs": ["PAGE"], "unverified": False}, "foreign"),
+    (True, dict(UNLOCKED), None),
+    (True, RuntimeError("no answer"), None),  # unknown at startup: attach as before (control refuses if locked)
+    (False, {"locked": True, "native": False, "tabs": ["PAGE"], "unverified": False}, None),
+])
+def test_a_fresh_supervisor_on_a_foreign_lock_starts_status_only(monkeypatch, managed, status, expected):
+    from tools.browser_supervisor import CDPSupervisor
+
+    monkeypatch.setattr(surface, "_managed", lambda: managed)
+    fresh = FakeSup()  # no record, no payment of this process
+    fresh.task_id, fresh.status = "t", status
+    run = asyncio.run_coroutine_threadsafe(CDPSupervisor._payment_recovery(fresh), fresh._loop)
+    assert run.result(timeout=10) == expected
+    assert bool(fresh.sent("Hermes.paymentSurfaceStatus")) is managed
 
 
 # ------------------------------------------------------------------ C5
@@ -400,3 +471,212 @@ def test_no_merchant_tab_stays_a_policy_refusal():
     assert not isinstance(caught.value, PaymentDestinationError)
     assert asyncio.run(_Tabs(["https://shop.test/c"])._merchant_tab_session("https://shop.test", "S")) == "S"
 
+
+
+# ------------------------------------------------------------------ round 2 (Codex + Opus review of build C)
+
+
+def test_a_second_pay_press_in_one_approval_is_refused_before_dispatch():
+    """r2 P1 (owner rule, Opus probe on base 802a3c003c): after the approval's Pay press, a fresh listing and a press
+    of the same Pay control is refused before anything is read on the page; owner_go does not change that."""
+    from tests.tools.test_browser_payment_surface import _claimed
+
+    sup = _claimed()  # the base probe's scenario: ROWS[0] is "Pay with card ..." on a checked approval
+    first = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
+    assert first["success"] is True and first["pay_pressed"] is True
+    for owner_go in (False, True):
+        listing = surface.payment_controls(sup)
+        assert listing["presses_in_lock"] == 1
+        calls = len(sup.calls)
+        second = surface.payment_click(sup, listing["controls"][0]["ref"], owner_go=owner_go)
+        assert second == {"success": False, "error_type": surface.ALREADY_PRESSED, "error": surface._ALREADY_PRESSED_TEXT}
+        assert "never press Pay again" in second["error"] and "payment_done" in second["error"]
+        assert sup.calls[calls:] == [] or all(c[0] == "Hermes.paymentSurfaceStatus" for c in sup.calls[calls:])
+    assert len(_mouse_presses(sup)) == 1 and surface.presses_in_lock(sup) == 1
+
+
+def test_preparatory_clicks_stay_allowed_around_the_one_pay_press():
+    """r2 P1: the terms checkbox and Continue before Pay, and after it, are not the Pay press; only a second Pay is
+    refused. A new fill (a new approval) may press Pay once again."""
+    sup = _claimed_effect(EffectSup())
+    for index in (TERMS, CONTINUE, PAY, TERMS, CONTINUE):
+        out = surface.payment_click(sup, _ref(sup, index))
+        assert out["success"] is True and out.get("pay_pressed", False) is (index == PAY), index
+    assert surface.payment_click(sup, _ref(sup, PAY))["error_type"] == surface.ALREADY_PRESSED
+    assert len(_mouse_presses(sup)) == 5 and surface.presses_in_lock(sup) == 5
+    _claimed_effect(sup)  # a new card fill in the same lock: a new approval card
+    assert surface.payment_click(sup, _ref(sup, PAY))["success"] is True
+    assert surface.presses_in_lock(sup) == 6, "r2 P7: the known count carries over into the new record"
+
+
+@pytest.mark.parametrize("role, caption, pay", [
+    ("button", "Pay now", True), ("button", "Place order", True), ("button", "Jetzt kaufen", True),
+    ("button", "Zahlungspflichtig bestellen", True), ("button", "Submit", True), ("button", "Confirm", True),
+    ("button", "Continue and pay", True), ("button", "", True), ("button", "OK", True),  # unknown: fails closed
+    ("button", surface.CAPTION_WITHHELD, True), ("button", "Continue", False), ("button", "Review order", False),
+    ("button", "Weiter zur Zahlung", False), ("button", "Continue to PayPal", False), ("link", "Terms", False),
+    ("link", "Jetzt bezahlen", True), ("checkbox", "Pay with this card", False), ("radio", "Buy now", False),
+])
+def test_which_press_is_the_pay_press(role, caption, pay):
+    assert surface._pay_press(role, caption) is pay
+
+
+def test_a_press_is_counted_at_dispatch_and_an_overlapping_click_is_refused(monkeypatch):
+    """r2 P2 (Codex P1, Opus LOW2): with the first press's settle paused, a parallel listing already counts it and a
+    parallel click (even of another control) is refused before anything is pressed."""
+    import threading
+
+    from tests.waiting import wait_until
+
+    release = threading.Event()
+
+    async def paused(*_a, **_k):
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(surface, "_bounded_effect", paused)
+    sup = _claimed_effect(EffectSup())
+    ref = _ref(sup, PAY)
+    out = {}
+    worker = threading.Thread(target=lambda: out.setdefault("first", surface.payment_click(sup, ref)), daemon=True)
+    worker.start()
+    try:
+        wait_until(lambda: any(c[0] == "Input.dispatchMouseEvent" and c[1].get("type") == "mouseReleased"
+                               for c in list(sup.calls)), what="the first press released")
+        assert surface.presses_in_lock(sup) == 1
+        listing = surface.payment_controls(sup)
+        assert listing["presses_in_lock"] == 1
+        for index in (PAY, CONTINUE):
+            busy = surface.payment_click(sup, listing["controls"][index]["ref"])
+            assert busy["error_type"] == surface.CLICK_BUSY and "nothing was pressed" in busy["error"]
+        assert len(_mouse_presses(sup)) == 1
+    finally:
+        release.set()
+        worker.join(timeout=10)
+    assert out["first"]["success"] is True and surface.presses_in_lock(sup) == 1
+    assert surface.payment_click(sup, listing["controls"][CONTINUE]["ref"])["success"] is True, "the ref survived"
+
+
+@pytest.mark.parametrize("after", [{"disabled": True}, {"busy": True}, {}])
+def test_a_pay_press_never_reads_as_unchanged(after):
+    """r2 P3 (Opus HIGH): a Pay button that only goes disabled (or busy, or shows nothing) after the press: the effect
+    reports the state change, unchanged is null, and the answer says Pay must not be pressed again."""
+    sup = _claimed_effect(EffectSup())
+    sup.after = {"state": {"listed": True, "hit": True, "checked": False, "disabled": False, "busy": False, **after}}
+    out = surface.payment_click(sup, _ref(sup, PAY))
+    assert out["success"] is True and out["pay_pressed"] is True and out["effect"]["unchanged"] is None
+    assert out["effect"]["control_state_changed"] is bool(after)
+    assert "never means Pay failed" in out["next"] and "call payment_done" in out["next"]
+
+
+def test_an_owner_go_pay_press_never_reads_as_unchanged_either():
+    """r2 P3: a fill-only card (no approved total) pressed with the owner's go: not enforced as the approval's one
+    press (no pay gate), but its effect is never "unchanged" either."""
+    sup = EffectSup()
+    assert surface.claim_payment_surface(sup, _hosted()) is None  # no approved total bound
+    out = surface.payment_click(sup, _ref(sup, PAY), owner_go=True)
+    assert out["success"] is True and out["pay_pressed"] is True and out["effect"]["unchanged"] is None
+
+
+def test_a_preparatory_click_that_only_disables_itself_is_not_unchanged():
+    sup = _claimed_effect(EffectSup())
+    sup.after = {"state": {"listed": True, "hit": True, "checked": False, "disabled": True, "busy": False}}
+    effect = surface.payment_click(sup, _ref(sup, CONTINUE))["effect"]
+    assert effect["control_state_changed"] is True and effect["unchanged"] is False
+
+
+# r2 P4: the real overlay and occluder scripts on an adversarial page that can read a filled card value (a same-origin
+# card field) and encodes its first digit in the number of dialogs it creates, and a bit in what covers a control.
+_ADVERSARIAL_DOM = r"""
+const filled = '4242424242424242';  // the page reads it from its same-origin card field
+const digit = Number(filled[0]);
+const el = (o = {}) => Object.assign({nodeType: 1, parentElement: null, matches: () => true,
+  closest: () => (o.dialog ? {} : null), getBoundingClientRect: () => ({left: 0, top: 0, width: 100, height: 100}),
+  getAttribute: () => null}, o);
+const dialogs = Array.from({length: digit}, () => el());
+const cover = el({dialog: digit % 2 === 0});
+const document = {querySelectorAll: () => dialogs, elementFromPoint: () => cover, body: {}, documentElement: {}};
+const getComputedStyle = () => ({visibility: 'visible', display: 'block', opacity: '1', position: 'static'});
+const innerWidth = 1000, innerHeight = 800;
+"""
+
+
+def _in_page(expression, this=False):
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required to run the page scripts")
+    call = f"({expression}).call(el())" if this else expression
+    harness = _ADVERSARIAL_DOM + f"process.stdout.write(JSON.stringify({call}));"
+    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+class PageSup(EffectSup):
+    """The overlay and occluder reads answered by the real scripts on the adversarial page (node)."""
+
+    def default(self, method, params, session):
+        if method == "Runtime.evaluate" and params.get("expression") == surface._OVERLAYS:
+            return {"result": {"value": _in_page(surface._OVERLAYS)}}
+        if method == "Runtime.callFunctionOn" and params["functionDeclaration"] == surface._OCCLUDER:
+            return {"result": {"value": _in_page(surface._OCCLUDER, this=True)}}
+        return super().default(method, params, session)
+
+
+def _detail_reads(sup):
+    return [c for c in sup.calls if (c[0] == "Runtime.evaluate" and c[1].get("expression") == surface._OVERLAYS)
+            or (c[0] == "Runtime.callFunctionOn" and c[1].get("functionDeclaration") == surface._OCCLUDER)]
+
+
+def test_the_page_scripts_do_carry_what_an_adversarial_page_chooses():
+    """The channel exists: the scripts report what the page built (4 dialogs = the first digit; an even digit makes
+    the occluder a dialog), so only withholding them closes it."""
+    assert _in_page(surface._OVERLAYS) == 4 and _in_page(surface._OCCLUDER, this=True) == "dialog"
+
+
+@pytest.mark.parametrize("inspected, tree", [
+    (_inspected, None),  # a merchant card field (same-origin card document) next to the hosted frame
+    (_hosted, (("PAGE", "LP", "https://psp.test/checkout", "https://psp.test", ""),
+               ("CARD", "L1", "https://psp.test/f", "https://psp.test", "PAGE"))),  # the top is on the card origin
+    (_hosted, (("PAGE", "LP", "https://shop.test/", "https://shop.test", ""),
+               ("CARD", "L1", "https://shop.test/card", "https://shop.test", "PAGE"))),  # card frame same-origin
+])
+def test_page_controlled_metadata_never_leaves_a_lock_whose_documents_can_read_the_card(inspected, tree):
+    sup = PageSup()
+    if tree:
+        sup.tree = sup.listed = tree  # what the press reads, and what the listing walks
+    _claimed_effect(sup, inspected())
+    sup.after = {"loader": "LP"}
+    effect = surface.payment_click(sup, _ref(sup, CONTINUE))["effect"]
+    assert set(effect) == {"navigated", "control_listed", "control_hit", "control_state_changed", "unchanged"}
+    sup.hit = False  # now covered: the refusal without a class
+    covered = surface.payment_click(sup, _ref(sup, CONTINUE))
+    assert covered["error_type"] == "payment_control_covered" and "occluder" not in covered
+    assert "dialog" not in covered["error"] and not _detail_reads(sup), "the scripts never ran"
+
+
+def test_a_hosted_only_payment_returns_the_page_counts():
+    sup = _claimed_effect(PageSup())
+    effect = surface.payment_click(sup, _ref(sup, CONTINUE))["effect"]
+    assert effect["overlays_before"] == effect["overlays_after"] == 4 and effect["card_frames_after"] == 1
+    sup.hit = False
+    assert surface.payment_click(sup, _ref(sup, CONTINUE))["occluder"] == "dialog"
+
+
+@pytest.mark.parametrize("frames, safe", [
+    ([("PAGE", "https://shop.test/", "https://shop.test"), ("CARD", "https://psp.test/f", "https://psp.test")], True),
+    ([("PAGE", "https://shop.test/", ""), ("CARD", "https://psp.test/f", "")], True),  # origins from the urls
+    ([("PAGE", "https://shop.test/", "https://shop.test")], True),  # an OOPIF card frame is cross-site by isolation
+    ([("PAGE", "https://shop.test/", "https://shop.test"), ("CARD", "about:blank", "")], False),  # unknown origin
+    ([("CARD", "https://psp.test/f", "https://psp.test")], False),  # the top document is the card document
+    ([], False),
+])
+def test_detail_safe_reads_every_card_frame_against_the_top(frames, safe):
+    sup = FakeSup()
+    assert surface.claim_payment_surface(sup, _hosted()) is None
+    assert surface.detail_safe(sup, frames) is safe
+    assert surface.detail_safe(FakeSup(), frames[:1]) is False, "no payment: never"

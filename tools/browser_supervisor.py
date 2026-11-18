@@ -44,6 +44,8 @@ _transport_logger.setLevel(logging.WARNING)
 # once its process exits; leave enough room for the former without leaking a
 # supervisor thread and warnings forever for the latter.
 MAX_POST_ATTACH_RECONNECT_FAILURES = 5
+# dlz (r2 P5): a socket serving a payment lock status-only polls control this often, and redials no faster
+PAYMENT_RECOVERY_POLL_S = 3.0
 # A persistent browser accumulates tabs whose renderer crashed: they stay in Target.getTargets, but
 # Page.enable / Runtime.evaluate never answer. Bound each page attach so one such tab is skipped,
 # and keep the initial-attach tries inside start()'s 15 s budget.
@@ -520,14 +522,25 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                 # stale dialog entry is rejected with "no dialog is showing", logged only).
                 self._page_session_id = None
                 self._reset_dialog_tabs()
-                if await self._payment_native_lost():
-                    # dlz (build C4): control refuses every session command on this socket while the lock holds,
-                    # so no attach is tried (no redial loop); the socket stays for status, tab list and
-                    # payment_close. Control closes it when the lock ends, and the next dial attaches as usual.
-                    last_success_at = time.time()
-                    reconnect_failures = redial_failures = 0
-                    backoff = 0.5
-                    await reader_task
+                recovery = await self._payment_recovery()
+                if recovery:
+                    # dlz (build C4, r2 P5): control refuses every session command on this socket while the lock
+                    # holds, so nothing is attached: the socket serves status, the tab list and payment_close, and
+                    # payment actions answer payment_native_lost / payment_lock_foreign. Status is polled until it
+                    # proves the slot unlocked; then this socket is closed and the next dial attaches as usual. An
+                    # unanswered or malformed status never falls back to attaching.
+                    self._ready_event.set()  # start() returns (a foreign lock at startup): not active
+                    answered, unlocked = await self._payment_status_only(reader_task)
+                    if answered:  # the endpoint lives: the budget counts dead endpoints, not a long lock
+                        reconnect_failures = redial_failures = 0
+                    if unlocked:
+                        backoff = 0.5
+                    else:  # no fast redial loop while the lock holds (control may close this socket at once)
+                        reconnect_failures += 0 if answered else 1
+                        backoff = max(backoff, PAYMENT_RECOVERY_POLL_S)
+                        if self._reconnect_budget_spent(reconnect_failures, RuntimeError("payment lock status "
+                                                                                         "unanswered")):
+                            return
                 else:
                     await self._attach_initial_page()
                     await self._rewatch_dialog_tabs()
@@ -569,28 +582,63 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 10.0)
 
-    async def _payment_native_lost(self) -> bool:
-        """dlz (build C4): on a (re)dialled socket, whether it serves a payment lock it can no longer act in: this
-        supervisor's lock record names another claim socket, and control's status on this socket says the slot is
-        locked and this connection is not native. Logs once per socket; any doubt (no record, an unanswered or
-        malformed status, unlocked) is False: the usual attach runs."""
-        try:
-            from tools import browser_payment_surface as pay
+    async def _payment_recovery(self) -> Optional[str]:
+        """dlz (build C4, r2 P5/P6): on a (re)dialled socket, whether it must serve a payment lock status-only (no
+        attach): ``"lost"`` when this supervisor's lock record names another claim socket (known locally, no status
+        needed: an unanswered status never falls back to attaching), ``"foreign"`` when it holds no record and no
+        payment, the browser is managed and control's status on this socket says locked and not native. None: the
+        usual attach (a foreign-lock check that cannot be read attaches as before; control refuses it if locked)."""
+        from tools import browser_payment_surface as pay
 
-            if not pay.claim_socket_changed(self):
-                return False
+        if pay.claim_socket_changed(self):
+            pay.mark_native_lost(self)
+            logger.warning("CDP supervisor %s: native payment connection lost during a payment lock; status only "
+                           "until the lock ends (payment actions answer payment_native_lost)", self.task_id)
+            return "lost"
+        try:
+            from tools.browser_payment_done import has_payment
+
+            if has_payment(self) or not pay._managed():
+                return None
             reply = await self._cdp(pay.STATUS_METHOD, {}, timeout=5)
             state, _tabs, native = pay.parse_lock_status_native(reply.get("result") if isinstance(reply, dict) else None)
         except Exception as e:  # health: allow BLE001 -- unknown: today's attach (control refuses it if locked)
-            logger.debug("CDP supervisor %s: payment lock status on redial unknown: %s", self.task_id,
+            logger.debug("CDP supervisor %s: payment lock status on dial unknown: %s", self.task_id,
                          _redact_cdp_error_text(e))
-            return False
+            return None
         if state != "locked" or native is not False:
-            return False
-        pay.mark_native_lost(self)
-        logger.warning("CDP supervisor %s: native payment connection lost during a payment lock; not attaching "
-                       "until the lock ends (payment actions answer payment_native_lost)", self.task_id)
-        return True
+            return None
+        pay.lock_status_seen(self, native=False)
+        logger.warning("CDP supervisor %s: another connection holds a payment lock on this browser; status only "
+                       "until it ends (payment actions answer payment_lock_foreign)", self.task_id)
+        return "foreign"
+
+    async def _payment_status_only(self, reader_task: asyncio.Task) -> tuple[bool, bool]:
+        """dlz (r2 P5): poll control's lock status every ``PAYMENT_RECOVERY_POLL_S`` on this socket (through the
+        surface's own reader, which books an unlock) until it proves the slot unlocked, the socket ends or the
+        supervisor stops. ``(answered, unlocked)``: whether any status was answered (locked or unlocked) on it."""
+        from tools import browser_payment_surface as pay
+
+        loop = asyncio.get_running_loop()
+        answered = False
+        while not self._stop_requested and not reader_task.done():
+            read = loop.run_in_executor(None, pay.lock_status, self)
+            await asyncio.wait({read, reader_task}, return_when=asyncio.FIRST_COMPLETED)
+            if not read.done():  # the socket ended first: _run's cleanup fails the status call; nothing was read
+                read.add_done_callback(lambda f: f.cancelled() or f.exception())
+                break
+            try:
+                state = read.result()
+            except Exception:  # health: allow BLE001 -- unanswered: keep polling, never attach
+                state = "unknown"
+            answered = answered or state in {"locked", "unlocked"}
+            if state == "unlocked":
+                logger.info("CDP supervisor %s: payment lock ended; reconnecting to attach", self.task_id)
+                return answered, True
+            await asyncio.wait({reader_task}, timeout=PAYMENT_RECOVERY_POLL_S)
+        if reader_task.done() and not reader_task.cancelled():
+            reader_task.exception()  # retrieved: the read loop logs its own end
+        return answered, False
 
     async def _attach_page(self, target_id: str, *, timeout: float, deadline: Optional[float] = None,
                            refuse_locked: bool = False) -> str:

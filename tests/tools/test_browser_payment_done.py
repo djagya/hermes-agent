@@ -87,7 +87,8 @@ class FakeSup:
         if method == "Runtime.callFunctionOn":
             fn = params["functionDeclaration"]
             if fn == surface._DESCRIBE:
-                return {"result": {"value": [{"i": 0, "role": "button", "text": "Pay 22.66 EUR", "disabled": False}]}}
+                return {"result": {"value": getattr(self, "rows", None)
+                                   or [{"i": 0, "role": "button", "text": "Pay 22.66 EUR", "disabled": False}]}}
             if fn in (surface._HIT, surface._pay_js("caption")):  # r4 C1: the caption check
                 return {"result": {"value": True}}
             return {"result": {"objectId": "el"}}
@@ -470,6 +471,10 @@ def test_a_3ds_page_is_clicked_only_after_the_checkouts_pay_was_admitted(first):
         return
     assert out["success"] is True and len(presses()) == 1
     sup.trees = [ACS]  # redirected to the bank's challenge page
+    _top_controls(sup)
+    # r2 P1: one Pay press per approval: a Pay-like control there is refused; the bank's own step is pressed
+    assert surface.payment_click(sup, _top_ref(sup, ACS))["error_type"] == "payment_already_pressed"
+    sup.rows = [{"i": 0, "role": "button", "text": "Continue", "disabled": False}]
     _top_controls(sup)
     assert surface.payment_click(sup, _top_ref(sup, ACS))["success"] is True and len(presses()) == 2
 
