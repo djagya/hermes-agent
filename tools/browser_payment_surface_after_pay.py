@@ -30,12 +30,11 @@ def _providers(sup: Any) -> frozenset:
 
 
 def _provider_site(sup: Any, url: Any) -> bool:
-    """build C r4 (Opus L2): ``url`` is on a recorded provider origin, or on the same site as one."""
-    providers = _providers(sup)
-    if _origin_of(url) in providers:
-        return True
-    site = _site(url)
-    return site is not None and site in {_site(o) for o in providers}
+    """``url`` is on a recorded provider origin (exact origin, not the site).
+
+    The exact origin, on purpose: a provider's own 3-D Secure host on the same site as its card frames
+    (hooks.stripe.com beside js.stripe.com) is a bank step after Pay and must stay pressable."""
+    return _origin_of(url) in _providers(sup)
 
 
 # build C r4: a follow-up press in a new dialog is never a retry after an error (that needs a new approval)

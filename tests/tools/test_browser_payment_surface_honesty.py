@@ -916,17 +916,21 @@ REGISTRY_SITE_TOP = ("PAGE", "LB", "https://hooks.stripe.com/3ds", "https://hook
 
 
 @pytest.mark.parametrize("where", ["sibling_top", "sibling_frame", "registry_site_top"])
-def test_after_pay_a_page_on_a_providers_site_is_no_bank_step(where):
-    """r4 (Opus final L2): a page on the site of a recorded provider origin (another host of the card origin's site,
-    or of a registry provider's) is not a bank's step: refused with nothing pressed or read for a total."""
+def test_after_pay_another_host_on_a_providers_site_is_a_bank_step(where):
+    """Owner direction 2026-11-18 ("make it all work"): only the exact recorded provider origin is refused after Pay
+    (see the provider_top / provider_frame cases); a provider's own 3-D Secure host on the same site as its card
+    frames (hooks.stripe.com beside js.stripe.com) is the bank step and is pressed once, with no total read."""
     from tests.tools.test_browser_payment_surface import TREE
 
     tree = {"sibling_top": (SIBLING_TOP, TREE[1]), "sibling_frame": (TREE[0], SIBLING_FRAME),
             "registry_site_top": (REGISTRY_SITE_TOP, TREE[1])}[where]
     sup = _pay_then([_row("Confirm")], tree)
     out, total_reads, pressed = _again(sup)
-    assert out["error_type"] == surface.ALREADY_PRESSED and pressed == 0 and total_reads == 0
-    assert surface.presses_in_lock(sup) == 1
+    assert out["success"] is True and pressed == 1 and total_reads == 0
+    assert surface.presses_in_lock(sup) == 2
+    sup.tree = sup.listed = TREE
+    out, _reads, pressed = _again(sup)
+    assert out["error_type"] == surface.ALREADY_PRESSED and pressed == 0
 
 
 class DialogSup(_RowsSup):
