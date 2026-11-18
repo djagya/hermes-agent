@@ -79,7 +79,8 @@ _HOLDER_ROW = next(n for n, (_p, token) in enumerate(_CHECKOUT_HEURISTICS) if to
 # ``_RE_ID_SEMANTIC``); a bare "id" only in the visible label, never as a DOM id suffix in the name/id attributes
 # (``id="cardholder-id"``, ``holderId``).
 _RE_HOLDER_CONFLICT = re.compile(
-    r"\b(?:phone|telephone|mobile|e[\s-]?mail|birth|dob|geburt\w*|identification|document|passport|ssn|"
+    r"\b(?:\w*phone\w*|tel|telefon\w*|telefono|handy\w*|mobil\w*|e[\s-]?mail|birth|dob|geburt\w*|identification|"
+    r"document|passport|ssn|adresse|anschrift|strasse|plz|postleitzahl|stadt|wohnort|benutzer\w*|firma|"
     r"gift|loyalty|member\w*|bonus|payback|(?:first|last|given|family|sur|middle)\s*name|vorname|nachname|prenom|"
     r"login|user\s*name|username|password|merchant|company|business)\b")
 _RE_FULL_NAME = re.compile(
@@ -89,8 +90,9 @@ _RE_FULL_NAME = re.compile(
 _RE_ID_SEMANTIC = re.compile(
     r"\b(?:id\s*(?:number|no|nr|nummer|card)|(?:national|personal|tax)\s*id|identity|\w*ausweis\w*|cpf|cnpj|dni)\b")
 _RE_ID_WORD = re.compile(r"\bid\b")
-# The holder words together with a name word ("Name on card", "cardholderName"): explicit enough that a tel input
-# type alone does not make it another purpose.
+# The holder named explicitly, so that a tel input type alone does not make it another purpose: the holder words in
+# the visible label ("Karteninhaber", "Name on card"), or with a name word anywhere ("cardholderName"). The holder
+# words alone in the name/id attributes (``name="card-holder"``) are not explicit.
 _RE_NAME_WORD = re.compile(r"\b(?:name|nom|naam|nombre|nome)\b")
 # Autocomplete tokens that leave a field free to be the holder; any other token names another purpose.
 _HOLDER_AUTOCOMPLETE_OK = frozenset({"off", "on", "name", "cc-name", "billing", "shipping"})
@@ -551,13 +553,15 @@ def _holder_conflict(control: LoginControl, texts: tuple) -> bool:
     cue, a later heuristic row, a foreign autocomplete token or input type), or carries the holder words only across
     its name and label together (name "card", label "Holder"). A full-name instruction is no name component; a bare
     "id" counts in the label only (in the name/id attributes it is a DOM id suffix); a tel type counts only when the
-    text does not name the holder's name explicitly ("Name on card", "cardholderName")."""
+    text does not name the holder explicitly (the label "Karteninhaber" or "Name on card", the name "cardholderName";
+    not the name "card-holder" alone)."""
     names = (_normalize_text(control.name), _split_camel(control.name))
     labels = (_normalize_text(control.label), _split_camel(control.label))
     holder = _CHECKOUT_HEURISTICS[_HOLDER_ROW][0]
     if not any(holder.search(t) for t in names + labels):
         return True
-    named = any(holder.search(t) and _RE_NAME_WORD.search(t) for t in names + labels)
+    named = (any(holder.search(t) for t in labels)
+             or any(holder.search(t) and _RE_NAME_WORD.search(t) for t in names + labels))
     if control.type in _HOLDER_FOREIGN_TYPES and not (control.type == "tel" and named):
         return True
     if any(t not in _HOLDER_AUTOCOMPLETE_OK and not t.startswith("section-")

@@ -527,8 +527,10 @@ def test_document_validity_is_never_the_card_expiry(control, token):
     ({"name": "holder ", "label": "Titulaire de la carte prénom et nom"}, "cc-name"),
     ({"name": "cardholder cardholder-id", "label": "Name on card"}, "cc-name"),
     ({"name": "cardholder cardholder_id", "label": "Name on card"}, "cc-name"), ({"name": "cardholderId"}, "cc-name"),
-    # a tel input whose text names the holder's name
+    # a tel input whose text names the holder explicitly (in its label, or with a name word)
     ({"name": "h ", "label": "Name on card", "type": "tel"}, "cc-name"), ({"name": "cardholderName", "type": "tel"}, "cc-name"),
+    ({"name": "h ", "label": "Karteninhaber", "type": "tel"}, "cc-name"),
+    ({"name": "h ", "label": "Titolare della carta", "type": "tel"}, "cc-name"),
     # "card" is a word in the decoy rule, never the start of "cardholder"
     ({"name": "customerCardholder ", "label": "Name on card"}, "cc-name"), ({"name": "customer_cardholder_name"}, "cc-name"),
     # ... while a name component, an identification cue and a bare tel holder stay out
@@ -536,8 +538,11 @@ def test_document_validity_is_never_the_card_expiry(control, token):
     ({"name": "cardholderFirstName", "label": "First and last name"}, None),
     ({"label": "Card holder ID"}, None), ({"label": "Card holder ID number"}, None),
     ({"name": "cardholder ", "label": "Ausweisnummer"}, None), ({"name": "cardholderDni"}, None),
-    ({"name": "card-holder", "type": "tel"}, None), ({"label": "Card holder phone", "type": "tel"}, None),
-    ({"label": "Titolare della carta", "type": "tel"}, None),
+    ({"name": "card-holder", "type": "tel"}, None), ({"name": "cardholder", "type": "tel"}, None),
+    ({"label": "Card holder phone", "type": "tel"}, None), ({"name": "h ", "label": "Name on card", "type": "number"}, None),
+    ({"name": "h ", "label": "Telefon des Karteninhabers", "type": "tel"}, None),
+    ({"name": "h ", "label": "Mobilnummer Karteninhaber", "type": "tel"}, None),
+    ({"label": "Adresse des Karteninhabers"}, None), ({"label": "Karteninhaber PLZ"}, None),
     # ... and the German compounds stay decoys
     ({"name": "k ", "label": "Kundenkartennummer"}, None), ({"label": "Geschenkkarte"}, None),
     ({"label": "Gutscheinkarte Nummer"}, None), ({"label": "PAYBACK Karte"}, None),
@@ -1158,7 +1163,7 @@ const mk = (id, token, top) => Object.assign(new HTMLInputElement(), {tagName: '
   id, labels: null, placeholder: '', type: 'text', form: null, maxLength: 0, disabled: false, readOnly: false,
   isConnected: true, tabIndex: 0, shadowRoot: null, ownerDocument: document, hidden: false, top,
   style: {setProperty() {}}, hasAttribute: () => false, dispatchEvent: () => true, blur() {},
-  getAttribute(n) { return n === 'aria-label' ? (this.aria || null) : null; },
+  getAttribute(n) { return n === 'aria-label' ? (this.aria || null) : n === 'title' ? (this.tip || null) : null; },
   getBoundingClientRect() { if (this.slow) mono += 1000;
     return this.hidden ? {width: 0, height: 0, left: 0, top: 0} : {width: 100, height: 20, left: 0, top: this.top}; },
   getClientRects() { return this.hidden ? [] : [1]; }, getRootNode: () => document, contains(o) { return o === this; },
@@ -1170,7 +1175,7 @@ const getComputedStyle = e => ({visibility: e.hidden ? 'hidden' : 'visible', opa
 const api = INSPECT;
 const n = els[1];
 n.onfocus = {none: () => {}, hide: () => { n.hidden = true; }, hide_other: () => { els[0].hidden = true; },
-  relabel: () => { n.aria = 'Gift card'; }, swap: () => { els = [els[0], mk('n2', 'cc-number', 40)]; },
+  relabel: () => { n.aria = 'Gift card'; }, retitle: () => { n.tip = 'Gift card'; }, swap: () => { els = [els[0], mk('n2', 'cc-number', 40)]; },
   navigate: () => { location.href = 'https://psp.example/elsewhere'; }, cover: () => { cover = {}; },
   parent_transparent: () => { owner.op = '0'; }, top_replaced: () => { parentWin.location.href += '?step=2'; },
   slow_checks: () => { n.slow = true; }}[CASE.focus];
@@ -1222,6 +1227,8 @@ _NUMBER_STEP = {"token": "cc-number", "step": 2}
     ("hide", False, ["c"], {"reason": "field_hidden", "fields": ["cc-number"]}),
     ("hide_other", False, ["c"], {"reason": "field_hidden", "fields": ["cc-csc"]}),
     ("relabel", False, ["c"], {"reason": "fields_relabeled", "fields": ["cc-number"], "keys": ["label"]}),
+    # a title (supplemental text, the descriptor's hint) is pinned like the label
+    ("retitle", False, ["c"], {"reason": "fields_relabeled", "fields": ["cc-number"], "keys": ["hint"]}),
     ("swap", False, ["c"], {"reason": "fields_replaced", "fields": ["cc-number"]}),
     ("navigate", False, ["c"], {"reason": "navigated"}), ("cover", True, ["c"], {"reason": "hit_test"}),
     # the parent iframe turned transparent / the top URL rewritten by focus code (same-origin chain)
