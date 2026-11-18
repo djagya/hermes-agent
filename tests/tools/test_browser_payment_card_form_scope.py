@@ -310,6 +310,8 @@ def test_revealed_rows_follow_the_inspection_scope():
     assert rs._revealed_left([other_form, same_form], card, True) == 1
     assert rs._revealed_left([other_form], card, False) == 1  # a hosted document: all of it is the card's
     assert rs._revealed_left(None, card, True) == 0 and rs._revealed_left({"overflow": True}, card, True) == 1
+    assert rs._revealed_left([dict(_row(-4, "to", "Gift card recipient", form=None), type="search")],
+                             sp._card_controls(_FORMLESS, True), True) == 1  # Codex check 3: type=search too
     recipient = dict(_row(-3, "giftCardRecipientEmail", "Gift card recipient email", form=None))
     assert rs._revealed_left([recipient], sp._card_controls(_FORMLESS, True), True) == 1
 
@@ -356,3 +358,13 @@ def test_the_result_helpers_are_not_re_exported_from_the_supervisor_module():
 def test_a_formless_checkout_result_serialises_without_values():
     document = _document([*_FORMLESS, _row(3, "first", "First name", form=None)], blank=frozenset({3}))
     assert "First" not in json.dumps(_report(document, CARD)) and "first" not in json.dumps(_report(document, CARD))
+
+
+def test_a_shipping_cue_in_the_hint_keeps_the_billing_postcode_out():
+    """Opus final L1: a ZIP whose only shipping cue is its aria-labelledby/title text is not the card's postcode."""
+    from agent.vault_login_classifier import LoginControl
+
+    for hint in ("Shipping address", "Delivery postcode", "Lieferadresse"):
+        control = LoginControl.from_dict(dict(_row(3, "zip", "ZIP"), hint=hint))
+        assert rs.shipping_field(control), hint
+        assert "postal-code" not in [c.token for c in sp._card_controls([*_FORM, dict(_row(3, "zip", "ZIP"), hint=hint)], True)]

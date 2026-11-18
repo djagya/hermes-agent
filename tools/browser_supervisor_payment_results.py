@@ -28,7 +28,7 @@ def shipping_field(control: Any) -> bool:
     shipping/delivery words in its name, label or placeholder (accents and camelCase folded)."""
     if "shipping" in str(control.autocomplete).lower().split():
         return True
-    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", f"{control.name} {control.label}")
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", f"{control.name} {control.label} {getattr(control, 'hint', '')}")
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
     return bool(_SHIPPING.search(re.sub(r"[^a-z0-9]+", " ", text)))
 
@@ -109,11 +109,11 @@ _CHROME = re.compile(r"\b(?:search\w*|query|q|suche\w*|recherche\w*|buscar|cerca
 
 
 def _page_chrome(row: dict) -> bool:
-    if str(row.get("type") or "").lower() == "search":
-        return True
     text = re.sub(r"([a-z])([A-Z])", r"\1 \2", f"{row.get('name') or ''} {row.get('label') or ''}")
     text = re.sub(r"[^a-z0-9]+", " ", unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower())
-    return bool(_CHROME.search(text)) and not _RECIPIENT.search(text)
+    if _RECIPIENT.search(text):  # who receives something is checkout, whatever its type says
+        return False
+    return str(row.get("type") or "").lower() == "search" or bool(_CHROME.search(text))
 
 
 # A field about who receives something (a gift card's recipient) is checkout, whatever else it names.
