@@ -55,6 +55,9 @@ _MAX_DESCRIBE_BYTES = 256 * 1024
 _DISCOVERY_LIMITS = {"inputs": 300, "shadow": 16, "text": 200, "bytes": _MAX_DESCRIBE_BYTES}
 # dlz (Codex B r1 #5): the exact shape of one discovery descriptor (describeOne in _INSPECT_TEMPLATE).
 _DESCRIPTOR_KEYS = frozenset({"index", "autocomplete", "name", "label", "type", "formIndex", "maxLength"})
+# The supplemental text (aria-labelledby targets, title) the closure reports apart from the label; a string under the
+# text limit when present (a descriptor without it is the shape before it existed).
+_HINT_KEY = "hint"
 _SELECT_TYPES = ("select", "select-multiple")
 
 PAGE_TOO_LARGE = ("This checkout page has more frames, frame nesting or form fields than Hermes inspects for a card "
@@ -375,12 +378,13 @@ def _valid_descriptor(row: Any, previous: int) -> bool:
     if not isinstance(row, dict) or not isinstance(row.get("type"), str) or len(row["type"]) > 32:
         return False
     select = row["type"] in _SELECT_TYPES
-    if set(row) != (_DESCRIPTOR_KEYS | {"options"} if select else _DESCRIPTOR_KEYS):
+    if set(row) - {_HINT_KEY} != (_DESCRIPTOR_KEYS | {"options"} if select else _DESCRIPTOR_KEYS):
         return False
     index, form, length = row["index"], row["formIndex"], row["maxLength"]
     text = _DISCOVERY_LIMITS["text"]
+    texts = ("autocomplete", "name", "label") + ((_HINT_KEY,) if _HINT_KEY in row else ())
     return (type(index) is int and previous < index < _DISCOVERY_LIMITS["inputs"]
-            and all(type(row[k]) is str and len(row[k]) <= text for k in ("autocomplete", "name", "label"))
+            and all(type(row[k]) is str and len(row[k]) <= text for k in texts)
             and (form is None or (type(form) is int and form >= -1))
             and (length is None or (type(length) is int and length > 0))
             and (not select or _valid_options(row["options"])))
