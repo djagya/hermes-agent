@@ -473,6 +473,80 @@ def test_a_decoy_word_elsewhere_in_a_real_card_field_name_does_not_hide_it():
     assert _token(name="ticket-checkout-cvc") == "cc-csc"
 
 
+@pytest.mark.parametrize("control, token", [
+    # Supplemental text (aria-labelledby, title) never promotes a field whose own evidence names another purpose:
+    # autocomplete, input type, or its own name/label.
+    ({"name": "phone ", "label": "Phone", "type": "tel", "autocomplete": "tel", "hint": "Card number"}, None),
+    ({"name": "phone ", "label": "Phone", "hint": "Card number"}, None),
+    ({"name": "f1 ", "type": "tel", "hint": "Card number"}, None), ({"name": "f1 ", "autocomplete": "tel",
+                                                                     "hint": "Card number"}, None),
+    ({"name": "f1 ", "type": "number", "hint": "CVC"}, None), ({"name": "qty ", "hint": "Card number"}, None),
+    ({"name": "name ", "label": "Full name", "hint": "Card number"}, None),
+    ({"name": "promo ", "hint": "Security code"}, None), ({"name": "dob ", "hint": "Expiry date (MM/YY)"}, None),
+    ({"name": "f1 ", "label": "Gift card", "hint": "Card number"}, None),  # a primary decoy is never overridden
+    ({"name": "cardholderEmail ", "hint": "Name on card"}, None),
+    # The hint never overrides the field's own classification either way.
+    ({"name": "ccnum ", "label": "Card number", "hint": "Phone"}, "cc-number"),
+    ({"name": "zip ", "label": "ZIP code", "hint": "Card number"}, "postal-code"),
+    # ... and it still names a field whose own text is silent, as it was added for.
+    ({"name": " ", "label": "  ", "hint": "Card number"}, "cc-number"),
+    ({"name": "f-3 field-3", "label": "  ", "hint": "Expiry date"}, "cc-exp"),
+    ({"name": "h h", "label": "  Max Mustermann", "hint": "Name on card"}, "cc-name"),
+    ({"name": "name ", "label": "  ", "hint": "Name on card"}, "cc-name"),  # a bare person name: the holder only
+    ({"name": "c ", "type": "password", "hint": "CVC"}, "cc-csc"),
+    ({"name": "m ", "type": "select", "hint": "Expiry month"}, "cc-exp-month"),
+    ({"name": " ", "hint": "Gift card number"}, None),  # the hint's own decoy rule still applies
+])
+def test_supplemental_text_only_names_a_field_whose_own_text_is_silent(control, token):
+    assert _token(**control) == token
+
+
+@pytest.mark.parametrize("control, token", [
+    # An identity document, passport, visa or birth date is never a card field.
+    ({"name": "passport_validity ", "label": "Passport valid until"}, None),
+    ({"name": "ausweis ", "label": "Ausweis gültig bis"}, None), ({"label": "Personalausweis Ablaufdatum"}, None),
+    ({"label": "Reisepass gültig bis"}, None), ({"label": "Document expiry date"}, None),
+    ({"label": "ID card valid until"}, None), ({"label": "ID card number"}, None),
+    ({"label": "Driver licence expiry"}, None), ({"label": "Visa expiry date"}, None),
+    ({"name": "visaValidUntil"}, None), ({"label": "Date of birth (MM/YY)"}, None),
+    ({"label": "Geburtsdatum MM/JJ"}, None),
+    # The card's own expiry keeps its token, a card brand beside "Visa" included.
+    ({"label": "Valid until"}, "cc-exp"), ({"label": "Visa card expiry"}, "cc-exp"),
+    ({"label": "Visa / Mastercard expiry date"}, "cc-exp"), ({"label": "Card number (Visa, Mastercard)"}, "cc-number"),
+])
+def test_document_validity_is_never_the_card_expiry(control, token):
+    assert _token(**control) == token
+
+
+@pytest.mark.parametrize("control, token", [
+    # A full-name instruction is no name component; a DOM id suffix is no identification cue.
+    ({"name": "cardholder ", "label": "Name on card (first and last name)"}, "cc-name"),
+    ({"name": "cardholder ", "label": "Karteninhaber Vorname Nachname"}, "cc-name"),
+    ({"name": "cardholder ", "label": "Karteninhaber Vor- und Nachname"}, "cc-name"),
+    ({"name": "cardholder ", "label": "Name on card (first name and last name)"}, "cc-name"),
+    ({"name": "holder ", "label": "Titulaire de la carte prénom et nom"}, "cc-name"),
+    ({"name": "cardholder cardholder-id", "label": "Name on card"}, "cc-name"),
+    ({"name": "cardholder cardholder_id", "label": "Name on card"}, "cc-name"), ({"name": "cardholderId"}, "cc-name"),
+    # a tel input whose text names the holder's name
+    ({"name": "h ", "label": "Name on card", "type": "tel"}, "cc-name"), ({"name": "cardholderName", "type": "tel"}, "cc-name"),
+    # "card" is a word in the decoy rule, never the start of "cardholder"
+    ({"name": "customerCardholder ", "label": "Name on card"}, "cc-name"), ({"name": "customer_cardholder_name"}, "cc-name"),
+    # ... while a name component, an identification cue and a bare tel holder stay out
+    ({"name": "cardholder ", "label": "First name"}, None), ({"name": "cardholder ", "label": "Nachname"}, None),
+    ({"name": "cardholderFirstName", "label": "First and last name"}, None),
+    ({"label": "Card holder ID"}, None), ({"label": "Card holder ID number"}, None),
+    ({"name": "cardholder ", "label": "Ausweisnummer"}, None), ({"name": "cardholderDni"}, None),
+    ({"name": "card-holder", "type": "tel"}, None), ({"label": "Card holder phone", "type": "tel"}, None),
+    ({"label": "Titolare della carta", "type": "tel"}, None),
+    # ... and the German compounds stay decoys
+    ({"name": "k ", "label": "Kundenkartennummer"}, None), ({"label": "Geschenkkarte"}, None),
+    ({"label": "Gutscheinkarte Nummer"}, None), ({"label": "PAYBACK Karte"}, None),
+    ({"name": "cc ", "label": "Customer card number"}, None), ({"label": "Customer card holder"}, None),
+])
+def test_full_name_instructions_and_dom_ids_keep_the_holder(control, token):
+    assert _token(**control) == token
+
+
 def test_a_holder_cue_on_a_zip_field_never_plans_the_holder_name_there():
     from tools import browser_vault_payment as bvp
 
@@ -877,17 +951,18 @@ process.stdout.write(JSON.stringify(api.describe()));
 """
 
 
-@pytest.mark.parametrize("case, label", [
-    # aria-labelledby (in the field's own root, then the document) and title join the label, each capped at 200
+@pytest.mark.parametrize("case, hint", [
+    # aria-labelledby (in the field's own root, then the document) and title make the hint, each capped at 200; the
+    # label stays the field's own text (labels, aria-label, placeholder)
     ({"attrs": {"aria-labelledby": "lbl outer", "title": "Karteninhaber"}, "root": True},
-     "  Name on card outside the root Max Mustermann Karteninhaber"),
-    ({"attrs": {"aria-labelledby": "hint"}, "root": True}, "  " + "x" * 200 + " Max Mustermann "),
-    # no root to ask (an element without getRootNode), an unknown id, nothing set: today's text
-    ({"attrs": {"aria-labelledby": "lbl"}, "root": False}, "   Max Mustermann "),
-    ({"attrs": {"aria-labelledby": "missing"}, "root": True}, "   Max Mustermann "),
-    ({"attrs": {}, "root": True}, "   Max Mustermann "),
+     "Name on card outside the root Karteninhaber"),
+    ({"attrs": {"aria-labelledby": "hint"}, "root": True}, "x" * 200 + " "),
+    # no root to ask (an element without getRootNode), an unknown id, nothing set: no hint text
+    ({"attrs": {"aria-labelledby": "lbl"}, "root": False}, " "),
+    ({"attrs": {"aria-labelledby": "missing"}, "root": True}, " "),
+    ({"attrs": {}, "root": True}, " "),
 ])
-def test_the_card_descriptor_reads_aria_labelledby_and_title_but_never_the_value(case, label):
+def test_the_card_descriptor_reads_aria_labelledby_and_title_but_never_the_value(case, hint):
     import re
     import shutil
     import subprocess
@@ -900,9 +975,134 @@ def test_the_card_descriptor_reads_aria_labelledby_and_title_but_never_the_value
     run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
     assert run.returncode == 0, run.stderr
     (row,) = json.loads(run.stdout)
-    assert row["label"] == label and "secret" not in run.stdout
+    assert row["label"] == "  Max Mustermann" and row["hint"] == hint and "secret" not in run.stdout
     if case["attrs"].get("aria-labelledby") == "lbl outer":
+        assert sp._bounded_description([row]) == [row]  # the discovery shape check accepts the hint key
+        # the field's own text ("h h", "Max Mustermann") is silent: the hint names the holder
         assert classify_checkout_control(LoginControl.from_dict(row)).token == "cc-name"
+
+
+# The page's fields go through the production chain: the closure's describe(), discovery's shape check, the
+# classifier, the document check, planning, and the same closure's commit() with that plan (its writes recorded per
+# element id).
+_PIPELINE_HARNESS = r"""
+const writes = [];
+const performance = {now: () => 1000};
+class HTMLInputElement { get value() { return this.held || ''; } set value(v) { writes.push([this.id, v]); this.held = v; } }
+class HTMLSelectElement { get value() { return ''; } set value(v) {} }
+class Event {} class InputEvent extends Event {} class FocusEvent extends Event {}
+const document = {forms: [], getElementById: id => (id in CASE.texts ? {textContent: CASE.texts[id]} : null)};
+const location = {href: 'https://shop.example/checkout'};
+const els = CASE.fields.map(f => Object.assign(new HTMLInputElement(), {tagName: 'INPUT', autocomplete: f.ac || '',
+  name: f.name, id: f.id, labels: f.label ? [{textContent: f.label}] : null, placeholder: f.placeholder || '', type: f.type || 'text',
+  form: null, maxLength: 0, disabled: false, readOnly: false, isConnected: true, tabIndex: 0, shadowRoot: null,
+  ownerDocument: document, style: {setProperty() {}}, hasAttribute: () => false, dispatchEvent: () => true, blur() {},
+  focus() {}, getAttribute: n => ((f.attrs || {})[n] ?? null), getBoundingClientRect: () => ({width: 100, height: 20}),
+  getClientRects: () => [1], getRootNode: () => document}));
+document.querySelectorAll = () => els;
+const getComputedStyle = () => ({visibility: 'visible', opacity: '1', pointerEvents: 'auto'});
+const api = INSPECT;
+process.stdout.write(JSON.stringify(CASE.plan ? {result: api.commit(CASE.plan, 60000), writes} : api.describe()));
+"""
+
+
+def _pipeline(fields: list, texts: dict | None = None) -> tuple:
+    """``(planned fills or the refusal message, the commit's writes [[element id, value]] or None)``."""
+    import re
+    import shutil
+    import subprocess
+
+    from tools import browser_vault_payment as bvp
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for the synthetic inspection closure")
+
+    def run(case):
+        values = {"CASE": json.dumps(case), "INSPECT": sp._INSPECT}
+        harness = re.sub(r"\bCASE\b|\bINSPECT\b", lambda m: values[m.group(0)], _PIPELINE_HARNESS)
+        out = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    case = {"fields": fields, "texts": texts or {}}
+    controls = sp._card_controls(sp._bounded_description(run(case)))
+    try:
+        docs = _card_documents([("f", "s", "o", MERCHANT, controls)], MERCHANT)
+    except PaymentPolicyError as exc:
+        return str(exc), None
+    fills = bvp._document_fills(_inspection(*docs), CARD)
+    plan = [{"index": f["index"], "token": f["token"], "value": f["value"]} for f in fills]
+    out = run({**case, "plan": plan})
+    assert out["result"]["success"] is True, out["result"]
+    return fills, out["writes"]
+
+
+_NUMBER = {"name": "ccnum", "id": "ccnum", "label": "Card number"}
+_EXPIRY = {"name": "exp", "id": "exp", "label": "Expiry date"}
+_CVC = {"name": "cvc", "id": "cvc", "label": "CVC"}
+_PHONE = {"name": "phone", "id": "phone", "label": "Phone", "type": "tel", "ac": "tel"}
+_PAN = CARD["card_number"]
+
+
+@pytest.mark.parametrize("phone_attrs, texts", [
+    ({"title": "Card number"}, {}), ({"aria-labelledby": "pan-label"}, {"pan-label": "Card number"}),
+])
+def test_a_title_or_labelledby_card_number_on_a_phone_input_never_receives_the_card_number(phone_attrs, texts):
+    # Codex r2 F1: the phone input beside expiry and CVC is refused as an incomplete card form; nothing is written.
+    phone = {**_PHONE, "attrs": phone_attrs}
+    assert _pipeline([phone, _EXPIRY, _CVC], texts) == ("Incomplete or ambiguous card fields", None)
+    # Beside a real number field the card number goes there, never into the phone input.
+    fills, writes = _pipeline([phone, _NUMBER, _EXPIRY, _CVC], texts)
+    assert ["ccnum", _PAN] in writes and all(element != "phone" for element, _value in writes)
+    assert len(writes) == 3
+    # The same title on an input with no text of its own still names the number (what the hint is for).
+    bare = {"name": "", "id": "", "attrs": phone_attrs}
+    fills, writes = _pipeline([bare, _EXPIRY, _CVC], texts)
+    assert ["", _PAN] in writes and len(writes) == 3
+
+
+def test_a_passport_validity_field_never_receives_the_card_expiry():
+    # Codex r2 F2: with number and CVC only, the passport field is no expiry: refused, nothing written ...
+    passport = {"name": "passport_validity", "id": "pv", "label": "Passport valid until"}
+    assert _pipeline([_NUMBER, _CVC, passport]) == ("Missing card expiry fields", None)
+    # ... and beside the card's own expiry the form is not a duplicate: three writes, none into the passport field.
+    fills, writes = _pipeline([_NUMBER, passport, _EXPIRY, _CVC])
+    assert sorted(f["token"] for f in fills) == ["cc-csc", "cc-exp", "cc-number"]
+    assert len(writes) == 3 and all(element != "pv" for element, _value in writes)
+
+
+@pytest.mark.parametrize("holder", [
+    {"name": "cardholder", "id": "h", "label": "Name on card (first and last name)"},
+    {"name": "cardholder", "id": "h", "label": "Karteninhaber", "placeholder": "Vorname Nachname"},
+    {"name": "cardholder", "id": "cardholder-id", "label": "Name on card"},
+    {"name": "customerCardholder", "id": "h", "label": "Name on card"},
+])
+def test_codex_r2_holders_are_planned_and_written_again(holder):
+    # Codex r2 F3/F4: these holders were dropped (no cc-name, three writes); the holder name goes into the holder.
+    fields = [_NUMBER, _EXPIRY, _CVC, holder]
+    fills, writes = _pipeline(fields)
+    assert [f["value"] for f in fills if f["token"] == "cc-name"] == [CARD["cardholder_name"]]
+    assert [holder["id"], CARD["cardholder_name"]] in writes and len(writes) == 4
+
+
+@pytest.mark.parametrize("hint, accepted", [
+    ("Card number", True), ("x" * 200, True), (" ", True), ("x" * 201, False), (7, False), (None, False),
+])
+def test_discovery_and_rebind_accept_only_a_bounded_string_hint(hint, accepted):
+    from agent.vault_payment_policy import PaymentDestinationError
+    from tools.browser_supervisor_payment_repin import _rebind_row
+
+    row = {"index": 0, "autocomplete": "", "name": "f ", "label": " ", "type": "text", "formIndex": None,
+           "maxLength": None, "hint": hint}
+    if accepted:
+        assert sp._bounded_description([row]) == [row]
+    else:
+        with pytest.raises(PaymentDestinationError):
+            sp._bounded_description([row])
+    # the reviewed closure's rebind has no text limit, only the type
+    assert _rebind_row(row, -1) is (isinstance(hint, str))
+    assert _rebind_row({k: v for k, v in row.items() if k != "hint"}, -1) is True
 
 
 _T0 = 1_794_000_000_000  # the browser's wall clock at closure creation
