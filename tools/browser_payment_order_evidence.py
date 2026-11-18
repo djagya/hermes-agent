@@ -62,6 +62,13 @@ FAILURE_SRC = (
     r"was not (?:placed|completed|processed|successful|accepted))|"
     r"(?:failed|declined|unsuccessful)\s+(?:%L%+\s+){0,2}?(?:payment|transaction|order|purchase)|"
     r"(?:payment|order|transaction)\s+(?:%L%+\s+){0,2}?error|an error (?:has )?occurred|"
+    # build F r3 (Codex P1): payment/order-qualified negatives ("Die Zahlung ist nicht möglich", "Payment not
+    # successful", "Order not confirmed")
+    r"(?:zahlung|bezahlung)\s+(?:%L%+\s+){0,3}?nicht\s+(?:%L%+\s+){0,2}?(?:möglich|erfolgreich|bestätigt)|"
+    r"(?:bestellung|kauf)\s+(?:%L%+\s+){0,3}?nicht\s+(?:%L%+\s+){0,2}?(?:erfolgreich|bestätigt|aufgegeben|"
+    r"abgeschlossen)|"
+    r"(?:payment|order|transaction|purchase)\s+(?:%L%+\s+){0,2}?(?:was\s+|has\s+|is\s+)?not\s+(?:been\s+)?"
+    r"(?:successful|confirmed|completed|processed|accepted|placed)|"
     r"no order (?:was|has been) (?:created|placed)|"
     r"not\s+(?:been\s+)?(?:placed|completed|processed|accepted)|"
     r"échoué|échouée|échec|refusé|refusée|n['’]a pas abouti|fallido|fallida|"

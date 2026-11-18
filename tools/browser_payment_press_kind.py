@@ -235,7 +235,8 @@ async def watch_leave(sup: Any, sid: str, arr: str) -> bool:
     return ((reply.get("result") or {}).get("result") or {}).get("value") is True
 
 
-async def prep_verdict(sup: Any, sid: str, arr: str, prep: tuple, effect: Optional[dict]) -> Optional[str]:
+async def prep_verdict(sup: Any, sid: str, arr: str, prep: tuple, effect: Optional[dict],
+                       started: Optional[tuple] = None) -> Optional[str]:
     """build F r2: after a preparatory press, why it counts as the Pay press after all (``navigated``: the top
     document changed; ``purchase_button_gone``: a purchase button listed before it is gone or disabled;
     ``effect_unread``; a submit, unload or navigation that started after the press also reads as
@@ -243,6 +244,11 @@ async def prep_verdict(sup: Any, sid: str, arr: str, prep: tuple, effect: Option
     if not isinstance(effect, dict):
         return "effect_unread"
     if effect.get("navigated") is not False:
+        return "navigated"
+    # build F r3 (Codex P1): Chrome's own navigation-start events (``started`` = (top frame id, press time)): a submit
+    # still in flight at the read, which a page script could hide from the in-page leave watch
+    seen = getattr(sup, "load_started_since", None)
+    if started is not None and (seen is None or seen(*started)):
         return "navigated"
     return None if await still_listed(sup, sid, arr, prep[0]) else "purchase_button_gone"
 

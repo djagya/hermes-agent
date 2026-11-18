@@ -1183,6 +1183,7 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
                    and gate.gen is not None and not gate.gen.paid else None)
         node = await pay_node(sup, sid, element, clicked) if pay_like or prep else None
         before = await _baseline(sup, page_sid, element, sid)
+        pressed_at = time.monotonic()
         refused = await _press_now(sup, deadline, (page_sid, sid, fid, loader, element, tree, child_sessions),
                                    (x2, y2, outer2), top, lambda: _book_press(
                                        sup, gate, gate.approved is not None, pay_like, progress, after=after,
@@ -1194,7 +1195,8 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         if refused:
             return refused
         effect = await _bounded_effect(sup, page_sid, element, sid, before, control["role"], deadline)
-        counted = _end_provisional(gate, await prep_verdict(sup, sid, arr, prep, effect)) if prep else None
+        counted = (_end_provisional(gate, await prep_verdict(sup, sid, arr, prep, effect, (fid, pressed_at)))
+                   if prep else None)
         return _clicked_answer(sup, control, effect, pay_like, prep is not None, counted)
     finally:
         for obj in filter(None, [element, *held]):

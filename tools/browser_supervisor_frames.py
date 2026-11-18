@@ -9,6 +9,7 @@ can route calls into the iframe over the supervisor's live socket.
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -158,8 +159,28 @@ class FrameTrackingMixin:
                          if f.parent_frame_id == frame.frame_id and f.frame_id not in visited)
         return {"top": top.to_dict(), "children": children, "truncated": truncated or bool(queue)}
 
+    def _on_frame_loading(self, params: dict[str, Any], session_id: Optional[str] = None) -> None:
+        """dlz (build F r3, Codex P1): when a frame's navigation or load STARTED (monotonic). Chrome sends these for
+        form submits and scripted navigations before the new document commits, and a page script cannot stop them
+        (unlike its own beforeunload/submit events). Read by ``load_started_since``."""
+        fid = params.get("frameId")
+        # a same-document navigation (pushState, a hash) loads nothing: a modal closing that way is no submit
+        if not fid or str(params.get("navigationType") or "").lower().startswith("samedocument"):
+            return
+        with self._state_lock:
+            self.__dict__.setdefault("_load_started", {})[str(fid)] = time.monotonic()
+
+    def load_started_since(self, frame_id: str, since: float) -> bool:
+        """dlz (build F r3): a navigation or load of ``frame_id`` started at or after ``since``."""
+        with self._state_lock:
+            at = self.__dict__.get("_load_started", {}).get(str(frame_id))
+        return at is not None and at >= since
+
     # CDP event → handler(self, params, session_id); merged into CDPSupervisor._EVENT_HANDLERS.
     EVENT_HANDLERS: dict[str, Callable[..., Any]] = {
+        "Page.frameRequestedNavigation": _on_frame_loading,
+        "Page.frameStartedNavigating": _on_frame_loading,
+        "Page.frameStartedLoading": _on_frame_loading,
         "Page.frameAttached": _on_frame_attached,
         "Page.frameNavigated": _on_frame_navigated,
         "Page.frameDetached": _on_frame_detached,

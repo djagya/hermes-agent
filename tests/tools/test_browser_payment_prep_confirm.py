@@ -138,6 +138,11 @@ class SundaySup(DialogSup, EffectSup):
         super().__init__(rows)
         self.prep, self.prep_calls, self.still, self.owner, self.node = list(prep), [], True, True, None
 
+    started_navigating = False  # Chrome's navigation-start events since the press (build F r3)
+
+    def load_started_since(self, frame_id, since):
+        return self.started_navigating
+
     def default(self, method, params, session):
         fn = params.get("functionDeclaration", "")
         if method == "Runtime.callFunctionOn" and fn == kind.PREP_CHECK:
@@ -186,6 +191,32 @@ def test_an_unwatched_confirm_stays_the_pay_press():
     assert first["pay_pressed"] is True and sup.watched == 1
     assert _click(sup, TOP_BUY)["error_type"] == surface.ALREADY_PRESSED
     assert len(_mouse_presses(sup)) == 1
+
+
+def test_a_navigation_chrome_saw_start_after_the_confirm_rebooks_it_as_pay():
+    """F r3 (Codex P1): a submit still in flight at the read, hidden from the in-page leave watch, is seen through
+    Chrome's navigation-start events: the confirm counts as the Pay press and the purchase is refused."""
+    sup = _sunday()
+    sup.started_navigating = True
+    first = _click(sup, TOP_CONFIRM)
+    assert first["pay_pressed"] is True and first["counted_as_pay"] == "navigated"
+    assert _click(sup, TOP_BUY)["error_type"] == surface.ALREADY_PRESSED
+    assert len(_mouse_presses(sup)) == 1
+
+
+def test_navigation_start_events_are_recorded_except_same_document_ones():
+    from tools.browser_supervisor_frames import FrameTrackingMixin
+    import threading
+
+    class F(FrameTrackingMixin):
+        def __init__(self):
+            self._state_lock = threading.Lock()
+
+    f = F()
+    f._on_frame_loading({"frameId": "TOP", "navigationType": "sameDocument"})
+    assert f.load_started_since("TOP", 0) is False
+    f._on_frame_loading({"frameId": "TOP", "reason": "formSubmissionPost"})
+    assert f.load_started_since("TOP", 0) is True and f.load_started_since("OTHER", 0) is False
 
 
 def test_sunday_the_method_confirm_is_preparatory_and_the_purchase_is_the_one_pay_press():
@@ -479,6 +510,13 @@ def test_order_phrases(text):
 @pytest.mark.parametrize("text", NOT_ORDER)
 def test_bare_thanks_and_checkout_words_are_no_order_wording(text):
     assert evidence.wording("", text)["order"] is False
+
+
+@pytest.mark.parametrize("text", ["Die Zahlung ist nicht möglich.", "Payment not successful", "Order not confirmed",
+                                  "Your payment was not successful. Please try again."])
+def test_payment_qualified_negatives_are_failure(text):
+    """F r3 (Codex P1): the narrowed wording still catches these real failure pages."""
+    assert evidence.wording("", text)["failure"] is True
 
 
 @pytest.mark.parametrize("text", FAILURE_PHRASES)
