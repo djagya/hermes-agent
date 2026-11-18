@@ -378,6 +378,140 @@ def test_an_ambiguous_or_foreign_unzer_holder_is_refused(frames, origins, messag
         _card_documents(_unzer_candidates(frames, origins), MERCHANT)
 
 
+def _token(**raw):
+    c = classify_checkout_control(LoginControl.from_dict({"index": 0, "autocomplete": "", "type": "text", **raw}))
+    return c.token if c else None
+
+
+@pytest.mark.parametrize("control, token", [
+    # A holder cue beside another purpose keeps that purpose's token (the base classification), or stays None.
+    ({"label": "Card holder ZIP code"}, "postal-code"), ({"label": "Card holder postal code"}, "postal-code"),
+    ({"label": "Card holder address"}, "address-line1"), ({"label": "Card holder street"}, "address-line1"),
+    ({"label": "Cardholder address"}, "address-line1"),  # was cc-name on base too
+    ({"label": "Card holder billing address line 2"}, "address-line2"), ({"label": "Card holder city"}, "address-level2"),
+    ({"label": "Card holder state"}, "address-level1"), ({"label": "Card holder country"}, "country-name"),
+    ({"label": "Card holder expiry date"}, "cc-exp"), ({"name": "card-holder", "label": "Expiry month"}, "cc-exp-month"),
+    ({"label": "Card holder phone", "type": "tel"}, None), ({"name": "card_holder_phone"}, None),
+    ({"name": "card-holder", "type": "tel"}, None), ({"label": "Card holder date of birth"}, None),
+    ({"label": "Card holder ID number"}, None), ({"label": "Card holder passport"}, None),
+    ({"label": "Gift card holder"}, None), ({"label": "Loyalty card holder name"}, None),
+    ({"name": "card_holder_first_name"}, None), ({"name": "card_holder_last_name"}, None),
+    ({"name": "cardHolderFirstName"}, None), ({"label": "Card holder login"}, None),
+    ({"name": "card-holder", "autocomplete": "username"}, None), ({"name": "card-holder", "label": "Merchant name"}, None),
+    ({"name": "card-holder", "label": "Company"}, None), ({"name": "cardholderEmail"}, None),
+    ({"name": "card", "label": "Holder"}, None),  # the holder words only across name and label
+    # ... and the holder itself still classifies.
+    ({"name": " card-holder", "label": "  Max Mustermann", "autocomplete": "off"}, "cc-name"),
+    ({"name": "card-holder", "autocomplete": "cc-name"}, "cc-name"), ({"name": "card-holder", "autocomplete": "name"}, "cc-name"),
+    ({"label": "Name of the card holder"}, "cc-name"), ({"name": "card-holder-name"}, "cc-name"),
+])
+def test_a_holder_cue_beside_another_purpose_keeps_that_purpose(control, token):
+    assert _token(**control) == token
+
+
+@pytest.mark.parametrize("control, token", [
+    # camelCase names (Adyen's encrypted field ids among them)
+    ({"name": "cardHolderName"}, "cc-name"), ({"name": "cardholderName"}, "cc-name"),
+    ({"name": "creditCardNumber"}, "cc-number"), ({"name": " encryptedCardNumber"}, "cc-number"),
+    ({"name": " encryptedSecurityCode"}, "cc-csc"), ({"name": " encryptedExpiryDate"}, "cc-exp"),
+    ({"name": "cardCvv"}, "cc-csc"), ({"name": "cardExpiry"}, "cc-exp"), ({"name": "ccExp"}, "cc-exp"),
+    ({"name": "cardExpiryMonth"}, "cc-exp-month"), ({"name": "expireMonth", "type": "select"}, "cc-exp-month"),
+    ({"name": "expireYear", "type": "select"}, "cc-exp-year"),
+    # separated and numbered names, German and Romance labels, placeholders
+    ({"name": "cc-number"}, "cc-number"), ({"name": "cc_number"}, "cc-number"), ({"name": "cvv2"}, "cc-csc"),
+    ({"label": "CVV2"}, "cc-csc"), ({"name": "cvc2"}, "cc-csc"), ({"label": "Card verification code"}, "cc-csc"),
+    ({"label": "Kreditkartennummer"}, "cc-number"), ({"label": "Prüfnr."}, "cc-csc"),
+    ({"label": "Kartenprüfziffer"}, "cc-csc"), ({"label": "Kartensicherheitscode"}, "cc-csc"),
+    ({"label": "Gültigkeitsdatum"}, "cc-exp"), ({"label": "MM / JJ"}, "cc-exp"), ({"label": "MM/AA"}, "cc-exp"),
+    ({"label": "MM/YYYY"}, "cc-exp"), ({"label": "Expires"}, "cc-exp"), ({"label": "Valid until"}, "cc-exp"),
+    ({"label": "Expire le"}, "cc-exp"),
+    ({"label": "Name on the card"}, "cc-name"), ({"label": "Name as it appears on card"}, "cc-name"),
+    ({"label": "Nom sur la carte"}, "cc-name"), ({"label": "Titolare della carta"}, "cc-name"),
+    ({"label": "Naam op kaart"}, "cc-name"), ({"label": "Nombre en la tarjeta"}, "cc-name"),
+    # Non-card camelCase names stay out; an issue date stays out however it is spelled.
+    ({"name": "promoCode"}, None), ({"name": "giftCardPin"}, None), ({"name": "companyName"}, None),
+    ({"name": "firstName"}, None), ({"name": "panelId"}, None), ({"name": "customerEmail"}, None),
+    ({"name": "issueDate"}, None), ({"name": "validFromDate"}, None), ({"name": "startMonth"}, None),
+    ({"name": "userName"}, None), ({"name": "phoneNumber"}, None), ({"label": "Valid from MM/YY"}, None),
+    ({"label": "SMS verification code"}, None),
+    # camelCase splitting is for the card rows only: an address-like camelCase name is not read as one
+    ({"name": "unitPrice"}, None),
+    # A bare month/year select (a date of birth whose legend is outside the label reads the same) stays out.
+    ({"name": "month", "type": "select"}, None), ({"name": "year", "type": "select"}, None),
+    ({"label": "Monat", "type": "select"}, None),
+])
+def test_card_sibling_names_and_labels_classify(control, token):
+    assert _token(**control) == token
+
+
+@pytest.mark.parametrize("control, token", [
+    ({"label": "Exp. MM/YY"}, "cc-exp"), ({"label": "EXP MM/YY"}, "cc-exp"), ({"label": "Exp (MM/YY)"}, "cc-exp"),
+    ({"label": "Exp MM / YYYY"}, "cc-exp"), ({"name": "exp_mm_yy"}, "cc-exp"), ({"label": "Expiry (MM/YY)"}, "cc-exp"),
+    # explicit month and year fields keep their tokens
+    ({"name": "exp_mm"}, "cc-exp-month"), ({"label": "Exp MM"}, "cc-exp-month"), ({"label": "Expiry month"}, "cc-exp-month"),
+    ({"name": "exp_yy"}, "cc-exp-year"), ({"label": "Expiry year (YYYY)"}, "cc-exp-year"),
+    ({"name": "expiry-month"}, "cc-exp-month"), ({"name": "expiry-year", "maxLength": 2}, "cc-exp-year"),
+])
+def test_a_combined_expiry_with_a_month_shape_is_the_combined_expiry(control, token):
+    assert _token(**control) == token
+
+
+@pytest.mark.parametrize("name, label", [
+    ("giftcard", "Gift card number"), ("giftcard", "Gift card code"), ("gc", "Gift card PIN"),
+    ("payback", "PAYBACK Kartennummer"), ("mm", "Miles & More Kartennummer"), ("loyalty", "Loyalty card number"),
+    ("membership", "Membership card number"), ("kundenkarte", "Kundenkartennummer"), ("voucher", "Gutscheincode"),
+    ("promo", "Promo card code"), ("ticket", "Ticket expiry date"), ("gift", "Geschenkkarte: Kartennummer"),
+    ("cc", "Customer card number"), ("giftCardNumber", ""),
+])
+def test_gift_loyalty_and_ticket_cards_are_never_card_fields(name, label):
+    assert _token(name=name, label=label) is None
+
+
+def test_a_decoy_word_elsewhere_in_a_real_card_field_name_does_not_hide_it():
+    # A ticket merchant's own field name around a bank card field: the cue must qualify the card itself.
+    assert _token(name="ticketPaymentCardNumber") == "cc-number"
+    assert _token(name="ticket-checkout-cvc") == "cc-csc"
+
+
+def test_a_holder_cue_on_a_zip_field_never_plans_the_holder_name_there():
+    from tools import browser_vault_payment as bvp
+
+    rows = [{"index": n, "autocomplete": "", "name": name, "label": label, "type": "text", "formIndex": 0,
+             "maxLength": None}
+            for n, (name, label) in enumerate([("ccnum ", "Card number"), ("expiry ", "Expiry date"),
+                                               ("cvc ", "CVC"), ("zip ", "Card holder ZIP code")])]
+    controls = sp._card_controls(sp._bounded_description(rows))
+    assert [c.token for c in controls] == ["cc-number", "cc-exp", "cc-csc"]  # the ZIP is no card field
+    docs = _card_documents([("f", "s", "o", MERCHANT, controls)], MERCHANT)
+    fills = bvp._document_fills(_inspection(*docs), CARD)
+    assert sorted(f["token"] for f in fills) == ["cc-csc", "cc-exp", "cc-number"]
+    assert all(f["index"] != 3 for f in fills)
+
+    # The merchant's own "Name on card" beside billing "Card holder address/city" fields fills as on base: four
+    # fields, the holder into "Name on card" only.
+    rows += [{**rows[0], "index": 4, "name": "name ", "label": "Name on card"},
+             {**rows[0], "index": 5, "name": "addr ", "label": "Card holder address"},
+             {**rows[0], "index": 6, "name": "city ", "label": "Card holder city"}]
+    controls = sp._card_controls(sp._bounded_description(rows))
+    docs = _card_documents([("f", "s", "o", MERCHANT, controls)], MERCHANT)
+    fills = bvp._document_fills(_inspection(*docs), CARD)
+    assert [(f["index"], f["value"]) for f in fills if f["token"] == "cc-name"] == [(4, "Ada Lovelace")]
+    assert len(fills) == 4
+
+
+def test_a_merchant_holder_beside_unzer_holder_is_refused_for_the_duplicate_under_the_cap():
+    # Four documents (Unzer UI v1's cap): merchant holder, Unzer number, CVC and holder frames, the expiry frame not
+    # loaded. The duplicate holder is refused before the missing expiry is even looked at ...
+    frames = {k: v for k, v in _unzer_frames().items() if k != "expiry"}
+    duplicate = _unzer_candidates({**frames, "page": [_UNZER_HOLDER]}, {"page": MERCHANT})
+    assert len(duplicate) == 4
+    with pytest.raises(PaymentPolicyError, match="Incomplete or ambiguous card fields"):
+        _card_documents(duplicate, MERCHANT)
+    # ... while the same documents without the merchant's holder pass that check and stop at the expiry.
+    with pytest.raises(PaymentPolicyError, match="Missing card expiry fields"):
+        _card_documents(_unzer_candidates(frames), MERCHANT)
+
+
 def _fill_unzer(monkeypatch, card):
     from tools import browser_vault_payment as bvp
 
@@ -716,6 +850,59 @@ wallNow += CASE.wallElapsed;
 const result = api.commit([{index: 0, token: 'cc-number', value: '4242'}], CASE.deadline);
 process.stdout.write(JSON.stringify({result, writes}));
 """
+
+
+
+_DESCRIBE_HARNESS = r"""
+let mono = 1000;
+const performance = {now: () => mono};
+class HTMLInputElement { get value() { return this.held || ''; } set value(v) { this.held = v; } }
+class HTMLSelectElement { get value() { return ''; } set value(v) {} }
+class Event {} class InputEvent extends Event {} class FocusEvent extends Event {}
+const texts = {lbl: 'Name on card', hint: 'x'.repeat(500), outer: 'outside the root'};
+const root = {getElementById: id => (id in texts && id !== 'outer' ? {textContent: texts[id]} : null)};
+const document = {forms: [], getElementById: id => (id === 'outer' ? {textContent: texts.outer} : null)};
+const attrs = CASE.attrs;
+const el = Object.assign(new HTMLInputElement(), {tagName: 'INPUT', autocomplete: 'off', name: 'h', id: 'h',
+  labels: null, placeholder: 'Max Mustermann', type: 'text', form: null, maxLength: 0, disabled: false, readOnly: false,
+  isConnected: true, tabIndex: 0, shadowRoot: null, ownerDocument: document, style: {setProperty() {}}, held: 'secret',
+  getAttribute: n => (n in attrs ? attrs[n] : null), hasAttribute: () => false,
+  getBoundingClientRect: () => ({width: 100, height: 20}), getClientRects: () => [1], dispatchEvent: () => true,
+  blur() {}, focus() {}, ...(CASE.root ? {getRootNode: () => root} : {})});
+document.querySelectorAll = () => [el];
+const location = {href: 'https://payment.example/holder'};
+const getComputedStyle = () => ({visibility: 'visible', opacity: '1', pointerEvents: 'auto'});
+const api = INSPECT;
+process.stdout.write(JSON.stringify(api.describe()));
+"""
+
+
+@pytest.mark.parametrize("case, label", [
+    # aria-labelledby (in the field's own root, then the document) and title join the label, each capped at 200
+    ({"attrs": {"aria-labelledby": "lbl outer", "title": "Karteninhaber"}, "root": True},
+     "  Name on card outside the root Max Mustermann Karteninhaber"),
+    ({"attrs": {"aria-labelledby": "hint"}, "root": True}, "  " + "x" * 200 + " Max Mustermann "),
+    # no root to ask (an element without getRootNode), an unknown id, nothing set: today's text
+    ({"attrs": {"aria-labelledby": "lbl"}, "root": False}, "   Max Mustermann "),
+    ({"attrs": {"aria-labelledby": "missing"}, "root": True}, "   Max Mustermann "),
+    ({"attrs": {}, "root": True}, "   Max Mustermann "),
+])
+def test_the_card_descriptor_reads_aria_labelledby_and_title_but_never_the_value(case, label):
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for the synthetic inspection closure")
+    values = {"CASE": json.dumps(case), "INSPECT": sp._INSPECT}
+    harness = re.sub(r"\bCASE\b|\bINSPECT\b", lambda m: values[m.group(0)], _DESCRIBE_HARNESS)
+    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
+    assert run.returncode == 0, run.stderr
+    (row,) = json.loads(run.stdout)
+    assert row["label"] == label and "secret" not in run.stdout
+    if case["attrs"].get("aria-labelledby") == "lbl outer":
+        assert classify_checkout_control(LoginControl.from_dict(row)).token == "cc-name"
 
 
 _T0 = 1_794_000_000_000  # the browser's wall clock at closure creation
