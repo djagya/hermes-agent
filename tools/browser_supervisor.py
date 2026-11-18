@@ -520,14 +520,23 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                 # stale dialog entry is rejected with "no dialog is showing", logged only).
                 self._page_session_id = None
                 self._reset_dialog_tabs()
-                await self._attach_initial_page()
-                await self._rewatch_dialog_tabs()
-                self._set_active(True)
-                last_success_at = time.time()
-                reconnect_failures = redial_failures = 0
-                backoff = 0.5  # reset after a successful attach
-                self._ready_event.set()
-                await reader_task
+                if await self._payment_native_lost():
+                    # dlz (build C4): control refuses every session command on this socket while the lock holds,
+                    # so no attach is tried (no redial loop); the socket stays for status, tab list and
+                    # payment_close. Control closes it when the lock ends, and the next dial attaches as usual.
+                    last_success_at = time.time()
+                    reconnect_failures = redial_failures = 0
+                    backoff = 0.5
+                    await reader_task
+                else:
+                    await self._attach_initial_page()
+                    await self._rewatch_dialog_tabs()
+                    self._set_active(True)
+                    last_success_at = time.time()
+                    reconnect_failures = redial_failures = 0
+                    backoff = 0.5  # reset after a successful attach
+                    self._ready_event.set()
+                    await reader_task
             except BaseException as e:
                 if self._fail_start(e):
                     raise
@@ -559,6 +568,29 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             logger.debug("CDP supervisor %s: reconnecting in %.1fs...", self.task_id, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 10.0)
+
+    async def _payment_native_lost(self) -> bool:
+        """dlz (build C4): on a (re)dialled socket, whether it serves a payment lock it can no longer act in: this
+        supervisor's lock record names another claim socket, and control's status on this socket says the slot is
+        locked and this connection is not native. Logs once per socket; any doubt (no record, an unanswered or
+        malformed status, unlocked) is False: the usual attach runs."""
+        try:
+            from tools import browser_payment_surface as pay
+
+            if not pay.claim_socket_changed(self):
+                return False
+            reply = await self._cdp(pay.STATUS_METHOD, {}, timeout=5)
+            state, _tabs, native = pay.parse_lock_status_native(reply.get("result") if isinstance(reply, dict) else None)
+        except Exception as e:  # health: allow BLE001 -- unknown: today's attach (control refuses it if locked)
+            logger.debug("CDP supervisor %s: payment lock status on redial unknown: %s", self.task_id,
+                         _redact_cdp_error_text(e))
+            return False
+        if state != "locked" or native is not False:
+            return False
+        pay.mark_native_lost(self)
+        logger.warning("CDP supervisor %s: native payment connection lost during a payment lock; not attaching "
+                       "until the lock ends (payment actions answer payment_native_lost)", self.task_id)
+        return True
 
     async def _attach_page(self, target_id: str, *, timeout: float, deadline: Optional[float] = None,
                            refuse_locked: bool = False) -> str:

@@ -927,6 +927,14 @@
         "params": "none",
         "result": "locked, native (this connection is the native one), tabs (owning tab ids), unverified (a lock record that did not read back: human clear only)",
         "errors": []
+      },
+      "Hermes.paymentSurfaceHolders": {
+        "params": "none",
+        "result": "tabs (the page targets of this connection's latest confirmed claim), holders (the tab-type targets control recorded with them; both are in the claim reply's tabs)",
+        "errors": [
+          "payment_surface_unavailable"
+        ],
+        "rules": "answered only to the slot's native connection after a confirmed claim; additive: the claim reply is unchanged, and a runtime that does not ask it keeps reading the whole owning set"
       }
     },
     "errors": {

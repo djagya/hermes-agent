@@ -834,6 +834,11 @@ def payment_dialog(supervisor: Any, dialog_id: Any, accept: Any) -> dict:
     if type(accept) is not bool or not isinstance(dialog_id, str) or not dialog_id:
         return _refusal("payment_dialog_invalid", "dialog_id (from dialog_pending) and accept (true or false) are "
                                                   "required. Nothing was done.")
+    from tools.browser_payment_surface import native_lost_refusal
+
+    lost = native_lost_refusal(supervisor)  # build C4: the answer would go out on a socket control refuses
+    if lost:
+        return lost
     if not has_payment(supervisor):
         return _refusal("payment_dialog_none", _DIALOG_NONE)
     dialog = next((d for d in _held_dialogs(supervisor) if d.id == dialog_id), None)
@@ -861,6 +866,11 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     loop = getattr(supervisor, "_loop", None)
     if loop is None or not loop.is_running():
         return _refusal("supervisor_required", "The supervised browser is not attached; nothing was done.")
+    from tools.browser_payment_surface import native_lost_refusal
+
+    lost = native_lost_refusal(supervisor)  # build C4: the confirmation cannot be read on this socket
+    if lost:
+        return lost
     payment, refused = _payment_for(supervisor)
     if refused:
         return refused

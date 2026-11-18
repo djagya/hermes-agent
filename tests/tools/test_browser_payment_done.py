@@ -147,6 +147,7 @@ def _fast(monkeypatch):
     monkeypatch.setattr(done, "_WAIT_S", 0.4)
     monkeypatch.setattr(done, "_RELEASE_WAIT_S", 0.2)
     monkeypatch.setattr(done, "_RELEASE_POLL_S", 0.01)
+    monkeypatch.setattr(surface, "_SETTLE_S", 0.02)  # build C3: the post-click settle
     from agent import redact
 
     from tools import browser_payment_card_values as card_values

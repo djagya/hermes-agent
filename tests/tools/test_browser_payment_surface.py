@@ -168,6 +168,7 @@ def _bump(sup):
 def _unmanaged(monkeypatch):
     # unknown status means locked only on a managed browser; these fakes run as a browser without control
     monkeypatch.setattr(surface, "_managed", lambda: False)
+    monkeypatch.setattr(surface, "_SETTLE_S", 0.02)  # build C3: the post-click settle (bounded; its own tests)
 
 
 def _claimed(sup=None, approved=APPROVED):
@@ -658,8 +659,10 @@ def test_payment_control_captions_never_carry_card_values():
 def test_payment_click_is_one_trusted_click_at_the_hit_tested_centre():
     sup = _claimed()
     ref = surface.payment_controls(sup)["controls"][0]["ref"]
-    assert surface.payment_click(sup, ref) == {"success": True, "clicked": ref, "role": "button",
-                                               "text": "Pay with card •••• •••• •••• ••••"}
+    out = surface.payment_click(sup, ref)
+    effect = out.pop("effect")  # build C3: the structural effect (its own tests: test_browser_payment_surface_honesty)
+    assert out == {"success": True, "clicked": ref, "role": "button", "text": "Pay with card •••• •••• •••• ••••"}
+    assert effect is None or set(effect) >= {"navigated", "control_listed", "control_hit", "unchanged"}
     clicks = sup.sent("Input.dispatchMouseEvent")
     assert [c[1]["type"] for c in clicks] == ["mouseMoved", "mousePressed", "mouseReleased"]
     # Quad centre (20, 20) in the card frame plus its iframe's content box (100, 200) on the page.

@@ -35,6 +35,8 @@ from tools.browser_supervisor_payment_stop import await_cleanup, release_object,
 
 
 _MAX_CARD_DOCUMENTS = 4
+# dlz (build C6): more than one tab on the merchant origin (typed, so Sera is told the one way on)
+MERCHANT_TAB_AMBIGUOUS = "payment_merchant_tab_ambiguous"
 # dlz (design v2 B3): global traversal bounds, both paths: frames in the whole tree, nesting depth below the top
 # document, and out-of-process iframe targets expanded into this page's tree.
 _MAX_FRAMES = 64
@@ -742,6 +744,13 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             and t.get("url", "").startswith("https://")
             and normalize_origin(t["url"]) == origin
         ]
+        if len(pages) > 1:  # dlz (build C6): typed, with the one way on (the shop's origin and a count only)
+            raise PaymentDestinationError(
+                MERCHANT_TAB_AMBIGUOUS,
+                f"{len(pages)} tabs of this browser are open on {origin}, so Hermes cannot tell which one is the "
+                f"checkout. Nothing was read or written. Close the other tabs on {origin} (keep the one with the "
+                "checkout), then fill again.",
+                {"merchant_origin": origin, "merchant_tabs": len(pages)})
         if len(pages) != 1:
             raise PaymentPolicyError("Merchant tab missing or ambiguous")
         try:

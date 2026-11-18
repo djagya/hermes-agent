@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 CLAIM_METHOD = "Hermes.claimPaymentSurface"
 STATUS_METHOD = "Hermes.paymentSurfaceStatus"
+# dlz (build C1): control names the tab-type holders of the latest native claim (additive; old control: blocked)
+HOLDERS_METHOD = "Hermes.paymentSurfaceHolders"
 UNAVAILABLE = "payment_surface_unavailable"
 LOCKED = "payment_surface_locked"
 # control-v1 ``cdp_methods.locked.commands`` (exact names); allowed only without a sessionId.
@@ -70,6 +72,8 @@ _LOCK = threading.Lock()
 _HELD: weakref.WeakSet = weakref.WeakSet()
 # Supervisors control last reported locked (read by loop-side checks that cannot wait for a status).
 _KNOWN_LOCKED: weakref.WeakSet = weakref.WeakSet()
+# build C4: supervisors control last reported locked with their socket not the lock's native connection.
+_NOT_NATIVE: weakref.WeakSet = weakref.WeakSet()
 # Claims on the wire per supervisor (a count, so no completion clears another claim's mark).
 _CLAIMING: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 # One claim, dialog answer or recovery call at a time per supervisor (claims are serialized).
@@ -137,17 +141,38 @@ def parse_lock_status(result: Any) -> tuple[str, frozenset]:
     ``("unknown", ∅)``. The one reader of the lock state. Exactly ``{locked, native, tabs, unverified}``:
     three bools and the sorted owning tab ids; ``locked`` must equal ``tabs or unverified`` and ``native``
     implies ``locked``. Any other shape, type or combination is unknown, never unlocked."""
+    return parse_lock_status_native(result)[:2]
+
+
+def parse_lock_status_native(result: Any) -> tuple[str, frozenset, Optional[bool]]:
+    """:func:`parse_lock_status` plus control's ``native`` (whether the asking connection is the lock's native
+    one): a bool when the state is ``locked``, else None."""
     if not isinstance(result, dict) or set(result) != {"locked", "native", "tabs", "unverified"}:
-        return "unknown", frozenset()
+        return "unknown", frozenset(), None
     locked, native, tabs, unverified = result["locked"], result["native"], result["tabs"], result["unverified"]
     if not (type(locked) is bool and type(native) is bool and type(unverified) is bool):
-        return "unknown", frozenset()
+        return "unknown", frozenset(), None
     if not (isinstance(tabs, list) and len(tabs) <= _MAX_STATUS_TABS and all(_valid_id(t) for t in tabs)
             and len(set(tabs)) == len(tabs)):
-        return "unknown", frozenset()
+        return "unknown", frozenset(), None
     if locked is not (bool(tabs) or unverified) or (native and not locked):
-        return "unknown", frozenset()
-    return ("locked", frozenset(tabs)) if locked else ("unlocked", frozenset())
+        return "unknown", frozenset(), None
+    return ("locked", frozenset(tabs), native) if locked else ("unlocked", frozenset(), None)
+
+
+def parse_holders(result: Any, tab: str, owned: Any) -> Optional[frozenset]:
+    """dlz (build C1): ``Hermes.paymentSurfaceHolders`` as the holder ids of the claim of ``tab``, or None (not
+    answered, another claim, any other shape). Exactly ``{tabs: [tab], holders}``, holders distinct well-formed
+    ids, none the claimed tab, every one in the claim reply's owning set ``owned``."""
+    if not isinstance(result, dict) or set(result) != {"tabs", "holders"} or result["tabs"] != [tab]:
+        return None
+    holders = result["holders"]
+    if not (isinstance(holders, list) and len(holders) <= _MAX_STATUS_TABS and all(_valid_id(h) for h in holders)
+            and len(set(holders)) == len(holders)):
+        return None
+    if tab in holders or not set(holders) <= set(owned):
+        return None
+    return frozenset(holders)
 
 
 def _claim_lock(supervisor: Any) -> threading.Lock:
@@ -189,11 +214,13 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
     gen = None
     with _LOCK:
         held_before = supervisor in _HELD
+        old = _GENS.get(supervisor) if held_before else None
+        pressing_at_start = _PRESSING_N > 0
         if not held_before:  # a new lock of this process (pressed_in_lock)
-            gen = _GENS[supervisor] = _LockGen(known=_PRESSING_N == 0 and supervisor not in _KNOWN_LOCKED)
-        elif _GENS.get(supervisor) is not None:  # B1: a new fill is a new approval; only its success binds a total
-            _GENS[supervisor].approved = None
-            _GENS[supervisor].admitted = False  # r4 C7: and no press of it was admitted yet
+            gen = _GENS[supervisor] = _LockGen(known=not pressing_at_start and supervisor not in _KNOWN_LOCKED)
+        elif old is not None:  # B1: a new fill is a new approval; only its success binds a total
+            old.approved = None
+            old.admitted = False  # r4 C7: and no press of it was admitted yet
         _HELD.add(supervisor)
         _CLAIMING[supervisor] = _CLAIMING.get(supervisor, 0) + 1
         _EPOCHS[supervisor] = _EPOCHS.get(supervisor, 0) + 1
@@ -205,9 +232,6 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
         result = reply.get("result") if isinstance(reply, dict) else None
         if not parse_claim_result(result, [tab]) or getattr(supervisor, "_ws", None) is not ws:
             raise SurfaceRefused("claim not confirmed")
-        if gen is not None and set(result["tabs"]) != {tab}:  # control's lock already held other tabs
-            with _LOCK:
-                gen.known = False
     except Exception as exc:  # health: allow BLE001 -- CDP/transport text is not surfaced; fixed type only
         if _control_refused(exc) and not held_before:
             # Only control's own refusal proves nothing changed; any other failure keeps the lock here,
@@ -226,11 +250,65 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
                 _CLAIMING[supervisor] = left
             else:
                 _CLAIMING.pop(supervisor, None)
+    owned = frozenset(result["tabs"])
+    others = owned - {tab}
+    if others:  # build C1: control's own holder of the claimed page is part of this claim, not another page
+        holders = _claim_holders(supervisor, loop, tab, owned, ws)
+        others = others - holders if holders is not None else others
+    _start_record(supervisor, gen, old, held_before, pressing_at_start, owned, bool(others), ws)
     # dlz (lockdown §2): the payment tab and its card documents, for browser_vault payment_done.
     from tools.browser_payment_done import record_payment
 
     record_payment(supervisor, inspected)
     return None
+
+
+def _claim_holders(supervisor: Any, loop: Any, tab: str, owned: frozenset, ws: Any) -> Optional[frozenset]:
+    """dlz (build C1): the tab-type holders control recorded with this claim (``HOLDERS_METHOD``), or None when it
+    cannot say (an older control answers ``cdp_method_blocked``; a timeout, another socket): the extra ids then
+    count as other tabs in the lock, as before (fail closed)."""
+    try:
+        reply = _wait(supervisor._cdp(HOLDERS_METHOD, {}, timeout=5), loop, timeout=7)
+    except Exception as exc:  # health: allow BLE001 -- old control or no answer: unknown, fail closed
+        logger.info("payment lock holders not named by control (%s)", type(exc).__name__)
+        return None
+    if getattr(supervisor, "_ws", None) is not ws:
+        return None
+    return parse_holders(reply.get("result") if isinstance(reply, dict) else None, tab, owned)
+
+
+def _start_record(supervisor: Any, gen: Any, old: Any, held_before: bool, pressing_at_start: bool,
+                  owned: frozenset, others: bool, ws: Any) -> None:
+    """After a confirmed claim: the lock record this fill presses in. A claim while this process held no lock keeps
+    the record it started before the claim was sent (``gen``). Build C2: a claim while it held one (a new fill after
+    an unproven release, or a re-fill) starts a fresh record, so presses of an earlier record never carry over; that
+    record is unknown when the old lock may still be held (control's owning set still names one of its tabs, or the
+    old record never had a confirmed claim) or a click was running when the claim began. Either is unknown when the
+    owning set holds a page that is not this claim's tab or its holder (``others``)."""
+    global _RECORD_SEQ
+    with _LOCK:
+        if not held_before:
+            if gen is None or _GENS.get(supervisor) is not gen:
+                return  # the lock ended (or was replaced) while the claim was on the wire
+            if others:
+                gen.known = False
+            rec, replaced = gen, None
+        else:
+            if _GENS.get(supervisor) is not old:
+                return  # another claim's record already replaced it
+            still_held = old is None or old.owned is None or bool(owned & old.owned)
+            rec = _GENS[supervisor] = _LockGen(known=not (pressing_at_start or still_held or others))
+            replaced = old.serial if old is not None else 0
+        rec.owned, rec.ws = owned, ws
+        _RECORD_SEQ += 1
+        if rec.serial == 0:
+            rec.serial = _RECORD_SEQ
+        known, serial, n = rec.known, rec.serial, len(owned)
+    if replaced is None:
+        logger.info("payment lock record %d started (owning ids %d, presses known %s)", serial, n, known)
+    else:
+        logger.info("payment lock record %d replaces record %d (owning ids %d, presses known %s)",
+                    serial, replaced, n, known)
 
 
 def _note_claim(supervisor: Any) -> None:
@@ -273,9 +351,10 @@ def lock_status(supervisor: Any) -> str:
     bound = _slot_bound(supervisor)
     with _LOCK:
         start, busy = _EPOCHS.get(supervisor, 0), _claiming(supervisor)
+    native = None
     try:
         reply = _wait(supervisor._cdp(STATUS_METHOD, {}, timeout=5), supervisor._loop, timeout=7)
-        state, _tabs = parse_lock_status(reply.get("result") if isinstance(reply, dict) else None)
+        state, _tabs, native = parse_lock_status_native(reply.get("result") if isinstance(reply, dict) else None)
     except Exception:  # health: allow BLE001 -- an unanswered status proves nothing
         state = "unknown"
     unlocked = saw_lock = False
@@ -287,8 +366,16 @@ def lock_status(supervisor: Any) -> str:
             _HELD.discard(supervisor)
             _GENS.pop(supervisor, None)  # the lock ended
             _KNOWN_LOCKED.discard(supervisor)
+            _NOT_NATIVE.discard(supervisor)
         elif state == "locked":
             _KNOWN_LOCKED.add(supervisor)
+            if native is False:  # build C4: the lock is held, by another connection than this socket
+                _NOT_NATIVE.add(supervisor)
+                gen = _GENS.get(supervisor) if supervisor in _HELD else None
+                if gen is not None and gen.owned is not None:
+                    gen.native_lost = True
+            else:
+                _NOT_NATIVE.discard(supervisor)
     # dlz: the confirmed release narrows the payment window to browser results (card_values)
     if unlocked and (saw_lock or (bound and _slot_bound(supervisor))):
         try:
@@ -314,15 +401,24 @@ def slot_locked(supervisor: Any) -> bool:
     a claim from this process is not proven released, when control says locked, and on a managed
     browser whenever control's answer is unknown. A browser without browser-control (no lock exists)
     is unlocked unless this process claimed it."""
+    return _lock_verdict(supervisor) != "unlocked"
+
+
+def _lock_verdict(supervisor: Any) -> str:
+    """:func:`slot_locked` as ``locked`` | ``unlocked`` | ``unknown`` (build C5): ``unknown`` only when control's
+    answer is unknown on a managed browser and this process holds no claim and saw no lock on this supervisor, so
+    nothing says a payment is running; it still refuses every model-reachable call."""
     start = epoch(supervisor)
     state = lock_status(supervisor)
     with _LOCK:
         if _claiming(supervisor) or _EPOCHS.get(supervisor, 0) != start:
-            return True
-        held = supervisor in _HELD
+            return "locked"
+        held, seen = supervisor in _HELD, supervisor in _KNOWN_LOCKED
     if state == "unknown":
-        return held or _managed()
-    return state == "locked"
+        if held or seen:
+            return "locked"
+        return "unknown" if _managed() else "unlocked"
+    return state
 
 
 def locally_locked(supervisor: Any) -> bool:
@@ -330,6 +426,65 @@ def locally_locked(supervisor: Any) -> bool:
     a claim not proven released, or control's last answer locked."""
     with _LOCK:
         return _claiming(supervisor) or supervisor in _HELD or supervisor in _KNOWN_LOCKED
+
+
+NATIVE_LOST = "payment_native_lost"
+NATIVE_LOST_TEXT = (
+    "Hermes lost its own browser connection while this card payment held the lock (the connection the card fill "
+    "claimed the payment tab on was replaced), so it can no longer list, click or read the payment tab, and whether "
+    "Pay went through is unknown. Do not press anything, do not fill the card again and do not pay again. Tell the "
+    "owner (Danil) to check the order, the shop's e-mail and his bank. Call browser_vault payment_close only after "
+    "he has looked: it closes the payment tab and ends the lock.")
+
+
+def claim_socket_changed(supervisor: Any) -> bool:
+    """build C4 (loop-safe, local state only): this supervisor holds a lock record whose confirmed claim went out on
+    another socket than its current one. Control's native connection is the claim's socket, so a redialled socket
+    is never native while that lock holds."""
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        return (gen is not None and gen.owned is not None and gen.ws is not None
+                and getattr(supervisor, "_ws", None) is not gen.ws)
+
+
+def mark_native_lost(supervisor: Any) -> None:
+    """build C4: control named this lock held by another connection than this supervisor's socket."""
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        if gen is not None and gen.owned is not None:
+            gen.native_lost = True
+
+
+def native_lost_refusal(supervisor: Any) -> Optional[dict]:
+    """build C4: ``payment_native_lost`` for a native payment action (payment_controls / payment_click /
+    payment_done / payment_dialog) when its lock can no longer be served on this socket, else None:
+    - this process's lock record says so (its claim socket was replaced, or control reported the lock held by
+      another connection) and control does not prove the slot unlocked; or
+    - this process holds no claim on this supervisor (a replaced supervisor, a restarted gateway) and control
+      reports the slot locked with this socket not native.
+    An unlocked slot is never "lost": the action then answers as it does without a payment."""
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        recorded = gen is not None and gen.owned is not None
+        flagged = recorded and gen.native_lost
+    if recorded and not flagged and not claim_socket_changed(supervisor):
+        return None
+    if not recorded:
+        from tools.browser_payment_done import has_payment
+
+        if has_payment(supervisor):  # a payment this process recorded on this supervisor: not a foreign lock
+            return None
+    state = lock_status(supervisor)
+    if state == "unlocked":
+        return None
+    with _LOCK:
+        gen = _GENS.get(supervisor) if supervisor in _HELD else None
+        if recorded:
+            if gen is not None and gen.owned is not None:
+                gen.native_lost = True
+            return _refusal(NATIVE_LOST, NATIVE_LOST_TEXT)
+        lost = state == "locked" and supervisor in _NOT_NATIVE and gen is None
+    return _refusal(NATIVE_LOST, NATIVE_LOST_TEXT) if lost else None
 
 
 def fenced_native(supervisor: Any, op) -> dict:
@@ -367,12 +522,29 @@ def fenced_dispatch(supervisor: Any, before: int, call) -> tuple:
     try:
         if epoch(supervisor) != before:
             return "refused", locked_withheld()
-        refused = locked_refusal(supervisor)
+        refused = vault_lock_refusal(supervisor)
         if refused:
             return "refused", refused
         return "ok", call()
     finally:
         lock.release()
+
+
+CONNECTION_UNAVAILABLE = "browser_connection_unavailable"
+_CONNECTION_UNAVAILABLE_TEXT = (
+    "Hermes could not read the browser's payment-lock state (browser control did not answer), and no card payment "
+    "of this Hermes process is open on it, so nothing was read or written. Retry this once; if it fails again, "
+    "report it to the user. This is not a payment lock: do not call payment_close for it.")
+
+
+def vault_lock_refusal(supervisor: Any) -> Optional[dict]:
+    """build C5: the refusal for a non-card vault page operation (login, signup, code fills), else None.
+    ``payment_surface_locked`` while the slot is locked; ``browser_connection_unavailable`` (retry once) when the
+    lock state is unknown and this process holds no claim and saw no lock. Either way nothing is dispatched."""
+    verdict = _lock_verdict(supervisor)
+    if verdict == "unknown":
+        return _refusal(CONNECTION_UNAVAILABLE, _CONNECTION_UNAVAILABLE_TEXT)
+    return _refusal(LOCKED, LOCKED_TEXT) if verdict == "locked" else None
 
 
 def locked_refusal(supervisor: Any, method: str = "", session_id: Optional[str] = None) -> Optional[dict]:
@@ -490,6 +662,158 @@ _DESCRIBE = r"""function(){ return this.map((el, i) => {
 _HIT = r"""function(){ this.scrollIntoView({block: 'center', inline: 'center'});
   const r = this.getBoundingClientRect(); const x = r.left + r.width / 2, y = r.top + r.height / 2;
   const hit = document.elementFromPoint(x, y); return !!hit && (hit === this || this.contains(hit)); }"""
+
+
+# build C3: structural, count-only reads around a press (nothing but bools, counts and a class word leaves the world).
+_DIALOG_SEL = "[role=dialog],[role=alertdialog],[aria-modal=true],dialog[open]"
+_OCCLUDER_JS = r"""const occluderClass = el => {
+  if (!el) return 'other';
+  if (el.closest && el.closest('__DIALOG__')) return 'dialog';
+  for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+    const p = getComputedStyle(n).position; if (p === 'fixed' || p === 'sticky') return 'fixed_overlay';
+  }
+  return 'other';
+};""".replace("__DIALOG__", _DIALOG_SEL)
+# On the control (its own document): the class of what sits at its centre.
+_OCCLUDER = ("function(){ " + _OCCLUDER_JS + r"""
+  const r = this.getBoundingClientRect();
+  return occluderClass(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)); }""")
+# In the payment tab's top document, at page coordinates (an element over a card iframe).
+_OCCLUDER_AT = "((x, y) => { " + _OCCLUDER_JS + " return occluderClass(document.elementFromPoint(x, y)); })"
+# On the pressed control: still listed (connected, laid out, visible), still hit at its centre, its checked state.
+_CONTROL_STATE = r"""function(){ const r = this.getBoundingClientRect(); const st = getComputedStyle(this);
+  const listed = this.isConnected && r.width >= 1 && r.height >= 1 && st.visibility === 'visible' && st.display !== 'none';
+  let hit = false;
+  if (listed) { const h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+                hit = !!h && (h === this || this.contains(h)); }
+  return {listed, hit, checked: !!this.checked || this.getAttribute('aria-checked') === 'true'}; }"""
+# The top document's open dialogs and large fixed overlays (a count, at most 50 + 5).
+_OVERLAYS = r"""(() => {
+  const vis = el => { const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
+    return r.width >= 1 && r.height >= 1 && st.visibility === 'visible' && st.display !== 'none' && st.opacity !== '0'; };
+  let n = 0;
+  for (const el of document.querySelectorAll('__DIALOG__')) { if (vis(el) && ++n >= 50) break; }
+  const W = innerWidth, H = innerHeight, seen = new Set();
+  for (const [fx, fy] of [[.5, .5], [.25, .25], [.75, .25], [.25, .75], [.75, .75]]) {
+    for (let el = document.elementFromPoint(W * fx, H * fy); el && el !== document.body && el !== document.documentElement;
+         el = el.parentElement) {
+      if (getComputedStyle(el).position !== 'fixed') continue;
+      const r = el.getBoundingClientRect();
+      if (r.width * r.height >= 0.25 * W * H && !el.matches('__DIALOG__')) seen.add(el);
+      break;
+    }
+  }
+  return n + seen.size;
+})()""".replace("__DIALOG__", _DIALOG_SEL)
+_OCCLUDER_CLASSES = ("dialog", "fixed_overlay", "other")
+_SETTLE_S = 1.5  # build C3: the longest a click waits after its release before it reads the effect
+_SETTLE_POLL_S = 0.25
+_EFFECT_BUDGET_S = 3.0  # settle plus the effect reads; the press margin leaves the caller more than this
+
+
+def _covered_text(occluder: str) -> str:
+    what = {"dialog": "a dialog", "fixed_overlay": "a fixed overlay"}.get(occluder, "another element")
+    return f"Another element covers that control ({what}); nothing was clicked."
+
+
+def _covered(occluder: str) -> dict:
+    """``payment_control_covered`` with the occluder's class only (``dialog`` | ``fixed_overlay`` | ``other``)."""
+    occluder = occluder if occluder in _OCCLUDER_CLASSES else "other"
+    return {**_refusal("payment_control_covered", _covered_text(occluder)), "occluder": occluder}
+
+
+async def _occluder(sup: Any, sid: str, element: str, page_sid: str, tree: tuple, child_sessions: dict) -> str:
+    """build C3: the class of what covers the control: read in the control's own document first, else (a page element
+    over its card iframe) in the payment tab's top document at the control's page point. Any failure: ``other``."""
+    try:
+        own = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _OCCLUDER,
+                                                         "returnByValue": True}, session_id=sid))["result"]["result"]
+        hit = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _HIT,
+                                                         "returnByValue": True}, session_id=sid))["result"]["result"]
+        if hit.get("value") is not True or sid == page_sid:
+            return own.get("value") if own.get("value") in _OCCLUDER_CLASSES else "other"
+        x, y, _outer = await _page_point(sup, sid, element, page_sid, tree, child_sessions)
+        ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": tree[0][0], "worldName": "hermes-payment-effect"},
+                              session_id=page_sid))["result"]["executionContextId"]
+        at = (await sup._cdp("Runtime.evaluate", {"expression": f"{_OCCLUDER_AT}({float(x)!r}, {float(y)!r})",
+                                                  "contextId": ctx, "returnByValue": True},
+                             session_id=page_sid))["result"]["result"]
+        return at.get("value") if at.get("value") in _OCCLUDER_CLASSES else "other"
+    except Exception as exc:  # health: allow BLE001 -- an unread class is "other"; the refusal stands
+        logger.info("payment_control_covered: occluder not classified (%s)", type(exc).__name__)
+        return "other"
+
+
+async def _structure(sup: Any, page_sid: str, element: str, sid: str) -> dict:
+    """build C3: the counts and states an effect compares (top document, overlays, card frames, the control)."""
+    from tools.browser_payment_done import card_frame_ids
+
+    top = await _top_frame(sup, page_sid)
+    out: dict = {"top": tuple(top[:2])}
+    try:
+        state = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _CONTROL_STATE,
+                                                           "returnByValue": True}, session_id=sid))["result"]["result"]
+        value = state.get("value") if isinstance(state.get("value"), dict) else {}
+    except Exception:  # health: allow BLE001 -- the control's document is gone: not listed, not hit
+        value = {}
+    out.update(listed=value.get("listed") is True, hit=value.get("hit") is True, checked=value.get("checked") is True)
+    ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": top[0], "worldName": "hermes-payment-effect"},
+                          session_id=page_sid))["result"]["executionContextId"]
+    n = (await sup._cdp("Runtime.evaluate", {"expression": _OVERLAYS, "contextId": ctx, "returnByValue": True},
+                        session_id=page_sid))["result"]["result"].get("value")
+    out["overlays"] = n if type(n) is int and 0 <= n <= 1000 else None
+    stack = [(await sup._cdp("Page.getFrameTree", session_id=page_sid))["result"]["frameTree"]]
+    frames = set()
+    while stack:
+        node = stack.pop()
+        frames.add((node.get("frame") or {}).get("id"))
+        stack.extend(node.get("childFrames") or [])
+    infos = (await sup._cdp("Target.getTargets"))["result"]["targetInfos"]
+    frames |= {t.get("targetId") for t in infos if isinstance(t, dict) and t.get("type") == "iframe"}
+    out["card_frames"] = len(card_frame_ids(sup) & frames)
+    return out
+
+
+async def _effect(sup: Any, page_sid: str, element: str, sid: str, before: Optional[dict], role: str) -> Optional[dict]:
+    """build C3: what the click visibly did, counts and yes/no only, read after a bounded settle (at most
+    ``_SETTLE_S``; earlier once the top document changed). None when it cannot be read."""
+    if before is None:
+        return None
+    end = time.monotonic() + _SETTLE_S
+    while time.monotonic() < end:
+        await asyncio.sleep(min(_SETTLE_POLL_S, max(0.0, end - time.monotonic())))
+        try:
+            if tuple((await _top_frame(sup, page_sid))[:2]) != before["top"]:
+                break
+        except Exception:  # health: allow BLE001 -- a navigating page may not answer yet; keep settling
+            continue
+    after = await _structure(sup, page_sid, element, sid)
+    navigated = after["top"] != before["top"]
+    toggled = role in {"checkbox", "radio"} and after["checked"] != before["checked"]
+    overlays = before["overlays"], after["overlays"]
+    effect = {"navigated": navigated, "control_listed": after["listed"], "control_hit": after["hit"],
+              "overlays_before": overlays[0], "overlays_after": overlays[1],
+              "card_frames_before": before["card_frames"], "card_frames_after": after["card_frames"]}
+    if role in {"checkbox", "radio"}:
+        effect["toggled"] = toggled
+    effect["unchanged"] = (not navigated and after["listed"] and after["hit"] and not toggled
+                           and None not in overlays and overlays[0] == overlays[1]
+                           and before["card_frames"] == after["card_frames"])
+    return effect
+
+
+async def _bounded_effect(sup: Any, page_sid: str, element: str, sid: str, before: Optional[dict], role: str,
+                          deadline: float) -> Optional[dict]:
+    """The effect read within ``_EFFECT_BUDGET_S`` and well before the caller's own timeout; a read that fails or
+    runs out is None (the click's success stands: it was pressed)."""
+    budget = min(_EFFECT_BUDGET_S, deadline + _PRESS_MARGIN_S - 1.5 - time.monotonic())
+    if budget <= 0:
+        return None
+    try:
+        return await asyncio.wait_for(_effect(sup, page_sid, element, sid, before, role), timeout=budget)
+    except Exception as exc:  # health: allow BLE001 -- unread effect: None, never an uncertain click
+        logger.info("payment_click: effect not read (%s)", type(exc).__name__)
+        return None
 
 
 def _mask(text: str) -> str:
@@ -703,10 +1027,10 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         hit = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _HIT,
                                                          "returnByValue": True}, session_id=sid))["result"]["result"]
         if hit.get("value") is not True:
-            return _refusal("payment_control_covered", "Another element covers that control; nothing was clicked.")
+            return _covered(await _occluder(sup, sid, element, page_sid, tree, child_sessions))
         x, y, outer = await _target_point(sup, sid, element, page_sid, tree, child_sessions)
         if x is None:
-            return _refusal("payment_control_covered", "Another element covers that control; nothing was clicked.")
+            return _covered(await _occluder(sup, sid, element, page_sid, tree, child_sessions))
         # The move first (hover handlers may re-render or navigate), then everything is read again: the
         # document, the hit target, the owner chain and the point. Any change: no press.
         await sup._cdp("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}, session_id=page_sid)
@@ -722,6 +1046,11 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
             refused, top = await _pay_gate(sup, page_sid, gate, clicked, element, sid)
             if refused:
                 return refused
+        try:  # build C3: what the effect is compared with (counts and states only; never a reason to refuse)
+            before = await _structure(sup, page_sid, element, sid)
+        except Exception as exc:  # health: allow BLE001 -- no baseline: the click goes on, its effect is null
+            logger.info("payment_click: structure before the press not read (%s)", type(exc).__name__)
+            before = None
         # r4 C2/C3: from here to the press no claim can start (the claim lock is held), and everything the gate's
         # awaits could have let change is read once more: the document, the hit target, the owner chain and point,
         # the top document the gate judged, and (last, with no await before the press) the claim generation.
@@ -747,7 +1076,8 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
                                                             "clickCount": 1}, session_id=page_sid)
         finally:
             fence.release()
-        return {"success": True, "role": control["role"], "text": _caption(control["text"], sup)}
+        effect = await _bounded_effect(sup, page_sid, element, sid, before, control["role"], deadline)
+        return {"success": True, "role": control["role"], "text": _caption(control["text"], sup), "effect": effect}
     finally:
         if element:
             await sup._release_payment_object(sid, element)
@@ -761,7 +1091,7 @@ async def _target_holds(sup: Any, sid: str, element: str, page_sid: str, tree: t
     hit = (await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _HIT,
                                                      "returnByValue": True}, session_id=sid))["result"]["result"]
     if hit.get("value") is not True:
-        return _refusal("payment_control_covered", "Another element covers that control; nothing was clicked."), 0, 0, 0
+        return _covered(await _occluder(sup, sid, element, page_sid, tree, child_sessions)), 0, 0, 0
     x, y, outer = await _target_point(sup, sid, element, page_sid, tree, child_sessions)
     if x is None or outer != point[2] or abs(x - point[0]) > 1 or abs(y - point[1]) > 1:
         return _refusal("payment_control_changed", "The control moved or changed just before the click; nothing was "
@@ -1098,6 +1428,9 @@ def cross_site(url: Any, merchant: Any) -> bool:
 def _run(supervisor: Any, coro_factory, progress: list | None = None) -> dict:
     from tools.browser_payment_done import has_payment
 
+    lost = native_lost_refusal(supervisor)  # build C4: before anything is read or pressed
+    if lost:
+        return lost
     if not has_payment(supervisor):
         return _refusal("payment_surface_none", "No card payment by Hermes is open on this browser connection: "
                                                 "use the browser tools as usual.")
@@ -1152,10 +1485,18 @@ class _LockGen:
     press may have landed in it), when control already reported the slot locked, or when control's lock already
     held other tabs. Read and written under ``_LOCK``."""
 
-    __slots__ = ("admitted", "approved", "known", "pressed", "presses")
+    __slots__ = ("admitted", "approved", "known", "native_lost", "owned", "pressed", "presses", "serial", "ws")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
+        # build C2: control's owning set at this record's confirmed claim (None: no confirmed claim yet), and a
+        # process-local serial for the log (ids only)
+        self.owned: Optional[frozenset] = None
+        self.serial = 0
+        # build C4: the supervisor socket the claim went out on (control's native connection), and whether control
+        # has since reported this lock held by another connection (``native: false``)
+        self.ws: Any = None
+        self.native_lost = False
         # B1: (cents, currency, top frame id, top loader, merchant origin) of the last successful fill in this lock
         # whose card stated the total and whose page check matched it (record_approved_total); None: no press is
         # covered by the card. r4 C8: ``UNBOUND`` when such a card covered Pay but its total could not be bound.
@@ -1167,6 +1508,7 @@ class _LockGen:
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
 _GENS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_RECORD_SEQ = 0  # build C2: lock record serials (log only)
 _CLICK_CLOSING = ("payment_close is closing the payment tab on this browser, so nothing was pressed. Wait for its "
                   "result; if the payment goes on, call payment_controls again afterwards.")
 

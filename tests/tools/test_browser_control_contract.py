@@ -22,8 +22,9 @@ CONTRACT_PATH = ROOT / "tests/fixtures/browser_control/control-v1.json"
 # /v1/handback/pending per wake, handback_not_saved) and pay-a3-surface (A9 cdp_methods,
 # capture-guard view payment_surface), 2026-11-10; feat/pay-lockdown-20261111 @ 2f9f1f8031 (slot lockdown:
 # claim {tabs}, status {locked, native, tabs, unverified}, locked.commands; dbcfa2a404: origin-only target
-# info for locked clients), 2026-11-11
-CONTRACT_SHA256 = "28d501257c43fc7061aa632c3bc17d5dd6d3a84e63fc302044f1a32079fc830b"
+# info for locked clients), 2026-11-11; plus only the Hermes.paymentSurfaceHolders entry of monolith
+# fix/payment-claim-holders (build C1, 2026-11-18)
+CONTRACT_SHA256 = "02ca07acedd384971ad63dc7b67cdaa396a43fd48e59171ed28d0239a61b8e61"
 # The body the fork's handback route reads for B10, as declared by control-v1.
 HANDOFF_ENDED_BODY = ["event", "session_id", "slot_id", "lease_id", "reason_code", "event_id"]
 
@@ -121,8 +122,9 @@ def test_a9_payment_surface_cdp_methods_match_the_fork(contract):
     from tools import browser_payment_surface as surface
 
     table = contract["cdp_methods"]
-    assert set(table["methods"]) == {surface.CLAIM_METHOD, surface.STATUS_METHOD}
+    assert set(table["methods"]) == {surface.CLAIM_METHOD, surface.STATUS_METHOD, surface.HOLDERS_METHOD}
     assert table["methods"][surface.CLAIM_METHOD]["errors"] == [surface.UNAVAILABLE]
+    assert table["methods"][surface.HOLDERS_METHOD]["errors"] == [surface.UNAVAILABLE]
     assert surface.LOCKED in table["errors"]
     # the fork's native-socket lock mirrors control's locked allowlist exactly
     assert frozenset(table["locked"]["commands"]) == surface.LOCKED_COMMANDS

@@ -193,6 +193,32 @@ class TestFill:
         assert backend.resolved == [] and page.writes == []
         consent.assert_not_called()
 
+    def test_two_merchant_tabs_are_a_typed_refusal_with_the_way_on(self, vault):
+        """Build C6 (2026-11-18): two tabs on the shop's origin used to read "request fresh consent"; the supervisor's
+        typed refusal now reaches the agent as it is, with the one way on, before anything is resolved."""
+        from agent.vault_payment_policy import PaymentDestinationError
+        from tools import browser_vault_tool
+        from tools.browser_supervisor_payment import MERCHANT_TAB_AMBIGUOUS
+
+        store, backend, _ = vault
+        meta = store.add_item(kind="payment", label="Card", origin="https://shop.example", secret=_CARD)
+        page = _FakePage("https://shop.example/checkout", _CARD_CONTROLS)
+
+        def inspect_payment(merchant_origin, *, bound_origins, frame_origins):
+            raise PaymentDestinationError(MERCHANT_TAB_AMBIGUOUS, "2 tabs of this browser are open on "
+                                          "https://shop.example; close the other tabs on https://shop.example, then "
+                                          "fill again.", {"merchant_origin": "https://shop.example", "merchant_tabs": 2})
+
+        page.inspect_payment = inspect_payment
+        page.discard_payment = lambda inspected: None
+        with _on_page(page), \
+             patch("tools.approval_prompt.request_elicitation_consent", return_value="accept") as consent:
+            out = json.loads(browser_vault_tool.browser_vault_fill(meta.id, task_id="t"))
+        assert out["success"] is False and out["error_type"] == "payment_merchant_tab_ambiguous", out
+        assert out["merchant_tabs"] == 2 and "close the other tabs on https://shop.example" in out["error"]
+        assert backend.resolved == [] and page.writes == []
+        consent.assert_not_called()
+
     def test_address_is_not_resolved_for_a_page_on_another_origin(self, vault):
         from tools import browser_vault_tool
 

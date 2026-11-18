@@ -1376,7 +1376,14 @@ BROWSER_VAULT_SCHEMA = {
         "card frames and of the payment tab's own page (the merchant checkout, or a bank's 3-D Secure page it "
         "was redirected to) unless that page is a card form; payment_click (ref) makes one trusted click on a "
         "listed control, so the Pay button is clicked there; refs die when the page changes, when you list again, and after one press (successful or uncertain): "
-        "a second press needs a new payment_controls. "
+        "a second press needs a new payment_controls. A successful payment_click carries effect, read after a short "
+        "settle (counts and yes/no only: navigated, control_listed, control_hit, overlays_before / overlays_after, "
+        "card_frames_before / card_frames_after, toggled for a checkbox, unchanged; null = not read): "
+        "effect.unchanged means the click made no visible progress; list controls again before Pay. "
+        "payment_control_covered names the occluder class only (occluder: dialog | fixed_overlay | other; nothing "
+        "clicked): deal with that dialog or overlay first. payment_native_lost means Hermes lost its own browser "
+        "connection during the lock: Pay state unknown, press nothing, tell the owner to check the order and e-mail, "
+        "and call payment_close only after he has looked. "
         "The owner's Approve on a card-fill approval card that stated the cart total and whose page check matched it "
         "(the button says \"fill + Pay once\") is the go for pressing Pay once "
         "for that checkout (the card says so; no separate chat go is needed). Preparatory clicks of the checkout "
@@ -1525,11 +1532,12 @@ def _payment_lock_refusal(task_id: Optional[str]) -> Optional[str]:
     """dlz (payment lockdown): ``payment_surface_locked`` for a non-card page operation while a card payment
     locks the task's slot. Only the native payment actions (card fill, payment_controls / payment_click,
     payment_done) work on a locked slot; a slot this process never attached a supervisor to holds no claim."""
-    from tools.browser_payment_surface import locked_refusal
+    from tools.browser_payment_surface import vault_lock_refusal
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id or "default")
-    refused = locked_refusal(supervisor) if supervisor is not None else None
+    # build C5: an unknown lock state with no claim or lock of this process is browser_connection_unavailable
+    refused = vault_lock_refusal(supervisor) if supervisor is not None else None
     return json.dumps(refused) if refused else None
 
 
