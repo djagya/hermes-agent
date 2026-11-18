@@ -491,8 +491,10 @@ def test_a_decoy_word_elsewhere_in_a_real_card_field_name_does_not_hide_it():
     # ... and it still names a field whose own text is silent, as it was added for.
     ({"name": " ", "label": "  ", "hint": "Card number"}, "cc-number"),
     ({"name": "f-3 field-3", "label": "  ", "hint": "Expiry date"}, "cc-exp"),
-    ({"name": "h h", "label": "  Max Mustermann", "hint": "Name on card"}, "cc-name"),
-    ({"name": "name ", "label": "  ", "hint": "Name on card"}, "cc-name"),  # a bare person name: the holder only
+    ({"name": "h h", "label": "  ••••", "hint": "Name on card"}, "cc-name"),
+    # Round 4: the own words must be generic ids; a placeholder name or a bare "name" blocks the hint.
+    ({"name": "h h", "label": "  Max Mustermann", "hint": "Name on card"}, None),
+    ({"name": "name ", "label": "  ", "hint": "Name on card"}, None),
     ({"name": "c ", "type": "password", "hint": "CVC"}, "cc-csc"),
     ({"name": "m ", "type": "select", "hint": "Expiry month"}, "cc-exp-month"),
     ({"name": " ", "hint": "Gift card number"}, None),  # the hint's own decoy rule still applies
@@ -507,12 +509,14 @@ def test_supplemental_text_only_names_a_field_whose_own_text_is_silent(control, 
     ({"name": "ausweis ", "label": "Ausweis gültig bis"}, None), ({"label": "Personalausweis Ablaufdatum"}, None),
     ({"label": "Reisepass gültig bis"}, None), ({"label": "Document expiry date"}, None),
     ({"label": "ID card valid until"}, None), ({"label": "ID card number"}, None),
-    ({"label": "Driver licence expiry"}, None), ({"label": "Visa expiry date"}, None),
-    ({"name": "visaValidUntil"}, None), ({"label": "Date of birth (MM/YY)"}, None),
+    ({"label": "Driver licence expiry"}, None), ({"label": "Travel visa expiry date"}, None),
+    ({"label": "Visa expiry (passport)"}, None), ({"label": "Date of birth (MM/YY)"}, None),
     ({"label": "Geburtsdatum MM/JJ"}, None),
     # The card's own expiry keeps its token, a card brand beside "Visa" included.
     ({"label": "Valid until"}, "cc-exp"), ({"label": "Visa card expiry"}, "cc-exp"),
     ({"label": "Visa / Mastercard expiry date"}, "cc-exp"), ({"label": "Card number (Visa, Mastercard)"}, "cc-number"),
+    # Round 4: "Visa" alone is the card brand (round 3 read these two as the visa document).
+    ({"label": "Visa expiry date"}, "cc-exp"), ({"name": "visaValidUntil"}, "cc-exp"),
 ])
 def test_document_validity_is_never_the_card_expiry(control, token):
     assert _token(**control) == token
@@ -983,8 +987,10 @@ def test_the_card_descriptor_reads_aria_labelledby_and_title_but_never_the_value
     assert row["label"] == "  Max Mustermann" and row["hint"] == hint and "secret" not in run.stdout
     if case["attrs"].get("aria-labelledby") == "lbl outer":
         assert sp._bounded_description([row]) == [row]  # the discovery shape check accepts the hint key
-        # the field's own text ("h h", "Max Mustermann") is silent: the hint names the holder
-        assert classify_checkout_control(LoginControl.from_dict(row)).token == "cc-name"
+        # Round 4: the placeholder "Max Mustermann" is own text that is no generic id, so the hint names nothing;
+        # with only generic own words ("h h") the same descriptor row's hint names the holder.
+        assert classify_checkout_control(LoginControl.from_dict(row)) is None
+        assert classify_checkout_control(LoginControl.from_dict({**row, "label": "  "})).token == "cc-name"
 
 
 # The page's fields go through the production chain: the closure's describe(), discovery's shape check, the
@@ -1779,3 +1785,152 @@ def test_payone_checkout_shape_is_five_documents_with_merchant_holder():
         _candidate(_PAYONE, "cc-exp-month", frame="mm"), _candidate(_PAYONE, "cc-exp-year", frame="yy"),
     ], MERCHANT)
     assert len(docs) == 5
+
+
+# Round 4 (redesign): the new reach (separated holder, hint, document veto) counts only on positive evidence, and
+# the holders base already filled are filled again. Regressions from the round-3 final reviews (Codex P1-P3, Opus
+# M1, M2, L1, L2).
+_M2_SEPARATED_LABELS = [
+    "Card holder nationality", "Card holder IBAN", "Card holder contact", "Card holder initials",
+    "Card holder reference", "Card holder signature", "Card holder title", "Card holder relationship",
+    "Card holder account number", "Card holder number", "Card holder age", "Card holder VAT number",
+    "Card holder tax number", "Card holder CPF", "Card holder social security number", "Card holder fax",
+    "Card holder WhatsApp", "Card holder cell", "Card holder occupation", "Card holder employer",
+    "Card holder house number", "Karteninhaber Hausnummer", "Karteninhaber Ort", "Karteninhaber Land",
+    "Karteninhaber Geburtsdatum", "Titulaire de la carte téléphone", "Titular de la tarjeta teléfono",
+    "Titular de la tarjeta DNI", "Titolare della carta telefono", "Kaarthouder telefoonnummer", "Kaarthouder adres",
+]
+
+
+@pytest.mark.parametrize("control, token", [
+    # Codex P1: a hint never names a field whose own words are not generic ids ...
+    *(({"name": "f1 ", "label": "ID", "hint": hint}, None) for hint in ("Card number", "CVC", "Expiry date", "Name on card")),
+    ({"name": "f1 ", "label": "Contact number", "hint": "Card number"}, None),
+    ({"name": "f1 f1", "label": "Phone", "hint": "Card number"}, None),
+    ({"name": "phone1 ", "hint": "Card number"}, None), ({"name": "id1 ", "hint": "Card number"}, None),
+    ({"name": " ", "autocomplete": "nope", "hint": "Card number"}, None),
+    # ... and still names one whose own words are generated ids, digits or mask characters.
+    ({"name": "f_3a9 ", "hint": "Card number"}, "cc-number"), ({"name": ":r1: input-12", "hint": "CVC"}, "cc-csc"),
+    ({"name": "3f2a9c1e-8b7d-4c1a-9e2f-1a2b3c4d5e6f ", "hint": "Expiry date"}, "cc-exp"),
+    ({"name": "el7 ", "label": "  1234 5678 9012 3456", "hint": "Card number"}, "cc-number"),
+    # Opus L2: a group legend naming several card roles names none of the fields.
+    ({"name": " ", "hint": "Enter card number, expiry date and security code Expiry date"}, None),
+    ({"name": " ", "hint": "Card number, expiry date and CVC"}, None), ({"name": " ", "hint": "Card details Expiry date"}, "cc-exp"),
+    # Codex P2: other holder attributes, separated and joined
+    ({"label": "Card holder fax", "type": "tel"}, None), ({"label": "Card holder VAT number"}, None),
+    ({"label": "Card holder title"}, None), ({"name": "cardholder ", "label": "Cardholder fax"}, None),
+    ({"name": "cardholder ", "label": "Cardholder VAT number"}, None), ({"name": "cardholder ", "label": "Cardholder title"}, None),
+    ({"name": "cardholder ", "label": "Cardholder house number"}, None),
+    ({"name": "card-holder", "label": "Card holder initials"}, None),  # one neutral source is not enough
+    # Opus M1: the holders base filled, with anti-autofill autocomplete, full-name placeholders, an alternative ...
+    *(({"name": "cardholder ", "label": "Name on card", "autocomplete": ac}, "cc-name")
+      for ac in ("nope", "chrome-off", "new-password", "false", "disabled", "none")),
+    ({"name": "cardholder ", "label": "Cardholder name  Name Surname"}, "cc-name"),
+    ({"name": "cardholder ", "label": "Cardholder name  Name and surname"}, "cc-name"),
+    ({"name": "cardholder ", "label": "Cardholder name (or company name)"}, "cc-name"),
+    ({"name": "cardholder ", "label": "Cardholder name (as on ID)"}, "cc-name"),
+    ({"name": "card-holder ", "label": "Name Surname"}, "cc-name"),
+    # ... while a recognised autocomplete token with another purpose, a company or a bare ID still conflict.
+    *(({"name": "cardholder ", "label": "Name on card", "autocomplete": ac}, None)
+      for ac in ("given-name", "cc-family-name", "tel-national", "organization", "honorific-prefix", "bday-day",
+                 "current-password", "one-time-code", "username")),
+    ({"name": "cardholder ", "label": "Cardholder company"}, None), ({"name": "cardholder ", "label": "Cardholder ID"}, None),
+    # Codex P3, Opus L1: "Visa" is the brand, a DOM id is no document, a card field's own name is never vetoed
+    ({"name": "cvc cvc", "label": "Visa CVC"}, "cc-csc"), ({"name": "f2 document-card-number", "label": "Card number"}, "cc-number"),
+    ({"name": "cvv ", "label": "CVV (3 digits on the back of your Visa)"}, "cc-csc"),
+    ({"label": "CVV (3 digits on the back of your Visa)"}, "cc-csc"),
+    ({"name": "cvc ", "label": "Card identification number (CID)"}, "cc-csc"),
+    ({"name": "exp ", "label": "Expiry date (Visa)"}, "cc-exp"), ({"label": "Expiry date (Visa)"}, "cc-exp"),
+    ({"name": "cardnumber ", "label": "Card number (not your ID card number)"}, "cc-number"),
+    # ... and the explicit document purposes still veto.
+    ({"label": "Residence permit valid until"}, None), ({"name": "f1 ", "label": "Passport expiry"}, None),
+    ({"label": "Driver's license expiry"}, None), ({"label": "Identity card valid until"}, None),
+])
+def test_round_4_new_reach_needs_positive_evidence(control, token):
+    assert _token(**control) == token
+
+
+@pytest.mark.parametrize("label", _M2_SEPARATED_LABELS)
+def test_round_4_a_holder_attribute_is_never_the_holder(label):
+    # Opus M2: a separated holder phrase beside another word never makes the holder, in any source combination.
+    for extra in ({}, {"type": "tel"}, {"name": "card-holder"}):
+        assert _token(label=label, **extra) != "cc-name", extra
+
+
+# The holder's other attributes beside a complete card form: three writes, none into the attribute field.
+@pytest.mark.parametrize("field", [
+    *({"name": "", "id": "x", "label": label} for label in _M2_SEPARATED_LABELS),
+    {"name": "", "id": "x", "label": "Card holder fax", "type": "tel"},
+    *({"name": "cardholder", "id": "x", "label": label} for label in ("Cardholder fax", "Cardholder VAT number",
+                                                                    "Cardholder title", "Cardholder house number")),
+])
+def test_round_4_holder_attribute_fields_never_receive_the_holder_name(field):
+    fills, writes = _pipeline([_NUMBER, _EXPIRY, _CVC, field])
+    assert sorted(f["token"] for f in fills) == ["cc-csc", "cc-exp", "cc-number"]
+    assert len(writes) == 3 and all(element != "x" for element, _value in writes)
+
+
+@pytest.mark.parametrize("label", ["ID", "Contact number"])
+@pytest.mark.parametrize("attrs, texts", [
+    *(({"title": role}, {}) for role in ("Card number", "CVC", "Expiry date", "Name on card")),
+    ({"aria-labelledby": "role"}, {"role": "Card number"}),
+])
+def test_round_4_an_id_or_contact_input_titled_as_a_card_field_never_receives_it(label, attrs, texts):
+    # Codex P1: beside a complete card form the suspect input is no card field (three writes, none into it) ...
+    suspect = {"name": "f1", "id": "f1", "label": label, "attrs": attrs}
+    fills, writes = _pipeline([suspect, _NUMBER, _EXPIRY, _CVC], texts)
+    assert sorted(f["token"] for f in fills) == ["cc-csc", "cc-exp", "cc-number"]
+    assert len(writes) == 3 and all(element != "f1" for element, _value in writes)
+    # ... and in place of the number it does not complete the form.
+    if attrs.get("title", "Card number") == "Card number":
+        assert _pipeline([suspect, _EXPIRY, _CVC], texts) == ("Incomplete or ambiguous card fields", None)
+
+
+_ZZ_HOLDERS = [
+    {"name": "cardholder", "id": "h", "label": "Name on card", "ac": "nope"},
+    {"name": "cardholder", "id": "h", "label": "Name on card", "ac": "chrome-off"},
+    {"name": "cardholder", "id": "h", "label": "Name on card", "ac": "new-password"},
+    {"name": "cardholder", "id": "h", "label": "Cardholder name", "placeholder": "Name Surname"},
+    {"name": "cardholder", "id": "h", "label": "Cardholder name", "placeholder": "Name and surname"},
+    {"name": "cardholder", "id": "h", "label": "Cardholder name (or company name)"},
+    {"name": "cardholder", "id": "h", "label": "Cardholder name (as on ID)"},
+    {"name": "", "id": "h", "label": "Card holder", "placeholder": ""},
+]
+
+
+@pytest.mark.parametrize("holder", _ZZ_HOLDERS)
+def test_round_4_base_filled_holders_are_written_again(holder):
+    # Opus M1 (adapted from the review's test_zz_review_holder_drop.py): round 3 dropped these; base wrote them.
+    fills, writes = _pipeline([_NUMBER, _EXPIRY, _CVC, holder])
+    assert [f["value"] for f in fills if f["token"] == "cc-name"] == [CARD["cardholder_name"]]
+    assert ["h", CARD["cardholder_name"]] in writes and len(writes) == 4
+
+
+@pytest.mark.parametrize("fields, element, value", [
+    ([_NUMBER, _EXPIRY, {"name": "cvc", "id": "v", "label": "Visa CVC"}], "v", CARD["cvc"]),
+    ([_NUMBER, _EXPIRY, {"name": "cvv", "id": "v", "label": "CVV (3 digits on the back of your Visa)"}], "v", CARD["cvc"]),
+    ([_NUMBER, _EXPIRY, {"name": "cvc", "id": "v", "label": "Card identification number (CID)"}], "v", CARD["cvc"]),
+    ([{"name": "", "id": "document-card-number", "label": "Card number"}, _EXPIRY, _CVC], "document-card-number", _PAN),
+    ([_NUMBER, {"name": "exp", "id": "v", "label": "Expiry date (Visa)"}, _CVC], "v", None),
+])
+def test_round_4_visa_branded_and_document_id_card_fields_are_written(fields, element, value):
+    # Codex P3, Opus L1: round 3 vetoed these as documents, and the complete form was refused.
+    _fills, writes = _pipeline(fields)
+    assert len(writes) == 3 and element in [e for e, _v in writes]
+    if value is not None:
+        assert [element, value] in writes
+
+
+def test_round_4_a_group_legend_in_aria_labelledby_names_no_field():
+    # Opus L2: three hosted inputs whose aria-labelledby is the group legend plus their own label: the legend names
+    # every card role, so no field is classified from it and the form is refused before any write ...
+    legend = "Enter card number, expiry date and security code"
+    texts = {"legend": legend, "ln": "Card number", "le": "Expiry date", "lc": "Security code"}
+    fields = [{"name": "", "id": f"i{n}", "attrs": {"aria-labelledby": f"legend {own}"}}
+              for n, own in enumerate(("ln", "le", "lc"))]
+    result, writes = _pipeline(fields, texts)
+    assert isinstance(result, str) and writes is None
+    # ... while their own labels alone name each field.
+    fields = [{**f, "attrs": {"aria-labelledby": own}} for f, own in zip(fields, ("ln", "le", "lc"))]
+    _fills, writes = _pipeline(fields, texts)
+    assert ["i0", _PAN] in writes and ["i2", CARD["cvc"]] in writes and len(writes) == 3
