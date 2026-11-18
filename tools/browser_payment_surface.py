@@ -53,6 +53,7 @@ from tools.browser_payment_press_kind import (  # build F: which press is the Pa
     prep_args,
     prep_verdict,
     watch_leave,
+    watch_left,
     preparatory,
 )
 
@@ -1176,8 +1177,13 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
             return refused
         if prep is not None and not await preparatory(sup, sid, element, arr, *prep):  # build F: read again
             return _changed()
-        if prep is not None and not await watch_leave(sup, sid, arr):  # build F r3: unwatched: the Pay press
+        watch = await watch_leave(sup, sid, arr) if prep is not None else None
+        if prep is not None and watch is None:  # build F r3: unwatched: the Pay press
             prep, pay_like = None, True
+        if pay_like and await _prep_left(sup, gate.gen):  # build F r5: the taken-back confirm submitted after all
+            with _LOCK:
+                gate.gen.paid, gate.gen.provisional = True, False
+                return _already_pressed(gate.gen)
         # build C r4: the dialogs open in the merchant document right before this approval's Pay press
         dialogs = (await _open_dialogs(sup, sid, element) if pay_like and after is None and not card
                    and gate.gen is not None and not gate.gen.paid else None)
@@ -1195,6 +1201,9 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         if refused:
             return refused
         effect = await _bounded_effect(sup, page_sid, element, sid, before, control["role"], deadline)
+        if prep and watch and gate.gen is not None:
+            with _LOCK:
+                gate.gen.prep_watch = (sid, watch)
         counted = (_end_provisional(gate, await prep_verdict(sup, sid, arr, prep, effect, (fid, pressed_at)))
                    if prep else None)
         return _clicked_answer(sup, control, effect, pay_like, prep is not None, counted)
@@ -1425,6 +1434,16 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             elif pay_press and after == "dialog":
                 gen.followup_used = True
     return None
+
+
+async def _prep_left(sup: Any, gen: Any) -> bool:
+    """build F r5: a purchase press after a taken-back preparatory press: whether that confirm submitted or navigated
+    since (its watch state read now, Chrome's navigation-start record). Not applicable: False."""
+    if gen is None or gen.paid or gen.prep_at is None:
+        return False
+    if _left_since(sup, gen.prep_at):
+        return True
+    return gen.prep_watch is None or await watch_left(sup, *gen.prep_watch)
 
 
 def _left_since(sup: Any, at: tuple) -> bool:
@@ -1835,8 +1854,8 @@ class _LockGen:
     held other tabs. Read and written under ``_LOCK``."""
 
     __slots__ = ("admitted", "approved", "followup_used", "known", "merchant", "native_lost", "owned", "paid",
-                 "paid_unnamed", "pay_caption", "pay_dialogs", "pay_node", "prep_at", "prep_used", "pressed", "presses",
-                 "provisional", "serial", "ws")
+                 "paid_unnamed", "pay_caption", "pay_dialogs", "pay_node", "prep_at", "prep_used", "prep_watch",
+                 "pressed", "presses", "provisional", "serial", "ws")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
@@ -1875,6 +1894,7 @@ class _LockGen:
         self.pay_node: Optional[tuple] = None
         self.prep_used = self.provisional = False
         self.prep_at: Optional[tuple] = None  # build F r4: (top frame id, monotonic) of the preparatory press
+        self.prep_watch: Optional[tuple] = None  # build F r5: (session, watch state object) of that press
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)

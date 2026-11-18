@@ -153,7 +153,10 @@ class SundaySup(DialogSup, EffectSup):
             return {"result": {"value": answer}}
         if method == "Runtime.callFunctionOn" and fn == kind.WATCH_LEAVE:
             self.watched = getattr(self, "watched", 0) + 1
-            return {"result": {"value": getattr(self, "watch", True)}}
+            return {"result": {"objectId": "watch"} if getattr(self, "watch", True) else {"type": "undefined"}}
+        if method == "Runtime.callFunctionOn" and fn == kind.WATCH_READ:
+            self.watch_reads = getattr(self, "watch_reads", 0) + 1
+            return {"result": {"value": getattr(self, "left", False)}}
         if method == "Runtime.callFunctionOn" and fn == kind.STILL_LISTED:
             if isinstance(self.still, Exception):
                 raise self.still
@@ -213,6 +216,16 @@ def test_a_navigation_that_starts_after_the_verdict_refuses_the_purchase():
     sup.started_navigating = True
     assert _click(sup, TOP_BUY)["error_type"] == surface.ALREADY_PRESSED
     assert len(_mouse_presses(sup)) == 1 and surface.pay_press(sup) is not None
+
+
+def test_a_background_submit_after_the_verdict_refuses_the_purchase():
+    """F r5 (Codex delta 3): the confirm was taken back, then its form was submitted by script without a navigation:
+    the kept watch state, read right before the purchase press, refuses it; nothing more is pressed."""
+    sup = _sunday()
+    assert _click(sup, TOP_CONFIRM)["pay_pressed"] is False
+    sup.left = True
+    assert _click(sup, TOP_BUY)["error_type"] == surface.ALREADY_PRESSED
+    assert sup.watch_reads == 1 and len(_mouse_presses(sup)) == 1
 
 
 def test_navigation_start_events_are_recorded_except_same_document_ones():

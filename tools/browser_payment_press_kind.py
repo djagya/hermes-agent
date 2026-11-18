@@ -133,7 +133,10 @@ WATCH_LEAVE = r"""function(){ const s = {left: false}; const mark = () => { s.le
   window.addEventListener('beforeunload', mark, true); window.addEventListener('pagehide', mark, true);
   document.addEventListener('submit', mark, true);
   try { if (window.navigation) window.navigation.addEventListener('navigate', mark); } catch (e) {}
-  this.__hermesPrepLeave = s; return true; }"""
+  this.__hermesPrepLeave = s; return s; }"""
+
+# build F r5 (Codex delta 3): the same watch state, read again right before the next purchase press
+WATCH_READ = r"""function(){ return this.left === true; }"""
 
 STILL_LISTED = r"""function(idx){ const s = this.__hermesPrepLeave; if (!s || s.left) return false;
   return idx.every(i => { const el = this[i];
@@ -223,16 +226,30 @@ async def prep_args(sup: Any, gen: Any, clicked: tuple, control: dict, doc_contr
     return (idx, list(held)) if await preparatory(sup, sid, element, arr, idx, held) else None
 
 
-async def watch_leave(sup: Any, sid: str, arr: str) -> bool:
-    """build F r3: install ``WATCH_LEAVE`` before a preparatory press. False: not installed (the caller keeps the press
-    the Pay press: an unwatched submit cannot be taken back)."""
+async def watch_leave(sup: Any, sid: str, arr: str) -> Optional[str]:
+    """build F r3: install ``WATCH_LEAVE`` before a preparatory press; returns the watch state's object id (kept for
+    the approval: ``watch_left`` reads it before the next purchase press), or None: not installed (the caller keeps the
+    press the Pay press: an unwatched submit cannot be taken back)."""
     try:
         reply = await sup._cdp("Runtime.callFunctionOn", {"objectId": arr, "functionDeclaration": WATCH_LEAVE,
-                                                          "returnByValue": True}, session_id=sid)
+                                                          "returnByValue": False}, session_id=sid)
     except Exception as exc:  # health: allow BLE001 -- unwatched: the preparatory press stays the Pay press
         logger.info("payment_click: leave watch not installed (%s)", type(exc).__name__)
-        return False
-    return ((reply.get("result") or {}).get("result") or {}).get("value") is True
+        return None
+    obj = ((reply.get("result") or {}).get("result") or {}).get("objectId")
+    return obj if isinstance(obj, str) and obj else None
+
+
+async def watch_left(sup: Any, sid: str, obj: str) -> bool:
+    """build F r5: a submit, unload or navigation started since the preparatory press (its watch state). Unreadable
+    (the document went away, the object was released): True."""
+    try:
+        reply = await sup._cdp("Runtime.callFunctionOn", {"objectId": obj, "functionDeclaration": WATCH_READ,
+                                                          "returnByValue": True}, session_id=sid)
+    except Exception as exc:  # health: allow BLE001 -- unread: the preparatory press counts as the Pay press
+        logger.info("payment_click: leave watch not read (%s)", type(exc).__name__)
+        return True
+    return ((reply.get("result") or {}).get("result") or {}).get("value") is not False
 
 
 async def prep_verdict(sup: Any, sid: str, arr: str, prep: tuple, effect: Optional[dict],
