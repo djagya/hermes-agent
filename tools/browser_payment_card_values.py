@@ -9,7 +9,8 @@ Two places hold them, both filled by the card fill before any field is written:
   proves the slot unlocked, which ``payment_done``'s ``lock_released`` and any later status read (after a recovery close of the payment
   tab too) all go through, by whichever supervisor is attached to the slot,
   :func:`slot_bound`; and :func:`release_unlocked_slot`, control's own view of the slot, when no supervisor
-  reads it) narrows it to browser tool results (the page may still show card text); it closes when the
+  reads it) narrows it to browser tool results (the page may still show card text; dlz D-0367 b: only the slot's
+  own, as browser_exec declares them, with currency amounts readable: agent.redact_vault); it closes when the
   slot's exposure ends (:func:`release_slot`: a wipe, a human clear or an operator clear of its mark).
   Every release is fenced by the window generation it observed first: a claim (:func:`note_claim`) or an
   open since then wins. A fill that stops before its first write takes its open back

@@ -32,11 +32,16 @@ or other output that names them is not card data). Windows are fenced by a per-w
 generation: a claim or an open gives it a new value from one process-wide counter (never reused, even after a
 window-less key's counter is forgotten), and a release that observed another generation changes nothing.
 A confirmed lock release keeps the window for browser and log output only (the page may still show card
-text; every browser result of the profile, whichever slot it names: a browser_exec workspace outlives its
-slot); the window goes when the slot's mark is cleared. An open whose fill stopped before its first write is taken
+text); the window goes when the slot's mark is cleared. dlz (D-0367 b, 2026-11-18): a released window masks a
+browser result only when that result is the slot's own (:func:`browser_result_slot`: browser_exec declares the slot
+its call ran on), and there a currency amount (``327,65``, ``€ 149``, ``12.50 EUR``) is not masked by the CVC length:
+totals on the merchant page stay readable. A browser result that declares no slot is masked by every released window
+of the profile, as before; log output is masked by every window. An open whose fill stopped before its first write is taken
 back (:func:`withdraw_card_window`): the card never left the process, so the window is as it was before.
 """
 
+import contextlib
+import contextvars
 import itertools
 import json
 import re
@@ -65,6 +70,17 @@ _ALL_DIGITS = re.compile(r"\d+")
 # number's length is masked, whatever the separators. A long decimal (a box-model coordinate) can be masked too
 # while a card window is open: display only, it fails safe (a narrower rule leaked mixed-separator numbers).
 _GROUPED = re.compile(r"(?<!\d)\d+(?:[ .-]\d+)+")  # lookbehind: linear on a long digit run
+# dlz (D-0367 b): the slot a browser result comes from (None: undeclared), and the currency amounts a released
+# window leaves readable there: a decimal amount (two decimals after a comma or dot, thousands grouped), or digits
+# next to a currency sign or ISO code.
+_BROWSER_SLOT: contextvars.ContextVar = contextvars.ContextVar("hermes_browser_result_slot", default=None)
+_CURRENCY = (r"(?:[€$£¥₹₣]|\b(?:EUR|USD|GBP|CHF|CAD|AUD|NZD|JPY|SEK|NOK|DKK|PLN|CZK|HUF|RON|BGN|TRY|SGD|HKD|"
+             r"Fr|SFr)\b)")
+_NUMBER = r"\d{1,3}(?:[.,'\u00a0\u202f ]\d{3})*"
+_AMOUNT = re.compile(
+    rf"(?<![\d.,]){_NUMBER}[.,]\d{{2}}(?![\d])"  # 327,65  1.234,56  149.00
+    rf"|{_CURRENCY}\.?\s?{_NUMBER}(?:[.,](?:\d{{2}}|-{{1,2}}))?(?![\d])"  # € 149  CHF 12.50  Fr. 20.-
+    rf"|(?<![\d.,]){_NUMBER}(?:[.,](?:\d{{2}}|-{{1,2}}))?\s?{_CURRENCY}")  # 149 €  12.50 EUR
 
 
 class _Entry:
@@ -260,16 +276,54 @@ def release_card_window(window: str, observed: int | None = None, *, keep_for_br
         return True
 
 
-def _mask_runs(text: str, exact: set, at_least: int) -> str:
+@contextlib.contextmanager
+def browser_result_slot(slot):
+    """dlz (D-0367 b): the browser result scrubbed inside is ``slot``'s own (``""``: a browser call with no slot
+    route). A released payment window then masks it only when it is that slot's window (a slot-less supervisor's
+    window: a result with no slot)."""
+    token = _BROWSER_SLOT.set(str(slot or ""))
+    try:
+        yield
+    finally:
+        _BROWSER_SLOT.reset(token)
+
+
+def _released_applies(key: str, audience: str) -> bool:
+    """Whether a released window ``key`` still masks this output: log output always; a browser result when it
+    declares no slot (as before D-0367), or is that slot's own."""
+    if audience == "log":
+        return True
+    if audience != "browser":
+        return False
+    slot = _BROWSER_SLOT.get()
+    if slot is None:
+        return True
+    return key == slot or (slot == "" and key.startswith("supervisor:"))
+
+
+def _amount_spans(text: str) -> list:
+    return [m.span() for m in _AMOUNT.finditer(text)]
+
+
+def _mask_runs(text: str, exact: set, at_least: int, released: set = frozenset()) -> str:
+    """Mask digit runs of an ``exact`` length, card-number-long runs and groups (``at_least``), and runs of a
+    ``released`` length outside a currency amount (D-0367 b). Masking keeps every position (one dot per digit)."""
     def dots(m):
         return re.sub(r"\d", "•", m.group(0))
 
     def grouped(m):
         return dots(m) if sum(map(len, _ALL_DIGITS.findall(m.group(0)))) >= at_least else m.group(0)
 
+    spans = _amount_spans(text) if released - exact else []
+
+    def in_amount(m):
+        return any(a <= m.start() and m.end() <= b for a, b in spans)
+
     def run(m):
         n = len(m.group(0))
-        return dots(m) if n in exact or 0 < at_least <= n else m.group(0)
+        if n in exact or 0 < at_least <= n:
+            return dots(m)
+        return dots(m) if n in released and not in_amount(m) else m.group(0)
 
     if at_least:
         text = _GROUPED.sub(grouped, text)
@@ -288,8 +342,8 @@ def redact_registered_vault_values(text: str, *, nondigit_only: bool = False, au
     scope, now = _vault_scope(), time.monotonic()
     with _VAULT_REDACTION_LOCK:
         bucket = _live(scope)
-        windows = [w for w in (_CARD_WINDOWS.get(scope) or {}).values()
-                   if not w[2] or audience in ("browser", "log")]
+        windows = [w for key, w in (_CARD_WINDOWS.get(scope) or {}).items()
+                   if not w[2] or _released_applies(key, audience)]
     for value in sorted(bucket, key=len, reverse=True):  # longest first: a substring never shadows its superstring
         if not _ALL_DIGITS.fullmatch(value) and value in text:
             text = text.replace(value, PLACEHOLDER)
@@ -298,10 +352,17 @@ def redact_registered_vault_values(text: str, *, nondigit_only: bool = False, au
         text = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", CARD_PLACEHOLDER, text, flags=re.IGNORECASE)
     if nondigit_only or audience == "authored":
         return text
-    lengths = {n for digit_lengths, _names, _r in windows for n in digit_lengths}
+    lengths = {n for digit_lengths, _names, released in windows if not released or audience == "log"
+               for n in digit_lengths}
     lengths |= {len(v) for v, e in bucket.items() if e.mask_until > now and _ALL_DIGITS.fullmatch(v)}
-    if lengths:
-        text = _mask_runs(text, {n for n in lengths if n < _LONG}, min((n for n in lengths if n >= _LONG), default=0))
+    # dlz (D-0367 b): a released window in a browser result: its CVC length spares currency amounts
+    narrowed = {n for digit_lengths, _names, released in windows if released and audience != "log"
+                for n in digit_lengths}
+    lengths_all = lengths | narrowed
+    if lengths_all:
+        short = {n for n in lengths if n < _LONG}
+        text = _mask_runs(text, short, min((n for n in lengths_all if n >= _LONG), default=0),
+                          {n for n in narrowed if n < _LONG} - short)
     return text
 
 

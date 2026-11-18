@@ -135,10 +135,11 @@ def test_marks_survive_a_gateway_restart_and_clear_only_by_operator(tmp_path):
     assert audit[-1]["slot_id"] == "shopping" and audit[-1]["confirmed_by"] == "operator: tab closed"
 
 
-def test_exec_ends_a_window_control_unlocked_and_keeps_masking_browser_output(managed, monkeypatch):
+def test_exec_ends_a_window_control_unlocked_and_keeps_masking_that_slots_browser_output(managed, monkeypatch):
     # dlz 11-12: the payment tab was closed outside Hermes and nothing read that slot's status again, so every
     # output of the profile (a name, a count, a status id) came back masked for hours. After the unlock the
-    # terminal is not masked; browser_exec output of every slot still is (its workspace outlives the slot)
+    # terminal is not masked. dlz (D-0367 b, 11-18): browser_exec output stays masked only on the payment slot
+    # itself (and browser results that name no slot); another slot's output no longer is (was: Codex r1 P1-2).
     from agent import redact
 
     grants, _ = managed
@@ -153,7 +154,11 @@ def test_exec_ends_a_window_control_unlocked_and_keeps_masking_browser_output(ma
         grants[:] = [_lease("research-1")]
         assert _exec("print(page_info())")["output"] != page  # control still reports the lock: every slot masked
         view.update(locked=False, tabs=[])
-        assert _exec("print(page_info())")["output"] != page  # Codex r1 P1-2: a lease's slot is not provenance
+        assert _exec("print(page_info())")["output"] == page  # D-0367 b: another slot's own result
+        grants[:] = [_lease("shopping")]
+        own = _exec("print(page_info())")["output"]
+        assert "Ada Testperson" not in own and "731" not in own and "7" * 19 not in own
+        assert redact.redact_sensitive_text(page, force=True, vault="browser") != page  # no slot declared
         assert redact.card_window_keys(unreleased=True) == []
         assert redact.redact_sensitive_text(page, force=True) == page
     finally:

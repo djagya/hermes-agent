@@ -87,7 +87,7 @@ class PaymentAutoMixin:
             rows = _sp()._bounded_description(raw) if i.unreviewed_origins else raw
             if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
                 return False
-            if _roles(_sp()._card_controls(rows)) != _roles(d.controls):
+            if _roles(_sp()._card_controls(rows, d.origin == i.merchant_origin)) != _roles(d.controls):
                 return False
             return _sp()._value(await self._cdp("Runtime.callFunctionOn", {
                 "objectId": d.object_id, "functionDeclaration": "function(){return this.accept()}",
@@ -195,6 +195,7 @@ class PaymentAutoMixin:
         # by now), or the discovery's own count of frames it looked into.
         prior.approval.pop("seen", None)
         prior.approval.pop("window", None)
+        prior.approval.pop("found", None)
         log = ReinspectLog()  # dlz (11-14): how the window was spent, for the stop record
         while time.monotonic() < deadline:
             fresh = None
@@ -207,8 +208,10 @@ class PaymentAutoMixin:
                     refused = {"payment_fields_unsupported": "incomplete",
                                "payment_fields_ambiguous": "ambiguous"}.get(exc.error_type, "unverifiable")
                     prior.approval["seen"] = _seen_detail(exc.detail, prior.approval)
+                    _note_found(prior.approval, refused, (exc.detail or {}).get("inspection"))
                 except PaymentPolicyError as exc:
                     refused = _reinspect_refusal(str(exc))
+                    _note_found(prior.approval, refused, getattr(exc, "summary", None))
                 except Exception as exc:  # health: allow BLE001 -- a page that cannot be read now may be read a moment later
                     refused = "unavailable"
                     log.error(exc)
@@ -230,6 +233,7 @@ class PaymentAutoMixin:
                         # controls of the middle reading must not come back as its card fields).
                         prior.approval["free"] = prior.approval["free"] | _free_documents(fresh)
                         prior.approval.pop("seen", None)
+                        prior.approval.pop("found", None)
                         # The hand-over has no await in it: the fresh inspection owns the shared frame sessions from
                         # here and a cancellation finds one owner. Only the earlier one's objects are left to go.
                         prior.child_sessions = {}
@@ -301,6 +305,7 @@ class PaymentAutoMixin:
                 if fresh is None:
                     st["seen"] = current.approval.get("seen")
                     st["window"] = current.approval.get("window")
+                    st["found"] = current.approval.get("found")
                     return _auto_result(result, st)
                 current = fresh
                 st["reinspections"] += 1
@@ -499,11 +504,41 @@ def _auto_result(result: dict, st: dict) -> dict:
         out["fill_reinspect"] = {"count": st["reinspections"], "repairs": st["repairs"],
                                  **({"refused": refused} if refused else {}),
                                  **({"seen": st["seen"]} if refused and st.get("seen") else {}),
+                                 # dlz (11-18): what an incomplete reading held (tokens found, counts per drop reason)
+                                 **({"found": found} if refused and (found := clean_found(st.get("found"))) else {}),
                                  # dlz (11-14): where the last generation stopped, and how the window of the
                                  # re-inspection that gave up was spent (counts and fixed codes only)
                                  **({"stopped": st["stopped"]} if refused and st.get("stopped") else {}),
                                  **({"window": window} if refused and (window := clean_window(st.get("window"))) else {})}
     return out
+
+
+_FOUND_COUNTS = ("frames", "documents", "tokens_duplicated", "frames_inspected", "frames_cardless",
+                 "inputs_unrecognised")
+
+
+def clean_found(found: Any) -> dict | None:
+    """dlz (11-18): an incomplete reading's record (``browser_supervisor_payment._summary``), only its exact shape:
+    the card field tokens it found (sorted) and its counts per drop reason. Anything else: None."""
+    if not isinstance(found, dict) or set(found) != {"tokens", *_FOUND_COUNTS}:
+        return None
+    tokens = found["tokens"]
+    if not (isinstance(tokens, list) and len(tokens) <= 16 and all(
+            isinstance(t, str) and len(t) <= 24 and t.replace("-", "").isalpha() and t.islower() for t in tokens)):
+        return None
+    if not all(type(found[k]) is int and 0 <= found[k] < 10_000 for k in _FOUND_COUNTS):
+        return None
+    return {"tokens": sorted(set(tokens)), **{k: found[k] for k in _FOUND_COUNTS}}
+
+
+def _note_found(approval: dict, refused: str, summary: Any) -> None:
+    """Keep the record of the reading that ended ``incomplete`` (the FlixBus / Payrails class); any other refusal
+    clears it (the last reading speaks)."""
+    found = clean_found(summary) if refused == "incomplete" else None
+    if found:
+        approval["found"] = found
+    else:
+        approval.pop("found", None)
 
 
 def _seen_fields(approval: dict, fresh: Any) -> dict:

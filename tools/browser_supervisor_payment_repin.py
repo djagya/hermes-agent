@@ -157,7 +157,10 @@ def repin_pins(controls: tuple, fill_tokens: list, answer: Any, written: list, n
             return None, "unreadable"
         previous = row["index"]
     rows = {row["index"]: LoginControl.from_dict(row) for row in fields}
-    found = [c for r in rows.values() if (c := classify_checkout_control(r)) and c.token.startswith("cc-")]
+    # dlz (D-0359 a): the billing postcode is a card field here only when the inspection made it one.
+    postal = any(c.token == "postal-code" for c in controls)
+    found = [c for r in rows.values() if (c := classify_checkout_control(r))
+             and (c.token.startswith("cc-") or (postal and c.token == "postal-code"))]
     tokens = [c.token for c in found]
     if len(tokens) != len(set(tokens)):
         return None, "token_twice"

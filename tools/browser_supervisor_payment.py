@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import secrets
 import time
@@ -38,6 +39,8 @@ from tools.browser_supervisor_payment_stop import admission_strict as _admission
 from tools.browser_supervisor_payment_stop import strict_exposure as _strict_exposure
 from tools.browser_supervisor_payment_stop import await_cleanup, release_object, strict_then_shown
 
+
+logger = logging.getLogger(__name__)
 
 _MAX_CARD_DOCUMENTS = 4
 # dlz (build C6): more than one tab on the merchant origin (typed, so Sera is told the one way on)
@@ -120,6 +123,10 @@ class PaymentDocument:
     controls: tuple
     # dlz: host monotonic time just after this document's closure was created (its renderer clock anchor).
     clock_anchor: float | None = None
+    # dlz (D-0358 a, 11-18): inspection indexes of its exposed fields the fill does not write (``_left_for_user``), and
+    # those of its exposed fields that held no value at inspection (None: unknown, every such field counts as empty).
+    left_for_user: tuple = ()
+    blank: Any = None
 
 
 @dataclass
@@ -184,6 +191,10 @@ class PaymentInspection:
     # dlz (11-15 r8): the rule that chose its frames, "strict" or "shown_fallback" (the strict pass found no complete
     # card form): its end check and new-frame checks (``_relevant_unchanged``) use the same (``_admission_strict``).
     admission: str = "strict"
+    # dlz (D-0358 a, 11-18): hosted frames on a card document's origin with fields but no card field, holding an empty
+    # field; and what the inspection saw (``_summary``: counts and tokens only).
+    cardless_frames: int = 0
+    summary: dict = field(default_factory=dict)
 
     @property
     def controls(self) -> tuple:
@@ -247,9 +258,11 @@ def _card_documents(candidates: list, merchant: str, unreviewed: frozenset = fro
     return tuple(PaymentDocument(*c) for c in candidates)
 
 
-def _explained_card_documents(candidates: list, merchant: str, tree: tuple, allowed: tuple) -> tuple:
+def _explained_card_documents(candidates: list, merchant: str, tree: tuple, allowed: tuple,
+                              summary: dict | None = None) -> tuple:
     """``_card_documents``, with a coverage refusal naming the provider-level cause it can see in the
-    frame tree (an unsupported PSP, a reviewed one not enabled, a non-card-field page)."""
+    frame tree (an unsupported PSP, a reviewed one not enabled, a non-card-field page). dlz (11-18): a refusal
+    carries ``summary`` (``_summary``: counts and tokens) for the re-inspection's stop record."""
     try:
         return _card_documents(candidates, merchant)
     except PaymentPolicyError as exc:
@@ -258,7 +271,9 @@ def _explained_card_documents(candidates: list, merchant: str, tree: tuple, allo
             explained = PaymentPolicyError(f"{exc} ({hint})")
             # dlz (Codex B r1 #8): the same cause without page-controlled paths, for typed results.
             explained.coverage = f"{exc} ({coverage_hint(tree, merchant, allowed, paths=False)})"
+            explained.summary = summary or {}
             raise explained from None
+        exc.summary = summary or {}
         raise
 
 
@@ -338,7 +353,8 @@ def _receiving(candidates: list, merchant: str, allowed: tuple) -> list:
     return [dict(e, fields=sorted(e["fields"])) for e in out.values()]
 
 
-def _discovery_documents(candidates: list, merchant: str, allowed: tuple, inspected_frames: int) -> tuple:
+def _discovery_documents(candidates: list, merchant: str, allowed: tuple, inspected_frames: int,
+                         summary: dict | None = None) -> tuple:
     """``_card_documents`` for the discovery inspection, with its refusals typed: nothing complete is
     ``payment_fields_unsupported`` (a count only: ad origins are never implied as destinations); duplicates, two
     hosted origins, too many documents or mixed expiry shapes are ``payment_fields_ambiguous`` (origins and tokens).
@@ -350,8 +366,10 @@ def _discovery_documents(candidates: list, merchant: str, allowed: tuple, inspec
         tokens = [control.token for c in candidates for control in c[4]]
         incomplete = str(exc) in ("Incomplete or ambiguous card fields", "Missing card expiry fields")
         if not candidates or (incomplete and len(tokens) == len(set(tokens))):
+            # dlz (11-18): with what the inspection saw (counts and card field tokens only, ``_summary``).
             raise PaymentDestinationError("payment_fields_unsupported", FIELDS_UNSUPPORTED,
-                                          {"unreviewed_frames_inspected": inspected_frames}) from None
+                                          {"unreviewed_frames_inspected": inspected_frames,
+                                           **({"inspection": summary} if summary else {})}) from None
         raise PaymentDestinationError("payment_fields_ambiguous", FIELDS_AMBIGUOUS,
                                       {"receiving_origins": _receiving(candidates, merchant, allowed)}) from None
 
@@ -410,8 +428,77 @@ def _take_probe(owner_nodes: dict, key: tuple) -> bool:
     return True
 
 
-def _card_controls(raw: list) -> tuple:
-    return tuple(c for r in raw if (c := classify_checkout_control(LoginControl.from_dict(r))) and c.token.startswith("cc-"))
+def _classified(raw: list) -> list:
+    """``(row, classified control or None)`` for each descriptor row, in row order."""
+    return [(r, classify_checkout_control(LoginControl.from_dict(r))) for r in raw]
+
+
+def _card_of(classified: list, merchant_doc: bool = False) -> tuple:
+    """A document's card controls: its cc-* fields and (dlz, D-0359 a) its billing postcode, which joins them only
+    beside card fields, when the document has exactly one postcode field, and on the merchant's own page only inside
+    a form that holds a card field (a shipping address form beside the card form is not the card's)."""
+    controls = [c for _r, c in classified if c is not None]
+    card = tuple(c for c in controls if c.token.startswith("cc-"))
+    postal = [c for c in controls if c.token == "postal-code"]
+    if not card or len(postal) != 1:
+        return card
+    form = postal[0].control.form_index
+    if merchant_doc and not (type(form) is int and form >= 0 and any(c.control.form_index == form for c in card)):
+        return card
+    return tuple(sorted((*card, postal[0]), key=lambda c: c.control.index))
+
+
+def _card_controls(raw: list, merchant_doc: bool = False) -> tuple:
+    return _card_of(_classified(raw), merchant_doc)
+
+
+def _left_for_user(classified: list, card: tuple, merchant_doc: bool) -> tuple:
+    """dlz (D-0358 a): the inspection indexes of a card document's exposed fields the fill does not write: every
+    other field of a hosted card document; on the merchant's own page, those in a form that holds a card field (its
+    header search or newsletter box is not part of the card form). Indexes only; the result reports counts."""
+    mine = {c.control.index for c in card}
+    forms = {c.control.form_index for c in card if type(c.control.form_index) is int and c.control.form_index >= 0}
+    out = []
+    for row, c in classified:
+        index = row.get("index") if isinstance(row, dict) else None
+        if type(index) is not int or index in mine:
+            continue
+        if merchant_doc and row.get("formIndex") not in forms:
+            continue
+        out.append(index)
+    return tuple(out)
+
+
+def _one_postcode(candidates: list) -> None:
+    """dlz (D-0359 a): a postcode field in more than one card document names no billing postcode: all are dropped
+    (left for the user and reported), never a reason to refuse the card form. In place."""
+    if sum(any(c.token == "postal-code" for c in cand[4]) for cand in candidates) < 2:
+        return
+    for k, cand in enumerate(candidates):
+        candidates[k] = (*cand[:4], tuple(c for c in cand[4] if c.token != "postal-code"))
+
+
+# dlz (11-18): the counts of an inspection summary (``_summary``), besides frames, documents and tokens.
+_SUMMARY_COUNTS = ("frames_inspected", "frames_cardless", "inputs_unrecognised")
+
+
+def _summary(tree: tuple, candidates: list, found: dict) -> dict:
+    """dlz (11-18): what an inspection saw, counts and card field tokens only (no origin, label, name or value):
+    frames in the tree, frames inspected, card documents, the distinct card field tokens found, how many tokens
+    appeared more than once, frames on a hosted origin with fields but no card field, and fields that classified as
+    nothing."""
+    tokens = [c.token for cand in candidates for c in cand[4]]
+    stats = found.get("stats") or dict.fromkeys(_SUMMARY_COUNTS, 0)
+    return {"frames": len(tree), "documents": len(candidates), "tokens": sorted(set(tokens)),
+            "tokens_duplicated": len(tokens) - len(set(tokens)), **{k: int(stats.get(k, 0)) for k in _SUMMARY_COUNTS}}
+
+
+def _blank_indexes(answer: Any) -> frozenset | None:
+    """The closure's ``blanks()`` answer (exposed fields holding no value), or None when it is not a list of indexes."""
+    if not isinstance(answer, list) or len(answer) > _DISCOVERY_LIMITS["inputs"] or \
+            not all(type(n) is int and n >= 0 for n in answer):
+        return None
+    return frozenset(answer)
 
 
 def _relevant_frames(i: PaymentInspection) -> set:
@@ -650,8 +737,10 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             unreviewed_frames = await self._inspect_frames(tree, merchant, allowed_frames, unreviewed, sid,
                                                            child_sessions, world, found, admission == "strict")
             candidates, absence = found["candidates"], found["absence"]
+            _one_postcode(candidates)
+            summary = _summary(tree, candidates, found)
             if unreviewed:
-                documents = _discovery_documents(candidates, merchant, allowed_frames, unreviewed_frames)
+                documents = _discovery_documents(candidates, merchant, allowed_frames, unreviewed_frames, summary)
                 # dlz (B4): card-free documents on the merchant or a receiving origin stay pinned as absence
                 # witnesses; those on other origins (ads, widgets) are released: they may churn freely.
                 receiving = {merchant, *(d.origin for d in documents)}
@@ -661,9 +750,15 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 if len(absence) > _MAX_ABSENCE_WITNESSES:
                     raise _page_too_large()
             else:
-                documents = _explained_card_documents(candidates, merchant, tree, allowed_frames)
+                documents = _explained_card_documents(candidates, merchant, tree, allowed_frames, summary)
+            left = found.get("left") or {}
             for d in documents:
                 d.clock_anchor = found["anchors"].get((d.frame_session, d.object_id))
+                d.left_for_user, d.blank = left.get((d.frame_session, d.object_id), ((), None))[:2]
+            pinned = {(d.frame_session, d.object_id) for d in documents}
+            hosted_origins = {d.origin for d in documents if d.origin != merchant}
+            cardless = sum(1 for key, (rows, blank, where) in left.items() if key not in pinned
+                           and where in hosted_origins and (blank is None or any(n in blank for n in rows)))
             if await self._payment_tree(sid, child_sessions) != tree:
                 raise PaymentPolicyError("Payment page changed during inspection")
             found["owners"] = await self._pin_frame_owners(documents, tree, sid, child_sessions, found["owners"])
@@ -687,6 +782,8 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 approval_id=world,
                 strict_exposure=strict,
                 admission=admission,
+                cardless_frames=cardless,
+                summary=summary,
             )
             if prior is not None:
                 inspection.auto, inspection.approval, inspection.policy_check = \
@@ -864,7 +961,20 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                     session_id=fsid,
                 )
             )
-            controls = _card_controls(_bounded_description(raw) if unreviewed else raw)
+            rows = _bounded_description(raw) if unreviewed else raw
+            merchant_doc = frame_origin == merchant
+            classified = _classified(rows)  # a reading that is no list raises here, as it always did
+            controls = _card_of(classified, merchant_doc)
+            # dlz (D-0358 a, 11-18): what the fill will not write here, as counts (inspection summary, result).
+            stats = found.setdefault("stats", dict.fromkeys(_SUMMARY_COUNTS, 0))
+            stats["frames_inspected"] += 1
+            stats["inputs_unrecognised"] += sum(c is None for _r, c in classified)
+            # A hosted frame with fields and no card field is left for the user whole (Payrails' holder frame).
+            left = _left_for_user(classified, controls, merchant_doc) if controls or not merchant_doc else ()
+            if left:
+                found.setdefault("left", {})[(fsid, obj)] = (left, await self._blanks(fsid, obj), frame_origin)
+            if classified and not controls and not merchant_doc:
+                stats["frames_cardless"] += 1
             if controls or unreviewed:
                 found["pending"].remove((fsid, obj))  # no await between: it is always in exactly one list
                 if controls:
@@ -879,6 +989,16 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
                 found["free"].append(fid)
         return unreviewed_frames
 
+    async def _blanks(self, fsid: str, obj: str) -> frozenset | None:
+        """dlz (D-0358 a): the exposed fields of a pinned document that hold no value (indexes only; a field the user
+        already typed into is not one Hermes left empty), or None when the document cannot say."""
+        try:
+            return _blank_indexes(_value(await self._cdp("Runtime.callFunctionOn", {
+                "objectId": obj, "functionDeclaration": "function(){return this.blanks()}", "returnByValue": True},
+                session_id=fsid)))
+        except Exception:  # health: allow BLE001 -- unknown: every such field counts as empty (reported, not hidden)
+            return None
+
     async def _bind_amount_witnesses(self, inspection: PaymentInspection, cart: tuple, witnesses: list) -> None:
         """B5: pin an amount witness in the top document and each unreviewed receiving document (a transcription
         check only) and record the page-check result shown to the owner."""
@@ -890,6 +1010,11 @@ class PaymentSupervisionMixin(PaymentAutoMixin):
             pins.append((place, await self._amount_witness(wfid, wsid, inspection.operation_id, cart, witnesses)))
         inspection.witnesses = tuple(witnesses)
         inspection.page_match = _page_match(pins, cart[0])
+        if inspection.page_match[0] == "ambiguous":
+            why = _page_match_reasons(pins, cart[0])
+            logger.info("card fill page check ambiguous: %s; labelled amounts %d (other %d), stated total seen %d "
+                        "time(s), %d document(s)", ",".join(why["reasons"]) or "-", why["labelled"], why["other"],
+                        why["stated"], why["documents"])
         # dlz (fill-auto): the reading itself, per witnessed document, for a re-inspection's comparison.
         inspection.cart = tuple(cart)
         inspection.cart_pins = tuple(sorted((place, json.dumps(pin, sort_keys=True)) for place, pin in pins))
@@ -1792,6 +1917,18 @@ _OWNERS_SCOPE_EXPOSED = ("function(href,origin,...els){" + _PARENT_AT + "return 
                          + _EXPOSED + ")(e))}")
 
 
+def _page_match_reasons(pins: list, cents: int) -> dict:
+    """dlz (11-18): why a page check is ``ambiguous``, fixed reason codes and counts, never an amount: ``unclear``
+    (a total-labelled text this check does not read clearly), ``unlabelled`` (the stated total appears, but no
+    total-labelled amount does), ``other_total`` (a total-labelled amount besides the stated one); with the number of
+    distinct labelled amounts, of other ones, of the stated total's occurrences and of documents checked."""
+    labelled = {v for _place, pin in pins for v in pin["labelled"]}
+    reasons = [code for code, hit in (("unclear", any(pin["unclear"] for _place, pin in pins)),
+                                      ("unlabelled", not labelled), ("other_total", bool(labelled - {cents}))) if hit]
+    return {"reasons": reasons, "labelled": len(labelled), "other": len(labelled - {cents}),
+            "stated": sum(pin["stated"] for _place, pin in pins), "documents": len(pins)}
+
+
 _PACED_STOPS = frozenset({"payment_page_changed", "payment_cart_changed", "payment_destination_disabled",
                           "payment_consent_expired"})
 
@@ -1817,9 +1954,11 @@ def _commit_order(i: PaymentInspection, groups: list) -> list:
 def _retention_result(documents: list) -> dict:
     """Success only when every written field of every document still holds its value after settling.
     ``documents`` pairs each document's fills with its ``retained()`` answer (None: unreadable). The
-    result names tokens, states and lengths only."""
+    result names tokens, states and lengths only. dlz (11-18): ``fields_invalid`` (only when not empty) names the
+    written tokens the provider marks invalid (the closure's fixed validity code; anything else counts as unknown)."""
     states: dict = {}
     lengths: dict = {}
+    invalid: set = set()
     held = total = 0
     for fills, answer in documents:
         answer = answer if isinstance(answer, list) and len(answer) == len(fills) else [None] * len(fills)
@@ -1830,11 +1969,14 @@ def _retention_result(documents: list) -> dict:
             total += 1
             held += state == "held"
             states[token] = state
+            if entry.get("validity") == "invalid":
+                invalid.add(token)
             if state != "held":
                 length = entry.get("length")
                 lengths[token] = length if type(length) is int and 0 <= length <= 256 else 0
+    marked = {"fields_invalid": sorted(invalid)} if invalid else {}
     if total and held == total:
-        return {"success": True, "filled_fields": held, "retention_verified": True}
+        return {"success": True, "filled_fields": held, "retention_verified": True, **marked}
     return {
         "success": False,
         "error_type": "payment_fields_not_retained",
@@ -1842,6 +1984,7 @@ def _retention_result(documents: list) -> dict:
         "partially_filled": True,
         "field_retention": dict(sorted(states.items())),
         "field_lengths": dict(sorted(lengths.items())),
+        **marked,
     }
 
 

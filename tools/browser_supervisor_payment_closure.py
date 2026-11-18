@@ -250,8 +250,26 @@ _INSPECT_TEMPLATE = r"""(() => {
   // the unknown marker (a field whose exposure cannot be judged).
   const bounded = (d, unsure) => overflow || (LIM && JSON.stringify(d).length > LIM.bytes) ? {overflow:true} :
     unsure ? {unknown:true} : d;
+  // dlz (D-0358 a, 11-18): the provider's own verdict on a written field, a fixed code: 'invalid' when the field or a
+  // close ancestor says so (aria-invalid, the :invalid state, a provider's invalid class), 'unknown' when it cannot be
+  // read, else 'valid'. No text, no value.
+  const INVALID_CLASSES = ['is-invalid','invalid','has-error','StripeElement--invalid','braintree-hosted-fields-invalid',
+    'adyen-checkout__input--invalid','adyen-checkout__input--error','adyen-checkout__field--error','input--invalid',
+    'field--invalid','field-error','input-error','error'];
+  const validity = el => {
+    try {
+      if (String(el.getAttribute('aria-invalid')||'').toLowerCase() === 'true') return 'invalid';
+      if (typeof el.matches === 'function' && el.matches(':invalid')) return 'invalid';
+      for (let n = el, k = 0; n && n.classList && k < 4; n = n.parentElement, k++)
+        if (INVALID_CLASSES.some(c => n.classList.contains(c))) return 'invalid';
+      return 'valid';
+    } catch (_) { return 'unknown'; }
+  };
   return {
     describe:()=>bounded(describe().filter(x=>selected.has(x.index)), unknown), valid,
+    // dlz (D-0358 a, 11-18): the inspection indexes of the exposed fields that hold no value now (indexes only).
+    blanks: () => entries.filter(x => { try { return !String(x.e.value == null ? '' : x.e.value).trim(); }
+                                        catch (_) { return true; } }).map(x => x.index),
     // dlz (B4, discovery only): the fields shown now, for a card-free document's absence check; null once the
     // document or its URL changed.
     scan: () => {
@@ -324,7 +342,8 @@ _INSPECT_TEMPLATE = r"""(() => {
         const el = f.index === -1 ? null : elements[f.index];
         // dlz: a field the provider hid in favour of a fresh input is not the one the user sees.
         if (!page || !el || !live(el) || !shown(el)) return {token:f.token,state:'replaced',length:0};
-        return {token:f.token,state:same(el.value,f.value)?'held':el.value?'changed':'empty',length:el.value.length};
+        return {token:f.token,state:same(el.value,f.value)?'held':el.value?'changed':'empty',length:el.value.length,
+                validity:validity(el)};
       });
     },
     // dlz: `repin` (config vault.payment_repin, reviewed destinations; a literal true only): the commit may pause

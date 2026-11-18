@@ -576,11 +576,14 @@ def test_a_holder_cue_on_a_zip_field_never_plans_the_holder_name_there():
             for n, (name, label) in enumerate([("ccnum ", "Card number"), ("expiry ", "Expiry date"),
                                                ("cvc ", "CVC"), ("zip ", "Card holder ZIP code")])]
     controls = sp._card_controls(sp._bounded_description(rows))
-    assert [c.token for c in controls] == ["cc-number", "cc-exp", "cc-csc"]  # the ZIP is no card field
+    # D-0359 a (11-18): the ZIP is the card's billing postcode field now, never the holder's
+    assert [c.token for c in controls] == ["cc-number", "cc-exp", "cc-csc", "postal-code"]
     docs = _card_documents([("f", "s", "o", MERCHANT, controls)], MERCHANT)
     fills = bvp._document_fills(_inspection(*docs), CARD)
     assert sorted(f["token"] for f in fills) == ["cc-csc", "cc-exp", "cc-number"]
     assert all(f["index"] != 3 for f in fills)
+    fills = bvp._document_fills(_inspection(*docs), {**CARD, "billing_postal_code": "10115"})
+    assert [(f["index"], f["token"], f["value"]) for f in fills if f["index"] == 3] == [(3, "postal-code", "10115")]
 
     # The merchant's own "Name on card" beside billing "Card holder address/city" fields fills as on base: four
     # fields, the holder into "Name on card" only.

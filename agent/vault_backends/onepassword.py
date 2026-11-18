@@ -305,7 +305,7 @@ class OnePasswordLoginBackend(LoginBackend):
     def resolve_payment_secret(self, handle: str) -> tuple[dict[str, str], Optional[str]]:
         """The card and the ``version`` of the item op revealed (same JSON). The fill compares it with the
         version the prompt was shown for, so an item edited meanwhile is never written."""
-        from agent.vault_payment_card import parse_onepassword_card
+        from agent.vault_payment_card import CardInvalid, parse_onepassword_card
 
         vault_id, item_id = _split_handle(handle, self.prefix)
         if not vault_id:
@@ -316,6 +316,8 @@ class OnePasswordLoginBackend(LoginBackend):
             return parse_onepassword_card(item, item_id=item_id, vault_id=vault_id), _item_revision(item)
         except (UnlockRequired, ItemNotFound, BackendRateLimited, BackendAuthExpired, BackendNetwork):
             raise  # typed causes carry no card data, only the scrubbed CLI error
+        except CardInvalid as exc:  # dlz (11-18): the same fixed text, with the check's fixed code
+            raise CardInvalid("Payment card resolution failed", exc.code) from None
         except Exception:
             raise ValueError("Payment card resolution failed") from None
 
