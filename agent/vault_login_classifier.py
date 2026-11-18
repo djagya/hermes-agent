@@ -675,21 +675,23 @@ def choose_password_control(classified: list[ClassifiedLoginControl],
                             controls: Optional[list[LoginControl]] = None) -> tuple[Optional[ClassifiedLoginControl], str]:
     """``(the current-password control to fill, "")`` or ``(None, reason)``.
 
-    An open dialog (``<dialog open>``, ``aria-modal``, the URL's ``:target``) that holds any listed input is
+    An open dialog (``<dialog open>``, ``aria-modal``, the URL's ``:target``) that holds a password input is
     what the user sees: only password fields inside it count (PyPI's step-up dialog over the change-password
-    form). Then rendered + visible + topmost fields win, then the score. Equal best candidates in different
-    forms are ``password_field_ambiguous``: nothing is written rather than a guess."""
+    form). A dialog without one (a newsletter box with an e-mail field) does not hide the page's login form.
+    Then rendered + visible + topmost fields win, then the score; among equal best candidates the first in the
+    DOM is filled (a header quick-login and the main form, as before 11-18). Equal best candidates in different
+    documents (frames, origins) are ``password_field_ambiguous``: nothing is written rather than a guess."""
     passwords = [c for c in classified if c.token == "current-password"]
     if not passwords:
         return None, NO_PASSWORD_FIELD
     pool = controls if controls is not None else [c.control for c in classified]
-    if any(c.modal is True for c in pool):
+    if any(c.modal is True and c.type == "password" for c in pool):
         passwords = [c for c in passwords if c.control.modal is True]
         if not passwords:
             return None, PASSWORD_OUTSIDE_DIALOG
     best = min(_shown_rank(c) for c in passwords)
     tied = sorted((c for c in passwords if _shown_rank(c) == best), key=lambda c: c.control.index)
-    if len({c.control.form_index for c in tied}) > 1:
+    if len({c.control.page_url for c in tied}) > 1:
         return None, PASSWORD_FIELD_AMBIGUOUS
     return tied[0], ""
 
@@ -1462,7 +1464,7 @@ _SIGNUP_FILL_JS_TEMPLATE = """(async () => {
 
 # Per-field outcome codes the login writer reports (fixed strings; anything else is unverifiable).
 FILL_REASONS = ("written", "field_missing", "not_password", "detached", "origin_changed", "not_visible",
-                "value_rejected", "no_option", "write_error")
+                "value_rejected", "no_option", "write_error", "mask_failed")
 
 
 def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "", refusal_tag: str = "",
@@ -1484,11 +1486,18 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
 
     The answer is ``{"filled": n, "reasons": [one FILL_REASONS code per fill]}``. With ``settle_ms`` (the login
     password fill) the script then waits that long, like the signup writer, and adds ``"retained"``: how many
-    written fields still hold their value (a framework that resets a controlled input clears it).
+    written fields still hold their value (a framework that resets a controlled input clears it). A page that
+    starts to navigate away during the settle (``beforeunload`` / ``pagehide``: the site auto-submitted) answers
+    at once with ``"navigated": true`` and no ``retained``.
+
+    A fill with ``"mask": True`` (a recovery code in a plain text box) hides the field's pixels BEFORE the value
+    lands: ``-webkit-text-security: disc`` where the engine supports it, else the input becomes
+    ``type=password``. If neither takes, nothing is written to that field (``mask_failed``).
     """
     payload = json.dumps(
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"],
-          **({"strict": True} if f.get("strict") else {})} for f in fills]
+          **({"strict": True} if f.get("strict") else {}), **({"mask": True} if f.get("mask") else {})}
+         for f in fills]
     )
     # One pass: a chained .replace() would rescan the already-spliced fill values, so a secret
     # containing "__NONCE__" (or any later placeholder) got JSON spliced into its string literal.
@@ -1569,6 +1578,7 @@ _FILL_JS_TEMPLATE = """(() => {
       if (window.location.origin !== expectedOrigin) { reasons.push("origin_changed"); continue; }
       if (f.token === "current-password" && el.type !== "password") { reasons.push("not_password"); continue; }
       if (f.strict === true && !visible(el)) { reasons.push("not_visible"); continue; }
+      if (f.mask === true && !maskField(el)) { reasons.push("mask_failed"); continue; }
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
@@ -1581,18 +1591,44 @@ _FILL_JS_TEMPLATE = """(() => {
   }
   clearStamps();
   if (settleMs <= 0) return stringify({ filled, reasons });
-  // Same settle as the signup writer: frameworks reset controlled inputs on a later tick.
-  return new P0((resolve) => wait(() => {
-    let retained = 0;
-    try {
-      for (let i = 0; i < kept.length; i++) {  // by index: no page-reachable array iterator on this path
-        const el = kept[i][0];
-        const now = valueGet ? valueGet.call(el) : el.value;
-        if (el.isConnected && now === kept[i][1]) retained += 1;
-      }
-    } catch (_) { retained = -1; }
-    resolve(stringify({ filled, reasons, retained }));
-  }, settleMs));
-  // (a hoisted declaration, so the early no-write refusal above can use it too)
+  // Same settle as the signup writer: frameworks reset controlled inputs on a later tick. A site that submits
+  // on its own navigates now: answer before the document goes, the write itself already landed.
+  return new P0((resolve) => {
+    let done = false;
+    const left = (e) => {  // a page-dispatched (untrusted) event is not a navigation
+      if (done || (e && e.isTrusted === false)) return;
+      done = true;
+      resolve(stringify({ filled, reasons, navigated: true }));
+    };
+    try { window.addEventListener("beforeunload", left, true); window.addEventListener("pagehide", left, true); } catch (_) {}
+    wait(() => {
+      if (done) return;
+      let retained = 0;
+      try {
+        for (let i = 0; i < kept.length; i++) {  // by index: no page-reachable array iterator on this path
+          const el = kept[i][0];
+          const now = valueGet ? valueGet.call(el) : el.value;
+          if (el.isConnected && now === kept[i][1]) retained += 1;
+        }
+      } catch (_) { retained = -1; }
+      done = true;
+      resolve(stringify(window.location.origin === expectedOrigin ? { filled, reasons, retained }
+                                                                  : { filled, reasons, navigated: true }));
+    }, settleMs);
+  });
+  // (hoisted declarations, so the early no-write refusal above can use them too)
   function clearStamps() { find("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot")); }
+  // Pixels first: a screenshot taken while the field holds a recovery code shows discs, never the code.
+  function maskField(el) {
+    try {
+      let css = false;
+      try { css = typeof CSS !== "undefined" && CSS.supports("-webkit-text-security", "disc"); } catch (_) { css = false; }
+      if (css) {
+        el.style.setProperty("-webkit-text-security", "disc", "important");
+        if (el.style.getPropertyValue("-webkit-text-security") === "disc") return true;
+      }
+      el.type = "password";
+      return el.type === "password";
+    } catch (_) { return false; }
+  }
 })()"""

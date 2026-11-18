@@ -217,9 +217,8 @@ class OnePasswordLoginBackend(LoginBackend):
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origins = _all_origins(urls)
             if not origins:
-                if urls:  # a website the fill cannot bind (no scheme, "pypi.org"): say so instead of hiding it
-                    reason = ("website_without_scheme" if all("://" not in u for u in urls) else "website_unreadable")
-                    skipped.append({"title": str(item.get("title") or "")[:120], "reason": reason})
+                if urls:  # a website the fill cannot bind (unparseable): say so instead of hiding it
+                    skipped.append({"title": str(item.get("title") or "")[:120], "reason": "website_unreadable"})
                 continue
             item_id = str(item.get("id") or "").strip()
             if not item_id:
@@ -275,8 +274,9 @@ class OnePasswordLoginBackend(LoginBackend):
         return _login_password(item, self.display_name)
 
     def resolve_recovery_codes(self, handle: str, field: str) -> list[str]:
-        """D-0365: the codes in the Login item's field (or section) named ``field``; [] when none match."""
-        from agent.vault_recovery_codes import field_matches, parse_codes
+        """D-0365: the codes in the Login item's field (or section) named ``field``; [] when none match;
+        ``RecoveryFieldNotCodes`` when the match is the password / username / TOTP field or has no code wording."""
+        from agent.vault_recovery_codes import pick_code_values
 
         vault_id, item_id = self._resolve_handle(handle)
         args = ["item", "get", item_id]
@@ -287,14 +287,16 @@ class OnePasswordLoginBackend(LoginBackend):
         except ValueError:
             raise BackendError(self.display_name, "op item get returned no JSON item") from None
         fields = item.get("fields") if isinstance(item, dict) else None
-        values = []
+        entries = []
         for f in fields if isinstance(fields, list) else []:
             if not isinstance(f, dict) or not isinstance(f.get("value"), str):
                 continue
             section = f.get("section") if isinstance(f.get("section"), dict) else {}
-            if field_matches(field, str(f.get("label") or ""), str(section.get("label") or "")):
-                values.append(f["value"])
-        return parse_codes(values)
+            # The login's own password, username and TOTP field are never codes, whatever their label says.
+            protected = (str(f.get("purpose") or "").upper() in ("PASSWORD", "USERNAME")
+                         or str(f.get("type") or "").upper() == "OTP" or str(f.get("id") or "") == "password")
+            entries.append((str(f.get("label") or ""), str(section.get("label") or ""), f["value"], protected))
+        return pick_code_values(field, entries)
 
     def resolve_secret(self, handle: str) -> dict[str, str]:
         """Reveal a single card only inside the trusted native filler, never in tool output."""
@@ -423,6 +425,9 @@ def _all_origins(urls: list[str]) -> list[str]:
     """
     out: list[str] = []
     for u in urls:
+        u = u.strip()
+        if u and "://" not in u:
+            u = "https://" + u  # dlz (11-18): "pypi.org" is read as https://pypi.org, as 1Password itself does
         try:
             origin = normalize_origin(u)
         except Exception:

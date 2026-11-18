@@ -38,6 +38,8 @@ from agent.vault_payment_policy import PaymentPolicyError, destination_consent_e
 
 from tools.browser_vault_context import (fill_context, plugin_errors_as_refusal, saved_origins, snapshot_refusal,
                                          write_backend_code)
+from tools.browser_vault_outcome import LOGIN_REASONS, fill_reasons, frames_refusal, log_outcome, login_write_result
+from tools.browser_vault_recovery import enter_recovery_code
 
 logger = logging.getLogger(__name__)
 _OTP_REDACTION_TTL_S = 300.0  # dlz: a one-time code is worthless after minutes; its length masking ends with it
@@ -486,9 +488,9 @@ def browser_vault_list() -> str:
         out["errors"] = errors
     if skipped:
         out["skipped"] = skipped
-        out["skipped_hint"] = ("These items cannot be filled: website_without_scheme means the saved website has no "
-                               "https:// in front; ask the user (or Sera's own 1Password tools) to save it with "
-                               "https://, then list again.")
+        out["skipped_hint"] = ("These items cannot be filled: website_unreadable means the saved website is not a "
+                               "readable address (a website without https:// is read as https:// and listed); ask "
+                               "the user (or Sera's own 1Password tools) to correct it, then list again.")
     return json.dumps(out, ensure_ascii=False)
 
 
@@ -702,17 +704,16 @@ def browser_vault_enter_code(
     boundary the same way a generated one is.
 
     dlz (D-0365): ``code_source="recovery"`` types ONE stored recovery/backup code from the login ``handle``'s
-    field named ``field`` (e.g. "recovery codes"), after its own approval (see :func:`_enter_recovery_code`)."""
+    field named ``field`` (e.g. "recovery codes"), after its own approval (see :mod:`tools.browser_vault_recovery`)."""
     if code_source == "recovery":
-        return _enter_recovery_code(handle, task_id or "default", field)
+        return enter_recovery_code(handle, task_id or "default", field)
     if code_source not in ("", "otp"):
         return json.dumps({"success": False, "error_type": "invalid_code_source",
                            "error": "code_source is otp (default) or recovery. Nothing was written."})
     from agent.redact import register_vault_redaction_value
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import (
-        SEVERAL_CODE_FIELDS, LoginControl, build_fill_js, build_inspection_js, build_otp_fills,
-        classify_otp_controls_detailed,
+        SEVERAL_CODE_FIELDS, build_fill_js, build_otp_fills, classify_otp_controls_detailed,
     )
 
     effective_task_id = task_id or "default"
@@ -751,18 +752,14 @@ def browser_vault_enter_code(
             return json.dumps(refusal)
 
     nonce = secrets.token_hex(8)
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
-    raw_controls = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
-    if isinstance(raw_controls, str):
-        raw_controls = _parse_json_result(raw_controls)
-    listed = [LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)]
+    listed = _page_controls(effective_task_id, nonce)
     otp_controls, why_none = classify_otp_controls_detailed(listed)
     if why_none == SEVERAL_CODE_FIELDS:
         return json.dumps({"success": False, "error_type": "no_code_field",
                            "error": ("Several possible code fields on the current page, so none was filled. Nothing was written. "
                                      "Tell the user which field takes the code, or ask them to enter it themselves.")})
     if not otp_controls:
-        if not listed and (framed := _frames_refusal(effective_task_id, meta)) is not None:
+        if not listed and (framed := frames_refusal(effective_task_id, meta)) is not None:
             return json.dumps(framed)
         return json.dumps(_no_code_field_result(listed))
 
@@ -790,7 +787,7 @@ def browser_vault_enter_code(
         if filled is None:
             return json.dumps(_FILL_UNVERIFIED)
         if not filled:
-            reasons = _fill_reasons(parsed, len(fills))
+            reasons = fill_reasons(parsed, len(fills))
             return json.dumps({"success": False, "error_type": "code_not_written", "filled_fields": 0,
                                "reason": next((r for r in reasons or [] if r != "written"), "unknown"),
                                "origin": origin, "source": source,
@@ -808,24 +805,28 @@ def browser_vault_enter_code(
             return written
     prompt = get_code_prompt_callback()
     if prompt is None or not can_prompt_here():
-        if _chat_session():
-            # dlz (11-18): a chat (Telegram) session is not headless: the user can send the code in chat.
-            return json.dumps({"success": False, "error_type": "prompt_unavailable",
-                               "error": (f"{site} asks for a one-time code and this chat has no masked code prompt. Ask "
-                                         "the user to send the code in chat (or read it from their mail with Hermes' "
-                                         "own mail workflow), then call enter_code with code and expected_origin set "
-                                         "to the page's origin. Saving an authenticator key on the login makes codes "
-                                         "automatic.")})
-        return json.dumps({"success": False, "error_type": "prompt_unavailable",
-                           "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
-                                     "Save an authenticator key for this login so codes can be generated automatically, or "
-                                     "obtain the code through Hermes' own mail workflow (or ask the user to send the one-time "
-                                     "code in chat) and pass it as the code argument with expected_origin set to the page's origin.")})
+        return _prompt_unavailable(site)
     typed = (prompt(site, "") or "").strip().replace(" ", "").replace("-", "")
     if not typed:
         return json.dumps({"success": False, "error_type": "code_declined",
                            "error": "The user did not enter a code. Do not ask again this turn."})
     return write(typed, "user")
+
+
+def _prompt_unavailable(site: str) -> str:
+    if _chat_session():
+        # dlz (11-18): a chat (Telegram) session is not headless: the user can send the code in chat.
+        return json.dumps({"success": False, "error_type": "prompt_unavailable",
+                           "error": (f"{site} asks for a one-time code and this chat has no masked code prompt. Ask "
+                                     "the user to send the code in chat (or read it from their mail with Hermes' "
+                                     "own mail workflow), then call enter_code with code and expected_origin set "
+                                     "to the page's origin. Saving an authenticator key on the login makes codes "
+                                     "automatic.")})
+    return json.dumps({"success": False, "error_type": "prompt_unavailable",
+                       "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
+                                 "Save an authenticator key for this login so codes can be generated automatically, or "
+                                 "obtain the code through Hermes' own mail workflow (or ask the user to send the one-time "
+                                 "code in chat) and pass it as the code argument with expected_origin set to the page's origin.")})
 
 
 def _no_code_field_result(listed: list) -> dict[str, Any]:
@@ -843,109 +844,6 @@ def _no_code_field_result(listed: list) -> dict[str, Any]:
             "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or an "
                       "approval tap in an app, tell the user to complete it on their device and wait for the page to "
                       "move on.")}
-
-
-def _confirm_recovery_code(label: str, origin: str) -> str:
-    from tools.browser_vault_signup import ask_consent
-
-    return ask_consent(
-        f"Enter one saved recovery code for '{label}' on {origin}?",
-        "The agent wants to type ONE of the recovery/backup codes saved on this login into the code field of "
-        "this exact site. The code never enters the conversation and is spent once used. Approve only if you "
-        "want Hermes to use a recovery code here.",
-        surface="vault-recovery-code", title="Use a recovery code?")
-
-
-def _enter_recovery_code(handle: str, task_id: str, field: str) -> str:
-    """D-0365: one stored recovery code into the page's recovery/one-time-code field, one approval per code.
-    Origin bound to the item before anything else; the code is chosen, marked spent and written inside the
-    backend's fill_context, after the approval; never returned."""
-    from agent.redact import register_vault_redaction_value
-    from agent.vault_backends import BackendError, UnlockRequired
-    from agent.vault_login_classifier import build_fill_js, classify_recovery_code_controls
-    from agent.vault_recovery_codes import take_unused
-    from tools.browser_vault_signup import not_given, outcome_of
-
-    def refuse(error_type: str, error: str, **extra: Any) -> str:
-        return json.dumps({"success": False, "error_type": error_type, "error": error, **extra})
-
-    if not field.strip():
-        return refuse("recovery_field_required", "code_source=recovery needs field: the name of the vault item's "
-                                                 "field that holds the codes (e.g. \"recovery codes\"). Nothing was written.")
-    backend, meta = _saved_login(handle)
-    if meta is None and backend is not None and backend.needs_unlock and not backend.is_unlocked():
-        return refuse("unlock_required", f"{backend.display_name} is locked; call browser_vault action=unlock.")
-    if meta is None:
-        return refuse("vault_item_not_found", "No saved login with this handle. Use browser_vault action=list.")
-    if meta.kind != "login":
-        return refuse("recovery_login_required", "Recovery codes are read from a saved login item. Nothing was written.")
-    origin = _bound_page_origin(task_id, meta, "otp")
-    if isinstance(origin, dict):
-        return json.dumps(origin)
-    nonce = secrets.token_hex(8)
-    listed = _page_controls(task_id, nonce)
-    targets = classify_recovery_code_controls(listed)
-    if not targets:
-        return json.dumps(_no_code_field_result(listed))
-    top = max(t.score for t in targets)
-    best = sorted((t for t in targets if t.score == top), key=lambda t: t.control.index)
-    if len({t.control.form_index for t in best}) > 1:
-        return refuse("several_code_fields", "Several fields could take the recovery code, so none was filled. "
-                                             "Nothing was written.")
-    target = best[0].control
-    outcome = outcome_of(_confirm_recovery_code(meta.label, origin))
-    if outcome != "accepted":
-        return not_given("recovery_code_declined", "Using a recovery code", outcome)
-    if _current_page_origin(task_id) != origin:
-        return refuse("origin_changed", "The page origin changed during approval. Nothing was written.")
-    with fill_context(backend):
-        refusal = snapshot_refusal(backend, handle, meta, origin)
-        if refusal is not None:
-            return json.dumps(refusal)
-        try:
-            codes = backend.resolve_recovery_codes(handle, field)
-        except UnlockRequired:
-            return refuse("unlock_required", f"{backend.display_name} locked again; call browser_vault action=unlock.")
-        except BackendError:
-            raise  # typed manager failures carry advice and no secret
-        except Exception:  # health: allow BLE001 -- untyped backend errors can carry secret bytes
-            return refuse("secret_resolution_failed", "Could not read the saved item. Nothing was written.")
-        fit = [c for c in codes if target.max_length is None or len(c) <= target.max_length]
-        if not codes:
-            return refuse("recovery_codes_not_found", f"The saved login has no codes in a field named {field!r}. "
-                                                      "Nothing was written.", next="Ask the user which field holds them.")
-        if not fit:
-            return refuse("code_field_too_short", "The code field cannot hold a whole recovery code. Nothing was written.")
-        code, left = take_unused(handle, fit)
-        if code is None:
-            return refuse("recovery_codes_used_up", "Every saved recovery code was already used by Hermes. Nothing "
-                                                    "was written.", next="Tell the user to generate new recovery "
-                                                                         "codes and update the vault item.")
-        refused = _register_redactions([code])
-        if refused:
-            return refused
-        result = _eval_js_secret(task_id, build_fill_js([{"index": target.index, "token": "one-time-code",
-                                                          "value": code}], expected_origin=origin, nonce=nonce))
-        del code
-    if not result.get("success"):
-        return refuse(str(result.get("error_type") or "fill_failed"), "The browser did not confirm the code write; "
-                      "the code counts as spent. Read the page before anything else.")
-    parsed = _parse_json_result(result.get("result"))
-    if isinstance(parsed, str):
-        parsed = _parse_json_result(parsed)
-    if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
-        return refuse("origin_changed", "The page navigated before the code could be entered. Nothing was written.")
-    filled = _filled_count(parsed, 1)
-    if filled is None:
-        return json.dumps(_FILL_UNVERIFIED)
-    if not filled:
-        reasons = _fill_reasons(parsed, 1)
-        return refuse("code_not_written", "The code field did not take the code. Do not submit; read the page.",
-                      reason=(reasons or ["unknown"])[0])
-    return json.dumps({"success": True, "filled_fields": 1, "origin": origin, "source": "recovery_codes",
-                       "codes_left": left,
-                       "next": ("Submit the form. That code is now spent; Hermes will not type it again."
-                                + (" Few codes are left: tell the user to generate new ones." if left <= 2 else ""))})
 
 
 def _inspect_fill_controls(task_id: str, nonce: str, kind: str, bind: str = "") -> tuple[list, list, Optional[str]]:
@@ -1157,53 +1055,6 @@ def _identifier_fill(classified: list, password_fill: list[dict[str, Any]], iden
     return [{"index": best.control.index, "token": best.token, "value": identifier}]
 
 
-def _frames_refusal(task_id: str, meta: Any) -> Optional[dict[str, Any]]:
-    """``form_in_frame`` when the page embeds frames the inspection could not enter (another origin): the form
-    may be inside one. Same-origin frames are already inspected and filled like the page itself. Names only the
-    frame origins that are saved on the item (they can be opened directly); counts the rest."""
-    from agent.vault_login_classifier import FRAME_PROBE_JS
-
-    res = _eval_js(task_id, FRAME_PROBE_JS)
-    origins = _parse_json_result(res.get("result")) if res.get("success") else None
-    if isinstance(origins, str):
-        origins = _parse_json_result(origins)
-    if not isinstance(origins, list):
-        return None
-    frames = [o for o in origins if isinstance(o, str) and o.startswith(("https://", "http://"))][:20]
-    if not frames:
-        return None
-    saved = [o for o in frames if meta is not None and o in saved_origins(meta)]
-    out: dict[str, Any] = {"success": False, "error_type": "form_in_frame", "frames_not_inspected": len(frames),
-                           "error": ("No fillable field on the page itself, and it embeds frames from another origin "
-                                     "that Hermes cannot reach from the page; the form may be inside one. Nothing "
-                                     "was written.")}
-    if saved:
-        out["saved_frame_origins"] = saved
-        out["next"] = ("A frame is on an origin saved on this item: open that frame's address in the tab with "
-                       "browser_exec, then call fill again.")
-    else:
-        out["next"] = "Open the login form's own page (the frame's address) if you can find it, else ask the user."
-    return out
-
-
-_LOGIN_REASONS = {
-    "password_field_ambiguous": ("Several password fields fit equally well (in different forms), so none was "
-                                 "filled. Nothing was written."),
-    "password_outside_open_dialog": ("A dialog is open on the page and holds no password field; the password "
-                                     "fields behind it were not filled. Nothing was written."),
-}
-
-
-def _fill_reasons(parsed: Any, most: int) -> Optional[list[str]]:
-    """The writer's per-field codes, or None when absent or not one fixed code per fill (never echoed)."""
-    from agent.vault_login_classifier import FILL_REASONS
-
-    reasons = parsed.get("reasons") if isinstance(parsed, dict) else None
-    if not isinstance(reasons, list) or len(reasons) != most or not all(r in FILL_REASONS for r in reasons):
-        return None
-    return list(reasons)
-
-
 def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, effective_task_id: str,
                      purpose: str = "login", with_identifier: bool = False) -> str:
     """Inspect the page, resolve the item's secret and write it; runs inside the backend's fill_context
@@ -1226,7 +1077,7 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     if refusal:
         return refusal
     if not classified and signup_target is None:
-        framed = _frames_refusal(effective_task_id, meta)
+        framed = frames_refusal(effective_task_id, meta)
         if framed is not None:
             return json.dumps(framed)
         return json.dumps({"success": False, "error_type": "no_matching_field",
@@ -1257,12 +1108,12 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     except Exception:  # health: allow BLE001 -- untyped backend errors can carry secret bytes: refuse without echoing them
         return json.dumps({"success": False, "error_type": "secret_resolution_failed",
                            "error": "Could not resolve the saved item. Nothing was written."})
-    if choice in _LOGIN_REASONS and not any(f["token"] == "current-password" for f in fills):
-        return json.dumps({"success": False, "error_type": choice, "error": _LOGIN_REASONS[choice],
+    if choice in LOGIN_REASONS and not any(f["token"] == "current-password" for f in fills):
+        return json.dumps({"success": False, "error_type": choice, "error": LOGIN_REASONS[choice],
                            "next": "Read the page: close what should not be open, or ask the user which form it is."})
     if not fills:
         # dlz: B19, a typed refusal with a next step (12 retry loops on identifier-first / signup pages).
-        if (framed := _frames_refusal(effective_task_id, meta)) is not None:
+        if (framed := frames_refusal(effective_task_id, meta)) is not None:
             return json.dumps(framed)
         return json.dumps({"success": False, "error_type": "no_matching_field",
                            "error": f"No fillable {meta.kind} field matched the saved item on this page. Nothing "
@@ -1308,43 +1159,7 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     parsed, refusal = _parse_fill_result(fill_result, page_origin, refusal_tag)
     if refusal:
         return refusal
-    filled = _filled_count(parsed, len(fills))
-    if filled is None:
-        return json.dumps(_FILL_UNVERIFIED)
-    reasons = _fill_reasons(parsed, len(fills))
-    base = {"backend": backend.name, "kind": meta.kind, "origin": page_origin}
-    pw_at = next((i for i, f in enumerate(fills) if f["token"] == "current-password"), None)
-    password_missed = reasons is not None and pw_at is not None and reasons[pw_at] != "written"
-    if filled == 0 or password_missed:
-        # dlz (11-18): never "Submit" after a write that did not land; say why, per field (fixed codes).
-        reason = (reasons[pw_at] if password_missed else
-                  next((r for r in reasons or [] if r != "written"), "unknown"))
-        return json.dumps({"success": False, "error_type": "login_fill_not_written" if meta.kind == "login"
-                           else "fill_not_written", "filled_fields": filled, "reason": reason,
-                           **({"field_reasons": reasons} if reasons else {}), **base,
-                           "error": ("The password did not go into the field. Do not submit." if password_missed
-                                     and filled else "No field took the value. Nothing was written; do not submit."),
-                           "next": "Read the form (it may have re-rendered or moved to another step), then fill again "
-                                   "once; if it fails the same way, tell the user."})
-    retained = parsed.get("retained") if isinstance(parsed, dict) else None
-    retention_known = settle > 0 and type(retained) is int and 0 <= retained <= filled
-    if retention_known and retained < filled:
-        return json.dumps({"success": False, "error_type": "password_not_retained", "filled_fields": filled,
-                           "retained_fields": retained, "partially_filled": True, **base,
-                           "error": ("The password was written, but the page cleared it again after it settled. "
-                                     "Nothing was submitted. Do not submit; read the form and fill again once, or "
-                                     "tell the user.")})
-    out = {"success": True, "filled_fields": filled, **base}
-    if settle > 0:
-        out["retention_verified"] = retention_known
-    if reasons and any(r != "written" for r in reasons):
-        out["field_reasons"] = reasons
-    if meta.kind == "login":
-        out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"
-                       + (" (a code will be generated automatically)." if meta.has_otp else "."))
-    if meta.kind != "login":
-        out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
-    return json.dumps(out)
+    return login_write_result(parsed, fills, settle, backend, meta, page_origin)
 
 
 _TAB_PROBES["letter"] = "!!document.querySelector('input[type=password], input[type=text], input:not([type])')"
@@ -1618,7 +1433,8 @@ BROWSER_VAULT_SCHEMA = {
         "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
         "their device; code_field_unrecognised means code-like boxes exist but none was recognised (read the form); "
         "code_source=recovery with handle and field (the item's field holding recovery/backup codes, e.g. "
-        "\"recovery codes\") types ONE stored recovery code after the user's approval, one approval per code, "
+        "\"recovery codes\"; never the password or TOTP field: recovery_field_not_codes) types ONE stored recovery "
+        "code after the user's approval, one approval per code, "
         "codes_left says how many remain; a code Hermes itself obtained through its own authorized mail workflow, or a one-time "
         "code the user sent in chat for this page, goes in code with expected_origin set to the page's origin, "
         "filled directly without a prompt); unlock (backend: ask the user "
@@ -1950,34 +1766,9 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
         return out
     if not isinstance(result, dict):
         return out
-    _log_outcome(args, result)
+    log_outcome(args, result)
     scrubbed = _scrub_page_fields(result, redact_sensitive_text)
     return out if scrubbed == result else json.dumps(scrubbed)
-
-
-_LOGGED_ACTIONS = ("fill", "enter_code", "save_login", "letter_login")
-
-
-def _log_outcome(args: dict[str, Any], result: dict[str, Any]) -> None:
-    """dlz (11-18): one INFO line per fill / enter_code (signup and reset are fill purposes): counts and fixed
-    codes only, never a value, a page text, an origin or a handle."""
-    action = str(args.get("action") or "")
-    if action not in _LOGGED_ACTIONS:
-        return
-
-    def code(key: str) -> str:
-        value = result.get(key)
-        return value if isinstance(value, str) and value.replace("_", "").replace("-", "").isalnum() and len(value) <= 48 else "-"
-
-    def count(key: str) -> str:
-        value = result.get(key)
-        return str(value) if type(value) is int else "-"
-
-    purpose = str(args.get("purpose") or "login") if action == "fill" else str(args.get("code_source") or "-")
-    logger.info("browser_vault %s purpose=%s success=%s error_type=%s reason=%s kind=%s filled=%s retained=%s",
-                action, purpose if purpose in ("login", "signup", "reset", "recovery", "otp", "-") else "other",
-                result.get("success") is True, code("error_type"), code("reason"), code("kind"),
-                count("filled_fields"), count("retained_fields"))
 
 
 _PAGE_FIELDS = ("error", "url", "title", "page", "origin", "receiving")  # dlz: page-derived text

@@ -115,7 +115,9 @@ class LoginBackend(ABC):
 
     def resolve_recovery_codes(self, handle: str, field: str) -> list[str]:
         """D-0365: the recovery/backup codes stored on a login item in the field labelled ``field``, in stored
-        order. Server-side only. A backend that cannot store them returns []."""
+        order. Server-side only. A backend that cannot store them returns []. A field that matches but is the
+        login's password / identifier / TOTP field, or carries no recovery-code wording, raises
+        ``agent.vault_recovery_codes.RecoveryFieldNotCodes`` (use ``pick_code_values``)."""
         return []
 
     def resolve_otp(self, handle: str) -> Optional[str]:

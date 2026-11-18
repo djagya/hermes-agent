@@ -103,6 +103,28 @@ def test_a_password_the_page_clears_after_the_settle_is_not_retained(core):
     assert out["partially_filled"] is True and "Do not submit" in out["error"]
 
 
+def test_a_page_that_navigates_during_the_settle_is_a_success_with_retention_unknown(core):
+    # Review E (L5): the site auto-submitted after the write landed.
+    core.answer["login"] = {"filled": 1, "reasons": ["written"], "navigated": True}
+    out = fill()
+    assert out["success"] is True and out["navigated_after_write"] is True and out["retention_verified"] is None
+    assert "moved on" in out["next"]
+
+
+_UNLOAD = ("const ls = {}; window.addEventListener = (t, f) => { (ls[t] = ls[t] || []).push(f); };"
+           "later(() => (ls.pagehide || []).forEach((f) => f({ isTrusted: %s })));")
+
+
+def test_the_real_login_writer_answers_when_the_page_unloads_during_the_settle():
+    controls = [dict(pw(), index=1)]
+    script = build_fill_js([{"index": 1, "token": "current-password", "value": SECRET}], ORIGIN, "nonce",
+                           settle_ms=300)
+    gone = _run(script, controls, _UNLOAD % "true", expected=SECRET)
+    assert json.loads(gone["raw"]) == {"filled": 1, "reasons": ["written"], "navigated": True}
+    forged = _run(script, controls, _UNLOAD % "false", expected=SECRET)  # a page-dispatched event is ignored
+    assert json.loads(forged["raw"]) == {"filled": 1, "reasons": ["written"], "retained": 1}
+
+
 def test_a_retained_login_fill_succeeds_and_the_writer_settles(core):
     out = fill()
     assert out["success"] is True and out["retention_verified"] is True
@@ -148,10 +170,19 @@ def test_an_open_dialog_holds_the_only_candidates_pypi_step_up():
     assert [f["index"] for f in fills] == [20] and reason == ""
 
 
-def test_a_dialog_without_a_password_field_writes_nothing_behind_it():
-    controls = L(pw(index=1), ctl(index=2, formIndex=1, name="token_name", modal=True))
+def test_a_dialog_whose_password_field_is_not_a_login_writes_nothing_behind_it():
+    controls = L(pw(index=1), ctl(index=2, formIndex=1, name="new_password", type="password",
+                                  autocomplete="new-password", modal=True))
     fills, reason = select_password_fill_detailed(classify_login_controls(controls), SECRET, controls)
     assert fills == [] and reason == "password_outside_open_dialog"
+
+
+def test_a_newsletter_dialog_without_a_password_field_does_not_block_the_login_form(core):
+    # Review E (L3): only a dialog that holds a password input restricts the choice.
+    core.page["controls"] = [ctl(index=0, name="email", type="email"), pw(index=1),
+                             ctl(index=2, formIndex=1, name="newsletter_email", type="email", modal=True)]
+    out = fill()
+    assert out["success"] is True and '"index": 1' in core.write.call_args.args[1]
 
 
 def test_the_field_on_top_wins_over_a_covered_one():
@@ -160,8 +191,16 @@ def test_the_field_on_top_wins_over_a_covered_one():
     assert [f["index"] for f in fills] == [2]
 
 
-def test_equal_password_fields_in_two_forms_are_ambiguous(core):
-    core.page["controls"] = [pw(index=1, formIndex=0), pw(index=2, formIndex=1)]
+def test_equal_password_fields_in_two_forms_fill_the_first_like_before(core):
+    # Review E (L4), owner direction: a header quick-login and the main form; the first shown one is filled.
+    core.page["controls"] = [ctl(index=0, name="username"), pw(index=1, formIndex=0),
+                             ctl(index=2, formIndex=1, name="username"), pw(index=3, formIndex=1)]
+    out = fill()
+    assert out["success"] is True and '"index": 1' in core.write.call_args.args[1]
+
+
+def test_equal_password_fields_in_two_documents_are_ambiguous(core):
+    core.page["controls"] = [pw(index=1, formIndex=0), pw(index=2, formIndex=1, pageUrl=ORIGIN + "/frame/login")]
     out = fill()
     assert out["error_type"] == "password_field_ambiguous"
     core.write.assert_not_called()
@@ -359,12 +398,12 @@ def test_onepassword_recovery_codes_come_from_the_named_field_or_section(monkeyp
 
     item = {"fields": [{"label": "password", "value": "pw"},
                        {"label": "Recovery codes", "value": "1. 0123456789abcdef\n2. fedcba9876543210"},
-                       {"label": "code 3", "value": "aaaabbbbccccdddd", "section": {"label": "recovery codes"}}]}
+                       {"label": "code 3", "value": "aaaa1bbbbccccdddd", "section": {"label": "recovery codes"}}]}
     backend = OnePasswordLoginBackend({})
     monkeypatch.setattr(backend, "_resolve_handle", lambda h: ("v", "i"))
     monkeypatch.setattr(backend, "_run", lambda *a: json.dumps(item))
     assert backend.resolve_recovery_codes("op:v:i", "recovery codes") == [
-        "0123456789abcdef", "fedcba9876543210", "aaaabbbbccccdddd"]
+        "0123456789abcdef", "fedcba9876543210", "aaaa1bbbbccccdddd"]
 
 
 # ── 7. one-time codes ──────────────────────────────────────────────────────────────────────────────────────
@@ -396,7 +435,8 @@ def test_code_like_boxes_that_do_not_classify_are_reported_with_counts_only(core
 
 # ── 8. vault list skips and re-list ────────────────────────────────────────────────────────────────────────
 
-def test_list_names_items_skipped_for_a_website_without_scheme(monkeypatch):
+def test_a_website_without_scheme_is_https_and_only_unreadable_ones_are_skipped(monkeypatch):
+    # Owner (build-E open question): "pypi.org" reads as https://pypi.org, as 1Password does.
     from agent.vault_backends import onepassword
 
     onepassword.clear_list_cache()
@@ -404,12 +444,14 @@ def test_list_names_items_skipped_for_a_website_without_scheme(monkeypatch):
     monkeypatch.setattr(backend, "is_unlocked", lambda: True)
     monkeypatch.setattr(backend, "_run", lambda *a: json.dumps([
         {"id": "a", "title": "PyPI", "category": "LOGIN", "urls": [{"href": "pypi.org"}], "vault": {"id": "v"}},
-        {"id": "b", "title": "Ok", "category": "LOGIN", "urls": [{"href": "https://ok.test"}], "vault": {"id": "v"}}]))
+        {"id": "b", "title": "Ok", "category": "LOGIN", "urls": [{"href": "https://ok.test"}], "vault": {"id": "v"}},
+        {"id": "c", "title": "Bad", "category": "LOGIN", "urls": [{"href": "https://[bad"}], "vault": {"id": "v"}}]))
     monkeypatch.setattr("agent.vault_backends.enabled_backends", lambda: [backend])
     monkeypatch.setattr("agent.vault_letter.list_letters", list)
     out = json.loads(vault.browser_vault_list())
-    assert [i["label"] for i in out["items"]] == ["Ok"]
-    assert out["skipped"] == [{"backend": "onepassword", "title": "PyPI", "reason": "website_without_scheme"}]
+    assert [i["label"] for i in out["items"]] == ["PyPI", "Ok"]
+    assert out["items"][0]["origin"] == "https://pypi.org"
+    assert out["skipped"] == [{"backend": "onepassword", "title": "Bad", "reason": "website_unreadable"}]
     onepassword.clear_list_cache()
 
 
