@@ -39,21 +39,29 @@ ADDRESS_AUTOFILL_TOKENS = ("address-line1", "address-line2", "address-level2", "
 # comes before the number row because "Kartenprüfnummer" also names a number. ``cardpan``, ``cardcvc2``,
 # ``cardexpiremonth`` and ``cardexpireyear`` are the PAYONE Client API hosted-iFrame field names.
 # ``card\s*holder`` covers the separated forms too: Unzer UI v1's hosted holder input is named
-# "card-holder" (normalised "card holder") with only a placeholder name as its label.
+# "card-holder" (normalised "card holder") with only a placeholder name as its label. The card rows also match
+# the camelCase-split text ("encryptedCardNumber" -> "encrypted card number"); the address rows do not.
+# The month row skips "Exp MM/YY" (a combined expiry): "exp mm" followed by a year shape is the cc-exp row's.
 _CHECKOUT_HEURISTICS = (
-    (re.compile(r"\b(?:cvc|cvv|csc|cvn|ccv|security\s*code|card\s*code|(?:karten)?prufnummer|prufziffer|"
-                r"sicherheitscode|cryptogramme|code\s*de\s*securite|beveiligingscode|codigo\s*de\s*seguridad|"
-                r"codice\s*di\s*sicurezza|cardcvc2?)\b"), "cc-csc"),
-    (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num|pan|kartennummer|numero\s*de\s*(?:la\s*)?carte|"
-                r"kaartnummer|numero\s*de\s*(?:la\s*)?tarjeta|numero\s*(?:della\s*)?carta|cardpan)\b"), "cc-number"),
-    (re.compile(r"\b(?:name\s*on\s*card|card\s*holder|cc\s*name|ccname|karteninhaber(?:in|s)?|name\s*auf\s*der\s*karte|"
-                r"titulaire(?:\s*de\s*la\s*carte)?|kaarthouder|titular(?:\s*de\s*la\s*tarjeta)?|"
-                r"intestatario(?:\s*della\s*carta)?)\b"), "cc-name"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?\s*month|exp\s*mm|ccmonth|ablaufmonat|cardexpiremonth)\b"), "cc-exp-month"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?\s*year|exp\s*yy(?:yy)?|ccyear|ablaufjahr|cardexpireyear)\b"), "cc-exp-year"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?(?:\s*date)?|mm\s*yy|valid\s*thru|ablaufdatum|gultig\s*bis|"
-                r"verfallsdatum|date\s*d\s*expiration|vervaldatum|fecha\s*de\s*(?:caducidad|vencimiento)|"
-                r"data\s*di\s*scadenza|scadenza)\b"), "cc-exp"),
+    (re.compile(r"\b(?:cv[cv]2?|csc|cvn|ccv|security\s*code|card\s*code|card\s*verification\s*(?:code|number|value)|"
+                r"(?:karten)?prufnummer|(?:karten)?prufziffer|prufnr|(?:karten)?sicherheitscode|cryptogramme|"
+                r"code\s*de\s*securite|beveiligingscode|codigo\s*de\s*seguridad|codice\s*di\s*sicurezza|cardcvc2?)\b"),
+     "cc-csc"),
+    (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num(?:ber)?|pan|(?:kredit)?kartennummer|"
+                r"numero\s*de\s*(?:la\s*)?carte|kaartnummer|numero\s*de\s*(?:la\s*)?tarjeta|numero\s*(?:della\s*)?carta|"
+                r"cardpan)\b"), "cc-number"),
+    (re.compile(r"\b(?:name\s*on\s*(?:the\s*)?card|name\s*as\s*(?:it\s*)?appears\s*on\s*(?:the\s*|your\s*)?card|"
+                r"card\s*holder|cc\s*name|ccname|karteninhaber(?:in|s)?|name\s*auf\s*der\s*karte|"
+                r"titulaire(?:\s*de\s*la\s*carte)?|nom\s*sur\s*la\s*carte|kaarthouder|naam\s*op\s*(?:de\s*)?kaart|"
+                r"titular(?:\s*de\s*la\s*tarjeta)?|nombre\s*en\s*la\s*tarjeta|"
+                r"intestatario(?:\s*della\s*carta)?|titolare\s*della\s*carta)\b"), "cc-name"),
+    (re.compile(r"\b(?:exp(?:iry|iration|ires?)?\s*month|exp\s*mm(?!\s*(?:yy|jj|aa))|ccmonth|ablaufmonat|"
+                r"cardexpiremonth)\b"), "cc-exp-month"),
+    (re.compile(r"\b(?:exp(?:iry|iration|ires?)?\s*year|exp\s*yy(?:yy)?|ccyear|ablaufjahr|cardexpireyear)\b"),
+     "cc-exp-year"),
+    (re.compile(r"\b(?:exp(?:iry|iration|ires?)?(?:\s*date)?|mm\s*(?:yy|jj|aa){1,2}|valid\s*(?:thru|until)|ablaufdatum|"
+                r"gultig\s*bis|gultigkeitsdatum|verfallsdatum|date\s*d\s*expiration|vervaldatum|"
+                r"fecha\s*de\s*(?:caducidad|vencimiento)|data\s*di\s*scadenza|scadenza)\b"), "cc-exp"),
     (re.compile(r"\b(?:address\s*(?:line\s*)?2|apt|suite|unit)\b"), "address-line2"),
     (re.compile(r"\b(?:address(?:\s*line\s*1)?|street)\b"), "address-line1"),
     (re.compile(r"\b(?:city|town|locality)\b"), "address-level2"),
@@ -61,11 +69,30 @@ _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:zip|postal|postcode)\b"), "postal-code"),
     (re.compile(r"\b(?:country)\b"), "country-name"),
 )
+_HOLDER_ROW = next(n for n, (_p, token) in enumerate(_CHECKOUT_HEURISTICS) if token == "cc-name")
+
+# A holder cue next to another purpose ("Card holder ZIP code", "card_holder_first_name", "Card holder phone",
+# name "card-holder" with label "Merchant name") names that purpose, not the holder's full name: the holder row
+# is skipped and the later rows (expiry, address, postal code) still classify the field.
+_RE_HOLDER_CONFLICT = re.compile(
+    r"\b(?:phone|telephone|mobile|e[\s-]?mail|birth|dob|geburt\w*|id|identification|document|passport|ssn|"
+    r"gift|loyalty|member\w*|bonus|payback|(?:first|last|given|family|sur|middle)\s*name|vorname|nachname|prenom|"
+    r"login|user\s*name|username|password|merchant|company|business)\b")
+# Autocomplete tokens that leave a field free to be the holder; any other token names another purpose.
+_HOLDER_AUTOCOMPLETE_OK = frozenset({"off", "on", "name", "cc-name", "billing", "shipping"})
+_HOLDER_FOREIGN_TYPES = frozenset({"tel", "number", "date", "month", "week", "time", "datetime-local", "url"})
+
+# Gift, voucher, loyalty, ticket and customer cards share the bank card's words ("Gift card number", "PAYBACK
+# Kartennummer", "Ticket expiry date"): such a field is never a card field (the card rows are skipped).
+_RE_CARD_DECOY = re.compile(
+    r"\b(?:gift|geschenk|gutschein|voucher|coupon|promo|loyalty|payback|miles(?:\s*(?:and\s*)?more)?|bonus|"
+    r"member(?:ship)?|kunden|ticket|customer)\s*(?:card|karte|kart|code|number|nummer|nr|pin|exp|valid|gultig)")
 
 # "Issue date (MM / YY)" / "Start date" / "Valid from" fields (Maestro and some debit cards) share
 # the expiry's MM/YY shape but are not the expiry.
 _RE_NOT_EXPIRY = re.compile(r"\b(?:issue(?:d)?|start(?:s)?|valid\s*(?:from|since)|gultig\s*ab|ausstellungsdatum)\b")
-_RE_EXPLICIT_EXPIRY = re.compile(r"\b(?:exp(?:iry|iration)?|valid\s*thru|ablaufdatum|gultig\s*bis|verfallsdatum)\b")
+_RE_EXPLICIT_EXPIRY = re.compile(r"\b(?:exp(?:iry|iration|ires?)?|valid\s*(?:thru|until)|ablaufdatum|gultig\s*bis|"
+                                 r"gultigkeitsdatum|verfallsdatum)\b")
 
 _EXCLUDED_AUTOCOMPLETE = {"new-password", "one-time-code"}
 
@@ -436,6 +463,27 @@ def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogin
     return result
 
 
+def _split_camel(value: str) -> str:
+    return _normalize_text(re.sub(r"([a-z])([A-Z])", r"\1 \2", value))
+
+
+def _holder_conflict(control: LoginControl, texts: tuple) -> bool:
+    """Whether a field the holder row matched names another purpose too (``_RE_HOLDER_CONFLICT``, a later
+    heuristic row, a foreign autocomplete token or input type), or carries the holder words only across its
+    name and label together (name "card", label "Holder")."""
+    parts = [t for part in (control.name, control.label) for t in (_normalize_text(part), _split_camel(part))]
+    holder = _CHECKOUT_HEURISTICS[_HOLDER_ROW][0]
+    if not any(holder.search(t) for t in parts):
+        return True
+    if control.type in _HOLDER_FOREIGN_TYPES:
+        return True
+    if any(t not in _HOLDER_AUTOCOMPLETE_OK and not t.startswith("section-")
+           for t in control.autocomplete.lower().split()):
+        return True
+    later = [pattern for pattern, _token in _CHECKOUT_HEURISTICS[_HOLDER_ROW + 1:]]
+    return any(_RE_HOLDER_CONFLICT.search(t) or any(p.search(t) for p in later) for t in texts)
+
+
 def _classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
     tokens = [t for t in control.autocomplete.lower().split() if t]
     for token in PAYMENT_AUTOFILL_TOKENS + ADDRESS_AUTOFILL_TOKENS:
@@ -445,20 +493,28 @@ def _classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogi
         return None
     raw_text = " ".join(part for part in (control.name, control.label) if part)
     searchable = _normalize_text(raw_text)
-    if _RE_EMAIL.search(searchable):
-        return None  # "CARDHOLDER_EMAIL" (Nexi Build) is not the holder name
-    date_words = _normalize_text(re.sub(r"([a-z])([A-Z])", r"\1 \2", raw_text))  # issueDate -> issue date
+    date_words = _split_camel(raw_text)  # issueDate -> issue date; encryptedCardNumber -> encrypted card number
+    if _RE_EMAIL.search(searchable) or _RE_EMAIL.search(date_words):
+        return None  # "CARDHOLDER_EMAIL" (Nexi Build), "cardholderEmail": not the holder name
+    texts = (searchable, date_words)
+    decoy = any(_RE_CARD_DECOY.search(t) for t in texts)
     label_words = _normalize_text(control.label)
     expiry = _RE_EXPLICIT_EXPIRY.search(label_words)
     other_date = _RE_NOT_EXPIRY.search(label_words)
     explicit_expiry = expiry is not None and (other_date is None or expiry.start() < other_date.start())
     for pattern, token in _CHECKOUT_HEURISTICS:
-        if pattern.search(searchable):
-            if control.type == "password" and token != "cc-csc":
-                return None  # a masked input is only ever the CVC (Unzer UI v2), never a login password
-            if token.startswith("cc-exp") and _RE_NOT_EXPIRY.search(date_words) and not explicit_expiry:
-                return None  # an issue/start date (Maestro) is not the expiry
-            return ClassifiedLoginControl(control, 70, token)
+        card = token.startswith("cc-")
+        if not (pattern.search(searchable) or (card and pattern.search(date_words))):
+            continue
+        if card and decoy:
+            continue  # a gift, loyalty or ticket card's number/code/expiry is no bank card field
+        if token == "cc-name" and _holder_conflict(control, texts):
+            continue  # "Card holder ZIP code" is the postal code
+        if control.type == "password" and token != "cc-csc":
+            return None  # a masked input is only ever the CVC (Unzer UI v2), never a login password
+        if token.startswith("cc-exp") and _RE_NOT_EXPIRY.search(date_words) and not explicit_expiry:
+            return None  # an issue/start date (Maestro) is not the expiry
+        return ClassifiedLoginControl(control, 70, token)
     return None
 
 
