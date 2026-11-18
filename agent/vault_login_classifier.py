@@ -38,13 +38,15 @@ ADDRESS_AUTOFILL_TOKENS = ("address-line1", "address-line2", "address-level2", "
 # "prufnummer"). Besides English: German, French, Dutch, Spanish and Italian checkout labels; the CVC row
 # comes before the number row because "Kartenprüfnummer" also names a number. ``cardpan``, ``cardcvc2``,
 # ``cardexpiremonth`` and ``cardexpireyear`` are the PAYONE Client API hosted-iFrame field names.
+# ``card\s*holder`` covers the separated forms too: Unzer UI v1's hosted holder input is named
+# "card-holder" (normalised "card holder") with only a placeholder name as its label.
 _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:cvc|cvv|csc|cvn|ccv|security\s*code|card\s*code|(?:karten)?prufnummer|prufziffer|"
                 r"sicherheitscode|cryptogramme|code\s*de\s*securite|beveiligingscode|codigo\s*de\s*seguridad|"
                 r"codice\s*di\s*sicurezza|cardcvc2?)\b"), "cc-csc"),
     (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num|pan|kartennummer|numero\s*de\s*(?:la\s*)?carte|"
                 r"kaartnummer|numero\s*de\s*(?:la\s*)?tarjeta|numero\s*(?:della\s*)?carta|cardpan)\b"), "cc-number"),
-    (re.compile(r"\b(?:name\s*on\s*card|cardholder|cc\s*name|ccname|karteninhaber(?:in|s)?|name\s*auf\s*der\s*karte|"
+    (re.compile(r"\b(?:name\s*on\s*card|card\s*holder|cc\s*name|ccname|karteninhaber(?:in|s)?|name\s*auf\s*der\s*karte|"
                 r"titulaire(?:\s*de\s*la\s*carte)?|kaarthouder|titular(?:\s*de\s*la\s*tarjeta)?|"
                 r"intestatario(?:\s*della\s*carta)?)\b"), "cc-name"),
     (re.compile(r"\b(?:exp(?:iry|iration)?\s*month|exp\s*mm|ccmonth|ablaufmonat|cardexpiremonth)\b"), "cc-exp-month"),
