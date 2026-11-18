@@ -74,19 +74,29 @@ _HOLDER_ROW = next(n for n, (_p, token) in enumerate(_CHECKOUT_HEURISTICS) if to
 # A holder cue next to another purpose ("Card holder ZIP code", "card_holder_first_name", "Card holder phone",
 # name "card-holder" with label "Merchant name") names that purpose, not the holder's full name: the holder row
 # is skipped and the later rows (expiry, address, postal code) still classify the field. A name component (first
-# name only, last name only) conflicts; a full-name instruction ("first and last name", "Vorname Nachname",
-# ``_RE_FULL_NAME``) does not. An identification cue conflicts when it names one ("ID number", "Ausweis",
+# name only, last name only) conflicts; a full-name instruction ("first and last name", "Vorname Nachname", "Name
+# Surname", ``_RE_FULL_NAME``) and an instruction or alternative ("as on ID", "or company name",
+# ``_RE_HOLDER_INSTRUCTION``) do not. An identification cue conflicts when it names one ("ID number", "Ausweis",
 # ``_RE_ID_SEMANTIC``); a bare "id" only in the visible label, never as a DOM id suffix in the name/id attributes
 # (``id="cardholder-id"``, ``holderId``).
 _RE_HOLDER_CONFLICT = re.compile(
-    r"\b(?:\w*phone\w*|tel|telefon\w*|telefono|handy\w*|mobil\w*|e[\s-]?mail|birth|dob|geburt\w*|identification|"
-    r"document|passport|ssn|adresse|anschrift|strasse|plz|postleitzahl|stadt|wohnort|benutzer\w*|firma|"
+    r"\b(?:\w*phone\w*|tel|telefon\w*|telefono|handy\w*|mobil\w*|cell|fax\w*|whats\s*app|e[\s-]?mail|contact\w*|"
+    r"kontakt\w*|birth|dob|age|geburt\w*|identification|document|passport|ssn|social\s*security|nationality|"
+    r"nationalitat|staatsangehorigkeit|adres(?:se)?|anschrift|strasse|plz|postleitzahl|stadt|wohnort|ort|land|telefoon\w*|"
+    r"woonplaats|indirizzo|direccion|"
+    r"(?:house|building)\s*(?:number|no|nr)|hausnummer|benutzer\w*|firma|vat|tax\w*|ust|steuer\w*|iban|account\w*|"
+    r"konto|title|salutation|anrede|signature|unterschrift|reference|referenz|initials|occupation|employer|"
+    r"relationship|"
     r"gift|loyalty|member\w*|bonus|payback|(?:first|last|given|family|sur|middle)\s*name|vorname|nachname|prenom|"
     r"login|user\s*name|username|password|merchant|company|business)\b")
 _RE_FULL_NAME = re.compile(
     r"\b(?:(?:first|given)\s*(?:name\s*)?(?:and\s*)?(?:last|family|sur)\s*name|"
-    r"(?:last|family|sur)\s*name\s*(?:and\s*)?(?:first|given)\s*name|"
+    r"(?:last|family|sur)\s*name\s*(?:and\s*)?(?:first|given)\s*name|name\s*(?:and\s*)?surname|surname\s*(?:and\s*)?name|"
     r"vor(?:name)?\s*(?:und\s*)?nachname|nachname\s*(?:und\s*)?vorname|prenom\s*(?:et\s*)?nom|nom\s*(?:et\s*)?prenom)\b")
+_RE_HOLDER_INSTRUCTION = re.compile(
+    r"\b(?:as\s*(?:it\s*)?(?:(?:appears|shown|written|printed|stated)\s*)?(?:on|in)\s*(?:your\s*|the\s*)?"
+    r"(?:id(?:\s*card)?|passport|card|ausweis)|or\s*(?:a\s*|the\s*)?(?:company|business|firm|organi[sz]ation)"
+    r"(?:\s*name)?)\b")
 _RE_ID_SEMANTIC = re.compile(
     r"\b(?:id\s*(?:number|no|nr|nummer|card)|(?:national|personal|tax)\s*id|identity|\w*ausweis\w*|cpf|cnpj|dni)\b")
 _RE_ID_WORD = re.compile(r"\bid\b")
@@ -94,9 +104,23 @@ _RE_ID_WORD = re.compile(r"\bid\b")
 # the visible label ("Karteninhaber", "Name on card"), or with a name word anywhere ("cardholderName"). The holder
 # words alone in the name/id attributes (``name="card-holder"``) are not explicit.
 _RE_NAME_WORD = re.compile(r"\b(?:name|nom|naam|nombre|nome)\b")
-# Autocomplete tokens that leave a field free to be the holder; any other token names another purpose.
-_HOLDER_AUTOCOMPLETE_OK = frozenset({"off", "on", "name", "cc-name", "billing", "shipping"})
 _HOLDER_FOREIGN_TYPES = frozenset({"tel", "number", "date", "month", "week", "time", "datetime-local", "url"})
+# The WHATWG autocomplete tokens that name a purpose other than the holder's full name. An unknown token ("nope",
+# "chrome-off", "false", anti-autofill noise) and new-password name nothing and leave the holder.
+_FOREIGN_AUTOCOMPLETE = frozenset({
+    "email", "username", "street-address", "postal-code", "given-name", "family-name", "additional-name",
+    "one-time-code", "current-password", "cc-given-name", "cc-family-name", "cc-additional-name", "cc-number",
+    "cc-csc"})
+_FOREIGN_AUTOCOMPLETE_PREFIXES = ("tel", "address-", "country", "bday", "honorific-", "organization", "cc-exp")
+
+# The holder row's joined spellings (the base row's "cardholder", "name on card", "Karteninhaber" and the other
+# languages). The separated "card holder" (from "card-holder", "card_holder", "cardHolderName") is new reach and
+# counts only on positive evidence (``_separated_holder_named``): one attribute or the visible label is the holder
+# phrase plus only ``_RE_HOLDER_NEUTRAL`` words. Unzer UI v1's hosted input is id "card-holder".
+_RE_HOLDER_JOINED = re.compile(_CHECKOUT_HEURISTICS[_HOLDER_ROW][0].pattern.replace(r"card\s*holder", "cardholder"))
+_RE_HOLDER_NEUTRAL = re.compile(
+    r"(?:\s*\b(?:name|full|first\s+and\s+last|vorname\s+(?:und\s+)?nachname|name\s+and\s+surname|"
+    r"surname\s+and\s+name|(?:of|on)(?:\s+the)?|as|it\s+appears|card|\d{1,2})\b)*\s*")
 
 # Gift, voucher, loyalty, ticket and customer cards share the bank card's words ("Gift card number", "PAYBACK
 # Kartennummer", "Ticket expiry date"): such a field is never a card field (the card rows are skipped). "card" is
@@ -106,14 +130,25 @@ _RE_CARD_DECOY = re.compile(
     r"\b(?:gift|geschenk|gutschein|voucher|coupon|promo|loyalty|payback|miles(?:\s*(?:and\s*)?more)?|bonus|"
     r"member(?:ship)?|kunden|ticket|customer)\s*(?:card(?!holder)|karte|kart|code|number|nummer|nr|pin|exp|valid|gultig)")
 # An identity document's fields share the card's words ("Passport valid until", "ID card number", "Ausweis gültig
-# bis", "Date of birth (MM/YY)"): the card rows are skipped. "Visa" is the document only without a card word
-# beside it ("Visa expiry date" is the visa; "Visa card expiry", "Visa/Mastercard expiry" are the card).
+# bis"): the card rows are skipped. Only explicit document purposes count: "Visa" alone is the card brand ("Visa
+# CVC", "Expiry date (Visa)") and a visa document only beside a travel word; "document" counts in the visible label
+# only, never in a DOM id ("document-card-number"). Strong card evidence (``_STRONG_CARD_NAMES``) is never vetoed.
 _RE_DOCUMENT_PURPOSE = re.compile(
     r"\b(?:passport\w*|reisepass\w*|pass\s*(?:nummer|nr|gultig\w*|ablauf\w*)|passnummer|\w*ausweis\w*|"
-    r"document\w*|dokument\w*|id\s*card|identity|identification|national\s*id|licen[cs]e|driver\w*\s*licen[cs]e|"
-    r"fuhrerschein\w*|birth\w*|geburt\w*|dob)\b")
+    r"(?:id|identity|identification)\s*card|national\s*id|driv(?:er|ing)\w*(?:\s*s)?\s*licen[cs]e|"
+    r"fuhrerschein\w*|residence\s*permit|aufenthalts\w*)\b")
+_RE_DOCUMENT_WORD = re.compile(r"\b(?:document\w*|dokument\w*)\b")
 _RE_VISA = re.compile(r"\bvisa\b")
-_RE_CARD_WORD = re.compile(r"\b(?:card\w*|\w*karte\w*|credit|kredit\w*|debit|master\s*card|amex|american\s*express)\b")
+_RE_VISA_TRAVEL = re.compile(r"\b(?:passport\w*|reisepass\w*|travel\w*|entry|einreise\w*|immigration)\b")
+# A date of birth shares the expiry's MM/YY shape ("Date of birth (MM/YY)", "Geburtsdatum MM/JJ"): the expiry rows
+# are skipped.
+_RE_BIRTH = re.compile(r"\b(?:birth\w*|geburt\w*|dob)\b")
+# A name/id attribute that is a card field's own name: its field is the card's whatever the label's words.
+_STRONG_CARD_NAMES = frozenset({
+    "cvc", "cvv", "cvc2", "cvv2", "csc", "cvn", "ccv", "cccsc", "cardcvc", "cardcvv", "cardcvc2", "securitycode",
+    "cardnumber", "ccnumber", "ccnum", "cardno", "pan", "cardpan", "expiry", "expirydate", "exp", "expdate", "ccexp",
+    "cardexpiry", "expmonth", "expyear", "ccmonth", "ccyear", "cardexpiremonth", "cardexpireyear", "ccname",
+    "cardholder", "cardholdername", "nameoncard"})
 
 # "Issue date (MM / YY)" / "Start date" / "Valid from" fields (Maestro and some debit cards) share
 # the expiry's MM/YY shape but are not the expiry.
@@ -490,16 +525,18 @@ def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogin
     the number, CVC, holder or a combined expiry.
 
     The field's own text (name, id, label, aria-label, placeholder) decides. The supplemental ``hint`` (the
-    aria-labelledby targets and title) is read only when that own text classifies nothing and names no other
-    purpose, and the input's type and autocomplete leave it free (``_hint_may_classify``): a ``name="phone"``,
-    ``type=tel`` input titled "Card number" stays None, an input with no own text labelled by "Card number" is the
-    number."""
+    aria-labelledby targets and title) is read only when that own text classifies nothing and is positively
+    neutral (empty or generic ids only), the input's type and autocomplete leave it free, and the hint names one
+    card role (``_hint_may_classify``): an input labelled "ID" or "Contact number" and titled "Card number" stays
+    None, an input with no own text labelled by "Card number" is the number."""
     result = _select_guard(control, _classify_checkout_control(control))
     if result is not None or not control.hint.strip():
         return result
+    if not _hint_may_classify(control):
+        return None
     view = replace(control, name="", label=control.hint, hint="")
     hinted = _select_guard(view, _classify_checkout_control(view))
-    if hinted is None or not _hint_may_classify(control, hinted.token):
+    if hinted is None:
         return None
     return ClassifiedLoginControl(control, hinted.score, hinted.token)
 
@@ -514,47 +551,87 @@ def _select_guard(control: LoginControl, result: Optional[ClassifiedLoginControl
 # Input types whose own purpose leaves room for a card field named only by the supplemental text. tel, number,
 # email, date and the rest name a purpose of their own (a phone, a quantity) the hint must not override.
 _HINT_FREE_TYPES = frozenset({"", "text", "password", "select"})
-# Own-text words naming a purpose other than a card field. A bare person "name" leaves room for the holder only.
-_RE_OWN_PURPOSE = re.compile(
-    r"\b(?:tel|phone\w*|telephone|telefon\w*|mobile?|handy|fax|e?mail\w*|user\w*|login|account\w*|konto|password|"
-    r"passwort|pass|company|firma|merchant|business|search|suche|query|qty|quantity|amount|price|betrag|total|"
-    r"coupon\w*|promo\w*|voucher\w*|gift\w*|discount\w*|rabatt\w*|referr?al\w*|code|pin|otp|date|datum|birth\w*|"
-    r"geburt\w*|dob|age|alter|street|strasse|address\w*|adresse|zip|plz|postal|postcode|city|stadt|ort|country|land|"
-    r"state|province|region|vat|tax|steuer\w*|iban|bic|swift|comment\w*|message|nachricht|note\w*|title|anrede|"
-    r"salutation|gender|website|url|vorname|nachname|prenom|nom|(?:first|last|given|family|sur|middle|full)\s*name)\b")
-_RE_PERSON_NAME = re.compile(r"\b(?:name|nombre|nome|naam)\b")
+# Own-text words that name nothing: generated ids ("f1", "field-3", "input2", "el7"), a single letter, digits, a
+# random id (letters in runs of one between digits: "f_3a9", ":r1:", "a1b2c3"), a hex/UUID-ish id, punctuation or
+# mask characters ("••••"). Every other word ("ID", "Contact", "Phone", "Name", "Max") blocks the hint.
+_RE_GENERIC_ID = re.compile(r"(?:f\d+|field\d*|input\d*|el\d+|\d+|[a-z]|(?:[a-z]?\d+)+[a-z]?)")
+_RE_HEX_ID = re.compile(r"(?=[0-9a-f]*\d)[0-9a-f]{8,}")
 
 
-def _hint_may_classify(control: LoginControl, token: str) -> bool:
-    """Whether the supplemental text may give ``control`` the card/address ``token``: the own text is silent (no
-    heuristic row, decoy, document, e-mail, phone, login or other purpose word in name or label), the type is
-    free (``_HINT_FREE_TYPES``) and no autocomplete token names a purpose (only off/on/billing/shipping/section-*)."""
+def _generic_word(word: str) -> bool:
+    compact = re.sub(r"[^a-z0-9]+", "", _normalize_text(word))
+    return not compact or bool(_RE_GENERIC_ID.fullmatch(compact) or _RE_HEX_ID.fullmatch(compact))
+
+
+def _card_roles(text: str) -> set:
+    """The card roles (number, CVC, holder, expiry) the card rows find in ``text``."""
+    texts = (_normalize_text(text), _split_camel(text))
+    return {("cc-exp" if token.startswith("cc-exp") else token)
+            for pattern, token in _CHECKOUT_HEURISTICS if token.startswith("cc-")
+            for t in texts if pattern.search(t)}
+
+
+def _hint_may_classify(control: LoginControl) -> bool:
+    """Whether the supplemental text may name ``control``: its own name/id/label/placeholder words are all generic
+    (``_generic_word``), its type is free (``_HINT_FREE_TYPES``), no autocomplete token names a purpose (only
+    off/on/billing/shipping/section-*), and the hint names at most one card role (a group legend "card number, expiry
+    date and security code" names none of the fields in particular)."""
     if control.type not in _HINT_FREE_TYPES:
         return False
     if any(t not in ("off", "on", "billing", "shipping") and not t.startswith("section-")
            for t in control.autocomplete.lower().split()):
         return False
-    raw_text = " ".join(part for part in (control.name, control.label) if part)
-    texts = (_normalize_text(raw_text), _split_camel(raw_text))
-    others = (_RE_OWN_PURPOSE, _RE_CARD_DECOY, _RE_DOCUMENT_PURPOSE, _RE_VISA, _RE_EMAIL, _RE_TEL, _RE_USERNAME,
-              _RE_NOT_EXPIRY, _RE_HOLDER_CONFLICT, _RE_ID_SEMANTIC, _RE_EXCLUDED_PASSWORD,
-              *(pattern for pattern, _token in _CHECKOUT_HEURISTICS))
-    if any(p.search(t) for p in others for t in texts):
+    if not all(_generic_word(word) for word in f"{control.name} {control.label}".split()):
         return False
-    return token == "cc-name" or not any(_RE_PERSON_NAME.search(t) for t in texts)
+    return len(_card_roles(control.hint)) <= 1
 
 
 def _split_camel(value: str) -> str:
     return _normalize_text(re.sub(r"([a-z])([A-Z])", r"\1 \2", value))
 
 
+def _foreign_autocomplete(control: LoginControl) -> bool:
+    return any(t in _FOREIGN_AUTOCOMPLETE or t.startswith(_FOREIGN_AUTOCOMPLETE_PREFIXES)
+               for t in control.autocomplete.lower().split())
+
+
+def _separated_holder_named(control: LoginControl) -> bool:
+    """Positive evidence for the separated "card holder": one name/id attribute on its own, or the visible label
+    (labels, aria-label, placeholder) on its own, is the holder phrase plus only neutral words ("name", "full",
+    "first and last", "of the", "as it appears on", "card", short numbers), and no source names the holder beside
+    other words. "card-holder", "cardHolderName", "Name of the card holder", id "card-holder" with the placeholder
+    "Max Mustermann" are; "Card holder fax", "card_holder_first_name", name "card-holder" with the label "Card holder
+    initials", name "card" + label "Holder" are not."""
+    holder = _CHECKOUT_HEURISTICS[_HOLDER_ROW][0]
+    sources = [_split_camel(part) for part in control.name.split()] + [_normalize_text(control.label)]
+    neutral = False
+    for source in sources:
+        match = holder.search(source)
+        if match is None:
+            continue
+        if not _RE_HOLDER_NEUTRAL.fullmatch(f"{source[:match.start()]} {source[match.end():]}"):
+            return False
+        neutral = True
+    return neutral
+
+
+def _holder_accepted(control: LoginControl, texts: tuple) -> bool:
+    """Whether the holder row's match makes ``control`` the holder: a joined holder word (base reach) unless it
+    names another purpose too (``_holder_conflict``); a separated "card holder" only on positive evidence
+    (``_separated_holder_named``) and the same conflict check."""
+    if not any(_RE_HOLDER_JOINED.search(t) for t in texts) and not _separated_holder_named(control):
+        return False
+    return not _holder_conflict(control, texts)
+
+
 def _holder_conflict(control: LoginControl, texts: tuple) -> bool:
     """Whether a field the holder row matched names another purpose too (``_RE_HOLDER_CONFLICT``, an identification
     cue, a later heuristic row, a foreign autocomplete token or input type), or carries the holder words only across
-    its name and label together (name "card", label "Holder"). A full-name instruction is no name component; a bare
-    "id" counts in the label only (in the name/id attributes it is a DOM id suffix); a tel type counts only when the
-    text does not name the holder explicitly (the label "Karteninhaber" or "Name on card", the name "cardholderName";
-    not the name "card-holder" alone)."""
+    its name and label together (name "card", label "Holder"). A full-name instruction is no name component, nor is
+    an instruction ("as on ID") or an alternative ("or company name"); a bare "id" counts in the label only (in the
+    name/id attributes it is a DOM id suffix); a tel type counts only when the text does not name the holder
+    explicitly (the label "Karteninhaber" or "Name on card", the name "cardholderName"; not the name "card-holder"
+    alone). Only a recognised autocomplete token with another purpose counts (``_FOREIGN_AUTOCOMPLETE``)."""
     names = (_normalize_text(control.name), _split_camel(control.name))
     labels = (_normalize_text(control.label), _split_camel(control.label))
     holder = _CHECKOUT_HEURISTICS[_HOLDER_ROW][0]
@@ -564,23 +641,32 @@ def _holder_conflict(control: LoginControl, texts: tuple) -> bool:
              or any(holder.search(t) and _RE_NAME_WORD.search(t) for t in names + labels))
     if control.type in _HOLDER_FOREIGN_TYPES and not (control.type == "tel" and named):
         return True
-    if any(t not in _HOLDER_AUTOCOMPLETE_OK and not t.startswith("section-")
-           for t in control.autocomplete.lower().split()):
+    if _foreign_autocomplete(control):
         return True
-    if any(_RE_HOLDER_CONFLICT.search(_RE_FULL_NAME.sub(" ", t)) or _RE_ID_SEMANTIC.search(t)
-           for t in names + labels + texts):
+
+    def plain(text: str) -> str:
+        return _RE_HOLDER_INSTRUCTION.sub(" ", _RE_FULL_NAME.sub(" ", text))
+
+    if any(_RE_HOLDER_CONFLICT.search(plain(t)) or _RE_ID_SEMANTIC.search(plain(t)) for t in names + labels + texts):
         return True
-    if any(_RE_ID_WORD.search(t) for t in labels):
+    if any(_RE_ID_WORD.search(plain(t)) for t in labels):
         return True
     later = [pattern for pattern, _token in _CHECKOUT_HEURISTICS[_HOLDER_ROW + 1:]]
     return any(p.search(t) for p in later for t in texts)
 
 
-def _document_purpose(texts: tuple) -> bool:
-    """An identity document, passport, visa or birth date: the card rows never apply."""
-    if any(_RE_DOCUMENT_PURPOSE.search(t) for t in texts):
+def _strong_card_name(control: LoginControl) -> bool:
+    return any(re.sub(r"[^a-z0-9]+", "", part.lower()) in _STRONG_CARD_NAMES for part in control.name.split())
+
+
+def _document_purpose(control: LoginControl, texts: tuple) -> bool:
+    """An identity document, passport, residence permit or a visa document (beside a travel word): the card rows
+    never apply, unless a name/id attribute is a card field's own name."""
+    if _strong_card_name(control):
+        return False
+    if any(_RE_DOCUMENT_PURPOSE.search(t) for t in texts) or _RE_DOCUMENT_WORD.search(_normalize_text(control.label)):
         return True
-    return any(_RE_VISA.search(t) for t in texts) and not any(_RE_CARD_WORD.search(t) for t in texts)
+    return any(_RE_VISA.search(t) for t in texts) and any(_RE_VISA_TRAVEL.search(t) for t in texts)
 
 
 def _classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
@@ -596,7 +682,8 @@ def _classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogi
     if _RE_EMAIL.search(searchable) or _RE_EMAIL.search(date_words):
         return None  # "CARDHOLDER_EMAIL" (Nexi Build), "cardholderEmail": not the holder name
     texts = (searchable, date_words)
-    decoy = any(_RE_CARD_DECOY.search(t) for t in texts) or _document_purpose(texts)
+    decoy = any(_RE_CARD_DECOY.search(t) for t in texts) or _document_purpose(control, texts)
+    birth = not _strong_card_name(control) and any(_RE_BIRTH.search(t) for t in texts)
     label_words = _normalize_text(control.label)
     expiry = _RE_EXPLICIT_EXPIRY.search(label_words)
     other_date = _RE_NOT_EXPIRY.search(label_words)
@@ -607,8 +694,10 @@ def _classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogi
             continue
         if card and decoy:
             continue  # a gift, loyalty or ticket card's, or a passport's, number/code/expiry is no bank card field
-        if token == "cc-name" and _holder_conflict(control, texts):
-            continue  # "Card holder ZIP code" is the postal code
+        if token.startswith("cc-exp") and birth:
+            continue  # a date of birth is no expiry
+        if token == "cc-name" and not _holder_accepted(control, texts):
+            continue  # "Card holder ZIP code" is the postal code; "Card holder fax" is nothing
         if control.type == "password" and token != "cc-csc":
             return None  # a masked input is only ever the CVC (Unzer UI v2), never a login password
         if token.startswith("cc-exp") and _RE_NOT_EXPIRY.search(date_words) and not explicit_expiry:
