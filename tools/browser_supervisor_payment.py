@@ -375,12 +375,12 @@ def _valid_descriptor(row: Any, previous: int) -> bool:
     if not isinstance(row, dict) or not isinstance(row.get("type"), str) or len(row["type"]) > 32:
         return False
     select = row["type"] in _SELECT_TYPES
-    if set(row) != (_DESCRIPTOR_KEYS | {"options"} if select else _DESCRIPTOR_KEYS):
+    if set(row) - {"hint"} != (_DESCRIPTOR_KEYS | {"options"} if select else _DESCRIPTOR_KEYS):
         return False
     index, form, length = row["index"], row["formIndex"], row["maxLength"]
     text = _DISCOVERY_LIMITS["text"]
     return (type(index) is int and previous < index < _DISCOVERY_LIMITS["inputs"]
-            and all(type(row[k]) is str and len(row[k]) <= text for k in ("autocomplete", "name", "label"))
+            and all(type(row[k]) is str and len(row[k]) <= text for k in ("autocomplete", "name", "label", "hint") if k in row)
             and (form is None or (type(form) is int and form >= -1))
             and (length is None or (type(length) is int and length > 0))
             and (not select or _valid_options(row["options"])))

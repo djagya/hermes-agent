@@ -72,7 +72,7 @@ def valid_check(check: Any, tokens: frozenset, fills: int) -> bool:
     return (check["token"] in names and check["reason"] in CHECK_REASONS
             and type(check["step"]) is int and 1 <= check["step"] <= max(fills, 1)
             and isinstance(fields, list) and 0 < len(fields) <= len(names) and set(fields) <= names
-            and isinstance(keys, list) and set(keys) <= _DESCRIPTOR_KEYS | {"options"})
+            and isinstance(keys, list) and set(keys) <= _DESCRIPTOR_KEYS | {"options", "hint"})
 
 
 def valid_pause(result: dict, kind: str, tokens: frozenset, fills: int, acknowledged: int) -> bool:
@@ -94,11 +94,12 @@ def _rebind_row(row: Any, previous: int) -> bool:
     if not isinstance(row, dict) or not isinstance(row.get("type"), str):
         return False
     select = row["type"] in ("select", "select-multiple")
-    if set(row) != (_DESCRIPTOR_KEYS | {"options"} if select else _DESCRIPTOR_KEYS):
+    if set(row) - {"hint"} != (_DESCRIPTOR_KEYS | {"options"} if select else _DESCRIPTOR_KEYS):
         return False
     index, form, length = row["index"], row["formIndex"], row["maxLength"]
+    texts = ("autocomplete", "name", "label") + (("hint",) if "hint" in row else ())
     return (type(index) is int and previous < index < _MAX_REBIND_FIELDS
-            and all(type(row[k]) is str for k in ("autocomplete", "name", "label"))
+            and all(type(row[k]) is str for k in texts)
             and (form is None or (type(form) is int and form >= -1))
             and (length is None or (type(length) is int and length > 0))
             and (not select or isinstance(row["options"], list)))

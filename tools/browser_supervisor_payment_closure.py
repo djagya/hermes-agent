@@ -44,9 +44,25 @@ _INSPECT_TEMPLATE = r"""(() => {
   const isSelect = e => e.tagName === 'SELECT';
   // A select's options (months, years: never a secret) are part of the description, so a list that
   // is re-populated after consent fails valid() like any other changed field.
+  // The text of the elements aria-labelledby names (in the field's own root first, as the login inspection reads
+  // it), each capped; metadata only, never a value. It goes, with the title, into `hint`, apart from the field's own
+  // label text: the classifier lets it name a field only when the field's own text is silent (classify_checkout_control).
+  const labelledBy = e => {
+    try {
+      const ids = String(e.getAttribute('aria-labelledby')||'').split(/\s+/).filter(Boolean).slice(0, 8);
+      if (!ids.length) return '';
+      const root = typeof e.getRootNode === 'function' ? e.getRootNode() : null;
+      return ids.map(id => {
+        const n = (root && typeof root.getElementById === 'function' ? root.getElementById(id) : null) ||
+          (typeof doc.getElementById === 'function' ? doc.getElementById(id) : null);
+        return n ? String(n.textContent||'').slice(0, 200) : '';
+      }).join(' ');
+    } catch (_) { return ''; }
+  };
   const describeOne = (e,index) => ({index, autocomplete:cut(e.autocomplete),
     name:cut(e.name+' '+e.id), label:cut((e.labels?Array.from(e.labels,l=>l.textContent).join(' '):'')+' '+
       (e.getAttribute('aria-label')||'')+' '+(e.placeholder||'')),
+    hint:cut(labelledBy(e)+' '+String(e.getAttribute('title')||'').slice(0, 200)),
     type:isSelect(e)?(e.multiple?'select-multiple':'select'):e.type,
     formIndex:e.form?Array.from(doc.forms).indexOf(e.form):null,
     maxLength:e.maxLength>0?e.maxLength:null,
@@ -175,13 +191,14 @@ _INSPECT_TEMPLATE = r"""(() => {
   const MAX_REPINS = 3;
   // dlz: the fixed descriptor keys that differ between two descriptions (names only, never their values).
   const keysOf = (a, b) => Object.keys(a).filter(k => JSON.stringify(a[k]) !== JSON.stringify(b && b[k]));
-  // dlz (fill-auto): the pinned elements are the same ones and, row by row, only their `label` text differs from
-  // the pinned description (validation text, a floating label, a placeholder hint). Type, autocomplete, name and id,
-  // form, length limit and a select's options are all unchanged.
+  // dlz (fill-auto): the pinned elements are the same ones and, row by row, only their `label` or `hint` text differs
+  // from the pinned description (validation text, a floating label, a placeholder hint, a title). Type, autocomplete,
+  // name and id, form, length limit and a select's options are all unchanged.
+  const textKey = k => k === 'label' || k === 'hint';
   const labelOnly = () => {
     const now = describe(), before = JSON.parse(signature);
     return now.length === before.length && now.every((d, n) =>
-      keysOf(d, before[n]).every(k => k === 'label') && keysOf(before[n], d).every(k => k === 'label'));
+      keysOf(d, before[n]).every(textKey) && keysOf(before[n], d).every(textKey));
   };
   // dlz: what a failed check saw, for the stop record: reason code, field token, write step, and for a changed
   // description the descriptor KEYS that changed; `fields` names the pinned tokens involved ('other': none).
