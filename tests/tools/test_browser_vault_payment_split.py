@@ -1053,12 +1053,12 @@ def test_a_title_or_labelledby_card_number_on_a_phone_input_never_receives_the_c
     phone = {**_PHONE, "attrs": phone_attrs}
     assert _pipeline([phone, _EXPIRY, _CVC], texts) == ("Incomplete or ambiguous card fields", None)
     # Beside a real number field the card number goes there, never into the phone input.
-    fills, writes = _pipeline([phone, _NUMBER, _EXPIRY, _CVC], texts)
+    _fills, writes = _pipeline([phone, _NUMBER, _EXPIRY, _CVC], texts)
     assert ["ccnum", _PAN] in writes and all(element != "phone" for element, _value in writes)
     assert len(writes) == 3
     # The same title on an input with no text of its own still names the number (what the hint is for).
     bare = {"name": "", "id": "", "attrs": phone_attrs}
-    fills, writes = _pipeline([bare, _EXPIRY, _CVC], texts)
+    _fills, writes = _pipeline([bare, _EXPIRY, _CVC], texts)
     assert ["", _PAN] in writes and len(writes) == 3
 
 
