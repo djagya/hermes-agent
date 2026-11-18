@@ -1178,7 +1178,7 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
             return refused
         if prep is not None and not await preparatory(sup, sid, element, arr, *prep):  # build F: read again
             return _changed()
-        watch = await watch_leave(sup, sid, arr) if prep is not None else None
+        watch = await watch_leave(sup, sid, arr, prep[0]) if prep is not None else None
         if prep is not None and watch is None:  # build F r3: unwatched: the Pay press
             prep, pay_like = None, True
         # build C r4: the dialogs open in the merchant document right before this approval's Pay press

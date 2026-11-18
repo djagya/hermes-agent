@@ -584,6 +584,30 @@ def test_a_submit_that_started_after_the_preparatory_press_rebooks_it(tmp_path):
     assert json.loads(run.stdout) == [False, True, False]
 
 
+def test_once_the_confirm_submitted_a_purchase_click_never_reaches_the_page():
+    """F r7 (Codex delta 5): the watch blocks a press on a purchase button in the renderer as the click is dispatched,
+    once the confirm submitted; before that, and on other elements, clicks pass."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required to run the page script")
+    harness = (
+        "const ls = {}; const on = (k) => (t, f) => { (ls[k + t] = ls[k + t] || []).push(f); };\n"
+        "const window = {addEventListener: on('w')}; const document = {addEventListener: on('d')};\n"
+        "const el = () => { const e = {}; e.contains = x => x === e; return e; };\n"
+        "const buy = el(), other = el(); const arr = [other, buy];\n"
+        f"const s = ({kind.WATCH_LEAVE}).call(arr, [1]);\n"
+        "const press = (target) => { const ev = {target, stopped: false, prevented: false,\n"
+        "  preventDefault() { this.prevented = true; }, stopImmediatePropagation() { this.stopped = true; }};\n"
+        "  for (const f of ls['wclick'] || []) f(ev); return ev.prevented && ev.stopped; };\n"
+        "const before = press(buy);\n"
+        "for (const f of ls['dsubmit'] || []) f();\n"
+        "const after = press(buy), elsewhere = press(other);\n"
+        "process.stdout.write(JSON.stringify([before, after, elsewhere, s.blocked]));")
+    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout) == [False, True, False, True]
+
+
 _SCAN_DOM = r"""
 const T = (data) => ({nodeType: 3, data});
 const E = (tag, kids = [], o = {}) => Object.assign({nodeType: 1, tagName: tag, childNodes: kids,

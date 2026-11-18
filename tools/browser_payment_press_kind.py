@@ -129,10 +129,16 @@ PREP_CHECK = r"""function(arr, idx, ...owners){
 # build F r3 (Opus final M1): installed on the listing array right before a preparatory press, in the controls' world:
 # any form submit, unload or navigation that STARTS after the press marks it, so an order still in flight at the read
 # (the new document not committed yet) re-books the press as the Pay press. Window/document events reach this world.
-WATCH_LEAVE = r"""function(){ const s = {left: false}; const mark = () => { s.left = true; };
+WATCH_LEAVE = r"""function(idx){ const s = {left: false, blocked: false}; const mark = () => { s.left = true; };
   window.addEventListener('beforeunload', mark, true); window.addEventListener('pagehide', mark, true);
   document.addEventListener('submit', mark, true);
   try { if (window.navigation) window.navigation.addEventListener('navigate', mark); } catch (e) {}
+  // build F r7 (Codex delta 5): once the confirm submitted, a press on a purchase button never reaches the page. Checked
+  // in the renderer as the click is dispatched (JS runs one task at a time), so no submit can slip in between.
+  const buys = (idx || []).map(i => this[i]).filter(Boolean);
+  const stop = e => { if (s.left && buys.some(b => b === e.target || b.contains(e.target))) {
+    e.preventDefault(); e.stopImmediatePropagation(); s.blocked = true; } };
+  for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) window.addEventListener(t, stop, true);
   this.__hermesPrepLeave = s; return s; }"""
 
 # build F r5 (Codex delta 3): the same watch state, read again right before the next purchase press
@@ -226,12 +232,13 @@ async def prep_args(sup: Any, gen: Any, clicked: tuple, control: dict, doc_contr
     return (idx, list(held)) if await preparatory(sup, sid, element, arr, idx, held) else None
 
 
-async def watch_leave(sup: Any, sid: str, arr: str) -> Optional[str]:
+async def watch_leave(sup: Any, sid: str, arr: str, idx: Optional[list] = None) -> Optional[str]:
     """build F r3: install ``WATCH_LEAVE`` before a preparatory press; returns the watch state's object id (kept for
     the approval: ``watch_left`` reads it before the next purchase press), or None: not installed (the caller keeps the
     press the Pay press: an unwatched submit cannot be taken back)."""
     try:
         reply = await sup._cdp("Runtime.callFunctionOn", {"objectId": arr, "functionDeclaration": WATCH_LEAVE,
+                                                          "arguments": [{"value": list(idx or [])}],
                                                           "returnByValue": False}, session_id=sid)
     except Exception as exc:  # health: allow BLE001 -- unwatched: the preparatory press stays the Pay press
         logger.info("payment_click: leave watch not installed (%s)", type(exc).__name__)
