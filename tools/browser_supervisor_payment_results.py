@@ -112,8 +112,13 @@ def _page_chrome(row: dict) -> bool:
     if str(row.get("type") or "").lower() == "search":
         return True
     text = re.sub(r"([a-z])([A-Z])", r"\1 \2", f"{row.get('name') or ''} {row.get('label') or ''}")
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
-    return bool(_CHROME.search(re.sub(r"[^a-z0-9]+", " ", text)))
+    text = re.sub(r"[^a-z0-9]+", " ", unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower())
+    return bool(_CHROME.search(text)) and not _RECIPIENT.search(text)
+
+
+# A field about who receives something (a gift card's recipient) is checkout, whatever else it names.
+_RECIPIENT = re.compile(r"\b(?:recipient\w*|empfanger\w*|beschenkt\w*|destinataire\w*|destinatario\w*|ontvanger\w*|"
+                        r"to name|to email|for whom)\b")
 
 
 def _one_postcode(candidates: list) -> list:

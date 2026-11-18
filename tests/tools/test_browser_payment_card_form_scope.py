@@ -310,11 +310,14 @@ def test_revealed_rows_follow_the_inspection_scope():
     assert rs._revealed_left([other_form, same_form], card, True) == 1
     assert rs._revealed_left([other_form], card, False) == 1  # a hosted document: all of it is the card's
     assert rs._revealed_left(None, card, True) == 0 and rs._revealed_left({"overflow": True}, card, True) == 1
+    recipient = dict(_row(-3, "giftCardRecipientEmail", "Gift card recipient email", form=None))
+    assert rs._revealed_left([recipient], sp._card_controls(_FORMLESS, True), True) == 1
 
 
 def test_gift_recipient_fields_still_count_on_a_formless_checkout():
     """B final (Codex P2): a gift-card redemption box is page chrome; the recipient's name or e-mail is checkout."""
-    for name, label in (("giftRecipientEmail", "Recipient e-mail"), ("giftRecipientName", "Gift recipient name")):
+    for name, label in (("giftRecipientEmail", "Recipient e-mail"), ("giftRecipientName", "Gift recipient name"),
+                        ("giftCardRecipientEmail", "Gift card recipient email"), ("gutschein_empfaenger", "Empfänger")):
         document = _document([*_FORMLESS, _row(3, name, label, form=None)], blank=frozenset({3}))
         assert document.left_for_user == (3,), name
 

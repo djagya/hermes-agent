@@ -271,9 +271,11 @@ _INSPECT_TEMPLATE = r"""(() => {
   const revealedRows = () => {
     try {
       if (document !== doc || location.href !== href) return null;
-      const fresh = allInputs().filter(e => { const n = elements.indexOf(e);
-        return !(n >= 0 && selected.has(n)) && exposure(e) === true && !String(e.value == null ? '' : e.value).trim();
-      });
+      // against the fields exposed at inspection (``inspected``), not the current pinned set: a re-pin that adopted
+      // a revealed field does not hide it here
+      const seen = new Set(inspected.map(x => x.e));
+      const fresh = allInputs().filter(e =>
+        !seen.has(e) && exposure(e) === true && !String(e.value == null ? '' : e.value).trim());
       return bounded(fresh.map((e, k) => describeOne(e, -1 - k)), false);
     } catch (_) { return null; }
   };
