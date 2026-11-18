@@ -186,9 +186,14 @@ def test_a_cardless_frame_of_the_card_origin_makes_the_form_incomplete():
 
 
 def test_a_locked_browser_gets_the_close_and_type_first_text():
-    card = {k: v for k, v in CARD.items() if k != "cardholder_name"}
-    out = _report(_document(_FORM + [_row(3, "holder", "Name on card")]), card, locked=True)
+    # D-0360 a: a missing holder name or postcode is first answered by filling again with the argument (see
+    # test_browser_payment_supplied_fields); a field the fill cannot take at all still gets the close-reopen-type path.
+    rows = _FORM + [_row(3, "x9", "Kontoinhaber Vorname")]
+    out = _report(_document(rows), CARD, locked=True)
     assert "payment_close" in out["next"] and "locked" in out["next"] and "do not press Pay" in out["next"]
+    card = {k: v for k, v in CARD.items() if k != "cardholder_name"}
+    named = _report(_document(_FORM + [_row(3, "holder", "Name on card")]), card, locked=True)
+    assert "holder_name" in named["next"] and "locked" in named["next"] and "payment_close" not in named["next"]
 
 
 def test_provider_invalid_marks_make_the_form_incomplete():

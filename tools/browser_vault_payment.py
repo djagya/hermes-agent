@@ -73,6 +73,72 @@ class _UnwrittenWindow:
             logger.info("payment window not withdrawn (%s)", type(exc).__name__)
 
 
+# dlz (D-0360 a, 11-18): the non-secret card fields the agent may supply: argument -> (card payload key, token).
+_SUPPLIABLE = {"holder_name": ("cardholder_name", "cc-name"),
+               "billing_postal_code": ("billing_postal_code", "postal-code")}
+_POSTCODE_SHAPE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9 -]*[A-Za-z0-9])?")
+
+
+def _clean_holder(value) -> str | None:
+    """A holder name the agent supplies: 2-60 characters, letters, spaces and ``'`` ``-`` ``.`` ``/`` only (a typographic
+    apostrophe counts as ``'``), at least one letter. ``""`` = none given; ``None`` = not usable. Never echoes it."""
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.replace("\u2019", "'").split())
+    if not text:
+        return ""
+    if not 2 <= len(text) <= 60 or not any(ch.isalpha() for ch in text):
+        return None
+    return text if all(ch.isalpha() or ch in " '-./" for ch in text) else None
+
+
+def _clean_postcode(value) -> str | None:
+    """A billing postcode the agent supplies: 3-10 characters, ASCII letters, digits, spaces and ``-`` only. ``""`` =
+    none given; ``None`` = not usable."""
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    if not text:
+        return ""
+    return text if 3 <= len(text) <= 10 and _POSTCODE_SHAPE.fullmatch(text) else None
+
+
+def _supplied_values(holder_name, billing_postal_code) -> tuple[dict, dict | None]:
+    """``({argument: clean value}, refusal)``: only the arguments given. A value that is not usable refuses the fill
+    before anything is read or shown (``payment_field_value_invalid``: the argument's name, never the value)."""
+    out = {}
+    for name, value, clean in (("holder_name", holder_name, _clean_holder),
+                               ("billing_postal_code", billing_postal_code, _clean_postcode)):
+        text = clean(value)
+        if text is None:
+            return {}, {"success": False, "error_type": "payment_field_value_invalid", "field": name,
+                        "error": _SUPPLIED_INVALID[name]}
+        if text:
+            out[name] = text
+    return out, None
+
+
+def _apply_supplied(secret: dict, supplied: dict) -> frozenset:
+    """Fold the agent's values into the card payload where the saved card has none (the item wins). Returns the tokens
+    that now come from the agent. The holder joins the card's own payment window like a saved one."""
+    from_agent = set()
+    for name, value in supplied.items():
+        key, token = _SUPPLIABLE[name]
+        if not secret.get(key):
+            secret[key] = value
+            from_agent.add(token)
+    return frozenset(from_agent)
+
+
+def _field_sources(fills: list, from_agent: frozenset) -> dict:
+    """Per written token, where its value came from: ``vault`` (the saved card) or ``agent`` (a supplied argument)."""
+    return {t: "agent" if t in from_agent else "vault" for t in sorted({f["token"] for f in fills})}
+
+
 class ExpiryOptionUnmatched(Exception):
     """An expiry ``<select>`` has no single option for the card's month or year. Carries no value."""
 
@@ -836,6 +902,16 @@ _FILL_REFUSED = ("Card resolution or page checks failed; nothing was submitted. 
                  "consent.")
 
 
+def _unreadable_card(verdict: str, locked: bool) -> dict:
+    """The stop when the card could not be read for the approved revision: the item changed meanwhile, or the backend
+    cannot name its revision on the read."""
+    if verdict == "changed":
+        return _lock_aware({"success": False, "error_type": "payment_item_changed", "error": _ITEM_CHANGED_ON_READ},
+                           locked, _ITEM_CHANGED_ON_READ_LOCKED)
+    return _lock_aware({"success": False, "error_type": "payment_item_revision_unavailable",
+                        "error": _REVISION_UNAVAILABLE_ON_READ}, locked, _REVISION_UNAVAILABLE_ON_READ_LOCKED)
+
+
 def _fill_refused(step: str, code: str = "") -> dict:
     """dlz (11-18): the opaque refusal, naming the step it stopped at and (a saved card the fill cannot use) the card
     check's fixed code. Never exception text."""
@@ -856,6 +932,25 @@ _FORM_INCOMPLETE_LOCKED_NEXT = (
     "once more (a new approval prompt); a field you typed before the fill is not reported again. Never type the card "
     "number, CVC or expiry."
 )
+_SUPPLIED_INVALID = {
+    "holder_name": "holder_name must be 2-60 characters: letters, spaces and ' - . / only. Nothing was read or "
+                   "written; fill again with a corrected name or without it.",
+    "billing_postal_code": "billing_postal_code must be 3-10 characters: letters, digits, spaces and - only. Nothing "
+                           "was read or written; fill again with a corrected postcode or without it.",
+}
+_FILL_AGAIN_NEXT = (
+    "The form has {fields} empty, and the saved card has no value for {it}. The browser is locked for this payment, "
+    "so nothing can be typed into it now: call browser_vault fill again with {arguments} (the user's own details; "
+    "ask the user if you do not know {it}; a new approval prompt). Do not press Pay while a field the form needs is "
+    "empty. Never type the card number, CVC or expiry."
+)
+_FORM_OTHER_LOCKED_NEXT = (
+    " Other fields of the form are empty too: they cannot be typed into while the browser is locked. If the form "
+    "needs them, call browser_vault payment_close, open the checkout again, type those non-card fields yourself, "
+    "then call fill once more."
+)
+_FILL_AGAIN_ARGUMENT = {"cc-name": "holder_name (the name on the card)",
+                        "postal-code": "billing_postal_code (the billing postcode)"}
 _FIELDS_INVALID_NEXT = (
     "The payment form marks the fields in fields_invalid as invalid after the fill: do not press Pay; tell the user "
     "which fields (by their names here) and let them decide."
@@ -891,14 +986,22 @@ def _form_report(result: dict, inspected, fills: list, locked: bool) -> dict:
     if sum(by_document) or card_fields or frames:
         out["fields_left_empty"] = {"card_fields": sorted(card_fields), "other_fields": sum(by_document),
                                     "by_document": by_document, "frames_without_card_fields": frames}
-        out["next"] = _FORM_INCOMPLETE_LOCKED_NEXT if locked else _FORM_INCOMPLETE_NEXT
+        named = [t for t in sorted(card_fields) if t in _FILL_AGAIN_ARGUMENT]
+        if locked and named:  # first preference: the fill takes the two non-secret fields itself
+            out["next"] = _FILL_AGAIN_NEXT.format(
+                fields=" and ".join(named), it="it" if len(named) == 1 else "them",
+                arguments=" and ".join(_FILL_AGAIN_ARGUMENT[t] for t in named))
+            if sum(by_document) or frames:
+                out["next"] += _FORM_OTHER_LOCKED_NEXT
+        else:
+            out["next"] = _FORM_INCOMPLETE_LOCKED_NEXT if locked else _FORM_INCOMPLETE_NEXT
     if invalid:
         out["next"] = _FIELDS_INVALID_NEXT + (" " + out["next"] if "next" in out else "")
     return out
 
 
 def _describe_result(result: dict, backend, inspected, fills: list, prompt: dict, bound_revision: str,
-                     unreviewed: bool, stated, locked: bool = False) -> dict:
+                     unreviewed: bool, stated, locked: bool = False, from_agent: frozenset = frozenset()) -> dict:
     try:
         report = _form_report(result, inspected, fills, locked)
     except Exception:  # health: allow BLE001 -- nothing after the commit may raise; an unreadable report is incomplete
@@ -913,6 +1016,7 @@ def _describe_result(result: dict, backend, inspected, fills: list, prompt: dict
         target_origins=list(inspected.target_origins),
         fields=sorted(f["token"] for f in fills),
         skipped_optional=sorted(set(prompt["fields"]) - {f["token"] for f in fills}),
+        field_sources=_field_sources(fills, from_agent),
         submitted=False,
         page_checks=prompt["checks"],
         merchant_reputation="human_review_required",
@@ -1028,7 +1132,7 @@ def _claim_and_readmit(vault, task_id: str, supervisor, inspected, lease: str) -
 
 
 def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, strict: bool = False,
-                 cart=None, approve_origins=None) -> str:
+                 cart=None, approve_origins=None, holder_name=None, billing_postal_code=None) -> str:
     """Native card fill after the owner's approval. ``strict`` (the unreviewed-destination feature): a managed
     browser is required, the capture guard's rollout exception does not apply, and each field is hit-tested
     before its setter. Reviewed fills keep ``strict=False``; an unreviewed destination always runs strict.
@@ -1052,11 +1156,20 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
     Order after consent (design v2 A6): backend context -> item revision -> live ownership -> page freshness
     -> capture guard (for the approved lease only) and local mark -> expiry -> live ownership again -> read the
     card -> its revision -> fills -> commit fence (ownership again, expiry) -> commit with its own per-document
-    and per-setter checks."""
+    and per-setter checks.
+
+    dlz (D-0360 a, 11-18): ``holder_name`` and ``billing_postal_code`` are non-secret values the agent may supply for the
+    ``cc-name`` and ``postal-code`` fields; each is used only when the saved card has no value for it (the item wins),
+    the approval card says they were supplied by Sera, and the result's ``field_sources`` says per written token whether
+    its value came from the vault or the agent. A value that is not usable refuses the fill first
+    (``payment_field_value_invalid``)."""
     from tools import browser_vault_tool as vault
     from tools.payment_consent_prompt import (
         UNAVAILABLE_FACTS, PaymentConsent, facts_for_inspection, request_payment_approval)
 
+    supplied, invalid = _supplied_values(holder_name, billing_postal_code)
+    if invalid is not None:
+        return json.dumps(invalid)
     if strict and not vault._is_managed():
         return json.dumps({"success": False, "error_type": "payment_destination_requires_managed_browser",
                            "error": _REQUIRES_MANAGED})
@@ -1111,7 +1224,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         prompt = inspected.prompt()
         # dlz: the owner-only payment card (tools.payment_consent_prompt): every fact or no prompt.
         try:
-            facts = facts_for_inspection(inspected, card_label=meta.label, cart=stated)
+            facts = facts_for_inspection(inspected, card_label=meta.label, cart=stated, supplied=tuple(supplied))
         except Exception:  # health: allow BLE001 -- facts out of bounds: no prompt, no fill
             facts = None
         consent = (request_payment_approval(facts, timeout_seconds=_remaining_seconds(inspected)) if facts is not None
@@ -1169,15 +1282,10 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             # Never resolve at inspection/list time, on decline or on stale consent.
             raw, verdict = _resolve_card(backend, meta, bound_revision)
             if raw is None:
-                locked = _post_claim_locked(vault, supervisor)
-                if verdict == "changed":
-                    return json.dumps(_lock_aware({"success": False, "error_type": "payment_item_changed",
-                                                   "error": _ITEM_CHANGED_ON_READ}, locked, _ITEM_CHANGED_ON_READ_LOCKED))
-                return json.dumps(_lock_aware({"success": False, "error_type": "payment_item_revision_unavailable",
-                                               "error": _REVISION_UNAVAILABLE_ON_READ}, locked,
-                                              _REVISION_UNAVAILABLE_ON_READ_LOCKED))
+                return json.dumps(_unreadable_card(verdict, _post_claim_locked(vault, supervisor)))
             at["step"] = "card_check"
             secret = validate_card(raw)
+            from_agent = _apply_supplied(secret, supplied)  # before the window opens: a supplied holder is masked too
             at["step"] = "fill_plan"
             with _UnwrittenWindow(secret, supervisor) as window:  # dlz: taken back by every return before the commit
                 from tools.browser_payment_done import register_dialog_card_values
@@ -1220,7 +1328,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             locked = _post_claim_locked(vault, supervisor)
             _commit_text(result, locked=locked)
             return json.dumps(_describe_result(result, backend, inspected, fills, prompt, bound_revision,
-                                               unreviewed, stated, locked))
+                                               unreviewed, stated, locked, from_agent))
     except BackendError as exc:
         if type(exc) is BackendError:  # unclassified op failure: keep the opaque refusal below
             return json.dumps(_fill_refused(at["step"]))
@@ -1234,7 +1342,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             "error_type": "payment_policy_refused",
             "error": str(exc) + "; inspect the checkout and request fresh consent.",
         })
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- op/JS/transport text can hold values: the step and a fixed code only
         # op/JS/transport exceptions can contain values. Do not interpolate them (the step and a check's own fixed
         # code only).
         return json.dumps(_fill_refused(at["step"], getattr(exc, "code", "") if isinstance(exc, CardInvalid) else ""))
