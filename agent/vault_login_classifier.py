@@ -158,7 +158,8 @@ _RE_BIRTH = re.compile(r"\b(?:birth\w*|geburt\w*|dob)\b")
 _STRONG_CARD_NAMES = frozenset({
     "cvc", "cvv", "cvc2", "cvv2", "csc", "cvn", "ccv", "cccsc", "cardcvc", "cardcvv", "cardcvc2", "securitycode",
     "cardnumber", "ccnumber", "ccnum", "cardno", "pan", "cardpan", "ccexp", "cardexpiry", "cardexpirydate", "ccmonth",
-    "ccyear", "cardexpiremonth", "cardexpireyear", "ccname", "cardholder", "cardholdername", "nameoncard"})
+    "ccyear", "cardexpiremonth", "cardexpireyear", "ccname", "cardholder", "cardholdername", "nameoncard",
+    "encryptedexpirydate", "encryptedexpirymonth", "encryptedexpiryyear"})
 
 # The expiry rows' reach on the base wording ("Expiry date", "Exp MM", "MM/YY", "valid thru", "Ablaufdatum"): any
 # label or name with it keeps matching. The wider reach (camelCase-split names, "expires", "valid until",
