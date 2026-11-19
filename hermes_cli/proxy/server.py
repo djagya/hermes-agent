@@ -134,6 +134,11 @@ async def _open_upstream(request: web.Request, rel_path: str, body: bytes, cred:
         upstream_url = f"{upstream_url}?{request.query_string}"
     fwd_headers = _filter_headers(request.headers)
     fwd_headers["Authorization"] = f"{cred.token_type} {cred.bearer}"
+    # The xAI subscription proxy (the xai-oauth default route) answers 426 without the Grok CLI
+    # headers; added only for that exact origin, never over a header the client sent.
+    from tools.xai_http import xai_grok_proxy_headers_for
+    present = {key.lower() for key in fwd_headers}
+    fwd_headers.update({k: v for k, v in xai_grok_proxy_headers_for(cred.base_url).items() if k.lower() not in present})
     logger.debug("proxy: forwarding %s %s -> %s (body=%d bytes)", request.method, rel_path, upstream_url, len(body))
     try:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300))

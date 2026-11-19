@@ -958,13 +958,13 @@ def _lazy_headers(module: str, name: str, pass_key: bool = False, pass_base: boo
 # host match wins; no match falls back to the provider profile's declared headers.
 _HOST_DEFAULT_HEADERS: list[tuple[str, Callable[[Any, str], dict[str, str]]]] = [
     ("openrouter.ai", _lazy_headers("agent.auxiliary_client", "build_or_headers")),
-    ("integrate.api.nvidia.com",
-     _lazy_headers("agent.auxiliary_client", "build_nvidia_nim_headers", pass_base=True)),
+    ("integrate.api.nvidia.com", _lazy_headers("agent.auxiliary_client", "build_nvidia_nim_headers", pass_base=True)),
     ("api.routermint.com", _lazy_headers("agent.client_lifecycle", "_routermint_headers")),
     ("api.kimi.com", lambda _k, _b: {"User-Agent": "claude-code/0.1.0"}),
     ("portal.qwen.ai", _lazy_headers("agent.client_lifecycle", "_qwen_portal_headers")),
     ("chatgpt.com", _lazy_headers("agent.codex_headers", "codex_cloudflare_headers", pass_key=True)),
-    ("x.ai", _lazy_headers("tools.xai_http", "hermes_xai_default_headers")),
+    ("x.ai", _lazy_headers("tools.xai_http", "hermes_xai_default_headers", pass_base=True)),
+    ("cli-chat-proxy.grok.com", _lazy_headers("tools.xai_http", "hermes_xai_default_headers", pass_base=True)),
 ]
 
 

@@ -293,13 +293,8 @@ class PooledCredential:
                 (self.agent_key, self.agent_key_expires_at),
                 (self.access_token, self.expires_at),
             ):
-                if (
-                    isinstance(token, str)
-                    and token.strip()
-                    and auth_mod._nous_invoke_jwt_is_usable(
-                        token, scope=getattr(self, "scope", None), expires_at=expires_at,
-                    )
-                ):
+                if isinstance(token, str) and token.strip() and auth_mod._nous_invoke_jwt_is_usable(
+                        token, scope=getattr(self, "scope", None), expires_at=expires_at):
                     return token.strip()
             return ""
         return str(self.access_token or "")
@@ -313,6 +308,9 @@ class PooledCredential:
             # for every reader of the row — initial resolution AND a 401/429 rotation
             # (client_lifecycle._swap_credential), or a rotation silently leaves the proxy.
             return get_secret_str("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or self.base_url
+        if self.provider == "xai-oauth":
+            xai_override = get_secret_str("HERMES_XAI_BASE_URL", "") or get_secret_str("XAI_BASE_URL", "")
+            return auth_mod._xai_oauth_runtime_base_url(self.base_url or "", override=xai_override)
         return self.base_url
 
 
