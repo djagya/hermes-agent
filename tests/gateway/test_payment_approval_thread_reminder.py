@@ -137,7 +137,7 @@ def test_a_group_card_goes_to_its_thread_and_only_the_owners_tap_acts(loop):
                       what="card sent and armed")
     kwargs, (approve, deny) = _card(adapter)
     assert kwargs["chat_id"] == GROUP and kwargs["message_thread_id"] == THREAD
-    assert "presses Pay once for 4321.98 CHF at https://shop.example" in kwargs["text"]
+    assert "pays once for 4321.98 CHF at https://shop.example" in kwargs["text"]
     adapter.send.assert_not_called()  # no neutral notice: the card is in the thread
     # Another member taps (allowlisted or not, Approve or Deny): answered, nothing resolved, the card stays live.
     for data, user in ((approve, 222), (deny, 222), (approve, 333), (deny, 333)):

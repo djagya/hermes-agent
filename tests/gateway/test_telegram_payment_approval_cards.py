@@ -180,11 +180,11 @@ def test_rendered_card_has_every_fact_verbatim_or_raises(state):
     # One tap = the fill and one Pay press, said in plain words with the stated total and the merchant; only a
     # matched page check covers Pay (peer r2 P2), anything else is the fill only.
     scope = {"not_checked": f"Approve: Sera fills the card only, at {origins[0]}. No total was stated",
-             "matched": f"Approve: Sera fills the card and presses Pay once for 1234.50 EUR at {origins[0]}."}.get(
+             "matched": f"Approve: Sera fills the card and pays once for 1234.50 EUR at {origins[0]}."}.get(
                  state, f"Approve: Sera fills the card only, at {origins[0]}. Hermes did not find 1234.50 EUR clearly")
     for fact in (origins[0], origins[1], "UNREVIEWED", "cc-number, cc-csc, cc-exp", "Test card",
                  PAGE_MATCH_LINES[state], "Expires in 97 s", "c" * 32, scope,
-                 "one Pay press" if state == "matched" else "Pay needs your go in chat",
+                 "one purchase" if state == "matched" else "Pay needs your go in chat",
                  "cannot verify what will be charged", *cart_facts):
         assert fact in plain, fact
     assert "3-D Secure" not in plain and "3DS" not in plain
@@ -335,12 +335,12 @@ async def test_a_card_without_a_stated_total_is_fill_only_in_button_and_toast():
     kwargs = adapter._bot.send_message.call_args.kwargs
     buttons = [b for row in kwargs["reply_markup"].inline_keyboard for b in row]
     assert [b.text for b in buttons] == [APPROVE_LABEL_FILL_ONLY, DENY_LABEL] and "Pay" not in APPROVE_LABEL_FILL_ONLY
-    assert "does not cover pressing Pay" in kwargs["text"] and "presses Pay once" not in kwargs["text"]
+    assert "does not cover pressing Pay" in kwargs["text"] and "pays once" not in kwargs["text"]
     coro, query = _tap(adapter, buttons[0].callback_data, chat_id=OWNER_ID, message_id=int(result.message_id))
     await coro
     assert entry.result == "once"
     toast = query.answer.call_args.kwargs["text"]
-    assert "Pay needs your go in chat" in toast and "presses Pay once" not in toast
+    assert "Pay needs your go in chat" in toast and "pays once" not in toast
 
 
 @pytest.mark.asyncio
@@ -355,9 +355,9 @@ async def test_pay_once_only_when_the_page_check_matched_the_stated_total(state,
                                                   page_match=PageMatch(state, "the merchant page"))
     assert pays_once(facts) is pays
     text = render_plain(facts)
-    assert ("presses Pay once for 12.50 CHF" in scope_line(facts)) is pays
+    assert ("pays once for 12.50 CHF" in scope_line(facts)) is pays
     assert ("does not cover pressing Pay: Pay needs your go in chat" in scope_line(facts)) is not pays
-    assert ("One tap covers one fill and one Pay press" in text) is pays
+    assert ("One tap covers one fill and one purchase" in text) is pays
     assert ("One tap covers one fill only" in text) is not pays
     adapter = _adapter()
     entry = _pending(exact_request=True, approver=OWNER)
@@ -408,7 +408,7 @@ async def test_with_the_pay_once_switch_off_every_card_is_fill_only(made, now, m
     assert PaymentPromptFacts.from_dict(facts.to_dict()) == facts  # the gateway's copy keeps the fill's reading
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"vault": {"payment_pay_once": now}})
     assert pays_once(facts) is False
-    assert "presses Pay once" not in scope_line(facts) and "Pay needs your go in chat" in scope_line(facts)
+    assert "pays once" not in scope_line(facts) and "Pay needs your go in chat" in scope_line(facts)
     assert "did not find" not in scope_line(facts)  # the page check did match: the card does not say otherwise
     assert "One tap covers one fill only" in render_plain(facts)
     adapter = _adapter()

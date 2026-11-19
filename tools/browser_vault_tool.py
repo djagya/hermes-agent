@@ -839,7 +839,8 @@ def _no_code_field_result(listed: list) -> dict[str, Any]:
         return {"success": False, "error_type": "code_field_unrecognised", "codeish_inputs": codeish,
                 "error": (f"The page has {codeish} input(s) that look like a code box, but none could be recognised "
                           "as the code field. Nothing was written."),
-                "next": "Read the form; if it does want a code, ask the user to type it or hand the tab over."}
+                "next": ("Read the form; if it wants a one-time code you have (mail, chat), type it into that box with "
+                         "browser tools: one-time codes are not secrets. Otherwise ask the user for the code.")}
     return {"success": False, "error_type": "no_code_field",
             "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or an "
                       "approval tap in an app, tell the user to complete it on their device and wait for the page to "
