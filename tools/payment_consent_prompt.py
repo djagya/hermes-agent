@@ -297,7 +297,7 @@ def scope_line(facts: PaymentPromptFacts) -> str:
         return (f"Approve: Sera fills the card only, at {facts.merchant_origin}. Hermes did not find "
                 f"{facts.cart.total} {facts.cart.currency} clearly as the page's total, so this does not cover "
                 "pressing Pay: Pay needs your go in chat.")
-    return (f"Approve: Sera fills the card and presses Pay once for {facts.cart.total} {facts.cart.currency} "
+    return (f"Approve: Sera fills the card and pays once for {facts.cart.total} {facts.cart.currency} "
             f"at {facts.merchant_origin}.")
 
 
@@ -339,7 +339,8 @@ def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
         lines.append(f"Total (stated by Sera): {bold(esc(facts.cart.total + ' ' + facts.cart.currency))}")
         where = f" Checked on {esc(facts.page_match.where)}." if facts.page_match.where else ""
         lines.append(esc(PAGE_MATCH_LINES[facts.page_match.state]) + where)
-    covers = ("One tap covers one fill and one Pay press for this checkout; any other payment needs a new approval."
+    covers = ("One tap covers one fill and one purchase at this checkout (Sera presses through its steps); any other payment "
+              "needs a new approval."
               if pays_once(facts) else
               "One tap covers one fill only: pressing Pay needs your go in chat. Any other payment needs a new approval.")
     lines += ["", f"{covers} Expires in {facts.expires_in_s} s.",

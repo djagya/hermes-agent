@@ -1,19 +1,17 @@
-"""What a press after an approval's Pay press may be (build C r4, 2026-11-18): the site rules a bank's own step is told
-apart by (``cross_site``, a provider's site), and the confirmation dialog the one follow-up press may be in (the
-dialogs open before the Pay press, the dialog a control sits in). Read by ``browser_payment_surface`` (``_bank_step``,
-``_confirm_possible``); the site rules moved here from it unchanged. Only node ids and verdicts leave the page.
+"""The site rules the pay gate tells a bank's own step apart by after an admitted press (build C r4, 2026-11-18;
+``cross_site``, a provider's site) and the pressed control's node id. Read by ``browser_payment_surface``
+(``_pay_gate``), ``browser_payment_press_kind`` (``pay_node``) and ``browser_payment_detect`` (a shop page). Build G1
+removed the one-press budget and with it the bank-step and confirmation-dialog exemptions that lived here.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, Optional
 
 logger = logging.getLogger("tools.browser_payment_surface")
 
-_DIALOG_SEL = "[role=dialog],[role=alertdialog],[aria-modal=true],dialog[open]"
-
+_DIALOG_SEL = "[role=dialog],[role=alertdialog],[aria-modal=true],dialog[open]"  # the occluder and overlay reads
 
 def _origin_of(url: Any) -> str:
     from tools.browser_payment_done import _url_origin
@@ -37,80 +35,10 @@ def _provider_site(sup: Any, url: Any) -> bool:
     return _origin_of(url) in _providers(sup)
 
 
-# build C r4: a follow-up press in a new dialog is never a retry after an error (that needs a new approval)
-_RETRY_WORDS = re.compile(r"\b(again|retry|try|erneut|nochmal|noch einmal|wiederholen|réessayer|reintentar)\b",
-                          re.IGNORECASE)
-
-
-_MAX_DIALOGS = 8
-_OPEN_DIALOGS = r"""function(){
-  const vis = el => { const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
-    return r.width >= 1 && r.height >= 1 && st.visibility === 'visible' && st.display !== 'none' && st.opacity !== '0'; };
-  const out = [];
-  for (const el of this.ownerDocument.querySelectorAll('__DIALOG__')) {
-    if (vis(el)) out.push(el);
-    if (out.length > __MAX__) break;
-  }
-  return out; }""".replace("__DIALOG__", _DIALOG_SEL).replace("__MAX__", str(_MAX_DIALOGS))
-_DIALOG_OF = "function(){ return this.closest('" + _DIALOG_SEL + "'); }"
-
-
 async def _backend_id(sup: Any, sid: str, obj: str) -> Optional[int]:
     reply = await sup._cdp("DOM.describeNode", {"objectId": obj}, session_id=sid)
     value = (((reply.get("result") or {}).get("node")) or {}).get("backendNodeId")
     return value if type(value) is int else None
-
-
-async def _open_dialogs(sup: Any, sid: str, element: str) -> Optional[frozenset]:
-    """build C r4: the node ids of the dialogs open in the Pay control's document right before the Pay press (read in
-    the controls' isolated world; only node ids leave it), or None (unread, more than ``_MAX_DIALOGS``): then no
-    confirmation press follows this Pay. Never a reason to refuse the Pay press."""
-    try:
-        reply = await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _OPEN_DIALOGS,
-                                                          "returnByValue": False}, session_id=sid)
-        arr = ((reply.get("result") or {}).get("result") or {}).get("objectId")
-        if not arr:
-            return None
-        try:
-            return await _dialog_ids(sup, sid, arr)
-        finally:
-            await sup._release_payment_object(sid, arr)
-    except Exception as exc:  # health: allow BLE001 -- unread: no confirmation press follows this Pay
-        logger.info("payment_click: open dialogs not read (%s)", type(exc).__name__)
-        return None
-
-
-async def _dialog_ids(sup: Any, sid: str, arr: str) -> Optional[frozenset]:
-    reply = await sup._cdp("Runtime.getProperties", {"objectId": arr, "ownProperties": True}, session_id=sid)
-    props = (reply.get("result") or {}).get("result")
-    if not isinstance(props, list):
-        return None
-    objs = [p["value"]["objectId"] for p in props if isinstance(p, dict) and str(p.get("name", "")).isdigit()
-            and isinstance(p.get("value"), dict) and p["value"].get("objectId")]
-    if len(objs) > _MAX_DIALOGS:
-        return None
-    ids = []
-    for obj in objs:
-        try:
-            ids.append(await _backend_id(sup, sid, obj))
-        finally:
-            await sup._release_payment_object(sid, obj)
-    return None if None in ids else frozenset(ids)
-
-
-async def _new_dialog(sup: Any, gen: Any, sid: str, element: str) -> bool:
-    """build C r4: the control sits in a dialog (``role=dialog``/``alertdialog``, ``aria-modal``, ``<dialog open>``)
-    that was not open when this approval's Pay was pressed (its node is not one recorded then)."""
-    reply = await sup._cdp("Runtime.callFunctionOn", {"objectId": element, "functionDeclaration": _DIALOG_OF,
-                                                      "returnByValue": False}, session_id=sid)
-    obj = ((reply.get("result") or {}).get("result") or {}).get("objectId")
-    if not obj:
-        return False
-    try:
-        node = await _backend_id(sup, sid, obj)
-    finally:
-        await sup._release_payment_object(sid, obj)
-    return node is not None and node not in gen.pay_dialogs[2]
 
 
 # r4 C4: public suffixes with two labels, so ``shop.co.uk`` is one site and ``bank.co.uk`` another. A suffix not

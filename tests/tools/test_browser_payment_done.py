@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools import browser_payment_done as done
+from tools import browser_payment_order_evidence as evidence
 from tools import browser_payment_surface as surface
 
 SHOP = "https://shop.test"
@@ -81,6 +82,9 @@ class FakeSup:
                 return {"result": {"type": "object", "value": dict(self.pin)}}
             if params.get("returnByValue") and params["expression"].startswith("(" + surface._pay_js("page")):
                 return {"result": {"type": "object", "value": {"ok": True, "why": "ok"}}}  # r4 C1: the Pay check
+            if params["expression"] == evidence.SCAN_JS:  # build F r2: the order/failure wording scan (booleans)
+                full = getattr(self, "full_text", None) or self.page["text"]  # the whole text, past the excerpt
+                return {"result": {"type": "object", "value": evidence.wording(self.page["title"], full)}}
             if params["expression"] != done.SNAPSHOT_JS:  # the payment_controls lister
                 return {"result": {"objectId": "arr"}}
             return {"result": {"type": "object", "value": self.page}}
@@ -183,6 +187,8 @@ def test_waits_through_3ds_and_provider_pages_then_hands_over():
     assert out["success"] is True and out["lock_released"] is True and out["payment_tab_closed"] is True
     assert (out["url"], out["title"], out["text"]) == (SHOP + "/thanks?order=77", "Thank you", "Order 77 confirmed")
     assert out["links"] == SNAPSHOT["links"] and out["new_tab"] == "NEWTAB" and "note" not in out
+    # build F: why this is the confirmation, and which tab holds it (browser_exec does not follow it)
+    assert out["order_evidence"] == "new_document" and "switch_tab(new_tab)" in out["next"]
     # the snapshot was read only from the confirmation, never from the checkout, 3-D Secure or provider page
     assert {c[3] for c in sup.sent("Runtime.evaluate")} == {CONFIRM}
     # the new tab is opened (same browser context, same URL) before the payment tab is closed
@@ -231,7 +237,9 @@ def test_no_handover_until_a_safe_confirmation_and_the_lock_stays(tree, snapshot
     out = done.payment_done(sup)
     assert out["error_type"] == "payment_confirmation_not_reached" and out["success"] is False
     assert out["lock_released"] is False and set(out) == {"success", "error_type", "error", "url", "title",
-                                                          "lock_released"}
+                                                          "reason", "lock_released"}
+    # build F r2: a fixed code for what the tab showed last (never page text)
+    assert out["reason"] == ("not_shop_page" if snapshot is None else "loading")
     # still locked: the tab's site only, never its title or path (exfil via document.title / location)
     assert out["url"] == done._url_origin(tree[0][2]) and out["title"] == ""
     assert not sup.sent("Target.createTarget") and not sup.sent("Target.closeTarget")
@@ -269,11 +277,22 @@ def test_lock_released_only_when_status_proves_it(status, released):
     assert bool(sup.sent("attach_page")) is released
 
 
-def test_single_page_shop_confirmation_once_the_card_frames_are_gone():
+@pytest.mark.parametrize("rows, reached", [
+    (None, False),  # the original fixture: "Pay 22.66 EUR" still listed and enabled on the checkout's own document
+    ([{"i": 0, "role": "button", "text": "Pay 22.66 EUR", "disabled": True}], True),  # the Pay button disabled
+    ([{"i": 0, "role": "link", "text": "Continue shopping", "disabled": False}], True),
+])
+def test_single_page_shop_confirmation_once_the_card_frames_are_gone(rows, reached):
     sup = _paid([CHECKOUT, SAME_DOC])
     sup.page.update(url=SHOP + "/thanks")
+    sup.rows = rows
     out = done.payment_done(sup)
-    assert out["success"] is True and out["url"] == SHOP + "/thanks"
+    # build F: the checkout's own document needs order wording ("Order 77 confirmed") and no enabled purchase button
+    if not reached:
+        assert out["error_type"] == "payment_confirmation_not_reached" and out["reason"] == "purchase_button_shown"
+        assert out["lock_released"] is False and not sup.sent("Target.closeTarget")
+        return
+    assert out["success"] is True and out["url"] == SHOP + "/thanks" and out["order_evidence"] == "confirmation_text"
     assert {c[3] for c in sup.sent("Runtime.evaluate")} == {SAME_DOC}
     # the same document never counts when the merchant page itself received a card field
     for merchant_fields in (True, "subframe"):
@@ -288,7 +307,7 @@ def test_new_tab_failure_never_closes_the_payment_tab():
     sup.fail.add("Target.createTarget")
     out = done.payment_done(sup)
     assert out["success"] is True and out["new_tab"] is None and out["lock_released"] is False
-    assert out["text"] == "Order 77 confirmed" and "note" in out
+    assert out["text"] == "Order 77 confirmed" and "note" in out and "next" not in out
     assert not sup.sent("Target.closeTarget")
 
 
@@ -472,18 +491,17 @@ def test_a_3ds_page_is_clicked_only_after_the_checkouts_pay_was_admitted(first):
     assert out["success"] is True and len(presses()) == 1
     sup.trees = [ACS]  # redirected to the bank's challenge page
     _top_controls(sup)
-    # r2 P1 / r3 Q1: one Pay press per approval, but the bank's own step on its challenge page is pressed whatever
-    # its caption says (the issuer's confirmation, not a second charge) ...
+    # r3 Q1: the bank's own step on its challenge page is pressed whatever its caption says (no merchant total)
     assert surface.payment_click(sup, _top_ref(sup, ACS))["success"] is True and len(presses()) == 2
     sup.rows = [{"i": 0, "role": "button", "text": "Continue", "disabled": False}]
     _top_controls(sup)
     assert surface.payment_click(sup, _top_ref(sup, ACS))["success"] is True and len(presses()) == 3
-    # ... and a Pay-like control on the merchant's own checkout document is refused
+    # G1 (owner 2026-11-19): back on the merchant's checkout with no payment detected (its Pay still offered), Pay
+    # goes again, its total read again (a retry after a declined challenge)
     sup.rows = [{"i": 0, "role": "button", "text": "Pay 22.66 EUR", "disabled": False}]
     sup.trees = [CHECKOUT]
     _top_controls(sup)
-    assert surface.payment_click(sup, _top_ref(sup, CHECKOUT))["error_type"] == "payment_already_pressed"
-    assert len(presses()) == 3
+    assert surface.payment_click(sup, _top_ref(sup, CHECKOUT))["success"] is True and len(presses()) == 4
 
 
 def test_a_top_document_ref_dies_with_its_document():
