@@ -251,15 +251,30 @@ _INSPECT_TEMPLATE = r"""(() => {
   const bounded = (d, unsure) => overflow || (LIM && JSON.stringify(d).length > LIM.bytes) ? {overflow:true} :
     unsure ? {unknown:true} : d;
   // dlz (D-0358 a, 11-18): the provider's own verdict on a written field, a fixed code: 'invalid' when the field or a
-  // close ancestor says so (aria-invalid, the :invalid state, a provider's invalid class), 'unknown' when it cannot be
-  // read, else 'valid'. No text, no value.
+  // close ancestor says so (aria-invalid, an HTML constraint it breaks, a provider's invalid class), 'unknown' when
+  // it cannot be read, else 'valid'. No text, no value.
+  // dlz (D-0358 a note, 11-19): the constraint test reads the ValidityState flags, not ``:invalid``, so that one HTML
+  // artefact can be told apart: a ``pattern`` attribute that is present but empty. HTML then accepts only the empty
+  // string, so every filled value is a patternMismatch (Shopify's hosted cardholder-name input carries ``pattern=""``
+  // inside a novalidate form). That is not the provider's rule and is ignored; every other flag, and a mismatch
+  // against a non-empty pattern, stays invalid. Without ``el.validity`` the old ``:invalid`` test applies.
   const INVALID_CLASSES = ['is-invalid','invalid','has-error','StripeElement--invalid','braintree-hosted-fields-invalid',
     'adyen-checkout__input--invalid','adyen-checkout__input--error','adyen-checkout__field--error','input--invalid',
     'field--invalid','field-error','input-error','error'];
+  const OTHER_FLAGS = ['valueMissing','typeMismatch','tooShort','tooLong','rangeUnderflow','rangeOverflow',
+    'stepMismatch','badInput','customError'];
+  const breaksConstraint = el => {
+    const v = el.validity;
+    if (!v || typeof v !== 'object') return typeof el.matches === 'function' && el.matches(':invalid');
+    const p = typeof el.getAttribute === 'function' ? el.getAttribute('pattern') : null;
+    const emptyPattern = p !== null && p !== undefined && !String(p).trim();
+    if (OTHER_FLAGS.some(k => v[k])) return true;
+    return v.valid === false && !(v.patternMismatch && emptyPattern);
+  };
   const validity = el => {
     try {
       if (String(el.getAttribute('aria-invalid')||'').toLowerCase() === 'true') return 'invalid';
-      if (typeof el.matches === 'function' && el.matches(':invalid')) return 'invalid';
+      if (breaksConstraint(el)) return 'invalid';
       for (let n = el, k = 0; n && n.classList && k < 4; n = n.parentElement, k++)
         if (INVALID_CLASSES.some(c => n.classList.contains(c))) return 'invalid';
       return 'valid';

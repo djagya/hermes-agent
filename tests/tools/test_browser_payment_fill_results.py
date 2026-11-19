@@ -234,7 +234,10 @@ const els = C.fields.map(f => Object.assign(new HTMLInputElement(), {tagName: 'I
   focus() {}, getAttribute: n => ((f.attrs || {})[n] ?? null), getBoundingClientRect: () => ({width: 100, height: 20}),
   getClientRects: () => [1], getRootNode: () => document,
   parentElement: {classList: {contains: c => f.parentClass === c}, parentElement: null},
-  classList: {contains: () => false}, matches: s => s === ':invalid' && !!f.invalid}));
+  classList: {contains: () => false}, matches: s => s === ':invalid' && !!f.invalid,
+  validity: f.flags ? Object.assign({valueMissing: false, typeMismatch: false, patternMismatch: false, tooShort: false,
+    tooLong: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false,
+    customError: false}, f.flags, {valid: !Object.values(f.flags).some(Boolean)}) : undefined}));
 document.querySelectorAll = () => els;
 const getComputedStyle = () => ({visibility: 'visible', opacity: '1', pointerEvents: 'auto'});
 const api = INSPECT;
@@ -275,6 +278,52 @@ def test_the_closure_reports_blank_fields_by_index_and_a_fixed_validity_code(att
     assert marker == {"revealed": []}  # B final: no field appeared during the fill (descriptors only, never a value)
     assert [(r["token"], r["state"], r["validity"]) for r in states] == [
         ("cc-number", "held", "valid"), ("cc-csc", "held", code)]
+
+
+def _validity_of(attrs, flags, parent_class="", invalid=False):
+    """The fixed validity code the closure reports for one filled cvc-like or name field."""
+    field = {"name": "holder", "label": "Name on card", "attrs": attrs, "flags": flags, "parentClass": parent_class,
+             "invalid": invalid}
+    plan = [{"index": 0, "token": "cc-name", "value": "Example Person"}]
+    raw, out = _node({"fields": [field], "plan": plan})
+    assert "Example Person" not in raw
+    return out["retained"][0]["validity"]
+
+
+# D-0358 a note (11-19): a present-but-empty ``pattern`` makes every filled value a patternMismatch (a hosted
+# cardholder-name input inside a novalidate form); that HTML artefact alone is not the provider's verdict.
+@pytest.mark.parametrize("pattern", ["", "   ", "\t\n"])
+def test_an_empty_pattern_alone_does_not_make_a_filled_field_invalid(pattern):
+    attrs = {"aria-invalid": "false", "pattern": pattern}
+    assert _validity_of(attrs, {"patternMismatch": True}, invalid=True) == "valid"
+
+
+@pytest.mark.parametrize("attrs, flags, parent_class, code", [
+    ({"pattern": "[A-Z]+"}, {"patternMismatch": True}, "", "invalid"),  # a real pattern the value breaks
+    ({"pattern": "[A-Z]+"}, {}, "", "valid"),  # a real pattern the value meets
+    ({"pattern": "", "aria-invalid": "true"}, {"patternMismatch": True}, "", "invalid"),  # the provider says so
+    ({"pattern": ""}, {"patternMismatch": True}, "StripeElement--invalid", "invalid"),  # its own invalid class
+    ({"pattern": ""}, {"patternMismatch": True, "valueMissing": True}, "", "invalid"),
+    ({"pattern": ""}, {"patternMismatch": True, "customError": True}, "", "invalid"),
+    ({"pattern": ""}, {"patternMismatch": True, "typeMismatch": True}, "", "invalid"),
+    ({"pattern": ""}, {"patternMismatch": True, "tooShort": True}, "", "invalid"),
+    ({"pattern": ""}, {"patternMismatch": True, "tooLong": True}, "", "invalid"),
+    ({"pattern": ""}, {"patternMismatch": True, "rangeOverflow": True}, "", "invalid"),
+    ({"pattern": ""}, {"patternMismatch": True, "stepMismatch": True}, "", "invalid"),
+    ({"pattern": ""}, {"patternMismatch": True, "badInput": True}, "", "invalid"),
+    ({}, {"valueMissing": True}, "", "invalid"),  # required and empty, no pattern at all
+    ({}, {"patternMismatch": True}, "", "invalid"),  # a mismatch with no pattern attribute is never excused
+    ({}, {"customError": True}, "", "invalid"),
+    ({}, {}, "is-invalid", "invalid"),
+    ({}, {}, "", "valid"),
+])
+def test_other_constraint_failures_stay_invalid(attrs, flags, parent_class, code):
+    assert _validity_of(attrs, flags, parent_class) == code
+
+
+def test_without_validity_state_the_old_invalid_selector_still_decides():
+    assert _validity_of({"pattern": ""}, None, invalid=True) == "invalid"
+    assert _validity_of({"pattern": ""}, None, invalid=False) == "valid"
 
 
 # --- records: refusals and stops name fixed codes and counts ------------------------------------------------------
