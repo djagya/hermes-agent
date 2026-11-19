@@ -609,6 +609,7 @@ def _xai_oauth_device_code_login(*, timeout_seconds: float = 20.0, open_browser:
         raise _xai_err("xAI device-code token response was missing required tokens.", "xai_device_token_invalid")
     return {
         "tokens": _xai_tokens_from_payload(payload, access_token, refresh_token),
-        "discovery": discovery, "redirect_uri": "", "base_url": _xai_oauth_persisted_base_url(_xai_oauth_inference_base_url()),
+        "discovery": discovery, "redirect_uri": "",
+        "base_url": _xai_oauth_persisted_base_url(_xai_oauth_inference_base_url()),
         "last_refresh": _utc_now_z(), "source": "oauth-device-code",
     }

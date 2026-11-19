@@ -860,11 +860,11 @@ def base_url_origin(base_url: str) -> tuple[str, str, int]:
 
 def is_xai_subscription_proxy_url(base_url: str) -> bool:
     """True only for the exact xAI subscription origin ``https://cli-chat-proxy.grok.com[:443]`` (no userinfo)."""
-    parsed = _parse_base_url(base_url)
     try:
+        parsed = _parse_base_url(base_url)
         return (parsed is not None and base_url_origin(base_url) == ("https", "cli-chat-proxy.grok.com", 443)
                 and parsed.username is None and parsed.password is None)
-    except ValueError:
+    except ValueError:  # malformed IPv6 literal / port
         return False
 
 
@@ -872,7 +872,10 @@ def is_xai_inference_host(base_url: str) -> bool:
     """True when ``base_url`` is an xAI inference route: the exact ``api.x.ai`` host or the exact
     subscription proxy origin (the xai-oauth default). Use this, not ``== "api.x.ai"``, wherever a
     route is recognised as xAI. Direct HTTP APIs (images, TTS, STT) stay on ``api.x.ai``."""
-    return base_url_hostname(base_url) == "api.x.ai" or is_xai_subscription_proxy_url(base_url)
+    try:
+        return base_url_hostname(base_url) == "api.x.ai" or is_xai_subscription_proxy_url(base_url)
+    except ValueError:
+        return False
 
 
 def base_url_host_matches(base_url: str, domain: str) -> bool:
