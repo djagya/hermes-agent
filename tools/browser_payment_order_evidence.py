@@ -213,9 +213,7 @@ async def judge(sup: Any, sid: str, row: tuple, scan: dict, checkout: bool, pay:
         return None, "pay_control_shown", False
     same = before is not None and tuple(before.get("doc") or ()) == tuple(row[:2])
     strong = scan["strong"]
-    # G2 (owner: pages act freely): the detection spends the approval on strong wording only, on any document;
-    # weaker order wording is left to payment_done
-    wording = (strong and before.get("strong") is False) if same else (strong if need_wording else scan["order"])
+    wording = (strong and before.get("strong") is False) if same else scan["order"]
     if not wording and (checkout or need_wording):
         return None, "no_order_wording", False
     if not checkout:

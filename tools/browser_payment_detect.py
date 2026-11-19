@@ -165,14 +165,22 @@ async def _scan_tab(sup: Any, gate: Any, sid: str) -> Optional[dict]:
     return {"evidence": evidence, "strong": strong}
 
 
-async def _scan_new_tabs(sup: Any, gate: Any, before: frozenset) -> Optional[dict]:
-    """A page target opened by the payment tab since ``before`` that shows order evidence (a new document)."""
+async def _scan_new_tabs(sup: Any, gate: Any, before: frozenset, only: Optional[frozenset] = None,
+                         seen: Optional[set] = None) -> Optional[dict]:
+    """A page target opened by the payment tab since ``before`` that shows order evidence (a new document).
+    ``only`` (G3): look at these targets only (the ones a press opened, re-read before the next press); ``seen``: filled
+    with every target the press opened (whatever it shows now)."""
     from tools import browser_payment_done as done
 
     opener = done.payment_tabs(sup)
     infos = (await sup._cdp("Target.getTargets"))["result"]["targetInfos"]
-    new = [t["targetId"] for t in infos if isinstance(t, dict) and t.get("type") == "page"
-           and t.get("targetId") not in before and t.get("openerId") in opener]
+    opened = [t for t in infos if isinstance(t, dict) and t.get("type") == "page"
+              and t.get("targetId") not in before and t.get("openerId") in opener
+              and (only is None or t.get("targetId") in only)]
+    if seen is not None:
+        seen.update(t["targetId"] for t in opened)
+    # G3 (Opus RG4 L4): another site's tab never uses the cap
+    new = [t["targetId"] for t in opened if _shop_page(sup, gate, str(t.get("url") or ""))]
     for tab in new[:_MAX_NEW_TABS]:
         try:  # G3 (Opus RG3 M2): one unreadable tab does not stop the scan of the others
             sid, temporary = await done._tab_session(sup, tab)
@@ -209,13 +217,16 @@ async def after_press(sup: Any, gate: Any, page_sid: str, before: Optional[froze
     the approval. ``base``: the booleans read right before this press (``before_press``). Bounded by ``until``
     (monotonic; the press already landed, so the answer must not time out); unread or no evidence: False."""
     gen = gate.gen
-    if gen is not None and gen.pay_tabs is None and before is not None:
-        gen.pay_tabs = before  # G3 (Opus RG3): tabs opened since are looked at again before a later Pay-like press
+    opened: set = set()
+    if gen is not None:
+        gen.pay_tabs = None
 
     async def look() -> Optional[dict]:
         found, _mine = await _scan_top(sup, gate, page_sid, base, True)
         if found is None and before is not None:
-            found = await _scan_new_tabs(sup, gate, before)
+            found = await _scan_new_tabs(sup, gate, before, seen=opened)
+            if gen is not None and opened:  # G3 (Opus RG3/RG4): only the tabs THIS press opened are read again
+                gen.pay_tabs = (before, frozenset(opened))
         return found
 
     try:
@@ -236,17 +247,20 @@ async def before_press(sup: Any, gate: Any, page_sid: str, deadline: float) -> t
     later = gen is not None and gen.pay_at is not None
     if later and inflight(sup, gen):
         return {"success": False, "error_type": INFLIGHT, "error": _INFLIGHT_TEXT}, None
-    async def look() -> tuple:
-        found, mine = await _scan_top(sup, gate, page_sid, gen.pay_base if later else None, later)
-        if found is None and later and gen.pay_tabs is not None:  # G3: a confirmation tab that loaded late
-            found = await _scan_new_tabs(sup, gate, gen.pay_tabs)
-        return found, mine
-
+    until = time.monotonic() + max(0.1, min(_BEFORE_SCAN_S, deadline - time.monotonic()))
     try:
-        found, mine = await asyncio.wait_for(look(), timeout=max(0.1, min(_BEFORE_SCAN_S, deadline - time.monotonic())))
+        found, mine = await asyncio.wait_for(
+            _scan_top(sup, gate, page_sid, gen.pay_base if later else None, later),
+            timeout=max(0.1, until - time.monotonic()))
     except Exception as exc:  # health: allow BLE001 -- unread: nothing found; the in-flight check still runs last
         logger.info("payment_click: payment detection before the press not read (%s)", type(exc).__name__)
         return None, None
+    if found is None and later and gen.pay_tabs is not None:  # G3: a confirmation tab that loaded late; its own
+        try:  # bound, so a slow tab never drops ``mine`` (Opus RG4 M2)
+            found = await asyncio.wait_for(_scan_new_tabs(sup, gate, *gen.pay_tabs),
+                                           timeout=max(0.1, until - time.monotonic()))
+        except Exception as exc:  # health: allow BLE001 -- unread tabs: no evidence; the top document's look stays
+            logger.info("payment_click: new tabs before the press not read (%s)", type(exc).__name__)
     if found and _spend(sup, gate, found, gen.pay_caption):
         return spent_refusal(gen), None
     return None, mine
