@@ -1179,10 +1179,15 @@ class SessionStore(
         return self._update_entry(session_key, _apply)
 
     def get_model_override(self, session_key: str) -> Optional[dict[str, str]]:
-        """Return the persisted /model override for *session_key*, if any."""
+        """Return the persisted /model override for *session_key*, if any, with its route ``base_url`` in the
+        live spelling (the stored xai-oauth legacy URL reads back as the subscription proxy)."""
+        from hermes_cli.route_identity import canonical_xai_route
         with self._lock:
             entry = self._entry_locked(session_key)
-            return dict(entry.model_override) if entry and entry.model_override else None
+            override = dict(entry.model_override) if entry and entry.model_override else None
+        if override and override.get("base_url"):
+            override["base_url"] = canonical_xai_route(override.get("provider"), override["base_url"])
+        return override
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""

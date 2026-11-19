@@ -72,6 +72,7 @@ SITES: dict[str, tuple[str, str]] = {
     "hermes_cli/runtime_provider.py::is_foreign_provider_endpoint": ("compare", "legacy is xai-oauth's own"),
     # read
     "gateway/run_agent_cache.py::GatewayAgentCacheMixin._rehydrate_session_model_override": ("read", "persisted override"),
+    "gateway/session.py::SessionStore.get_model_override": ("read", "session-store override reader"),
     "hermes_state_gateway.py::SessionGatewayMixin.session_gateway_runtime": ("read", "resume route reader"),
     "hermes_cli/auth_xai.py::_xai_oauth_runtime_base_url": ("read", "auth/pool rows"),
     "hermes_cli/auth_xai.py::_xai_oauth_inference_base_url": ("read", "-> _xai_oauth_runtime_base_url"),
@@ -532,6 +533,43 @@ def test_session_route_reads_back_live(home, provider, stored):
     db = _session_db(home)
     db.update_session_model("s1", "grok-4", provider=provider, base_url=PROXY)
     assert SessionDB.session_gateway_runtime(db.get_session("s1"))["base_url"] == PROXY
+
+
+@pytest.fixture
+def override_store(tmp_path, monkeypatch):
+    import hermes_state
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+
+    def _raise():
+        raise RuntimeError("SQLite disabled in test")
+
+    monkeypatch.setattr(hermes_state, "SessionDB", _raise)
+    return lambda: SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+@pytest.mark.parametrize("stored", sorted(STORED))
+def test_session_store_override_reads_back_live(override_store, tmp_path, provider, stored):
+    """``SessionStore.get_model_override`` is the one read chokepoint of the session-store override
+    (``messaging_route_info`` -> ``effort_fields`` reads it raw): it returns the live spelling, sessions.json
+    keeps the stored one, and a restarted store reads the same."""
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    store = override_store()
+    key = store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, user_id="u", chat_id="c",
+                                                    user_name="t", chat_type="dm")).session_key
+    store.set_model_override(key, {"model": "grok-4", "provider": provider, "base_url": STORED[stored]})
+    want = PROXY if provider == "xai-oauth" and stored in ("legacy", "legacy-slash") else STORED[stored]
+    want_stored = LEGACY if provider == "xai-oauth" and stored == "proxy" else STORED[stored]
+    for reader in (store, override_store()):
+        got = reader.get_model_override(key)
+        assert got["base_url"] == want and got["provider"] == provider and got["model"] == "grok-4"
+    assert json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))[key]["model_override"]["base_url"] == want_stored
+    # The returned dict is a copy: mutating it never changes the stored entry.
+    copy = store.get_model_override(key)
+    copy["base_url"] = "https://mutated.example/v1"
+    assert store.get_model_override(key)["base_url"] == want
 
 
 @pytest.mark.parametrize("stored", sorted(STORED))
