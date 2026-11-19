@@ -174,12 +174,16 @@ async def _scan_new_tabs(sup: Any, gate: Any, before: frozenset) -> Optional[dic
     new = [t["targetId"] for t in infos if isinstance(t, dict) and t.get("type") == "page"
            and t.get("targetId") not in before and t.get("openerId") in opener]
     for tab in new[:_MAX_NEW_TABS]:
-        sid, temporary = await done._tab_session(sup, tab)
-        try:
-            found = await _scan_tab(sup, gate, sid)
-        finally:
-            if temporary:
-                await sup._release_payment_sessions({"tab": sid})
+        try:  # G3 (Opus RG3 M2): one unreadable tab does not stop the scan of the others
+            sid, temporary = await done._tab_session(sup, tab)
+            try:
+                found = await _scan_tab(sup, gate, sid)
+            finally:
+                if temporary:
+                    await sup._release_payment_sessions({"tab": sid})
+        except Exception as exc:  # health: allow BLE001 -- this tab unread: the next one is still looked at
+            logger.info("payment_click: a new tab not read (%s)", type(exc).__name__)
+            continue
         if found:
             return {"where": "new_tab", "tab": tab, **found}
     return None
@@ -204,6 +208,10 @@ async def after_press(sup: Any, gate: Any, page_sid: str, before: Optional[froze
     """After a Pay-like press's effect read: order evidence on the top document (or a tab the press opened) spends
     the approval. ``base``: the booleans read right before this press (``before_press``). Bounded by ``until``
     (monotonic; the press already landed, so the answer must not time out); unread or no evidence: False."""
+    gen = gate.gen
+    if gen is not None and gen.pay_tabs is None and before is not None:
+        gen.pay_tabs = before  # G3 (Opus RG3): tabs opened since are looked at again before a later Pay-like press
+
     async def look() -> Optional[dict]:
         found, _mine = await _scan_top(sup, gate, page_sid, base, True)
         if found is None and before is not None:
@@ -228,10 +236,14 @@ async def before_press(sup: Any, gate: Any, page_sid: str, deadline: float) -> t
     later = gen is not None and gen.pay_at is not None
     if later and inflight(sup, gen):
         return {"success": False, "error_type": INFLIGHT, "error": _INFLIGHT_TEXT}, None
+    async def look() -> tuple:
+        found, mine = await _scan_top(sup, gate, page_sid, gen.pay_base if later else None, later)
+        if found is None and later and gen.pay_tabs is not None:  # G3: a confirmation tab that loaded late
+            found = await _scan_new_tabs(sup, gate, gen.pay_tabs)
+        return found, mine
+
     try:
-        found, mine = await asyncio.wait_for(
-            _scan_top(sup, gate, page_sid, gen.pay_base if later else None, later),
-            timeout=max(0.1, min(_BEFORE_SCAN_S, deadline - time.monotonic())))
+        found, mine = await asyncio.wait_for(look(), timeout=max(0.1, min(_BEFORE_SCAN_S, deadline - time.monotonic())))
     except Exception as exc:  # health: allow BLE001 -- unread: nothing found; the in-flight check still runs last
         logger.info("payment_click: payment detection before the press not read (%s)", type(exc).__name__)
         return None, None

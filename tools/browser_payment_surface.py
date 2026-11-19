@@ -1681,7 +1681,7 @@ class _LockGen:
     held other tabs. Read and written under ``_LOCK``."""
 
     __slots__ = ("admitted", "approved", "known", "merchant", "native_lost", "owned", "paid", "paid_by", "pay_at",
-                 "pay_base", "pay_caption", "pay_node", "pressed", "presses", "serial", "ws")
+                 "pay_base", "pay_caption", "pay_node", "pay_tabs", "pressed", "presses", "serial", "ws")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
@@ -1719,6 +1719,7 @@ class _LockGen:
         # build G2: ``{"doc": (frame id, loader), "strong": bool or None}`` read right before the latest Pay-like press
         # (the strong order wording the document showed before it; the detection counts only what is new)
         self.pay_base: Optional[dict] = None
+        self.pay_tabs: Optional[frozenset] = None  # G3: the page targets before this approval's first Pay-like press
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
