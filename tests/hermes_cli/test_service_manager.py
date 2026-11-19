@@ -277,8 +277,9 @@ def test_render_finish_script_does_not_restart_on_clean_exit(tmp_path) -> None:
 # stop from a restart kill, and the gateway_state=stopped suppression
 # (run.py) would never engage for explicit stops.
 #
-# The fake below replays what s6 2.15.0.0 (s6-overlay 3.2.3.0, pinned in the
-# Dockerfile) actually prints, captured from the real binary:
+# The fake below replays what s6 2.15.0.0 (s6-overlay 3.2.3.0) actually
+# prints, captured from the real binary. The Dockerfile now pins s6-overlay
+# 3.2.3.2 (s6 2.15.1.0); these lines were not re-captured on it:
 #   s6-svstat <dir>         -> up (pid 26 pgid 26) 1 seconds
 #   s6-svstat -o pid <dir>  -> 26          (-1 when not up)
 #   s6-svstat -o up <dir>   -> true|false

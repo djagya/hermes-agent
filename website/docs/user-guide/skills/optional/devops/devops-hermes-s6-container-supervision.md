@@ -46,7 +46,7 @@ If you're just running the Hermes Agent and want to use Docker, see `website/doc
 
 <!-- ascii-guard-ignore -->
 ```
-/init                                  ← PID 1 (s6-overlay v3.2.3.0)
+/init                                  ← PID 1 (s6-overlay v3.2.3.2)
 ├── cont-init.d                        ← oneshot setup, runs as root
 │   ├── 01-hermes-setup                ← docker/stage2-hook.sh
 │   │   ├── UID/GID remap
