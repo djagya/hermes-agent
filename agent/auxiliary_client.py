@@ -3473,7 +3473,6 @@ _AUTH_REFRESH_PROVIDER_BY_HOST = (
 def _provider_for_host(base_url: str, table: tuple[tuple[str, str], ...]) -> Optional[str]:
     """First provider in ``table`` whose host matches ``base_url``, else a profile claiming the host."""
     for host, provider in table:
-        # ``api.x.ai`` rows name the xAI inference routes: the API host and the xai-oauth subscription proxy.
         if is_xai_inference_host(base_url) if host == "api.x.ai" else base_url_host_matches(base_url, host):
             return provider
     from providers import profile_for_host

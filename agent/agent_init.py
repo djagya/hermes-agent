@@ -290,12 +290,9 @@ def _resolve_api_mode(agent, api_mode, provider_name, base_url):
     elif provider_name is None and host == "chatgpt.com" and "/backend-api/codex" in url:
         agent.api_mode = "codex_responses"
         agent.provider = "openai-codex"
-    elif provider_name is None and host == "api.x.ai":
+    elif provider_name is None and (host == "api.x.ai" or is_xai_subscription_proxy_url(url)):
         agent.api_mode = "codex_responses"
-        agent.provider = "xai"
-    elif provider_name is None and is_xai_subscription_proxy_url(url):
-        agent.api_mode = "codex_responses"
-        agent.provider = "xai-oauth"
+        agent.provider = "xai" if host == "api.x.ai" else "xai-oauth"
     elif agent.provider == "anthropic" or (provider_name is None and host == "api.anthropic.com"):
         agent.api_mode = "anthropic_messages"
         agent.provider = "anthropic"

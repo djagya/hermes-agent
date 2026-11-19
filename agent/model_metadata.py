@@ -517,10 +517,7 @@ def _strip_openrouter_routing_variant(
     base = openrouter_variant_base(model)
     if base is None:
         return model
-    logger.debug(
-        "Resolving context length for OpenRouter routing variant %r via base id %r",
-        model, base,
-    )
+    logger.debug("Resolving context length for OpenRouter routing variant %r via base id %r", model, base)
     return base
 
 

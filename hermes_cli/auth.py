@@ -2294,15 +2294,12 @@ def _update_config_for_provider(
     require_readable_config_before_write(config_path)
     config = read_raw_config()
     current_model = config.get("model")
-    if isinstance(current_model, dict):
-        model_cfg = dict(current_model)
-    else:
-        model_cfg = {"default": current_model.strip()} if _nonempty_str(current_model) else {}
+    model_cfg = (dict(current_model) if isinstance(current_model, dict)
+                 else {"default": current_model.strip()} if _nonempty_str(current_model) else {})
     model_cfg["provider"] = provider_id
-    if provider_id == "xai-oauth" and (inference_base_url or "").strip():
-        inference_base_url = _xai_oauth_persisted_base_url(inference_base_url)
     if inference_base_url and inference_base_url.strip():
-        model_cfg["base_url"] = inference_base_url.rstrip("/")
+        stored = _xai_oauth_persisted_base_url(inference_base_url) if provider_id == "xai-oauth" else inference_base_url
+        model_cfg["base_url"] = stored.rstrip("/")
     else:
         model_cfg.pop("base_url", None)  # clear stale base_url when switching providers
 
