@@ -482,7 +482,8 @@ def _builtin_session(provider: str, stt_config: dict[str, Any], language: Option
         api_key = str(get_env_value("XAI_API_KEY") or "").strip()  # API key only, like the Desktop wire
         if not api_key:
             return None
-        base = str(section.get("base_url") or get_env_value("XAI_STT_BASE_URL") or tc.XAI_STT_BASE_URL)
+        from tools.xai_http import xai_api_base_url
+        base = xai_api_base_url(section.get("base_url"), get_env_value("XAI_STT_BASE_URL"), tc.XAI_STT_BASE_URL)
         return XAIStreamingSession(api_key, base, tc.normalize_xai_stt_model(section.get("model")),
                                    language, on_partial)
     if provider == "elevenlabs":

@@ -95,7 +95,6 @@ class TestTranscribeCallSitesReadDotenv:
     def test_transcribe_xai_forwards_dotenv_key(self):
         """An explicit XAI_API_KEY must win over Grok subscription OAuth for STT."""
         from tools import transcription_tools as tt
-        from tools import xai_http
 
         captured: dict = {}
 
@@ -113,18 +112,17 @@ class TestTranscribeCallSitesReadDotenv:
                 return "xai-dotenv-key"
             return None
 
+        # A live subscription OAuth credential is in the pool: the resolver STT asks must still pick the key.
+        oauth = MagicMock(runtime_api_key="subscription-oauth-token", base_url="https://api.x.ai/v1")
         with patch("hermes_cli.config.get_env_value", side_effect=fake_get_env_value), \
-             patch.object(xai_http, "resolve_xai_http_credentials", return_value={
-                 "provider": "xai-oauth",
-                 "api_key": "subscription-oauth-token",
-                 "base_url": "https://api.x.ai/v1",
-             }), \
+             patch("agent.credential_pool.load_pool", return_value=MagicMock(select=MagicMock(return_value=oauth))), \
              patch("requests.post", side_effect=fake_post), \
              patch("builtins.open", MagicMock()):
             result = tt._transcribe_xai("/tmp/fake.mp3", "grok-stt")
 
         assert result["success"] is True
         assert captured["headers"]["Authorization"] == "Bearer xai-dotenv-key"
+        assert captured["url"] == "https://api.x.ai/v1/stt"
 
     def test_transcribe_elevenlabs_forwards_dotenv_key(self):
         from tools import transcription_tools as tt

@@ -213,6 +213,15 @@ def _off_subscription_proxy(base_url: str) -> str:
     return DEFAULT_XAI_BASE_URL if _xai_is_grok_proxy_url(base_url) else base_url
 
 
+def xai_api_base_url(*candidates: Any) -> str:
+    """The base URL an xAI API key (or an OAuth bearer kept off the subscription proxy) is sent to: the
+    first non-empty candidate when it is a validated xAI HTTPS origin, else ``api.x.ai``; the subscription
+    proxy maps to ``api.x.ai``. Every API-key surface (STT, TTS, streaming STT, this resolver) uses it."""
+    import hermes_cli.auth as auth_mod
+    chosen = next((str(c).strip().rstrip("/") for c in candidates if str(c or "").strip()), "")
+    return _off_subscription_proxy(auth_mod._xai_validate_inference_base_url(chosen, fallback=DEFAULT_XAI_BASE_URL))
+
+
 def resolve_xai_http_credentials(
     *, force_refresh: bool = False, api_key_hint: Optional[str] = None, prefer_api_key: bool = False,
     subscription_route: bool = False,
@@ -244,9 +253,7 @@ def resolve_xai_http_credentials(
     import hermes_cli.auth as auth_mod
     if prefer_api_key and (explicit_key := str(_resolve_explicit_xai_api_key() or "").strip()):
         # Origin-pinned so a tampered env override can't exfiltrate the bearer; rejection -> default URL.
-        override = _xai_base_url_override()
-        base_url = auth_mod._xai_validate_inference_base_url(override, fallback=DEFAULT_XAI_BASE_URL)
-        return {"provider": "xai", "api_key": explicit_key, "base_url": _off_subscription_proxy(base_url)}
+        return {"provider": "xai", "api_key": explicit_key, "base_url": xai_api_base_url(_xai_base_url_override())}
 
     try:
         from agent.credential_pool import load_pool
@@ -269,6 +276,4 @@ def resolve_xai_http_credentials(
         pass
 
     # No OAuth bearer: the API key goes only to a validated xAI origin, never to the subscription proxy.
-    api_key = _resolve_explicit_xai_api_key()
-    base_url = auth_mod._xai_validate_inference_base_url(_xai_base_url_override(), fallback=DEFAULT_XAI_BASE_URL)
-    return {"provider": "xai", "api_key": api_key, "base_url": _off_subscription_proxy(base_url)}
+    return {"provider": "xai", "api_key": _resolve_explicit_xai_api_key(), "base_url": xai_api_base_url(_xai_base_url_override())}
