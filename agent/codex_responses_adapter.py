@@ -781,7 +781,7 @@ class ResponsesRouteFlags(NamedTuple):
 def classify_responses_route(agent: Any) -> ResponsesRouteFlags:
     """Classify the agent's Responses route from provider + base URL. Host checks are
     exact-host-or-subdomain, never substring (``evil.com/chatgpt.com`` is not ChatGPT)."""
-    from utils import base_url_hostname
+    from utils import base_url_hostname, is_xai_inference_host
     provider = getattr(agent, "provider", None)
     base_url = str(getattr(agent, "base_url", "") or "")
     hostname = str(getattr(agent, "_base_url_hostname", "") or "").lower() or base_url_hostname(base_url)
@@ -790,7 +790,7 @@ def classify_responses_route(agent: Any) -> ResponsesRouteFlags:
         return hostname == domain or hostname.endswith("." + domain)
     return ResponsesRouteFlags(
         is_codex_backend=provider == "openai-codex" or (_host_is("chatgpt.com") and "/backend-api/codex" in lower),
-        is_xai_responses=provider in {"xai", "xai-oauth"} or hostname == "api.x.ai",
+        is_xai_responses=provider in {"xai", "xai-oauth"} or is_xai_inference_host(base_url),
         endpoint=responses_endpoint_quirks(base_url),
     )
 

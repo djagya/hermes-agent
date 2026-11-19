@@ -20,7 +20,7 @@ from hermes_cli.auth_constants import (
     XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_DEVICE_CODE_URL,
     XAI_OAUTH_DISCOVERY_URL, XAI_OAUTH_SCOPE, _FORM_JSON_HEADERS, _xai_err, httpx,
 )
-from utils import env_float
+from utils import env_float, is_xai_subscription_proxy_url
 
 if TYPE_CHECKING:  # annotation-only; the runtime import would be a cycle
     from hermes_cli.auth import ProviderConfig
@@ -234,13 +234,7 @@ def _xai_validate_oauth_endpoint(url: str, *, field: str) -> str:
 
 def _xai_is_grok_proxy_url(value: str) -> bool:
     """Match only the subscription HTTPS origin (not arbitrary grok.com hosts)."""
-    try:
-        parsed = urlparse(value)
-        return (parsed.scheme == "https" and parsed.hostname == "cli-chat-proxy.grok.com"
-                and parsed.port in (None, 443) and parsed.username is None
-                and parsed.password is None)
-    except ValueError:
-        return False
+    return is_xai_subscription_proxy_url(value)
 
 
 def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:

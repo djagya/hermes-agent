@@ -139,7 +139,7 @@ from agent.auxiliary_unavailable import (
     AuxiliaryClientUnavailable, clear_nous_credential_failure, missing_provider_credentials_message,
     nous_credential_failure_detail, record_nous_credential_failure)
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
-from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
+from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path, env_float, is_truthy_value, is_xai_inference_host, is_xai_subscription_proxy_url, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -2253,9 +2253,9 @@ def _endpoint_default_headers(
         headers = route
     elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
         headers = dict(build_nvidia_nim_headers(base_url))
-    elif xai and base_url_host_matches(base_url, "x.ai"):
+    elif xai and (base_url_host_matches(base_url, "x.ai") or is_xai_subscription_proxy_url(base_url)):
         from tools.xai_http import hermes_xai_default_headers
-        headers = dict(hermes_xai_default_headers())
+        headers = dict(hermes_xai_default_headers(base_url))
     else:
         headers = _profile_default_headers(provider) or {}
     return _apply_user_default_headers(headers or None) or None
@@ -3473,7 +3473,8 @@ _AUTH_REFRESH_PROVIDER_BY_HOST = (
 def _provider_for_host(base_url: str, table: tuple[tuple[str, str], ...]) -> Optional[str]:
     """First provider in ``table`` whose host matches ``base_url``, else a profile claiming the host."""
     for host, provider in table:
-        if base_url_host_matches(base_url, host):
+        # ``api.x.ai`` rows name the xAI inference routes: the API host and the xai-oauth subscription proxy.
+        if is_xai_inference_host(base_url) if host == "api.x.ai" else base_url_host_matches(base_url, host):
             return provider
     from providers import profile_for_host
     return getattr(profile_for_host(base_url), "name", None)

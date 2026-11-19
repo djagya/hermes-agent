@@ -23,7 +23,7 @@ from agent.context_default_record import mark_context_defaulted, records_context
 from agent.model_metadata_llamacpp import llamacpp_context
 from agent.model_metadata_memo_bounds import MEMO_LOCK, bound_codex_caches, remember_endpoint_models as _remember_endpoint_models
 
-from utils import atomic_json_write, base_url_host_matches, base_url_hostname
+from utils import atomic_json_write, base_url_host_matches, base_url_hostname, is_xai_inference_host
 
 from hermes_constants import OPENROUTER_MODELS_URL, openrouter_variant_base
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, unpriced_replay_fields, without_persistence_fields
@@ -477,6 +477,8 @@ def _infer_provider_from_url(base_url: str) -> Optional[str]:
     from providers import profile_for_host
     if (profile := profile_for_host(base_url, metadata=True)) is not None:  # profile claims beat table rows
         return profile.name
+    if is_xai_inference_host(base_url):  # the xai-oauth subscription proxy shares models.dev's ``xai`` card
+        return "xai"
     for domain, provider in _URL_TO_PROVIDER.items():
         if base_url_host_matches(host, domain):
             return provider

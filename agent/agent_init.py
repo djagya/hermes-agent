@@ -48,7 +48,7 @@ from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
 from hermes_state_ids import new_session_id
-from utils import base_url_host_matches, is_truthy_value
+from utils import base_url_host_matches, is_truthy_value, is_xai_subscription_proxy_url
 
 # Same logger name as run_agent so caplog/patches on "run_agent" see our records.
 logger = logging.getLogger("run_agent")
@@ -293,6 +293,9 @@ def _resolve_api_mode(agent, api_mode, provider_name, base_url):
     elif provider_name is None and host == "api.x.ai":
         agent.api_mode = "codex_responses"
         agent.provider = "xai"
+    elif provider_name is None and is_xai_subscription_proxy_url(url):
+        agent.api_mode = "codex_responses"
+        agent.provider = "xai-oauth"
     elif agent.provider == "anthropic" or (provider_name is None and host == "api.anthropic.com"):
         agent.api_mode = "anthropic_messages"
         agent.provider = "anthropic"
