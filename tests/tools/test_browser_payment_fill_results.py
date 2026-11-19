@@ -325,17 +325,53 @@ def test_other_constraint_failures_stay_invalid(attrs, flags, parent_class, code
     assert _validity_of(attrs, flags, parent_class) == code
 
 
-# The excuse applies only where the browser would not block the submission anyway, and only to an <input>.
+# The excuse applies only where the browser would not block the submission anyway.
 @pytest.mark.parametrize("extra, code", [
     ({}, "valid"),  # no form at all
     ({"form": {"noValidate": True}}, "valid"),  # Shopify's hosted frame form
     ({"form": {"noValidate": False}}, "invalid"),  # a native form: its submit button would never submit
-    ({"tagName": "FA-INPUT"}, "invalid"),  # a custom element is not the HTML input artefact
-    ({"tagName": "fa-input", "form": {"noValidate": True}}, "invalid"),
-    ({"tagName": "input"}, "valid"),  # tagName casing does not matter
 ])
-def test_an_empty_pattern_is_excused_only_on_an_input_the_browser_would_not_block(extra, code):
+def test_an_empty_pattern_is_excused_only_where_the_browser_would_not_block(extra, code):
     assert _validity_of({"pattern": ""}, {"patternMismatch": True}, **extra) == code
+
+
+# ... and only on an <input>. The closure only ever enumerates INPUT and SELECT, so a custom element (a form-associated
+# one can report any ValidityState) is exercised on the validity decision itself, cut out of the closure text.
+_DECISION = r"""
+const CASE_EL = EL;
+const el = {tagName: CASE_EL.tagName, form: CASE_EL.form || null, validity: CASE_EL.validity,
+  getAttribute: n => (n === 'pattern' ? CASE_EL.pattern : null), classList: {contains: () => false},
+  parentElement: null, matches: s => s === ':invalid'};
+SEGMENT
+process.stdout.write(JSON.stringify(validity(el)));
+"""
+
+
+def _decision_of(**el):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for the synthetic inspection closure")
+    start = sp._INSPECT.index("  const INVALID_CLASSES")
+    segment = sp._INSPECT[start:sp._INSPECT.index("  // dlz (B final, Codex P1)", start)]
+    values = {"EL": json.dumps(el), "SEGMENT": segment}
+    harness = re.sub(r"\bEL\b|\bSEGMENT\b", lambda m: values[m.group(0)], _DECISION)
+    run = subprocess.run([node], input=harness, text=True, capture_output=True, timeout=10, check=False)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+@pytest.mark.parametrize("tag, form, code", [
+    ("INPUT", None, "valid"),
+    ("INPUT", {"noValidate": True}, "valid"),
+    ("INPUT", {"noValidate": False}, "invalid"),
+    ("input", {"noValidate": True}, "valid"),  # tagName casing does not matter
+    ("FA-INPUT", None, "invalid"),  # a custom element is not the HTML input artefact
+    ("FA-INPUT", {"noValidate": True}, "invalid"),
+    ("SELECT", None, "invalid"),
+])
+def test_the_empty_pattern_excuse_is_for_an_input_element_only(tag, form, code):
+    validity = {"valid": False, "patternMismatch": True}
+    assert _decision_of(tagName=tag, form=form, pattern="", validity=validity) == code
 
 
 # A field the browser does not validate is never :invalid, whatever its ValidityState says (as before the change).
