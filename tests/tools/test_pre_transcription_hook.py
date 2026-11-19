@@ -403,7 +403,7 @@ class TestUnsupportedBackends:
         audio = _make_audio(tmp_path)
         monkeypatch.setattr(
             "tools.xai_http.resolve_xai_http_credentials",
-            lambda: {"api_key": "xk-test", "base_url": None},
+            lambda **_kw: {"api_key": "xk-test", "base_url": None},
         )
         monkeypatch.setattr(
             "tools.xai_http.hermes_xai_user_agent", lambda: "test-ua",

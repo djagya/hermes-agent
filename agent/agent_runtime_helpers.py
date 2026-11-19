@@ -2031,8 +2031,6 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         keepalive_http = agent._build_keepalive_http_client(client_kwargs.get("base_url", ""), verify=httpx_verify)
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http
-    # Retries belong to the outer conversation loop (honors Retry-After); SDK retries would
-    # double-retry inside it. auxiliary_client keeps SDK retries as it isn't wrapped.
     # Delegate all rate-limit / 5xx retry to hermes's outer conversation loop, which honors Retry-After and
     # applies adaptive/jittered backoff. The OpenAI SDK default (max_retries=2) uses its own 1-2s backoff
     # that ignores Retry-After and double-retries inside our loop — the same deadlock the Anthropic clients
@@ -2050,6 +2048,8 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     )
     # ``process_bootstrap.OpenAI`` is a lazy SDK proxy; resolved at call time so tests can patch it.
     from agent import process_bootstrap
+    from tools.xai_http import apply_xai_route_headers
+    apply_xai_route_headers(client_kwargs, str(client_kwargs.get("base_url", "")))
     client = process_bootstrap.OpenAI(**client_kwargs)
     # Routing proxies name the deployment they served in a response header (#54864).
     from agent.served_model import install_served_model_capture

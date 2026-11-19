@@ -20,7 +20,7 @@ from hermes_cli.auth_constants import (
     XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_DEVICE_CODE_URL,
     XAI_OAUTH_DISCOVERY_URL, XAI_OAUTH_SCOPE, _FORM_JSON_HEADERS, _xai_err, httpx,
 )
-from utils import env_float
+from utils import env_float, is_xai_subscription_proxy_url
 
 if TYPE_CHECKING:  # annotation-only; the runtime import would be a cycle
     from hermes_cli.auth import ProviderConfig
@@ -232,8 +232,13 @@ def _xai_validate_oauth_endpoint(url: str, *, field: str) -> str:
     raise _xai_err(message, "xai_discovery_invalid")
 
 
+def _xai_is_grok_proxy_url(value: str) -> bool:
+    """Match only the subscription HTTPS origin (not arbitrary grok.com hosts)."""
+    return is_xai_subscription_proxy_url(value)
+
+
 def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
-    """Pin the OAuth inference base_url to ``*.x.ai``; warn and use *fallback* on rejection.
+    """Pin inference to xAI HTTPS origins or the exact subscription proxy origin.
 
     Warn-not-raise: a bad env var must not deadlock auth, but the bearer must never leak elsewhere.
     """
@@ -242,10 +247,14 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
         return fallback
     try:
         problem, host = _xai_url_problem(candidate)
+        parsed = urlparse(candidate)
+        port = parsed.port
     except Exception:
         logger.warning("Ignoring malformed xAI base_url override %r; using %s instead.", candidate, fallback)
         return fallback
-    if problem is None:
+    if _xai_is_grok_proxy_url(candidate):
+        return candidate
+    if problem is None and port in (None, 443) and parsed.username is None and parsed.password is None:
         return candidate
     if problem == "scheme":
         logger.warning(
@@ -258,7 +267,7 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
     else:
         logger.warning(
             "Refusing xAI base_url override %r — host %r is not on the xAI origin "
-            "(expected x.ai or a *.x.ai subdomain). The xai-oauth bearer is only "
+            "(expected HTTPS x.ai, *.x.ai, or cli-chat-proxy.grok.com on port 443, without userinfo). The xai-oauth bearer is only "
             "valid against xAI's inference API; sending it elsewhere would leak "
             "the credential. Falling back to %s.",
             candidate, host, fallback,
@@ -407,11 +416,31 @@ def _quarantine_xai_oauth_tokens(exc: AuthError) -> None:
         logger.debug("xAI OAuth: failed to persist quarantined state: %s", save_exc)
 
 
+def _xai_oauth_runtime_base_url(value: str = "", *, override: str = "") -> str:
+    """Migrate legacy OAuth defaults at read time, without rewriting auth rows.
+
+    The canonical API URL used to be persisted as the OAuth default, so it is
+    not evidence of customization. Noncanonical compatible routes survive;
+    explicit environment overrides (even the canonical API URL) win separately.
+    """
+    from hermes_cli.route_identity import canonical_xai_route
+    candidate = canonical_xai_route("xai-oauth", str(value or "").strip()).rstrip("/")
+    base = _xai_validate_inference_base_url(candidate, fallback=DEFAULT_XAI_OAUTH_BASE_URL)
+    return _xai_validate_inference_base_url(override, fallback=base)
+
+
+def _xai_oauth_persisted_base_url(value: str = "") -> str:
+    """The base_url to store for xai-oauth (auth.json, pool, config.yaml): the new default is stored as the
+    legacy API URL, so rolling the image back keeps a working route and the read-time migration does the rest."""
+    from hermes_cli.route_identity import persisted_xai_route
+    candidate = str(value or "").strip().rstrip("/")
+    return persisted_xai_route("xai-oauth", candidate or DEFAULT_XAI_OAUTH_BASE_URL).rstrip("/")
+
+
 def _xai_oauth_inference_base_url() -> str:
-    return _xai_validate_inference_base_url(
-        os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/") or os.getenv("XAI_BASE_URL", "").strip().rstrip("/"),
-        fallback=DEFAULT_XAI_OAUTH_BASE_URL,
-    )
+    return _xai_oauth_runtime_base_url(override=(
+        os.getenv("HERMES_XAI_BASE_URL", "").strip() or os.getenv("XAI_BASE_URL", "").strip()
+    ))
 
 
 def resolve_xai_oauth_runtime_credentials(
@@ -579,6 +608,7 @@ def _xai_oauth_device_code_login(*, timeout_seconds: float = 20.0, open_browser:
         raise _xai_err("xAI device-code token response was missing required tokens.", "xai_device_token_invalid")
     return {
         "tokens": _xai_tokens_from_payload(payload, access_token, refresh_token),
-        "discovery": discovery, "redirect_uri": "", "base_url": _xai_oauth_inference_base_url(),
+        "discovery": discovery, "redirect_uri": "",
+        "base_url": _xai_oauth_persisted_base_url(_xai_oauth_inference_base_url()),
         "last_refresh": _utc_now_z(), "source": "oauth-device-code",
     }

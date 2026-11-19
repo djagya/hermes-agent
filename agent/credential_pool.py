@@ -293,13 +293,8 @@ class PooledCredential:
                 (self.agent_key, self.agent_key_expires_at),
                 (self.access_token, self.expires_at),
             ):
-                if (
-                    isinstance(token, str)
-                    and token.strip()
-                    and auth_mod._nous_invoke_jwt_is_usable(
-                        token, scope=getattr(self, "scope", None), expires_at=expires_at,
-                    )
-                ):
+                if isinstance(token, str) and token.strip() and auth_mod._nous_invoke_jwt_is_usable(
+                        token, scope=getattr(self, "scope", None), expires_at=expires_at):
                     return token.strip()
             return ""
         return str(self.access_token or "")
@@ -313,6 +308,9 @@ class PooledCredential:
             # for every reader of the row — initial resolution AND a 401/429 rotation
             # (client_lifecycle._swap_credential), or a rotation silently leaves the proxy.
             return get_secret_str("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or self.base_url
+        if self.provider == "xai-oauth":
+            xai_override = get_secret_str("HERMES_XAI_BASE_URL", "") or get_secret_str("XAI_BASE_URL", "")
+            return auth_mod._xai_oauth_runtime_base_url(self.base_url or "", override=xai_override)
         return self.base_url
 
 
@@ -631,8 +629,9 @@ def credential_pool_entry_serves_endpoint(entry: Any, base_url: Any) -> bool:
     entry_url = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None)
     if not isinstance(entry_url, str) or not entry_url:
         return True
-    from hermes_cli.route_identity import normalize_route_base_url
-    return normalize_route_base_url(entry_url) == normalize_route_base_url(base_url)
+    from hermes_cli.route_identity import route_key
+    provider = getattr(entry, "provider", "")
+    return route_key(provider, entry_url) == route_key(provider, base_url)
 
 
 def credential_pool_matches_provider(
@@ -2726,7 +2725,7 @@ def _seed_tokens_singleton(seed: _Seeder, auth_store: dict[str, Any]) -> None:
         base_url = auth_mod.DEFAULT_CODEX_BASE_URL
         custom_label = str(state.get("label") or "").strip()
     else:
-        base_url = auth_mod.DEFAULT_XAI_OAUTH_BASE_URL
+        base_url = auth_mod._xai_oauth_persisted_base_url()
         custom_label = ""
     seed.upsert("device_code", {
         "auth_type": AUTH_TYPE_OAUTH,

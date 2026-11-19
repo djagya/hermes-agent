@@ -145,7 +145,8 @@ def _resolve_stt_client_config() -> dict[str, Any]:
         api_key = str(get_env_value("XAI_API_KEY") or "").strip()
         if not api_key:
             return _relay("xai oauth (server-managed) or no credentials")
-        return direct(STT_WIRE_XAI, env_base_url("XAI_STT_BASE_URL", tc.XAI_STT_BASE_URL), api_key,
+        from tools.xai_http import xai_api_base_url
+        return direct(STT_WIRE_XAI, xai_api_base_url(env_base_url("XAI_STT_BASE_URL", tc.XAI_STT_BASE_URL)), api_key,
                       tc.normalize_xai_stt_model(section.get("model")))
     if provider == "elevenlabs":
         api_key = tt._resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs")

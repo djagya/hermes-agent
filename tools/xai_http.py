@@ -58,9 +58,41 @@ def hermes_xai_user_agent() -> str:
         return "Hermes-Agent/unknown"
 
 
-def hermes_xai_default_headers() -> dict[str, str]:
+# Inspected official Grok CLI 1.0.67 protocol headers. This is transport
+# compatibility, not a claim about the credential's subscription or quota.
+XAI_GROK_PROXY_REQUIRED_HEADERS = {
+    "X-XAI-Token-Auth": "xai-grok-cli",
+    "x-authenticateresponse": "authenticate-response",
+    "x-grok-client-mode": "headless",
+    "x-grok-client-version": "1.0.67",
+    "x-grok-client-identifier": "grok-shell",
+}
+
+
+def xai_grok_proxy_headers_for(base_url: str) -> dict[str, str]:
+    from hermes_cli.auth_xai import _xai_is_grok_proxy_url
+    return dict(XAI_GROK_PROXY_REQUIRED_HEADERS) if _xai_is_grok_proxy_url(base_url) else {}
+
+
+def apply_xai_route_headers(kwargs: dict, base_url: str) -> None:
+    """Merge case-insensitively, removing stale proxy headers after a route swap."""
+    required = xai_grok_proxy_headers_for(base_url)
+    headers = dict(kwargs.get("default_headers") or {})
+    names = {key.lower() for key in XAI_GROK_PROXY_REQUIRED_HEADERS}
+    if not required:
+        headers = {key: value for key, value in headers.items() if key.lower() not in names}
+    else:
+        present = {key.lower() for key in headers}
+        headers.update({key: value for key, value in required.items() if key.lower() not in present})
+    if headers:
+        kwargs["default_headers"] = headers
+    else:
+        kwargs.pop("default_headers", None)
+
+
+def hermes_xai_default_headers(base_url: str = "") -> dict[str, str]:
     """Default headers for OpenAI-SDK and raw HTTP clients talking to xAI (replaces the SDK User-Agent)."""
-    return {"User-Agent": hermes_xai_user_agent()}
+    return {"User-Agent": hermes_xai_user_agent(), **xai_grok_proxy_headers_for(base_url)}
 
 
 _TRUE_WORDS = {"1", "true", "yes", "on", "enabled"}
@@ -174,8 +206,25 @@ def _xai_base_url_override() -> str:
     return str(get_env_value("HERMES_XAI_BASE_URL") or get_env_value("XAI_BASE_URL") or "").strip().rstrip("/")
 
 
+def _off_subscription_proxy(base_url: str) -> str:
+    """The API route for a caller that must not use the subscription proxy: the proxy URL maps to
+    ``api.x.ai``; any other validated route is kept."""
+    from hermes_cli.auth_xai import _xai_is_grok_proxy_url
+    return DEFAULT_XAI_BASE_URL if _xai_is_grok_proxy_url(base_url) else base_url
+
+
+def xai_api_base_url(*candidates: Any) -> str:
+    """The base URL an xAI API key (or an OAuth bearer kept off the subscription proxy) is sent to: the
+    first non-empty candidate when it is a validated xAI HTTPS origin, else ``api.x.ai``; the subscription
+    proxy maps to ``api.x.ai``. Every API-key surface (STT, TTS, streaming STT, this resolver) uses it."""
+    import hermes_cli.auth as auth_mod
+    chosen = next((str(c).strip().rstrip("/") for c in candidates if str(c or "").strip()), "")
+    return _off_subscription_proxy(auth_mod._xai_validate_inference_base_url(chosen, fallback=DEFAULT_XAI_BASE_URL))
+
+
 def resolve_xai_http_credentials(
     *, force_refresh: bool = False, api_key_hint: Optional[str] = None, prefer_api_key: bool = False,
+    subscription_route: bool = False,
 ) -> dict[str, str]:
     """Resolve bearer credentials for direct xAI HTTP endpoints.
 
@@ -195,13 +244,16 @@ def resolve_xai_http_credentials(
     The key is read through :func:`tools.tool_backend_helpers.resolve_provider_secret` so profile secret
     scoping is identical to the fallback branch, and the base URL honors ``HERMES_XAI_BASE_URL`` /
     ``XAI_BASE_URL`` behind the same origin-pinning validation as the OAuth branch. See #87045, #88040.
+
+    The OAuth bearer reaches the subscription proxy (``cli-chat-proxy.grok.com``) only with
+    ``subscription_route=True`` (x_search's ``/responses``, sent with the proxy headers). Every other
+    direct endpoint stays on ``api.x.ai``: the proxy answers 404 for ``/image-generation-models`` and
+    ``/audio/transcriptions``, and those callers send no proxy headers. An API key never goes there.
     """
     import hermes_cli.auth as auth_mod
     if prefer_api_key and (explicit_key := str(_resolve_explicit_xai_api_key() or "").strip()):
         # Origin-pinned so a tampered env override can't exfiltrate the bearer; rejection -> default URL.
-        override = _xai_base_url_override()
-        base_url = auth_mod._xai_validate_inference_base_url(override, fallback=DEFAULT_XAI_BASE_URL)
-        return {"provider": "xai", "api_key": explicit_key, "base_url": base_url}
+        return {"provider": "xai", "api_key": explicit_key, "base_url": xai_api_base_url(_xai_base_url_override())}
 
     try:
         from agent.credential_pool import load_pool
@@ -212,18 +264,16 @@ def resolve_xai_http_credentials(
             # the next healthy account rather than resurrecting the stale row.
             entry = pool.select()
         access_token = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
-        fallback_base_url = str(
-            getattr(entry, "runtime_base_url", None)
-            or getattr(entry, "base_url", "")
-            or auth_mod.DEFAULT_XAI_OAUTH_BASE_URL
-        ).strip().rstrip("/")
-        base_url = auth_mod._xai_validate_inference_base_url(_xai_base_url_override(), fallback=fallback_base_url)
+        base_url = auth_mod._xai_oauth_runtime_base_url(
+            getattr(entry, "base_url", "") or getattr(entry, "runtime_base_url", "") or "",
+            override=_xai_base_url_override(),
+        )
+        if not subscription_route:
+            base_url = _off_subscription_proxy(base_url)
         if str(access_token).strip():
             return {"provider": "xai-oauth", "api_key": str(access_token).strip(), "base_url": base_url}
     except Exception:
         pass
 
-    from hermes_cli.config import get_env_value
-    api_key = _resolve_explicit_xai_api_key()
-    base_url = str(get_env_value("XAI_BASE_URL") or DEFAULT_XAI_BASE_URL).strip().rstrip("/")
-    return {"provider": "xai", "api_key": api_key, "base_url": base_url}
+    # No OAuth bearer: the API key goes only to a validated xAI origin, never to the subscription proxy.
+    return {"provider": "xai", "api_key": _resolve_explicit_xai_api_key(), "base_url": xai_api_base_url(_xai_base_url_override())}

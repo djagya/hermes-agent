@@ -1491,7 +1491,7 @@ def test_try_refresh_codex_client_credentials_handles_xai_oauth(monkeypatch):
     assert closed["value"] is False
     assert retired["client"] is existing
     assert rebuilt["kwargs"]["api_key"] == "fresh-xai-token"
-    assert rebuilt["kwargs"]["base_url"] == "https://api.x.ai/v1"
+    assert rebuilt["kwargs"]["base_url"] == "https://cli-chat-proxy.grok.com/v1"  # legacy default migrates
     assert isinstance(agent.client, _RebuiltClient)
     assert agent.api_key == "fresh-xai-token"
 

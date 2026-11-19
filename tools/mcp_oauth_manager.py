@@ -28,6 +28,23 @@ except ImportError:  # pragma: no cover — SDK required in CI; module must stil
     _SDK_BASES = ()
 
 
+# ``error=`` auth-param of a WWW-Authenticate challenge, quoted or bare (RFC 6750 §3).
+_CHALLENGE_ERROR_RE = re.compile(r'(?:^|[\s,])error\s*=\s*(?:"([^"]*)"|([^\s,]+))', re.IGNORECASE)
+
+
+def _resource_401_invites_refresh(response) -> bool:
+    """True when a resource 401 rejects the access token itself, so one refresh may cure it: a Bearer
+    challenge naming ``invalid_token`` among any other params, or naming no error at all (Todoist answers
+    a rejected token with ``Bearer resource_metadata=..., scope=...``). A missing challenge, another
+    scheme, or another error (``insufficient_scope``: a refresh cannot widen scope) stays on the SDK path."""
+    challenge = (response.headers.get("www-authenticate") or "").strip()
+    scheme, _, params = challenge.partition(" ")
+    if scheme.lower() != "bearer":
+        return False
+    match = _CHALLENGE_ERROR_RE.search(params)
+    return match is None or (match.group(1) or match.group(2) or "").lower() == "invalid_token"
+
+
 @dataclass
 class _ProviderEntry:
     """Per-server OAuth state. ``last_mtime_ns``: last-seen tokens-file mtime (0 = never read),
@@ -330,8 +347,7 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                     if (not refresh_seen and buffered and self.context.is_token_valid()
                             and self.context.can_refresh_token()
                             and self.context.oauth_metadata is not None
-                            and incoming.headers.get("www-authenticate", "").strip().lower()
-                                == 'bearer error="invalid_token"'):
+                            and _resource_401_invites_refresh(incoming)):
                         await inner.aclose()  # release the SDK lock before restarting
                         # In-memory invalidation only; never edit persisted expiry. The server rejected this
                         # token, so a failed refresh must not fall back to it as a still-live early refresh.

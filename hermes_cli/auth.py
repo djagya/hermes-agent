@@ -73,7 +73,7 @@ from hermes_cli.auth_xai import (
     _write_through_xai_oauth_to_global_root, _xai_access_token_is_expiring,
     _xai_oauth_device_code_login, _xai_oauth_discovery, _xai_oauth_poll_device_token,
     _xai_oauth_request_device_code, _xai_proactive_refresh_skew_seconds,
-    _xai_validate_inference_base_url, refresh_xai_oauth_pure, resolve_xai_oauth_runtime_credentials)
+    _xai_oauth_persisted_base_url, _xai_oauth_runtime_base_url, _xai_validate_inference_base_url, refresh_xai_oauth_pure, resolve_xai_oauth_runtime_credentials)
 from hermes_cli.auth_codex import (
     _codex_access_token_is_expiring, _codex_device_code_login, _codex_http_client,
     _codex_pool_rate_limit_status, _codex_quota_probe_cache, _codex_usage_probe_url,
@@ -2294,13 +2294,12 @@ def _update_config_for_provider(
     require_readable_config_before_write(config_path)
     config = read_raw_config()
     current_model = config.get("model")
-    if isinstance(current_model, dict):
-        model_cfg = dict(current_model)
-    else:
-        model_cfg = {"default": current_model.strip()} if _nonempty_str(current_model) else {}
+    model_cfg = (dict(current_model) if isinstance(current_model, dict)
+                 else {"default": current_model.strip()} if _nonempty_str(current_model) else {})
     model_cfg["provider"] = provider_id
     if inference_base_url and inference_base_url.strip():
-        model_cfg["base_url"] = inference_base_url.rstrip("/")
+        from hermes_cli.route_identity import persisted_xai_route
+        model_cfg["base_url"] = persisted_xai_route(provider_id, inference_base_url).rstrip("/")
     else:
         model_cfg.pop("base_url", None)  # clear stale base_url when switching providers
 

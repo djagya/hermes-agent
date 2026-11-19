@@ -139,7 +139,7 @@ from agent.auxiliary_unavailable import (
     AuxiliaryClientUnavailable, clear_nous_credential_failure, missing_provider_credentials_message,
     nous_credential_failure_detail, record_nous_credential_failure)
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
-from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
+from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path, env_float, is_truthy_value, is_xai_subscription_proxy_url, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -195,8 +195,6 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
         return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
     kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
     _apply_required_codex_headers(kwargs, access_token=api_key, base_url=base_url)
-    # Hermes owns aux retry/fallback policy; the SDK default (max_retries=2) would triple
-    # wall time on a hung endpoint before Hermes sees one failure.
     # Hermes owns auxiliary retry + provider/model fallback policy (the same-provider transient retry in
     # call_llm plus the except-chain fallback). The OpenAI SDK's own default (max_retries=2 → up to 3
     # attempts) silently multiplies the effective wall time of every aux call by 3× on a slow/hung endpoint,
@@ -204,6 +202,8 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
     # SDK-internal retries by default and let Hermes control the budget; explicit callers can still override
     # via kwargs.
     kwargs.setdefault("max_retries", 0)
+    from tools.xai_http import apply_xai_route_headers
+    apply_xai_route_headers(kwargs, base_url)
     return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
 
 
@@ -2253,9 +2253,9 @@ def _endpoint_default_headers(
         headers = route
     elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
         headers = dict(build_nvidia_nim_headers(base_url))
-    elif xai and base_url_host_matches(base_url, "x.ai"):
+    elif xai and (base_url_host_matches(base_url, "x.ai") or is_xai_subscription_proxy_url(base_url)):
         from tools.xai_http import hermes_xai_default_headers
-        headers = dict(hermes_xai_default_headers())
+        headers = dict(hermes_xai_default_headers(base_url))
     else:
         headers = _profile_default_headers(provider) or {}
     return _apply_user_default_headers(headers or None) or None
@@ -3471,9 +3471,9 @@ _AUTH_REFRESH_PROVIDER_BY_HOST = (
 
 
 def _provider_for_host(base_url: str, table: tuple[tuple[str, str], ...]) -> Optional[str]:
-    """First provider in ``table`` whose host matches ``base_url``, else a profile claiming the host."""
+    """First ``table`` provider whose host or subdomain (api.x.ai: also the proxy) matches, else a profile's."""
     for host, provider in table:
-        if base_url_host_matches(base_url, host):
+        if base_url_host_matches(base_url, host) or (host == "api.x.ai" and is_xai_subscription_proxy_url(base_url)):
             return provider
     from providers import profile_for_host
     return getattr(profile_for_host(base_url), "name", None)

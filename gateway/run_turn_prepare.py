@@ -96,12 +96,11 @@ def _managed_oauth_env_host(provider: str) -> str:
     """The profile's documented host override for a managed OAuth provider, read through the
     secret scope like the resolver reads it: the process env holds the launch profile's value."""
     from agent.secret_scope import get_secret_str
-    from hermes_cli.auth_xai import DEFAULT_XAI_OAUTH_BASE_URL, _xai_validate_inference_base_url
+    from hermes_cli.route_identity import xai_oauth_profile_route
 
     if provider == "openai-codex":
         return get_secret_str("HERMES_CODEX_BASE_URL", "").strip()
-    raw = get_secret_str("HERMES_XAI_BASE_URL", "").strip() or get_secret_str("XAI_BASE_URL", "").strip()
-    return _xai_validate_inference_base_url(raw, fallback=DEFAULT_XAI_OAUTH_BASE_URL)
+    return xai_oauth_profile_route()
 
 
 def _session_override_uses_managed_oauth(override: Optional[dict]) -> bool:
@@ -119,9 +118,10 @@ def _session_override_uses_managed_oauth(override: Optional[dict]) -> bool:
         return False
     # The managed host is the registry default OR its documented override (HERMES_CODEX_BASE_URL /
     # HERMES_XAI_BASE_URL): the auth store still owns the bearer for either.
-    managed_hosts = {PROVIDER_REGISTRY[provider].inference_base_url.rstrip("/"),
-                     _managed_oauth_env_host(provider).rstrip("/")} - {""}
-    return (override.get("base_url") or "").rstrip("/") in managed_hosts
+    from hermes_cli.route_identity import route_key
+    managed_hosts = {route_key(provider, PROVIDER_REGISTRY[provider].inference_base_url),
+                     route_key(provider, _managed_oauth_env_host(provider))} - {""}
+    return route_key(provider, override.get("base_url")) in managed_hosts
 
 
 def _resolve_session_override_runtime(override: dict, *, managed_oauth: bool) -> dict:
@@ -130,8 +130,9 @@ def _resolve_session_override_runtime(override: dict, *, managed_oauth: bool) ->
     runtime = _resolve_runtime_agent_kwargs_for_provider(
         override["provider"], target_model=override.get("model") or None)
     if managed_oauth:
+        from hermes_cli.route_identity import route_key
         if (runtime.get("provider") != override["provider"]
-                or (runtime.get("base_url") or "").rstrip("/") != override["base_url"].rstrip("/")
+                or route_key(override["provider"], runtime.get("base_url")) != route_key(override["provider"], override["base_url"])
                 or not runtime.get("api_key")):
             raise RuntimeError("Managed OAuth resolution no longer matches the session route")
         # _apply_session_model_override reads this dict again: replacing only the returned
@@ -349,6 +350,9 @@ class GatewayTurnPrepareMixin:
         }
         runtime["fallback_active"] = bool(getattr(agent, "_fallback_activated", False))
         runtime = {k: v for k, v in runtime.items() if v not in (None, "")}
+        if runtime.get("base_url"):  # compare in the stored spelling, or every xai-oauth turn rewrites the row
+            from hermes_cli.route_identity import persisted_xai_route
+            runtime["base_url"] = persisted_xai_route(runtime.get("provider"), runtime["base_url"])
         try:
             db = self._session_db._db
             row = db.get_session(session_id)

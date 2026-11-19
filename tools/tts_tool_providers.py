@@ -312,11 +312,10 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: dict[str, Any]) -
     text_normalization = _config_bool(
         xai_config.get("text_normalization"), DEFAULT_XAI_TEXT_NORMALIZATION_DEFAULT)
     if creds.get("provider") == "xai-oauth":
-        base_url = creds.get("base_url")
-    else:
-        from hermes_cli.config import get_env_value
-        base_url = xai_config.get("base_url") or creds.get("base_url") or get_env_value("XAI_BASE_URL")
-    base_url = str(base_url or DEFAULT_XAI_BASE_URL).strip().rstrip("/")
+        base_url = str(creds.get("base_url") or DEFAULT_XAI_BASE_URL).strip().rstrip("/")
+    else:  # API key: the tts.xai.base_url override, validated like every xAI API-key route (never the proxy)
+        from tools.xai_http import xai_api_base_url
+        base_url = xai_api_base_url(xai_config.get("base_url"), creds.get("base_url"))
 
     # Documented minimal POST /v1/tts shape; optional fields only when they differ from defaults.
     codec = "wav" if output_path.endswith(".wav") else "mp3"

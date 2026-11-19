@@ -44,11 +44,11 @@ from agent.tool_guardrails import (
     ToolCallGuardrailConfig, ToolCallGuardrailController
 )
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
-from hermes_cli.route_identity import normalize_route_base_url
+from hermes_cli.route_identity import canonical_xai_route, normalize_route_base_url, route_key
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
 from hermes_state_ids import new_session_id
-from utils import base_url_host_matches, is_truthy_value
+from utils import base_url_host_matches, is_truthy_value, is_xai_subscription_proxy_url
 
 # Same logger name as run_agent so caplog/patches on "run_agent" see our records.
 logger = logging.getLogger("run_agent")
@@ -59,7 +59,7 @@ def _provider_default_routes(provider: str) -> set[str]:
     routes: set[str] = set()
 
     def add(value):
-        route = normalize_route_base_url(value)
+        route = route_key(provider, value)
         if route:
             routes.add(route)
 
@@ -92,8 +92,8 @@ def _context_route_mismatch(
     *, already_normalized: bool = False,
 ) -> bool:
     """Return whether a context pin's configured route differs from runtime."""
-    _norm = (lambda v: str(v or "")) if already_normalized else normalize_route_base_url
-    configured_route, active_route = _norm(configured_base_url), _norm(active_base_url)
+    _key = (lambda p, v: canonical_xai_route(p, v or "")) if already_normalized else route_key
+    configured_route, active_route = _key(configured_provider, configured_base_url), _key(active_provider, active_base_url)
     if configured_route:
         return configured_route != active_route
 
@@ -290,9 +290,9 @@ def _resolve_api_mode(agent, api_mode, provider_name, base_url):
     elif provider_name is None and host == "chatgpt.com" and "/backend-api/codex" in url:
         agent.api_mode = "codex_responses"
         agent.provider = "openai-codex"
-    elif provider_name is None and host == "api.x.ai":
+    elif provider_name is None and (host == "api.x.ai" or is_xai_subscription_proxy_url(url)):
         agent.api_mode = "codex_responses"
-        agent.provider = "xai"
+        agent.provider = "xai" if host == "api.x.ai" else "xai-oauth"
     elif agent.provider == "anthropic" or (provider_name is None and host == "api.anthropic.com"):
         agent.api_mode = "anthropic_messages"
         agent.provider = "anthropic"
@@ -958,13 +958,13 @@ def _lazy_headers(module: str, name: str, pass_key: bool = False, pass_base: boo
 # host match wins; no match falls back to the provider profile's declared headers.
 _HOST_DEFAULT_HEADERS: list[tuple[str, Callable[[Any, str], dict[str, str]]]] = [
     ("openrouter.ai", _lazy_headers("agent.auxiliary_client", "build_or_headers")),
-    ("integrate.api.nvidia.com",
-     _lazy_headers("agent.auxiliary_client", "build_nvidia_nim_headers", pass_base=True)),
+    ("integrate.api.nvidia.com", _lazy_headers("agent.auxiliary_client", "build_nvidia_nim_headers", pass_base=True)),
     ("api.routermint.com", _lazy_headers("agent.client_lifecycle", "_routermint_headers")),
     ("api.kimi.com", lambda _k, _b: {"User-Agent": "claude-code/0.1.0"}),
     ("portal.qwen.ai", _lazy_headers("agent.client_lifecycle", "_qwen_portal_headers")),
     ("chatgpt.com", _lazy_headers("agent.codex_headers", "codex_cloudflare_headers", pass_key=True)),
-    ("x.ai", _lazy_headers("tools.xai_http", "hermes_xai_default_headers")),
+    ("x.ai", _lazy_headers("tools.xai_http", "hermes_xai_default_headers", pass_base=True)),
+    ("cli-chat-proxy.grok.com", _lazy_headers("tools.xai_http", "hermes_xai_default_headers", pass_base=True)),
 ]
 
 

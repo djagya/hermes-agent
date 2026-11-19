@@ -835,8 +835,13 @@ class TestTranscribeAudioMistralDispatch:
 @pytest.fixture
 def mock_xai_http_module():
     """Inject a fake tools.xai_http module for testing."""
+    import tools.xai_http as real
+
     fake_module = MagicMock()
     fake_module.hermes_xai_user_agent = MagicMock(return_value="hermes-xai/test")
+    # The real resolver unless a test sets return_value/side_effect; the real API-key URL validation.
+    fake_module.resolve_xai_http_credentials = MagicMock(wraps=real.resolve_xai_http_credentials)
+    fake_module.xai_api_base_url = real.xai_api_base_url
     with patch.dict("sys.modules", {"tools.xai_http": fake_module}):
         yield fake_module
 
@@ -913,7 +918,7 @@ class TestTranscribeXAI:
             "Bearer fresh-oauth-token"
         )
         assert mock_xai_http_module.resolve_xai_http_credentials.call_args_list == [
-            call(),
+            call(prefer_api_key=True),
             call(force_refresh=True, api_key_hint="stale-oauth-token"),
         ]
 

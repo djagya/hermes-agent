@@ -485,10 +485,13 @@ def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict
     """Copy of *override* with only persistable, non-secret keys, or ``None`` when empty."""
     if not isinstance(override, dict):
         return None
+    from hermes_cli.route_identity import persisted_xai_route
     cleaned = {
         k: str(v) for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    if "base_url" in cleaned:
+        cleaned["base_url"] = persisted_xai_route(cleaned.get("provider"), cleaned["base_url"])
     return cleaned or None
 
 
@@ -1176,10 +1179,15 @@ class SessionStore(
         return self._update_entry(session_key, _apply)
 
     def get_model_override(self, session_key: str) -> Optional[dict[str, str]]:
-        """Return the persisted /model override for *session_key*, if any."""
+        """Return the persisted /model override for *session_key*, if any, with its route ``base_url`` in the
+        live spelling (``live_xai_route``: a stored xai-oauth default reads back as the profile's default route)."""
+        from hermes_cli.route_identity import live_xai_route
         with self._lock:
             entry = self._entry_locked(session_key)
-            return dict(entry.model_override) if entry and entry.model_override else None
+            override = dict(entry.model_override) if entry and entry.model_override else None
+        if override and override.get("base_url"):
+            override["base_url"] = live_xai_route(override.get("provider"), override["base_url"])
+        return override
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""

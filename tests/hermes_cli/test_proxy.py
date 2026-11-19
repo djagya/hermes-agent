@@ -381,6 +381,41 @@ def test_server_strips_client_auth_header():
     asyncio.run(run())
 
 
+def test_server_adds_grok_proxy_headers_only_for_the_subscription_origin(monkeypatch):
+    """xai-oauth now defaults to the Grok subscription proxy, which needs the Grok CLI headers.
+    The origin gate (``xai_grok_proxy_headers_for``) is stubbed to accept the local fake upstream."""
+    from tools import xai_http
+
+    async def run(proxy_origin: bool):
+        seen: dict[str, Any] = {}
+
+        async def echo(request):
+            seen.update({key.lower(): value for key, value in request.headers.items()})
+            return web.json_response({"ok": True})
+
+        upstream = web.Application()
+        upstream.router.add_route("*", "/v1/chat/completions", echo)
+        upstream_runner, upstream_base = await _start_runner(upstream)
+        monkeypatch.setattr(xai_http, "xai_grok_proxy_headers_for", lambda base: (
+            {"x-grok-client-version": "1.0.67", "X-XAI-Token-Auth": "xai-grok-cli"}
+            if proxy_origin and base == f"{upstream_base}/v1" else {}))
+        proxy_runner, proxy_base = await _start_runner(create_app(FakeAdapter(f"{upstream_base}/v1")))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{proxy_base}/v1/chat/completions", json={},
+                                        headers={"X-Grok-Client-Version": "client-own"}) as resp:
+                    await resp.read()
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+        return seen
+
+    seen = asyncio.run(run(True))
+    assert seen.get("x-xai-token-auth") == "xai-grok-cli"
+    assert seen.get("x-grok-client-version") == "client-own"  # the client's own value wins
+    assert "x-xai-token-auth" not in asyncio.run(run(False))
+
+
 @pytest.mark.parametrize("bound,headers,allowed", [
     ("127.0.0.1", {}, True),                                              # plain local client
     ("127.0.0.1", {"Origin": "http://{authority}"}, True),                # the proxy's own origin

@@ -234,3 +234,38 @@ def test_suppression_is_scoped_to_its_provider(tmp_path, monkeypatch):
     monkeypatch.setenv("XAI_API_KEY", "dead-key")
     assert resolve_provider_secret("ELEVENLABS_API_KEY", "elevenlabs") == "el-key"
     assert resolve_provider_secret("XAI_API_KEY", "xai") == ""
+
+
+# ---------------------------------------------------------------------------
+# No-OAuth fallback: the API key goes only to a validated xAI origin, never to the
+# subscription proxy or a foreign host (the same routing as the preferred-key branch).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"XAI_BASE_URL": "https://attacker.example/v1"}, "https://api.x.ai/v1"),
+        ({"HERMES_XAI_BASE_URL": "https://attacker.example/v1"}, "https://api.x.ai/v1"),
+        ({"XAI_BASE_URL": "http://api.x.ai/v1"}, "https://api.x.ai/v1"),
+        ({"XAI_BASE_URL": "https://cli-chat-proxy.grok.com/v1"}, "https://api.x.ai/v1"),
+        ({"HERMES_XAI_BASE_URL": "https://cli-chat-proxy.grok.com/v1"}, "https://api.x.ai/v1"),
+        ({"HERMES_XAI_BASE_URL": "https://staging.x.ai/v1", "XAI_BASE_URL": "https://ignored.x.ai/v1"},
+         "https://staging.x.ai/v1"),
+        ({}, "https://api.x.ai/v1"),
+    ],
+)
+def test_no_oauth_fallback_validates_the_base_url_and_never_uses_the_proxy(monkeypatch, env, expected):
+    from tools.xai_http import resolve_xai_http_credentials
+
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value",
+        lambda name, default=None: {"XAI_API_KEY": "paid-key-x1", **env}.get(name, default),
+    )
+    _set_xai_oauth_unavailable(monkeypatch)
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no pool")))
+
+    for subscription_route in (False, True):
+        creds = resolve_xai_http_credentials(subscription_route=subscription_route)
+        assert creds == {"provider": "xai", "api_key": "paid-key-x1", "base_url": expected}

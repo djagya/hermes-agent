@@ -54,7 +54,7 @@ from agent.local_prompt_progress import prompt_progress, with_prompt_progress
 from agent.repetition_guard import RunawayStreamWatch, is_repetition_dominated
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool_lifecycle import is_persistent_env
-from utils import base_url_host_matches, base_url_hostname, env_float, env_int
+from utils import base_url_host_matches, base_url_hostname, env_float, env_int, is_xai_inference_host
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
@@ -1348,7 +1348,7 @@ def _alias_tool_search_bridge_for_xai(agent, transport, tools_for_api):
     reverse-map a name this request never aliased). Deep-copy first (#27907)."""
     if transport is not None and hasattr(transport, "_last_wire_aliases"):
         transport._last_wire_aliases = {}
-    is_xai_chat = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
+    is_xai_chat = agent.provider in {"xai", "xai-oauth"} or is_xai_inference_host(str(getattr(agent, "base_url", "") or ""))
     if not (is_xai_chat and tools_for_api):
         return tools_for_api
     try:

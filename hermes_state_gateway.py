@@ -910,6 +910,16 @@ class SessionGatewayMixin:
 
     @staticmethod
     def session_gateway_runtime(session_meta: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """The persisted route (:meth:`_stored_gateway_runtime`) in its live spelling: a stored
+        xai-oauth default reads back as the profile's default route (``live_xai_route``)."""
+        route = SessionGatewayMixin._stored_gateway_runtime(session_meta)
+        if route.get("base_url"):
+            from hermes_cli.route_identity import live_xai_route
+            route["base_url"] = live_xai_route(route.get("provider"), route["base_url"])
+        return route
+
+    @staticmethod
+    def _stored_gateway_runtime(session_meta: Optional[dict[str, Any]]) -> dict[str, Any]:
         """Read the persisted runtime route off a session row dict (``model_config`` as
         JSON string or parsed dict). Precedence: nested ``gateway_runtime`` (gateway sync /
         CLI ``/model``), then top-level ``provider``/``base_url``/``api_mode`` (TUI), with

@@ -102,7 +102,18 @@ CASES = [
     ("proactive_then_401", None, "OAuthNonInteractiveError",
      ["refresh", "resource", "prm", "asm"]),
     ("peer_rotation", 200, None, ["resource", "resource"]),
+    ("challenge_without_error", 200, None, ["resource", "refresh", "resource"]),
+    ("invalid_token_with_params", 200, None, ["resource", "refresh", "resource"]),
 ]
+# WWW-Authenticate per scenario; ``bare_401`` sends none, the rest a plain invalid_token challenge.
+CHALLENGES = {
+    "scope_challenge": 'Bearer error="insufficient_scope", scope="write"',
+    # The shape Todoist's MCP server answers a rejected bearer token with: no error code.
+    "challenge_without_error": ('Bearer resource_metadata="https://resource.invalid/.well-known/'
+                                'oauth-protected-resource/mcp", scope="read"'),
+    "invalid_token_with_params": ('Bearer realm="mcp", error="invalid_token", '
+                                  'error_description="The access token expired"'),
+}
 
 
 @pytest.mark.asyncio
@@ -175,8 +186,7 @@ async def test_resource_invalid_token(native_provider, monkeypatch, caplog, caps
             if (request.headers.get("authorization") == "Bearer " + TOKENS[1]
                     and scenario not in ("repeated_401", "proactive_then_401")):
                 return http.Response(200, json={"ok": True})
-            challenge = ('Bearer error="insufficient_scope", scope="write"'
-                         if scenario == "scope_challenge" else 'Bearer error="invalid_token"')
+            challenge = CHALLENGES.get(scenario, 'Bearer error="invalid_token"')
             return http.Response(401, headers={} if scenario == "bare_401" else {
                 "www-authenticate": challenge,
             })
@@ -221,7 +231,8 @@ async def test_resource_invalid_token(native_provider, monkeypatch, caplog, caps
             response = await client.post("https://resource.invalid/mcp", content=BODY)
             assert response.status_code == status
     assert events == expected_events
-    if scenario in ("positive", "repeated_401", "peer_rotation"):
+    if scenario in ("positive", "repeated_401", "peer_rotation", "challenge_without_error",
+                    "invalid_token_with_params"):
         persisted = await storage.get_tokens()
         assert persisted.access_token == TOKENS[1]
         assert persisted.refresh_token == TOKENS[3]

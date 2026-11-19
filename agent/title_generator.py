@@ -203,7 +203,8 @@ def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
     except Exception:
         return True
     pinned_base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
-    return not pinned_base_url or pinned_base_url == main_base_url
+    from hermes_cli.route_identity import route_key
+    return not pinned_base_url or route_key(pinned_provider, pinned_base_url) == route_key(provider, main_base_url)
 
 
 def _is_self_hosted_provider(provider: str) -> bool:

@@ -13,7 +13,7 @@ import hashlib
 import logging
 from typing import Any, Optional
 
-from utils import base_url_hostname
+from utils import is_xai_inference_host
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ def is_slot_keyed_cache_route(provider: Any, model: Any, base_url: Any = "") -> 
     """
     if str(provider or "").strip().lower() in {"xai", "xai-oauth"}:
         return True
-    if base_url_hostname(str(base_url or "")) == "api.x.ai":
+    if is_xai_inference_host(str(base_url or "")):
         return True
     return str(model or "").strip().lower().startswith(GROK_AGGREGATOR_MODEL_PREFIXES)
 
