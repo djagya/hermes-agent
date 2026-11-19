@@ -166,22 +166,24 @@ async def _scan_tab(sup: Any, gate: Any, sid: str) -> Optional[dict]:
 
 
 async def _scan_new_tabs(sup: Any, gate: Any, before: frozenset, only: Optional[frozenset] = None,
-                         seen: Optional[set] = None) -> Optional[dict]:
+                         record: Any = None) -> Optional[dict]:
     """A page target opened by the payment tab since ``before`` that shows order evidence (a new document).
     ``only`` (G3): look at these targets only (the ones a press opened, re-read before the next press); ``seen``: filled
-    with every target the press opened (whatever it shows now)."""
+    ``record``: the lock record whose ``pay_tabs`` gets every target the press opened (whatever it shows now),
+    added before any tab is scanned."""
     from tools import browser_payment_done as done
 
     opener = done.payment_tabs(sup)
     infos = (await sup._cdp("Target.getTargets"))["result"]["targetInfos"]
     opened = [t for t in infos if isinstance(t, dict) and t.get("type") == "page"
               and t.get("targetId") not in before and t.get("openerId") in opener]
-    if seen is not None:
-        seen.update(t["targetId"] for t in opened)
+    if record is not None:  # G3 (Opus RG5/RG6): every pass records, so a tab opened late is never lost
+        record.pay_tabs = frozenset(record.pay_tabs or ()) | frozenset(t["targetId"] for t in opened)
     opened = [t for t in opened if only is None or t.get("targetId") in only]
-    # G3 (Opus RG4 L4): another site's tab never uses the cap
+    # G3 (Opus RG4 L4): another site's tab never uses the cap; the re-read of recorded tabs has no cap (RG6 L1: its
+    # own time bound limits it)
     new = [t["targetId"] for t in opened if _shop_page(sup, gate, str(t.get("url") or ""))]
-    for tab in new[:_MAX_NEW_TABS]:
+    for tab in (new if only is not None else new[:_MAX_NEW_TABS]):
         try:  # G3 (Opus RG3 M2): one unreadable tab does not stop the scan of the others
             sid, temporary = await done._tab_session(sup, tab)
             try:
@@ -219,13 +221,14 @@ async def after_press(sup: Any, gate: Any, page_sid: str, before: Optional[froze
     gen = gate.gen
 
     async def look() -> Optional[dict]:
-        if before is not None and gen is not None:  # G3 (Opus RG3-RG5): first record which tabs this press opened
-            opened: set = set()  # (all Pay presses of the approval add up), so a slow scan never loses them
-            await _scan_new_tabs(sup, gate, before, only=frozenset(), seen=opened)
-            gen.pay_tabs = frozenset(gen.pay_tabs or ()) | frozenset(opened)
+        if before is not None and gen is not None:  # G3 (Opus RG3-RG6): first record which tabs this press opened (all
+            try:  # Pay presses of the approval add up), so a slow scan never loses them; a failed record never skips
+                await asyncio.wait_for(_scan_new_tabs(sup, gate, before, only=frozenset(), record=gen), 2.0)
+            except Exception as exc:  # health: allow BLE001 -- unrecorded: the scan below records again
+                logger.info("payment_click: tabs after the press not listed (%s)", type(exc).__name__)
         found, _mine = await _scan_top(sup, gate, page_sid, base, True)
         if found is None and before is not None:
-            found = await _scan_new_tabs(sup, gate, before)
+            found = await _scan_new_tabs(sup, gate, before, record=gen)
         return found
 
     try:

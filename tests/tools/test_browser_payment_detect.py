@@ -559,6 +559,34 @@ def test_a_confirmation_tab_that_loads_late_is_looked_at_again_before_the_next_p
     assert len(_mouse_presses(sup)) == presses and detect.detected(sup)["where"] == "new_tab"
 
 
+def test_a_confirmation_tab_opened_during_the_look_after_the_press_is_recorded():
+    """G3 (Opus RG6 M1): the purchase opens its confirmation tab while the checkout is being read after the press;
+    the tab is blank then and shows the thank-you page later: the next purchase press is refused."""
+    sup = _sunday()
+    real = sup.answer
+    text = {"now": ""}
+
+    def answer(method, params, session_id=None):
+        if (method == "Runtime.evaluate" and params.get("expression") == evidence.SCAN_JS and session_id != "S-temp"
+                and _mouse_presses(sup)):
+            sup.popup = True  # window.open from the page while Hermes reads the checkout after the press
+        if method == "Target.getTargets" and sup.popup:
+            infos = real(method, params, session_id)
+            return {"targetInfos": infos["targetInfos"] + [
+                {"targetId": "POP", "type": "page", "openerId": "TAB", "url": SHOP + "/danke"}]}
+        if method == "Page.getFrameTree" and session_id == "S-temp":
+            return done_tests.frame_tree((("POPTOP", "LQ", SHOP + "/danke", SHOP, ""),))
+        if method == "Runtime.evaluate" and params.get("expression") == evidence.SCAN_JS and session_id == "S-temp":
+            return {"result": {"type": "object", "value": evidence.wording("", text["now"])}}
+        return real(method, params, session_id)
+
+    sup.answer, sup.popup = answer, False
+    assert _press(sup, "JETZT KAUFEN")["payment_detected"] is False
+    text["now"] = "Vielen Dank für Ihre Bestellung! Bestellnummer 10023."
+    assert _press(sup, "JETZT KAUFEN")["error_type"] == detect.SPENT
+    assert len(_mouse_presses(sup)) == 1
+
+
 def test_a_shop_tab_opened_between_the_presses_is_not_read_as_the_order():
     """G3 (Opus RG4 M3): a help/AGB tab the checkout opened after BESTÄTIGEN (not by a press) mentions an order number:
     it is never read as the confirmation, and JETZT KAUFEN goes through."""
