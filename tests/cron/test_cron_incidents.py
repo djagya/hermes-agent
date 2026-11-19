@@ -211,6 +211,24 @@ def test_auth_type_requires_runtime_auth_evidence(monkeypatch, tmp_path):
         assert inc._classify_failure_type(prose) != "auth", prose
 
 
+def test_auth_type_counts_raised_auth_exception_names(monkeypatch, tmp_path):
+    """A raised ``AuthError`` (or ``*OAuthError``) recorded as ``Name: message`` is a credential
+    failure, while prose words that merely contain "auth" still are not."""
+    inc = _point_db(monkeypatch, tmp_path)
+    for error in (
+        "AuthError: Nous refresh token expired",
+        "AnthropicOAuthError: refresh rejected",
+        "MicrosoftGraphAuthError: consent revoked",
+    ):
+        assert inc._classify_failure_type(error) == "auth", error
+    for prose in (
+        "Checked the author's changelog: 3 items still open",
+        "Release notes list two authorized reviewers",
+        "Posted the summary to the OAuth PR thread; nothing else to report",
+    ):
+        assert inc._classify_failure_type(prose) != "auth", prose
+
+
 def test_agent_declared_failure_records_agent_reported_type(monkeypatch, tmp_path):
     """A ``[CRON_FAILURE]`` verdict is the agent's own judgement: even when its prose names a 401,
     the incident is typed ``agent_reported`` instead of being re-diagnosed by keywords."""

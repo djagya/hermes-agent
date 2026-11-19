@@ -42,6 +42,9 @@ _FAILURE_TYPE_ORDER = (
         r"\b401\b", "unauthorized", "authentication failed", "authentication error",
         "authenticationerror", "invalid api key", "invalid_api_key", "invalid_grant",
         "oauthnoninteractiveerror", "token refresh failed",
+        # A raised auth exception's class name ("AuthError: ...", "AnthropicOAuthError: ..."):
+        # the run path records ``f"{type(e).__name__}: {e}"``, so the name is runtime evidence.
+        r"\b\w*autherror\b",
     )),
     ("delivery", ("delivery", "deliver", "delivering")),
     ("config", ("config", "configuration", "validation")),
