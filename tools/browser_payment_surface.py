@@ -1719,7 +1719,7 @@ class _LockGen:
         # build G2: ``{"doc": (frame id, loader), "strong": bool or None}`` read right before the latest Pay-like press
         # (the strong order wording the document showed before it; the detection counts only what is new)
         self.pay_base: Optional[dict] = None
-        self.pay_tabs: Optional[tuple] = None  # G3: (targets before, targets opened) of the latest Pay-like press
+        self.pay_tabs: Optional[frozenset] = None  # G3: the tabs this approval's Pay-like presses opened
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
