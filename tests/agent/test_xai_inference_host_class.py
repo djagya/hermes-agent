@@ -46,6 +46,14 @@ def test_route_flags_cache_scope_and_api_mode_treat_both_hosts_alike(url):
     assert _provider_for_host(url, _POOL_PROVIDER_BY_HOST) == "xai-oauth"
 
 
+@pytest.mark.parametrize("url", ["https://us-east-1.api.x.ai/v1", "https://eu.api.x.ai/v1"])
+def test_aux_host_tables_keep_api_x_ai_subdomains(url):
+    """The aux pool/refresh tables matched ``*.api.x.ai`` on the base release; the proxy is added, not swapped in."""
+    from agent.auxiliary_client import _AUTH_REFRESH_PROVIDER_BY_HOST
+    assert _provider_for_host(url, _POOL_PROVIDER_BY_HOST) == "xai-oauth"
+    assert _provider_for_host(url, _AUTH_REFRESH_PROVIDER_BY_HOST) == "xai-oauth"
+
+
 @pytest.mark.parametrize("url", FOREIGN)
 def test_lookalikes_are_not_xai_routes_anywhere(url):
     agent = SimpleNamespace(provider="", base_url=url, _base_url_hostname="", _base_url_lower=url)

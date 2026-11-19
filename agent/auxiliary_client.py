@@ -139,7 +139,7 @@ from agent.auxiliary_unavailable import (
     AuxiliaryClientUnavailable, clear_nous_credential_failure, missing_provider_credentials_message,
     nous_credential_failure_detail, record_nous_credential_failure)
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
-from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path, env_float, is_truthy_value, is_xai_inference_host, is_xai_subscription_proxy_url, model_forces_max_completion_tokens, normalize_proxy_env_vars
+from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path, env_float, is_truthy_value, is_xai_subscription_proxy_url, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -3471,9 +3471,9 @@ _AUTH_REFRESH_PROVIDER_BY_HOST = (
 
 
 def _provider_for_host(base_url: str, table: tuple[tuple[str, str], ...]) -> Optional[str]:
-    """First provider in ``table`` whose host matches ``base_url``, else a profile claiming the host."""
+    """First ``table`` provider whose host or subdomain (api.x.ai: also the proxy) matches, else a profile's."""
     for host, provider in table:
-        if is_xai_inference_host(base_url) if host == "api.x.ai" else base_url_host_matches(base_url, host):
+        if base_url_host_matches(base_url, host) or (host == "api.x.ai" and is_xai_subscription_proxy_url(base_url)):
             return provider
     from providers import profile_for_host
     return getattr(profile_for_host(base_url), "name", None)
