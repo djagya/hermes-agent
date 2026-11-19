@@ -2724,7 +2724,7 @@ def _seed_tokens_singleton(seed: _Seeder, auth_store: dict[str, Any]) -> None:
         base_url = auth_mod.DEFAULT_CODEX_BASE_URL
         custom_label = str(state.get("label") or "").strip()
     else:
-        base_url = auth_mod.DEFAULT_XAI_OAUTH_BASE_URL
+        base_url = auth_mod._xai_oauth_persisted_base_url()
         custom_label = ""
     seed.upsert("device_code", {
         "auth_type": AUTH_TYPE_OAUTH,

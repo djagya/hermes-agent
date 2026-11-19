@@ -272,7 +272,7 @@ _OAUTH_ADD_SPECS: dict[str, _OAuthAddSpec] = {
         source=SOURCE_MANUAL_DEVICE_CODE,
         fields=lambda creds, provider: {
             "refresh_token": creds["tokens"].get("refresh_token"),
-            "base_url": creds.get("base_url") or auth_mod.DEFAULT_XAI_OAUTH_BASE_URL,
+            "base_url": auth_mod._xai_oauth_persisted_base_url(creds.get("base_url") or ""),
             "last_refresh": creds.get("last_refresh")},
         activate_first=True),
     "qwen-oauth": _OAuthAddSpec(

@@ -74,6 +74,9 @@ _FORM_JSON_HEADERS = {"Content-Type": "application/x-www-form-urlencoded", "Acce
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 # OAuth inference uses the official CLI subscription route; API keys keep api.x.ai.
 DEFAULT_XAI_OAUTH_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+# What stored state keeps for the OAuth default: an image rolled back to the api.x.ai default still
+# reads it, and every reader here migrates it to the route above (``_xai_oauth_runtime_base_url``).
+LEGACY_XAI_OAUTH_BASE_URL = "https://api.x.ai/v1"
 MINIMAX_OAUTH_CLIENT_ID = "78257093-7e40-4613-99e0-527b14b39113"
 MINIMAX_OAUTH_SCOPE = "group_id profile model.completion"
 MINIMAX_OAUTH_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:user_code"

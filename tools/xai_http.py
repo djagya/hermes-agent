@@ -268,7 +268,7 @@ def resolve_xai_http_credentials(
     except Exception:
         pass
 
-    from hermes_cli.config import get_env_value
+    # No OAuth bearer: the API key goes only to a validated xAI origin, never to the subscription proxy.
     api_key = _resolve_explicit_xai_api_key()
-    base_url = str(get_env_value("XAI_BASE_URL") or DEFAULT_XAI_BASE_URL).strip().rstrip("/")
-    return {"provider": "xai", "api_key": api_key, "base_url": base_url}
+    base_url = auth_mod._xai_validate_inference_base_url(_xai_base_url_override(), fallback=DEFAULT_XAI_BASE_URL)
+    return {"provider": "xai", "api_key": api_key, "base_url": _off_subscription_proxy(base_url)}
