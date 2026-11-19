@@ -1160,12 +1160,12 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         await _same_document(sup, sid, fid, loader)
         top = None
         if gate.approved is not None:  # B1: the approved total, read before every press
-            refused, top = await _pay_gate(sup, page_sid, gate, clicked, element, sid)
+            refused, top = await _pay_gate(sup, page_sid, gate, clicked, element, sid, pay_like)
             if refused:
                 return refused
-        scanned = None
-        if pay_like:  # build G1: an earlier Pay-like press of this approval: still loading, or a payment shown now
-            refused, scanned = await detect.before_press(sup, gate, page_sid, deadline)
+        kept = None
+        if pay_like:  # build G1/G2: still loading, a payment shown now; else the booleans kept with this press
+            refused, kept = await detect.before_press(sup, gate, page_sid, deadline)
             if refused:
                 return refused
         node = await pay_node(sup, sid, element, clicked) if pay_like else None
@@ -1174,14 +1174,14 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         refused = await _press_now(sup, deadline, (page_sid, sid, fid, loader, element, tree, child_sessions),
                                    (x2, y2, outer2), top, lambda: _book_press(
                                        sup, gate, gate.approved is not None, pay_like, progress, node=node,
-                                       caption=_caption(control["text"], sup), top=tree[0][0]),
+                                       caption=_caption(control["text"], sup), top=tree[0][0], base=kept),
                                    gate.approved is not None,
-                                   last=(lambda: detect.last_check(sup, gate, page_sid, scanned)) if pay_like else None)
+                                   last=(lambda: detect.last_check(sup, gate, page_sid, kept)) if pay_like else None)
         if refused:
             return refused
         effect = await _bounded_effect(sup, page_sid, element, sid, before, control["role"], deadline)
         detected = (await detect.after_press(sup, gate, page_sid, tabs, _caption(control["text"], sup),
-                                             deadline + _PRESS_MARGIN_S - 1.0) if pay_like else False)
+                                             deadline + _PRESS_MARGIN_S - 1.0, kept) if pay_like else False)
         return _clicked_answer(sup, control, effect, pay_like, detected)
     finally:
         if element:
@@ -1314,14 +1314,15 @@ def _admission_holds(sup: Any, gate: _Gate) -> bool:
 
 
 def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress: list, *, node: Any = None,
-                caption: str = "", top: Any = None) -> Optional[dict]:
+                caption: str = "", top: Any = None, base: Optional[dict] = None) -> Optional[dict]:
     """build C r2 (P2): right before mousePressed, in one step under ``_LOCK``: the admission still holds (r4 C2) and,
     for a Pay-like press, no payment was detected for this approval (build G1); then the press is booked in its lock
     record (``presses``, ``pressed``, r4 C7 ``admitted``), so a listing during the press or its settle already counts
     it. A refusal (nothing booked) means nothing is pressed. build G1: a Pay-like press keeps its time and ``top``
     frame id (``pay_at``, the in-flight guard) and, on that top document or as the first one, ``node`` ``(frame id,
     loader, backendNodeId, origin + path)`` and its redacted ``caption`` (``pay_press``: payment_done's identity
-    veto). ``gen`` is None when this process saw no lock of this supervisor: nothing to book then."""
+    veto); ``base``: the document and strong-wording boolean read right before the press (``pay_base``, build G2).
+    ``gen`` is None when this process saw no lock of this supervisor: nothing to book then."""
     with _LOCK:
         if not _admission_holds(sup, gate):
             return _refusal(APPROVAL_CHANGED, _APPROVAL_CHANGED_TEXT)
@@ -1337,7 +1338,7 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             if checked:  # r4 C7: a press checked against this approval (not owner_go)
                 gen.admitted = True
             if pay_press:
-                gen.pay_at = (top, time.monotonic())
+                gen.pay_at, gen.pay_base = (top, time.monotonic()), base
                 if (node and node[0] == top) or gen.pay_node is None:
                     gen.pay_node, gen.pay_caption = node, caption
     return None
@@ -1562,7 +1563,8 @@ async def _top_frame(sup: Any, sid: str) -> tuple:
     return frame.get("id"), frame.get("loaderId"), frame.get("url")
 
 
-async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, element: str, sid: str) -> tuple:
+async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, element: str, sid: str,
+                    pay_like: bool = False) -> tuple:
     """B1 (owner 2026-11-13): ``(None, top)`` when this press may go out, else ``(payment_total_changed, top)``.
     ``clicked``: the pressed control's document ``(frame id, loader, url, is the top)``.
 
@@ -1573,7 +1575,9 @@ async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, elemen
     the fill's own rule and pass the Pay check (``_PAY_PAGE``), the document read again after the check. After an
     admitted press, a top document on another site (a bank's 3-D Secure page, r4 C4) and a bank challenge that
     replaced one of the payment's card documents under the bound checkout (r4 C5) have no merchant total: they are
-    pressed with the caption check only."""
+    pressed with the caption check only. build G2 (Codex P1-1): a Pay-like press (``pay_like``) on a top document on a
+    payment provider's or card origin (the fill's frames moved there after Pay) is no bank step: it keeps the total
+    check, as in the live build (where a provider's page after Pay was refused outright)."""
     from tools.browser_supervisor_payment import _page_match, _valid_pin
 
     cents, currency, fid, loader, merchant = gate.approved
@@ -1586,7 +1590,7 @@ async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, elemen
     if top[1] != loader:
         if not gate.admitted:
             return no, top
-        if cross_site(top[2], merchant):
+        if cross_site(top[2], merchant) and not (pay_like and _provider_site(sup, top[2])):
             return None, top
     pin, page_ok = await _page_total(sup, page_sid, top[0], cents, currency)
     if (await _top_frame(sup, page_sid))[:2] != top[:2]:  # the document changed during the read
@@ -1677,7 +1681,7 @@ class _LockGen:
     held other tabs. Read and written under ``_LOCK``."""
 
     __slots__ = ("admitted", "approved", "known", "merchant", "native_lost", "owned", "paid", "paid_by", "pay_at",
-                 "pay_caption", "pay_node", "pressed", "presses", "serial", "ws")
+                 "pay_base", "pay_caption", "pay_node", "pressed", "presses", "serial", "ws")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
@@ -1712,6 +1716,9 @@ class _LockGen:
         self.pay_caption = ""
         self.pay_node: Optional[tuple] = None
         self.pay_at: Optional[tuple] = None
+        # build G2: ``{"doc": (frame id, loader), "strong": bool or None}`` read right before the latest Pay-like press
+        # (the strong order wording the document showed before it; the detection counts only what is new)
+        self.pay_base: Optional[dict] = None
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)

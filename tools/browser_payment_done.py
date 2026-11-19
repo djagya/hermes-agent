@@ -569,6 +569,8 @@ async def _probe(sup: Any, payment: _Payment, expected: str, previous: Optional[
         evidence, reason = await order_evidence(sup, sid, tree[0], _checkout_like(tree[0], payment, page, pay), pay)
         if evidence is None:  # build F: no order evidence on this document yet: look again
             return "settling", {**seen, "reason": reason}, key
+        if await sup._payment_tree(sid, child_sessions) != tree:  # build G2: the document scanned is still this one
+            return "wait", {**seen, "reason": "loading"}, None
         page["browser_context"] = tab.get("browserContextId")
         page["order_evidence"] = evidence
         return "ready", page, key
@@ -582,8 +584,12 @@ def _detected_here(found: Optional[dict], tree: tuple, payment: _Payment, expect
     """build G1: the payment detection spent the approval on this very document (a single-page shop whose
     confirmation keeps the provider's card frames in its tree): it counts as the shop page too, when it is on the
     shop's origin, never held a card field itself and no frame in its tree is a card document on the shop's origin
-    (the snapshot skips frames, and a cross-origin card frame cannot be read from the top document)."""
-    if not found or found.get("where") != "top" or not tree or len(tree[0]) != 5 or tree[0][4]:
+    (the snapshot skips frames, and a cross-origin card frame cannot be read from the top document). build G2 (Opus
+    HIGH 1): only when the detection rested on strong wording (a thank-you-for-your-order sentence or an order number)
+    that was absent before the press; a checkout still holding card frames is otherwise no confirmation (a spinner
+    over a 3-D Secure frame)."""
+    if not found or found.get("where") != "top" or found.get("strong") is not True or not tree or len(tree[0]) != 5 \
+            or tree[0][4]:
         return False
     if (found.get("frame"), found.get("loader")) != tuple(tree[0][:2]) or payment.merchant_fields:
         return False

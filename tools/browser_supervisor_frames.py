@@ -21,6 +21,9 @@ logger = logging.getLogger("tools.browser_supervisor")
 FRAME_TREE_MAX_ENTRIES = 30
 FRAME_TREE_MAX_OOPIF_DEPTH = 2
 
+# frameRequestedNavigation reasons that always load another document (build G2)
+_CROSS_REASONS = frozenset({"formSubmissionGet", "formSubmissionPost", "httpHeaderRefresh", "metaTagRefresh", "reload"})
+
 _AUTO_ATTACH_PARAMS = {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True}
 
 
@@ -70,6 +73,7 @@ class FrameTrackingMixin:
         if not frame_id:
             return
         with self._state_lock:
+            self.__dict__.setdefault("_load_stopped", {})[str(frame_id)] = time.monotonic()  # build G2: the commit
             old = self._frames.get(frame_id) or FrameInfo(frame_id, "", "", None, False, session_id)
             self._frames[frame_id] = FrameInfo(
                 frame_id=frame_id, url=str(frame.get("url") or ""),
@@ -162,22 +166,39 @@ class FrameTrackingMixin:
     def _on_frame_loading(self, params: dict[str, Any], session_id: Optional[str] = None) -> None:
         """dlz (build F r3, G1): when a frame's navigation or load STARTED (monotonic). Chrome sends these for form
         submits and scripted navigations before the new document commits, and a page script cannot stop them. Read
-        by ``loading_since`` (the payment surface's in-flight guard after a Pay press)."""
+        by ``loading_since`` (the payment surface's in-flight guard after a Pay press). build G2: a start that is
+        known to load another document (a ``navigationType`` other than a same-document one, or a form submission,
+        reload or refresh) is kept apart: a same-document event (``navigatedWithinDocument``) does not end it."""
         fid = params.get("frameId")
+        kind = str(params.get("navigationType") or "").lower()
         # a same-document navigation (pushState, a hash; ``sameDocument`` and ``historySameDocument``) loads nothing,
         # and a request for another tab or a download does not navigate this frame
-        if (not fid or "samedocument" in str(params.get("navigationType") or "").lower()
-                or params.get("disposition") not in (None, "currentTab")):
+        if not fid or "samedocument" in kind or params.get("disposition") not in (None, "currentTab"):
             return
+        cross = bool(kind) or str(params.get("reason") or "") in _CROSS_REASONS
         with self._state_lock:
-            self.__dict__.setdefault("_load_started", {})[str(fid)] = time.monotonic()
+            started, stopped = self.__dict__.setdefault("_load_started", {}), self.__dict__.setdefault("_load_stopped", {})
+            marks = self.__dict__.setdefault("_load_cross", {})
+            before, ended = started.get(str(fid)), stopped.get(str(fid))
+            # one navigation sends several starts (request, navigating, loading): a later one never downgrades it
+            pending = before is not None and (ended is None or ended < before) and marks.get(str(fid), False)
+            started[str(fid)], marks[str(fid)] = time.monotonic(), cross or pending
 
     def _on_frame_stopped(self, params: dict[str, Any], session_id: Optional[str] = None) -> None:
-        """dlz (build G1): a frame's load finished (or a same-document navigation ended one that never loads)."""
+        """dlz (build G1): a frame's load finished (or a same-document navigation ended one that never loads).
+        build G2: a same-document navigation (``Page.navigatedWithinDocument``, a hash change or pushState while the
+        order POST is pending) does not end a start known to load another document; the new document's commit
+        (``frameNavigated``) or its load does."""
         fid = params.get("frameId")
         if fid:
             with self._state_lock:
+                if params.get("sameDocument") and self.__dict__.get("_load_cross", {}).get(str(fid)):
+                    return
                 self.__dict__.setdefault("_load_stopped", {})[str(fid)] = time.monotonic()
+
+    def _on_frame_within_document(self, params: dict[str, Any], session_id: Optional[str] = None) -> None:
+        """build G2: ``Page.navigatedWithinDocument``: a stop for a start that never loads another document."""
+        self._on_frame_stopped({**params, "sameDocument": True}, session_id)
 
     def loading_since(self, frame_id: str, since: float) -> bool:
         """dlz (build G1): a navigation or load of ``frame_id`` started at or after ``since`` and has not finished
@@ -193,7 +214,7 @@ class FrameTrackingMixin:
         "Page.frameStartedNavigating": _on_frame_loading,
         "Page.frameStartedLoading": _on_frame_loading,
         "Page.frameStoppedLoading": _on_frame_stopped,
-        "Page.navigatedWithinDocument": _on_frame_stopped,
+        "Page.navigatedWithinDocument": _on_frame_within_document,
         "Page.frameAttached": _on_frame_attached,
         "Page.frameNavigated": _on_frame_navigated,
         "Page.frameDetached": _on_frame_detached,

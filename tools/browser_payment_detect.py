@@ -13,10 +13,15 @@ that started after this approval's last Pay-like press (Chrome's own navigation-
 ``loading_since``; same-document navigations ignored), for at most ``_INFLIGHT_S``, the press would land on a
 checkout whose order is still being placed (``payment_in_flight``).
 
-Evidence counts only on a shop page: a document on the merchant's site (not another site, such as a bank's 3-D Secure
-page, and not a payment provider's or card origin). A checkout-like document needs order wording and no enabled
-purchase button; any other shop document needs order wording too. Failure wording and the pressed Pay control still
-shown are never evidence. Only fixed codes and booleans leave the page.
+Evidence counts only on a shop page: a document positively on the merchant's site (the same known site, or the exact
+merchant origin; not another or an unknown site, a bank's 3-D Secure page, a provider's or card origin). Right before
+each Pay-like press the same value-free scan runs and its booleans are kept with the press (build G2). On the very
+document the press was made on, only a strong class (a thank-you-for-your-order sentence, an order number) that was
+absent before the press counts, with no enabled purchase button and the pressed control gone; any other shop document
+(a new loader, a new tab) needs order wording, and a checkout-like one no enabled purchase button. Failure wording
+and the pressed Pay control still shown are never evidence. The document scanned is read again after the scan (frame,
+loader, origin, shop page) and the approval is spent only when it did not change. Only fixed codes and booleans
+leave the page.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger("tools.browser_payment_surface")
 
-_INFLIGHT_S = 20.0  # the longest a Pay-like press's navigation holds the next Pay-like press back
+_INFLIGHT_S = 45.0  # the longest a Pay-like press's navigation holds the next Pay-like press back (build G2: 45 s)
 _BEFORE_SCAN_S = 6.0  # the longest the look before a Pay-like press may take (unread: the press goes on)
 _MAX_NEW_TABS = 2
 
@@ -85,33 +90,53 @@ def _merchant(gate: Any) -> Optional[str]:
 
 
 def _shop_page(sup: Any, gate: Any, url: Any) -> bool:
-    """A document on the merchant's site: never another site (a bank's page) or a provider's or card origin."""
-    from tools.browser_payment_surface_after_pay import _provider_site, cross_site
+    """A document positively on the merchant's site (build G2): both sites known and equal, else the exact merchant
+    origin. An unknown site (an IP address, localhost, http, a single-label host) is never the shop unless it is the
+    merchant's own origin; never a provider's or card origin."""
+    from tools.browser_payment_surface_after_pay import _origin_of, _provider_site, _site
 
     merchant = _merchant(gate)
-    return bool(merchant) and isinstance(url, str) and url.startswith(("https://", "http://")) \
-        and not cross_site(url, merchant) and not _provider_site(sup, url)
+    if not merchant or not isinstance(url, str) or not url.startswith(("https://", "http://")):
+        return False
+    a, b = _site(url), _site(merchant)
+    same = a == b if a is not None and b is not None else bool(_origin_of(url)) and _origin_of(url) == _origin_of(merchant)
+    return same and not _provider_site(sup, url)
 
 
-async def _evidence(sup: Any, gate: Any, sid: str, row: tuple, checkout: bool) -> Optional[str]:
-    from tools.browser_payment_order_evidence import order_evidence
-    from tools.browser_payment_surface import pay_press
+async def _still_the_shop(sup: Any, gate: Any, sid: str, row: tuple) -> bool:
+    """The document scanned (``row``: frame id, loader, url) is still the one on ``sid``'s top, with the same origin,
+    and still a shop page (build G2: it could have been replaced, or redirected to a bank, during the scan)."""
+    from tools.browser_payment_surface import _top_frame
+    from tools.browser_payment_surface_after_pay import _origin_of
 
-    if not _shop_page(sup, gate, row[2]):
-        return None
-    evidence, _reason = await order_evidence(sup, sid, row, checkout, pay_press(sup), need_wording=True)
-    return evidence
+    now = await _top_frame(sup, sid)
+    return tuple(now[:2]) == tuple(row[:2]) and _origin_of(now[2]) == _origin_of(row[2]) and _shop_page(sup, gate, now[2])
 
 
-async def _scan_top(sup: Any, gate: Any, page_sid: str) -> tuple:
-    """``(found or None, top)``: the payment tab's top document ``(frame id, loader, url)`` and its evidence."""
+async def _scan_top(sup: Any, gate: Any, page_sid: str, base: Optional[dict], judged: bool) -> tuple:
+    """``(found or None, mine)``: the payment tab's top document read once. ``mine``: ``{"doc": (frame id, loader),
+    "strong": bool or None}``, the booleans kept with a Pay-like press (None: not a shop page, or unread). ``found``
+    (only when ``judged``): the evidence, judged against ``base`` (the earlier look at this document; None: none read,
+    which a checkout-like document cannot be judged without)."""
     from tools import browser_payment_done as done
+    from tools.browser_payment_order_evidence import judge, scan_document
     from tools.browser_payment_surface import _top_frame, pay_press
 
     top = await _top_frame(sup, page_sid)
-    evidence = await _evidence(sup, gate, page_sid, top, done.checkout_like_now(sup, top, pay_press(sup)))
-    found = {"where": "top", "frame": top[0], "loader": top[1], "evidence": evidence} if evidence else None
-    return found, top[:2]
+    mine = {"doc": tuple(top[:2]), "strong": None}
+    if not _shop_page(sup, gate, top[2]):
+        return None, mine
+    scan = await scan_document(sup, page_sid, top)
+    if scan is None:
+        return None, mine
+    mine["strong"] = scan["strong"]
+    checkout = done.checkout_like_now(sup, top, pay_press(sup))
+    if not judged or (checkout and base is None):
+        return None, mine
+    evidence, _reason, strong = await judge(sup, page_sid, top, scan, checkout, pay_press(sup), True, base)
+    if evidence is None or not await _still_the_shop(sup, gate, page_sid, top):
+        return None, mine
+    return {"where": "top", "frame": top[0], "loader": top[1], "evidence": evidence, "strong": strong}, mine
 
 
 async def page_tabs(sup: Any) -> Optional[frozenset]:
@@ -124,10 +149,25 @@ async def page_tabs(sup: Any) -> Optional[frozenset]:
         return None
 
 
+async def _scan_tab(sup: Any, gate: Any, sid: str) -> Optional[dict]:
+    from tools.browser_payment_order_evidence import judge, scan_document
+    from tools.browser_payment_surface import _top_frame
+
+    row = await _top_frame(sup, sid)
+    if not _shop_page(sup, gate, row[2]):
+        return None
+    scan = await scan_document(sup, sid, row)
+    if scan is None:
+        return None
+    evidence, _reason, strong = await judge(sup, sid, row, scan, False, None, True)
+    if evidence is None or not await _still_the_shop(sup, gate, sid, row):
+        return None
+    return {"evidence": evidence, "strong": strong}
+
+
 async def _scan_new_tabs(sup: Any, gate: Any, before: frozenset) -> Optional[dict]:
     """A page target opened by the payment tab since ``before`` that shows order evidence (a new document)."""
     from tools import browser_payment_done as done
-    from tools.browser_payment_surface import _top_frame
 
     opener = done.payment_tabs(sup)
     infos = (await sup._cdp("Target.getTargets"))["result"]["targetInfos"]
@@ -136,13 +176,12 @@ async def _scan_new_tabs(sup: Any, gate: Any, before: frozenset) -> Optional[dic
     for tab in new[:_MAX_NEW_TABS]:
         sid, temporary = await done._tab_session(sup, tab)
         try:
-            row = await _top_frame(sup, sid)
-            evidence = await _evidence(sup, gate, sid, row, False)
+            found = await _scan_tab(sup, gate, sid)
         finally:
             if temporary:
                 await sup._release_payment_sessions({"tab": sid})
-        if evidence:
-            return {"where": "new_tab", "tab": tab, "evidence": evidence}
+        if found:
+            return {"where": "new_tab", "tab": tab, **found}
     return None
 
 
@@ -161,12 +200,12 @@ def _spend(sup: Any, gate: Any, found: dict, caption: str) -> bool:
 
 
 async def after_press(sup: Any, gate: Any, page_sid: str, before: Optional[frozenset], caption: str,
-                      until: float) -> bool:
+                      until: float, base: Optional[dict] = None) -> bool:
     """After a Pay-like press's effect read: order evidence on the top document (or a tab the press opened) spends
-    the approval. Bounded by ``until`` (monotonic; the press already landed, so the answer must not time out);
-    unread or no evidence: False."""
+    the approval. ``base``: the booleans read right before this press (``before_press``). Bounded by ``until``
+    (monotonic; the press already landed, so the answer must not time out); unread or no evidence: False."""
     async def look() -> Optional[dict]:
-        found, _top = await _scan_top(sup, gate, page_sid)
+        found, _mine = await _scan_top(sup, gate, page_sid, base, True)
         if found is None and before is not None:
             found = await _scan_new_tabs(sup, gate, before)
         return found
@@ -180,32 +219,34 @@ async def after_press(sup: Any, gate: Any, page_sid: str, before: Optional[froze
 
 
 async def before_press(sup: Any, gate: Any, page_sid: str, deadline: float) -> tuple:
-    """``(refusal or None, top scanned or None)`` before a Pay-like press that follows another one in this approval:
-    the last one's navigation still loading (``payment_in_flight``), or order evidence shown now (spent:
-    ``payment_already_made``). Unread: the press goes on (its total was read)."""
+    """``(refusal or None, kept or None)`` right before a Pay-like press. ``kept``: the booleans of the top document
+    now (``_scan_top``'s ``mine``), kept with the press: the document after it is judged against them. For a press
+    that follows another one in this approval: the last one's navigation still loading (``payment_in_flight``), or
+    order evidence shown now (spent: ``payment_already_made``), judged against the last press's booleans. Unread:
+    the press goes on (its total was read)."""
     gen = gate.gen
-    if gen is None or gen.pay_at is None:
-        return None, None
-    if inflight(sup, gen):
+    later = gen is not None and gen.pay_at is not None
+    if later and inflight(sup, gen):
         return {"success": False, "error_type": INFLIGHT, "error": _INFLIGHT_TEXT}, None
     try:
-        found, top = await asyncio.wait_for(_scan_top(sup, gate, page_sid),
-                                            timeout=max(0.1, min(_BEFORE_SCAN_S, deadline - time.monotonic())))
+        found, mine = await asyncio.wait_for(
+            _scan_top(sup, gate, page_sid, gen.pay_base if later else None, later),
+            timeout=max(0.1, min(_BEFORE_SCAN_S, deadline - time.monotonic())))
     except Exception as exc:  # health: allow BLE001 -- unread: nothing found; the in-flight check still runs last
         logger.info("payment_click: payment detection before the press not read (%s)", type(exc).__name__)
         return None, None
     if found and _spend(sup, gate, found, gen.pay_caption):
         return spent_refusal(gen), None
-    return None, top
+    return None, mine
 
 
-async def last_check(sup: Any, gate: Any, page_sid: str, scanned: Optional[tuple]) -> Optional[dict]:
+async def last_check(sup: Any, gate: Any, page_sid: str, kept: Optional[dict]) -> Optional[dict]:
     """The last await before a Pay-like press is booked (``_press_now``): still loading, spent meanwhile, or the
     top document is no longer the one ``before_press`` looked at (``payment_control_changed``)."""
     from tools.browser_payment_surface import _changed, _top_frame
 
     if inflight(sup, gate.gen):
         return {"success": False, "error_type": INFLIGHT, "error": _INFLIGHT_TEXT}
-    if scanned is not None and tuple((await _top_frame(sup, page_sid))[:2]) != tuple(scanned):
+    if kept is not None and tuple((await _top_frame(sup, page_sid))[:2]) != tuple(kept["doc"]):
         return _changed()
     return spent_refusal(gate.gen)

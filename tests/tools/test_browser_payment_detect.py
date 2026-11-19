@@ -237,6 +237,17 @@ ORDER_PHRASES = [
     "Vielen Dank für Ihre Bestellung!", "Thank you for your order", "Votre commande a bien été enregistrée",
     "Pedido confirmado", "Ordine confermato", "Bestelling geplaatst", "Réservation confirmée",
 ]
+# build G2: the strong classes (a thank-you-for-your-order sentence, an order number); the rest is order wording that
+# a checkout's own service text can also carry
+STRONG_PHRASES = {
+    "Bestellnummer: 4711", "Your order number is 77", "Numéro de commande : 77", "Número de pedido 77",
+    "Numero d'ordine 77", "Bestelnummer 77", "Vielen Dank für Ihre Bestellung!", "Thank you for your order",
+}
+SERVICE_TEXT = [  # Opus HIGH 1: ordinary checkout text that reads as order wording but is no confirmation
+    "Nach Absenden der Bestellung erhalten Sie eine Bestellbestätigung per E-Mail.",
+    "Your payment is processed securely by Stripe.", "Once your order has been placed you will receive an email.",
+    "Nach erfolgreicher Zahlung erhalten Sie eine E-Mail.", "ORDER COMPLETE",
+]
 NOT_ORDER = ["Danke", "Danke, dass du sunday vertraust", "Thank you!", "Merci", "Your order will be placed once you pay",
              "Ihre Bestellung wird bestätigt", "Jetzt kaufen", "Bestellung abschließen", "Zahlung bestätigen",
              "Warenkorb 16 Pakete Summe 22,66 EUR"]
@@ -253,7 +264,12 @@ FAILURE_PHRASES = [
 
 @pytest.mark.parametrize("text", ORDER_PHRASES)
 def test_order_phrases(text):
-    assert evidence.wording("", text) == {"order": True, "failure": False}
+    assert evidence.wording("", text) == {"order": True, "failure": False, "strong": text in STRONG_PHRASES}
+
+
+@pytest.mark.parametrize("text", SERVICE_TEXT)
+def test_checkout_service_text_is_order_wording_but_never_strong(text):
+    assert evidence.wording("", text) == {"order": True, "failure": False, "strong": False}
 
 
 @pytest.mark.parametrize("text", NOT_ORDER)
@@ -284,7 +300,7 @@ def test_failure_phrases(text):
 ])
 def test_service_text_on_a_real_thank_you_page_is_no_failure(text):
     """F r3 (Opus final M2): ordinary service text is not failure wording; the order wording still counts."""
-    assert evidence.wording("", text) == {"order": True, "failure": False}
+    assert evidence.wording("", text) == {"order": True, "failure": False, "strong": True}
 
 
 _SCAN_DOM = r"""
@@ -308,13 +324,13 @@ def test_the_page_script_scans_all_visible_text_and_no_form_value():
     script = _SCAN_DOM.replace("SCAN", evidence.SCAN_JS) + "process.stdout.write(JSON.stringify({" + ", ".join(
         f"{json.dumps(k)}: scan('Sunday', {v})" for k, v in cases.items()) + "}));"
     out = _node(script)
-    assert out["past the excerpt"] == {"order": True, "failure": False}
+    assert out["past the excerpt"] == {"order": True, "failure": False, "strong": False}
     for key in ("in a textarea", "hidden", "editable"):
-        assert out[key] == {"order": False, "failure": False}, key
+        assert out[key] == {"order": False, "failure": False, "strong": False}, key
     assert out["failure"]["failure"] is True and out["accented"]["failure"] is True
     phrases = _node(_SCAN_DOM.replace("SCAN", evidence.SCAN_JS) + "process.stdout.write(JSON.stringify(" + json.dumps(
-        ORDER_PHRASES + NOT_ORDER + FAILURE_PHRASES) + ".map(t => scan('', [E('P', [T(t)])]))));")
-    assert phrases == [evidence.wording("", t) for t in ORDER_PHRASES + NOT_ORDER + FAILURE_PHRASES]
+        ORDER_PHRASES + SERVICE_TEXT + NOT_ORDER + FAILURE_PHRASES) + ".map(t => scan('', [E('P', [T(t)])]))));")
+    assert phrases == [evidence.wording("", t) for t in ORDER_PHRASES + SERVICE_TEXT + NOT_ORDER + FAILURE_PHRASES]
 
 
 # ------------------------------------------------------------------ G1: detect the payment, no press budget
@@ -332,6 +348,7 @@ class ShopSup(PaySup):
     loading_since = FrameTrackingMixin.loading_since
     _on_frame_loading = FrameTrackingMixin._on_frame_loading
     _on_frame_stopped = FrameTrackingMixin._on_frame_stopped
+    _on_frame_within_document = FrameTrackingMixin._on_frame_within_document
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -382,7 +399,7 @@ def test_sunday_the_method_confirm_and_the_purchase_both_go_and_the_thank_you_sp
     assert second["success"] is True and second["pay_pressed"] is True and second["payment_detected"] is True
     assert second["next"] == surface.DETECTED_NEXT and len(_mouse_presses(sup)) == 2
     assert detect.detected(sup) == {"where": "top", "frame": "TOP", "loader": "L0", "evidence": "confirmation_text",
-                                    "caption": "JETZT KAUFEN"}
+                                    "strong": True, "caption": "JETZT KAUFEN"}
     calls = len(sup.calls)
     third = _press(sup, "Jetzt kaufen")  # a recommendation's Pay-like control on the thank-you page
     assert third["success"] is False and third["error_type"] == detect.SPENT
@@ -505,7 +522,7 @@ def test_a_confirmation_in_a_tab_the_pay_press_opened_is_detected():
         if method == "Page.getFrameTree" and session_id == "S-temp":
             return done_tests.frame_tree((("POPTOP", "LQ", SHOP + "/danke", SHOP, ""),))
         if method == "Runtime.evaluate" and params.get("expression") == evidence.SCAN_JS and session_id == "S-temp":
-            return {"result": {"type": "object", "value": {"order": True, "failure": False}}}
+            return {"result": {"type": "object", "value": evidence.wording("", "Ihre Bestellung ist bei uns eingegangen.")}}
         return real(method, params, session_id)
 
     sup.answer, sup.popup = answer, False
@@ -521,3 +538,260 @@ def test_detection_never_reads_a_page_value():
     _press(sup, "JETZT KAUFEN", after={"page": THANKS, "rows": [_row("Weiter einkaufen", role="link")]})
     evaluated = {c[1].get("expression") for c in sup.sent("Runtime.evaluate")}
     assert evidence.SCAN_JS in evaluated and done.SNAPSHOT_JS not in evaluated
+
+
+# ------------------------------------------------------------------ G2: ordinary checkout text is no payment (fix round)
+
+MICRO = " Nach Absenden der Bestellung erhalten Sie eine Bestellbestätigung per E-Mail."  # reads as order wording
+THANKS_WEAK = {"title": "Danke", "url": SHOP + "/danke", "text": "Ihre Bestellung ist bei uns eingegangen."}
+THANKS_NEW_DOC = (("TOP", "L7", SHOP + "/danke", SHOP, ""),)
+THANKS_NEW_DOC_CARD = THANKS_NEW_DOC + (done_tests.CHECKOUT[1],)  # the provider's card frame still in the tree
+
+
+def test_spinner_over_a_3ds_frame_on_a_checkout_with_service_text_is_no_payment():
+    """Opus HIGH 1: a single-page checkout, card frames still in the tree, JETZT KAUFEN replaced by a spinner while a 3-D
+    Secure challenge runs; the checkout carries ordinary microcopy that reads as order wording. Nothing is spent, the
+    bank's Bestätigen goes, and payment_done neither succeeds nor closes the tab."""
+    sup = _sunday()
+    sup.page.update({**CART, "text": CART["text"] + MICRO})
+    out = _press(sup, "JETZT KAUFEN", after={"rows": [_row("Hilfe", role="link")]})
+    assert out["success"] is True and out["payment_detected"] is False and detect.detected(sup) is None
+    sup.rows = [_row("Bestätigen")]
+    bank = _press(sup, "Bestätigen")
+    assert bank["success"] is True and len(_mouse_presses(sup)) == 2
+    res = done.payment_done(sup)
+    assert res["success"] is False and not sup.sent("Target.closeTarget")
+
+
+def test_a_method_confirm_while_the_purchase_button_is_busy_spends_nothing():
+    """Opus MEDIUM 2: Sunday's BESTÄTIGEN closes the method modal while JETZT KAUFEN is briefly disabled; the checkout
+    carries order-like microcopy. No spend, and JETZT KAUFEN then goes through."""
+    sup = _sunday()
+    sup.page.update({**CART, "text": CART["text"] + MICRO})
+    busy = {**_row("JETZT KAUFEN", i=1), "disabled": True}
+    first = _press(sup, "BESTÄTIGEN", after={"rows": [busy]})
+    assert first["success"] is True and first["payment_detected"] is False
+    sup.rows = [_row("JETZT KAUFEN", i=1)]
+    second = _press(sup, "JETZT KAUFEN")
+    assert second["success"] is True and len(_mouse_presses(sup)) == 2 and detect.detected(sup) is None
+
+
+def test_strong_wording_that_was_on_the_checkout_before_the_press_does_not_count():
+    sup = _sunday()
+    sup.page.update({**CART, "text": CART["text"] + " Ihre Bestellnummer erhalten Sie per E-Mail."})
+    out = _press(sup, "JETZT KAUFEN", after={"rows": [_row("Hilfe", role="link")]})  # a spinner: no purchase button
+    assert out["payment_detected"] is False and detect.detected(sup) is None
+
+
+def test_a_thank_you_that_loaded_after_the_last_answer_refuses_the_next_press_without_a_new_document():
+    """The before-press look compares with the last press's booleans: strong wording that is new on the same document
+    spends the approval and nothing is pressed."""
+    sup = _sunday()
+    assert _press(sup, "JETZT KAUFEN")["payment_detected"] is False
+    sup.page.update(THANKS)
+    sup.rows = [_row("Jetzt kaufen", role="link")]
+    out = _press(sup, "Jetzt kaufen")
+    assert out["error_type"] == detect.SPENT and len(_mouse_presses(sup)) == 1
+    assert detect.detected(sup)["strong"] is True
+
+
+def test_a_different_document_keeps_the_full_rules_and_a_weak_one_does_not_lift_payment_done_s_card_frame_rule():
+    sup = _sunday()
+    out = _press(sup, "JETZT KAUFEN", after={"tree": THANKS_NEW_DOC_CARD, "page": THANKS_WEAK,
+                                             "rows": [_row("Weiter einkaufen", role="link")]})
+    assert out["payment_detected"] is True and detect.detected(sup)["strong"] is False  # a new loader: order wording
+    _not_reached(done.payment_done(sup), "not_shop_page")  # no strong wording: the card frame still refuses
+    strong = _sunday()
+    out = _press(strong, "JETZT KAUFEN", after={"tree": THANKS_NEW_DOC_CARD, "page": {**THANKS, "url": SHOP + "/danke"},
+                                                "rows": [_row("Weiter einkaufen", role="link")]})
+    assert out["payment_detected"] is True and detect.detected(strong)["strong"] is True
+    assert done.payment_done(strong)["success"] is True
+
+
+def test_the_sunday_owner_go_path_detects_on_the_purchase_press_only():
+    sup = done_tests._claimed(ShopSup([done_tests.CHECKOUT], status=dict(done_tests.LOCKED_TAB)))
+    sup.page.update(CART)
+
+    def press(caption, after=None):
+        surface.payment_controls(sup)
+        with surface._LOCK:
+            issued = dict(surface._ISSUED.get(sup) or {})
+        key = f"{sup.tree[0][0]}|{sup.tree[0][1]}"
+        ref = next(r for r, spec in issued.items() if spec[0] == key and spec[3] == caption)
+        sup.after = after or {}
+        return surface.payment_click(sup, ref, owner_go=True)
+
+    first = press("BESTÄTIGEN")
+    assert first["success"] and first["payment_detected"] is False
+    second = press("JETZT KAUFEN", after={"page": THANKS, "rows": [_row("Weiter einkaufen", role="link")]})
+    assert second["success"] and second["payment_detected"] is True
+    assert done.payment_done(sup)["success"] is True
+
+
+# build G2 (Codex P1-2, Opus LOW 3): the shop page is a positive match
+
+
+class _Gate:
+    def __init__(self, merchant):
+        self.approved, self.gen = (2266, "EUR", "TOP", "L0", merchant), None
+
+
+@pytest.mark.parametrize("url, merchant, shop", [
+    ("https://shop.test/checkout", "https://shop.test", True),
+    ("https://pay.shop.test/thanks", "https://shop.test", True),  # same known site
+    ("https://acs.bank.test/challenge", "https://shop.test", False),  # another site
+    ("https://203.0.113.5/ok", "https://shop.test", False),  # an IP address: site unknown
+    ("https://localhost/ok", "https://shop.test", False), ("http://shop.test/ok", "https://shop.test", False),
+    ("https://intranet/ok", "https://shop.test", False),
+    ("http://127.0.0.1:8080/ok", "http://127.0.0.1:8080", True),  # the merchant's own exact origin
+    ("http://127.0.0.1:9090/ok", "http://127.0.0.1:8080", False), ("https://shop.test/x", "", False),
+    ("about:blank", "https://shop.test", False),
+])
+def test_a_shop_page_is_a_positive_match_with_the_merchant(url, merchant, shop):
+    assert detect._shop_page(done_tests.FakeSup([CHECKOUT]), _Gate(merchant), url) is shop
+
+
+def test_a_provider_origin_is_never_the_shop_page():
+    sup = _sunday()
+    assert detect._shop_page(sup, _Gate("https://js.stripe.com"), "https://js.stripe.com/hosted/pay") is False
+
+
+def test_an_unrecorded_page_on_an_ip_address_never_spends_the_approval():
+    sup = _sunday()
+    ip_doc = (("TOP", "L8", "https://203.0.113.5/ok", "https://203.0.113.5", ""),)
+    out = _press(sup, "JETZT KAUFEN", after={"tree": ip_doc, "page": {**THANKS, "url": "https://203.0.113.5/ok"},
+                                             "rows": [_row("Weiter", role="link")]})
+    assert out["success"] is True and out["payment_detected"] is False and detect.detected(sup) is None
+
+
+# build G2 (Codex P1-3, Opus LOW 4): the evidence is bound to the document that was scanned
+
+
+def _swap_when_scanned(sup, tree):
+    """Once armed (by the press), the document is replaced right after the wording scan ran."""
+    real = sup.answer
+    sup.armed = False
+
+    def answer(method, params, session_id=None):
+        out = real(method, params, session_id)
+        if method == "Runtime.evaluate" and params.get("expression") == evidence.SCAN_JS and sup.armed:
+            sup.tree = tree
+        return out
+
+    sup.answer = answer
+
+
+@pytest.mark.parametrize("after", [
+    {"page": THANKS, "rows": [_row("Weiter", role="link")]},  # the checkout's own document
+    {"tree": THANKS_NEW_DOC, "page": THANKS_WEAK, "rows": [_row("Weiter", role="link")]},  # a new shop document
+])
+def test_a_document_replaced_during_the_scan_spends_nothing(after):
+    """The scan read the shop's thank-you, then the frame went to a bank page: the evidence belongs to a document that is
+    gone, and the approval stays open."""
+    sup = _sunday()
+    _swap_when_scanned(sup, done_tests.ACS)
+    out = _press(sup, "JETZT KAUFEN", after={**after, "armed": True})
+    assert out["success"] is True and out["payment_detected"] is False and detect.detected(sup) is None
+
+
+def test_a_new_tab_replaced_during_the_scan_spends_nothing():
+    sup = _sunday()
+    real = sup.answer
+    seen = {"scan": False}
+
+    def answer(method, params, session_id=None):
+        if method == "Target.getTargets" and sup.popup:
+            infos = real(method, params, session_id)
+            return {"targetInfos": infos["targetInfos"] + [
+                {"targetId": "POP", "type": "page", "openerId": "TAB", "url": SHOP + "/danke"}]}
+        if method == "Page.getFrameTree" and session_id == "S-temp":
+            row = ("POPTOP", "LQ", SHOP + "/danke", SHOP, "") if not seen["scan"] else (
+                "POPTOP", "LR", "https://acs.bank.test/x", "https://acs.bank.test", "")
+            return done_tests.frame_tree((row,))
+        if method == "Runtime.evaluate" and params.get("expression") == evidence.SCAN_JS and session_id == "S-temp":
+            seen["scan"] = True
+            return {"result": {"type": "object", "value": evidence.wording("", "Vielen Dank für Ihre Bestellung!")}}
+        return real(method, params, session_id)
+
+    sup.answer, sup.popup = answer, False
+    out = _press(sup, "JETZT KAUFEN", after={"popup": True})
+    assert out["payment_detected"] is False and detect.detected(sup) is None
+
+
+def test_payment_done_does_not_succeed_on_a_document_that_changed_after_its_evidence_read():
+    sup = _sunday()
+    out = _press(sup, "JETZT KAUFEN", after={"tree": THANKS_NEW_DOC, "page": THANKS_WEAK,
+                                             "rows": [_row("Weiter", role="link")]})
+    assert out["payment_detected"] is True
+    _swap_when_scanned(sup, done_tests.ACS)  # armed from here: the document is replaced right after payment_done's scan
+    sup.armed = True
+    res = done.payment_done(sup)
+    assert res["success"] is False and not sup.sent("Target.closeTarget")
+
+
+# build G2 (Codex P1-1): a Pay-like press on a provider's page keeps the approved-total check
+
+
+PSP_TOP = (("TOP", "L2", done_tests.STRIPE + "/hosted/pay", done_tests.STRIPE, ""),)
+
+
+def test_a_confirm_on_a_providers_page_after_pay_is_held_to_the_approved_total():
+    """Codex's scenario: Pay moved the top frame to the provider's own page asking another amount; its plain Confirm must
+    not go. The bank's own page (another site) stays without a merchant total."""
+    from tests.tools.test_browser_payment_surface import _total_reads
+
+    import dataclasses
+
+    sup = _sunday()
+    with done._LOCK:  # the card fields were typed into the merchant's own top document: its frame id stays "a card frame"
+        payment = done._PAYMENTS[sup]["TAB"]
+        done._PAYMENTS[sup]["TAB"] = dataclasses.replace(payment, documents=payment.documents | {("TOP", "L0")},
+                                                         merchant_fields=True)
+    assert _press(sup, "JETZT KAUFEN", after={"tree": PSP_TOP, "rows": [_row("Confirm")]})["success"] is True
+    sup.pin = {"state": "matched", "labelled": [2999], "stated": 1, "unclear": False}  # this page asks 29.99
+    out = _press(sup, "Confirm")
+    assert out["error_type"] == surface.TOTAL_CHANGED and len(_mouse_presses(sup)) == 1
+    sup.pin = {"state": "matched", "labelled": [2266], "stated": 1, "unclear": False}  # the approved amount: goes
+    reads = len(_total_reads(sup))
+    assert _press(sup, "Confirm")["success"] is True and len(_total_reads(sup)) > reads
+
+
+# build G2 (Opus LOW 5): a same-document event does not end the in-flight hold of a cross-document navigation
+
+
+class _Frames(FrameTrackingMixin):
+    def __init__(self):
+        import threading
+        self._state_lock, self._frames = threading.Lock(), {}
+
+
+def test_a_same_document_event_does_not_end_a_cross_document_navigation_hold():
+    handlers = FrameTrackingMixin.EVENT_HANDLERS
+    frames = _Frames()
+    handlers["Page.frameRequestedNavigation"](frames, {"frameId": "TOP", "reason": "formSubmissionPost",
+                                                       "disposition": "currentTab"})
+    handlers["Page.frameStartedLoading"](frames, {"frameId": "TOP"})  # a later start never downgrades it
+    handlers["Page.navigatedWithinDocument"](frames, {"frameId": "TOP", "url": SHOP + "/checkout/#x"})
+    assert frames.loading_since("TOP", 0.0) is True
+    handlers["Page.frameNavigated"](frames, {"frame": {"id": "TOP", "url": SHOP + "/danke", "loaderId": "L9"}}, None)
+    assert frames.loading_since("TOP", 0.0) is False  # the new document's commit ends it
+    other = _Frames()  # a start that does not say it loads another document: a same-document event ends it
+    handlers["Page.frameStartedLoading"](other, {"frameId": "TOP"})
+    handlers["Page.navigatedWithinDocument"](other, {"frameId": "TOP", "url": SHOP + "/checkout/#x"})
+    assert other.loading_since("TOP", 0.0) is False
+    typed = _Frames()
+    handlers["Page.frameStartedNavigating"](typed, {"frameId": "TOP", "navigationType": "differentDocument"})
+    handlers["Page.navigatedWithinDocument"](typed, {"frameId": "TOP", "url": SHOP + "/checkout/#x"})
+    assert typed.loading_since("TOP", 0.0) is True
+    handlers["Page.frameStoppedLoading"](typed, {"frameId": "TOP"})
+    assert typed.loading_since("TOP", 0.0) is False
+
+
+def test_a_second_pay_press_during_a_pending_order_post_is_refused_despite_a_hash_change(monkeypatch):
+    sup = _sunday()
+    assert _press(sup, "JETZT KAUFEN")["success"] is True
+    FrameTrackingMixin.EVENT_HANDLERS["Page.frameStartedNavigating"](
+        sup, {"frameId": "TOP", "navigationType": "differentDocument"})
+    FrameTrackingMixin.EVENT_HANDLERS["Page.navigatedWithinDocument"](sup, {"frameId": "TOP", "url": SHOP + "/c/#x"})
+    assert _press(sup, "JETZT KAUFEN")["error_type"] == detect.INFLIGHT and len(_mouse_presses(sup)) == 1
+    assert detect._INFLIGHT_S == 45.0

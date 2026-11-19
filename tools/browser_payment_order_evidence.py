@@ -52,6 +52,11 @@ _NUMBER = (r"bestellnummer|auftragsnummer|buchungsnummer|order number|order no\.
            r"confirmation number|numéro de commande|número de pedido|numero d['’]ordine|numero ordine|bestelnummer|"
            r"ordernummer")
 ORDER_SRC = (rf"(?<!%L%)(?:(?:{_NOUN})(?:\s+(?:{_FILL})){{0,4}}\s+(?:{_VERB})|{_THANKS}|{_NUMBER})(?!%L%)")
+# build G2 (Opus HIGH 1): the strong classes alone. A checkout carries ordinary service text that reads as order wording
+# ("Nach Absenden der Bestellung erhalten Sie eine E-Mail", "Your payment is processed securely"); only a
+# thank-you-for-your-order sentence or an order number counts on the document the press was made on, and only when it
+# was not there before the press.
+STRONG_SRC = rf"(?<!%L%)(?:{_THANKS}|{_NUMBER})(?!%L%)"
 FAILURE_SRC = (
     r"(?<!%L%)(?:fehlgeschlagen|abgelehnt|abgebrochen|zahlungsfehler|keine bestellung|"
     # build G1 (Opus L3): not "bestätigt" / "bearbeitet" alone ("E-Mail-Adresse ist noch nicht bestätigt",
@@ -85,13 +90,14 @@ def _py(src: str) -> re.Pattern:
 
 
 ORDER = _py(ORDER_SRC)
+STRONG = _py(STRONG_SRC)
 FAILURE = _py(FAILURE_SRC)
 
 # Runs in a fresh isolated world of the candidate document: the title and every visible text node (open shadow roots
 # included; form controls, editable regions, frames, scripts and hidden subtrees skipped, as in the snapshot) up to
 # far larger bounds than the snapshot's excerpt. Only two booleans leave the page.
 SCAN_JS = r"""(() => {
-  const ORDER = new RegExp(%ORDER%, 'iu'), FAILURE = new RegExp(%FAILURE%, 'iu');
+  const ORDER = new RegExp(%ORDER%, 'iu'), FAILURE = new RegExp(%FAILURE%, 'iu'), STRONG = new RegExp(%STRONG%, 'iu');
   const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'INPUT', 'TEXTAREA', 'SELECT', 'OPTION',
     'OPTGROUP', 'DATALIST', 'IFRAME', 'FRAME', 'FRAMESET', 'OBJECT', 'EMBED', 'CANVAS']);
   const shown = (el) => { const s = getComputedStyle(el); return !s || (s.display !== 'none' && s.visibility !== 'hidden'); };
@@ -116,9 +122,10 @@ SCAN_JS = r"""(() => {
   const root = document.body || document.documentElement;
   if (root) walk(root, 0);
   const text = out.join(' ').replace(/\s+/g, ' ');
-  return {order: ORDER.test(text), failure: FAILURE.test(text)};
+  return {order: ORDER.test(text), failure: FAILURE.test(text), strong: STRONG.test(text)};
 })()""".replace("%ORDER%", json.dumps(ORDER_SRC.replace("%L%", r"[\p{L}\p{N}]"))).replace(
-    "%FAILURE%", json.dumps(FAILURE_SRC.replace("%L%", r"[\p{L}\p{N}]")))
+    "%FAILURE%", json.dumps(FAILURE_SRC.replace("%L%", r"[\p{L}\p{N}]"))).replace(
+    "%STRONG%", json.dumps(STRONG_SRC.replace("%L%", r"[\p{L}\p{N}]")))
 
 # On the pressed Pay element (resolved by its backendNodeId): still connected and rendered.
 _SHOWN = r"""function(){ if (!this.isConnected) return false; const r = this.getBoundingClientRect();
@@ -129,11 +136,12 @@ _SHOWN = r"""function(){ if (!this.isConnected) return false; const r = this.get
 def wording(title: str, text: str) -> dict:
     """The scan's answer for a title and text (the page script's regexes, in Python): tests and fakes."""
     joined = " ".join(f"{title} {text}".split())
-    return {"order": bool(ORDER.search(joined)), "failure": bool(FAILURE.search(joined))}
+    return {"order": bool(ORDER.search(joined)), "failure": bool(FAILURE.search(joined)),
+            "strong": bool(STRONG.search(joined))}
 
 
 async def _scan(sup: Any, sid: str, frame_id: str) -> Optional[dict]:
-    """``{"order": bool, "failure": bool}`` from ``SCAN_JS``, or None when it is not exactly that (unread)."""
+    """``{"order", "failure", "strong": bool}`` from ``SCAN_JS``, or None when it is not exactly that (unread)."""
     try:
         ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": frame_id, "worldName": "hermes-payment-done"},
                               session_id=sid))["result"]["executionContextId"]
@@ -143,7 +151,7 @@ async def _scan(sup: Any, sid: str, frame_id: str) -> Optional[dict]:
         logger.info("payment_done: order wording not read (%s)", type(exc).__name__)
         return None
     value = (reply.get("result") or {}).get("value") if not reply.get("exceptionDetails") else None
-    if not (isinstance(value, dict) and set(value) == {"order", "failure"}
+    if not (isinstance(value, dict) and set(value) == {"order", "failure", "strong"}
             and all(type(v) is bool for v in value.values())):
         return None
     return value
@@ -182,25 +190,44 @@ async def _purchase_button_listed(sup: Any, sid: str, row: tuple) -> bool:
     return any(purchase_button(c) for c in controls)
 
 
-async def order_evidence(sup: Any, sid: str, row: tuple, checkout: bool, pay: Optional[dict],
-                         need_wording: bool = False) -> tuple:
-    """``(evidence, reason)``: ``("confirmation_text" | "new_document", None)`` for a confirmation, else
-    ``(None, reason code)``. ``row``: the candidate's top frame row; ``checkout``: it is checkout-like (the caller
-    knows the checkout's loaders and URLs); ``pay``: the Pay press of this lock (``pay_press``), or None.
-    ``need_wording`` (build G1, the payment detection after a Pay-like press): a new document needs order wording
-    too."""
-    scan = await _scan(sup, sid, row[0])
-    if scan is None:
-        return None, "page_unread"
+async def scan_document(sup: Any, sid: str, row: tuple) -> Optional[dict]:
+    """The value-free wording scan of the document ``row`` (``(frame id, loader, ...)``): ``{"order", "failure",
+    "strong"}`` booleans, or None (unread)."""
+    return await _scan(sup, sid, row[0])
+
+
+async def judge(sup: Any, sid: str, row: tuple, scan: dict, checkout: bool, pay: Optional[dict],
+                need_wording: bool = False, before: Optional[dict] = None) -> tuple:
+    """``(evidence, reason, strong)`` for a scanned document: ``("confirmation_text" | "new_document", None, ...)`` for
+    a confirmation, else ``(None, reason code, False)``; ``strong``: the evidence rests on a thank-you sentence or an
+    order number. ``row``: the candidate's top frame row; ``checkout``: it is checkout-like (the caller knows the
+    checkout's loaders and URLs); ``pay``: the Pay press of this lock (``pay_press``), or None. ``need_wording``
+    (build G1, the payment detection after a Pay-like press): a new document needs order wording too. ``before``
+    (build G2, the detection): ``{"doc": (frame id, loader), "strong": bool}`` read right before the press; on that
+    very document only a strong class that was absent before the press counts (a checkout's own service text reads as
+    order wording and is there before the press); any other document keeps the full rules."""
     if scan["failure"]:
-        return None, "failure_wording"
+        return None, "failure_wording", False
     if (pay is not None and isinstance(pay.get("node"), int) and (pay.get("frame"), pay.get("loader")) == row[:2]
             and await _pay_control_shown(sup, sid, row[0], pay["node"])):
-        return None, "pay_control_shown"
-    if not scan["order"] and (checkout or need_wording):
-        return None, "no_order_wording"
+        return None, "pay_control_shown", False
+    same = before is not None and tuple(before.get("doc") or ()) == tuple(row[:2])
+    strong = scan["strong"]
+    wording = (strong and before.get("strong") is False) if same else scan["order"]
+    if not wording and (checkout or need_wording):
+        return None, "no_order_wording", False
     if not checkout:
-        return "new_document", None
+        return "new_document", None, bool(wording and strong)
     if await _purchase_button_listed(sup, sid, row):
-        return None, "purchase_button_shown"
-    return "confirmation_text", None
+        return None, "purchase_button_shown", False
+    return "confirmation_text", None, bool(wording and strong)
+
+
+async def order_evidence(sup: Any, sid: str, row: tuple, checkout: bool, pay: Optional[dict],
+                         need_wording: bool = False) -> tuple:
+    """``(evidence, reason)`` (``judge``) for the document ``row``, scanned here (payment_done's read)."""
+    scan = await scan_document(sup, sid, row)
+    if scan is None:
+        return None, "page_unread"
+    evidence, reason, _strong = await judge(sup, sid, row, scan, checkout, pay, need_wording)
+    return evidence, reason
