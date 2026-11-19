@@ -96,12 +96,11 @@ def _managed_oauth_env_host(provider: str) -> str:
     """The profile's documented host override for a managed OAuth provider, read through the
     secret scope like the resolver reads it: the process env holds the launch profile's value."""
     from agent.secret_scope import get_secret_str
-    from hermes_cli.auth_xai import DEFAULT_XAI_OAUTH_BASE_URL, _xai_validate_inference_base_url
+    from hermes_cli.route_identity import xai_oauth_profile_route
 
     if provider == "openai-codex":
         return get_secret_str("HERMES_CODEX_BASE_URL", "").strip()
-    raw = get_secret_str("HERMES_XAI_BASE_URL", "").strip() or get_secret_str("XAI_BASE_URL", "").strip()
-    return _xai_validate_inference_base_url(raw, fallback=DEFAULT_XAI_OAUTH_BASE_URL)
+    return xai_oauth_profile_route()
 
 
 def _session_override_uses_managed_oauth(override: Optional[dict]) -> bool:
@@ -351,6 +350,9 @@ class GatewayTurnPrepareMixin:
         }
         runtime["fallback_active"] = bool(getattr(agent, "_fallback_activated", False))
         runtime = {k: v for k, v in runtime.items() if v not in (None, "")}
+        if runtime.get("base_url"):  # compare in the stored spelling, or every xai-oauth turn rewrites the row
+            from hermes_cli.route_identity import persisted_xai_route
+            runtime["base_url"] = persisted_xai_route(runtime.get("provider"), runtime["base_url"])
         try:
             db = self._session_db._db
             row = db.get_session(session_id)

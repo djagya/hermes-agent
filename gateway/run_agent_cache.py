@@ -163,9 +163,9 @@ class GatewayAgentCacheMixin:
             return
         override: dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
         provider = persisted.get("provider")
-        if override.get("base_url"):
-            from hermes_cli.route_identity import canonical_xai_route
-            override["base_url"] = canonical_xai_route(provider, override["base_url"])  # stored spelling -> live
+        if override.get("base_url"):  # stored spelling -> the route it dials now (an operator pin included)
+            from hermes_cli.route_identity import live_xai_route
+            override["base_url"] = live_xai_route(provider, override["base_url"])
         from hermes_cli.runtime_provider import is_foreign_provider_endpoint
         if is_foreign_provider_endpoint(provider, override.get("base_url")):
             override["base_url"] = None  # left over from a switch that kept the previous provider's URL

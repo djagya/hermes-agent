@@ -5,7 +5,8 @@ runtime uses the subscription proxy. ``hermes_cli.route_identity`` owns the mapp
 ``canonical_xai_route`` / ``route_key`` (read and compare) and ``persisted_xai_route`` (write).
 
 1. ``test_every_site_is_registered``: an AST scan of the source tree finds every function that
-   (A) calls a route-identity primitive, (B) writes to a persistence sink and mentions ``base_url``, or
+   (A) calls a route-identity primitive, (B) writes to a persistence sink (config.yaml, auth.json, sessions.json,
+   every state.db route writer) and mentions ``base_url`` or ``model_config``, or
    (C) compares a ``base_url`` while naming xai-oauth or a provider's registry default. Each must be a
    ``SITES`` row with a kind; a new site fails until it is classified.
 2. ``test_site_kind_uses_the_mechanism``: compare/read/persist rows call the mechanism (static check).
@@ -14,6 +15,8 @@ runtime uses the subscription proxy. ``hermes_cli.route_identity`` owns the mapp
    for ``xai-oauth`` and the API-key provider ``xai``.
 4. Refresh failures (AuthError, timeout) during resolution never persist the proxy, never send an API
    key to the proxy and keep the stored spelling.
+5. Readers that hand a stored route to an agent follow an operator pin (``HERMES_XAI_BASE_URL``) the way the
+   runtime resolver does.
 """
 from __future__ import annotations
 
@@ -51,6 +54,8 @@ SITES: dict[str, tuple[str, str]] = {
     "hermes_cli/route_identity.py::should_clear_context_pin": ("pin", "-> _context_route_mismatch"),
     "hermes_cli/route_identity.py::should_clear_context_pin_async": ("pin", "-> should_clear_context_pin"),
     "utils.py::is_xai_inference_host": ("mechanism", "host class (r2), not route identity"),
+    "hermes_cli/route_identity.py::live_xai_route": ("mechanism", "read side + the operator pin"),
+    "hermes_cli/route_identity.py::xai_oauth_profile_route": ("mechanism", "profile default route"),
     # compare
     "agent/agent_init.py::_context_route_mismatch": ("compare", "the context-pin route check"),
     "agent/agent_init.py::_provider_default_routes.add": ("compare", "default routes in route_key form"),
@@ -70,6 +75,7 @@ SITES: dict[str, tuple[str, str]] = {
     "hermes_cli/model_switch.py::selection_route_changed": ("compare", "endpoint-bound credentials"),
     "hermes_cli/models.py::_configured_relay_base_url": ("compare", "own endpoint vs relay"),
     "hermes_cli/runtime_provider.py::is_foreign_provider_endpoint": ("compare", "legacy is xai-oauth's own"),
+    "agent/title_generator.py::title_upgrade_must_wait_for_turn": ("compare", "title pin vs main route"),
     # read
     "gateway/run_agent_cache.py::GatewayAgentCacheMixin._rehydrate_session_model_override": ("read", "persisted override"),
     "gateway/session.py::SessionStore.get_model_override": ("read", "session-store override reader"),
@@ -79,6 +85,9 @@ SITES: dict[str, tuple[str, str]] = {
     "agent/credential_pool.py::PooledCredential.runtime_base_url": ("read", "-> _xai_oauth_runtime_base_url"),
     "tools/xai_http.py::resolve_xai_http_credentials": ("read", "-> _xai_oauth_runtime_base_url"),
     "hermes_cli/runtime_provider.py::_pool_entry_mode_and_url": ("transport", "entry URL is runtime_base_url"),
+    "acp_adapter/session.py::SessionManager._restore": ("read", "ACP resume (model_config, billing)"),
+    "gateway/session_local_migration.py::legacy_launch_params": ("read", "billing-only legacy rows"),
+    "gateway/run_turn_prepare.py::_managed_oauth_env_host": ("read", "-> xai_oauth_profile_route"),
     # persist
     "gateway/session.py::sanitize_model_override": ("persist", "session-store override"),
     "hermes_cli/route_identity.py::persisted_route_patch": ("persist", "session DB route patch"),
@@ -94,6 +103,26 @@ SITES: dict[str, tuple[str, str]] = {
     "hermes_cli/auth_commands.py::<module>": ("persist", "_xai_oauth_persisted_base_url"),
     "hermes_cli/web_server_config.py::_apply_main_assignment_sync": ("persist", "_prepare_main_assignment"),
     "hermes_cli/web_routers/profiles.py::_write_profile_model": ("persist", "_apply_main_model_assignment"),
+    # the state.db sinks: model_config (replace, constructor) and the billing route (row + per-model usage)
+    "hermes_cli/route_identity.py::persisted_model_config_json": ("persist", "persisted_route_patch"),
+    "hermes_state_sessions.py::SessionSessionsMixin.update_session_meta": ("persist", "persisted_model_config_json"),
+    "hermes_state_sessions.py::SessionSessionsMixin.patch_session_model_config": ("persist", "_write_model_config_patch"),
+    "hermes_state_worker_lifecycle.py::insert_session_row_in_transaction": ("persist", "persisted_route_patch"),
+    "hermes_state_worker_lifecycle.py::worker_billing_route": ("persist", "stored_billing_url"),
+    "hermes_state_usage.py::stored_billing_url": ("persist", "persisted_xai_route"),
+    "hermes_state_usage.py::SessionUsageMixin.update_session_billing_route": ("persist", "stored_billing_url"),
+    "hermes_state_usage.py::SessionUsageMixin._update_token_counts_in_transaction": ("persist", "stored_billing_url"),
+    "hermes_state_usage.py::SessionUsageMixin.record_auxiliary_usage": ("persist", "stored_billing_url"),
+    "hermes_state_usage.py::SessionUsageMixin.update_token_counts": ("persist", "_update_token_counts_in_transaction"),
+    # route writers above those sinks
+    "gateway/run_turn_prepare.py::GatewayTurnPrepareMixin._sync_session_model_from_agent": (
+        "persist", "persisted_xai_route, then update_session_meta"),
+    "acp_adapter/session.py::SessionManager._persist": ("persist", "update_session_meta / create_session"),
+    "tui_gateway/agent_factory.py::_persist_live_session_runtime": ("persist", "update_session_meta"),
+    "tui_gateway/session_workdir.py::_ensure_session_db_row": ("persist", "create_session"),
+    "agent/agent_runtime_helpers.py::_persist_switch_billing_route": ("persist", "update_session_billing_route"),
+    "agent/runtime_session_lifecycle.py::RuntimeSessionLifecycleMixin.update_session_billing_route": (
+        "persist", "session.billing_route -> worker_billing_route"),
     # transport: raw URL on purpose (which host a client dials, cache keys, earned verdicts)
     "agent/agent_init.py::_active_route_url": ("transport", "query-string reattach"),
     "agent/agent_runtime_helpers.py::_route_may_be_custom": ("entry", "custom entries"),
@@ -158,13 +187,37 @@ SITES: dict[str, tuple[str, str]] = {
     "hermes_cli/web_server_config.py::_apply_aux_assignment_sync": ("other", "aux"),
     "tools/cronjob_job_args.py::_custom_stored_key_error": ("other", "custom stored key"),
     "tui_gateway/methods_profiles.py::_inherit_launch_model": ("other", "raw config copy"),
+    # session-row writers with no route keys (lineage markers, yolo, constructor facts, sidecars), and config.yaml
+    # copies of the stored model block; any route they carried would still pass the state.db sinks above
+    "agent/onboarding_record.py::delete_chat": ("other", "onboarding row"),
+    "agent/onboarding_record.py::start": ("other", "onboarding row"),
+    "agent/prompt_refresh.py::_persist_epoch": ("other", "prompt epoch key"),
+    "agent/runtime_session_child.py::ChildSessionStore.create_session": ("other", "constructor keys only"),
+    "agent/runtime_session_lifecycle.py::RuntimeSessionLifecycleMixin.create_session": ("other", "worker: constructor keys"),
+    "agent/runtime_session_store.py::RuntimeSessionStore.patch_session_model_config": ("other", "worker: SIDECAR_KEYS"),
+    "agent/runtime_session_store.py::RuntimeSessionStore.update_conversation_model_config_value": (
+        "other", "worker: SIDECAR_KEYS"),
+    "gateway/slash_commands_session.py::GatewaySessionCommandsMixin._handle_branch_command": ("other", "_branched_from"),
+    "hermes_cli/cli_commands_mixin.py::CLICommandsMixin._handle_branch_command": ("other", "_branched_from"),
+    "hermes_cli/cli_session_mixin.py::CLISessionMixin.new_session": ("other", "max_iterations/reasoning/yolo"),
+    "hermes_cli/model_setup_flows_common.py::_commit_model_config": ("other", "saves the caller's cfg"),
+    "hermes_cli/profiles.py::_seed_model_config": ("other", "copy of the stored model block"),
+    "run_agent.py::AIAgent._ensure_db_session": ("other", "init config: no route keys"),
+    "tools/delegate_tool_child_run.py::_reserve_child_transcript": ("other", "_delegate_from"),
+    "tui_gateway/methods_session.py::_persist_branch": ("other", "_branched_from"),
+    "plugins/browser/browser_use/provider.py::BrowserUseBrowserProvider.create_session": ("other", "browser service"),
+    "plugins/browser/browserbase/provider.py::BrowserbaseBrowserProvider.create_session": ("other", "browser service"),
 }
 
-_PRIM = re.compile(r"\b(normalize_route_base_url|route_key|canonical_xai_route|persisted_xai_route|persisted_route_patch|"
+_PRIM = re.compile(r"\b(normalize_route_base_url|route_key|canonical_xai_route|live_xai_route|xai_oauth_profile_route|"
+                   r"persisted_xai_route|persisted_route_patch|persisted_model_config_json|stored_billing_url|"
                    r"should_clear_context_pin(?:_async)?|_context_route_mismatch|selection_route_changed|"
                    r"_xai_oauth_persisted_base_url|_xai_oauth_runtime_base_url)\(")
-_SINK = re.compile(r"\b(save_config|atomic_config_replace|write_config_keys|set_config_value|save_auth_store|"
-                   r"_save_auth_store|_store_provider_state|patch_session_model_config|update_session_model|"
+# Persistence sinks: config.yaml, auth.json, sessions.json and every state.db route writer (model_config and the
+# billing route); a function that calls one and mentions base_url is a site.
+_SINK = re.compile(r"\b(save_config|atomic_config_replace|atomic_config_write|write_config_keys|set_config_value|"
+                   r"save_auth_store|_save_auth_store|_store_provider_state|patch_session_model_config|"
+                   r"update_session_model|update_session_meta|create_session|update_session_billing_route|"
                    r"set_model_override|_persist_routing_data)\(")
 _NAMES_DEFAULT = re.compile(r"xai-oauth|xai_oauth|XAI_OAUTH|grok-oauth|inference_base_url|PROVIDER_REGISTRY|"
                             r"base_url_override")
@@ -177,7 +230,7 @@ def _anchors(seg: str) -> frozenset:
     out = set()
     if _PRIM.search(seg):
         out.add("A")
-    if _SINK.search(seg) and "base_url" in seg:
+    if _SINK.search(seg) and ("base_url" in seg or "model_config" in seg):
         out.add("B")
     if _NAMES_DEFAULT.search(seg) and _CMP.search(seg):
         out.add("C")
@@ -236,7 +289,8 @@ def test_every_site_is_registered(scanned):
 
 _USES = {
     "compare": re.compile(r"\b(route_key|canonical_xai_route)\("),
-    "read": re.compile(r"\b(canonical_xai_route|_xai_oauth_runtime_base_url|runtime_base_url)\b"),
+    "read": re.compile(r"\b(canonical_xai_route|live_xai_route|xai_oauth_profile_route|_xai_oauth_runtime_base_url|"
+                       r"runtime_base_url)\b"),
     "pin": re.compile(r"\b(should_clear_context_pin(?:_async)?|_context_route_mismatch)\("),
 }
 
@@ -428,6 +482,7 @@ STATIC_ONLY = {
     "gateway/run_inbound.py::GatewayInboundMixin._inbound_model_context_length": "async; -> should_clear_context_pin_async",
     "gateway/run_turn_hygiene.py::GatewayTurnHygieneMixin._hmwa_hygiene_settings": "async; -> should_clear_context_pin_async",
     "hermes_cli/route_identity.py::should_clear_context_pin_async": "covered by the sync harness",
+    "agent/title_generator.py::title_upgrade_must_wait_for_turn": "self-hosted routes only; test_title_pin_compares_route_keys",
 }
 
 
@@ -505,12 +560,110 @@ def _p_login_config(p, url, home):
     return yaml.safe_load((home / "config.yaml").read_text())["model"]["base_url"]
 
 
+def _route_config(p, url):  # the shapes resume reads: top level (TUI/ACP) and gateway_runtime (gateway, CLI)
+    route = {"provider": p, "base_url": url, "api_mode": "codex_responses"}
+    return {**route, "gateway_runtime": dict(route), "cwd": "/w"}
+
+
+def _both_shapes(cfg):
+    assert cfg["base_url"] == cfg["gateway_runtime"]["base_url"]
+    return cfg["base_url"]
+
+
+def _p_update_session_meta(p, url, home):  # the generic sink (TUI live runtime, workdir, ACP, gateway sync)
+    db = _session_db(home)
+    db.update_session_meta("s1", json.dumps(_route_config(p, url)), "grok-4")
+    return _both_shapes(_row(db))
+
+
+def _p_create_session(p, url, home):  # the constructor sink (ACP first persist, TUI first prompt)
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("s1", "acp", model="grok-4", model_config=_route_config(p, url))
+    return _both_shapes(_row(db))
+
+
+def _p_gateway_sync(p, url, home):
+    """Every gateway turn: the runtime route lands in ``gateway_runtime`` in the stored spelling, and a second
+    turn on the same route does not rewrite the row (compare in the stored spelling)."""
+    from gateway.run_turn_prepare import GatewayTurnPrepareMixin
+    db = _session_db(home)
+    writes = []
+    real = db.update_session_meta
+    db.update_session_meta = lambda *a, **kw: (writes.append(a), real(*a, **kw))[1]
+    agent = SimpleNamespace(model="grok-4", provider=p, requested_provider=p, base_url=url,
+                            api_mode="codex_responses", _fallback_activated=False)
+    for _turn in range(2):
+        GatewayTurnPrepareMixin._sync_session_model_from_agent(SimpleNamespace(_session_db=SimpleNamespace(_db=db)),
+                                                               "s1", agent)
+    assert len(writes) == 1, "an unchanged route rewrote the row"
+    return _row(db)["gateway_runtime"]["base_url"]
+
+
+def _p_acp_persist(p, url, home):
+    """ACP ``_persist``: the create branch (``create_session``) and the update branch (``update_session_meta``)."""
+    from acp_adapter.session import SessionManager, SessionState
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=home / "state.db")
+    agent = SimpleNamespace(provider=p, base_url=url, api_mode="codex_responses", session_id="s1", model="grok-4")
+    state = SessionState(session_id="s1", agent=agent, cwd=str(home), model="grok-4",
+                         history=[{"role": "user", "content": "hi"}])
+    mgr = SessionManager(db=db)
+    stored = []
+    for _call in range(2):
+        mgr._persist(state)
+        stored.append(_row(db)["base_url"])
+    assert stored[0] == stored[1]
+    return stored[1]
+
+
+def _billing_urls(home):
+    import sqlite3
+    with sqlite3.connect(home / "state.db") as conn:
+        row = conn.execute("SELECT billing_base_url FROM sessions WHERE id='s1'").fetchone()[0]
+        usage = {r[0] for r in conn.execute("SELECT billing_base_url FROM session_model_usage WHERE session_id='s1'")}
+    return row, usage
+
+
+def _p_billing_route(p, url, home):  # /model switch (agent_runtime_helpers._persist_switch_billing_route)
+    db = _session_db(home)
+    db.update_session_billing_route("s1", provider=p, base_url=url, billing_mode="subscription_included")
+    return _billing_urls(home)[0]
+
+
+def _p_worker_billing_route(p, url, home):  # the runtime-store worker's session.billing_route
+    from hermes_state_worker_lifecycle import worker_billing_route
+    db = _session_db(home)
+    db._execute_write(lambda conn: worker_billing_route(
+        db, conn, "s1", {"provider": p, "base_url": url, "billing_mode": None}))
+    return _billing_urls(home)[0]
+
+
+def _p_token_counts(p, url, home):  # every turn (turn_usage -> queue_token_counts) and the aux recorder
+    db = _session_db(home)
+    db.queue_token_counts("s1", source="cli", input_tokens=3, output_tokens=2, model="grok-4", billing_provider=p,
+                          billing_base_url=url, api_call_count=1)
+    db.flush_token_counts()
+    db.record_auxiliary_usage("s1", "title_generation", model="grok-4", billing_provider=p, billing_base_url=url,
+                              input_tokens=1)
+    row, usage = _billing_urls(home)
+    assert usage == {row}, "session row and per-model usage rows disagree on the route spelling"
+    return row
+
+
 PERSIST = {
     "hermes_cli/model_switch.py::model_selection_config_updates": _p_selection,
     "gateway/session.py::sanitize_model_override": _p_sanitize,
     "hermes_state_sessions.py::SessionSessionsMixin.update_session_model": _p_update_session_model,
     "hermes_cli/route_identity.py::persisted_route_patch": _p_patch_session,
     "hermes_cli/auth.py::_update_config_for_provider": _p_login_config,
+    "hermes_state_sessions.py::SessionSessionsMixin.update_session_meta": _p_update_session_meta,
+    "hermes_state_worker_lifecycle.py::insert_session_row_in_transaction": _p_create_session,
+    "gateway/run_turn_prepare.py::GatewayTurnPrepareMixin._sync_session_model_from_agent": _p_gateway_sync,
+    "acp_adapter/session.py::SessionManager._persist": _p_acp_persist,
+    "hermes_state_usage.py::SessionUsageMixin.update_session_billing_route": _p_billing_route,
+    "hermes_state_worker_lifecycle.py::worker_billing_route": _p_worker_billing_route,
+    "hermes_state_usage.py::SessionUsageMixin._update_token_counts_in_transaction": _p_token_counts,
 }
 
 
@@ -570,6 +723,101 @@ def test_session_store_override_reads_back_live(override_store, tmp_path, provid
     copy = store.get_model_override(key)
     copy["base_url"] = "https://mutated.example/v1"
     assert store.get_model_override(key)["base_url"] == want
+
+
+# An operator pin (HERMES_XAI_BASE_URL) moves xai-oauth's default route; a stored default spelling must follow it,
+# as the runtime resolver does, or a resumed/rehydrated session dials the proxy the operator pinned away from.
+PINS = {"none": "", "legacy": LEGACY, "custom": CUSTOM, "proxy": PROXY, "foreign": FOREIGN}
+
+
+def _pinned_default(pin):  # what the runtime resolver dials for xai-oauth under the pin (a foreign pin is refused)
+    return {"legacy": LEGACY, "custom": CUSTOM}.get(pin, PROXY)
+
+
+def _live_expect(provider, stored, pin):
+    if provider == "xai-oauth" and stored in DEFAULT_SPELLINGS:
+        return _pinned_default(pin)
+    return STORED[stored]
+
+
+@pytest.fixture
+def pinned(home, monkeypatch, request):
+    pin = request.param
+    if PINS[pin]:
+        monkeypatch.setenv("HERMES_XAI_BASE_URL", PINS[pin])
+    return pin
+
+
+@pytest.mark.parametrize("pinned", sorted(PINS), indirect=True)
+@pytest.mark.parametrize("provider", PROVIDERS)
+@pytest.mark.parametrize("stored", sorted(STORED))
+def test_stored_route_readers_follow_the_operator_pin(home, monkeypatch, pinned, provider, stored):
+    """Every reader that hands a stored route to an agent: the resume reader, the session-store override, the
+    local-session migration (route and billing-only rows) and the ACP restore (model_config and billing)."""
+    from gateway.session_local_migration import legacy_launch_params
+    from hermes_state import SessionDB
+    want = _live_expect(provider, stored, pinned)
+    url = STORED[stored]
+    assert SessionDB.session_gateway_runtime({"model_config": {"gateway_runtime": {
+        "provider": provider, "base_url": url}}})["base_url"] == want
+    for config, billing in (({"gateway_runtime": {"provider": provider, "base_url": url}}, ""), ({}, url)):
+        row = {"source": "cli", "model": "grok-4", "model_config": json.dumps(config), "billing_provider": provider,
+               "billing_base_url": billing}
+        assert legacy_launch_params(row)[0].get("base_url") == want, (config, billing)
+    from acp_adapter.session import SessionManager
+    db = SessionDB(db_path=home / "state.db")
+    for sid, config, billing in (("a1", {"provider": provider, "base_url": url}, None), ("a2", {"provider": provider}, url)):
+        db.create_session(sid, "acp", model="grok-4", model_config={**config, "cwd": str(home)})
+        if billing:
+            db.update_session_billing_route(sid, provider=provider, base_url=billing)
+        seen = {}
+        mgr = SessionManager(db=db)
+        monkeypatch.setattr(mgr, "_make_agent", lambda **kw: (seen.update(kw), SimpleNamespace(model="grok-4"))[1])
+        assert mgr._restore(sid) is not None
+        assert seen["base_url"] == want, sid
+
+
+@pytest.mark.parametrize("pinned", sorted(PINS), indirect=True)
+@pytest.mark.parametrize("provider", PROVIDERS)
+@pytest.mark.parametrize("stored", sorted(STORED))
+def test_session_store_override_follows_the_operator_pin(override_store, pinned, provider, stored):
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    store = override_store()
+    key = store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, user_id="u", chat_id="c",
+                                                    user_name="t", chat_type="dm")).session_key
+    store.set_model_override(key, {"model": "grok-4", "provider": provider, "base_url": STORED[stored]})
+    assert store.get_model_override(key)["base_url"] == _live_expect(provider, stored, pinned)
+
+
+@pytest.mark.parametrize("pinned", sorted(PINS), indirect=True)
+@pytest.mark.parametrize("stored", sorted(STORED))
+def test_rehydrated_override_dials_the_pinned_route(home, monkeypatch, pinned, stored):
+    """A persisted xai-oauth override rehydrated under an operator pin dials what the resolver dials, and the
+    managed-route check of the next turn accepts it (it refused a custom-host pin before)."""
+    import gateway.run
+    from gateway.run_turn_prepare import _resolve_session_override_runtime, _session_override_uses_managed_oauth
+    monkeypatch.setattr(gateway.run, "_resolve_runtime_agent_kwargs_for_provider",
+                        _outcome("ok", "xai-oauth", _pinned_default(pinned)))
+    runner = _Runner({"model": "grok-4", "provider": "xai-oauth", "base_url": STORED[stored]})
+    runner._rehydrate("k")
+    override = runner.state.conversation.model_override
+    assert override["base_url"] == _live_expect("xai-oauth", stored, pinned)
+    managed = _session_override_uses_managed_oauth(override)
+    assert managed == (stored in DEFAULT_SPELLINGS or (pinned == "custom" and stored == "custom"))
+    if managed:
+        runtime = _resolve_session_override_runtime(override, managed_oauth=True)
+        assert override["base_url"] == runtime["base_url"]
+
+
+def test_title_pin_compares_route_keys(monkeypatch):
+    """A title pin on the turn's own self-hosted server is the same endpoint in any spelling of it."""
+    import agent.title_generator as tg
+    main = {"provider": "custom", "base_url": "http://localhost:1234/v1"}
+    for pin, waits in (("HTTP://LocalHost:1234/v1/", True), ("http://localhost:1234/v1", True),
+                       ("http://localhost:4321/v1", False)):
+        monkeypatch.setattr(tg, "_title_config", lambda pin=pin: {"provider": "custom", "base_url": pin})
+        assert tg.title_upgrade_must_wait_for_turn(main) is waits, pin
 
 
 @pytest.mark.parametrize("stored", sorted(STORED))

@@ -687,11 +687,13 @@ class SessionSessionsMixin:
     def update_session_meta(
         self, session_id: str, model_config_json: str, model: Optional[str] = None,
     ) -> None:
-        """Update model_config and (COALESCE) optionally model."""
+        """Replace model_config (its route ``base_url`` in the stored spelling, as every route write) and
+        (COALESCE) optionally model. Route writer for the TUI live runtime, ACP and the gateway turn sync."""
+        from hermes_cli.route_identity import persisted_model_config_json
         self.flush_token_counts()  # barrier against queued token deltas — see update_session_model
         self._write_sql(
             "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-            (model_config_json, model, session_id),
+            (persisted_model_config_json(model_config_json), model, session_id),
         )
 
     def update_system_prompt(self, session_id: str, system_prompt: Optional[str]) -> None:
@@ -752,8 +754,9 @@ class SessionSessionsMixin:
         params: Optional[Callable[[Optional[str]], tuple]] = None,
     ) -> None:
         """Merge ``patch`` into model_config then run ``sql`` with ``params(merged)`` in one write
-        transaction; no-op when the row doesn't exist. Every route write lands here, so a route's
-        ``base_url`` is stored in its persisted spelling (``persisted_route_patch``)."""
+        transaction; no-op when the row doesn't exist. A route's ``base_url`` is stored in its persisted
+        spelling (``persisted_route_patch``), as in the other route sinks (``update_session_meta``, the
+        constructor ``insert_session_row_in_transaction``, the billing-route writers)."""
         from hermes_cli.route_identity import persisted_route_patch
         patch = persisted_route_patch(patch)
 

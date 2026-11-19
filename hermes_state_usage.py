@@ -80,6 +80,16 @@ _MODEL_USAGE_FIELDS = frozenset((
     "actual_cost_usd", "cost_status", "cost_source", "api_call_count"))
 
 
+def stored_billing_url(provider: Optional[str], base_url: Optional[str]) -> Optional[str]:
+    """``billing_base_url`` in the stored route spelling (``persisted_xai_route``: the xai-oauth proxy is stored
+    as the legacy API URL, as every route column), so a rolled-back image and the per-model usage key read
+    one route. Readers that hand it to an agent map it back (``live_xai_route``)."""
+    if not base_url:
+        return base_url
+    from hermes_cli.route_identity import persisted_xai_route
+    return persisted_xai_route(provider, base_url)
+
+
 class SessionUsageMixin:
     """Coalesced token writer, per-model usage rows, billing route."""
 
@@ -95,6 +105,7 @@ class SessionUsageMixin:
         """
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
+        base_url = stored_billing_url(provider, base_url)
 
         def _do(conn):
             conn.execute("""UPDATE sessions SET
@@ -315,6 +326,7 @@ class SessionUsageMixin:
         pricing_version: Optional[str]=None, billing_provider: Optional[str]=None, billing_base_url: Optional[str]=None,
         billing_mode: Optional[str]=None, api_call_count: int=0, absolute: bool=False, task: str="",
     ) -> None:
+        billing_base_url = stored_billing_url(billing_provider, billing_base_url)
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
         sql = _TOKEN_UPDATE_ABSOLUTE_SQL if absolute else _TOKEN_UPDATE_DELTA_SQL
         has_usage = bool(input_tokens or output_tokens or cache_read_tokens or cache_write_tokens or reasoning_tokens
@@ -404,6 +416,7 @@ class SessionUsageMixin:
         Background-review forks record an aggregate of N fork API calls in one write with
         ``task='background_review'`` (issue #87250).
         """
+        billing_base_url = stored_billing_url(billing_provider, billing_base_url)
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
         if not session_id or not task:
             return

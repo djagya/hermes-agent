@@ -492,11 +492,13 @@ class SessionManager:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
             history = []
 
+        provider = meta.get("provider") or row.get("billing_provider")
+        from hermes_cli.route_identity import live_xai_route  # the row stores the route's persisted spelling
         try:
             agent = self._make_agent(
                 session_id=session_id, cwd=cwd, model=model, api_mode=meta.get("api_mode") or None,
-                requested_provider=meta.get("provider") or row.get("billing_provider"),
-                base_url=meta.get("base_url") or row.get("billing_base_url"))
+                requested_provider=provider,
+                base_url=live_xai_route(provider, meta.get("base_url") or row.get("billing_base_url")) or None)
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
             return None

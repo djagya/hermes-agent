@@ -911,11 +911,11 @@ class SessionGatewayMixin:
     @staticmethod
     def session_gateway_runtime(session_meta: Optional[dict[str, Any]]) -> dict[str, Any]:
         """The persisted route (:meth:`_stored_gateway_runtime`) in its live spelling: a stored
-        xai-oauth legacy API URL reads back as the subscription route (``canonical_xai_route``)."""
+        xai-oauth default reads back as the profile's default route (``live_xai_route``)."""
         route = SessionGatewayMixin._stored_gateway_runtime(session_meta)
         if route.get("base_url"):
-            from hermes_cli.route_identity import canonical_xai_route
-            route["base_url"] = canonical_xai_route(route.get("provider"), route["base_url"])
+            from hermes_cli.route_identity import live_xai_route
+            route["base_url"] = live_xai_route(route.get("provider"), route["base_url"])
         return route
 
     @staticmethod

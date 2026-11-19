@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -84,6 +85,31 @@ def persisted_xai_route(provider: Any, base_url: Any) -> str:
     return raw
 
 
+def xai_oauth_profile_route() -> str:
+    """This profile's live default xai-oauth route: its validated ``HERMES_XAI_BASE_URL`` / ``XAI_BASE_URL`` pin
+    (read through the secret scope, as the runtime resolver reads it), else the subscription proxy."""
+    from agent.secret_scope import get_secret_str
+    from hermes_cli.auth_xai import _xai_validate_inference_base_url
+    pin = get_secret_str("HERMES_XAI_BASE_URL", "").strip() or get_secret_str("XAI_BASE_URL", "").strip()
+    return _xai_validate_inference_base_url(pin, fallback=_xai_oauth_route_pair()[0])
+
+
+def live_xai_route(provider: Any, base_url: Any) -> str:
+    """The URL a stored route dials: ``canonical_xai_route``, and for xai-oauth a default spelling (the legacy API
+    URL or the proxy) is this profile's live default (``xai_oauth_profile_route``), so an operator pin wins over
+    a stored default exactly as it does for the runtime resolver. A custom or foreign URL is never rewritten."""
+    live = canonical_xai_route(provider, base_url)
+    if not is_xai_oauth_provider(provider) or normalize_route_base_url(live.strip()) != _xai_oauth_route_pair()[0]:
+        return live
+    from agent.secret_scope import UnscopedSecretError
+    try:
+        return xai_oauth_profile_route()
+    except UnscopedSecretError:
+        # A multiplexed reader outside any profile scope cannot know whose pin applies: keep the registry route
+        # (the reader's answer before pins were honoured) rather than fail the read.
+        return live
+
+
 def persisted_route_patch(patch: dict) -> dict:
     """A session ``model_config`` patch with its route ``base_url`` (top level and nested ``gateway_runtime``)
     in the stored spelling; ``SessionDB.session_gateway_runtime`` reads it back in the live spelling."""
@@ -94,6 +120,19 @@ def persisted_route_patch(patch: dict) -> dict:
     if isinstance(runtime, dict) and runtime.get("base_url"):
         out["gateway_runtime"] = {**runtime, "base_url": persisted_xai_route(runtime.get("provider"), runtime["base_url"])}
     return out
+
+
+def persisted_model_config_json(raw: Any) -> Any:
+    """``persisted_route_patch`` over a serialized ``model_config`` (``SessionDB.update_session_meta`` takes JSON
+    text). Text that is not a JSON object is returned unchanged, and so is a config with nothing to rewrite."""
+    try:
+        config = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return raw
+    if not isinstance(config, dict):
+        return raw
+    patched = persisted_route_patch(config)
+    return raw if patched == config else json.dumps(patched)
 
 
 def route_key(provider: Any, base_url: Any) -> str:

@@ -140,9 +140,11 @@ def worker_billing_route(db, conn, session_id, payload):
             or any(payload[k] is not None and not isinstance(payload[k], str) for k in payload)):
         raise RuntimeStoreError('invalid_params')
     # Same contract as SessionDB.update_session_billing_route: route writers never touch the
-    # stored prompt; only session.prompt replaces the frozen snapshot.
+    # stored prompt (only session.prompt replaces the frozen snapshot), and the URL is stored in its spelling.
+    from hermes_state_usage import stored_billing_url
     conn.execute('UPDATE sessions SET billing_provider=?,billing_base_url=?,billing_mode=COALESCE(?,billing_mode) '
-                 'WHERE id=?', (payload['provider'], payload['base_url'], payload['billing_mode'], session_id))
+                 'WHERE id=?', (payload['provider'], stored_billing_url(payload['provider'], payload['base_url']),
+                                payload['billing_mode'], session_id))
     return {'value': None}
 
 
@@ -219,6 +221,7 @@ def insert_session_row_in_transaction(
     """
     from hermes_state_sessions import _UPSERT_KEEP_EXISTING_SQL
     from hermes_state_mutation_retirement import RETIRED_PREFIX
+    from hermes_cli.route_identity import persisted_route_patch
     # A delayed constructor/accounting backfill must not recreate a deleted session
     # beside its durable tombstone (the exact delete retry would then report a stale
     # success while a fresh delete collides with the existing marker).
@@ -275,7 +278,7 @@ def insert_session_row_in_transaction(
 """ + _UPSERT_KEEP_EXISTING_SQL,
         (
             session_id, source, source, user_id, session_key, chat_id, chat_type, thread_id, model,
-            json.dumps(model_config) if model_config else None, system_prompt_hash,
+            json.dumps(persisted_route_patch(model_config)) if model_config else None, system_prompt_hash,
             parent_session_id, cwd, profile_name, transport_profile, git_repo_root, origin_json,
             display_name, time.time(),
         ),
