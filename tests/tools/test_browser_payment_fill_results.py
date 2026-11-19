@@ -227,14 +227,18 @@ class HTMLSelectElement { get value() { return ''; } set value(v) {} }
 class Event {} class InputEvent extends Event {} class FocusEvent extends Event {}
 const document = {forms: [], getElementById: () => null};
 const location = {href: 'https://shop.example/checkout'};
-const els = C.fields.map(f => Object.assign(new HTMLInputElement(), {tagName: 'INPUT', autocomplete: '',
+// ``matches(':invalid')`` follows a real browser: a field is :invalid only when it is validated (willValidate: false for
+// readonly, disabled, fieldset-disabled and datalist fields) and its ValidityState is not valid. Without a ValidityState
+// (``flags`` null) the case's own ``invalid`` stands in.
+const isInvalid = f => f.flags ? f.willValidate !== false && Object.values(f.flags).some(Boolean) : !!f.invalid;
+const els = C.fields.map(f => Object.assign(new HTMLInputElement(), {tagName: f.tagName || 'INPUT', autocomplete: '',
   name: f.name, id: f.name, labels: [{textContent: f.label}], placeholder: '', type: 'text', held: f.held || '',
-  form: null, maxLength: 0, disabled: false, readOnly: false, isConnected: true, tabIndex: 0, shadowRoot: null,
+  form: f.form || null, maxLength: 0, disabled: false, readOnly: false, isConnected: true, tabIndex: 0, shadowRoot: null,
   ownerDocument: document, style: {setProperty() {}}, hasAttribute: () => false, dispatchEvent: () => true, blur() {},
   focus() {}, getAttribute: n => ((f.attrs || {})[n] ?? null), getBoundingClientRect: () => ({width: 100, height: 20}),
   getClientRects: () => [1], getRootNode: () => document,
   parentElement: {classList: {contains: c => f.parentClass === c}, parentElement: null},
-  classList: {contains: () => false}, matches: s => s === ':invalid' && !!f.invalid,
+  classList: {contains: () => false}, matches: s => s === ':invalid' && isInvalid(f),
   validity: f.flags ? Object.assign({valueMissing: false, typeMismatch: false, patternMismatch: false, tooShort: false,
     tooLong: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false,
     customError: false}, f.flags, {valid: !Object.values(f.flags).some(Boolean)}) : undefined}));
@@ -280,10 +284,10 @@ def test_the_closure_reports_blank_fields_by_index_and_a_fixed_validity_code(att
         ("cc-number", "held", "valid"), ("cc-csc", "held", code)]
 
 
-def _validity_of(attrs, flags, parent_class="", invalid=False):
+def _validity_of(attrs, flags, parent_class="", invalid=False, **extra):
     """The fixed validity code the closure reports for one filled cvc-like or name field."""
     field = {"name": "holder", "label": "Name on card", "attrs": attrs, "flags": flags, "parentClass": parent_class,
-             "invalid": invalid}
+             "invalid": invalid, **extra}
     plan = [{"index": 0, "token": "cc-name", "value": "Example Person"}]
     raw, out = _node({"fields": [field], "plan": plan})
     assert "Example Person" not in raw
@@ -295,7 +299,7 @@ def _validity_of(attrs, flags, parent_class="", invalid=False):
 @pytest.mark.parametrize("pattern", ["", "   ", "\t\n"])
 def test_an_empty_pattern_alone_does_not_make_a_filled_field_invalid(pattern):
     attrs = {"aria-invalid": "false", "pattern": pattern}
-    assert _validity_of(attrs, {"patternMismatch": True}, invalid=True) == "valid"
+    assert _validity_of(attrs, {"patternMismatch": True}) == "valid"
 
 
 @pytest.mark.parametrize("attrs, flags, parent_class, code", [
@@ -319,6 +323,38 @@ def test_an_empty_pattern_alone_does_not_make_a_filled_field_invalid(pattern):
 ])
 def test_other_constraint_failures_stay_invalid(attrs, flags, parent_class, code):
     assert _validity_of(attrs, flags, parent_class) == code
+
+
+# The excuse applies only where the browser would not block the submission anyway, and only to an <input>.
+@pytest.mark.parametrize("extra, code", [
+    ({}, "valid"),  # no form at all
+    ({"form": {"noValidate": True}}, "valid"),  # Shopify's hosted frame form
+    ({"form": {"noValidate": False}}, "invalid"),  # a native form: its submit button would never submit
+    ({"tagName": "FA-INPUT"}, "invalid"),  # a custom element is not the HTML input artefact
+    ({"tagName": "fa-input", "form": {"noValidate": True}}, "invalid"),
+    ({"tagName": "input"}, "valid"),  # tagName casing does not matter
+])
+def test_an_empty_pattern_is_excused_only_on_an_input_the_browser_would_not_block(extra, code):
+    assert _validity_of({"pattern": ""}, {"patternMismatch": True}, **extra) == code
+
+
+# A field the browser does not validate is never :invalid, whatever its ValidityState says (as before the change).
+@pytest.mark.parametrize("why, flags", [
+    ("readonly", {"patternMismatch": True}),
+    ("readonly", {"valueMissing": True}),
+    ("disabled, or inside a disabled fieldset", {"patternMismatch": True}),
+    ("inside a datalist", {"patternMismatch": True}),
+    ("empty pattern, custom error", {"patternMismatch": True, "customError": True}),
+])
+def test_a_field_the_browser_does_not_validate_stays_valid(why, flags):
+    # the mock cannot model the DOM reasons themselves: ``willValidate`` false is what a browser reports for each
+    assert _validity_of({"pattern": "[0-9]+"}, flags, willValidate=False) == "valid"
+
+
+def test_a_native_form_empty_pattern_stays_invalid_with_a_provider_marker_or_not():
+    native = {"form": {"noValidate": False}}
+    assert _validity_of({"pattern": "", "aria-invalid": "false"}, {"patternMismatch": True}, **native) == "invalid"
+    assert _validity_of({"pattern": ""}, {"patternMismatch": True}, willValidate=False, **native) == "valid"
 
 
 def test_without_validity_state_the_old_invalid_selector_still_decides():
