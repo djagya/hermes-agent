@@ -522,7 +522,7 @@ def test_a_confirmation_in_a_tab_the_pay_press_opened_is_detected():
         if method == "Page.getFrameTree" and session_id == "S-temp":
             return done_tests.frame_tree((("POPTOP", "LQ", SHOP + "/danke", SHOP, ""),))
         if method == "Runtime.evaluate" and params.get("expression") == evidence.SCAN_JS and session_id == "S-temp":
-            return {"result": {"type": "object", "value": evidence.wording("", "Ihre Bestellung ist bei uns eingegangen.")}}
+            return {"result": {"type": "object", "value": evidence.wording("", "Vielen Dank für Ihre Bestellung! Bestellnummer 10023.")}}
         return real(method, params, session_id)
 
     sup.answer, sup.popup = answer, False
@@ -595,11 +595,13 @@ def test_a_thank_you_that_loaded_after_the_last_answer_refuses_the_next_press_wi
     assert detect.detected(sup)["strong"] is True
 
 
-def test_a_different_document_keeps_the_full_rules_and_a_weak_one_does_not_lift_payment_done_s_card_frame_rule():
+def test_weak_wording_on_a_new_document_does_not_spend_and_does_not_lift_payment_done_s_card_frame_rule():
+    """G2: the detection spends on strong wording only, on any document (a review page's microcopy must not refuse
+    its own confirm); payment_done still reads the weak document with its full rules."""
     sup = _sunday()
     out = _press(sup, "JETZT KAUFEN", after={"tree": THANKS_NEW_DOC_CARD, "page": THANKS_WEAK,
                                              "rows": [_row("Weiter einkaufen", role="link")]})
-    assert out["payment_detected"] is True and detect.detected(sup)["strong"] is False  # a new loader: order wording
+    assert out["payment_detected"] is False and detect.detected(sup) is None
     _not_reached(done.payment_done(sup), "not_shop_page")  # no strong wording: the card frame still refuses
     strong = _sunday()
     out = _press(strong, "JETZT KAUFEN", after={"tree": THANKS_NEW_DOC_CARD, "page": {**THANKS, "url": SHOP + "/danke"},
@@ -720,7 +722,7 @@ def test_a_new_tab_replaced_during_the_scan_spends_nothing():
 
 def test_payment_done_does_not_succeed_on_a_document_that_changed_after_its_evidence_read():
     sup = _sunday()
-    out = _press(sup, "JETZT KAUFEN", after={"tree": THANKS_NEW_DOC, "page": THANKS_WEAK,
+    out = _press(sup, "JETZT KAUFEN", after={"tree": THANKS_NEW_DOC, "page": {**THANKS, "url": SHOP + "/danke"},
                                              "rows": [_row("Weiter", role="link")]})
     assert out["payment_detected"] is True
     _swap_when_scanned(sup, done_tests.ACS)  # armed from here: the document is replaced right after payment_done's scan
