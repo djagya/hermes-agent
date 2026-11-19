@@ -160,27 +160,40 @@ class FrameTrackingMixin:
         return {"top": top.to_dict(), "children": children, "truncated": truncated or bool(queue)}
 
     def _on_frame_loading(self, params: dict[str, Any], session_id: Optional[str] = None) -> None:
-        """dlz (build F r3, Codex P1): when a frame's navigation or load STARTED (monotonic). Chrome sends these for
-        form submits and scripted navigations before the new document commits, and a page script cannot stop them
-        (unlike its own beforeunload/submit events). Read by ``load_started_since``."""
+        """dlz (build F r3, G1): when a frame's navigation or load STARTED (monotonic). Chrome sends these for form
+        submits and scripted navigations before the new document commits, and a page script cannot stop them. Read
+        by ``loading_since`` (the payment surface's in-flight guard after a Pay press)."""
         fid = params.get("frameId")
-        # a same-document navigation (pushState, a hash) loads nothing: a modal closing that way is no submit
-        if not fid or str(params.get("navigationType") or "").lower().startswith("samedocument"):
+        # a same-document navigation (pushState, a hash; ``sameDocument`` and ``historySameDocument``) loads nothing,
+        # and a request for another tab or a download does not navigate this frame
+        if (not fid or "samedocument" in str(params.get("navigationType") or "").lower()
+                or params.get("disposition") not in (None, "currentTab")):
             return
         with self._state_lock:
             self.__dict__.setdefault("_load_started", {})[str(fid)] = time.monotonic()
 
-    def load_started_since(self, frame_id: str, since: float) -> bool:
-        """dlz (build F r3): a navigation or load of ``frame_id`` started at or after ``since``."""
+    def _on_frame_stopped(self, params: dict[str, Any], session_id: Optional[str] = None) -> None:
+        """dlz (build G1): a frame's load finished (or a same-document navigation ended one that never loads)."""
+        fid = params.get("frameId")
+        if fid:
+            with self._state_lock:
+                self.__dict__.setdefault("_load_stopped", {})[str(fid)] = time.monotonic()
+
+    def loading_since(self, frame_id: str, since: float) -> bool:
+        """dlz (build G1): a navigation or load of ``frame_id`` started at or after ``since`` and has not finished
+        loading since it started."""
         with self._state_lock:
-            at = self.__dict__.get("_load_started", {}).get(str(frame_id))
-        return at is not None and at >= since
+            started = self.__dict__.get("_load_started", {}).get(str(frame_id))
+            stopped = self.__dict__.get("_load_stopped", {}).get(str(frame_id))
+        return started is not None and started >= since and (stopped is None or stopped < started)
 
     # CDP event → handler(self, params, session_id); merged into CDPSupervisor._EVENT_HANDLERS.
     EVENT_HANDLERS: dict[str, Callable[..., Any]] = {
         "Page.frameRequestedNavigation": _on_frame_loading,
         "Page.frameStartedNavigating": _on_frame_loading,
         "Page.frameStartedLoading": _on_frame_loading,
+        "Page.frameStoppedLoading": _on_frame_stopped,
+        "Page.navigatedWithinDocument": _on_frame_stopped,
         "Page.frameAttached": _on_frame_attached,
         "Page.frameNavigated": _on_frame_navigated,
         "Page.frameDetached": _on_frame_detached,

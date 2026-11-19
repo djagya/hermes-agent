@@ -54,8 +54,11 @@ _NUMBER = (r"bestellnummer|auftragsnummer|buchungsnummer|order number|order no\.
 ORDER_SRC = (rf"(?<!%L%)(?:(?:{_NOUN})(?:\s+(?:{_FILL})){{0,4}}\s+(?:{_VERB})|{_THANKS}|{_NUMBER})(?!%L%)")
 FAILURE_SRC = (
     r"(?<!%L%)(?:fehlgeschlagen|abgelehnt|abgebrochen|zahlungsfehler|keine bestellung|"
-    r"nicht\s+(?:%L%+\s+){0,2}?(?:erfolgreich|aufgegeben|abgeschlossen|durchgeführt|ausgeführt|bearbeitet|bestätigt"
-    r")|"
+    # build G1 (Opus L3): not "bestätigt" / "bearbeitet" alone ("E-Mail-Adresse ist noch nicht bestätigt",
+    # "Änderungen können nicht mehr bearbeitet werden" on a real thank-you page)
+    r"nicht\s+(?:%L%+\s+){0,2}?(?:erfolgreich|aufgegeben|abgeschlossen|durchgeführt|ausgeführt)|"
+    # build G1 (Opus L2): German payment errors
+    r"ein\s+fehler\s+(?:ist\s+)?aufgetreten|fehler\s+bei\s+der\s+(?:zahlung|bezahlung|bestellung)|"
     # build F r3 (Opus final M2): the bare English words need a payment or order word nearby ("If you notice an error
     # in your order, contact us" on a real thank-you page is not a failure)
     r"(?:payment|transaction|card|order|purchase|checkout)\s+(?:%L%+\s+){0,3}?(?:failed|declined|unsuccessful|"
@@ -64,13 +67,14 @@ FAILURE_SRC = (
     r"(?:payment|order|transaction)\s+(?:%L%+\s+){0,2}?error|an error (?:has )?occurred|"
     # build F r3 (Codex P1): payment/order-qualified negatives ("Die Zahlung ist nicht möglich", "Payment not
     # successful", "Order not confirmed")
-    r"(?:zahlung|bezahlung)\s+(?:%L%+\s+){0,3}?nicht\s+(?:%L%+\s+){0,2}?(?:möglich|erfolgreich|bestätigt)|"
+    r"(?:zahlung|bezahlung)\s+(?:%L%+\s+){0,3}?nicht\s+(?:%L%+\s+){0,2}?(?:möglich|erfolgreich|bestätigt|"
+    r"autorisiert|akzeptiert|verarbeitet|angenommen)|"
     r"(?:bestellung|kauf)\s+(?:%L%+\s+){0,3}?nicht\s+(?:%L%+\s+){0,2}?(?:erfolgreich|bestätigt|aufgegeben|"
     r"abgeschlossen)|"
     r"(?:payment|order|transaction|purchase)\s+(?:%L%+\s+){0,2}?(?:was\s+|has\s+|is\s+)?not\s+(?:been\s+)?"
     r"(?:successful|confirmed|completed|processed|accepted|placed)|"
     r"no order (?:was|has been) (?:created|placed)|"
-    r"not\s+(?:been\s+)?(?:placed|completed|processed|accepted)|"
+    # build G1 (Opus L3): no bare "not (been) completed" ("your account has not been completed")
     r"échoué|échouée|échec|refusé|refusée|n['’]a pas abouti|fallido|fallida|"
     r"rechazado|rechazada|non\s+(?:è\s+)?(?:riuscito|riuscita|andato a buon fine)|rifiutato|rifiutata|mislukt|"
     r"geweigerd|niet gelukt)(?!%L%)")
@@ -178,10 +182,13 @@ async def _purchase_button_listed(sup: Any, sid: str, row: tuple) -> bool:
     return any(purchase_button(c) for c in controls)
 
 
-async def order_evidence(sup: Any, sid: str, row: tuple, checkout: bool, pay: Optional[dict]) -> tuple:
+async def order_evidence(sup: Any, sid: str, row: tuple, checkout: bool, pay: Optional[dict],
+                         need_wording: bool = False) -> tuple:
     """``(evidence, reason)``: ``("confirmation_text" | "new_document", None)`` for a confirmation, else
     ``(None, reason code)``. ``row``: the candidate's top frame row; ``checkout``: it is checkout-like (the caller
-    knows the checkout's loaders and URLs); ``pay``: the Pay press of this lock (``pay_press``), or None."""
+    knows the checkout's loaders and URLs); ``pay``: the Pay press of this lock (``pay_press``), or None.
+    ``need_wording`` (build G1, the payment detection after a Pay-like press): a new document needs order wording
+    too."""
     scan = await _scan(sup, sid, row[0])
     if scan is None:
         return None, "page_unread"
@@ -190,10 +197,10 @@ async def order_evidence(sup: Any, sid: str, row: tuple, checkout: bool, pay: Op
     if (pay is not None and isinstance(pay.get("node"), int) and (pay.get("frame"), pay.get("loader")) == row[:2]
             and await _pay_control_shown(sup, sid, row[0], pay["node"])):
         return None, "pay_control_shown"
+    if not scan["order"] and (checkout or need_wording):
+        return None, "no_order_wording"
     if not checkout:
         return "new_document", None
-    if not scan["order"]:
-        return None, "no_order_wording"
     if await _purchase_button_listed(sup, sid, row):
         return None, "purchase_button_shown"
     return "confirmation_text", None

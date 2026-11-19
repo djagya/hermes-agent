@@ -537,9 +537,9 @@ def test_presses_in_lock_counts_every_press_including_an_uncertain_one(outcome):
     surface.payment_click(sup, again["controls"][PREP]["ref"])  # r2 P1: a preparatory press after Pay
     listing = surface.payment_controls(sup)
     assert listing["presses_in_lock"] == 2
-    # r2 P1: a second Pay press of this approval is refused before anything is read or pressed
-    assert surface.payment_click(sup, listing["controls"][0]["ref"])["error_type"] == "payment_already_pressed"
-    assert surface.payment_controls(sup)["presses_in_lock"] == 2
+    # G1 (owner 2026-11-19): no press budget: a second Pay press with no payment detected goes too, and is counted
+    surface.payment_click(sup, listing["controls"][0]["ref"])
+    assert surface.payment_controls(sup)["presses_in_lock"] == 3
 
 
 def test_payment_done_reports_the_presses_read_before_it_ends_the_lock(monkeypatch):
@@ -668,6 +668,7 @@ def test_payment_click_is_one_trusted_click_at_the_hit_tested_centre():
     out = surface.payment_click(sup, ref)
     effect = out.pop("effect")  # build C3: the structural effect (its own tests: test_browser_payment_surface_honesty)
     assert out.pop("pay_pressed") is True and out.pop("next") == surface.PAY_PRESSED_NEXT  # r2 P3: a Pay press
+    assert out.pop("payment_detected") is False  # G1: the fake page shows no order evidence
     assert out == {"success": True, "clicked": ref, "role": "button", "text": "Pay with card •••• •••• •••• ••••"}
     assert effect is None or set(effect) >= {"navigated", "control_listed", "control_hit", "unchanged"}
     clicks = sup.sent("Input.dispatchMouseEvent")
@@ -1894,14 +1895,19 @@ console.log(JSON.stringify(out));
                                       "calls": ["native:Place order?", "native-alert:Saved"]}
 
 
-def test_the_tool_text_allows_preparatory_clicks_and_exactly_one_final_pay():
+def test_the_tool_text_allows_preparatory_clicks_and_no_press_limit():
     """r4 C9 (Codex r3 P3): Continue -> review page -> Place order is supported, so the text must not limit every
-    click after the first one to bank steps; it still allows exactly one final Pay and nothing after an uncertain one."""
+    click after the first one to bank steps. G1 (owner 2026-11-19): no press limit; the payment is detected; nothing
+    after an uncertain press."""
     from tools.browser_vault_tool import BROWSER_VAULT_SCHEMA
 
     text = " ".join(BROWSER_VAULT_SCHEMA["description"].split())
-    assert "Preparatory clicks of the checkout" in text and "is made exactly once after a successful fill" in text
+    assert "Preparatory clicks of the checkout" in text and "there is no press limit" in text
     assert "once it is 1 (or null), another payment_click is only for a bank" not in text
-    assert "never again (nor anything else) when payment_click_uncertain" in text
+    assert "never press anything again when payment_click_uncertain" in text
+    for gone in ("payment_already_pressed", "one Pay press per", "is made exactly once", "never press Pay again"):
+        assert gone not in text, gone
+    for code in ("payment_detected", "payment_already_made", "payment_in_flight"):
+        assert code in text
     for code in ("payment_approval_changed", "payment_total_unbound", "payment_go_required", "payment_total_changed"):
         assert code in text
