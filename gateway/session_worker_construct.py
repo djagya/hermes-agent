@@ -161,8 +161,8 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
     if launch_url:
         # The creation request is immutable identity, not the current selection: once a canonical
         # model mutation moved the route off the launch endpoint, the policy's selection wins.
-        from hermes_cli.route_identity import normalize_route_base_url
-        if normalize_route_base_url(launch_url) != normalize_route_base_url((frozen.get('model') or {}).get('base_url')):
+        from hermes_cli.route_identity import route_key
+        if route_key(provider, launch_url) != route_key(provider, (frozen.get('model') or {}).get('base_url')):
             launch_url = None
     # Every rung reads the session's FROZEN config, never live config.yaml: a later
     # ``model.base_url`` edit must not carry this route's frozen credential to the new host

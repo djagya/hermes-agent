@@ -485,10 +485,13 @@ def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict
     """Copy of *override* with only persistable, non-secret keys, or ``None`` when empty."""
     if not isinstance(override, dict):
         return None
+    from hermes_cli.route_identity import persisted_xai_route
     cleaned = {
         k: str(v) for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    if "base_url" in cleaned:
+        cleaned["base_url"] = persisted_xai_route(cleaned.get("provider"), cleaned["base_url"])
     return cleaned or None
 
 

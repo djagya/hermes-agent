@@ -119,9 +119,10 @@ def _session_override_uses_managed_oauth(override: Optional[dict]) -> bool:
         return False
     # The managed host is the registry default OR its documented override (HERMES_CODEX_BASE_URL /
     # HERMES_XAI_BASE_URL): the auth store still owns the bearer for either.
-    managed_hosts = {PROVIDER_REGISTRY[provider].inference_base_url.rstrip("/"),
-                     _managed_oauth_env_host(provider).rstrip("/")} - {""}
-    return (override.get("base_url") or "").rstrip("/") in managed_hosts
+    from hermes_cli.route_identity import route_key
+    managed_hosts = {route_key(provider, PROVIDER_REGISTRY[provider].inference_base_url),
+                     route_key(provider, _managed_oauth_env_host(provider))} - {""}
+    return route_key(provider, override.get("base_url")) in managed_hosts
 
 
 def _resolve_session_override_runtime(override: dict, *, managed_oauth: bool) -> dict:
@@ -130,8 +131,9 @@ def _resolve_session_override_runtime(override: dict, *, managed_oauth: bool) ->
     runtime = _resolve_runtime_agent_kwargs_for_provider(
         override["provider"], target_model=override.get("model") or None)
     if managed_oauth:
+        from hermes_cli.route_identity import route_key
         if (runtime.get("provider") != override["provider"]
-                or (runtime.get("base_url") or "").rstrip("/") != override["base_url"].rstrip("/")
+                or route_key(override["provider"], runtime.get("base_url")) != route_key(override["provider"], override["base_url"])
                 or not runtime.get("api_key")):
             raise RuntimeError("Managed OAuth resolution no longer matches the session route")
         # _apply_session_model_override reads this dict again: replacing only the returned

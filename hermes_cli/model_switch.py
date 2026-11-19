@@ -1829,10 +1829,12 @@ def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg:
     var, but a same-provider same-base_url model re-pick keeps it whatever the provider is. The
     dashboard re-adds an explicitly submitted key / the target provider's own pointer after this
     (``_apply_main_model_assignment`` / ``_resolve_assignment_credentials``)."""
+    from hermes_cli.route_identity import persisted_xai_route
     model_cfg = current_model_cfg if isinstance(current_model_cfg, dict) else {}
     updates: dict[str, Any] = {
         "default": result.new_model, "provider": result.target_provider,
-        "base_url": result.base_url or None, "api_mode": result.api_mode or None,
+        "base_url": persisted_xai_route(result.target_provider, result.base_url) or None,
+        "api_mode": result.api_mode or None,
     }
     if "context_length" in model_cfg:
         from hermes_cli.route_identity import should_clear_context_pin
@@ -1854,10 +1856,11 @@ def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg:
 def selection_route_changed(model_cfg: dict, result: ModelSwitchResult) -> bool:
     """Provider or endpoint differs between a ``model:`` block and the switch target. The one
     route-identity test for endpoint-bound credentials (inline keys, ``key_env``, launch keys)."""
-    from hermes_cli.route_identity import normalize_route_base_url
-    if str(model_cfg.get("provider") or "").strip().lower() != str(result.target_provider or "").strip().lower():
+    from hermes_cli.route_identity import route_key
+    provider = str(model_cfg.get("provider") or "").strip().lower()
+    if provider != str(result.target_provider or "").strip().lower():
         return True
-    return normalize_route_base_url(model_cfg.get("base_url")) != normalize_route_base_url(result.base_url)
+    return route_key(provider, model_cfg.get("base_url")) != route_key(provider, result.base_url)
 
 
 def apply_model_selection(model_cfg: Any, result: ModelSwitchResult, *, mask_cleared: bool = False) -> dict:

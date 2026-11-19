@@ -44,6 +44,65 @@ def normalize_route_base_url(base_url: Any) -> str:
     return normalized
 
 
+# xai-oauth has two spellings of ONE route: the legacy API URL that stored state keeps (auth.json,
+# the pool, config.yaml, session rows; an image rolled back still reads it) and the subscription proxy
+# the runtime uses. ``canonical_xai_route`` is the read side (every comparison), ``persisted_xai_route``
+# the write side (every persisted base_url). Only these exact two URLs alias, only for xai-oauth: the
+# API-key provider ``xai`` keeps api.x.ai as its own route, and a custom ``*.x.ai`` host is its own route.
+# ``tests/hermes_cli/test_xai_route_identity_sites.py`` enumerates every site that must use them.
+XAI_OAUTH_PROVIDER_IDS = frozenset({"xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth"})
+
+
+def _xai_oauth_route_pair() -> tuple[str, str]:
+    from hermes_cli.auth_constants import DEFAULT_XAI_OAUTH_BASE_URL, LEGACY_XAI_OAUTH_BASE_URL
+    return DEFAULT_XAI_OAUTH_BASE_URL, LEGACY_XAI_OAUTH_BASE_URL
+
+
+def is_xai_oauth_provider(provider: Any) -> bool:
+    return str(provider or "").strip().lower() in XAI_OAUTH_PROVIDER_IDS
+
+
+def canonical_xai_route(provider: Any, base_url: Any) -> str:
+    """The live spelling of ``base_url`` for comparison: for xai-oauth the stored legacy API URL is the
+    subscription proxy route; any other URL or provider is returned unchanged (as ``str``)."""
+    raw = "" if base_url is None else str(base_url)
+    if is_xai_oauth_provider(provider):
+        live, legacy = _xai_oauth_route_pair()
+        if normalize_route_base_url(raw.strip()) == legacy:
+            return live
+    return raw
+
+
+def persisted_xai_route(provider: Any, base_url: Any) -> str:
+    """The spelling of ``base_url`` to store: for xai-oauth the subscription proxy route is stored as the
+    legacy API URL (rollback-safe; readers map it back); any other URL or provider is returned unchanged."""
+    raw = "" if base_url is None else str(base_url)
+    if is_xai_oauth_provider(provider):
+        live, legacy = _xai_oauth_route_pair()
+        if normalize_route_base_url(raw.strip()) == live:
+            return legacy
+    return raw
+
+
+def persisted_route_patch(patch: dict) -> dict:
+    """A session ``model_config`` patch with its route ``base_url`` (top level and nested ``gateway_runtime``)
+    in the stored spelling; ``SessionDB.session_gateway_runtime`` reads it back in the live spelling."""
+    out = dict(patch)
+    if out.get("base_url"):
+        out["base_url"] = persisted_xai_route(out.get("provider"), out["base_url"])
+    runtime = out.get("gateway_runtime")
+    if isinstance(runtime, dict) and runtime.get("base_url"):
+        out["gateway_runtime"] = {**runtime, "base_url": persisted_xai_route(runtime.get("provider"), runtime["base_url"])}
+    return out
+
+
+def route_key(provider: Any, base_url: Any) -> str:
+    """Route-identity key of ``(provider, base_url)``: compare two routes with ``route_key(p1, u1) ==
+    route_key(p2, u2)``, never with raw or merely normalized URLs (the xai-oauth spellings differ).
+    Transport decisions (which URL a client dials, cache keys) keep the raw URL."""
+    return normalize_route_base_url(canonical_xai_route(provider, base_url))
+
+
 def provider_owns_route(provider: Any, base_url: Any, config: Any = None) -> Optional[bool]:
     """Whether ``model.base_url`` is *provider*'s own endpoint.
 

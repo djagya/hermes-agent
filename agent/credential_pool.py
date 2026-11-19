@@ -629,8 +629,9 @@ def credential_pool_entry_serves_endpoint(entry: Any, base_url: Any) -> bool:
     entry_url = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None)
     if not isinstance(entry_url, str) or not entry_url:
         return True
-    from hermes_cli.route_identity import normalize_route_base_url
-    return normalize_route_base_url(entry_url) == normalize_route_base_url(base_url)
+    from hermes_cli.route_identity import route_key
+    provider = getattr(entry, "provider", "")
+    return route_key(provider, entry_url) == route_key(provider, base_url)
 
 
 def credential_pool_matches_provider(

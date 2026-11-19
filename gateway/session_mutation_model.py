@@ -345,7 +345,7 @@ async def _selection_guard_refusal(authority, live, payload, snapshot, current, 
     refusal, never a silent apply."""
     import hashlib
     from hermes_cli.model_selection_guards import combined_message, selection_context_for_agent, selection_warnings
-    from hermes_cli.route_identity import normalize_route_base_url
+    from hermes_cli.route_identity import route_key
     lookup = (getattr(authority.runner, '_resident_agent_for', None)
               or getattr(authority.runner, '_cached_agent_for', None))
     agent = lookup(live.route) if live is not None and callable(lookup) else None
@@ -362,9 +362,9 @@ async def _selection_guard_refusal(authority, live, payload, snapshot, current, 
         model_info=result.model_info, selection_context=context)
     if not warnings:
         return None
-    binding = {'target': [result.new_model, result.target_provider, normalize_route_base_url(result.base_url),
+    binding = {'target': [result.new_model, result.target_provider, route_key(result.target_provider, result.base_url),
                           result.api_mode or ''],
-               'current': [current.model, current.provider, normalize_route_base_url(current.base_url)],
+               'current': [current.model, current.provider, route_key(current.provider, current.base_url)],
                'session': [snapshot['target'], snapshot['target_revision']],
                'guards': sorted(w.kind for w in warnings)}
     token = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()

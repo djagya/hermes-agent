@@ -752,7 +752,11 @@ class SessionSessionsMixin:
         params: Optional[Callable[[Optional[str]], tuple]] = None,
     ) -> None:
         """Merge ``patch`` into model_config then run ``sql`` with ``params(merged)`` in one write
-        transaction; no-op when the row doesn't exist."""
+        transaction; no-op when the row doesn't exist. Every route write lands here, so a route's
+        ``base_url`` is stored in its persisted spelling (``persisted_route_patch``)."""
+        from hermes_cli.route_identity import persisted_route_patch
+        patch = persisted_route_patch(patch)
+
         def _do(conn):
             merged = self._merge_model_config_json(conn, session_id, patch)
             if merged is _MODEL_CONFIG_ROW_MISSING:

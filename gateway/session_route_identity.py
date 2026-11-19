@@ -85,6 +85,6 @@ def same_route(a_cfg: dict, b_cfg: dict, config: dict) -> bool:
     if 'auto' in (a_id, b_id):
         return True
     if a_url or b_url:
-        from hermes_cli.route_identity import normalize_route_base_url
-        return normalize_route_base_url(a_url) == normalize_route_base_url(b_url)
+        from hermes_cli.route_identity import route_key
+        return route_key(a_id, a_url) == route_key(b_id, b_url)
     return a_id == b_id

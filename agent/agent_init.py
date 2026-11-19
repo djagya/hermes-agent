@@ -44,7 +44,7 @@ from agent.tool_guardrails import (
     ToolCallGuardrailConfig, ToolCallGuardrailController
 )
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
-from hermes_cli.route_identity import normalize_route_base_url
+from hermes_cli.route_identity import canonical_xai_route, normalize_route_base_url, route_key
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
 from hermes_state_ids import new_session_id
@@ -59,7 +59,7 @@ def _provider_default_routes(provider: str) -> set[str]:
     routes: set[str] = set()
 
     def add(value):
-        route = normalize_route_base_url(value)
+        route = route_key(provider, value)
         if route:
             routes.add(route)
 
@@ -92,8 +92,8 @@ def _context_route_mismatch(
     *, already_normalized: bool = False,
 ) -> bool:
     """Return whether a context pin's configured route differs from runtime."""
-    _norm = (lambda v: str(v or "")) if already_normalized else normalize_route_base_url
-    configured_route, active_route = _norm(configured_base_url), _norm(active_base_url)
+    _key = (lambda p, v: canonical_xai_route(p, v or "")) if already_normalized else route_key
+    configured_route, active_route = _key(configured_provider, configured_base_url), _key(active_provider, active_base_url)
     if configured_route:
         return configured_route != active_route
 

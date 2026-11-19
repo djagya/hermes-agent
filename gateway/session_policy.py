@@ -357,9 +357,10 @@ def profile_target(config):
 
 def model_route(block):
     """``(provider, endpoint)`` identity of a ``model:`` block: what an endpoint-bound credential belongs to."""
-    from hermes_cli.route_identity import normalize_route_base_url
+    from hermes_cli.route_identity import route_key
     block = block if isinstance(block, dict) else {}
-    return str(block.get('provider') or '').strip().lower(), normalize_route_base_url(block.get('base_url'))
+    provider = str(block.get('provider') or '').strip().lower()
+    return provider, route_key(provider, block.get('base_url'))
 
 
 def bound_route_holds(bound, bound_config, block, config):

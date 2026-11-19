@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 from hermes_cli.auth_codex import _load_auth_store_maybe_locked, _refresh_payload_access_token
 from hermes_cli.auth_constants import (
     AUTH_LOCK_TIMEOUT_SECONDS, AuthError, DEFAULT_XAI_OAUTH_BASE_URL, DEVICE_CODE_GRANT_TYPE,
-    LEGACY_XAI_OAUTH_BASE_URL,
     XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_DEVICE_CODE_URL,
     XAI_OAUTH_DISCOVERY_URL, XAI_OAUTH_SCOPE, _FORM_JSON_HEADERS, _xai_err, httpx,
 )
@@ -424,9 +423,8 @@ def _xai_oauth_runtime_base_url(value: str = "", *, override: str = "") -> str:
     not evidence of customization. Noncanonical compatible routes survive;
     explicit environment overrides (even the canonical API URL) win separately.
     """
-    candidate = str(value or "").strip().rstrip("/")
-    if candidate == LEGACY_XAI_OAUTH_BASE_URL:
-        candidate = ""
+    from hermes_cli.route_identity import canonical_xai_route
+    candidate = canonical_xai_route("xai-oauth", str(value or "").strip()).rstrip("/")
     base = _xai_validate_inference_base_url(candidate, fallback=DEFAULT_XAI_OAUTH_BASE_URL)
     return _xai_validate_inference_base_url(override, fallback=base)
 
@@ -434,8 +432,9 @@ def _xai_oauth_runtime_base_url(value: str = "", *, override: str = "") -> str:
 def _xai_oauth_persisted_base_url(value: str = "") -> str:
     """The base_url to store for xai-oauth (auth.json, pool, config.yaml): the new default is stored as the
     legacy API URL, so rolling the image back keeps a working route and the read-time migration does the rest."""
+    from hermes_cli.route_identity import persisted_xai_route
     candidate = str(value or "").strip().rstrip("/")
-    return LEGACY_XAI_OAUTH_BASE_URL if candidate in ("", DEFAULT_XAI_OAUTH_BASE_URL) else candidate
+    return persisted_xai_route("xai-oauth", candidate or DEFAULT_XAI_OAUTH_BASE_URL).rstrip("/")
 
 
 def _xai_oauth_inference_base_url() -> str:

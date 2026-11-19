@@ -386,11 +386,12 @@ def is_foreign_provider_endpoint(provider: Optional[str], base_url: Optional[str
     switch that kept the old URL (openai-codex + the Nous Portal URL sent the Codex slug to the Portal).
     Only registered providers are judged: a custom or proxy URL is never another provider's canonical one.
     """
+    from hermes_cli.route_identity import route_key
     pconfig = PROVIDER_REGISTRY.get(str(provider or "").strip().lower())
-    url = str(base_url or "").strip().rstrip("/")
-    if pconfig is None or not url or url == (pconfig.inference_base_url or "").rstrip("/"):
+    url = route_key(provider, str(base_url or "").strip())  # xai-oauth's stored legacy URL is its own route
+    if pconfig is None or not url or url == route_key(provider, pconfig.inference_base_url):
         return False
-    return any(url == (other.inference_base_url or "").rstrip("/") for other in PROVIDER_REGISTRY.values())
+    return any(url == route_key(other_id, other.inference_base_url) for other_id, other in PROVIDER_REGISTRY.items())
 
 
 def _anthropic_base_url_override_ok(base_url: str) -> bool:
