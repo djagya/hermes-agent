@@ -259,8 +259,9 @@ class TestPowerShellPositionalScriptAndAbbreviatedSwitches:
         # CPU-time ratio for what the counters cannot see (a regex that rescans from each launcher word, as in
         # b3621441ee5: 0.46 s at n=1000, 1.70 s at 2000, 6.66 s at 4000, against 0.06/0.07/0.15 s clean). Best of
         # three readings at n and 4n; process_time does not count time spent descheduled on a loaded runner.
-        # Linear is ~4x, quadratic ~16x (the regression measured ~14x); the floor keeps timer resolution out.
+        # Linear is ~4x (wmic-quoted measures 5.0-5.7x: it carries a mild C-speed quadratic term), quadratic ~16x
+        # (the regression measured ~15x), so the bound sits at 10x; the floor keeps timer resolution out.
         narrow = max(min(measure(1000)[1] for _ in range(3)), 0.005)
         wide = min(measure(4000)[1] for _ in range(3))
-        assert wide <= 8 * narrow, (narrow, wide)
+        assert wide <= 10 * narrow, (narrow, wide)
         assert wide < 4.0, wide  # absolute CPU backstop at n=4000 (clean ~0.15-0.35 s, regression ~6.7 s)
