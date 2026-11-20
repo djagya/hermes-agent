@@ -266,19 +266,21 @@ _INSPECT_TEMPLATE = r"""(() => {
     'field--invalid','field-error','input-error','error'];
   const OTHER_FLAGS = ['valueMissing','typeMismatch','tooShort','tooLong','rangeUnderflow','rangeOverflow',
     'stepMismatch','badInput','customError'];
-  // A form submits without constraint validation when it carries ``novalidate`` (read as the attribute, so a control
-  // named ``noValidate`` cannot hide it) or a submit/image control with ``formnovalidate`` (the browser skips validation
-  // for a submission made with that submitter). The controls come from the field's own tree, not ``form.elements``
-  // (which leaves out ``input type=image`` and can be shadowed by a control named ``elements``). A disabled control
-  // (or one in a disabled fieldset) cannot submit, so it does not count. Which control is Pay is not known here, so
-  // any other one counts, hidden or not: a wrong excuse costs a refused submit, a wrong block costs the payment.
+  // A form submits without constraint validation when it carries ``novalidate`` (the ``noValidate`` property, then the
+  // intrinsic ``Element.prototype.hasAttribute``, which a control named ``hasAttribute`` or ``noValidate`` cannot
+  // shadow) or a submit/image control with ``formnovalidate`` (the browser skips
+  // validation for a submission made with that submitter). The controls come from the field's own tree, not
+  // ``form.elements`` (which leaves out ``input type=image`` and can be shadowed by a control named ``elements``).
+  // Which control is Pay is not known here, so any other one counts, hidden or disabled: a Pay button that is
+  // disabled only until a terms box is ticked still submits later, and a wrong excuse costs a refused submit while a
+  // wrong block costs the payment.
   const skipsValidation = el => {
     const form = el.form;
-    if (form.noValidate === true || (typeof form.hasAttribute === 'function' && form.hasAttribute('novalidate')))
-      return true;
+    if (form.noValidate === true) return true;
+    // a throw here keeps the fail-closed verdict (no excuse at all), as an unreadable form always did
+    try { if (Element.prototype.hasAttribute.call(form, 'novalidate')) return true; } catch (_) { return false; }
     return Array.from(el.getRootNode().querySelectorAll('button[formnovalidate],input[formnovalidate]')).some(
-      c => c && c.form === form && c.formNoValidate === true && (c.type === 'submit' || c.type === 'image') &&
-        !c.disabled && !(typeof c.matches === 'function' && c.matches(':disabled')));
+      c => c && c.form === form && c.formNoValidate === true && (c.type === 'submit' || c.type === 'image'));
   };
   const breaksConstraint = el => {
     if (!(typeof el.matches === 'function' && el.matches(':invalid'))) return false;
