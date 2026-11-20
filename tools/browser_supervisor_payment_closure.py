@@ -266,12 +266,20 @@ _INSPECT_TEMPLATE = r"""(() => {
     'field--invalid','field-error','input-error','error'];
   const OTHER_FLAGS = ['valueMissing','typeMismatch','tooShort','tooLong','rangeUnderflow','rangeOverflow',
     'stepMismatch','badInput','customError'];
-  // A form submits without constraint validation when it carries ``novalidate`` or a submit control with
-  // ``formnovalidate`` (the browser skips validation for a submission made with that submitter; which control Pay is,
-  // is not known here, so any such control counts: a wrong excuse costs a refused submit, a wrong block costs the
-  // payment).
-  const skipsValidation = form => form.noValidate === true || Array.from(form.elements || []).some(
-    c => c && c.formNoValidate === true && (c.type === 'submit' || c.type === 'image'));
+  // A form submits without constraint validation when it carries ``novalidate`` (read as the attribute, so a control
+  // named ``noValidate`` cannot hide it) or a submit/image control with ``formnovalidate`` (the browser skips validation
+  // for a submission made with that submitter). The controls come from the field's own tree, not ``form.elements``
+  // (which leaves out ``input type=image`` and can be shadowed by a control named ``elements``). A disabled control
+  // (or one in a disabled fieldset) cannot submit, so it does not count. Which control is Pay is not known here, so
+  // any other one counts, hidden or not: a wrong excuse costs a refused submit, a wrong block costs the payment.
+  const skipsValidation = el => {
+    const form = el.form;
+    if (form.noValidate === true || (typeof form.hasAttribute === 'function' && form.hasAttribute('novalidate')))
+      return true;
+    return Array.from(el.getRootNode().querySelectorAll('button[formnovalidate],input[formnovalidate]')).some(
+      c => c && c.form === form && c.formNoValidate === true && (c.type === 'submit' || c.type === 'image') &&
+        !c.disabled && !(typeof c.matches === 'function' && c.matches(':disabled')));
+  };
   const breaksConstraint = el => {
     if (!(typeof el.matches === 'function' && el.matches(':invalid'))) return false;
     // dlz (J-0269): the browser already calls this field :invalid, so a read that throws below keeps that verdict
@@ -282,7 +290,7 @@ _INSPECT_TEMPLATE = r"""(() => {
       const p = typeof el.getAttribute === 'function' ? el.getAttribute('pattern') : null;
       const emptyPattern = p !== null && p !== undefined && !String(p).trim();
       // a string compare, not instanceof: the field may live in another frame
-      const excusable = String(el.tagName).toUpperCase() === 'INPUT' && (!el.form || skipsValidation(el.form));
+      const excusable = String(el.tagName).toUpperCase() === 'INPUT' && (!el.form || skipsValidation(el));
       return !(v.patternMismatch && emptyPattern && excusable && !OTHER_FLAGS.some(k => v[k]));
     } catch (_) { return true; }
   };

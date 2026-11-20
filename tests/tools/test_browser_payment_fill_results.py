@@ -242,7 +242,16 @@ const els = C.fields.map(f => Object.assign(new HTMLInputElement(), {tagName: f.
   validity: f.flags ? Object.assign({valueMissing: false, typeMismatch: false, patternMismatch: false, tooShort: false,
     tooLong: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false,
     customError: false}, f.flags, {valid: !Object.values(f.flags).some(Boolean)}) : undefined}));
-document.querySelectorAll = () => els;
+// A field's form may list ``controls`` (what ``root.querySelectorAll('[formnovalidate]')`` finds): each belongs to that
+// form unless ``otherForm``; ``fieldsetDisabled`` makes ``matches(':disabled')`` true like a disabled fieldset does.
+// ``novalidateAttr`` is the form's novalidate attribute (it follows ``noValidate`` when absent).
+const controls = [];
+for (const f of C.fields) if (f.form) {
+  f.form.hasAttribute = n => n === 'novalidate' && (f.form.novalidateAttr ?? f.form.noValidate === true);
+  for (const c of f.form.controls || [])
+    controls.push(Object.assign({matches: s => s === ':disabled' && !!c.fieldsetDisabled}, c, {form: c.otherForm ? {} : f.form}));
+}
+document.querySelectorAll = sel => (/formnovalidate/.test(sel) ? controls : els);
 const getComputedStyle = () => ({visibility: 'visible', opacity: '1', pointerEvents: 'auto'});
 const api = INSPECT;
 const blanks = api.blanks();
@@ -326,25 +335,44 @@ def test_other_constraint_failures_stay_invalid(attrs, flags, parent_class, code
     assert _validity_of(attrs, flags, parent_class) == code
 
 
-# The excuse applies only where the browser would not block the submission anyway.
-_FIELD = {"type": "text"}  # a non-submit form control, next to the submit controls
+# The excuse applies only where the browser would not block the submission anyway. A form lists the controls the field's
+# root finds with ``[formnovalidate]`` (``controls``); ``elements`` is never read (``input type=image`` is not in it and
+# a control named ``elements`` replaces it).
+def _form(*controls, **kw):
+    return {"noValidate": False, "controls": list(controls), **kw}
+
+
+_FNV_SUBMIT = {"type": "submit", "formNoValidate": True}
 @pytest.mark.parametrize("extra, code", [
     ({}, "valid"),  # no form at all
     ({"form": {"noValidate": True}}, "valid"),  # Shopify's hosted frame form
     ({"form": {"noValidate": False}}, "invalid"),  # a native form: its submit button would never submit
     # a submit control with formnovalidate: the browser skips constraint validation for that submission
-    ({"form": {"noValidate": False, "elements": [_FIELD, {"type": "submit", "formNoValidate": True}]}}, "valid"),
-    ({"form": {"noValidate": False, "elements": [{"type": "image", "formNoValidate": True}]}}, "valid"),
-    ({"form": {"noValidate": False, "elements": [{"type": "submit", "formNoValidate": False}]}}, "invalid"),
-    ({"form": {"noValidate": False, "elements": [{"type": "button", "formNoValidate": True}]}}, "invalid"),
-    ({"form": {"noValidate": False, "elements": [{"type": "text"}, {"type": "submit"}]}}, "invalid"),
+    ({"form": _form(_FNV_SUBMIT)}, "valid"),
+    # <input type=image formnovalidate>: the root finds it, form.elements would not
+    ({"form": _form({"type": "image", "formNoValidate": True})}, "valid"),
+    ({"form": _form({"type": "submit", "formNoValidate": False})}, "invalid"),
+    ({"form": _form({"type": "button", "formNoValidate": True})}, "invalid"),
+    ({"form": _form({"type": "submit"})}, "invalid"),
+    # a control the browser would not let submit does not count ...
+    ({"form": _form({**_FNV_SUBMIT, "disabled": True})}, "invalid"),
+    ({"form": _form({**_FNV_SUBMIT, "fieldsetDisabled": True})}, "invalid"),
+    ({"form": _form({**_FNV_SUBMIT, "disabled": True}, _FNV_SUBMIT)}, "valid"),  # ... unless another one does
+    # a control of another form does not count
+    ({"form": _form({**_FNV_SUBMIT, "otherForm": True})}, "invalid"),
+    # hidden but enabled: not told apart from Pay, so it counts (a wrong excuse costs a refused submit, no charge)
+    ({"form": _form({**_FNV_SUBMIT, "hidden": True})}, "valid"),
+    # a control named ``elements`` (it replaces form.elements) or ``noValidate`` (it shadows the property) hides nothing
+    ({"form": _form(_FNV_SUBMIT, elements={"tagName": "INPUT", "name": "elements"})}, "valid"),
+    ({"form": {"noValidate": {"tagName": "INPUT", "name": "noValidate"}, "novalidateAttr": True}}, "valid"),
+    ({"form": {"noValidate": {"tagName": "INPUT", "name": "noValidate"}, "novalidateAttr": False}}, "invalid"),
 ])
 def test_an_empty_pattern_is_excused_only_where_the_browser_would_not_block(extra, code):
     assert _validity_of({"pattern": ""}, {"patternMismatch": True}, **extra) == code
 
 
 def test_formnovalidate_excuses_nothing_but_the_empty_pattern_artefact():
-    form = {"noValidate": False, "elements": [{"type": "submit", "formNoValidate": True}]}
+    form = _form(_FNV_SUBMIT)
     for flags in ({"valueMissing": True}, {"patternMismatch": True, "typeMismatch": True}):
         assert _validity_of({"pattern": ""}, flags, form=form) == "invalid"
     assert _validity_of({"pattern": "[0-9]+"}, {"patternMismatch": True}, form=form) == "invalid"
@@ -354,14 +382,20 @@ def test_formnovalidate_excuses_nothing_but_the_empty_pattern_artefact():
 # one can report any ValidityState) is exercised on the validity decision itself, cut out of the closure text.
 _DECISION = r"""
 const CASE_EL = EL;
-const el = {tagName: CASE_EL.tagName, form: CASE_EL.form || null, validity: CASE_EL.validity,
+const form = CASE_EL.form || null;
+const controls = [];
+if (form) {
+  form.hasAttribute = n => n === 'novalidate' && (form.novalidateAttr ?? form.noValidate === true);
+  for (const c of form.controls || []) controls.push(Object.assign({matches: s => s === ':disabled' && !!c.fieldsetDisabled}, c, {form}));
+}
+const el = {tagName: CASE_EL.tagName, form, getRootNode: () => ({querySelectorAll: () => controls}), validity: CASE_EL.validity,
   getAttribute: n => (n === 'pattern' ? CASE_EL.pattern : null), classList: {contains: () => false},
   parentElement: null, matches: s => s === ':invalid'};
 const boom = () => { throw new Error('unreadable'); };
 if (CASE_EL.throwOn === 'validity') Object.defineProperty(el, 'validity', {get: boom});
 if (CASE_EL.throwOn === 'matches') el.matches = boom;
 if (CASE_EL.throwOn === 'pattern') el.getAttribute = n => (n === 'pattern' ? boom() : null);
-if (CASE_EL.throwOn === 'elements') el.form = {noValidate: false, get elements() { return boom(); }};
+if (CASE_EL.throwOn === 'controls') el.getRootNode = boom;
 SEGMENT
 process.stdout.write(JSON.stringify(validity(el)));
 """
@@ -399,12 +433,13 @@ def test_the_empty_pattern_excuse_is_for_an_input_element_only(tag, form, code):
 @pytest.mark.parametrize("throw_on, code", [
     ("validity", "invalid"),
     ("pattern", "invalid"),
-    ("elements", "invalid"),
+    ("controls", "invalid"),
     ("matches", "unknown"),
 ])
 def test_a_read_that_throws_after_the_invalid_gate_stays_invalid(throw_on, code):
     validity = {"valid": False, "patternMismatch": True}
-    assert _decision_of(tagName="INPUT", form=None, pattern="", validity=validity, throwOn=throw_on) == code
+    form = {"noValidate": False}  # a native form, so the submit-control read is reached
+    assert _decision_of(tagName="INPUT", form=form, pattern="", validity=validity, throwOn=throw_on) == code
 
 
 # GLM review nit: a ValidityState-like object with no boolean ``valid`` is read like no ValidityState at all.
