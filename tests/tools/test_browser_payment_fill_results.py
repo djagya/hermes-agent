@@ -250,6 +250,8 @@ for (const f of C.fields) if (f.form) {
   f.form.hasAttribute = n => n === 'novalidate' && (f.form.novalidateAttr ?? f.form.noValidate === true);
   for (const c of f.form.controls || [])
     controls.push(Object.assign({matches: s => s === ':disabled' && !!c.fieldsetDisabled}, c, {form: c.otherForm ? {} : f.form}));
+  // what a browser's ``form.elements`` lists: this form's controls, never an ``input type=image`` (unless shadowed)
+  if (!('elements' in f.form)) f.form.elements = controls.filter(c => c.form === f.form && c.type !== 'image');
 }
 document.querySelectorAll = sel => (/formnovalidate/.test(sel) ? controls : els);
 const getComputedStyle = () => ({visibility: 'visible', opacity: '1', pointerEvents: 'auto'});
@@ -387,6 +389,7 @@ const controls = [];
 if (form) {
   form.hasAttribute = n => n === 'novalidate' && (form.novalidateAttr ?? form.noValidate === true);
   for (const c of form.controls || []) controls.push(Object.assign({matches: s => s === ':disabled' && !!c.fieldsetDisabled}, c, {form}));
+  if (!('elements' in form)) form.elements = controls.filter(c => c.type !== 'image');  // never lists type=image
 }
 const el = {tagName: CASE_EL.tagName, form, getRootNode: () => ({querySelectorAll: () => controls}), validity: CASE_EL.validity,
   getAttribute: n => (n === 'pattern' ? CASE_EL.pattern : null), classList: {contains: () => false},
