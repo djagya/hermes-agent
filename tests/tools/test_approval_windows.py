@@ -213,13 +213,46 @@ class TestPowerShellPositionalScriptAndAbbreviatedSwitches:
         assert not _is_dangerous(cmd), cmd
 
 
-    @pytest.mark.parametrize("command", [
-        'echo "' + "wmic shadowcopy " * 2000 + 'list"; echo ok',
-        'echo "' + "ssh -x " * 2000 + 'cat"; echo ok',
-        "; ssh -x" * 3000,
-        "\n ssh -x" * 3000,
-    ])
-    def test_repeated_launcher_words_scan_in_linear_time(self, command):
-        start = time.perf_counter()
-        assert not _is_dangerous(command)
-        assert time.perf_counter() - start < 2, command[:30]
+    @pytest.mark.parametrize("build", [
+        lambda n: 'echo "' + "wmic shadowcopy " * n + 'list"; echo ok',
+        lambda n: 'echo "' + "ssh -x " * n + 'cat"; echo ok',
+        lambda n: "; ssh -x" * n,
+        lambda n: "\n ssh -x" * n,
+    ], ids=["wmic-quoted", "ssh-quoted", "ssh-semicolons", "ssh-newlines"])
+    def test_repeated_launcher_words_scan_in_linear_time(self, build, monkeypatch):
+        """Count the scanner's work instead of timing it (a loaded CI runner made a wall-clock bound flaky).
+
+        The shell scanner steps and command words the detector reads must grow in proportion to the
+        input: doubling the repeats may at most ~double the counts; a rescan from each launcher word
+        would make them quadruple. The regex rules are not countable, so
+        CPU time (not wall time) keeps a wide bound against catastrophic backtracking."""
+        from tools import approval_detection as detection
+
+        counts = dict.fromkeys(("scan steps", "command words"), 0)
+        scan_shell, word_spans = detection._scan_shell, detection._iter_shell_command_word_spans
+
+        def counting_scan_shell(*args, **kwargs):
+            for item in scan_shell(*args, **kwargs):
+                counts["scan steps"] += 1
+                yield item
+
+        def counting_word_spans(command):
+            for item in word_spans(command):
+                counts["command words"] += 1
+                yield item
+
+        monkeypatch.setattr(detection, "_scan_shell", counting_scan_shell)
+        monkeypatch.setattr(detection, "_iter_shell_command_word_spans", counting_word_spans)
+
+        def measure(repeats):
+            counts.update(dict.fromkeys(counts, 0))
+            start = time.process_time()
+            assert not _is_dangerous(build(repeats))
+            return dict(counts), time.process_time() - start
+
+        small, _ = measure(1000)
+        large, cpu_seconds = measure(2000)
+        assert all(small.values()), small  # the instrumentation is on the path being guarded
+        for name, small_count in small.items():
+            assert large[name] <= small_count * 2.5, (name, small_count, large[name])
+        assert cpu_seconds < 30, cpu_seconds
