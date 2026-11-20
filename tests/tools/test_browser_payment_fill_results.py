@@ -312,6 +312,7 @@ def test_an_empty_pattern_alone_does_not_make_a_filled_field_invalid(pattern):
     ({"pattern": ""}, {"patternMismatch": True, "typeMismatch": True}, "", "invalid"),
     ({"pattern": ""}, {"patternMismatch": True, "tooShort": True}, "", "invalid"),
     ({"pattern": ""}, {"patternMismatch": True, "tooLong": True}, "", "invalid"),
+    ({"pattern": ""}, {"patternMismatch": True, "rangeUnderflow": True}, "", "invalid"),
     ({"pattern": ""}, {"patternMismatch": True, "rangeOverflow": True}, "", "invalid"),
     ({"pattern": ""}, {"patternMismatch": True, "stepMismatch": True}, "", "invalid"),
     ({"pattern": ""}, {"patternMismatch": True, "badInput": True}, "", "invalid"),
@@ -326,13 +327,27 @@ def test_other_constraint_failures_stay_invalid(attrs, flags, parent_class, code
 
 
 # The excuse applies only where the browser would not block the submission anyway.
+_FIELD = {"type": "text"}  # a non-submit form control, next to the submit controls
 @pytest.mark.parametrize("extra, code", [
     ({}, "valid"),  # no form at all
     ({"form": {"noValidate": True}}, "valid"),  # Shopify's hosted frame form
     ({"form": {"noValidate": False}}, "invalid"),  # a native form: its submit button would never submit
+    # a submit control with formnovalidate: the browser skips constraint validation for that submission
+    ({"form": {"noValidate": False, "elements": [_FIELD, {"type": "submit", "formNoValidate": True}]}}, "valid"),
+    ({"form": {"noValidate": False, "elements": [{"type": "image", "formNoValidate": True}]}}, "valid"),
+    ({"form": {"noValidate": False, "elements": [{"type": "submit", "formNoValidate": False}]}}, "invalid"),
+    ({"form": {"noValidate": False, "elements": [{"type": "button", "formNoValidate": True}]}}, "invalid"),
+    ({"form": {"noValidate": False, "elements": [{"type": "text"}, {"type": "submit"}]}}, "invalid"),
 ])
 def test_an_empty_pattern_is_excused_only_where_the_browser_would_not_block(extra, code):
     assert _validity_of({"pattern": ""}, {"patternMismatch": True}, **extra) == code
+
+
+def test_formnovalidate_excuses_nothing_but_the_empty_pattern_artefact():
+    form = {"noValidate": False, "elements": [{"type": "submit", "formNoValidate": True}]}
+    for flags in ({"valueMissing": True}, {"patternMismatch": True, "typeMismatch": True}):
+        assert _validity_of({"pattern": ""}, flags, form=form) == "invalid"
+    assert _validity_of({"pattern": "[0-9]+"}, {"patternMismatch": True}, form=form) == "invalid"
 
 
 # ... and only on an <input>. The closure only ever enumerates INPUT and SELECT, so a custom element (a form-associated
@@ -342,6 +357,11 @@ const CASE_EL = EL;
 const el = {tagName: CASE_EL.tagName, form: CASE_EL.form || null, validity: CASE_EL.validity,
   getAttribute: n => (n === 'pattern' ? CASE_EL.pattern : null), classList: {contains: () => false},
   parentElement: null, matches: s => s === ':invalid'};
+const boom = () => { throw new Error('unreadable'); };
+if (CASE_EL.throwOn === 'validity') Object.defineProperty(el, 'validity', {get: boom});
+if (CASE_EL.throwOn === 'matches') el.matches = boom;
+if (CASE_EL.throwOn === 'pattern') el.getAttribute = n => (n === 'pattern' ? boom() : null);
+if (CASE_EL.throwOn === 'elements') el.form = {noValidate: false, get elements() { return boom(); }};
 SEGMENT
 process.stdout.write(JSON.stringify(validity(el)));
 """
@@ -372,6 +392,26 @@ def _decision_of(**el):
 def test_the_empty_pattern_excuse_is_for_an_input_element_only(tag, form, code):
     validity = {"valid": False, "patternMismatch": True}
     assert _decision_of(tagName=tag, form=form, pattern="", validity=validity) == code
+
+
+# J-0269: once the browser calls the field :invalid, a validity read that throws keeps that verdict (it never becomes
+# 'unknown', which counts as nothing); a throw before that gate is unreadable, as before.
+@pytest.mark.parametrize("throw_on, code", [
+    ("validity", "invalid"),
+    ("pattern", "invalid"),
+    ("elements", "invalid"),
+    ("matches", "unknown"),
+])
+def test_a_read_that_throws_after_the_invalid_gate_stays_invalid(throw_on, code):
+    validity = {"valid": False, "patternMismatch": True}
+    assert _decision_of(tagName="INPUT", form=None, pattern="", validity=validity, throwOn=throw_on) == code
+
+
+# GLM review nit: a ValidityState-like object with no boolean ``valid`` is read like no ValidityState at all.
+@pytest.mark.parametrize("validity", [{"patternMismatch": True}, {"valid": "false", "patternMismatch": True},
+                                      {"valid": None, "patternMismatch": True}])
+def test_a_validity_without_a_boolean_valid_falls_back_to_the_invalid_selector(validity):
+    assert _decision_of(tagName="INPUT", form=None, pattern="", validity=validity) == "invalid"
 
 
 # A field the browser does not validate is never :invalid, whatever its ValidityState says (as before the change).
