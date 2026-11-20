@@ -255,9 +255,10 @@ _INSPECT_TEMPLATE = r"""(() => {
   // it cannot be read, else 'valid'. No text, no value.
   // dlz (D-0358 a note, 11-19): ``:invalid`` stays the gate (it already leaves out readonly, disabled, fieldset-disabled
   // and datalist fields, which the browser does not validate); the ValidityState flags only EXCUSE one HTML artefact: a
-  // ``pattern`` attribute that is present but empty, on an <input> the browser would not block anyway (no form, or a
-  // novalidate form). HTML then accepts only the empty string, so every filled value is a patternMismatch (Shopify's
-  // hosted cardholder-name input carries ``pattern=""`` inside a novalidate form). That is not the provider's rule.
+  // ``pattern`` attribute that is present but empty, on an <input> the browser would not block anyway (no form, a
+  // novalidate form, or a form with a formnovalidate submit control). HTML then accepts only the empty string, so
+  // every filled value is a patternMismatch (Shopify's hosted cardholder-name input carries ``pattern=""`` inside a
+  // novalidate form). That is not the provider's rule.
   // A native form without novalidate keeps it invalid (its submit never goes through); every other flag, and a
   // mismatch against a non-empty pattern, stays invalid. Without ``el.validity`` the plain ``:invalid`` test applies.
   const INVALID_CLASSES = ['is-invalid','invalid','has-error','StripeElement--invalid','braintree-hosted-fields-invalid',
@@ -265,15 +266,35 @@ _INSPECT_TEMPLATE = r"""(() => {
     'field--invalid','field-error','input-error','error'];
   const OTHER_FLAGS = ['valueMissing','typeMismatch','tooShort','tooLong','rangeUnderflow','rangeOverflow',
     'stepMismatch','badInput','customError'];
+  // A form submits without constraint validation when it carries ``novalidate`` (the ``noValidate`` property, then the
+  // intrinsic ``Element.prototype.hasAttribute``, which a control named ``hasAttribute`` or ``noValidate`` cannot
+  // shadow) or a submit/image control with ``formnovalidate`` (the browser skips
+  // validation for a submission made with that submitter). The controls come from the field's own tree, not
+  // ``form.elements`` (which leaves out ``input type=image`` and can be shadowed by a control named ``elements``).
+  // Which control is Pay is not known here, so any other one counts, hidden or disabled: a Pay button that is
+  // disabled only until a terms box is ticked still submits later, and a wrong excuse costs a refused submit while a
+  // wrong block costs the payment.
+  const skipsValidation = el => {
+    const form = el.form;
+    if (form.noValidate === true) return true;
+    // a throw here keeps the fail-closed verdict (no excuse at all), as an unreadable form always did
+    try { if (Element.prototype.hasAttribute.call(form, 'novalidate')) return true; } catch (_) { return false; }
+    return Array.from(el.getRootNode().querySelectorAll('button[formnovalidate],input[formnovalidate]')).some(
+      c => c && c.form === form && c.formNoValidate === true && (c.type === 'submit' || c.type === 'image'));
+  };
   const breaksConstraint = el => {
     if (!(typeof el.matches === 'function' && el.matches(':invalid'))) return false;
-    const v = el.validity;
-    if (!v || typeof v !== 'object') return true;
-    const p = typeof el.getAttribute === 'function' ? el.getAttribute('pattern') : null;
-    const emptyPattern = p !== null && p !== undefined && !String(p).trim();
-    // a string compare, not instanceof: the field may live in another frame
-    const excusable = String(el.tagName).toUpperCase() === 'INPUT' && (!el.form || el.form.noValidate === true);
-    return !(v.patternMismatch && emptyPattern && excusable && !OTHER_FLAGS.some(k => v[k]));
+    // dlz (J-0269): the browser already calls this field :invalid, so a read that throws below keeps that verdict
+    // (the pre-excuse behaviour) instead of turning into 'unknown', which would let Pay through.
+    try {
+      const v = el.validity;
+      if (!v || typeof v !== 'object' || typeof v.valid !== 'boolean') return true;
+      const p = typeof el.getAttribute === 'function' ? el.getAttribute('pattern') : null;
+      const emptyPattern = p !== null && p !== undefined && !String(p).trim();
+      // a string compare, not instanceof: the field may live in another frame
+      const excusable = String(el.tagName).toUpperCase() === 'INPUT' && (!el.form || skipsValidation(el));
+      return !(v.patternMismatch && emptyPattern && excusable && !OTHER_FLAGS.some(k => v[k]));
+    } catch (_) { return true; }
   };
   const validity = el => {
     try {
