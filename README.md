@@ -1,3 +1,5 @@
+> **About this fork.** This is Danil's fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), not the official project. It adds operational fixes for one always-on Docker deployment: restart resume, approvals bound to what was reviewed, vault fills for logins and card payments with per-purchase owner approval, honest cron alerts, a sandboxed document toolbox and an attested amd64 image. What it changes, why, what it costs and when stock upstream is the better choice: **[the fork in plain words](https://github.com/djagya/beyond-prompting/blob/main/guides/hermes-fork.en.md)** ([по-русски](https://github.com/djagya/beyond-prompting/blob/main/guides/hermes-fork.ru.md)). The live build is on a `release/vX.Y.Z-dlz` branch, not on `main`.
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
