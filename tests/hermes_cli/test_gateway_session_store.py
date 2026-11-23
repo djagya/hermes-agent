@@ -456,6 +456,28 @@ def test_create_if_missing_merges_required_skills_so_the_resume_passes(store, mo
     assert [c for c in client.calls if c[0] == "session.create"][-1][1]["skills"] == ["x"]
 
 
+def test_create_if_missing_leaves_out_auto_load_skills_like_the_resume(store, monkeypatch):
+    """A ``skills.auto_load`` name in ``-s``/``--required-skills`` is left out at creation, the same way the
+    resume leaves it out (``_explicit_launch_skills``), so the new session accepts its own resume."""
+    import argparse
+    from agent import skill_commands
+    from hermes_cli import gateway_session_store as gss
+    from hermes_cli.cli_init_mixin import launch_skills_without_auto_load
+    from hermes_cli.gateway_chat import check_resume_policy
+    db, client = store
+    monkeypatch.setattr(gss, "session_store", lambda: db)
+    monkeypatch.setattr(skill_commands, "resolve_auto_load_skills", lambda _config: ["release"])
+    args = argparse.Namespace(skills=["shell"], required_skills=["release"], toolsets=None, ignore_rules=False)
+    assert gss.create_titled_session("Deploy", args) == "local-new"
+    params = [c for c in client.calls if c[0] == "session.create"][-1][1]
+    assert params["skills"] == ["shell"]
+    resumed = launch_skills_without_auto_load(["shell", "release"], False)  # what the resume asks for
+    check_resume_policy(argparse.Namespace(skills=resumed, toolsets=None), {"info": {"launch_request": params}})
+    kept = argparse.Namespace(skills=["shell"], required_skills=["release"], toolsets=None, ignore_rules=True)
+    gss.create_titled_session("Deploy raw", kept)
+    assert [c for c in client.calls if c[0] == "session.create"][-1][1]["skills"] == ["shell", "release"]
+
+
 def test_bare_continue_finds_the_last_session_the_cli_created(tmp_path, monkeypatch):
     """Bare ``-c`` (main.py ``_resolve_last_session``) reads main's labels too: a gateway row labelled
     ``local`` that the CLI created is CLI history."""

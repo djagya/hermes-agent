@@ -61,12 +61,18 @@ def _gateway_launch(cli):
 def _explicit_launch_skills(cli):
     """The `-s/--skills` names, which the gateway renders into the session once at creation (the CLI's
     own prompt never reaches it). ``skills.auto_load`` names are left out: the gateway's agent loads those."""
-    requested = getattr(cli, "_preload_skills_requested", None) or []
+    return launch_skills_without_auto_load(getattr(cli, "_preload_skills_requested", None),
+                                           getattr(cli, "ignore_rules", False))
+
+
+def launch_skills_without_auto_load(requested, ignore_rules):
+    """``requested`` minus the ``skills.auto_load`` names (none dropped under ``--ignore-rules``), or None.
+    The one rule both the create and the resume of a titled session apply, so their skills compare equal."""
     if not requested:
         return None
     from agent.skill_commands import resolve_auto_load_skills
     from cli import CLI_CONFIG
-    auto = set() if getattr(cli, "ignore_rules", False) else set(resolve_auto_load_skills(CLI_CONFIG))
+    auto = set() if ignore_rules else set(resolve_auto_load_skills(CLI_CONFIG))
     return [name for name in requested if name not in auto] or None
 
 

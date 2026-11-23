@@ -563,8 +563,12 @@ def create_titled_session(title, args=None):
     launch = {key: getattr(args, key, None) for key in (*_LAUNCH_POLICY, "run_budget", "verbose")}
     # The classic launch (cli._build_cli_from_args) folds --required-skills into the skills it asks for and
     # the resume repeats that merged list, so create with it; _requested_policy splits and dedupes.
-    launch["skills"] = [name for value in (launch["skills"], getattr(args, "required_skills", None)) if value
-                        for name in (value if isinstance(value, (list, tuple)) else [value])] or None
+    # Both drop skills.auto_load names the same way (the gateway's agent loads those).
+    from hermes_cli.cli_init_mixin import launch_skills_without_auto_load
+    merged = [part.strip() for value in (launch["skills"], getattr(args, "required_skills", None)) if value
+              for name in (value if isinstance(value, (list, tuple)) else [value])
+              for part in str(name).split(",") if part.strip()]
+    launch["skills"] = launch_skills_without_auto_load(merged, getattr(args, "ignore_rules", False))
     params = _creation_policy(launch)
     params["cwd"] = _launch_cwd()
     params["source"] = "cli"  # main's titled row is `cli` (hermes_cli.main._create_titled_session)
