@@ -420,6 +420,23 @@ def test_create_if_missing_titles_a_gateway_created_session(store, monkeypatch):
     assert params["title"] == "Fresh Named" and params["source"] and params["cwd"]
 
 
+def test_create_if_missing_carries_the_launch_flags_the_resume_then_repeats(store, monkeypatch):
+    """``chat -c NAME --create-if-missing --provider P --model M -s S``: the new session is created
+    with those flags, so the resume that follows (which repeats them) matches its frozen launch
+    instead of being refused with "creation overrides are unsupported on resume"."""
+    import argparse
+    from hermes_cli import gateway_session_store as gss
+    from hermes_cli.gateway_chat import check_resume_policy
+    db, client = store
+    monkeypatch.setattr(gss, "session_store", lambda: db)
+    args = argparse.Namespace(provider="anthropic", model="claude-x", skills=["a", "b"], toolsets=None)
+    assert gss.create_titled_session("Fresh Named", args) == "local-new"
+    _method, params = [c for c in client.calls if c[0] == "session.create"][-1]
+    assert (params["provider"], params["model"], params["skills"]) == ("anthropic", "claude-x", ["a", "b"])
+    assert "toolsets" not in params
+    check_resume_policy(args, {"info": {"launch_request": params}})  # the resume accepts the same flags
+
+
 def test_bare_continue_finds_the_last_session_the_cli_created(tmp_path, monkeypatch):
     """Bare ``-c`` (main.py ``_resolve_last_session``) reads main's labels too: a gateway row labelled
     ``local`` that the CLI created is CLI history."""
