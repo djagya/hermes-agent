@@ -1,14 +1,15 @@
 """Stored recovery / backup codes (owner decision D-0365, 2026-11-18): ``browser_vault enter_code`` with
 ``code_source=recovery`` types ONE stored code per human approval.
 
-A login item keeps its codes in a field the agent names (``recovery codes``); the value is split into codes
-here, server-side only. Only a field whose label or section says recovery / backup / codes (six languages) is
-read, and never the item's password, username or one-time-password field (review E, 11-18: ``field=password``
-typed the password into a code box). Each code is single-use on the site, so a small ledger remembers which
-codes Hermes already typed: only a keyed hash (HMAC-SHA256 with a random per-install key kept in the same
-mode-600 file) per canonical item id, never a code. A code is marked used BEFORE it is written, so a write
-whose outcome is unknown never offers the same code twice. The read-select-save transaction holds a file lock
-next to the ledger, so two processes sharing ``HERMES_HOME`` never pick the same code.
+The backend picks the field, not the agent (J-0141, 2026-11-23): a field is a candidate only when it is not the
+login's password, username or one-time-password field and its LABEL says both recovery/backup and code
+(:func:`is_recovery_code_label`, six languages). Exactly one candidate is used; the approval shows its exact
+label, and after the approval only that field is read, at the same item revision (:func:`bound_codes`). The
+value is split into codes here, server-side only. Each code is single-use on the site, so a small ledger
+remembers which codes Hermes already typed: only a keyed hash (HMAC-SHA256 with a random per-install key kept
+in the same mode-600 file) per canonical item id, never a code. A code is marked used BEFORE it is written, so
+a write whose outcome is unknown never offers the same code twice. The read-select-save transaction holds a
+file lock next to the ledger, so two processes sharing ``HERMES_HOME`` never pick the same code.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import threading
 import unicodedata
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Iterable, Iterator, NamedTuple, Optional, Sequence
 
 msvcrt = None
 try:
@@ -37,52 +38,66 @@ except ImportError:  # pragma: no cover - platform-specific fallback (same shape
 _CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{3,63}$")
 _CHUNK_SPLIT_RE = re.compile(r"[,;]+")
 _DIGIT_GROUP_RE = re.compile(r"^\d{2,5}$")
+_KEY_RE = re.compile(r"[0-9a-fA-F]{64}")
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 _lock = threading.Lock()
 _MAX_ENTRIES = 2000
 
-# Recovery / backup wording on the field's label or section (normalised: lower case, accents dropped, words
-# split on anything else). EN, DE, FR, ES, IT, NL. Stems, so compounds ("Wiederherstellungscodes",
-# "herstelcodes", "backupcodes") match.
-_RECOVERY_WORDS_RE = re.compile(
-    r"recover|backup|back up|wiederherstell|sicherungscode|notfallcode|recuper|secours|sauvegarde|respaldo|"
-    r"herstel|reservecode")
-_CODE_WORD_RE = re.compile(r"cod(?:e|es|igo|igos|ice|ici)\b")
-# "code" alone is not enough when the text names something else that is secret or not a recovery code.
-_NOT_CODES_RE = re.compile(
-    r"pass|kennwort|wachtwoord|contrasena|mot de passe|\bpin\b|\botp\b|totp|one time|einmal|seed|secret|"
-    r"user ?name|e ?mail|zip|post|bar ?code|promo|gift|coupon|voucher|discount")
-# A field label that names the account's own secret or identifier is never read as codes, whatever the section.
-_SECRET_LABEL_RE = re.compile(
-    r"^(?:password|passwort|kennwort|wachtwoord|contrasena|mot de passe|passcode|pin|username|user name|"
-    r"e ?mail|login|one time password|otp|totp|authenticator|secret|seed)(?: (?!cod)\w+)?$")
+# The whole label rule, no deny list: a recovery word AND a code word, both in the label itself (lower case,
+# accents dropped, anything else a space; one trailing "(...)" is the site's name and says nothing). EN, DE, FR,
+# ES, IT, NL. Stems inside one word, so compounds match ("Wiederherstellungscodes", "herstelcodes"); the
+# optional space joins "Notfall-Codes" and "Back up codes" but never two unrelated words ("disco de respaldo").
+_RECOVERY_WORD_RE = re.compile(
+    r"recover|back ?up|wiederherstell|sicherungs ?code|notfall ?code|ersatz ?code|recuper|secours|sauvegarde|"
+    r"respaldo|riserva|emergen|herstel|reserve ?code")
+_CODE_WORD_RE = re.compile(r"cod(?:e|igo|ic[ei])")
+_TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
+_MAX_LABEL = 80
 
 
-class RecoveryFieldNotCodes(Exception):
-    """The named field exists but is not a recovery-code field (the password, an identifier, a TOTP seed, or a
-    label without recovery/backup/code wording). Carries no value."""
+class RecoveryField(NamedTuple):
+    """One recovery-code field of an item as an approval binds it: the backend's field id, its exact label and
+    the item's revision at that read. Never a value."""
+    id: str
+    label: str
+    revision: str
 
 
 class RecoveryLedgerUnreadable(Exception):
     """The spent-code ledger exists but cannot be parsed: refusing beats re-offering a spent code."""
 
 
-def normalize_label(text: str) -> str:
-    folded = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"[^a-z0-9]+", " ", folded.lower()).strip()
+def is_recovery_code_label(label: str) -> bool:
+    """True when the field LABEL says recovery/backup codes ("Recovery codes (PyPI)", "Notfallcodes",
+    "Códigos de respaldo"). "Code (TOTP)", "Security code" and "Codice fiscale" say no recovery word, so they
+    never are. The approval shows the label as it is, so it must be one short printable line."""
+    label = str(label or "")
+    if len(label) > _MAX_LABEL or not label.isprintable():
+        return False
+    folded = unicodedata.normalize("NFKD", _TRAILING_PAREN_RE.sub("", label)).encode("ascii", "ignore").decode("ascii")
+    words = re.sub(r"[^a-z0-9]+", " ", folded.lower())
+    return bool(_RECOVERY_WORD_RE.search(words) and _CODE_WORD_RE.search(words))
 
 
-def has_code_wording(text: str) -> bool:
-    """True when ``text`` (a field label plus its section) says recovery / backup codes."""
-    words = normalize_label(text)
-    if _RECOVERY_WORDS_RE.search(words):
-        return True
-    return bool(_CODE_WORD_RE.search(words)) and not _NOT_CODES_RE.search(words)
+def choose_field(field: str, candidates: Sequence[RecoveryField]) -> Optional[RecoveryField]:
+    """The one field to read: the item's only candidate, or among several the one whose label equals the agent's
+    ``field`` exactly (case-insensitive). ``None``: no candidate, or several and no single exact match."""
+    if len(candidates) > 1:
+        want = str(field or "").strip().casefold()
+        candidates = [c for c in candidates if c.label.strip().casefold() == want]
+    return candidates[0] if len(candidates) == 1 else None
 
 
-def names_account_secret(text: str) -> bool:
-    """True when ``text`` names the login's password, identifier or one-time-password field."""
-    words = normalize_label(text)
-    return bool(_SECRET_LABEL_RE.match(words)) and not _RECOVERY_WORDS_RE.search(words)
+def bound_codes(chosen: RecoveryField, fields: Iterable[tuple[RecoveryField, str]]) -> Optional[list[str]]:
+    """After the approval: the codes of exactly the approved field, from the item's revealed candidates. ``None``
+    when the item no longer has that field id under that label at that revision (edited since the prompt, or no
+    revision to compare): nothing else is ever read instead."""
+    from agent.vault_store import revision_verdict
+
+    values = [value for found, value in fields
+              if (found.id, found.label) == (chosen.id, chosen.label)
+              and revision_verdict(chosen.revision, found.revision) == "match"]
+    return parse_codes(values) if len(values) == 1 else None
 
 
 def _line_codes(line: str) -> list[str]:
@@ -109,29 +124,6 @@ def parse_codes(values: Iterable[str]) -> list[str]:
                 if _CODE_RE.match(token) and any(ch.isdigit() for ch in token) and token not in out:
                     out.append(token)
     return out
-
-
-def field_matches(field: str, label: str, section: str = "") -> bool:
-    """The agent-named field: its label equals ``field`` or starts with it ("recovery codes" matches
-    "Recovery codes (PyPI)"), or the field sits in a section of that name."""
-    want = normalize_label(field)
-    if not want:
-        return False
-    have = normalize_label(label)
-    return have == want or have.startswith(want + " ") or normalize_label(section) == want
-
-
-def pick_code_values(field: str, entries: Iterable[tuple[str, str, str, bool]]) -> list[str]:
-    """Codes from the item's fields ``(label, section, value, protected)`` that match ``field``. ``protected``
-    is the backend's own mark for the password / username / one-time-password field. ``[]`` when nothing
-    matches; :class:`RecoveryFieldNotCodes` when fields match but none of them may be read as codes."""
-    matched = [(label, section, value, protected) for label, section, value, protected in entries
-               if field_matches(field, label, section)]
-    usable = [value for label, section, value, protected in matched
-              if not protected and not names_account_secret(label) and has_code_wording(label + " " + section)]
-    if matched and not usable:
-        raise RecoveryFieldNotCodes()
-    return parse_codes(usable)
 
 
 def _ledger_path() -> Path:
@@ -172,14 +164,16 @@ def _load(path: Path) -> Optional[dict]:
         text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         raise RecoveryLedgerUnreadable() from None
     try:
         data = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise RecoveryLedgerUnreadable() from None
     key = data.get("key") if isinstance(data, dict) else None
-    if not isinstance(key, str) or len(key) != 64 or not isinstance(data.get("used"), list):
+    used = data.get("used") if isinstance(data, dict) else None
+    if (not isinstance(key, str) or not _KEY_RE.fullmatch(key) or not isinstance(used, list)
+            or not all(isinstance(entry, str) and _DIGEST_RE.fullmatch(entry) for entry in used)):
         raise RecoveryLedgerUnreadable()
     return data
 
