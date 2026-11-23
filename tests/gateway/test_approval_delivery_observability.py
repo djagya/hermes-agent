@@ -21,7 +21,7 @@ import pytest
 # when the suite runs from a developer worktree — the home-I/O guard is fixture-scoped and only
 # active during a test, so the probe must happen here at collection time.
 import gateway.run as gateway_run
-from gateway.run_turn_runner import TurnRunner
+from gateway.run_turn_runner import TurnRunner, _ExecApprovalDeclined
 from gateway.platforms.base import SendResult
 from tools import approval as _approval
 from tools import approval_gateway_wait as wait_mod
@@ -141,9 +141,47 @@ def test_text_fallback_send_leaves_a_record(tmp_path, monkeypatch, caplog, text_
     runner._close_native_stream_boundary = lambda _why: None
 
     with caplog.at_level(logging.INFO, logger="gateway.run"):
-        runner._approval_notify_sync(dict(APPROVAL, request_id="req-1"))
+        if text_ok:
+            runner._approval_notify_sync(dict(APPROVAL, request_id="req-1"))
+        else:  # nobody saw the prompt: the notifier refuses instead of arming a timeout nobody can answer
+            with pytest.raises(_ExecApprovalDeclined, match="undeliverable: Not connected"):
+                runner._approval_notify_sync(dict(APPROVAL, request_id="req-1"))
 
     text = [r for r in caplog.records if r.message.startswith("Exec approval text prompt send")]
     assert len(text) == 1 and text[0].levelno == level
     assert f"success={text_ok}" in text[0].message and "request_id=req-1" in text[0].message
     assert "rm -rf" not in text[0].message
+
+
+def test_api_server_approval_that_cannot_be_shown_is_refused_at_once(tmp_path, monkeypatch):
+    """11-19 Claude Code relay: an exec approval on the api_server surface (HTTP request/response, so
+    send() always fails) waited the full 5-minute timeout for an answer nobody could give. The wait
+    must settle as ``notify_failed`` immediately, which the tool turns into "BLOCKED: Failed to send
+    approval request to user"."""
+    (tmp_path / "config.yaml").write_text("display: {}")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    _clear_queues()
+    monkeypatch.setattr(wait_mod._ctx, "_fire_approval_hook", lambda name, **kw: None)
+
+    def _never_wait(*_a, **_k):
+        raise AssertionError("the approval wait must not start for a prompt nobody could see")
+    monkeypatch.setattr(wait_mod, "_poll_event", _never_wait)
+
+    class _ApiServerAdapter:  # gateway.platforms.api_server.APIServerAdapter.send, verbatim result
+        typed_command_prefix = "/"
+
+        def pause_typing_for_chat(self, chat_id: str) -> None:
+            return None
+
+        async def send(self, chat_id: str, message: str, **k: Any) -> SendResult:
+            return SendResult(success=False, error="API server uses HTTP request/response, not send()")
+
+    runner = object.__new__(TurnRunner)
+    runner._ctx = SimpleNamespace(
+        _status_adapter=_ApiServerAdapter(), _status_chat_id="C1", _status_thread_metadata=None, session_key=SESSION)
+    runner._schedule = lambda coro, _label: SimpleNamespace(result=lambda timeout=None, _r=asyncio.run(coro): _r)
+    runner._close_native_stream_boundary = lambda _why: None
+
+    decision = wait_mod._await_gateway_decision(SESSION, runner._approval_notify_sync, dict(APPROVAL), timeout_s=300)
+
+    assert decision == {"resolved": False, "choice": None, "notify_failed": True}
