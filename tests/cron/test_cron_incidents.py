@@ -121,49 +121,79 @@ def test_incidents_list_newest_instant_first_across_dst_fall_back(monkeypatch, t
 
 
 def _run_tokens(rng):
-    """One run's worth of per-run tokens, as the cron scripts' error text carries them."""
+    """One run's worth of per-run tokens, drawn from the alphabets the tools that make them use."""
     import string
-    alnum = string.ascii_letters + string.digits
+    alnum, hexdigits = string.ascii_letters + string.digits, "0123456789abcdef"
+
+    def draw(alphabet, n):
+        return "".join(rng.choice(alphabet) for _ in range(n))
+
+    def mktemp(n):  # mktemp's X's; an all-lowercase draw is not masked (the accepted miss: one extra alert)
+        name = draw(alnum, n)
+        return name if any(c.isdigit() or c.isupper() for c in name) else mktemp(n)
     stamp = f"2026-11-{rng.randint(10, 28)}T{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}Z"
     return {
-        "tmp": "".join(rng.choice(alnum) for _ in range(6)) + "A1",  # never all-lowercase letters
-        "sha": "".join(rng.choice("0123456789abcdef") for _ in range(64)),
-        "short": "".join(rng.choice("0123456789abcdef") for _ in range(7)) + "a",  # a digit-only run is a number, not a SHA
-        "uuid": "-".join("".join(rng.choice("0123456789abcdef") for _ in range(n)) for n in (8, 4, 4, 4, 12)),
+        "tmp6": mktemp(6),  # mktemp -d /tmp/worktree.XXXXXX
+        "tmp10": mktemp(10),  # bare mktemp: $TMPDIR/tmp.XXXXXXXXXX
+        "py": "tmp" + draw(string.ascii_lowercase + string.digits + "_", 8),  # tempfile.mkdtemp()
+        "sha": draw(hexdigits, 64), "sha1": draw(hexdigits, 40), "md5": draw(hexdigits, 32),
+        "uuid": "-".join(draw(hexdigits, n) for n in (8, 4, 4, 4, 12)),
         "bytes": rng.randint(10, 9_999_999),
         "stamp": stamp,
         "compact": stamp.replace("-", "").replace(":", ""),
+        "clock": f"{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}",
         "secs": rng.randint(1, 3000),
     }
 
 
-def test_signature_ignores_per_run_tokens(monkeypatch, tmp_path):
-    """Generator test for the class: the same failure with fresh per-run tokens (random mktemp
-    worktree names, receipt paths, sha256 digests, SHAs, byte counts, timestamps, durations) is ONE
-    signature, so the repeat-alert cooldown applies; a different real error is still another one."""
+_PER_RUN_TEMPLATE = (
+    "script failed: Error: manifest rejected at /tmp/worktree.{tmp6}/scripts/sync.mjs:12:34\n"
+    "log /var/folders/ab/cd12/T/tmp.{tmp10} and /private/tmp/{py}/out.json at {clock}; "
+    "receipt /srv/receipts/{compact}.json sha256={sha} sha1={sha1} md5={md5} ({bytes} bytes) run {uuid} "
+    "started {stamp}, waited {secs}s"
+)
+
+# Two different failures of one job that must never share a signature: every collision a review round found.
+_MUST_DIFFER = (
+    ("open /var/data/a.sqlite3 failed", "open /var/data/a.sqlite4 failed"),
+    ("open data.sqlite failed: HTTP 502", "open data.config failed: HTTP 503"),
+    ("E: Version '1:20.0' for 'demo' was not found", "E: Version '1:30.0' for 'demo' was not found"),
+    ("  12:34  error  'x' is not defined  no-undef", "  56:07  error  'x' is not defined  no-undef"),
+    ("TypeError: manifest rejected at sync.mjs:12:34", "TypeError: manifest rejected at sync.mjs:12:35"),
+    ("TypeError: manifest rejected at sync.mjs:12:19", "TypeError: manifest rejected at sync.mjs:13:19"),
+    ("at /tmp/worktree.aB3xY9/scripts/sync.mjs:12:34", "at /tmp/worktree.aB3xY9/scripts/sync.mjs:13:34"),
+    ("crashed builtins.KeyError: 'k'", "crashed builtins.EOFError: 'k'"),
+    ("process exited 0xc0000005", "process exited 0xc0000409"),
+    ("exit status c0000005", "exit status c0000409"),
+    ("script exited with code 1234567", "script exited with code 7654321"),
+    ("script exited with code 137", "script exited with code 143"),
+    ("pkg 1.2.345678 rejected", "pkg 1.2.345679 rejected"),
+    ("expected 01:20 got 01:25", "expected 01:30 got 01:25"),
+    ("import pkg.Module1 failed", "import pkg.Module2 failed"),
+    ("HEAD at abc1234 failed", "HEAD at def5678 failed"),
+    ("open /srv/data/Report2024.csv failed", "open /srv/data/Report2025.csv failed"),
+    ("missing /tmp/build.log", "missing /tmp/cache.db"),
+    ("disk full: 512 MiB left", "disk full: 768 MiB left"),
+)
+
+
+def test_signature_ignores_per_run_tokens_and_keeps_meaningful_ones(monkeypatch, tmp_path):
+    """The same failure with fresh per-run tokens (mktemp's 6- and 10-character names, Python tempfile
+    names, clocks, timestamps, digests, UUIDs, byte counts, durations) is ONE signature, so the
+    repeat-alert cooldown applies. Two failures that differ in a meaningful token are two: a shared
+    signature with a closed incident would hide the second one for good."""
     import random
     inc = _point_db(monkeypatch, tmp_path)
-    template = (
-        "script failed: Error: manifest rejected at /tmp/worktree.{tmp}/scripts/sync.mjs:12:34\n"
-        "receipt /srv/receipts/{compact}.json sha256={sha} ({bytes} bytes) commit {short} run {uuid} "
-        "started {stamp}, waited {secs}s"
-    )
     rng = random.Random(1123)
-    sigs = {inc._error_signature("job-1", template.format(**_run_tokens(rng))) for _ in range(200)}
+    sigs = {inc._error_signature("job-1", _PER_RUN_TEMPLATE.format(**_run_tokens(rng))) for _ in range(500)}
     assert len(sigs) == 1, sigs
-    base = template.format(**_run_tokens(rng))
+    base = _PER_RUN_TEMPLATE.format(**_run_tokens(rng))
     for other in (base.replace("manifest rejected", "schema rejected"), base.replace("sync.mjs:12", "sync.mjs:13"),
                   base.replace("script failed", "script crashed")):
         assert inc._error_signature("job-1", other) not in sigs
     assert inc._error_signature("job-2", base) not in sigs  # same text, other job
-    # Source locations, plain numbers and status codes are not per-run tokens (two-digit columns too).
-    loc = "TypeError: manifest rejected at sync.mjs:{}"
-    assert len({inc._error_signature("j", loc.format(x)) for x in ("12:34", "56:78", "12:19", "13:19")}) == 4
-    assert (inc._error_signature("j", "script exited with code 1234567")
-            != inc._error_signature("j", "script exited with code 7654321"))
-    # Plain file extensions and status codes are not per-run tokens.
-    assert (inc._error_signature("j", "open data.sqlite failed: HTTP 502")
-            != inc._error_signature("j", "open data.config failed: HTTP 503"))
+    shared = [(a, b) for a, b in _MUST_DIFFER if inc._error_signature("j", a) == inc._error_signature("j", b)]
+    assert not shared, shared
 
 
 def test_same_signature_dedups_same_incident(monkeypatch, tmp_path):

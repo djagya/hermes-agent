@@ -55,22 +55,33 @@ _FAILURE_TYPE_ORDER = (
 )
 MAX_ERROR_CHARS = 500
 _MAX_SIGNATURE_ERROR_CHARS = 200
-# Per-run tokens differ for the same failure, so they are masked out of the signature (one incident
-# per real error, not per run): a ``mktemp`` suffix (``worktree.aB3xY9``, ``run.Qw3Er5Ty``; matched
-# before lowercasing, and only when it has a digit or capital so plain extensions survive),
-# timestamps, UUIDs, hex digests/SHAs (7+ hex chars with a letter a-f: exit codes and ids stay), byte
-# counts and measured durations ("idle for 603s", "retry in 12.5 seconds"). ``file:LINE:COL``, status
-# codes and other numbers still count.
-_MKTEMP_SUFFIX_RE = re.compile(r"(?<=[\w-])\.(?=[a-z]*[A-Z\d])[A-Za-z\d]{6,8}\b")
+# Per-run tokens differ for the same failure, so they are masked out of the signature (one incident per
+# real error, not per run). Allow-list only: a mask that over-matches merges two real errors, and a
+# closed incident then hides the second one for good, so only shapes that cannot carry meaning are
+# masked. Dated timestamps and HH:MM:SS clocks, UUIDs, whole md5/sha1/sha256 digests, "N bytes" and
+# measured durations ("idle for 603s", "retry in 12.5 seconds"). Short SHAs, file:LINE:COL, versions,
+# exit codes and other numbers count.
 _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
-    (r"\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:z|[+-]\d{2}:?\d{2})?)?", "#t"),
+    (r"\b\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:z|[+-]\d{2}:?\d{2})?)?", "#t"),
     (r"\b\d{8}[t_-]\d{6}z?\b", "#t"),
-    (r"(?<![:\w.])\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?![:\d])", "#t"),  # not ``file:LINE:COL``
-    (r"\b\d+\s*(?:bytes?|[kmg]i?b)\b", "#b"),
+    (r"(?<![:\w.])\d{2}:\d{2}:\d{2}(?:\.\d+)?(?![:\d])", "#t"),
     (r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "#h"),
-    (r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,64}\b", "#h"),
+    (r"\b[0-9a-f]{32,64}\b", "#h"),
+    (r"\b\d+\s*bytes?\b", "#b"),
     (r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b", "#s"),
 ))
+# Temp names by context, not shape: the entry right under a temp root (``/tmp``, ``/var/tmp``,
+# ``/private/tmp``, macOS ``$TMPDIR`` ``/var/folders/*/*/T``) is per-run by nature. In it, Python's
+# ``tempfile`` name (``tmp`` + 8 of ``[a-z0-9_]``) and every 6+ character run with a digit or a capital
+# (``mktemp``'s ``tmp.XXXXXXXXXX``, ``worktree.XXXXXX``) are masked, before lowercasing.
+_TEMP_ENTRY_RE = re.compile(r"(?<![\w.-])((?:/private)?(?:/tmp|/var/tmp|/var/folders/[^/\s]+/[^/\s]+/T)/)([^/\s:'\"()]+)")
+_PY_TEMP_NAME_RE = re.compile(r"^tmp[a-z\d_]{8}(?![A-Za-z\d_])")
+_RANDOM_RUN_RE = re.compile(r"(?=[A-Za-z\d]*[A-Z\d])[A-Za-z\d]{6,}")
+
+
+def _mask_temp_entry(match: re.Match) -> str:
+    return match.group(1) + _RANDOM_RUN_RE.sub("#", _PY_TEMP_NAME_RE.sub("#", match.group(2)))
+
 
 _lock = threading.RLock()
 
@@ -155,7 +166,7 @@ def _redact_error(error: str) -> str:
 
 def _error_signature(job_id: str, error: str) -> str:
     """Dedup key: stable for same job + same error once per-run tokens are masked."""
-    normalized = _normalize_error(_MKTEMP_SUFFIX_RE.sub(".#", str(error or "")))
+    normalized = _normalize_error(_TEMP_ENTRY_RE.sub(_mask_temp_entry, str(error or "")))
     for pattern, mask in _PER_RUN_TOKENS:
         normalized = pattern.sub(mask, normalized)
     normalized = normalized[:_MAX_SIGNATURE_ERROR_CHARS]
