@@ -109,11 +109,12 @@ def _reconcile_locked(path, backup, report):
 # `hermes sessions repair` (repair_declarative_schema: same additive catch-up, no time limit). The
 # scan is tied to the file's (size, mtime) signature: if the store changed by the time the lock is
 # held, the scan no longer vouches for it and nothing is written. Under the lock only the cheap drift
-# re-check and the DDL run, cut off by BROWSE_RECONCILE_BUDGET_S (a sqlite progress handler; the DDL
-# rolls back). Busy waiting does not run the progress handler, so each connection's busy timeout is
-# capped at the remaining budget. Gateway boot waits this budget out (gateway.run_bootstrap).
+# re-check and the DDL run, cut off by BROWSE_RECONCILE_BUDGET_S (_Budget.arm: at the deadline the
+# running statement is interrupted and later ones are refused; the DDL rolls back). An interrupt does
+# not end a busy wait, so the busy timeout is reset to the remaining budget before BEGIN and COMMIT.
+# The drift check, the connection open and the legacy-holder check are not covered. Gateway boot
+# waits this budget out (gateway.run_bootstrap).
 BROWSE_INTEGRITY_BUDGET_S = BROWSE_RECONCILE_BUDGET_S
-_BUDGET_PROGRESS_OPS = 1000
 
 
 def canonical_home(home: Path) -> Path:
@@ -242,18 +243,46 @@ class _Budget:
     def busy_timeout(self) -> float:
         return max(self.remaining(), 0.05)
 
-    def arm(self, conn) -> None:
-        def progress():
-            if self._clock() >= self.deadline:
-                self.expired = True
-                return 1  # sqlite raises OperationalError('interrupted'); the caller rolls back
-            return 0
-        conn.set_progress_handler(progress, _BUDGET_PROGRESS_OPS)
+    @contextlib.contextmanager
+    def arm(self, conn):
+        """From the deadline on, statements on *conn* fail and the caller rolls back. A thread
+        interrupts the running one (a progress handler runs only every N VM steps, and a cold-disk
+        pragma or BEGIN takes fewer; SQLite acts on the interrupt at its next interruptible point, not
+        during a busy wait), and the authorizer refuses statements prepared afterwards, so a caller that
+        logs one failure and goes on cannot keep writing. Transaction control stays allowed for the
+        ROLLBACK. The thread is joined on exit: no interrupt lands after the block."""
+        done = threading.Event()
 
-    def check(self) -> None:
+        def expire():
+            if done.wait(self.remaining()):
+                return
+            self.expired = True
+            while True:  # until the block exits: an interrupt sent just before a statement starts is lost
+                conn.interrupt()
+                if done.wait(0.05):
+                    return
+
+        conn.set_authorizer(lambda action, *_: sqlite3.SQLITE_DENY
+                            if self.expired and action != sqlite3.SQLITE_TRANSACTION else sqlite3.SQLITE_OK)
+        # health: allow HX012 -- the thread only interrupts this one connection and reads no profile state
+        watchdog = threading.Thread(target=expire, name='browse-budget', daemon=True)
+        watchdog.start()
+        try:
+            yield
+        finally:
+            done.set()
+            watchdog.join()
+            conn.set_authorizer(None)
+
+    def check(self, conn=None) -> None:
+        """Raise once the budget is spent. With *conn*, also reset its busy timeout to what is left:
+        the one set at open goes stale while earlier steps run, and an interrupt does not end a
+        lock wait, so the next BEGIN or COMMIT would otherwise wait out the whole original timeout."""
         if self.expired or self.remaining() <= 0:
             self.expired = True
             raise BrowseBudgetExceeded('browse schema catch-up exceeded its time budget')
+        if conn is not None:
+            conn.execute(f'PRAGMA busy_timeout={int(self.busy_timeout() * 1000)}')
 
 
 def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
@@ -269,11 +298,14 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
     budget = budget or _Budget(BROWSE_RECONCILE_BUDGET_S)
     budget.check()
     with closing(_connect_tracked_db(path, tracking_path=path, timeout=budget.busy_timeout(),
-                                     isolation_level=None)) as conn:
+                                     isolation_level=None)) as conn, budget.arm(conn):
+        # Armed before anything runs on the connection: on a slow disk the macOS barrier pragmas
+        # and BEGIN can outlast the budget too, and that time is spent holding gateway.lock. An
+        # interrupt there (the barriers swallow theirs) is the budget's, never a generic failure.
         _reapply_durability_barriers(conn)
-        budget.arm(conn)
-        conn.execute('BEGIN IMMEDIATE')
         try:
+            budget.check(conn)
+            conn.execute('BEGIN IMMEDIATE')
             cursor = conn.cursor()
             apply_declared_schema(cursor, path.parent)
             # Postcondition, still inside the transaction: every declared table/column resolves.
@@ -284,12 +316,12 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
                     if _schema_not_built(exc):
                         raise DeclarativeDrift(str(exc)) from exc
                     raise
-            budget.check()
+            budget.check(conn)
             conn.execute('COMMIT')
         except BaseException as exc:
             with contextlib.suppress(sqlite3.Error):
                 conn.execute('ROLLBACK')
-            if budget.expired and isinstance(exc, sqlite3.OperationalError):
+            if budget.expired and isinstance(exc, sqlite3.DatabaseError):
                 raise BrowseBudgetExceeded('browse schema catch-up exceeded its time budget') from exc
             raise
 
@@ -313,8 +345,7 @@ def _integrity_problem(path: Path, budget: _Budget):
     budget.check()
     try:
         with closing(_connect_tracked_db(path.resolve().as_uri() + '?mode=ro', uri=True, tracking_path=path,
-                                         timeout=budget.busy_timeout())) as conn:
-            budget.arm(conn)
+                                         timeout=budget.busy_timeout())) as conn, budget.arm(conn):
             rows = conn.execute('PRAGMA integrity_check(3)').fetchall()
     except sqlite3.DatabaseError as exc:
         if budget.expired:

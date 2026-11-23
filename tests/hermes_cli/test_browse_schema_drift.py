@@ -528,22 +528,28 @@ import hermes_cli.sqlite_safe_read as ssr
 from fastapi import HTTPException
 from hermes_cli.web_server_sessions import _open_session_db_at_path
 
-phase = sys.argv[2]
+phase, step_s = sys.argv[2], float(sys.argv[3])
 original = ssr.connect_tracked
 
 class SlowConnection:
-    """A real sqlite connection whose VM runs slowly (stand-in for a cold multi-GB disk). The
-    slowdown is installed here, whether or not the code under test sets its own progress handler,
-    and chains to that handler when it does."""
+    """A real sqlite connection whose VM runs slowly (stand-in for a cold multi-GB disk): every 5
+    VM steps cost step_s. The slowdown is installed here, whether or not the code under test sets
+    its own progress handler, and chains to that handler at the N it asked for when it does."""
     def __init__(self, conn):
         self._conn = conn
         self.set_progress_handler(None, 0)
     def __getattr__(self, name):
         return getattr(self._conn, name)
     def set_progress_handler(self, handler, n):
+        steps = 0
         def slow():
-            time.sleep(0.01)
-            return handler() if handler is not None else 0
+            nonlocal steps
+            time.sleep(step_s)
+            steps += 5
+            if handler is None or steps < n:
+                return 0
+            steps = 0
+            return handler()
         return self._conn.set_progress_handler(slow, 5)
     def close(self):
         return self._conn.close()
@@ -576,12 +582,14 @@ except HTTPException as exc:
 
 
 @pytest.mark.platforms("linux", "macos")
-@pytest.mark.parametrize("phase", ["ddl"])
-def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(tmp_path, phase):
+@pytest.mark.parametrize("phase,step_s", [("ddl", 0.01), ("ddl", 0.1)], ids=["ddl", "ddl-cold-open"])
+def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(tmp_path, phase, step_s):
     """R2-2: the busy timeout bounds lock contention, not SQL execution. A slow DDL must be
     interrupted at the browse budget (rolled back, retryable 503), and gateway boot's wait must
     outlast that budget, so a slow browse never turns into a startup refusal. (The integrity scan
-    no longer runs under the lock: see test_gateway_boot_never_waits_on_a_slow_integrity_scan.)"""
+    no longer runs under the lock: see test_gateway_boot_never_waits_on_a_slow_integrity_scan.)
+    ``ddl-cold-open``: so slow that, on macOS, the barrier pragmas already outrun the budget: still
+    the same retryable 503, inside the budget."""
     import os
     import subprocess
     import sys
@@ -597,7 +605,7 @@ def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(
     home = _profile_home(tmp_path)
     path = _lagging_store_with_history(home, rows=400)
     before = _file_state(path)
-    browse = subprocess.Popen([sys.executable, "-c", _SLOW_BROWSE, str(path), phase], env=os.environ,
+    browse = subprocess.Popen([sys.executable, "-c", _SLOW_BROWSE, str(path), phase, str(step_s)], env=os.environ,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     assert browse.stdout.readline().strip() == "started"
     assert browse.stdout.readline().strip() == "slowed", "the slow phase never ran under the lock"
@@ -770,7 +778,8 @@ def test_gateway_boot_never_waits_on_a_slow_integrity_scan(tmp_path):
 
 
 class _SlowProgress:
-    """A real sqlite connection whose VM runs slowly, chaining to the code's own progress handler."""
+    """A real sqlite connection whose VM runs slowly (0.01 s per 5 steps), chaining to the code's own
+    progress handler at the N it asked for."""
 
     def __init__(self, conn):
         self._conn = conn
@@ -781,10 +790,16 @@ class _SlowProgress:
 
     def set_progress_handler(self, handler, n):
         import time
+        steps = 0
 
         def slow():
+            nonlocal steps
             time.sleep(0.01)  # health: allow HX013 -- the slowed VM IS the behaviour under test (cold disk)
-            return handler() if handler is not None else 0
+            steps += 5
+            if handler is None or steps < n:
+                return 0
+            steps = 0
+            return handler()
         return self._conn.set_progress_handler(slow, 5)
 
     def close(self):
@@ -904,6 +919,28 @@ def test_budget_refusal_on_unowned_store_names_repair_not_a_gateway(tmp_path, mo
     forget_slow_scans()
     _open_session_db_at_path(path, read_only=True).close()
     assert "last_read_at" in _session_columns(path)
+
+
+def test_blocked_begin_waits_only_for_what_is_left_of_the_budget(tmp_path, monkeypatch):
+    """The busy timeout is set when the connection opens. Setup that has already used most of the budget
+    must not leave BEGIN waiting out the whole original timeout on a real write lock held elsewhere."""
+    import time
+
+    from persistence.sqlite.admin._reconcile import BrowseBudgetExceeded, _apply_additive_schema, _Budget
+
+    path = _lagging_store_with_history(_profile_home(tmp_path), rows=10)
+    before = _file_state(path)
+    monkeypatch.setattr("persistence.sqlite._state.repair._reapply_durability_barriers",
+                        lambda _conn: time.sleep(0.8))  # health: allow HX013 -- slow setup IS the behaviour (cold disk)
+    with closing(sqlite3.connect(path, isolation_level=None)) as holder:
+        holder.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        with pytest.raises(BrowseBudgetExceeded):
+            _apply_additive_schema(path, _Budget(1.0))
+        elapsed = time.monotonic() - started
+        holder.execute("ROLLBACK")
+    assert elapsed < 1.4, elapsed
+    assert _file_state(path) == before
 
 
 _LEGACY_GATEWAY = r'''
