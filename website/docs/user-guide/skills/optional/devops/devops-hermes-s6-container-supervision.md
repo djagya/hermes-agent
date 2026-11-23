@@ -146,8 +146,8 @@ docker exec <c> tail -n 50 /opt/data/logs/container-boot.log
 1. Create `docker/s6-rc.d/<name>/type` with `longrun\n` and `docker/s6-rc.d/<name>/run` (use `#!/command/with-contenv sh` + `# shellcheck shell=sh`).
 2. Drop to hermes via `s6-setuidgid hermes` at the top of run (unless you specifically need root).
 3. Create empty `docker/s6-rc.d/<name>/dependencies.d/base` so it waits for the base bundle.
-4. Create empty `docker/s6-rc.d/user/contents.d/<name>` so it joins the user bundle.
-5. The `COPY docker/s6-rc.d/` in the Dockerfile picks it up automatically — no other changes.
+4. Create empty `docker/user-bundles.d/user/contents.d/<name>` so it joins the user bundle.
+5. The `COPY docker/s6-rc.d/` and `COPY docker/user-bundles.d/` lines in the Dockerfile pick it up automatically — no other changes.
 
 ### Change the per-profile gateway run command
 

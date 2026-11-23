@@ -114,7 +114,7 @@ def test_profile_gateway_scandir_is_supervised_unprivileged(tmp_path: Path) -> N
     assert not _under_root_scandir(gateway_scandir)
     # Wired into the user bundle so s6-rc starts it after cont-init has seeded the scandir.
     assert (rc_dir / name / "type").read_text().strip() == "longrun"
-    assert (rc_dir / "user" / "contents.d" / name).exists()
+    assert (DOCKER_DIR / "user-bundles.d" / "user" / "contents.d" / name).exists()
     assert (rc_dir / name / "dependencies.d" / "base").exists()
 
     # cont-init seeds that same directory hermes-owned before s6-rc starts the supervisor.

@@ -576,6 +576,9 @@ COPY --chmod=0444 docker/sera-toolbox/managed-config.yaml /etc/hermes/config.yam
 # root /run/service scandir, and are reconciled on container restart by
 # /etc/cont-init.d/02-reconcile-profiles (Phase 4 Task 4.0).
 COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+# The user bundle lists which services start at boot (s6-overlay 3.2.3.2 reads it from
+# user-bundles.d; an s6-rc.d/user directory makes rc.init fail for a non-root --user start).
+COPY docker/user-bundles.d/ /etc/s6-overlay/user-bundles.d/
 
 # stage2-hook handles UID/GID remap, volume chown, config seeding,
 # skills sync — all the work the old entrypoint.sh did before

@@ -54,3 +54,23 @@ def test_user_pinned_to_hermes_uid_works(
         f"--user 10000:10000 (hermes UID) was rejected: {r.stderr[-500:]}"
     )
     assert "OK" in r.stdout
+
+
+def test_user_bundle_lives_in_user_bundles_d(built_image: str) -> None:
+    """s6-overlay 3.2.3.2 reads the user bundle from user-bundles.d.
+
+    A leftover /etc/s6-overlay/s6-rc.d/user makes rc.init write user/type,
+    which fails for a non-root --user start and hangs the container.  Inspect
+    the static image (entrypoint bypassed) so the check does not depend on boot.
+    """
+    r = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "sh", built_image, "-c",
+         "test ! -e /etc/s6-overlay/s6-rc.d/user "
+         "&& ls /etc/s6-overlay/user-bundles.d/user/contents.d"],
+        capture_output=True, text=True, timeout=60,
+        check=False,
+    )
+    assert r.returncode == 0, (
+        f"s6-rc.d/user exists or user bundle missing: {r.stdout} {r.stderr[-500:]}"
+    )
+    assert sorted(r.stdout.split()) == ["dashboard", "main-hermes", "profile-gateways"]
