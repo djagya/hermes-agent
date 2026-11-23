@@ -120,6 +120,47 @@ def test_incidents_list_newest_instant_first_across_dst_fall_back(monkeypatch, t
     assert [row["id"] for row in inc.list_incidents()] == [later, earlier]
 
 
+def _run_tokens(rng):
+    """One run's worth of per-run tokens, as the cron scripts' error text carries them."""
+    import string
+    alnum = string.ascii_letters + string.digits
+    stamp = f"2026-11-{rng.randint(10, 28)}T{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}Z"
+    return {
+        "tmp": "".join(rng.choice(alnum) for _ in range(6)) + "A1",  # never all-lowercase letters
+        "sha": "".join(rng.choice("0123456789abcdef") for _ in range(64)),
+        "short": "".join(rng.choice("0123456789abcdef") for _ in range(7)) + "9",
+        "uuid": "-".join("".join(rng.choice("0123456789abcdef") for _ in range(n)) for n in (8, 4, 4, 4, 12)),
+        "bytes": rng.randint(10, 9_999_999),
+        "stamp": stamp,
+        "compact": stamp.replace("-", "").replace(":", ""),
+        "secs": rng.randint(1, 3000),
+    }
+
+
+def test_signature_ignores_per_run_tokens(monkeypatch, tmp_path):
+    """Generator test for the class: the same failure with fresh per-run tokens (random mktemp
+    worktree names, receipt paths, sha256 digests, SHAs, byte counts, timestamps, durations) is ONE
+    signature, so the repeat-alert cooldown applies; a different real error is still another one."""
+    import random
+    inc = _point_db(monkeypatch, tmp_path)
+    template = (
+        "script failed: Error: manifest rejected at /tmp/worktree.{tmp}/scripts/sync.mjs:12:9\n"
+        "receipt /srv/receipts/{compact}.json sha256={sha} ({bytes} bytes) commit {short} run {uuid} "
+        "started {stamp}, waited {secs}s"
+    )
+    rng = random.Random(1123)
+    sigs = {inc._error_signature("job-1", template.format(**_run_tokens(rng))) for _ in range(200)}
+    assert len(sigs) == 1, sigs
+    base = template.format(**_run_tokens(rng))
+    for other in (base.replace("manifest rejected", "schema rejected"), base.replace("sync.mjs:12", "sync.mjs:13"),
+                  base.replace("script failed", "script crashed")):
+        assert inc._error_signature("job-1", other) not in sigs
+    assert inc._error_signature("job-2", base) not in sigs  # same text, other job
+    # Plain file extensions and status codes are not per-run tokens.
+    assert (inc._error_signature("j", "open data.sqlite failed: HTTP 502")
+            != inc._error_signature("j", "open data.config failed: HTTP 503"))
+
+
 def test_same_signature_dedups_same_incident(monkeypatch, tmp_path):
     inc = _point_db(monkeypatch, tmp_path)
 
@@ -183,6 +224,7 @@ def test_failure_type_classification(monkeypatch, tmp_path):
         ("Provider read timed out after 60s", "timeout"),
         ("authentication failed: invalid API key", "auth"),
         ("HTTP 429: rate limit exceeded", "rate_limit"),
+        ("RateLimitError: Too Many Requests", "rate_limit"),
         ("configuration validation blocked the run", "config"),
         ("script exited with code 1", "script"),
         ("agent crashed mid-conversation", "agent"),
@@ -190,6 +232,15 @@ def test_failure_type_classification(monkeypatch, tmp_path):
     ]
     for error, expected in cases:
         assert inc._classify_failure_type(error) == expected, (error, expected)
+
+
+def test_bare_quota_is_not_a_rate_limit(monkeypatch, tmp_path):
+    """An error that merely mentions "quota" (disk, calendar, mailbox) is not labelled ``rate_limit``;
+    a real 429 that mentions it still is."""
+    inc = _point_db(monkeypatch, tmp_path)
+    for error in ("disk quota exceeded writing /var/out", "calendar quota check skipped", "mailbox quota full"):
+        assert inc._classify_failure_type(error) != "rate_limit", error
+    assert inc._classify_failure_type("Codex provider quota exhausted (429); retry after 900s") == "rate_limit"
 
 
 def test_auth_type_requires_runtime_auth_evidence(monkeypatch, tmp_path):

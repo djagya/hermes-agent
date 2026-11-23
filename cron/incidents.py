@@ -34,7 +34,9 @@ INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
 # the job's subject, not runtime evidence, so keyword classification would invent a cause.
 AGENT_REPORTED_FAILURE_TYPE = "agent_reported"
 _FAILURE_TYPE_ORDER = (
-    ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
+    # Rate-limit evidence only: HTTP 429, its reason phrase, or the SDK's ``RateLimitError`` class. A bare
+    # "quota" is not a signal (it labelled spending, disk and calendar quota errors ``rate_limit``).
+    ("rate_limit", (r"\b429\b", "rate limit", "ratelimit", "rate_limit", "too many requests", "usage limit")),
     ("timeout", ("timeout", "timed out")),
     # Runtime auth evidence only: a bare "auth" substring matched agent prose ("OAuth",
     # "scoped-auth route", "authorized") and mislabelled ordinary verdicts as credential failures.
@@ -53,11 +55,21 @@ _FAILURE_TYPE_ORDER = (
 )
 MAX_ERROR_CHARS = 500
 _MAX_SIGNATURE_ERROR_CHARS = 200
-# Measured durations ("idle for 603s", "retry in 12.5 seconds") differ run to run for the same
-# failure, so they are masked out of the signature. Status codes and other numbers still count.
-_DURATION_RE = re.compile(
-    r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b"
-)
+# Per-run tokens differ for the same failure, so they are masked out of the signature (one incident
+# per real error, not per run): a ``mktemp`` suffix (``worktree.aB3xY9``, ``run.Qw3Er5Ty``; matched
+# before lowercasing, and only when it has a digit or capital so plain extensions survive),
+# timestamps, UUIDs, hex digests/SHAs (7+ hex chars with a digit), byte counts and measured durations
+# ("idle for 603s", "retry in 12.5 seconds"). Status codes and other numbers still count.
+_MKTEMP_SUFFIX_RE = re.compile(r"(?<=[\w-])\.(?=[a-z]*[A-Z\d])[A-Za-z\d]{6,8}\b")
+_PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
+    (r"\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:z|[+-]\d{2}:?\d{2})?)?", "#t"),
+    (r"\b\d{8}[t_-]\d{6}z?\b", "#t"),
+    (r"\b\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?\b", "#t"),
+    (r"\b\d+\s*(?:bytes?|[kmg]i?b)\b", "#b"),
+    (r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "#h"),
+    (r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,64}\b", "#h"),
+    (r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b", "#s"),
+))
 
 _lock = threading.RLock()
 
@@ -141,8 +153,11 @@ def _redact_error(error: str) -> str:
 
 
 def _error_signature(job_id: str, error: str) -> str:
-    """Dedup key: stable for same job + same normalized error prefix."""
-    normalized = _DURATION_RE.sub("#s", _normalize_error(error))[:_MAX_SIGNATURE_ERROR_CHARS]
+    """Dedup key: stable for same job + same error once per-run tokens are masked."""
+    normalized = _normalize_error(_MKTEMP_SUFFIX_RE.sub(".#", str(error or "")))
+    for pattern, mask in _PER_RUN_TOKENS:
+        normalized = pattern.sub(mask, normalized)
+    normalized = normalized[:_MAX_SIGNATURE_ERROR_CHARS]
     return hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()[:12]
 
 
