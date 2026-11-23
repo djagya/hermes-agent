@@ -430,6 +430,7 @@ class _Owner(FakeClient):
         self.titles, self.frozen = dict(titles or {}), dict(frozen or {})
         self.history = dict(history or {})
         self.keys = {}  # the launch key each session was created with (the owner holds it, not the policy)
+        self.tips = {}  # a session whose compression committed: resume lands on its tip
 
     def _snapshot(self, sid):
         reply = snapshot(sid)
@@ -461,7 +462,11 @@ class _Owner(FakeClient):
             if key and self.keys.get(params["session_id"]) != key:  # rebind_launch_key's rule
                 from hermes_cli.gateway_client import GatewayRPCError
                 raise GatewayRPCError("admission_conflict")
-            return self._snapshot(params["session_id"])
+            sid = params["session_id"]
+            if sid in self.tips:
+                self.frozen[self.tips[sid]] = self.frozen[sid]
+                sid = self.tips[sid]
+            return self._snapshot(sid)
         return {"status": "ok", "detached": True}
 
 
@@ -575,8 +580,9 @@ def test_create_if_missing_with_a_typed_key_into_a_session_without_it_is_refused
         with pytest.raises(SystemExit) as refused:
             launch(create_title="T", model="m-old", api_key="sk-typed")
         assert refused.value.code == 1
+        owner.tips["local-1"] = "local-tip"  # compressed between the create and the keyed resume
         fresh = launch(create_title="Fresh", model="m1", api_key="sk-typed")
-        assert owner.keys[fresh.session_id] == "sk-typed"
+        assert owner.keys["local-1"] == "sk-typed" and fresh.session_id == "local-tip"
     finally:
         conn.close()
 

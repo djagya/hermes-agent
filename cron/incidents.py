@@ -72,15 +72,17 @@ _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
 ))
 # Temp names by context and template: the entry right under a temp root (``/tmp``, ``/var/tmp``,
 # ``/private/tmp``, macOS ``$TMPDIR`` ``/var/folders/*/*/T``) is masked only when it is Python's
-# ``tempfile`` name (``tmp`` + 8 of ``[a-z0-9_]``, with any ``suffix=``) or bare ``mktemp``'s ``tmp.XXXXXXXXXX``.
+# ``tempfile`` name (``tmp`` + 8 of ``[a-z0-9_]``; a dot-led ``suffix=`` such as ``.tar.gz`` is kept) or bare
+# ``mktemp``'s ``tmp.XXXXXXXXXX``.
 # A named template (``worktree.XXXXXX``) is not guessed at: its random part looks like a stable name
 # (``report.2024q1``), and one extra alert per run is the safe error. Linear on any error length.
 _TEMP_ENTRY_RE = re.compile(r"(?<![\w.-])((?:/private)?(?:/tmp|/var/tmp|/var/folders/[^/\s]+/[^/\s]+/T)/)([^/\s:;,'\"()]+)")
-_TEMP_NAME_RE = re.compile(r"tmp(?:[a-z\d_]{8}(?:\.[A-Za-z\d]{1,10})*|\.[A-Za-z\d]{10})")
+_TEMP_NAME_RE = re.compile(r"tmp(?:[a-z\d_]{8}((?:\.[A-Za-z\d]{1,10})*)|\.[A-Za-z\d]{10})")
 
 
 def _mask_temp_entry(match: re.Match) -> str:
-    return match.group(1) + ("#" if _TEMP_NAME_RE.fullmatch(match.group(2)) else match.group(2))
+    name = _TEMP_NAME_RE.fullmatch(match.group(2))
+    return match.group(1) + ("#" + (name.group(1) or "") if name else match.group(2))
 
 
 _lock = threading.RLock()
