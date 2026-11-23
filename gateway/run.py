@@ -800,6 +800,10 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
+# raw_response marks for "the send may have landed": relay lost ack, Telegram lost ack, Telegram partial chunks.
+_UNCERTAIN_SEND_MARKS = ("ambiguous", "delivery_uncertain", "partial_overflow")
+
+
 def _approval_send_outcome(future, timeout: float) -> str:
     """Classify an approval prompt send as ``sent`` / ``failed`` / ``ambiguous``.
 
@@ -834,7 +838,7 @@ def _approval_send_outcome(future, timeout: float) -> str:
     from gateway.relay.egress import declined_send
 
     _raw = getattr(result, "raw_response", None)
-    if isinstance(_raw, dict) and _raw.get("ambiguous"):
+    if isinstance(_raw, dict) and any(_raw.get(k) for k in _UNCERTAIN_SEND_MARKS):
         # The frame may have been applied. Same physics as a scheduling
         # timeout: possibly-delivered, so never re-send. Checked BEFORE the
         # decline classification because an ambiguous result is a transport

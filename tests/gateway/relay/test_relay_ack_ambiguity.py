@@ -165,3 +165,15 @@ class TestTransportTagsAmbiguity:
         result2 = await transport.send_outbound({"op": "send"})
         assert result2["success"] is False
         assert "ambiguous" not in result2, "fail-fast paths are definite"
+
+
+class TestPlainSendKeepsAmbiguity:
+    @pytest.mark.asyncio
+    async def test_lost_ack_on_plain_send_is_marked_ambiguous(self):
+        """The approval text prompt reads ``raw_response['ambiguous']`` to tell a possibly-delivered send
+        from a definite failure; the plain send projection used to drop it."""
+        adapter, _ = _connected_adapter()
+        adapter._transport = AckLossTransport(lose_acks_for=("send",))
+        r = await adapter.send("C1", "approve?")
+        assert not r.success
+        assert r.raw_response == {"ambiguous": True}

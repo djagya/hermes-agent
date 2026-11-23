@@ -128,7 +128,7 @@ def _run_tokens(rng):
     return {
         "tmp": "".join(rng.choice(alnum) for _ in range(6)) + "A1",  # never all-lowercase letters
         "sha": "".join(rng.choice("0123456789abcdef") for _ in range(64)),
-        "short": "".join(rng.choice("0123456789abcdef") for _ in range(7)) + "9",
+        "short": "".join(rng.choice("0123456789abcdef") for _ in range(7)) + "a",  # a digit-only run is a number, not a SHA
         "uuid": "-".join("".join(rng.choice("0123456789abcdef") for _ in range(n)) for n in (8, 4, 4, 4, 12)),
         "bytes": rng.randint(10, 9_999_999),
         "stamp": stamp,
@@ -144,7 +144,7 @@ def test_signature_ignores_per_run_tokens(monkeypatch, tmp_path):
     import random
     inc = _point_db(monkeypatch, tmp_path)
     template = (
-        "script failed: Error: manifest rejected at /tmp/worktree.{tmp}/scripts/sync.mjs:12:9\n"
+        "script failed: Error: manifest rejected at /tmp/worktree.{tmp}/scripts/sync.mjs:12:34\n"
         "receipt /srv/receipts/{compact}.json sha256={sha} ({bytes} bytes) commit {short} run {uuid} "
         "started {stamp}, waited {secs}s"
     )
@@ -156,6 +156,11 @@ def test_signature_ignores_per_run_tokens(monkeypatch, tmp_path):
                   base.replace("script failed", "script crashed")):
         assert inc._error_signature("job-1", other) not in sigs
     assert inc._error_signature("job-2", base) not in sigs  # same text, other job
+    # Source locations, plain numbers and status codes are not per-run tokens (two-digit columns too).
+    loc = "TypeError: manifest rejected at sync.mjs:{}"
+    assert len({inc._error_signature("j", loc.format(x)) for x in ("12:34", "56:78", "12:19", "13:19")}) == 4
+    assert (inc._error_signature("j", "script exited with code 1234567")
+            != inc._error_signature("j", "script exited with code 7654321"))
     # Plain file extensions and status codes are not per-run tokens.
     assert (inc._error_signature("j", "open data.sqlite failed: HTTP 502")
             != inc._error_signature("j", "open data.config failed: HTTP 503"))
@@ -225,6 +230,7 @@ def test_failure_type_classification(monkeypatch, tmp_path):
         ("authentication failed: invalid API key", "auth"),
         ("HTTP 429: rate limit exceeded", "rate_limit"),
         ("RateLimitError: Too Many Requests", "rate_limit"),
+        ("google.api_core.exceptions.ResourceExhausted: RESOURCE_EXHAUSTED", "rate_limit"),
         ("configuration validation blocked the run", "config"),
         ("script exited with code 1", "script"),
         ("agent crashed mid-conversation", "agent"),

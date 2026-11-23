@@ -36,7 +36,7 @@ AGENT_REPORTED_FAILURE_TYPE = "agent_reported"
 _FAILURE_TYPE_ORDER = (
     # Rate-limit evidence only: HTTP 429, its reason phrase, or the SDK's ``RateLimitError`` class. A bare
     # "quota" is not a signal (it labelled spending, disk and calendar quota errors ``rate_limit``).
-    ("rate_limit", (r"\b429\b", "rate limit", "ratelimit", "rate_limit", "too many requests", "usage limit")),
+    ("rate_limit", (r"\b429\b", "rate limit", "ratelimit", "rate_limit", "too many requests", "usage limit", "resource_exhausted")),
     ("timeout", ("timeout", "timed out")),
     # Runtime auth evidence only: a bare "auth" substring matched agent prose ("OAuth",
     # "scoped-auth route", "authorized") and mislabelled ordinary verdicts as credential failures.
@@ -58,16 +58,17 @@ _MAX_SIGNATURE_ERROR_CHARS = 200
 # Per-run tokens differ for the same failure, so they are masked out of the signature (one incident
 # per real error, not per run): a ``mktemp`` suffix (``worktree.aB3xY9``, ``run.Qw3Er5Ty``; matched
 # before lowercasing, and only when it has a digit or capital so plain extensions survive),
-# timestamps, UUIDs, hex digests/SHAs (7+ hex chars with a digit), byte counts and measured durations
-# ("idle for 603s", "retry in 12.5 seconds"). Status codes and other numbers still count.
+# timestamps, UUIDs, hex digests/SHAs (7+ hex chars with a letter a-f: exit codes and ids stay), byte
+# counts and measured durations ("idle for 603s", "retry in 12.5 seconds"). ``file:LINE:COL``, status
+# codes and other numbers still count.
 _MKTEMP_SUFFIX_RE = re.compile(r"(?<=[\w-])\.(?=[a-z]*[A-Z\d])[A-Za-z\d]{6,8}\b")
 _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
     (r"\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:z|[+-]\d{2}:?\d{2})?)?", "#t"),
     (r"\b\d{8}[t_-]\d{6}z?\b", "#t"),
-    (r"\b\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?\b", "#t"),
+    (r"(?<![:\w.])\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?![:\d])", "#t"),  # not ``file:LINE:COL``
     (r"\b\d+\s*(?:bytes?|[kmg]i?b)\b", "#b"),
     (r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "#h"),
-    (r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,64}\b", "#h"),
+    (r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,64}\b", "#h"),
     (r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b", "#s"),
 ))
 

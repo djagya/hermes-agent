@@ -437,6 +437,27 @@ def test_create_if_missing_carries_the_launch_flags_the_resume_then_repeats(stor
     check_resume_policy(args, {"info": {"launch_request": params}})  # the resume accepts the same flags
 
 
+def test_create_if_missing_merges_required_skills_so_the_resume_passes(store, monkeypatch):
+    """``--required-skills X``: the classic launch asks for skills + required, so the session must be
+    created with that merged list or the resume that follows is refused for a skills mismatch."""
+    import argparse
+    from hermes_cli import gateway_session_store as gss
+    from hermes_cli.gateway_chat import check_resume_policy
+    db, client = store
+    monkeypatch.setattr(gss, "session_store", lambda: db)
+    args = argparse.Namespace(skills=["a"], required_skills=["b,a"], toolsets=None)
+    assert gss.create_titled_session("Fresh Named", args) == "local-new"
+    _method, params = [c for c in client.calls if c[0] == "session.create"][-1]
+    assert params["skills"] == ["a", "b"]
+    from cli import _parse_skills_argument
+    resume = argparse.Namespace(skills=[*_parse_skills_argument(args.skills), *_parse_skills_argument(args.required_skills)],
+                                toolsets=None)
+    check_resume_policy(resume, {"info": {"launch_request": params}})  # no skills-policy refusal
+    only = argparse.Namespace(skills=None, required_skills=["x"], toolsets=None)
+    gss.create_titled_session("Other", only)
+    assert [c for c in client.calls if c[0] == "session.create"][-1][1]["skills"] == ["x"]
+
+
 def test_bare_continue_finds_the_last_session_the_cli_created(tmp_path, monkeypatch):
     """Bare ``-c`` (main.py ``_resolve_last_session``) reads main's labels too: a gateway row labelled
     ``local`` that the CLI created is CLI history."""

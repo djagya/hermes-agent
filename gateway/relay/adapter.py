@@ -91,6 +91,8 @@ _LEN_FNS: dict[str, Callable[[str], int]] = {"chars": len, "utf16": _utf16_len}
 
 def _send_result(result: dict[str, Any], **extra: Any) -> SendResult:
     """Project a connector ``outbound_result`` dict onto a SendResult."""
+    # A lost ack (``ambiguous``) must survive the projection: the send may have landed.
+    extra.setdefault("raw_response", {"ambiguous": True} if result.get("ambiguous") else None)
     return SendResult(
         success=bool(result.get("success")), message_id=result.get("message_id"),
         error=result.get("error"), **extra,

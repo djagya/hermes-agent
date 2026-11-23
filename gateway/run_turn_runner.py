@@ -847,7 +847,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                            "Exec approval text prompt send (success=%s, message_id=%s, error=%s, request_id=%s, session=%s)",
                            getattr(res, "success", None), getattr(res, "message_id", None), getattr(res, "error", None),
                            approval_data.get("request_id"), ctx.session_key)
-                if getattr(res, "success", None) is False:
+                # Refuse at once only on DEFINITE non-delivery with nobody else able to answer: a session
+                # authority publishes the prompt to its own clients, and an uncertain send (lost ack,
+                # partial chunks) may already be in the chat. Both keep the registered, armed wait.
+                if (getattr(res, "success", None) is False and self._approval_owner is None
+                        and _approval_send_outcome(fut, timeout=0) in ("failed", "declined")):
                     undelivered = getattr(res, "error", None) or "send failed"
                 else:
                     # No card to edit on the text path: the prompt has no buttons to drop and carries
@@ -856,7 +860,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         except Exception as e:
             logger.error("Failed to send approval request: %s", e)
         if undelivered is not None:
-            # Nobody saw the prompt, so nobody can answer it: refuse now (no timeout notice either).
+            # Nobody saw the prompt and nobody else can answer it: refuse now (no timeout notice either).
             raise _ExecApprovalDeclined(f"exec approval undeliverable: {undelivered}")
 
     # ── run_sync phases ─────────────────────────────────────────────────────────────────────
