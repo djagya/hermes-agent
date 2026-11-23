@@ -763,6 +763,11 @@ def _py_root_group(p: str) -> list[str] | None:
     """
     if p in _PY_FULL_FILES or p.startswith(_PY_FULL_PREFIXES):
         return None
+    if p.startswith("tests/docker/"):
+        # The image job runs these against its prebuilt image. Named as a root
+        # here, the built_image fixture builds the whole image inside the Python
+        # lane's file timeout and the file is killed (fork PR #195).
+        return []
     if p.startswith("tests/"):
         # A test file's coverage is itself. conftest/fakes/fixtures are
         # handled above; runner infrastructure under scripts/ never lands
@@ -904,7 +909,8 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, object]:
                 py_full = True
                 py_groups = []
                 break
-            py_groups.append(group)
+            if group:
+                py_groups.append(group)
     if not python:
         py_scope: str = "none"
         py_roots: list[list[str]] = []

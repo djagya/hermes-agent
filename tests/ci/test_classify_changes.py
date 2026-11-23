@@ -553,9 +553,12 @@ CASES = {
         ["apps/desktop/e2e/core/harness.ts"],
         _lanes(frontend=True, e2e_desktop_core=True, e2e_desktop_update=True, os_tests=True, workspaces=["apps/desktop", "apps/shared"]),
     ),
+    # The image job runs tests/docker; as a Python-lane root the file built the
+    # whole image inside the 600 s file timeout (fork PR #195). No roots left:
+    # select_test_roots fails closed to the full suite, which skips tests/docker.
     "image tests → docker": (
         ["tests/docker/test_image_smoke.py"],
-        _lanes(python=True, python_prod=False, scan=True, docker=True, py_full=False, py_roots=[["tests/docker/test_image_smoke.py"]]),
+        _lanes(python=True, python_prod=False, scan=True, docker=True, py_full=False, py_roots=[]),
     ),
     # Catalog entry data runs the catalog tests INSTEAD of the Python suite.
     "catalog entry → catalog only": (["plugin-catalog/foo.yaml"], _lanes(catalog=True)),
