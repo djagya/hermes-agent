@@ -410,8 +410,8 @@ def test_cli_listings_include_gateway_rows_created_by_the_cli(store, tmp_path, m
 
 
 def test_create_if_missing_titles_a_gateway_created_session(store, monkeypatch):
-    """``chat -c NAME --create-if-missing``: the gateway creates the titled session (its own
-    resolve -> create -> title step); the CLI then resumes the id it returns. No client write."""
+    """The TUI's ``chat -c NAME --create-if-missing``: the gateway creates the titled session (its own
+    resolve -> create -> title step); the TUI then resumes the id it returns. No client write."""
     db, client = store
     from hermes_cli import gateway_session_store as gss
     monkeypatch.setattr(gss, "session_store", lambda: db)
@@ -420,62 +420,133 @@ def test_create_if_missing_titles_a_gateway_created_session(store, monkeypatch):
     assert params["title"] == "Fresh Named" and params["source"] and params["cwd"]
 
 
-def test_create_if_missing_carries_the_launch_flags_the_resume_then_repeats(store, monkeypatch):
-    """``chat -c NAME --create-if-missing --provider P --model M -s S``: the new session is created
-    with those flags, so the resume that follows (which repeats them) matches its frozen launch
-    instead of being refused with "creation overrides are unsupported on resume"."""
-    import argparse
+class _Owner(FakeClient):
+    """The owner's side of ``session.create``: the real ``build_policy`` (its refusals included) freezes
+    the request, ``session.resume`` returns it; ``titles`` maps a title to the session that holds it."""
+    CONFIG = {"agent": {}, "platform_toolsets": {"cli": ["terminal"]}}
+
+    def __init__(self, titles=None, frozen=None):
+        super().__init__(known=())
+        self.titles, self.frozen = dict(titles or {}), dict(frozen or {})
+
+    def _snapshot(self, sid):
+        reply = snapshot(sid)
+        reply["info"]["launch_request"] = dict(self.frozen[sid])
+        return reply
+
+    async def rpc(self, method, *, _timeout=None, **params):
+        import json
+
+        from gateway.session_policy import build_policy
+        from hermes_state_runtime import RuntimeStoreError
+        self.calls.append((method, dict(params)))
+        if method == "session.create":
+            title = params.pop("title", None)
+            if title not in self.titles:
+                try:
+                    policy = build_policy(params, self.CONFIG)
+                except RuntimeStoreError as exc:
+                    raise GatewayClientError("invalid_params") from exc
+                sid = f"local-{len(self.frozen)}"
+                self.frozen[sid], self.titles[title] = json.loads(policy.request_json), sid
+            return self._snapshot(self.titles[title])
+        if method == "session.resume":
+            if params["session_id"] not in self.frozen:
+                raise GatewayClientError("not_found")
+            return self._snapshot(params["session_id"])
+        return {"status": "ok", "detached": True}
+
+
+def _classic_launch(monkeypatch, owner):
+    """``hermes chat`` flags -> the real ``_build_cli_from_args`` -> ``_ensure_gateway_session`` on ``owner``."""
+    import cli as cli_module
     from hermes_cli import gateway_session_store as gss
-    from hermes_cli.gateway_chat import check_resume_policy
-    db, client = store
-    monkeypatch.setattr(gss, "session_store", lambda: db)
-    args = argparse.Namespace(provider="anthropic", model="claude-x", skills=["a", "b"], toolsets=None)
-    assert gss.create_titled_session("Fresh Named", args) == "local-new"
-    _method, params = [c for c in client.calls if c[0] == "session.create"][-1]
-    assert (params["provider"], params["model"], params["skills"]) == ("anthropic", "claude-x", ["a", "b"])
-    assert "toolsets" not in params
-    check_resume_policy(args, {"info": {"launch_request": params}})  # the resume accepts the same flags
+    from hermes_cli.model_switch import DIRECT_ALIASES, DirectAlias
+
+    @asynccontextmanager
+    async def connect():
+        yield owner
+    conn = GatewayConnection(connect=connect)
+    conn.start(5)
+    monkeypatch.setattr(gss, "session_store", lambda: GatewaySessionStore(conn))
+    monkeypatch.setitem(cli_module.CLI_CONFIG, "model", {"default": "cfg-model", "provider": "openrouter"})
+    monkeypatch.setattr("agent.skill_commands.resolve_auto_load_skills", lambda config=None: ["release"])
+    monkeypatch.setattr("agent.coding_context.coding_selection", lambda **_: None)
+    # A startup alias that carries its own endpoint and key (#28660); seeded aliases are kept as they are.
+    monkeypatch.setitem(DIRECT_ALIASES, "fast", DirectAlias("vendor/fast-1", "custom", "https://fast.example/v1",
+                                                            api_key="sk-alias"))
+
+    def launch(*, model=None, provider=None, skills=None, required=None, ignore_rules=False, reasoning=None,
+               toolsets=None, max_turns=None, checkpoints=False, run_budget=None, verbose=None, resume=None,
+               create_title=None):
+        host = cli_module._build_cli_from_args(model, toolsets, provider, reasoning, None, None, max_turns, run_budget,
+                                               verbose, False, resume, checkpoints, False, ignore_rules, skills,
+                                               required_skills=required, create_title=create_title)
+        host._ensure_gateway_session()
+        return host
+    return launch, conn
 
 
-def test_create_if_missing_merges_required_skills_so_the_resume_passes(store, monkeypatch):
-    """``--required-skills X``: the classic launch asks for skills + required, so the session must be
-    created with that merged list or the resume that follows is refused for a skills mismatch."""
-    import argparse
-    from hermes_cli import gateway_session_store as gss
-    from hermes_cli.gateway_chat import check_resume_policy
-    db, client = store
-    monkeypatch.setattr(gss, "session_store", lambda: db)
-    args = argparse.Namespace(skills=["a"], required_skills=["b,a"], toolsets=None)
-    assert gss.create_titled_session("Fresh Named", args) == "local-new"
-    _method, params = [c for c in client.calls if c[0] == "session.create"][-1]
-    assert params["skills"] == ["a", "b"]
-    resume = argparse.Namespace(skills=["a", "b"], toolsets=None)  # what _build_cli_from_args asks for on resume
-    check_resume_policy(resume, {"info": {"launch_request": params}})  # no skills-policy refusal
-    only = argparse.Namespace(skills=None, required_skills=["x"], toolsets=None)
-    gss.create_titled_session("Other", only)
-    assert [c for c in client.calls if c[0] == "session.create"][-1][1]["skills"] == ["x"]
+def test_create_if_missing_then_resume_over_every_launch_flag(monkeypatch):
+    """``hermes chat -c T --create-if-missing <flags>`` then the same command as ``-c T`` (the resume), over
+    the product of the flags that the CLI normalises (aliases, ``provider:model``, ``-s`` with
+    ``--required-skills`` and ``skills.auto_load``, ``--ignore-rules`` and HERMES_IGNORE_RULES, a valid and
+    an unparseable ``--reasoning``) with the rest rotated through. The create and the resume read one launch
+    policy, so the create is never refused, the resume always passes, and the session carries only the
+    flags that were passed."""
+    import itertools
+    owner = _Owner()
+    launch, conn = _classic_launch(monkeypatch, owner)
+    simple = (("toolsets", "web"), ("max_turns", 5), ("checkpoints", True), ("run_budget", 90), ("verbose", True))
+    product = itertools.product((None, "m1", "fast", "anthropic:claude-x"), (None, "anthropic"),
+                                (None, "shell", "release,shell"), (None, "release,lint"), (False, True), (False, True),
+                                (None, "high", "bogus"))
+    try:
+        for i, (model, provider, skills, required, typed_ignore, env_ignore, reasoning) in enumerate(product):
+            if env_ignore:
+                monkeypatch.setenv("HERMES_IGNORE_RULES", "1")
+            else:
+                monkeypatch.delenv("HERMES_IGNORE_RULES", raising=False)
+            flags = dict(model=model, provider=provider, skills=skills, required=required, ignore_rules=typed_ignore,
+                         reasoning=reasoning, **{k: v for bit, (k, v) in enumerate(simple) if i >> bit & 1})
+            case = (i, flags, env_ignore)
+            title = f"T{i}"
+            created = launch(create_title=title, **flags)
+            sid = owner.titles[title]
+            assert created.session_id == sid, case
+            params = [p for m, p in owner.calls if m == "session.create"][-1]
+            assert params["title"] == title and params["source"] == "cli" and params["row_cwd"] == "", case
+            asked = [n for v in (skills, required) if v for n in v.split(",")]
+            kept = [n for n in dict.fromkeys(asked) if typed_ignore or env_ignore or n != "release"]
+            expected = {"skills": kept or None, "ignore_rules": (typed_ignore or env_ignore) or None,
+                        "reasoning": "high" if reasoning == "high" else None,
+                        "toolsets": ["web"] if "toolsets" in flags else None, "pass_session_id": None,
+                        **{k: (90.0 if k == "run_budget" else v) if k in flags else None for k, v in simple[1:]}}
+            assert {k: params.get(k) for k in expected} == expected, case
+            route = set() if not model else {"model", "provider"} if provider or model != "m1" else {"model"}
+            if model == "fast":  # the alias's endpoint, and its key unless --provider names the route
+                route |= {"base_url"} if provider else {"base_url", "api_key"}
+            assert {"model", "provider", "base_url", "api_key"} & set(params) == route, (case, params)
+            resumed = launch(resume=sid, **flags)  # `-c T`: main resolves the title to this id
+            assert resumed.session_id == sid, case
+    finally:
+        conn.close()
 
 
-def test_create_if_missing_leaves_out_auto_load_skills_like_the_resume(store, monkeypatch):
-    """A ``skills.auto_load`` name in ``-s``/``--required-skills`` is left out at creation, the same way the
-    resume leaves it out (``_explicit_launch_skills``), so the new session accepts its own resume."""
-    import argparse
-    from agent import skill_commands
-    from hermes_cli import gateway_session_store as gss
-    from hermes_cli.cli_init_mixin import launch_skills_without_auto_load
-    from hermes_cli.gateway_chat import check_resume_policy
-    db, client = store
-    monkeypatch.setattr(gss, "session_store", lambda: db)
-    monkeypatch.setattr(skill_commands, "resolve_auto_load_skills", lambda _config: ["release"])
-    args = argparse.Namespace(skills=["shell"], required_skills=["release"], toolsets=None, ignore_rules=False)
-    assert gss.create_titled_session("Deploy", args) == "local-new"
-    params = [c for c in client.calls if c[0] == "session.create"][-1][1]
-    assert params["skills"] == ["shell"]
-    resumed = launch_skills_without_auto_load(["shell", "release"], False)  # what the resume asks for
-    check_resume_policy(argparse.Namespace(skills=resumed, toolsets=None), {"info": {"launch_request": params}})
-    kept = argparse.Namespace(skills=["shell"], required_skills=["release"], toolsets=None, ignore_rules=True)
-    gss.create_titled_session("Deploy raw", kept)
-    assert [c for c in client.calls if c[0] == "session.create"][-1][1]["skills"] == ["shell", "release"]
+def test_create_if_missing_into_a_session_that_appeared_meanwhile(monkeypatch, capsys):
+    """The title resolved to nothing, but the owner finds a session holding it by the time it creates (its
+    resolve-or-create returns that session as is). Its launch is checked like a resume: the same flags pass,
+    a different one is main's "could not be created" and exit 1, never a session that ignores the flag."""
+    owner = _Owner(titles={"T": "local-old"}, frozen={"local-old": {"model": "m-old"}})
+    launch, conn = _classic_launch(monkeypatch, owner)
+    try:
+        assert launch(create_title="T", model="m-old").session_id == "local-old"
+        with pytest.raises(SystemExit) as exit_info:
+            launch(create_title="T", model="m1")
+        assert exit_info.value.code == 1
+        assert "No session found matching 'T' and a new titled session could not be created." in capsys.readouterr().err
+    finally:
+        conn.close()
 
 
 def test_bare_continue_finds_the_last_session_the_cli_created(tmp_path, monkeypatch):

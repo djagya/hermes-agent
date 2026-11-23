@@ -141,7 +141,10 @@ class GatewaySessionStore:
 
     def open_session(self, cli, launch=None):
         """Create (or resume) the gateway session for this CLI and adopt its id. A resume target the
-        gateway does not know is left as is: main's own "Session not found" path reports it."""
+        gateway does not know is left as is: main's own "Session not found" path reports it.
+        ``cli._create_title`` (``-c <title> --create-if-missing``) creates the titled session from this
+        same ``launch``, then runs the resume's own check on it: the owner resolves a title that appeared
+        meanwhile to that existing session, which is refused unless its launch matches."""
         key = self.connection.launch_api_key = (launch or {}).get("api_key") or None
         self.connection.launch_api_key_typed = key is not None and key == getattr(cli, "_typed_api_key", None)
         if getattr(cli, "_resumed", False):
@@ -151,12 +154,20 @@ class GatewaySessionStore:
                 if str(exc) in RESUME_REFUSALS:
                     return None
                 raise
-            # The CLI sends a coding-posture toolset pick and an env-folded ignore_rules too; only a typed
-            # -t / --ignore-rules is checked.
-            _check_resume_launch({**(launch or {}), "toolsets": getattr(cli, "_typed_toolsets", None),
-                                  "ignore_rules": getattr(cli, "_explicit_ignore_rules", None) or None}, snapshot)
+            _check_cli_launch(cli, launch, snapshot)
             return self._adopt(snapshot)
-        return self.create(launch)
+        title = getattr(cli, "_create_title", None)
+        if not title:
+            return self.create(launch)
+        try:
+            sid = self.create(launch, title=title, record_cwd=False)
+            _check_cli_launch(cli, launch, self.snapshots[sid])
+        except GatewayClientError as exc:
+            logger.warning("Failed to create titled session %r on the gateway: %s", title, exc)
+            print(f"No session found matching '{title}' and a new titled session could not be created.",
+                  file=sys.stderr)
+            raise SystemExit(1) from None
+        return sid
 
     def create(self, launch=None, title=None, *, record_cwd=True):
         """``session.create`` with the launch policy (and ``title``: the owner's resolve -> create ->
@@ -165,8 +176,9 @@ class GatewaySessionStore:
         from agent.session_source import CLI_FAMILY_SOURCES, create_surface, session_source_for
         params = _creation_policy(launch or {})
         params["cwd"] = _launch_cwd()
-        # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source.
-        params["source"] = create_surface(session_source_for("cli"))
+        # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source; a titled
+        # row (``--create-if-missing``) is always ``cli``, as main's ``_create_titled_session`` wrote it.
+        params["source"] = "cli" if title else create_surface(session_source_for("cli"))
         # Main's row stamp (run_agent._launch_cwd_for_session): this process's cwd (``-w`` never
         # chdirs, so the repo root), only for a CLI-family label on a local terminal backend.
         local = (os.getenv("TERMINAL_ENV") or "local").strip().lower() in ("", "local")
@@ -517,6 +529,13 @@ def _classic_only_policy(launch):
 _RESUME_CHECKED = _LAUNCH_POLICY
 
 
+def _check_cli_launch(cli, launch, snapshot):
+    """:func:`_check_resume_launch` for this CLI's ``launch``. The CLI sends a coding-posture toolset pick
+    and an env-folded ignore_rules too; only a typed -t / --ignore-rules is checked."""
+    _check_resume_launch({**(launch or {}), "toolsets": getattr(cli, "_typed_toolsets", None),
+                          "ignore_rules": getattr(cli, "_explicit_ignore_rules", None) or None}, snapshot)
+
+
 def _check_resume_launch(launch, snapshot):
     """Explicit launch flags on ``--resume`` / ``-c`` against the session's frozen route, as the thin
     client checks them: the same flags again are fine, a different value is refused, never dropped."""
@@ -552,24 +571,13 @@ def session_store():
     return GatewaySessionStore()
 
 
-def create_titled_session(title, args=None):
+def create_titled_session(title):
     """``chat -c <title> --create-if-missing`` for the classic CLI: the gateway's ``session.create``
     with ``title`` (it resolves-or-creates under one owner lock), so this process writes no row.
-    The launch flags in ``args`` (``--provider``/``--model``/``-s`` ...) are the new session's policy:
-    the resume that follows repeats them, and a resume refuses flags the session was not created with.
     Main's ``_create_titled_session`` minted the id and wrote the row itself, with no cwd stamp
     (``row_cwd`` ""). Returns the id, or None when the gateway refused (the caller prints main's
     "could not be created" copy)."""
-    launch = {key: getattr(args, key, None) for key in (*_LAUNCH_POLICY, "run_budget", "verbose")}
-    # The classic launch (cli._build_cli_from_args) folds --required-skills into the skills it asks for and
-    # the resume repeats that merged list, so create with it; _requested_policy splits and dedupes.
-    # Both drop skills.auto_load names the same way (the gateway's agent loads those).
-    from hermes_cli.cli_init_mixin import launch_skills_without_auto_load
-    merged = [part.strip() for value in (launch["skills"], getattr(args, "required_skills", None)) if value
-              for name in (value if isinstance(value, (list, tuple)) else [value])
-              for part in str(name).split(",") if part.strip()]
-    launch["skills"] = launch_skills_without_auto_load(merged, getattr(args, "ignore_rules", False))
-    params = _creation_policy(launch)
+    params = _creation_policy({})
     params["cwd"] = _launch_cwd()
     params["source"] = "cli"  # main's titled row is `cli` (hermes_cli.main._create_titled_session)
     params["row_cwd"] = ""
