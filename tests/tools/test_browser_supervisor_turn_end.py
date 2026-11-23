@@ -6,6 +6,7 @@ is injected to fail, to hang and to never run (a blocked supervisor loop); none 
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -23,12 +24,17 @@ from tools import browser_session_lifecycle as lifecycle
 TASK = "turn-end-task"
 
 
+UNLOCKED = {"locked": False, "native": False, "tabs": [], "unverified": False}
+
+
 class _Control:
-    """A WebSocket endpoint in its own thread that tracks the connections it has open."""
+    """A WebSocket endpoint in its own thread that tracks the connections it has open. It answers the payment
+    claim as browser-control does (confirmed), the lock status as unlocked, and anything else with ``{}``."""
 
     def __init__(self):
         self.open = 0
         self.messages = 0
+        self.methods = []
         self.ended = threading.Event()
         self.seen = threading.Event()
         self._loop = asyncio.new_event_loop()
@@ -46,8 +52,15 @@ class _Control:
             self.open += 1
             self.seen.set()
             try:
-                async for _ in ws:
+                async for raw in ws:
                     self.messages += 1
+                    msg = json.loads(raw)
+                    method, params = msg.get("method"), msg.get("params") or {}
+                    self.methods.append(method)
+                    result = ({"claimed": True, "locked": True, "tabs": params.get("tabs")}
+                              if method == pay_surface.CLAIM_METHOD else
+                              UNLOCKED if method == pay_surface.STATUS_METHOD else {})
+                    await ws.send(json.dumps({"id": msg.get("id"), "result": result}))
             except Exception:
                 pass
             finally:
@@ -98,6 +111,14 @@ def _turn_end(monkeypatch, *, vm_fails=False):
     monkeypatch.setattr("agent.chat_completion_helpers.is_persistent_env", lambda _t: False)
     monkeypatch.setattr("tools.browser_session_cloud.is_headed_mode", lambda: False)
     helpers.cleanup_task_resources(SimpleNamespace(verbose_logging=False), TASK)
+
+
+def _inspected():
+    docs = (SimpleNamespace(frame_id="CARD", frame_session="S-card", origin="https://psp.test"),)
+    tree = (("PAGE", "LP", "https://shop.test/", "https://shop.test", ""),
+            ("CARD", "L1", "https://psp.test/f", "https://psp.test", "PAGE"))
+    return SimpleNamespace(documents=docs, page_session="S-page", page_id="PAGE", merchant_origin="https://shop.test",
+                           tree=tree, child_sessions={"CARD": "S-card"})
 
 
 def _freed(control, supervisor, within):
@@ -193,3 +214,72 @@ def test_a_supervisor_in_a_card_payment_survives_the_turn_end(control, superviso
     _turn_end(monkeypatch)
     assert bs.SUPERVISOR_REGISTRY.get(TASK) is supervisor
     assert not control.ended.wait(0.5) and control.open == 1
+
+
+def test_a_claim_admitted_at_turn_end_keeps_the_supervisor(control, supervisor, monkeypatch):
+    """A claim that holds the claim lock but has not marked the lock yet: the turn end keeps the supervisor, and the
+    claim then commits on a live socket."""
+    lock = pay_surface._claim_lock(supervisor)
+    lock.acquire()
+    try:
+        _turn_end(monkeypatch)
+    finally:
+        lock.release()
+    assert pay_surface.claim_payment_surface(supervisor, _inspected()) is None
+    assert bs.SUPERVISOR_REGISTRY.get(TASK) is supervisor
+    assert not control.ended.wait(0.5) and control.open == 1
+
+
+def test_a_claim_after_the_stop_decision_refuses_and_sends_nothing(control, supervisor, monkeypatch):
+    """A claim (an abandoned tool worker) that starts after the turn end decided to stop the supervisor: refused
+    before anything is sent, so no claim is committed on a socket that is about to close."""
+    real_stop, answers = supervisor.stop, []
+
+    def claim_then_stop(*a, **k):
+        answers.append(pay_surface.claim_payment_surface(supervisor, _inspected()))
+        real_stop(*a, **k)
+
+    monkeypatch.setattr(supervisor, "stop", claim_then_stop)
+    _turn_end(monkeypatch)
+    assert [a and a.get("error_type") for a in answers] == [pay_surface.UNAVAILABLE]
+    assert pay_surface.CLAIM_METHOD not in control.methods
+    _freed(control, supervisor, 5)
+
+
+def test_a_replacement_registered_after_the_check_is_not_stopped(control, supervisor, monkeypatch):
+    """A supervisor that replaced the checked one before the stop keeps its socket; only the checked one stops."""
+    replacement = bs.CDPSupervisor(task_id=TASK, cdp_url=control.url)
+    replacement.start()
+    try:
+        assert control.open == 2
+
+        def replaced(_sup):
+            with bs.SUPERVISOR_REGISTRY._lock:  # as get_or_start registers it
+                bs.SUPERVISOR_REGISTRY._by_task[TASK] = replacement
+            return False
+
+        monkeypatch.setattr(pay_done, "has_payment", replaced)
+        _turn_end(monkeypatch)
+        assert control.ended.wait(5) and control.open == 1
+        assert not supervisor._thread.is_alive() and replacement._thread.is_alive()
+        assert bs.SUPERVISOR_REGISTRY.get(TASK) is replacement
+    finally:
+        replacement.stop()
+
+
+def test_a_pending_dialog_survives_the_turn_end_and_is_answered_next_turn(control, supervisor, monkeypatch):
+    """The user is asked between turns (must_respond, 300 s): the supervisor holding the dialog is kept, the next
+    turn answers it, and the turn end after that stops it."""
+    from tools.browser_dialog_tool import browser_dialog
+
+    asyncio.run_coroutine_threadsafe(
+        supervisor._on_dialog_opening({"type": "confirm", "message": "Place order?"}, None), supervisor._loop
+    ).result(5)
+    assert len(supervisor.snapshot().pending_dialogs) == 1
+    _turn_end(monkeypatch)
+    assert bs.SUPERVISOR_REGISTRY.get(TASK) is supervisor and control.open == 1
+    out = json.loads(browser_dialog("accept", task_id=TASK))
+    assert out["success"] is True and out["dialog"]["message"] == "Place order?"
+    assert "Page.handleJavaScriptDialog" in control.methods
+    _turn_end(monkeypatch)
+    _freed(control, supervisor, 5)
