@@ -191,8 +191,7 @@ def test_a_stop_during_the_dial_closes_the_socket_it_returns(control, monkeypatc
     sup = bs.CDPSupervisor(task_id=TASK, cdp_url=control.url)
 
     async def slow_connect(*a, **k):
-        await asyncio.sleep(0.3)
-        sup._stop_requested = True  # stop() ran meanwhile
+        sup._stop_requested = True  # stop() runs while the dial is in flight
         ws = await real_connect(*a, **k)
         landed.set()
         return ws
