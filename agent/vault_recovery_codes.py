@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover - platform-specific fallback (same shape
 _CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{3,63}$")
 _CHUNK_SPLIT_RE = re.compile(r"[,;]+")
 _DIGIT_GROUP_RE = re.compile(r"^\d{2,5}$")
+_KEY_RE = re.compile(r"[0-9a-fA-F]{64}")
 _lock = threading.Lock()
 _MAX_ENTRIES = 2000
 
@@ -47,10 +48,13 @@ _RECOVERY_WORDS_RE = re.compile(
     r"recover|backup|back up|wiederherstell|sicherungscode|notfallcode|recuper|secours|sauvegarde|respaldo|"
     r"herstel|reservecode")
 _CODE_WORD_RE = re.compile(r"cod(?:e|es|igo|igos|ice|ici)\b")
-# "code" alone is not enough when the text names something else that is secret or not a recovery code.
+# "code" alone is not enough when the text names something else that is secret or not a recovery code; and a
+# field LABEL that names one ("Recovery email", "Backup phone", "Password recovery question") is never read as
+# codes even with recovery wording.
 _NOT_CODES_RE = re.compile(
     r"pass|kennwort|wachtwoord|contrasena|mot de passe|\bpin\b|\botp\b|totp|one time|einmal|seed|secret|"
-    r"user ?name|e ?mail|zip|post|bar ?code|promo|gift|coupon|voucher|discount")
+    r"user ?name|e ?mail|phone|mobile|handy|telefon|sms|question|frage|answer|antwort|hint|address|adresse|"
+    r"zip|post|bar ?code|promo|gift|coupon|voucher|discount")
 # A field label that names the account's own secret or identifier is never read as codes, whatever the section.
 _SECRET_LABEL_RE = re.compile(
     r"^(?:password|passwort|kennwort|wachtwoord|contrasena|mot de passe|passcode|pin|username|user name|"
@@ -128,7 +132,8 @@ def pick_code_values(field: str, entries: Iterable[tuple[str, str, str, bool]]) 
     matched = [(label, section, value, protected) for label, section, value, protected in entries
                if field_matches(field, label, section)]
     usable = [value for label, section, value, protected in matched
-              if not protected and not names_account_secret(label) and has_code_wording(label + " " + section)]
+              if not protected and not names_account_secret(label) and not _NOT_CODES_RE.search(normalize_label(label))
+              and has_code_wording(label + " " + section)]
     if matched and not usable:
         raise RecoveryFieldNotCodes()
     return parse_codes(usable)
@@ -172,14 +177,16 @@ def _load(path: Path) -> Optional[dict]:
         text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         raise RecoveryLedgerUnreadable() from None
     try:
         data = json.loads(text)
     except ValueError:
         raise RecoveryLedgerUnreadable() from None
     key = data.get("key") if isinstance(data, dict) else None
-    if not isinstance(key, str) or len(key) != 64 or not isinstance(data.get("used"), list):
+    used = data.get("used") if isinstance(data, dict) else None
+    if (not isinstance(key, str) or not _KEY_RE.fullmatch(key) or not isinstance(used, list)
+            or not all(isinstance(entry, str) for entry in used)):
         raise RecoveryLedgerUnreadable()
     return data
 

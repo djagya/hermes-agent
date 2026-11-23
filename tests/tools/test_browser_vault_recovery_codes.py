@@ -68,6 +68,21 @@ def test_recovery_wording_in_six_languages_is_read(monkeypatch, label):
     assert _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", label) == ["1111-aaaa", "2222-bbbb"]
 
 
+@pytest.mark.parametrize("label", ["Recovery email", "Recovery e-mail address", "Backup phone", "Recovery phone number",
+                                   "Password recovery question", "Recovery answer", "Backup email", "Recovery password",
+                                   "Recovery PIN", "Notfall Telefon", "Recovery codes email", "Recovery hint"])
+def test_a_recovery_label_that_names_another_secret_is_not_read_as_codes(monkeypatch, label):
+    item = {"fields": [{"id": "x", "type": "STRING", "label": label, "value": "1111-aaaa\n2222-bbbb"}]}
+    _not_codes(lambda: _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", label.split()[0]))
+    _not_codes(lambda: _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", label))
+
+
+def test_a_recovery_section_named_after_an_account_does_not_hide_the_real_codes(monkeypatch):
+    item = {"fields": [{"id": "x", "type": "CONCEALED", "label": "Backup codes", "value": "1111-aaaa",
+                        "section": {"label": "Email account"}}]}
+    assert _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", "backup codes") == ["1111-aaaa"]
+
+
 def test_a_password_labelled_field_inside_a_recovery_section_is_not_read(monkeypatch):
     item = {"fields": [{"id": "p2", "type": "CONCEALED", "label": "password", "value": PW,
                         "section": {"label": "Recovery codes"}}]}
@@ -170,14 +185,23 @@ def test_two_processes_selecting_at_once_never_take_the_same_code(tmp_path):
 
 # ── 5. a corrupt ledger refuses ────────────────────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("text", ["{truncated", "", "[]", '{"used": []}'])
-def test_an_unreadable_ledger_refuses_instead_of_forgetting_spent_codes(recovery, tmp_path, text):
+_KEY = "ab" * 32
+
+
+@pytest.mark.parametrize("raw", [
+    b"{truncated", b"", b"[]", b'{"used": []}',
+    b"\xff\xfe\x00bad",                                              # not UTF-8 at all
+    json.dumps({"key": "zz" * 32, "used": []}).encode(),              # 64 characters but not hex
+    json.dumps({"key": _KEY, "used": [["x"]]}).encode(),              # an entry that is not a digest string
+    json.dumps({"key": _KEY, "used": [1]}).encode(),
+])
+def test_an_unreadable_ledger_refuses_instead_of_forgetting_spent_codes(recovery, tmp_path, raw):
     assert enter(field="recovery codes")["success"] is True
-    (tmp_path / "used.json").write_text(text)
+    (tmp_path / "used.json").write_bytes(raw)
     out = enter(field="recovery codes")
     assert out["error_type"] == "recovery_ledger_unreadable"
     assert recovery.write.call_count == 1
-    assert (tmp_path / "used.json").read_text() == text  # never re-keyed
+    assert (tmp_path / "used.json").read_bytes() == raw  # never re-keyed
 
 
 def test_the_ledger_is_private_and_holds_no_code(recovery, tmp_path):
