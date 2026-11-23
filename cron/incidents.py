@@ -62,25 +62,33 @@ _MAX_SIGNATURE_ERROR_CHARS = 200
 # measured durations ("idle for 603s", "retry in 12.5 seconds"). Short SHAs, file:LINE:COL, versions,
 # exit codes and other numbers count.
 _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
-    (r"\b\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:z|[+-]\d{2}:?\d{2})?)?", "#t"),
+    (r"\b\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?(?:z|[+-]\d{2}:?\d{2})?)?", "#t"),
     (r"\b\d{8}[t_-]\d{6}z?\b", "#t"),
-    (r"(?<![:\w.])\d{2}:\d{2}:\d{2}(?:\.\d+)?(?![:\d])", "#t"),
+    (r"(?<![:\w.])\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?![:\d])", "#t"),
     (r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "#h"),
     (r"\b[0-9a-f]{32,64}\b", "#h"),
     (r"\b\d+\s*bytes?\b", "#b"),
     (r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b", "#s"),
 ))
-# Temp names by context, not shape: the entry right under a temp root (``/tmp``, ``/var/tmp``,
-# ``/private/tmp``, macOS ``$TMPDIR`` ``/var/folders/*/*/T``) is per-run by nature. In it, Python's
-# ``tempfile`` name (``tmp`` + 8 of ``[a-z0-9_]``) and every 6+ character run with a digit or a capital
-# (``mktemp``'s ``tmp.XXXXXXXXXX``, ``worktree.XXXXXX``) are masked, before lowercasing.
+# Temp names by context and template: the entry right under a temp root (``/tmp``, ``/var/tmp``,
+# ``/private/tmp``, macOS ``$TMPDIR`` ``/var/folders/*/*/T``) is masked only when it is Python's
+# ``tempfile`` name (``tmp`` + 8 of ``[a-z0-9_]``) or a ``mktemp`` template ``<word>.<6-10 random>``
+# (``tmp.XXXXXXXXXX``, ``worktree.XXXXXX``) whose random part has 2+ digits or capitals. A stable
+# name (``build1.log``, ``Report2024.csv``) counts. Plain string checks: linear on any error length.
 _TEMP_ENTRY_RE = re.compile(r"(?<![\w.-])((?:/private)?(?:/tmp|/var/tmp|/var/folders/[^/\s]+/[^/\s]+/T)/)([^/\s:'\"()]+)")
-_PY_TEMP_NAME_RE = re.compile(r"^tmp[a-z\d_]{8}(?![A-Za-z\d_])")
-_RANDOM_RUN_RE = re.compile(r"(?=[A-Za-z\d]*[A-Z\d])[A-Za-z\d]{6,}")
+_PY_TEMP_NAME_RE = re.compile(r"tmp[a-z\d_]{8}")
+
+
+def _is_temp_name(entry: str) -> bool:
+    if _PY_TEMP_NAME_RE.fullmatch(entry):
+        return True
+    word, dot, rand = entry.rpartition(".")
+    return bool(dot and word and 6 <= len(rand) <= 10 and rand.isascii() and rand.isalnum()
+                and sum(c.isdigit() or c.isupper() for c in rand) >= 2)
 
 
 def _mask_temp_entry(match: re.Match) -> str:
-    return match.group(1) + _RANDOM_RUN_RE.sub("#", _PY_TEMP_NAME_RE.sub("#", match.group(2)))
+    return match.group(1) + ("#" if _is_temp_name(match.group(2)) else match.group(2))
 
 
 _lock = threading.RLock()

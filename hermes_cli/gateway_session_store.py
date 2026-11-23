@@ -164,7 +164,7 @@ class GatewaySessionStore:
             _check_cli_launch(cli, launch, self.snapshots[sid])
         except GatewayClientError as exc:
             logger.warning("Failed to create titled session %r on the gateway: %s", title, exc)
-            print(f"No session found matching '{title}' and a new titled session could not be created.",
+            print(f"No session found matching '{title}' and a new titled session could not be created: {exc}",
                   file=sys.stderr)
             raise SystemExit(1) from None
         # A title that raced into an existing session is that session: resume its history, as main did.

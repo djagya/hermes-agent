@@ -480,10 +480,14 @@ def _classic_launch(monkeypatch, owner):
 
     def launch(*, model=None, provider=None, skills=None, required=None, ignore_rules=False, reasoning=None,
                toolsets=None, max_turns=None, checkpoints=False, run_budget=None, verbose=None, resume=None,
-               create_title=None):
+               create_title=None, leases=None):
         host = cli_module._build_cli_from_args(model, toolsets, provider, reasoning, None, None, max_turns, run_budget,
                                                verbose, False, resume, checkpoints, False, ignore_rules, skills,
                                                required_skills=required, create_title=create_title)
+        if leases is not None:  # the CLI's active-session lease, claimed in run() before the session opens
+            host._active_session_lease = "lease"
+            host._release_active_session = lambda: leases.append(("release", host.session_id))
+            host._claim_active_session = lambda *a, **k: (leases.append(("claim", host.session_id)), True)[1]
         host._ensure_gateway_session()
         return host
     return launch, conn
@@ -550,7 +554,23 @@ def test_create_if_missing_into_a_session_that_appeared_meanwhile(monkeypatch, c
         with pytest.raises(SystemExit) as exit_info:
             launch(create_title="T", model="m1")
         assert exit_info.value.code == 1
-        assert "No session found matching 'T' and a new titled session could not be created." in capsys.readouterr().err
+        assert "No session found matching 'T' and a new titled session could not be created" in capsys.readouterr().err
+    finally:
+        conn.close()
+
+
+def test_create_if_missing_moves_the_lease_to_the_session_it_lands_on(monkeypatch):
+    """The lease run() claimed under the local mint is re-claimed for the titled session, fresh or raced in,
+    so a second CLI opening that title is refused as on main (which resumed it by id)."""
+    owner = _Owner(titles={"T": "local-old"}, frozen={"local-old": {"model": "m-old"}})
+    launch, conn = _classic_launch(monkeypatch, owner)
+    try:
+        leases = []
+        assert launch(create_title="T", model="m-old", leases=leases).session_id == "local-old"
+        assert leases[-1] == ("claim", "local-old")
+        leases = []
+        fresh = launch(create_title="Fresh", model="m1", leases=leases)
+        assert leases[-1] == ("claim", fresh.session_id) and fresh.session_id.startswith("local-")
     finally:
         conn.close()
 
