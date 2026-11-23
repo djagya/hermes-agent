@@ -164,7 +164,7 @@ class GatewaySessionStore:
             if self.connection.launch_api_key:
                 # A title that raced in was created without this key: open it as a keyed resume does,
                 # so the owner binds the key or refuses a session launched without it (as main did).
-                self._adopt(self.connection.resume(self.call, sid, typed=self.connection.launch_api_key_typed))
+                sid = self._adopt(self.connection.resume(self.call, sid, typed=self.connection.launch_api_key_typed))
             _check_cli_launch(cli, launch, self.snapshots[sid])
         except GatewayClientError as exc:
             logger.warning("Failed to create titled session %r on the gateway: %s", title, exc)

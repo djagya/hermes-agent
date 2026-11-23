@@ -128,14 +128,9 @@ def _run_tokens(rng):
     def draw(alphabet, n):
         return "".join(rng.choice(alphabet) for _ in range(n))
 
-    def mktemp(n):  # mktemp's X's; a draw with under 2 digits/capitals is not masked (accepted: one extra alert)
-        name = draw(alnum, n)
-        ok = any(c.islower() for c in name) and sum(c.isdigit() or c.isupper() for c in name) >= 2
-        return name if ok else mktemp(n)
     stamp = f"2026-11-{rng.randint(10, 28)}T{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}Z"
     return {
-        "tmp6": mktemp(6),  # mktemp -d /tmp/worktree.XXXXXX
-        "tmp10": mktemp(10),  # bare mktemp: $TMPDIR/tmp.XXXXXXXXXX
+        "tmp10": draw(alnum, 10),  # bare mktemp: $TMPDIR/tmp.XXXXXXXXXX
         "py": "tmp" + draw(string.ascii_lowercase + string.digits + "_", 8),  # tempfile.mkdtemp()
         "pyfile": "tmp" + draw(string.ascii_lowercase + string.digits + "_", 8) + ".json",  # mkstemp(suffix=)
         "sha": draw(hexdigits, 64), "sha1": draw(hexdigits, 40), "md5": draw(hexdigits, 32),
@@ -150,7 +145,7 @@ def _run_tokens(rng):
 
 
 _PER_RUN_TEMPLATE = (
-    "script failed: {asctime} ERROR manifest rejected at /tmp/worktree.{tmp6}/scripts/sync.mjs:12:34\n"
+    "script failed: {asctime} ERROR manifest rejected at /tmp/{py}/scripts/sync.mjs:12:34\n"
     "log /var/folders/ab/cd12/T/tmp.{tmp10} and /private/tmp/{py}/out.json at {clock}, /tmp/{pyfile}.gz; "
     "{clock}: manifest missing; "
     "receipt /srv/receipts/{compact}.json sha256={sha} sha1={sha1} md5={md5} ({bytes} bytes) run {uuid} "
@@ -166,6 +161,10 @@ _MUST_DIFFER = (
     ("TypeError: manifest rejected at sync.mjs:12:34", "TypeError: manifest rejected at sync.mjs:12:35"),
     ("TypeError: manifest rejected at sync.mjs:12:19", "TypeError: manifest rejected at sync.mjs:13:19"),
     ("at /tmp/worktree.aB3xY9/scripts/sync.mjs:12:34", "at /tmp/worktree.aB3xY9/scripts/sync.mjs:13:34"),
+    ("open /tmp/sums.sha256sum failed", "open /tmp/sums.sha512sum failed"),
+    ("open /tmp/report.2024q1 failed", "open /tmp/report.2024q2 failed"),
+    ("open /tmp/model.v2beta1 failed", "open /tmp/model.v2beta2 failed"),
+    ("link 10:20:30:ab:cd:ef down", "link 10:20:31:ab:cd:ef down"),
     ("crashed builtins.KeyError: 'k'", "crashed builtins.EOFError: 'k'"),
     ("process exited 0xc0000005", "process exited 0xc0000409"),
     ("exit status c0000005", "exit status c0000409"),

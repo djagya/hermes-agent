@@ -64,7 +64,7 @@ _MAX_SIGNATURE_ERROR_CHARS = 200
 _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
     (r"\b\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+|,\d{3}(?![\d,]))?)?(?:z|[+-]\d{2}:?\d{2})?)?", "#t"),
     (r"\b\d{8}[t_-]\d{6}z?\b", "#t"),
-    (r"(?<![:\w.])\d{2}:\d{2}:\d{2}(?:\.\d+|,\d{3}(?![\d,]))?(?!\d|:\d)", "#t"),
+    (r"(?<![:\w.])\d{2}:\d{2}:\d{2}(?:\.\d+|,\d{3}(?![\d,]))?(?!\d|:[\da-f])", "#t"),
     (r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "#h"),
     (r"\b[0-9a-f]{32,64}\b", "#h"),
     (r"\b\d+\s*bytes?\b", "#b"),
@@ -72,23 +72,15 @@ _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
 ))
 # Temp names by context and template: the entry right under a temp root (``/tmp``, ``/var/tmp``,
 # ``/private/tmp``, macOS ``$TMPDIR`` ``/var/folders/*/*/T``) is masked only when it is Python's
-# ``tempfile`` name (``tmp`` + 8 of ``[a-z0-9_]``) or a ``mktemp`` template ``<word>.<6-10 random>``
-# (``tmp.XXXXXXXXXX``, ``worktree.XXXXXX``) whose random part mixes lowercase with 2+ digits or capitals. A stable
-# name (``build1.log``, ``Report2024.csv``) counts. Plain string checks: linear on any error length.
+# ``tempfile`` name (``tmp`` + 8 of ``[a-z0-9_]``, with any ``suffix=``) or bare ``mktemp``'s ``tmp.XXXXXXXXXX``.
+# A named template (``worktree.XXXXXX``) is not guessed at: its random part looks like a stable name
+# (``report.2024q1``), and one extra alert per run is the safe error. Linear on any error length.
 _TEMP_ENTRY_RE = re.compile(r"(?<![\w.-])((?:/private)?(?:/tmp|/var/tmp|/var/folders/[^/\s]+/[^/\s]+/T)/)([^/\s:;,'\"()]+)")
-_PY_TEMP_NAME_RE = re.compile(r"tmp[a-z\d_]{8}(?:\.[A-Za-z\d]{1,10})*")  # mkstemp(suffix=".tar.gz") too
-
-
-def _is_temp_name(entry: str) -> bool:
-    if _PY_TEMP_NAME_RE.fullmatch(entry):
-        return True
-    word, dot, rand = entry.rpartition(".")
-    return bool(dot and word and 6 <= len(rand) <= 10 and rand.isascii() and rand.isalnum()
-                and any(c.islower() for c in rand) and sum(c.isdigit() or c.isupper() for c in rand) >= 2)
+_TEMP_NAME_RE = re.compile(r"tmp(?:[a-z\d_]{8}(?:\.[A-Za-z\d]{1,10})*|\.[A-Za-z\d]{10})")
 
 
 def _mask_temp_entry(match: re.Match) -> str:
-    return match.group(1) + ("#" if _is_temp_name(match.group(2)) else match.group(2))
+    return match.group(1) + ("#" if _TEMP_NAME_RE.fullmatch(match.group(2)) else match.group(2))
 
 
 _lock = threading.RLock()
