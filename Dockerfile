@@ -171,11 +171,11 @@ db.close()"
 # the whole 15-45 min build. curl -fsSL --retry 3 self-heals those blips,
 # and every tarball is still checksum-verified below before extraction.
 ARG TARGETARCH
-ARG S6_OVERLAY_VERSION=3.2.3.0
-ARG S6_OVERLAY_NOARCH_SHA256=b720f9d9340efc8bb07528b9743813c836e4b02f8693d90241f047998b4c53cf
-ARG S6_OVERLAY_X86_64_SHA256=a93f02882c6ed46b21e7adb5c0add86154f01236c93cd82c7d682722e8840563
-ARG S6_OVERLAY_AARCH64_SHA256=0952056ff913482163cc30e35b2e944b507ba1025d78f5becbb89367bf344581
-ARG S6_OVERLAY_SYMLINKS_SHA256=a60dc5235de3ecbcf874b9c1f18d73263ab99b289b9329aa950e8729c4789f0e
+ARG S6_OVERLAY_VERSION=3.2.3.2
+ARG S6_OVERLAY_NOARCH_SHA256=5379750ed30a84bbd2e2dd74847ba6b5bd29cd0b2e3ea2ec58049b57eb2eda12
+ARG S6_OVERLAY_X86_64_SHA256=e6befcc96a437a3831386ecfc51808c5d3e939dc5fe3c02ae9284599e8aa2408
+ARG S6_OVERLAY_AARCH64_SHA256=b17f17a82e7a515c682a91edaf2ffdabb73f891981b6c1fd712115693a2f8b4c
+ARG S6_OVERLAY_SYMLINKS_SHA256=a215675c375aca9efecde3065df22b19fb8dcdc1362566931c6b5e778099a0fb
 RUN set -eu; \
     case "${TARGETARCH:-amd64}" in \
         amd64) s6_arch="x86_64"; s6_arch_sha="${S6_OVERLAY_X86_64_SHA256}" ;; \
@@ -576,6 +576,9 @@ COPY --chmod=0444 docker/sera-toolbox/managed-config.yaml /etc/hermes/config.yam
 # root /run/service scandir, and are reconciled on container restart by
 # /etc/cont-init.d/02-reconcile-profiles (Phase 4 Task 4.0).
 COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+# The user bundle lists which services start at boot (s6-overlay 3.2.3.2 reads it from
+# user-bundles.d; an s6-rc.d/user directory makes rc.init fail for a non-root --user start).
+COPY docker/user-bundles.d/ /etc/s6-overlay/user-bundles.d/
 
 # stage2-hook handles UID/GID remap, volume chown, config seeding,
 # skills sync — all the work the old entrypoint.sh did before
