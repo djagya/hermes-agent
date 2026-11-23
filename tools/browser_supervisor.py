@@ -59,6 +59,9 @@ CDP_CLIENT_TIMEOUT_S = 10.0
 # used the whole start budget before the createTarget fallback ran. The initial attach now runs against
 # one deadline and keeps this much of it for the fresh blank tab.
 CREATE_TARGET_RESERVE_S = 4.0
+# dlz (J-0001): a WebSocket close waits this long for the closing handshake, then the transport is aborted
+# (inside stop()'s 2 s budget for the close).
+WS_CLOSE_TIMEOUT_S = 1.5
 
 
 def _redact_cdp_error_text(exc: object) -> str:
@@ -82,6 +85,18 @@ def _redial_refused(exc: BaseException) -> bool:
     if status is None:
         status = getattr(exc, "status_code", None)  # legacy websockets InvalidStatusCode
     return status == 403
+
+
+def _shutdown_socket(ws: Any) -> None:
+    """dlz (J-0001): last resort from a thread that is not the loop's: shut the TCP socket under ``ws`` down
+    (thread-safe at the OS level, unlike the transport's own close) so the peer sees the end of the stream."""
+    import socket
+
+    transport = getattr(ws, "transport", None)
+    with contextlib.suppress(Exception):
+        sock = transport.get_extra_info("socket") if transport is not None else None
+        if sock is not None:
+            sock.shutdown(socket.SHUT_RDWR)
 
 
 def _cdp_reconnect_is_handshake_race(redial_failures: int) -> bool:
@@ -228,9 +243,12 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             raise RuntimeError(f"CDP supervisor failed to start: {_redact_cdp_error_text(err)}") from None
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Cancel the supervisor task and join the thread."""
+        """Cancel the supervisor task and join the thread. dlz (J-0001): the socket is closed whatever the
+        close does: a failed or slow close aborts the transport on the loop (:meth:`_close_ws`), and a loop
+        that never ran the close in time (blocked, or the thread outlived the join) has the socket shut
+        down from this thread, so browser-control sees the transport end and the lease can go idle."""
         self._stop_requested = True
-        loop = self._loop
+        ws, loop = self._ws, self._loop
         if loop is not None and loop.is_running():
             # Close the WebSocket from inside the loop so ``async for raw in self._ws``
             # returns cleanly, ``_run`` hits its ``finally``, THEN the thread exits.
@@ -238,6 +256,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                 _schedule(self._close_ws(), loop, timeout=2.0)
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                _shutdown_socket(self._ws or ws)
         self._set_active(False)
 
     def _set_active(self, value: bool) -> None:
@@ -459,11 +479,18 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
         return True
 
     async def _close_ws(self) -> None:
-        """Detach and close the current WebSocket, swallowing close errors."""
+        """Detach and close the current WebSocket, swallowing close errors. dlz (J-0001): a close that
+        raises, hangs past WS_CLOSE_TIMEOUT_S or is cancelled still aborts the transport."""
         ws, self._ws = self._ws, None
         if ws is not None:
-            with contextlib.suppress(Exception):
-                await ws.close()
+            try:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(ws.close(), timeout=WS_CLOSE_TIMEOUT_S)
+            finally:
+                transport = getattr(ws, "transport", None)
+                if transport is not None:
+                    with contextlib.suppress(Exception):
+                        transport.abort()
 
     def _reconnect_budget_spent(self, failures: int, e: BaseException) -> bool:
         """True once ``failures`` consecutive post-attach reconnects failed: log ONE final line
@@ -493,6 +520,9 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             try:
                 self._ws = await asyncio.wait_for(websockets.connect(self.cdp_url, **connect_kwargs),
                                                   timeout=CDP_CLIENT_TIMEOUT_S)
+                if self._stop_requested:  # dlz (J-0001): stop() ran during the dial; its close saw no socket
+                    await self._close_ws()
+                    return
             except Exception as e:
                 if self._fail_start(e):
                     return
