@@ -167,6 +167,8 @@ class GatewaySessionStore:
             print(f"No session found matching '{title}' and a new titled session could not be created.",
                   file=sys.stderr)
             raise SystemExit(1) from None
+        # A title that raced into an existing session is that session: resume its history, as main did.
+        cli._resumed = bool(self.snapshots[sid].get("messages"))
         return sid
 
     def create(self, launch=None, title=None, *, record_cwd=True):

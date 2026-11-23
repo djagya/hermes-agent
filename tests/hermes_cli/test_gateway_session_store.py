@@ -425,12 +425,14 @@ class _Owner(FakeClient):
     the request, ``session.resume`` returns it; ``titles`` maps a title to the session that holds it."""
     CONFIG = {"agent": {}, "platform_toolsets": {"cli": ["terminal"]}}
 
-    def __init__(self, titles=None, frozen=None):
+    def __init__(self, titles=None, frozen=None, history=None):
         super().__init__(known=())
         self.titles, self.frozen = dict(titles or {}), dict(frozen or {})
+        self.history = dict(history or {})
 
     def _snapshot(self, sid):
         reply = snapshot(sid)
+        reply["messages"] = list(self.history.get(sid, []))
         reply["info"]["launch_request"] = dict(self.frozen[sid])
         return reply
 
@@ -535,12 +537,16 @@ def test_create_if_missing_then_resume_over_every_launch_flag(monkeypatch):
 
 def test_create_if_missing_into_a_session_that_appeared_meanwhile(monkeypatch, capsys):
     """The title resolved to nothing, but the owner finds a session holding it by the time it creates (its
-    resolve-or-create returns that session as is). Its launch is checked like a resume: the same flags pass,
-    a different one is main's "could not be created" and exit 1, never a session that ignores the flag."""
-    owner = _Owner(titles={"T": "local-old"}, frozen={"local-old": {"model": "m-old"}})
+    resolve-or-create returns that session as is). Its launch is checked like a resume: the same flags pass
+    and the CLI resumes it with its history, as main did; a different one is main's "could not be created"
+    and exit 1, never a session that ignores the flag."""
+    owner = _Owner(titles={"T": "local-old"}, frozen={"local-old": {"model": "m-old"}},
+                   history={"local-old": [{"role": "user", "content": "earlier"}]})
     launch, conn = _classic_launch(monkeypatch, owner)
     try:
-        assert launch(create_title="T", model="m-old").session_id == "local-old"
+        adopted = launch(create_title="T", model="m-old")
+        assert adopted.session_id == "local-old"
+        assert adopted._resumed is True
         with pytest.raises(SystemExit) as exit_info:
             launch(create_title="T", model="m1")
         assert exit_info.value.code == 1
