@@ -113,11 +113,11 @@ class LoginBackend(ABC):
         """Drop any cached listing so the next ``get_meta``/``list_items`` reads the manager again (a fill whose
         handle missed the cache retries once). No-op for backends without a cache."""
 
-    def resolve_recovery_codes(self, handle: str, field: str) -> list[str]:
-        """D-0365: the recovery/backup codes stored on a login item in the field labelled ``field``, in stored
-        order. Server-side only. A backend that cannot store them returns []. A field that matches but is the
-        login's password / identifier / TOTP field, or carries no recovery-code wording, raises
-        ``agent.vault_recovery_codes.RecoveryFieldNotCodes`` (use ``pick_code_values``)."""
+    def recovery_fields(self, handle: str, reveal: bool = False) -> list:
+        """D-0365: a login item's recovery-code fields as ``(RecoveryField, value)`` pairs, in stored order: the
+        fields that are not the login's password / identifier / TOTP field and whose label passes
+        ``agent.vault_recovery_codes.is_recovery_code_label``. ``value`` is "" unless ``reveal`` (the read after
+        the approval). Server-side only. A backend that cannot store them returns []."""
         return []
 
     def resolve_otp(self, handle: str) -> Optional[str]:

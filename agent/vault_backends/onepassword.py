@@ -273,30 +273,36 @@ class OnePasswordLoginBackend(LoginBackend):
             raise BackendError(self.display_name, "op item get returned no JSON item") from None
         return _login_password(item, self.display_name)
 
-    def resolve_recovery_codes(self, handle: str, field: str) -> list[str]:
-        """D-0365: the codes in the Login item's field (or section) named ``field``; [] when none match;
-        ``RecoveryFieldNotCodes`` when the match is the password / username / TOTP field or has no code wording."""
-        from agent.vault_recovery_codes import pick_code_values
+    def recovery_fields(self, handle: str, reveal: bool = False) -> list:
+        """D-0365: the Login item's recovery-code fields, each with the item's revision at this read. The read
+        before the approval runs ``op item get`` without ``--reveal`` and keeps no value, whatever op printed
+        (the ``payment_revision`` precedent); the read after it reveals, and the caller takes only the field the
+        approval named, at the same revision (``bound_codes``)."""
+        from agent.vault_recovery_codes import RecoveryField, is_recovery_code_label
 
         vault_id, item_id = self._resolve_handle(handle)
         args = ["item", "get", item_id]
         if vault_id:
             args += ["--vault", vault_id]
         try:
-            item = json.loads(self._run(*args, "--format", "json", "--reveal"))
+            item = json.loads(self._run(*args, "--format", "json", *(["--reveal"] if reveal else [])))
         except ValueError:
             raise BackendError(self.display_name, "op item get returned no JSON item") from None
         fields = item.get("fields") if isinstance(item, dict) else None
-        entries = []
+        revision = _item_revision(item)
+        out = []
         for f in fields if isinstance(fields, list) else []:
-            if not isinstance(f, dict) or not isinstance(f.get("value"), str):
+            if not isinstance(f, dict):
                 continue
-            section = f.get("section") if isinstance(f.get("section"), dict) else {}
             # The login's own password, username and TOTP field are never codes, whatever their label says.
             protected = (str(f.get("purpose") or "").upper() in ("PASSWORD", "USERNAME")
                          or str(f.get("type") or "").upper() == "OTP" or str(f.get("id") or "") == "password")
-            entries.append((str(f.get("label") or ""), str(section.get("label") or ""), f["value"], protected))
-        return pick_code_values(field, entries)
+            field_id, label, value = f.get("id"), f.get("label"), f.get("value") if reveal else ""
+            if protected or not (isinstance(field_id, str) and field_id) or not isinstance(label, str):
+                continue
+            if is_recovery_code_label(label):
+                out.append((RecoveryField(field_id, label, revision), value if isinstance(value, str) else ""))
+        return out
 
     def resolve_secret(self, handle: str) -> dict[str, str]:
         """Reveal a single card only inside the trusted native filler, never in tool output."""

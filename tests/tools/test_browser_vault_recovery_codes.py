@@ -1,17 +1,19 @@
-"""Stored recovery codes, review E round 2 (2026-11-18): only a recovery-code field is ever read (never the
-password, username or TOTP seed), the code's pixels are masked before it lands, handle aliases share one
-spent-code record, two processes never pick the same code, a corrupt ledger refuses, codes parse per line.
-Synthetic items and pages only."""
+"""Stored recovery codes (review E round 2, 2026-11-18; label redesign J-0141, 2026-11-23): the backend picks the
+item's one field whose label says recovery/backup codes, the approval names that exact label, and only that
+field is read after it, at the same item revision (never the password, username, TOTP seed or any other field).
+The code's pixels are masked before it lands, handle aliases share one spent-code record, two processes never
+pick the same code, a corrupt ledger refuses, codes parse per line. Synthetic items and pages only."""
 import json
 import multiprocessing as mp
 import queue
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent import vault_recovery_codes as rc
 from agent.vault_backends import local as local_mod
-from agent.vault_backends.onepassword import OnePasswordLoginBackend
+from agent.vault_backends import onepassword as op_mod
 from agent.vault_login_classifier import build_fill_js
 from tests.tools import test_browser_vault_credential_fills as cred
 from tests.tools.test_browser_vault_signup import _run
@@ -22,130 +24,269 @@ core, recovery = cred.core, cred.recovery  # the shared fixtures (synthetic back
 
 PW = "correct-horse-battery-staple"
 SEED = "JBSWY3DPEHPK3PXP"
-ITEM = {"id": "i1", "fields": [
-    {"id": "username", "type": "STRING", "purpose": "USERNAME", "label": "username", "value": "danil@example.test"},
-    {"id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password", "value": PW},
-    {"id": "TOTP_x", "type": "OTP", "label": "one-time password", "value": SEED, "totp": "123456"},
-    {"id": "n1", "type": "STRING", "label": "notes", "value": "pin 4711 safe"},
-    {"id": "rc", "type": "CONCEALED", "label": "recovery codes", "value": "abcd-1234 efgh-5678"}]}
+OTHER = "qqqq-7777"  # the value of a field that is not the recovery codes; parses as a code, so a read types it
+STORED = "wxyz-1111\nwxyz-2222"
 
 
-def _op(monkeypatch, item=ITEM):
-    backend = OnePasswordLoginBackend({})
-    monkeypatch.setattr(backend, "_resolve_handle", lambda h: ("v1", "i1"))
-    monkeypatch.setattr(backend, "_run", lambda *a: json.dumps(item))
-    return backend
+def item(*fields, version=7):
+    """A 1Password Login item as ``op item get --format json`` prints it: the login's own fields, then
+    ``fields`` as ``(label, value)`` or ``(label, value, section)``."""
+    own = [
+        {"id": "username", "type": "STRING", "purpose": "USERNAME", "label": "username", "value": "danil@example.test"},
+        {"id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password", "value": PW},
+        {"id": "TOTP_x", "type": "OTP", "label": "one-time password", "value": SEED, "totp": "123456"},
+        {"id": "notesPlain", "type": "STRING", "purpose": "NOTES", "label": "notesPlain", "value": "pin 4711 safe"}]
+    extra = [{"id": f"f{i}", "type": "CONCEALED", "label": f[0], "value": f[1],
+              **({"section": {"id": "s1", "label": f[2]}} if len(f) > 2 else {})} for i, f in enumerate(fields)]
+    return {"id": "i1", "version": version, "updated_at": "2026-11-23T10:00:00Z", "fields": own + extra}
 
 
-def _not_codes(call):
-    with pytest.raises(Exception) as err:
-        call()
-    assert type(err.value).__name__ == "RecoveryFieldNotCodes"
-    assert PW not in str(err.value) and SEED not in str(err.value)
+class FakeOp:
+    """The ``op`` CLI under the real 1Password backend: prints ``item`` (``after_approval`` for the revealing
+    read, when set) with every value, as op may, and records each read. ``metadata_failure`` /
+    ``reveal_failure``: an exception ``run_cli`` raises, ``str`` stderr of a failed op, or ``bytes`` printed as is."""
+
+    def __init__(self):
+        self.item, self.after_approval, self.calls = item(), None, []
+        self.metadata_failure = self.reveal_failure = None
+
+    def __call__(self, argv, **_kw):
+        reveal = "--reveal" in argv
+        self.calls.append("reveal" if reveal else "metadata")
+        failure = self.reveal_failure if reveal else self.metadata_failure
+        if isinstance(failure, Exception):
+            raise failure
+        if isinstance(failure, str):
+            return SimpleNamespace(returncode=1, stdout="", stderr=failure)
+        if isinstance(failure, bytes):
+            return SimpleNamespace(returncode=0, stdout=failure.decode(), stderr="")
+        shown = self.after_approval if reveal and self.after_approval is not None else self.item
+        return SimpleNamespace(returncode=0, stdout=json.dumps(shown), stderr="")
 
 
-# ── 1. the named field must be a recovery-code field ───────────────────────────────────────────────────────
+@pytest.fixture
+def op(recovery, monkeypatch):
+    """The real 1Password backend behind ``enter_code code_source=recovery``, over :class:`FakeOp`."""
+    backend = op_mod.OnePasswordLoginBackend({})
+    backend._service_token = "synthetic-service-token"
+    monkeypatch.setattr(backend, "_op", lambda: Path("op"))
+    monkeypatch.setattr(backend, "_resolve_handle", lambda handle: ("v1", "i1"))
+    fake = FakeOp()
+    monkeypatch.setattr(op_mod, "run_cli", fake)
+    monkeypatch.setattr(vault, "_saved_login", lambda handle: (backend, recovery.meta))
+    return fake
 
-@pytest.mark.parametrize("field", ["password", "Password", "one-time password", "one", "username", "notes"])
-def test_the_password_totp_seed_or_an_unnamed_field_is_never_typed_as_a_recovery_code(recovery, monkeypatch, field):
-    recovery.backend.resolve_recovery_codes = _op(monkeypatch).resolve_recovery_codes
-    out = enter(field=field)
-    assert out["success"] is False and out["error_type"] == "recovery_field_not_codes", out
-    assert not any(PW in c.args[1] or SEED in c.args[1] for c in recovery.write.call_args_list)
+
+def typed(recovery) -> str:
+    """Everything the page writer was handed."""
+    return "".join(call.args[1] for call in recovery.write.call_args_list)
+
+
+# ── 1. which field is read: the backend picks, the approval names it, the read is bound to it ──────────────────
+
+# Labels that must never be read as recovery codes, as (label, section). Rows 1-13 are the final reviews' and the
+# approach verdict's cases (J-0141): each was typed by the old "code word minus a deny list" rule.
+NOT_RECOVERY_CODES = [
+    ("Code (TOTP)", ""), ("Code (PIN)", ""), ("Pincode", ""), ("Security code", ""), ("Code word", ""),
+    ("Codice fiscale", ""), ("Code confidentiel", ""), ("Access code", ""), ("Sort code", ""), ("CVV code", ""),
+    ("Codes (2FA seed)", ""), ("One-time code", ""), ("Code", "TOTP"),
+    ("Code", "PIN"), ("Code", "Password"), ("Code 3", "Recovery codes"), ("password", "Recovery codes"),
+    ("Code (OTP)", ""), ("Codes (password)", ""), ("Code (backup phone)", ""), ("Codes (recovery)", ""),
+    ("Codes", ""), ("Login codes", ""), ("Einmalcode", ""), ("Passcode", ""), ("PIN code", ""), ("2FA code", ""),
+    ("Authenticator code", ""), ("Verification code", ""), ("Master code", ""), ("Door code", ""), ("PUK code", ""),
+    ("Sicherheitscode", ""), ("Zugangscode", ""), ("Kartencode", ""), ("Code de sécurité", ""), ("Code d'accès", ""),
+    ("Código de seguridad", ""), ("Código de acceso", ""), ("Codice di sicurezza", ""), ("Codice di accesso", ""),
+    ("Beveiligingscode", ""), ("Toegangscode", ""), ("Telefoon code", ""),
+    # recovery wording without a code word
+    ("Recovery email", ""), ("Backup phone", ""), ("Recovery phone number", ""), ("Recovery answer", ""),
+    ("Recovery password", ""), ("Recovery PIN", ""), ("Recovery key", ""), ("Recovery number", ""),
+    ("Backup authenticator key", ""), ("Recovery 2FA key", ""), ("Notfall Telefon", ""),
+    ("Herstel telefoonnummer", ""), ("Mobilnummer Wiederherstellung", ""), ("Réponse de récupération", ""),
+    ("Portable de secours", ""), ("Respuesta de recuperación", ""), ("Cellulare di recupero", ""),
+    ("Number", "Recovery"), ("1", "Backup"),
+    # a stem spelled across two unrelated words is not that word
+    ("Contraseña del disco de respaldo", ""), ("Clave del disco de recuperación", ""), ("More cover codec", ""),
+    # a label the approval could not show as it is
+    ("Recovery codes\nPassword", ""), ("Recovery codes " + "x" * 80, ""),
+]
+
+
+@pytest.mark.parametrize("label,section", NOT_RECOVERY_CODES)
+def test_a_field_not_labelled_recovery_codes_is_never_read_or_typed(op, recovery, label, section):
+    op.item = item((label, OTHER, section)) if section else item((label, OTHER))
+    for field in ("", label, section, "code", "codes", "recovery", "backup", "recovery codes", "one", "1", "c"):
+        out = enter(field=field)
+        assert out["success"] is False, (field, out)
+        assert OTHER not in json.dumps(out)
+    recovery.consent.assert_not_called()   # nobody is even asked
     recovery.write.assert_not_called()
-    assert PW not in json.dumps(out) and SEED not in json.dumps(out)
+    assert "reveal" not in op.calls
 
 
-@pytest.mark.parametrize("field", ["password", "one-time password", "one", "username", "notes"])
-def test_onepassword_never_returns_the_password_username_or_totp_field(monkeypatch, field):
-    _not_codes(lambda: _op(monkeypatch).resolve_recovery_codes("op:v1:i1", field))
+RECOVERY_CODES = [
+    ("Backup codes", ""), ("Wiederherstellungscodes", ""), ("Codes de récupération", ""), ("Códigos de respaldo", ""),
+    ("Codici di backup", ""), ("Herstelcodes", ""),                                              # six languages
+    ("Recovery codes (PyPI)", ""), ("Notfallcodes", ""), ("Backup codes (1Password)", ""),
+    ("recovery codes", ""), ("Recovery codes (Postbank)", ""), ("Recovery codes (T-Mobile)", ""),
+    ("Sicherungscodes", ""), ("Reservecodes", ""), ("Notfall-Codes", ""), ("Back up codes", ""), ("Ersatzcodes", ""),
+    ("Backup-Einmalcodes", ""), ("One-time recovery codes", ""), ("Emergency codes", ""), ("Codes de secours", ""),
+    ("Códigos de recuperación", ""), ("Codici di recupero", ""), ("Posteo recovery codes", ""),
+    ("Backup codes", "Email account"), ("Recovery codes", "TOTP"),                               # sections play no part
+]
 
 
-@pytest.mark.parametrize("label", ["Backup codes", "Wiederherstellungscodes", "Codes de récupération",
-                                   "Códigos de respaldo", "Codici di backup", "Herstelcodes", "Codes", "Login codes"])
-def test_recovery_wording_in_six_languages_is_read(monkeypatch, label):
-    item = {"fields": [{"id": "x", "type": "CONCEALED", "label": label, "value": "1111-aaaa\n2222-bbbb"}]}
-    assert _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", label) == ["1111-aaaa", "2222-bbbb"]
+@pytest.mark.parametrize("label,section", RECOVERY_CODES)
+def test_the_one_recovery_code_field_is_picked_named_in_the_approval_and_typed(op, recovery, label, section):
+    codes = (label, STORED, section) if section else (label, STORED)
+    op.item = item(("Recovery number", "+49 151 23456789"), ("Code (TOTP)", SEED), codes, ("Security code", OTHER))
+    out = enter()
+    assert out["success"] is True and out["codes_left"] == 1, out
+    assert recovery.consent.call_args.args[0] == f"Type one code from '{label}' of 'Synthetic' on {ORIGIN}?"
+    assert "wxyz-1111" in typed(recovery)
+    assert not any(v in typed(recovery) + json.dumps(out) for v in (OTHER, SEED, PW, "23456789", "wxyz-2222"))
+    assert op.calls == ["metadata", "reveal"]
 
 
-@pytest.mark.parametrize("label", ["Recovery email", "Recovery e-mail address", "Backup phone", "Recovery phone number",
-                                   "Password recovery question", "Recovery answer", "Backup email", "Recovery password",
-                                   "Recovery PIN", "Notfall Telefon", "Recovery codes email", "Recovery hint",
-                                   "Recovery codes phone", "Backup codes SMS", "Recovery codes question",
-                                   "Recovery codes answer", "Recovery codes hint", "Recovery codes address",
-                                   "Wiederherstellungscodes Handy", "Recovery codes mobile", "Recovery codes username"])
-def test_a_recovery_label_that_names_another_secret_is_not_read_as_codes(monkeypatch, label):
-    item = {"fields": [{"id": "x", "type": "STRING", "label": label, "value": "1111-aaaa\n2222-bbbb"}]}
-    _not_codes(lambda: _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", label.split()[0]))
-    _not_codes(lambda: _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", label))
+@pytest.mark.parametrize("field", ["password", "one-time password", "username", "notesPlain", "code", "Code (TOTP)"])
+def test_a_field_name_from_the_agent_never_reaches_another_field(op, recovery, field):
+    op.item = item(("Code (TOTP)", SEED), ("Recovery codes", STORED))
+    assert enter(field=field)["success"] is True
+    assert "'Recovery codes'" in recovery.consent.call_args.args[0]  # what is read is what the user was shown
+    assert "wxyz-1111" in typed(recovery) and SEED not in typed(recovery) and PW not in typed(recovery)
 
 
-@pytest.mark.parametrize("label,section,kind", [
-    ("Herstel telefoonnummer", "", "STRING"), ("Herstel antwoord", "", "STRING"), ("Herstelvraag", "", "STRING"),
-    ("Mobilnummer Wiederherstellung", "", "STRING"), ("Rufnummer Wiederherstellung", "", "STRING"),
-    ("Antwort Wiederherstellung", "", "STRING"),
-    ("Réponse de récupération", "", "STRING"), ("Indice de récupération", "", "STRING"),
-    ("Portable de secours", "", "STRING"), ("Respuesta de recuperación", "", "STRING"),
-    ("Móvil de recuperación", "", "STRING"), ("Risposta di recupero", "", "STRING"),
-    ("Cellulare di recupero", "", "STRING"),
-    ("Recovery number", "", "STRING"), ("Recovery cell", "", "STRING"), ("Recovery contact", "", "STRING"),
-    ("Recovery hint", "", "STRING"), ("Recovery question", "", "STRING"),
-    ("Backup authenticator key", "", "STRING"), ("Backup authenticator key", "", "CONCEALED"),
-    ("Recovery 2FA key", "", "STRING"), ("Recovery 2FA key", "", "CONCEALED"),
-    ("Number", "Recovery", "STRING"), ("Cell", "Backup", "STRING"), ("1", "Recovery", "STRING"),
+@pytest.mark.parametrize("mark", [{"purpose": "PASSWORD"}, {"purpose": "USERNAME"}, {"type": "OTP"}, {"id": "password"}])
+def test_the_logins_own_password_username_or_totp_field_is_never_codes_whatever_its_label(op, recovery, mark):
+    op.item = item()
+    op.item["fields"] = [{"id": "x1", "type": "CONCEALED", "label": "Recovery codes", "value": OTHER, **mark}]
+    out = enter()
+    assert out["error_type"] == "recovery_field_not_codes" and "\"Recovery codes\"" in out["next"], out
+    recovery.consent.assert_not_called()
+    recovery.write.assert_not_called()
+
+
+def test_several_recovery_code_fields_refuse_until_one_is_named_exactly(op, recovery):
+    op.item = item(("Recovery codes", OTHER), ("Backup codes (old)", STORED))
+    for field in ("", "backup", "Backup codes", "recovery", "codes"):  # no prefix, no guess
+        out = enter(field=field)
+        assert out["error_type"] == "several_recovery_fields", (field, out)
+        assert "'Recovery codes'" in out["error"] and "'Backup codes (old)'" in out["error"]
+    recovery.consent.assert_not_called()
+    assert "reveal" not in op.calls
+    assert enter(field="backup CODES (old)")["success"] is True
+    assert "'Backup codes (old)'" in recovery.consent.call_args.args[0]
+    assert "wxyz-1111" in typed(recovery) and OTHER not in typed(recovery)
+
+
+def test_two_fields_with_the_same_label_refuse(op, recovery):
+    op.item = item(("Recovery codes", OTHER), ("Recovery codes", STORED, "Old"))
+    assert enter(field="Recovery codes")["error_type"] == "several_recovery_fields"
+    recovery.consent.assert_not_called()
+
+
+def _renamed(label):
+    def edit(shown):
+        shown["fields"][-1]["label"] = label
+    return edit
+
+
+def _moved_to_a_new_field(shown):
+    shown["fields"][-1].update(label="Security code")
+    shown["fields"].append({"id": "f9", "type": "CONCEALED", "label": "Recovery codes", "value": OTHER})
+
+
+@pytest.mark.parametrize("edit", [
+    lambda shown: shown.update(version=8),                        # any edit at all bumps the item version
+    _renamed("Code (TOTP)"),                                      # the approved field id now says something else
+    _renamed("Backup codes"),                                     # ... even another recovery-code label
+    _moved_to_a_new_field,                                        # the approved label now sits on another field id
+    lambda shown: shown["fields"].pop(),                          # the field is gone
+    lambda shown: shown["fields"].append(dict(shown["fields"][-1])),  # two fields answer to the approved id
+    lambda shown: shown.pop("version"),                           # no version to compare with the prompt's
 ])
-def test_a_label_without_a_code_word_is_never_read_even_with_recovery_wording(monkeypatch, label, section, kind):
-    field = section or label.split()[0]
-    entry = {"id": "x", "type": kind, "label": label, "value": "1111-aaaa\n2222-bbbb"}
-    if section:
-        entry["section"] = {"label": section}
-    _not_codes(lambda: _op(monkeypatch, {"fields": [entry]}).resolve_recovery_codes("op:v1:i1", field))
+def test_an_item_edited_between_the_approval_and_the_read_types_nothing(op, recovery, edit):
+    op.item = item(("Recovery codes", OTHER))
+    op.after_approval = item(("Recovery codes", OTHER))
+    edit(op.after_approval)
+    out = enter(field="recovery codes")
+    assert out["error_type"] == "recovery_item_changed", out
+    assert recovery.consent.call_count == 1 and op.calls == ["metadata", "reveal"]
+    recovery.write.assert_not_called()
+    assert OTHER not in json.dumps(out)
 
 
-def test_a_phone_field_before_the_real_codes_is_skipped(monkeypatch):
-    item = {"fields": [
-        {"id": "a", "type": "STRING", "label": "Recovery number", "value": "+49 151 23456789"},
-        {"id": "b", "type": "CONCEALED", "label": "Recovery codes", "value": "abcd-1234\nefgh-5678"}]}
-    assert _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", "recovery") == ["abcd-1234", "efgh-5678"]
+def test_an_item_without_any_revision_is_never_read(op, recovery):
+    op.item = item(("Recovery codes", OTHER))
+    del op.item["version"], op.item["updated_at"]
+    assert enter()["error_type"] == "recovery_item_changed"
+    recovery.write.assert_not_called()
 
 
-@pytest.mark.parametrize("label", [
-    "Recovery codes (PyPI)", "Notfallcodes", "Sicherungscodes", "Reservecodes",
-    "Recovery codes (Postbank)", "Recovery codes (LastPass)", "Recovery codes (T-Mobile)", "Recovery codes (iPhone)",
-    "Backup codes (1Password)", "Backup codes (Zipcar)", "Recovery codes (Compass)", "Backup-Einmalcodes",
-    "One-time recovery codes"])
-def test_a_code_label_that_names_the_site_or_a_compound_is_read(monkeypatch, label):
-    item = {"fields": [{"id": "x", "type": "CONCEALED", "label": label, "value": "1111-aaaa\n2222-bbbb"}]}
-    for field in (label, label.split()[0]):
-        assert _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", field) == ["1111-aaaa", "2222-bbbb"]
+@pytest.mark.parametrize("failure", [
+    RuntimeError("op timed out"),                       # run_cli gave up on a slow op
+    "[ERROR] dial tcp 1.2.3.4:443: i/o timeout",        # op's own network failure
+    "[ERROR] Too many requests. rate limit exceeded",
+    "[ERROR] something op never said before",
+    b"<html>proxy error</html>",                        # exit 0 without an item
+    b"[]",
+])
+def test_a_failed_slow_or_timed_out_metadata_read_refuses_and_reveals_nothing(op, recovery, failure):
+    op.item = item(("Recovery codes", OTHER))
+    op.metadata_failure = failure
+    out = json.loads(vault.typed_page_op(lambda: json.dumps(enter(field="recovery codes"))))
+    assert out["success"] is False, out
+    assert op.calls == ["metadata"]  # no fallback to a read the approval does not bind
+    recovery.consent.assert_not_called()
+    recovery.write.assert_not_called()
 
 
-def test_a_recovery_section_named_after_an_account_does_not_hide_the_real_codes(monkeypatch):
-    item = {"fields": [{"id": "x", "type": "CONCEALED", "label": "Backup codes", "value": "1111-aaaa",
-                        "section": {"label": "Email account"}}]}
-    assert _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", "backup codes") == ["1111-aaaa"]
+def test_a_failed_read_after_the_approval_types_nothing(op, recovery):
+    op.item = item(("Recovery codes", OTHER))
+    op.reveal_failure = RuntimeError("op timed out")
+    out = json.loads(vault.typed_page_op(lambda: json.dumps(enter(field="recovery codes"))))
+    assert out["success"] is False and out["error_type"] == "vault_network", out
+    recovery.write.assert_not_called()
 
 
-def test_a_password_labelled_field_inside_a_recovery_section_is_not_read(monkeypatch):
-    item = {"fields": [{"id": "p2", "type": "CONCEALED", "label": "password", "value": PW,
-                        "section": {"label": "Recovery codes"}}]}
-    _not_codes(lambda: _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", "recovery codes"))
+def test_the_read_before_the_approval_keeps_no_value_and_a_decline_reveals_nothing(op, recovery):
+    op.item = item(("Recovery codes", OTHER))  # FakeOp prints the value even without --reveal
+    recovery.consent.side_effect = None
+    recovery.consent.return_value = "decline"
+    backend = vault._saved_login("op:v1:i1")[0]
+    assert backend.recovery_fields("op:v1:i1") == [(rc.RecoveryField("f0", "Recovery codes",
+                                                    "op.version=7;op.updated_at=2026-11-23T10:00:00Z"), "")]
+    out = enter()
+    assert out["error_type"] == "recovery_code_declined" and "reveal" not in op.calls
+    assert OTHER not in json.dumps(out)
 
 
-@pytest.mark.parametrize("field", ["password", "otp secret", "otp_secret", "username"])
-def test_the_local_vault_never_reads_password_seed_or_identifier_keys(monkeypatch, field):
-    store = type("S", (), {"resolve_secret": lambda self, h: {
-        "username": "danil", "password": PW, "otp_secret": SEED, "recovery_codes": "1111-2222"}})()
+@pytest.fixture
+def local(recovery, monkeypatch):
+    """The local vault backend behind the tool, over a stub store holding one record."""
+    record = {"secret": {"username": "danil", "password": PW, "otp_secret": SEED, "security_code": OTHER,
+                         "code": OTHER, "recovery_codes": STORED}, "revision": "local=r1"}
+    store = SimpleNamespace(resolve_secret=lambda handle: dict(record["secret"]),
+                            resolve_secret_with_revision=lambda handle: (dict(record["secret"]), record["revision"]))
     monkeypatch.setattr(local_mod, "_store", lambda: store)
     backend = local_mod.LocalLoginBackend.__new__(local_mod.LocalLoginBackend)
-    _not_codes(lambda: backend.resolve_recovery_codes("local:x", field))
-    assert backend.resolve_recovery_codes("local:x", "recovery codes") == ["1111-2222"]
+    monkeypatch.setattr(vault, "_saved_login", lambda handle: (backend, recovery.meta))
+    return record
 
 
-def test_the_approval_names_the_field(recovery):
-    assert enter(field="recovery codes")["success"] is True
-    message = recovery.consent.call_args.args[0]
-    assert "'recovery codes'" in message and ORIGIN in message
+@pytest.mark.parametrize("field", ["", "password", "otp_secret", "otp secret", "username", "code", "security_code"])
+def test_the_local_vault_reads_only_its_recovery_codes_key(local, recovery, field):
+    assert enter(field=field)["success"] is True
+    assert "'recovery_codes'" in recovery.consent.call_args.args[0]
+    assert "wxyz-1111" in typed(recovery)
+    assert not any(v in typed(recovery) for v in (PW, SEED, OTHER))
+
+
+def test_the_local_vault_without_a_recovery_codes_key_or_edited_after_the_approval_refuses(local, recovery):
+    recovery.consent.side_effect = lambda *a, **kw: local.update(revision="local=r2") or "accept"
+    assert enter()["error_type"] == "recovery_item_changed"
+    del local["secret"]["recovery_codes"]
+    assert enter()["error_type"] == "recovery_field_not_codes"
+    recovery.write.assert_not_called()
 
 
 # ── 2. screenshots never show the code ─────────────────────────────────────────────────────────────────────
@@ -264,7 +405,7 @@ def test_an_upper_cased_spent_digest_refuses_instead_of_offering_the_code_again(
 def test_the_ledger_is_private_and_holds_no_code(recovery, tmp_path):
     enter(field="recovery codes")
     path = tmp_path / "used.json"
-    assert path.stat().st_mode & 0o777 == 0o600 and "aaaa" not in path.read_text()
+    assert path.stat().st_mode & 0o777 == 0o600 and "aaaa-1111" not in path.read_text()
 
 
 # ── 6. code parsing ────────────────────────────────────────────────────────────────────────────────────────

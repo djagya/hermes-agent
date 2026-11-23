@@ -353,8 +353,13 @@ def test_a_form_less_spa_signup_writes_end_to_end_in_the_page(monkeypatch):
 @pytest.fixture
 def recovery(core, monkeypatch, tmp_path):
     monkeypatch.setattr("agent.vault_recovery_codes._ledger_path", lambda: tmp_path / "used.json")
-    core.backend.resolve_recovery_codes = Mock(side_effect=lambda h, f: core.events.append("codes") or
-                                               ["aaaa-1111", "bbbb-2222"])
+    from agent.vault_recovery_codes import RecoveryField
+
+    def fields(handle, reveal=False):  # one recovery-code field; its value only on the read after the approval
+        core.events.append("codes" if reveal else "labels")
+        return [(RecoveryField("rc", "Recovery codes", "local=r1"), "aaaa-1111 bbbb-2222" if reveal else "")]
+
+    core.backend.recovery_fields = Mock(side_effect=fields)
     core.page["controls"] = [ctl(index=2, name="recovery_code_value recovery_code_value",
                                  label="Enter recovery code (required)")]
     monkeypatch.setattr(vault, "_saved_login", lambda handle: (core.backend, core.meta))
@@ -368,13 +373,13 @@ def enter(**kw):
 
 
 def test_one_recovery_code_per_approval_never_echoed_never_reused(recovery):
-    first = enter(field="recovery codes")
+    first = enter()
     assert first["success"] is True and first["codes_left"] == 1 and first["source"] == "recovery_codes"
-    assert recovery.events[:3] == ["consent:vault-recovery-code", "codes", "write"]
+    assert recovery.events[:4] == ["labels", "consent:vault-recovery-code", "codes", "write"]
     assert "aaaa-1111" in recovery.write.call_args.args[1]
-    second = enter(field="recovery codes")
+    second = enter()
     assert "bbbb-2222" in recovery.write.call_args.args[1] and second["codes_left"] == 0
-    third = enter(field="recovery codes")
+    third = enter()
     assert third["error_type"] == "recovery_codes_used_up"
     assert recovery.write.call_count == 2
     assert "aaaa" not in json.dumps([first, second, third]) and "bbbb" not in json.dumps([first, second, third])
@@ -383,27 +388,9 @@ def test_one_recovery_code_per_approval_never_echoed_never_reused(recovery):
 def test_a_declined_recovery_approval_reads_no_code(recovery):
     recovery.consent.side_effect = None
     recovery.consent.return_value = "decline"
-    assert enter(field="recovery codes")["error_type"] == "recovery_code_declined"
-    recovery.backend.resolve_recovery_codes.assert_not_called()
+    assert enter()["error_type"] == "recovery_code_declined"
+    assert recovery.events == ["labels"]  # the labels before the approval; never the values
     recovery.write.assert_not_called()
-
-
-def test_recovery_needs_a_field_name(recovery):
-    assert enter()["error_type"] == "recovery_field_required"
-    recovery.consent.assert_not_called()
-
-
-def test_onepassword_recovery_codes_come_from_the_named_field_or_section(monkeypatch):
-    from agent.vault_backends.onepassword import OnePasswordLoginBackend
-
-    item = {"fields": [{"label": "password", "value": "pw"},
-                       {"label": "Recovery codes", "value": "1. 0123456789abcdef\n2. fedcba9876543210"},
-                       {"label": "code 3", "value": "aaaa1bbbbccccdddd", "section": {"label": "recovery codes"}}]}
-    backend = OnePasswordLoginBackend({})
-    monkeypatch.setattr(backend, "_resolve_handle", lambda h: ("v", "i"))
-    monkeypatch.setattr(backend, "_run", lambda *a: json.dumps(item))
-    assert backend.resolve_recovery_codes("op:v:i", "recovery codes") == [
-        "0123456789abcdef", "fedcba9876543210", "aaaa1bbbbccccdddd"]
 
 
 # ── 7. one-time codes ──────────────────────────────────────────────────────────────────────────────────────

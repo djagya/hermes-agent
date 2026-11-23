@@ -704,7 +704,8 @@ def browser_vault_enter_code(
     boundary the same way a generated one is.
 
     dlz (D-0365): ``code_source="recovery"`` types ONE stored recovery/backup code from the login ``handle``'s
-    field named ``field`` (e.g. "recovery codes"), after its own approval (see :mod:`tools.browser_vault_recovery`)."""
+    one recovery-code field (``field`` only picks among several), after its own approval that names that field
+    (see :mod:`tools.browser_vault_recovery`)."""
     if code_source == "recovery":
         return enter_recovery_code(handle, task_id or "default", field)
     if code_source not in ("", "otp"):
@@ -1435,9 +1436,9 @@ BROWSER_VAULT_SCHEMA = {
         "enters it in a masked prompt, Hermes saves and fills it); enter_code (a one-time/2FA code after the "
         "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
         "their device; code_field_unrecognised means code-like boxes exist but none was recognised (read the form); "
-        "code_source=recovery with handle and field (the item's field holding recovery/backup codes, e.g. "
-        "\"recovery codes\"; never the password or TOTP field: recovery_field_not_codes) types ONE stored recovery "
-        "code after the user's approval, one approval per code, "
+        "code_source=recovery with handle types ONE stored recovery code from the item's one field named like "
+        "recovery/backup codes (none: recovery_field_not_codes, the user renames it \"Recovery codes\"; several: "
+        "several_recovery_fields lists them, pass the exact one as field) after the user's approval, one approval per code, "
         "codes_left says how many remain; a code Hermes itself obtained through its own authorized mail workflow, or a one-time "
         "code the user sent in chat for this page, goes in code with expected_origin set to the page's origin, "
         "filled directly without a prompt); unlock (backend: ask the user "
@@ -1578,9 +1579,9 @@ BROWSER_VAULT_SCHEMA = {
                                        "labelled confirm-password input in the same form; never submits. reset: the "
                                        "same write on a choose/reset-a-new-password form, after its own approval."},
             "code_source": {"type": "string", "enum": ["otp", "recovery"], "description":
-                            "enter_code only: recovery types one stored recovery/backup code (needs handle and field)."},
+                            "enter_code only: recovery types one stored recovery/backup code (needs handle)."},
             "field": {"type": "string", "description":
-                      "enter_code with code_source=recovery: the vault item's field holding the codes, e.g. \"recovery codes\"."},
+                      "enter_code with code_source=recovery, only after several_recovery_fields: the exact name of the one to use."},
             "secret_field": {"type": "string", "description":
                 "letter_login only: the field for the letter's password/code (name, id or visible label) when not recognised."},
             "identifier_field": {"type": "string", "description":
