@@ -75,9 +75,9 @@ def browser_dialog(
         return json.dumps({
             "success": False,
             "error": (
-                "No CDP supervisor is attached to this task: no browser "
-                "session has been started yet. Call browser_exec or "
-                "/browser connect first."
+                "No CDP supervisor is attached to this task now (none was "
+                "started, or it stopped at a turn end with no dialog open). "
+                "Call browser_exec or /browser connect to attach one."
             ),
         })
     from tools.browser_payment_surface import fenced_native

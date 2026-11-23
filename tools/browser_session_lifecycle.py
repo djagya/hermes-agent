@@ -160,8 +160,11 @@ def cleanup_single_session(cache_key: str) -> None:
 def cleanup_browser(task_id: Optional[str] = None) -> None:
     """Close the sessions serving ``task_id``: its exact key, its hybrid ``::local`` sidecar, and the
     served-profile-tagged keys browser_exec builds for it (``<task>@<home>``). Per-turn cleanup calls this
-    with the bare task id."""
+    with the bare task id; it also stops the task's own CDP supervisor (browser_exec attaches it under the bare
+    task id, outside any session), first, so a failing session close cannot skip it."""
+    from tools.browser_session_cdp import stop_turn_supervisor
     task = task_id or "default"
+    stop_turn_supervisor(task)
     bs = _bs()
     with bs._cleanup_lock:
         if bs.is_local_sidecar_key(task):

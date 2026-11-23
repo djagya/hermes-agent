@@ -188,6 +188,26 @@ def ensure_cdp_supervisor(task_id: str) -> None:
         logger.debug("CDP supervisor attach for task=%s failed (non-fatal): %s", task_id, exc)
 
 
+def stop_turn_supervisor(task_id: str) -> None:
+    """dlz (J-0001, option c): the turn's own teardown stops ``task_id``'s CDP supervisor, so its automatic CDP
+    traffic and redials do not keep the browser lease looking used between turns (the lease then goes idle on
+    browser-control's TTL; the next browser call attaches a fresh supervisor). Kept running: a supervisor inside a
+    card payment (the lock's native socket is the only way out of it, payment_done / payment_close; a new one would
+    answer ``payment_native_lost``), and one holding a dialog for the user (browser_dialog answers it next turn; its
+    own watchdog dismisses it after ``dialog_timeout_s``). A kept one ends with its lease (released, recycled or
+    taken) or a later turn end. The payment check and the stop decision are one step under the claim lock
+    (:func:`~tools.browser_payment_surface.stop_for_turn_end`), and only the supervisor that passed it is stopped."""
+    try:
+        from tools.browser_payment_surface import stop_for_turn_end
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        supervisor = SUPERVISOR_REGISTRY.get(task_id)
+        if supervisor is None or supervisor.snapshot().pending_dialogs or not stop_for_turn_end(supervisor):
+            return
+        SUPERVISOR_REGISTRY.stop_exact(task_id, supervisor)
+    except Exception as exc:  # health: allow BLE001 -- unknown payment state: keep it, as for a payment
+        logger.debug("CDP supervisor turn-end stop for task=%s failed (kept): %s", task_id, exc)
+
+
 def stop_cdp_supervisor(task_id: str) -> None:
     """Stop ``task_id``'s CDP supervisor if one exists."""
     try:
