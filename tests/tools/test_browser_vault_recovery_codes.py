@@ -70,11 +70,54 @@ def test_recovery_wording_in_six_languages_is_read(monkeypatch, label):
 
 @pytest.mark.parametrize("label", ["Recovery email", "Recovery e-mail address", "Backup phone", "Recovery phone number",
                                    "Password recovery question", "Recovery answer", "Backup email", "Recovery password",
-                                   "Recovery PIN", "Notfall Telefon", "Recovery codes email", "Recovery hint"])
+                                   "Recovery PIN", "Notfall Telefon", "Recovery codes email", "Recovery hint",
+                                   "Recovery codes phone", "Backup codes SMS", "Recovery codes question",
+                                   "Recovery codes answer", "Recovery codes hint", "Recovery codes address",
+                                   "Wiederherstellungscodes Handy", "Recovery codes mobile", "Recovery codes username"])
 def test_a_recovery_label_that_names_another_secret_is_not_read_as_codes(monkeypatch, label):
     item = {"fields": [{"id": "x", "type": "STRING", "label": label, "value": "1111-aaaa\n2222-bbbb"}]}
     _not_codes(lambda: _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", label.split()[0]))
     _not_codes(lambda: _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", label))
+
+
+@pytest.mark.parametrize("label,section,kind", [
+    ("Herstel telefoonnummer", "", "STRING"), ("Herstel antwoord", "", "STRING"), ("Herstelvraag", "", "STRING"),
+    ("Mobilnummer Wiederherstellung", "", "STRING"), ("Rufnummer Wiederherstellung", "", "STRING"),
+    ("Antwort Wiederherstellung", "", "STRING"),
+    ("Réponse de récupération", "", "STRING"), ("Indice de récupération", "", "STRING"),
+    ("Portable de secours", "", "STRING"), ("Respuesta de recuperación", "", "STRING"),
+    ("Móvil de recuperación", "", "STRING"), ("Risposta di recupero", "", "STRING"),
+    ("Cellulare di recupero", "", "STRING"),
+    ("Recovery number", "", "STRING"), ("Recovery cell", "", "STRING"), ("Recovery contact", "", "STRING"),
+    ("Recovery hint", "", "STRING"), ("Recovery question", "", "STRING"),
+    ("Backup authenticator key", "", "STRING"), ("Backup authenticator key", "", "CONCEALED"),
+    ("Recovery 2FA key", "", "STRING"), ("Recovery 2FA key", "", "CONCEALED"),
+    ("Number", "Recovery", "STRING"), ("Cell", "Backup", "STRING"), ("1", "Recovery", "STRING"),
+])
+def test_a_label_without_a_code_word_is_never_read_even_with_recovery_wording(monkeypatch, label, section, kind):
+    field = section or label.split()[0]
+    entry = {"id": "x", "type": kind, "label": label, "value": "1111-aaaa\n2222-bbbb"}
+    if section:
+        entry["section"] = {"label": section}
+    _not_codes(lambda: _op(monkeypatch, {"fields": [entry]}).resolve_recovery_codes("op:v1:i1", field))
+
+
+def test_a_phone_field_before_the_real_codes_is_skipped(monkeypatch):
+    item = {"fields": [
+        {"id": "a", "type": "STRING", "label": "Recovery number", "value": "+49 151 23456789"},
+        {"id": "b", "type": "CONCEALED", "label": "Recovery codes", "value": "abcd-1234\nefgh-5678"}]}
+    assert _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", "recovery") == ["abcd-1234", "efgh-5678"]
+
+
+@pytest.mark.parametrize("label", [
+    "Recovery codes (PyPI)", "Notfallcodes", "Sicherungscodes", "Reservecodes",
+    "Recovery codes (Postbank)", "Recovery codes (LastPass)", "Recovery codes (T-Mobile)", "Recovery codes (iPhone)",
+    "Backup codes (1Password)", "Backup codes (Zipcar)", "Recovery codes (Compass)", "Backup-Einmalcodes",
+    "One-time recovery codes"])
+def test_a_code_label_that_names_the_site_or_a_compound_is_read(monkeypatch, label):
+    item = {"fields": [{"id": "x", "type": "CONCEALED", "label": label, "value": "1111-aaaa\n2222-bbbb"}]}
+    for field in (label, label.split()[0]):
+        assert _op(monkeypatch, item).resolve_recovery_codes("op:v1:i1", field) == ["1111-aaaa", "2222-bbbb"]
 
 
 def test_a_recovery_section_named_after_an_account_does_not_hide_the_real_codes(monkeypatch):
@@ -194,6 +237,9 @@ _KEY = "ab" * 32
     json.dumps({"key": "zz" * 32, "used": []}).encode(),              # 64 characters but not hex
     json.dumps({"key": _KEY, "used": [["x"]]}).encode(),              # an entry that is not a digest string
     json.dumps({"key": _KEY, "used": [1]}).encode(),
+    json.dumps({"key": _KEY, "used": ["A" * 64]}).encode(),           # a digest must be 64 lower-case hex
+    json.dumps({"key": _KEY, "used": ["junk"]}).encode(),
+    b"[" * 200000,                                                   # json.loads raises RecursionError
 ])
 def test_an_unreadable_ledger_refuses_instead_of_forgetting_spent_codes(recovery, tmp_path, raw):
     assert enter(field="recovery codes")["success"] is True
@@ -202,6 +248,17 @@ def test_an_unreadable_ledger_refuses_instead_of_forgetting_spent_codes(recovery
     assert out["error_type"] == "recovery_ledger_unreadable"
     assert recovery.write.call_count == 1
     assert (tmp_path / "used.json").read_bytes() == raw  # never re-keyed
+
+
+def test_an_upper_cased_spent_digest_refuses_instead_of_offering_the_code_again(tmp_path, monkeypatch):
+    path = tmp_path / "vault" / "used.json"
+    monkeypatch.setattr(rc, "_ledger_path", lambda: path)
+    assert rc.take_unused("i1", ["abcd-1234", "efgh-5678"]) == ("abcd-1234", 1)
+    data = json.loads(path.read_text())
+    data["used"] = [d.upper() for d in data["used"]]
+    path.write_text(json.dumps(data))
+    with pytest.raises(rc.RecoveryLedgerUnreadable):
+        rc.take_unused("i1", ["abcd-1234", "efgh-5678"])
 
 
 def test_the_ledger_is_private_and_holds_no_code(recovery, tmp_path):
