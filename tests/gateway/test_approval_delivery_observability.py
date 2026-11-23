@@ -21,7 +21,7 @@ import pytest
 # when the suite runs from a developer worktree — the home-I/O guard is fixture-scoped and only
 # active during a test, so the probe must happen here at collection time.
 import gateway.run as gateway_run
-from gateway.run_turn_runner import TurnRunner, _ExecApprovalDeclined
+from gateway.run_turn_runner import TurnRunner
 from gateway.platforms.base import SendResult
 from tools import approval as _approval
 from tools import approval_gateway_wait as wait_mod
@@ -141,11 +141,7 @@ def test_text_fallback_send_leaves_a_record(tmp_path, monkeypatch, caplog, text_
     runner._close_native_stream_boundary = lambda _why: None
 
     with caplog.at_level(logging.INFO, logger="gateway.run"):
-        if text_ok:
-            runner._approval_notify_sync(dict(APPROVAL, request_id="req-1"))
-        else:  # nobody saw the prompt: the notifier refuses instead of arming a timeout nobody can answer
-            with pytest.raises(_ExecApprovalDeclined, match="undeliverable: Not connected"):
-                runner._approval_notify_sync(dict(APPROVAL, request_id="req-1"))
+        runner._approval_notify_sync(dict(APPROVAL, request_id="req-1"))
 
     text = [r for r in caplog.records if r.message.startswith("Exec approval text prompt send")]
     assert len(text) == 1 and text[0].levelno == level
@@ -153,43 +149,9 @@ def test_text_fallback_send_leaves_a_record(tmp_path, monkeypatch, caplog, text_
     assert "rm -rf" not in text[0].message
 
 
-def test_api_server_approval_that_cannot_be_shown_is_refused_at_once(tmp_path, monkeypatch):
-    """11-19 Claude Code relay: an exec approval on the api_server surface (HTTP request/response, so
-    send() always fails) waited the full 5-minute timeout for an answer nobody could give. The wait
-    must settle as ``notify_failed`` immediately, which the tool turns into "BLOCKED: Failed to send
-    approval request to user"."""
-    (tmp_path / "config.yaml").write_text("display: {}")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    _clear_queues()
-    monkeypatch.setattr(wait_mod._ctx, "_fire_approval_hook", lambda name, **kw: None)
-
-    def _never_wait(*_a, **_k):
-        raise AssertionError("the approval wait must not start for a prompt nobody could see")
-    monkeypatch.setattr(wait_mod, "_poll_event", _never_wait)
-
-    class _ApiServerAdapter:  # gateway.platforms.api_server.APIServerAdapter.send, verbatim result
-        typed_command_prefix = "/"
-
-        def pause_typing_for_chat(self, chat_id: str) -> None:
-            return None
-
-        async def send(self, chat_id: str, message: str, **k: Any) -> SendResult:
-            return SendResult(success=False, error="API server uses HTTP request/response, not send()")
-
-    runner = object.__new__(TurnRunner)
-    runner._ctx = SimpleNamespace(
-        _status_adapter=_ApiServerAdapter(), _status_chat_id="C1", _status_thread_metadata=None, session_key=SESSION)
-    runner._schedule = lambda coro, _label: SimpleNamespace(result=lambda timeout=None, _r=asyncio.run(coro): _r)
-    runner._close_native_stream_boundary = lambda _why: None
-
-    decision = wait_mod._await_gateway_decision(SESSION, runner._approval_notify_sync, dict(APPROVAL), timeout_s=300)
-
-    assert decision == {"resolved": False, "choice": None, "notify_failed": True}
-
-
-def _text_prompt_decision(tmp_path, monkeypatch, send_result, owner=None):
-    """Drive the real wait with a text-only adapter whose send() returns ``send_result``.
-    Returns (decision, waited): ``waited`` is True when the approval wait actually started."""
+def _approval_decision(tmp_path, monkeypatch, adapter, owner=None):
+    """Drive the real wait with ``adapter`` as the prompt surface. Returns (decision, waited): ``waited`` is
+    True when the approval wait started (the prompt stayed pending for an answer)."""
     (tmp_path / "config.yaml").write_text("display: {}")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr("gateway.platforms.base_exec_approval.approval_timeout_seconds", lambda: 300)
@@ -198,19 +160,9 @@ def _text_prompt_decision(tmp_path, monkeypatch, send_result, owner=None):
     monkeypatch.setattr(wait_mod._ctx, "_fire_approval_hook", lambda name, **kw: None)
     polled = []
     monkeypatch.setattr(wait_mod, "_poll_event", lambda *a, **k: polled.append(1) or "timeout")
-
-    class _TextAdapter:
-        typed_command_prefix = "/"
-
-        def pause_typing_for_chat(self, chat_id: str) -> None:
-            return None
-
-        async def send(self, chat_id: str, message: str, **k: Any) -> SendResult:
-            return send_result
-
     runner = object.__new__(TurnRunner)
     runner._ctx = SimpleNamespace(
-        _status_adapter=_TextAdapter(), _status_chat_id="C1", _status_thread_metadata=None, session_key=SESSION)
+        _status_adapter=adapter, _status_chat_id="C1", _status_thread_metadata=None, session_key=SESSION)
     runner._approval_owner = owner
     runner._schedule = lambda coro, _label: SimpleNamespace(result=lambda timeout=None, _r=asyncio.run(coro): _r)
     runner._close_native_stream_boundary = lambda _why: None
@@ -218,25 +170,54 @@ def _text_prompt_decision(tmp_path, monkeypatch, send_result, owner=None):
     return decision, bool(polled)
 
 
-def test_api_canonical_session_prompt_is_registered_and_waits_despite_failed_send(tmp_path, monkeypatch):
-    """The API server's send() always fails, but a session authority publishes the prompt to its own
-    clients (``POST /v1/runs/{id}/approval``): it must be registered and waited on, never refused."""
+class _ApiServerAdapter:  # gateway.platforms.api_server.APIServerAdapter: no push, send() is a stub
+    typed_command_prefix = "/"
+    supports_async_delivery = False
+
+    def pause_typing_for_chat(self, chat_id: str) -> None:
+        return None
+
+    async def send(self, chat_id: str, message: str, **k: Any) -> SendResult:
+        return SendResult(success=False, error="API server uses HTTP request/response, not send()")
+
+
+def test_api_server_approval_that_cannot_be_shown_is_refused_at_once(tmp_path, monkeypatch):
+    """11-19 Claude Code relay: an exec approval on the api_server surface (HTTP request/response, no
+    push) waited the full 5-minute timeout for an answer nobody could give. It must settle as
+    ``notify_failed`` at once, which the tool turns into "BLOCKED: Failed to send approval request"."""
+    decision, waited = _approval_decision(tmp_path, monkeypatch, _ApiServerAdapter())
+    assert decision == {"resolved": False, "choice": None, "notify_failed": True}
+    assert not waited
+
+
+def test_api_canonical_session_prompt_is_registered_and_waits(tmp_path, monkeypatch):
+    """The same surface with a session authority: the authority publishes the prompt to its own clients
+    (``POST /v1/runs/{id}/approval``), so it is registered and waited on, never refused."""
     registered = []
     authority = SimpleNamespace(
         check_approval_generation=lambda *a: None,
         register_approval=lambda sid, gen, route, data, timeout_s=None: registered.append(data))
-    decision, waited = _text_prompt_decision(
-        tmp_path, monkeypatch, SendResult(success=False, error="API server uses HTTP request/response, not send()"),
-        owner=(authority, "s1", 1))
+    decision, waited = _approval_decision(tmp_path, monkeypatch, _ApiServerAdapter(), owner=(authority, "s1", 1))
     assert waited and len(registered) == 1
     assert decision.get("notify_failed") is not True
 
 
-@pytest.mark.parametrize("raw", [{"delivery_uncertain": True}, {"ambiguous": True}, {"partial_overflow": True}])
-def test_uncertain_text_send_keeps_the_approval_armed(tmp_path, monkeypatch, raw):
-    """A lost Telegram/relay ack or a partly sent prompt may already be in the chat: the entry stays
-    pending so a typed /approve still resolves it."""
-    decision, waited = _text_prompt_decision(
-        tmp_path, monkeypatch, SendResult(success=False, error="timed out", raw_response=raw))
+def test_card_with_a_lost_ack_then_a_failed_text_send_stays_pending(tmp_path, monkeypatch):
+    """Telegram's card send turns a lost ack (``TimedOut``) into an unmarked ``success=False``: the card
+    with live buttons may be in the chat. The text fallback then fails for certain. A push surface never
+    refuses on a send outcome, so the prompt stays pending for a tap or a typed /approve."""
+    class _TelegramLike:
+        typed_command_prefix = "/"
+
+        def pause_typing_for_chat(self, chat_id: str) -> None:
+            return None
+
+        async def send_exec_approval(self, *a: Any, **k: Any) -> SendResult:
+            return SendResult(success=False, error="Timed out")
+
+        async def send(self, chat_id: str, message: str, **k: Any) -> SendResult:
+            return SendResult(success=False, error="Not connected")
+
+    decision, waited = _approval_decision(tmp_path, monkeypatch, _TelegramLike())
     assert waited
     assert decision.get("notify_failed") is not True

@@ -108,12 +108,13 @@ class _NoStreamConsumer(RuntimeError):
 
 class _ExecApprovalDeclined(RuntimeError):
     """The approval prompt cannot be shown: the connector refused the card's destination, or the
-    surface refused the plain-text prompt too (the API server has no send()).
+    surface cannot push a prompt at all (the API server's ``send()`` is a stub) and no session
+    authority answers it.
 
     Raised (not returned) so it propagates out of `_approval_notify_sync` to
     `_await_gateway_decision`, whose notify-failure path drops the central
-    approval queue entry and unblocks the waiting tool at once ("BLOCKED: Failed to send approval
-    request"), instead of waiting out the approval timeout for an answer nobody can give.
+    approval queue entry and unblocks the waiting tool. A plain return
+    suppressed the text fallback but left that entry pending.
     """
 
 
@@ -748,8 +749,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from gateway.run import _approval_send_outcome, _interim_metadata, _redact_approval_command
         from gateway.run_turn_runner_approval_settle import register_timeout_notice
         from gateway.run_turn_runner_approval_text import approval_text_prompt
+        from gateway.wake import adapter_supports_push
         ctx = self._ctx
         adapter = ctx._status_adapter
+        if self._approval_owner is None and not adapter_supports_push(adapter):
+            # Nobody can see a prompt here and nobody else answers it: refuse now, not at the timeout.
+            raise _ExecApprovalDeclined("exec approval undeliverable: this surface cannot show a prompt")
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.
@@ -832,7 +837,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # in Slack threads and reserved by Matrix clients.
         msg = approval_text_prompt(adapter, ctx._status_chat_id, ctx.session_key or "", approval_data.get("request_id"),
                                    cmd, desc, getattr(adapter, "typed_command_prefix", "/"), **flags)
-        undelivered = None
         try:
             # Mark as approval prompt: WeCom routes it through the control lane and Telegram pushes it
             # in "important" mode (#132516). Never ``notify`` — A2A reads that as the turn-final reply.
@@ -847,21 +851,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                            "Exec approval text prompt send (success=%s, message_id=%s, error=%s, request_id=%s, session=%s)",
                            getattr(res, "success", None), getattr(res, "message_id", None), getattr(res, "error", None),
                            approval_data.get("request_id"), ctx.session_key)
-                # Refuse at once only on DEFINITE non-delivery with nobody else able to answer: a session
-                # authority publishes the prompt to its own clients, and an uncertain send (lost ack,
-                # partial chunks) may already be in the chat. Both keep the registered, armed wait.
-                if (getattr(res, "success", None) is False and self._approval_owner is None
-                        and _approval_send_outcome(fut, timeout=0) in ("failed", "declined")):
-                    undelivered = getattr(res, "error", None) or "send failed"
-                else:
-                    # No card to edit on the text path: the prompt has no buttons to drop and carries
-                    # the /approve instructions, so the timeout notice is posted as a new message.
-                    register_timeout_notice(self, approval_data, command=cmd, card_message_id=None)
+                # No card to edit on the text path: the prompt has no buttons to drop and carries
+                # the /approve instructions, so the timeout notice is posted as a new message.
+                register_timeout_notice(self, approval_data, command=cmd, card_message_id=None)
         except Exception as e:
             logger.error("Failed to send approval request: %s", e)
-        if undelivered is not None:
-            # Nobody saw the prompt and nobody else can answer it: refuse now (no timeout notice either).
-            raise _ExecApprovalDeclined(f"exec approval undeliverable: {undelivered}")
 
     # ── run_sync phases ─────────────────────────────────────────────────────────────────────
 
