@@ -218,8 +218,11 @@ def test_an_item_edited_between_the_approval_and_the_read_types_nothing(op, reco
 def test_an_item_without_any_revision_is_never_read(op, recovery):
     op.item = item(("Recovery codes", OTHER))
     del op.item["version"], op.item["updated_at"]
-    assert enter()["error_type"] == "recovery_item_changed"
+    out = enter()
+    assert out["error_type"] == "recovery_item_unversioned" and "call again" not in out["next"].lower(), out
+    recovery.consent.assert_not_called()   # nobody is asked for an approval that can never bind
     recovery.write.assert_not_called()
+    assert "reveal" not in op.calls
 
 
 @pytest.mark.parametrize("failure", [
@@ -285,7 +288,9 @@ def test_the_local_vault_without_a_recovery_codes_key_or_edited_after_the_approv
     recovery.consent.side_effect = lambda *a, **kw: local.update(revision="local=r2") or "accept"
     assert enter()["error_type"] == "recovery_item_changed"
     del local["secret"]["recovery_codes"]
-    assert enter()["error_type"] == "recovery_field_not_codes"
+    out = enter()
+    assert out["error_type"] == "recovery_field_not_codes", out
+    assert "1Password" in out["next"] and "Recovery codes" not in out["next"], out  # renaming does not help here
     recovery.write.assert_not_called()
 
 

@@ -82,9 +82,16 @@ def _fields(backend: Any, handle: str, reveal: bool) -> tuple[list, Optional[str
         return [], _refuse("secret_resolution_failed", "Could not read the saved item. Nothing was written.")
 
 
+_NO_FIELD_NEXT = {"onepassword": "Tell the user to name the field that holds the codes \"Recovery codes\" in the "
+                                 "1Password item."}
+_NO_FIELD_ELSEWHERE = ("Stored recovery codes are only read from 1Password items, so renaming a field here does not "
+                       "help. Ask the user to type the code in chat.")
+
+
 def _choose_field(backend: Any, handle: str, field: str) -> tuple[Any, Optional[str]]:
     """Before the approval, from metadata only: the one field a code may come from, or the refusal."""
     from agent.vault_recovery_codes import choose_field
+    from agent.vault_store import revision_binding
 
     fields, refusal = _fields(backend, handle, reveal=False)
     if refusal is not None:
@@ -92,13 +99,15 @@ def _choose_field(backend: Any, handle: str, field: str) -> tuple[Any, Optional[
     candidates = [found for found, _value in fields]
     chosen = choose_field(field, candidates)
     if chosen is not None:
+        if revision_binding(chosen.revision) == "none":  # the read after the approval could never bind: don't ask
+            return None, _refuse("recovery_item_unversioned", "The saved item reports no version or change time, so "
+                                 "a recovery code cannot be tied to what the user approves. Nothing was written.",
+                                 next="Ask the user to type the code in chat; this item cannot be used for it.")
         return chosen, None
     if not candidates:
         return None, _refuse("recovery_field_not_codes", "This login has no field whose name says recovery or backup "
                              "codes (its password, username and one-time-password fields are never read). Nothing "
-                             "was written.",
-                             next="Tell the user to name the field that holds the codes \"Recovery codes\" in the "
-                                  "password manager.")
+                             "was written.", next=_NO_FIELD_NEXT.get(backend.name, _NO_FIELD_ELSEWHERE))
     labels = ", ".join(repr(c.label) for c in candidates)
     return None, _refuse("several_recovery_fields", f"Several fields of this login could hold recovery codes: "
                          f"{labels}. Nothing was written.",

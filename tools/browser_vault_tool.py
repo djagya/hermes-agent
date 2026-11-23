@@ -1437,7 +1437,7 @@ BROWSER_VAULT_SCHEMA = {
         "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
         "their device; code_field_unrecognised means code-like boxes exist but none was recognised (read the form); "
         "code_source=recovery with handle types ONE stored recovery code from the item's one field named like "
-        "recovery/backup codes (none: recovery_field_not_codes, the user renames it \"Recovery codes\"; several: "
+        "recovery/backup codes (none: recovery_field_not_codes, on 1Password the user renames it \"Recovery codes\"; several: "
         "several_recovery_fields lists them, pass the exact one as field) after the user's approval, one approval per code, "
         "codes_left says how many remain; a code Hermes itself obtained through its own authorized mail workflow, or a one-time "
         "code the user sent in chat for this page, goes in code with expected_origin set to the page's origin, "
