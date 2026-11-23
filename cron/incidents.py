@@ -36,7 +36,7 @@ AGENT_REPORTED_FAILURE_TYPE = "agent_reported"
 _FAILURE_TYPE_ORDER = (
     # Rate-limit evidence only: HTTP 429, its reason phrase, or the SDK's ``RateLimitError`` class. A bare
     # "quota" is not a signal (it labelled spending, disk and calendar quota errors ``rate_limit``).
-    ("rate_limit", (r"\b429\b", "rate limit", "ratelimit", "rate_limit", "too many requests", "usage limit", "resource_exhausted")),
+    ("rate_limit", (r"\b429\b", "rate limit", "ratelimit", "rate_limit", "too many requests", "usage limit", "resource_exhausted", "resourceexhausted")),
     ("timeout", ("timeout", "timed out")),
     # Runtime auth evidence only: a bare "auth" substring matched agent prose ("OAuth",
     # "scoped-auth route", "authorized") and mislabelled ordinary verdicts as credential failures.
@@ -64,7 +64,7 @@ _MAX_SIGNATURE_ERROR_CHARS = 200
 _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
     (r"\b\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+|,\d{3}(?![\d,]))?)?(?:z|[+-]\d{2}:?\d{2})?)?", "#t"),
     (r"\b\d{8}[t_-]\d{6}z?\b", "#t"),
-    (r"(?<![:\w.])\d{2}:\d{2}:\d{2}(?:\.\d+|,\d{3}(?![\d,]))?(?![:\d])", "#t"),
+    (r"(?<![:\w.])\d{2}:\d{2}:\d{2}(?:\.\d+|,\d{3}(?![\d,]))?(?!\d|:\d)", "#t"),
     (r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "#h"),
     (r"\b[0-9a-f]{32,64}\b", "#h"),
     (r"\b\d+\s*bytes?\b", "#b"),
@@ -73,10 +73,10 @@ _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
 # Temp names by context and template: the entry right under a temp root (``/tmp``, ``/var/tmp``,
 # ``/private/tmp``, macOS ``$TMPDIR`` ``/var/folders/*/*/T``) is masked only when it is Python's
 # ``tempfile`` name (``tmp`` + 8 of ``[a-z0-9_]``) or a ``mktemp`` template ``<word>.<6-10 random>``
-# (``tmp.XXXXXXXXXX``, ``worktree.XXXXXX``) whose random part has 2+ digits or capitals. A stable
+# (``tmp.XXXXXXXXXX``, ``worktree.XXXXXX``) whose random part mixes lowercase with 2+ digits or capitals. A stable
 # name (``build1.log``, ``Report2024.csv``) counts. Plain string checks: linear on any error length.
 _TEMP_ENTRY_RE = re.compile(r"(?<![\w.-])((?:/private)?(?:/tmp|/var/tmp|/var/folders/[^/\s]+/[^/\s]+/T)/)([^/\s:;,'\"()]+)")
-_PY_TEMP_NAME_RE = re.compile(r"tmp[a-z\d_]{8}(?:\.[A-Za-z\d]{1,10})?")  # mkstemp(suffix=".json") too
+_PY_TEMP_NAME_RE = re.compile(r"tmp[a-z\d_]{8}(?:\.[A-Za-z\d]{1,10})*")  # mkstemp(suffix=".tar.gz") too
 
 
 def _is_temp_name(entry: str) -> bool:
@@ -84,7 +84,7 @@ def _is_temp_name(entry: str) -> bool:
         return True
     word, dot, rand = entry.rpartition(".")
     return bool(dot and word and 6 <= len(rand) <= 10 and rand.isascii() and rand.isalnum()
-                and sum(c.isdigit() or c.isupper() for c in rand) >= 2)
+                and any(c.islower() for c in rand) and sum(c.isdigit() or c.isupper() for c in rand) >= 2)
 
 
 def _mask_temp_entry(match: re.Match) -> str:

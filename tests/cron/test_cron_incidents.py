@@ -130,7 +130,8 @@ def _run_tokens(rng):
 
     def mktemp(n):  # mktemp's X's; a draw with under 2 digits/capitals is not masked (accepted: one extra alert)
         name = draw(alnum, n)
-        return name if sum(c.isdigit() or c.isupper() for c in name) >= 2 else mktemp(n)
+        ok = any(c.islower() for c in name) and sum(c.isdigit() or c.isupper() for c in name) >= 2
+        return name if ok else mktemp(n)
     stamp = f"2026-11-{rng.randint(10, 28)}T{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}Z"
     return {
         "tmp6": mktemp(6),  # mktemp -d /tmp/worktree.XXXXXX
@@ -150,7 +151,8 @@ def _run_tokens(rng):
 
 _PER_RUN_TEMPLATE = (
     "script failed: {asctime} ERROR manifest rejected at /tmp/worktree.{tmp6}/scripts/sync.mjs:12:34\n"
-    "log /var/folders/ab/cd12/T/tmp.{tmp10} and /private/tmp/{py}/out.json at {clock}, /tmp/{pyfile}; "
+    "log /var/folders/ab/cd12/T/tmp.{tmp10} and /private/tmp/{py}/out.json at {clock}, /tmp/{pyfile}.gz; "
+    "{clock}: manifest missing; "
     "receipt /srv/receipts/{compact}.json sha256={sha} sha1={sha1} md5={md5} ({bytes} bytes) run {uuid} "
     "started {stamp}, waited {secs}s"
 )
@@ -180,6 +182,8 @@ _MUST_DIFFER = (
     ("open /tmp/a.sqlite3 failed", "open /tmp/a.sqlite4 failed"),
     ("2026-11-24T10:00:00,404,/api failed", "2026-11-24T10:00:00,500,/api failed"),
     ("at 10:00:00,5 rows rejected", "at 10:00:00,6 rows rejected"),
+    ("open /tmp/report.202401 failed", "open /tmp/report.202402 failed"),
+    ("open /tmp/data.SQLITE3 failed", "open /tmp/data.SQLITE4 failed"),
     ("disk full: 512 MiB left", "disk full: 768 MiB left"),
 )
 
@@ -277,6 +281,7 @@ def test_failure_type_classification(monkeypatch, tmp_path):
         ("HTTP 429: rate limit exceeded", "rate_limit"),
         ("RateLimitError: Too Many Requests", "rate_limit"),
         ("google.api_core.exceptions.ResourceExhausted: RESOURCE_EXHAUSTED", "rate_limit"),
+        ("google.api_core.exceptions.ResourceExhausted: too many concurrent requests", "rate_limit"),
         ("configuration validation blocked the run", "config"),
         ("script exited with code 1", "script"),
         ("agent crashed mid-conversation", "agent"),
