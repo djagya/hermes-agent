@@ -429,6 +429,7 @@ class _Owner(FakeClient):
         super().__init__(known=())
         self.titles, self.frozen = dict(titles or {}), dict(frozen or {})
         self.history = dict(history or {})
+        self.keys = {}  # the launch key each session was created with (the owner holds it, not the policy)
 
     def _snapshot(self, sid):
         reply = snapshot(sid)
@@ -450,11 +451,16 @@ class _Owner(FakeClient):
                 except RuntimeStoreError as exc:
                     raise GatewayClientError("invalid_params") from exc
                 sid = f"local-{len(self.frozen)}"
+                self.keys[sid] = params.get("api_key")
                 self.frozen[sid], self.titles[title] = json.loads(policy.request_json), sid
             return self._snapshot(self.titles[title])
         if method == "session.resume":
             if params["session_id"] not in self.frozen:
                 raise GatewayClientError("not_found")
+            key = params.get("api_key")
+            if key and self.keys.get(params["session_id"]) != key:  # rebind_launch_key's rule
+                from hermes_cli.gateway_client import GatewayRPCError
+                raise GatewayRPCError("admission_conflict")
             return self._snapshot(params["session_id"])
         return {"status": "ok", "detached": True}
 
@@ -478,10 +484,10 @@ def _classic_launch(monkeypatch, owner):
     monkeypatch.setitem(DIRECT_ALIASES, "fast", DirectAlias("vendor/fast-1", "custom", "https://fast.example/v1",
                                                             api_key="sk-alias"))
 
-    def launch(*, model=None, provider=None, skills=None, required=None, ignore_rules=False, reasoning=None,
+    def launch(*, model=None, provider=None, skills=None, required=None, ignore_rules=False, reasoning=None, api_key=None,
                toolsets=None, max_turns=None, checkpoints=False, run_budget=None, verbose=None, resume=None,
                create_title=None, leases=None, owned_elsewhere=()):
-        host = cli_module._build_cli_from_args(model, toolsets, provider, reasoning, None, None, max_turns, run_budget,
+        host = cli_module._build_cli_from_args(model, toolsets, provider, reasoning, api_key, None, max_turns, run_budget,
                                                verbose, False, resume, checkpoints, False, ignore_rules, skills,
                                                required_skills=required, create_title=create_title)
         if leases is not None:  # the CLI's active-session lease, claimed in run() before the session opens
@@ -556,6 +562,21 @@ def test_create_if_missing_into_a_session_that_appeared_meanwhile(monkeypatch, c
             launch(create_title="T", model="m1")
         assert exit_info.value.code == 1
         assert "No session found matching 'T' and a new titled session could not be created" in capsys.readouterr().err
+    finally:
+        conn.close()
+
+
+def test_create_if_missing_with_a_typed_key_into_a_session_without_it_is_refused(monkeypatch):
+    """A title that raced into a session launched without the typed --api-key is refused, as main's keyed
+    resume after its create was; a fresh keyed create opens."""
+    owner = _Owner(titles={"T": "local-old"}, frozen={"local-old": {"model": "m-old"}})
+    launch, conn = _classic_launch(monkeypatch, owner)
+    try:
+        with pytest.raises(SystemExit) as refused:
+            launch(create_title="T", model="m-old", api_key="sk-typed")
+        assert refused.value.code == 1
+        fresh = launch(create_title="Fresh", model="m1", api_key="sk-typed")
+        assert owner.keys[fresh.session_id] == "sk-typed"
     finally:
         conn.close()
 
