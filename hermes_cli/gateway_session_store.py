@@ -561,11 +561,10 @@ def create_titled_session(title, args=None):
     (``row_cwd`` ""). Returns the id, or None when the gateway refused (the caller prints main's
     "could not be created" copy)."""
     launch = {key: getattr(args, key, None) for key in (*_LAUNCH_POLICY, "run_budget", "verbose")}
-    # The classic launch (cli._build_cli_from_args) folds --required-skills into the skills it asks for;
-    # the resume repeats that merged list, so the session must be created with it.
-    from cli import _parse_skills_argument
-    launch["skills"] = list(dict.fromkeys(
-        [*_parse_skills_argument(launch["skills"]), *_parse_skills_argument(getattr(args, "required_skills", None))])) or None
+    # The classic launch (cli._build_cli_from_args) folds --required-skills into the skills it asks for and
+    # the resume repeats that merged list, so create with it; _requested_policy splits and dedupes.
+    launch["skills"] = [name for value in (launch["skills"], getattr(args, "required_skills", None)) if value
+                        for name in (value if isinstance(value, (list, tuple)) else [value])] or None
     params = _creation_policy(launch)
     params["cwd"] = _launch_cwd()
     params["source"] = "cli"  # main's titled row is `cli` (hermes_cli.main._create_titled_session)

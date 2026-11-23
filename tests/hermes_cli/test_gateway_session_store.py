@@ -449,9 +449,7 @@ def test_create_if_missing_merges_required_skills_so_the_resume_passes(store, mo
     assert gss.create_titled_session("Fresh Named", args) == "local-new"
     _method, params = [c for c in client.calls if c[0] == "session.create"][-1]
     assert params["skills"] == ["a", "b"]
-    from cli import _parse_skills_argument
-    resume = argparse.Namespace(skills=[*_parse_skills_argument(args.skills), *_parse_skills_argument(args.required_skills)],
-                                toolsets=None)
+    resume = argparse.Namespace(skills=["a", "b"], toolsets=None)  # what _build_cli_from_args asks for on resume
     check_resume_policy(resume, {"info": {"launch_request": params}})  # no skills-policy refusal
     only = argparse.Namespace(skills=None, required_skills=["x"], toolsets=None)
     gss.create_titled_session("Other", only)
