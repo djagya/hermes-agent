@@ -851,6 +851,15 @@ class _SupervisorRegistry:
         if supervisor is not None:
             supervisor.stop()
 
+    def stop_exact(self, task_id: str, supervisor: CDPSupervisor) -> None:
+        """dlz (J-0001): stop ``supervisor``; unregister it only while ``task_id`` still maps to it, so a
+        replacement registered meanwhile is neither removed nor stopped."""
+        with self._lock:
+            if self._by_task.get(task_id) is supervisor:
+                self._home_by_task.pop(task_id, None)
+                self._by_task.pop(task_id, None)
+        supervisor.stop()
+
     def stop_home(self, home_key: str) -> None:
         """Stop the supervisors one profile home started (``/browser connect`` on a multiplexed gateway)."""
         with self._lock:

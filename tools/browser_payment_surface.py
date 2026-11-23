@@ -216,7 +216,28 @@ def claim_payment_surface(supervisor: Any, inspected: Any) -> Optional[dict]:
     if not lock.acquire(timeout=_CLAIM_WAIT_S):  # another claim or a fenced native op is running
         return _refusal(UNAVAILABLE, _UNAVAILABLE_TEXT)
     try:
+        if getattr(supervisor, "_stop_requested", False):  # dlz (J-0001): its socket is closing (stop_for_turn_end)
+            return _refusal(UNAVAILABLE, _UNAVAILABLE_TEXT)
         return _claim_serialized(supervisor, inspected, loop, tab)
+    finally:
+        lock.release()
+
+
+def stop_for_turn_end(supervisor: Any) -> bool:
+    """dlz (J-0001): the turn end's decision to stop ``supervisor``, exclusive with claim admission. Under its claim
+    lock (not waited for: a running claim, dialog answer or recovery call keeps it), True when it is in no payment
+    (nothing locally locked, no record not handed over) and marks it stopping, so every later claim on it refuses
+    before anything is sent; False keeps it."""
+    from tools.browser_payment_done import has_payment
+
+    lock = _claim_lock(supervisor)
+    if not lock.acquire(blocking=False):
+        return False
+    try:
+        if locally_locked(supervisor) or has_payment(supervisor):
+            return False
+        supervisor._stop_requested = True
+        return True
     finally:
         lock.release()
 
