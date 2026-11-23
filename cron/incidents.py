@@ -62,9 +62,9 @@ _MAX_SIGNATURE_ERROR_CHARS = 200
 # measured durations ("idle for 603s", "retry in 12.5 seconds"). Short SHAs, file:LINE:COL, versions,
 # exit codes and other numbers count.
 _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
-    (r"\b\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?(?:z|[+-]\d{2}:?\d{2})?)?", "#t"),
+    (r"\b\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+|,\d{3}(?![\d,]))?)?(?:z|[+-]\d{2}:?\d{2})?)?", "#t"),
     (r"\b\d{8}[t_-]\d{6}z?\b", "#t"),
-    (r"(?<![:\w.])\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?![:\d])", "#t"),
+    (r"(?<![:\w.])\d{2}:\d{2}:\d{2}(?:\.\d+|,\d{3}(?![\d,]))?(?![:\d])", "#t"),
     (r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "#h"),
     (r"\b[0-9a-f]{32,64}\b", "#h"),
     (r"\b\d+\s*bytes?\b", "#b"),
@@ -75,8 +75,8 @@ _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
 # ``tempfile`` name (``tmp`` + 8 of ``[a-z0-9_]``) or a ``mktemp`` template ``<word>.<6-10 random>``
 # (``tmp.XXXXXXXXXX``, ``worktree.XXXXXX``) whose random part has 2+ digits or capitals. A stable
 # name (``build1.log``, ``Report2024.csv``) counts. Plain string checks: linear on any error length.
-_TEMP_ENTRY_RE = re.compile(r"(?<![\w.-])((?:/private)?(?:/tmp|/var/tmp|/var/folders/[^/\s]+/[^/\s]+/T)/)([^/\s:'\"()]+)")
-_PY_TEMP_NAME_RE = re.compile(r"tmp[a-z\d_]{8}")
+_TEMP_ENTRY_RE = re.compile(r"(?<![\w.-])((?:/private)?(?:/tmp|/var/tmp|/var/folders/[^/\s]+/[^/\s]+/T)/)([^/\s:;,'\"()]+)")
+_PY_TEMP_NAME_RE = re.compile(r"tmp[a-z\d_]{8}(?:\.[A-Za-z\d]{1,10})?")  # mkstemp(suffix=".json") too
 
 
 def _is_temp_name(entry: str) -> bool:

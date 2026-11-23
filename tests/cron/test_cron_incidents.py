@@ -136,6 +136,7 @@ def _run_tokens(rng):
         "tmp6": mktemp(6),  # mktemp -d /tmp/worktree.XXXXXX
         "tmp10": mktemp(10),  # bare mktemp: $TMPDIR/tmp.XXXXXXXXXX
         "py": "tmp" + draw(string.ascii_lowercase + string.digits + "_", 8),  # tempfile.mkdtemp()
+        "pyfile": "tmp" + draw(string.ascii_lowercase + string.digits + "_", 8) + ".json",  # mkstemp(suffix=)
         "sha": draw(hexdigits, 64), "sha1": draw(hexdigits, 40), "md5": draw(hexdigits, 32),
         "uuid": "-".join(draw(hexdigits, n) for n in (8, 4, 4, 4, 12)),
         "bytes": rng.randint(10, 9_999_999),
@@ -149,7 +150,7 @@ def _run_tokens(rng):
 
 _PER_RUN_TEMPLATE = (
     "script failed: {asctime} ERROR manifest rejected at /tmp/worktree.{tmp6}/scripts/sync.mjs:12:34\n"
-    "log /var/folders/ab/cd12/T/tmp.{tmp10} and /private/tmp/{py}/out.json at {clock}; "
+    "log /var/folders/ab/cd12/T/tmp.{tmp10} and /private/tmp/{py}/out.json at {clock}, /tmp/{pyfile}; "
     "receipt /srv/receipts/{compact}.json sha256={sha} sha1={sha1} md5={md5} ({bytes} bytes) run {uuid} "
     "started {stamp}, waited {secs}s"
 )
@@ -177,6 +178,8 @@ _MUST_DIFFER = (
     ("missing /tmp/build1.log", "missing /tmp/build2.log"),
     ("open /tmp/Report2024.csv failed", "open /tmp/Report2025.csv failed"),
     ("open /tmp/a.sqlite3 failed", "open /tmp/a.sqlite4 failed"),
+    ("2026-11-24T10:00:00,404,/api failed", "2026-11-24T10:00:00,500,/api failed"),
+    ("at 10:00:00,5 rows rejected", "at 10:00:00,6 rows rejected"),
     ("disk full: 512 MiB left", "disk full: 768 MiB left"),
 )
 

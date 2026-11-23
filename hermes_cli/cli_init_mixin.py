@@ -107,7 +107,7 @@ def lease_handed_over(cli, held):
         cli._claim_active_session("cli", stderr=True)
         raise
     if not cli._claim_active_session("cli", stderr=True):
-        raise RuntimeError("session_already_owned")
+        raise SystemExit(1)  # the claim printed why: another live owner holds the session
 
 
 class CLIInitMixin:

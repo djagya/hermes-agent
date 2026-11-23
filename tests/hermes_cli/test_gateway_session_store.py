@@ -480,14 +480,15 @@ def _classic_launch(monkeypatch, owner):
 
     def launch(*, model=None, provider=None, skills=None, required=None, ignore_rules=False, reasoning=None,
                toolsets=None, max_turns=None, checkpoints=False, run_budget=None, verbose=None, resume=None,
-               create_title=None, leases=None):
+               create_title=None, leases=None, owned_elsewhere=()):
         host = cli_module._build_cli_from_args(model, toolsets, provider, reasoning, None, None, max_turns, run_budget,
                                                verbose, False, resume, checkpoints, False, ignore_rules, skills,
                                                required_skills=required, create_title=create_title)
         if leases is not None:  # the CLI's active-session lease, claimed in run() before the session opens
             host._active_session_lease = "lease"
             host._release_active_session = lambda: leases.append(("release", host.session_id))
-            host._claim_active_session = lambda *a, **k: (leases.append(("claim", host.session_id)), True)[1]
+            host._claim_active_session = lambda *a, **k: (leases.append(("claim", host.session_id)),
+                                                          host.session_id not in owned_elsewhere)[1]
         host._ensure_gateway_session()
         return host
     return launch, conn
@@ -571,6 +572,9 @@ def test_create_if_missing_moves_the_lease_to_the_session_it_lands_on(monkeypatc
         leases = []
         fresh = launch(create_title="Fresh", model="m1", leases=leases)
         assert leases[-1] == ("claim", fresh.session_id) and fresh.session_id.startswith("local-")
+        with pytest.raises(SystemExit) as refused:  # another live CLI holds the session the title raced into
+            launch(create_title="T", model="m-old", leases=[], owned_elsewhere={"local-old"})
+        assert refused.value.code == 1
     finally:
         conn.close()
 
