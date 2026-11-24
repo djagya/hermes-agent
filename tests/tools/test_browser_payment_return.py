@@ -295,21 +295,25 @@ def test_after_a_return_a_confirmation_the_owners_payment_opened_in_a_new_tab_is
     assert "BANK" not in read, "another site's tab is never read"
 
 
-@pytest.mark.parametrize("where", ["top", "new_tab"])
+@pytest.mark.parametrize("where", ["top", "new_tab", "new_document_after_her_press"])
 def test_after_a_return_order_wording_hermes_cannot_be_sure_of_presses_nothing(env, where):
     """GLM M1: the owner paid; the confirmation says "Your order has been received. Payment successful." (order
-    wording a checkout's own service text can carry too, no thank-you sentence or order number) on the payment tab
-    or in a tab his payment opened, and Sera never pressed Pay: Hermes cannot tell, so payment_detected is null and
-    even a fresh approval presses nothing."""
-    flow = _returned(env)
+    wording a checkout's own service text can carry too, no thank-you sentence or order number) on the payment tab,
+    in a tab his payment opened, or on a new document after a Pay press of Sera's (the owner had the tab: not that
+    press's result). Hermes cannot tell, so payment_detected is null and even a fresh approval presses nothing."""
+    flow = _returned(env, pressed=where == "new_document_after_her_press")
     text = "Your order has been received. Payment successful."
-    if where == "top":
+    if where == "new_tab":
+        flow.ctl.popups["DONE"] = ("TAB", shop.SHOP + "/order-received/123/", text)
+    else:
         flow.ctl.page.page.update({"title": "Order", "text": text})
         flow.ctl.page.rows = list(PAID_ROWS)
-    else:
-        flow.ctl.popups["DONE"] = ("TAB", shop.SHOP + "/order-received/123/", text)
+    if where == "new_document_after_her_press":
+        flow.ctl.page.tree = (("TOP", "L9", shop.SHOP + "/order-received/123/", shop.SHOP, ""),)
     listed = flow.act()
     assert listed["payment_detected"] is None and "could not check" in listed["next"]
+    if where == "new_document_after_her_press":
+        return
     _fresh_approval(flow)
     out = flow.press("Jetzt kaufen" if where == "top" else "JETZT KAUFEN")
     assert out["error_type"] == "payment_return_unchecked" and flow.presses() == []

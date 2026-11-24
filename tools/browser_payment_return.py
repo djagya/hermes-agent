@@ -197,13 +197,13 @@ async def _look(sup: Any, gate: Any, page_sid: str) -> tuple:
     then every shop tab whose opener chain leads to the payment tab (a confirmation the owner's payment opened in a
     new tab). Each read must answer in full; a document replaced during the read raises. ``mine``: the top
     document's booleans (``before_press``'s baseline for the press). A document is judged by the detection's full
-    rules; order evidence is ``found`` only when it is sure: on the top document, a strong class (a thank-you
-    sentence, an order number) new since the last look kept from a Pay-like press of this process (with no such look:
-    any strong class), or any order wording on another document than that look's; on a tab, a strong class or a tab
-    Sera's own Pay press opened. Order wording that is not sure (a cart's service text reads the same as "Order
-    confirmed") raises: the owner looks. A document without order wording, or still showing the pressed Pay control
-    or a purchase button, is no order (None). The top document's evidence is ``strong`` for payment_done (its
-    card-frame rule) only against such a look."""
+    rules; its order evidence is ``found`` only when it is sure: a strong class (a thank-you sentence, an order
+    number; on the document a look kept from a Pay-like press of this process saw, one that look did not see), or, on
+    a tab, any order wording when Sera's own Pay press opened that tab. The owner had the tab, so a new document is
+    not that press's result, and other order wording (a cart's service text reads the same as "Order confirmed")
+    raises: the owner looks, and payment_done never closes a cart as paid. A document without order wording, or
+    still showing the pressed Pay control or a purchase button, is no order (None). The top document's evidence is
+    ``strong`` for payment_done (its card-frame rule) only against such a look."""
     from tools import browser_payment_done as done
     from tools.browser_payment_order_evidence import judge, scan_document
 
@@ -216,19 +216,16 @@ async def _look(sup: Any, gate: Any, page_sid: str) -> tuple:
             raise surface.SurfaceRefused("order wording not read")
         mine["strong"] = scan["strong"]
         pay, base = surface.pay_press(sup), gen.pay_base
-        evidence, _reason, strong = await judge(sup, page_sid, top, scan, done.checkout_like_now(sup, top, pay), pay,
-                                                True, None, strict=True)
+        evidence, _reason, _strong = await judge(sup, page_sid, top, scan, done.checkout_like_now(sup, top, pay),
+                                                 pay, True, None, strict=True)
         if evidence is not None:
             if not await detect._still_the_shop(sup, gate, page_sid, top):
                 raise surface.SurfaceRefused("the page changed during the check")
-            if base is not None and tuple(base.get("doc") or ()) != tuple(top[:2]):
-                sure = True
-            else:
-                sure = scan["strong"] and (base is None or base.get("strong") is False)
-            if not sure:
+            same = base is not None and tuple(base.get("doc") or ()) == tuple(top[:2])
+            if not (scan["strong"] and (not same or base.get("strong") is False)):
                 raise surface.SurfaceRefused("order wording that may be the checkout's own")
             return {"where": "top", "frame": top[0], "loader": top[1], "evidence": evidence,
-                    "strong": strong and base is not None}, mine
+                    "strong": base is not None}, mine
     roots = done.payment_tabs(sup)
     infos = (await sup._cdp("Target.getTargets"))["result"]["targetInfos"]
     for tab, url in _opened_tabs(infos, roots):
