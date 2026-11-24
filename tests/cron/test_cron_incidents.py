@@ -134,7 +134,6 @@ def _run_tokens(rng):
         "py": "tmp" + draw(string.ascii_lowercase + string.digits + "_", 8),  # tempfile.mkdtemp()
         "pyfile": "tmp" + draw(string.ascii_lowercase + string.digits + "_", 8) + ".json",  # mkstemp(suffix=)
         "sha": draw(hexdigits, 64), "sha1": draw(hexdigits, 40), "md5": draw(hexdigits, 32),
-        "uuid": "-".join(draw(hexdigits, n) for n in (8, 4, 4, 4, 12)),
         "bytes": rng.randint(10, 9_999_999),
         "stamp": stamp,
         "compact": stamp.replace("-", "").replace(":", ""),
@@ -148,9 +147,13 @@ _PER_RUN_TEMPLATE = (
     "script failed: {asctime} ERROR manifest rejected at /tmp/{py}/scripts/sync.mjs:12:34\n"
     "log /var/folders/ab/cd12/T/tmp.{tmp10} and /private/tmp/{py}/out.json at {clock}, /tmp/{pyfile}.gz; "
     "{clock}: manifest missing; "
-    "receipt /srv/receipts/{compact}.json sha256={sha} sha1={sha1} md5={md5} ({bytes} bytes) run {uuid} "
+    "receipt /srv/receipts/{compact}.json sha256={sha} sha1={sha1} md5={md5} ({bytes} bytes) "
     "started {stamp}, waited {secs}s"
 )
+
+_TRACEBACK = ("Script exited with code 1\nstderr:\nTraceback (most recent call last):\n"
+              '  File "/opt/data/scripts/dekra_scan.py", line 212, in <module>\n    main()\n'
+              '  File "/opt/data/scripts/dekra_scan.py", line 198, in main\n    scan(account)\n')
 
 # Two different failures of one job that must never share a signature: every collision a review round found.
 _MUST_DIFFER = (
@@ -162,6 +165,9 @@ _MUST_DIFFER = (
     ("TypeError: manifest rejected at sync.mjs:12:19", "TypeError: manifest rejected at sync.mjs:13:19"),
     ("at /tmp/worktree.aB3xY9/scripts/sync.mjs:12:34", "at /tmp/worktree.aB3xY9/scripts/sync.mjs:13:34"),
     ("open /tmp/sums.sha256sum failed", "open /tmp/sums.sha512sum failed"),
+    ("Could not find database with ID: 59833787-2cf9-4fdf-8782-e53db20768a5.",
+     "Could not find database with ID: 1b2c3d4e-5f60-4a7b-8c9d-0e1f2a3b4c5d."),
+    (_TRACEBACK + "KeyError: 'messages'", _TRACEBACK + "RefreshError: invalid_grant"),  # the cause is last
     ("The model `gpt-4o-2024-05-13` does not exist", "The model `gpt-4o-2024-08-06` does not exist"),
     ("Unsupported api-version 2024-02-15-preview", "Unsupported api-version 2024-08-01-preview"),
     ("denied: '/tmp/tmpk3j2h1g0.json'", "denied: '/tmp/tmpk3j2h1g0.csv'"),

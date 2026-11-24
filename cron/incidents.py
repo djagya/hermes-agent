@@ -54,18 +54,16 @@ _FAILURE_TYPE_ORDER = (
     ("agent", ("agent", "model", "provider", "inference")),
 )
 MAX_ERROR_CHARS = 500
-_MAX_SIGNATURE_ERROR_CHARS = 200
 # Per-run tokens differ for the same failure, so they are masked out of the signature (one incident per
 # real error, not per run). Allow-list only: a mask that over-matches merges two real errors, and a
 # closed incident then hides the second one for good, so only shapes that cannot carry meaning are
-# masked. Date-and-time timestamps (a bare date, as in gpt-4o-2024-05-13, counts), HH:MM:SS clocks, UUIDs, whole md5/sha1/sha256 digests, "N bytes" and
+# masked. Date-and-time timestamps (a bare date, as in gpt-4o-2024-05-13, counts), HH:MM:SS clocks, 32-64 hex digests and ids, "N bytes" and
 # measured durations ("idle for 603s", "retry in 12.5 seconds"). Short SHAs, file:LINE:COL, versions,
 # exit codes and other numbers count.
 _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
     (r"\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+|,\d{3}(?![\d,]))?)?(?:z|[+-]\d{2}:?\d{2})?", "#t"),
     (r"\b\d{8}[t_-]\d{6}z?\b", "#t"),
     (r"(?<![:\w.])\d{2}:\d{2}:\d{2}(?:\.\d+|,\d{3}(?![\d,]))?(?!\d|:[\da-f])", "#t"),
-    (r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "#h"),
     (r"\b[0-9a-f]{32,64}\b", "#h"),
     (r"\b\d+\s*bytes?\b", "#b"),
     (r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b", "#s"),
@@ -171,7 +169,6 @@ def _error_signature(job_id: str, error: str) -> str:
     normalized = _normalize_error(_TEMP_ENTRY_RE.sub(_mask_temp_entry, str(error or "")))
     for pattern, mask in _PER_RUN_TOKENS:
         normalized = pattern.sub(mask, normalized)
-    normalized = normalized[:_MAX_SIGNATURE_ERROR_CHARS]
     return hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()[:12]
 
 
