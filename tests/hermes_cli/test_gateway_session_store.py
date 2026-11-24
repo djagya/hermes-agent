@@ -410,14 +410,200 @@ def test_cli_listings_include_gateway_rows_created_by_the_cli(store, tmp_path, m
 
 
 def test_create_if_missing_titles_a_gateway_created_session(store, monkeypatch):
-    """``chat -c NAME --create-if-missing``: the gateway creates the titled session (its own
-    resolve -> create -> title step); the CLI then resumes the id it returns. No client write."""
+    """The TUI's ``chat -c NAME --create-if-missing``: the gateway creates the titled session (its own
+    resolve -> create -> title step); the TUI then resumes the id it returns. No client write."""
     db, client = store
     from hermes_cli import gateway_session_store as gss
     monkeypatch.setattr(gss, "session_store", lambda: db)
     assert gss.create_titled_session("Fresh Named") == "local-new"
     _method, params = [c for c in client.calls if c[0] == "session.create"][-1]
     assert params["title"] == "Fresh Named" and params["source"] and params["cwd"]
+
+
+class _Owner(FakeClient):
+    """The owner's side of ``session.create``: the real ``build_policy`` (its refusals included) freezes
+    the request, ``session.resume`` returns it; ``titles`` maps a title to the session that holds it."""
+    CONFIG = {"agent": {}, "platform_toolsets": {"cli": ["terminal"]}}
+
+    def __init__(self, titles=None, frozen=None, history=None):
+        super().__init__(known=())
+        self.titles, self.frozen = dict(titles or {}), dict(frozen or {})
+        self.history = dict(history or {})
+        self.keys = {}  # the launch key each session was created with (the owner holds it, not the policy)
+        self.tips = {}  # a session whose compression committed: resume lands on its tip
+
+    def _snapshot(self, sid):
+        reply = snapshot(sid)
+        reply["messages"] = list(self.history.get(sid, []))
+        reply["info"]["launch_request"] = dict(self.frozen[sid])
+        return reply
+
+    async def rpc(self, method, *, _timeout=None, **params):
+        import json
+
+        from gateway.session_policy import build_policy
+        from hermes_state_runtime import RuntimeStoreError
+        self.calls.append((method, dict(params)))
+        if method == "session.create":
+            title = params.pop("title", None)
+            if title not in self.titles:
+                try:
+                    policy = build_policy(params, self.CONFIG)
+                except RuntimeStoreError as exc:
+                    raise GatewayClientError("invalid_params") from exc
+                sid = f"local-{len(self.frozen)}"
+                self.keys[sid] = params.get("api_key")
+                self.frozen[sid], self.titles[title] = json.loads(policy.request_json), sid
+            return self._snapshot(self.titles[title])
+        if method == "session.resume":
+            if params["session_id"] not in self.frozen:
+                raise GatewayClientError("not_found")
+            key = params.get("api_key")
+            if key and self.keys.get(params["session_id"]) != key:  # rebind_launch_key's rule
+                from hermes_cli.gateway_client import GatewayRPCError
+                raise GatewayRPCError("admission_conflict")
+            sid = params["session_id"]
+            if sid in self.tips:
+                self.frozen[self.tips[sid]] = self.frozen[sid]
+                sid = self.tips[sid]
+            return self._snapshot(sid)
+        return {"status": "ok", "detached": True}
+
+
+def _classic_launch(monkeypatch, owner):
+    """``hermes chat`` flags -> the real ``_build_cli_from_args`` -> ``_ensure_gateway_session`` on ``owner``."""
+    import cli as cli_module
+    from hermes_cli import gateway_session_store as gss
+    from hermes_cli.model_switch import DIRECT_ALIASES, DirectAlias
+
+    @asynccontextmanager
+    async def connect():
+        yield owner
+    conn = GatewayConnection(connect=connect)
+    conn.start(5)
+    monkeypatch.setattr(gss, "session_store", lambda: GatewaySessionStore(conn))
+    monkeypatch.setitem(cli_module.CLI_CONFIG, "model", {"default": "cfg-model", "provider": "openrouter"})
+    monkeypatch.setattr("agent.skill_commands.resolve_auto_load_skills", lambda config=None: ["release"])
+    monkeypatch.setattr("agent.coding_context.coding_selection", lambda **_: None)
+    # A startup alias that carries its own endpoint and key (#28660); seeded aliases are kept as they are.
+    monkeypatch.setitem(DIRECT_ALIASES, "fast", DirectAlias("vendor/fast-1", "custom", "https://fast.example/v1",
+                                                            api_key="sk-alias"))
+
+    def launch(*, model=None, provider=None, skills=None, required=None, ignore_rules=False, reasoning=None, api_key=None,
+               toolsets=None, max_turns=None, checkpoints=False, run_budget=None, verbose=None, resume=None,
+               create_title=None, leases=None, owned_elsewhere=()):
+        host = cli_module._build_cli_from_args(model, toolsets, provider, reasoning, api_key, None, max_turns, run_budget,
+                                               verbose, False, resume, checkpoints, False, ignore_rules, skills,
+                                               required_skills=required, create_title=create_title)
+        if leases is not None:  # the CLI's active-session lease, claimed in run() before the session opens
+            host._active_session_lease = "lease"
+            host._release_active_session = lambda: leases.append(("release", host.session_id))
+            host._claim_active_session = lambda *a, **k: (leases.append(("claim", host.session_id)),
+                                                          host.session_id not in owned_elsewhere)[1]
+        host._ensure_gateway_session()
+        return host
+    return launch, conn
+
+
+def test_create_if_missing_then_resume_over_every_launch_flag(monkeypatch):
+    """``hermes chat -c T --create-if-missing <flags>`` then the same command as ``-c T`` (the resume), over
+    the product of the flags that the CLI normalises (aliases, ``provider:model``, ``-s`` with
+    ``--required-skills`` and ``skills.auto_load``, ``--ignore-rules`` and HERMES_IGNORE_RULES, a valid and
+    an unparseable ``--reasoning``) with the rest rotated through. The create and the resume read one launch
+    policy, so the create is never refused, the resume always passes, and the session carries only the
+    flags that were passed."""
+    import itertools
+    owner = _Owner()
+    launch, conn = _classic_launch(monkeypatch, owner)
+    simple = (("toolsets", "web"), ("max_turns", 5), ("checkpoints", True), ("run_budget", 90), ("verbose", True))
+    product = itertools.product((None, "m1", "fast", "anthropic:claude-x"), (None, "anthropic"),
+                                (None, "shell", "release,shell"), (None, "release,lint"), (False, True), (False, True),
+                                (None, "high", "bogus"))
+    try:
+        for i, (model, provider, skills, required, typed_ignore, env_ignore, reasoning) in enumerate(product):
+            if env_ignore:
+                monkeypatch.setenv("HERMES_IGNORE_RULES", "1")
+            else:
+                monkeypatch.delenv("HERMES_IGNORE_RULES", raising=False)
+            flags = dict(model=model, provider=provider, skills=skills, required=required, ignore_rules=typed_ignore,
+                         reasoning=reasoning, **{k: v for bit, (k, v) in enumerate(simple) if i >> bit & 1})
+            case = (i, flags, env_ignore)
+            title = f"T{i}"
+            created = launch(create_title=title, **flags)
+            sid = owner.titles[title]
+            assert created.session_id == sid, case
+            params = [p for m, p in owner.calls if m == "session.create"][-1]
+            assert params["title"] == title and params["source"] == "cli" and params["row_cwd"] == "", case
+            asked = [n for v in (skills, required) if v for n in v.split(",")]
+            kept = [n for n in dict.fromkeys(asked) if typed_ignore or env_ignore or n != "release"]
+            expected = {"skills": kept or None, "ignore_rules": (typed_ignore or env_ignore) or None,
+                        "reasoning": "high" if reasoning == "high" else None,
+                        "toolsets": ["web"] if "toolsets" in flags else None, "pass_session_id": None,
+                        **{k: (90.0 if k == "run_budget" else v) if k in flags else None for k, v in simple[1:]}}
+            assert {k: params.get(k) for k in expected} == expected, case
+            route = set() if not model else {"model", "provider"} if provider or model != "m1" else {"model"}
+            if model == "fast":  # the alias's endpoint, and its key unless --provider names the route
+                route |= {"base_url"} if provider else {"base_url", "api_key"}
+            assert {"model", "provider", "base_url", "api_key"} & set(params) == route, (case, params)
+            resumed = launch(resume=sid, **flags)  # `-c T`: main resolves the title to this id
+            assert resumed.session_id == sid, case
+    finally:
+        conn.close()
+
+
+def test_create_if_missing_into_a_session_that_appeared_meanwhile(monkeypatch, capsys):
+    """The title resolved to nothing, but the owner finds a session holding it by the time it creates (its
+    resolve-or-create returns that session as is). Its launch is checked like a resume: the same flags pass
+    and the CLI resumes it with its history, as main did; a different one is main's "could not be created"
+    and exit 1, never a session that ignores the flag."""
+    owner = _Owner(titles={"T": "local-old"}, frozen={"local-old": {"model": "m-old"}},
+                   history={"local-old": [{"role": "user", "content": "earlier"}]})
+    launch, conn = _classic_launch(monkeypatch, owner)
+    try:
+        adopted = launch(create_title="T", model="m-old")
+        assert adopted.session_id == "local-old"
+        assert adopted._resumed is True
+        with pytest.raises(SystemExit) as exit_info:
+            launch(create_title="T", model="m1")
+        assert exit_info.value.code == 1
+        assert "No session found matching 'T' and a new titled session could not be created" in capsys.readouterr().err
+    finally:
+        conn.close()
+
+
+def test_create_if_missing_with_a_typed_key_into_a_session_without_it_is_refused(monkeypatch):
+    """A title that raced into a session launched without the typed --api-key is refused, as main's keyed
+    resume after its create was; a fresh keyed create opens."""
+    owner = _Owner(titles={"T": "local-old"}, frozen={"local-old": {"model": "m-old"}})
+    launch, conn = _classic_launch(monkeypatch, owner)
+    try:
+        with pytest.raises(SystemExit) as refused:
+            launch(create_title="T", model="m-old", api_key="sk-typed")
+        assert refused.value.code == 1
+        owner.tips["local-1"] = "local-tip"  # compressed between the create and the keyed resume
+        fresh = launch(create_title="Fresh", model="m1", api_key="sk-typed")
+        assert owner.keys["local-1"] == "sk-typed" and fresh.session_id == "local-tip"
+    finally:
+        conn.close()
+
+
+def test_create_if_missing_moves_the_lease_to_the_session_it_lands_on(monkeypatch):
+    """The lease run() claimed under the local mint is re-claimed for the titled session, fresh or raced in,
+    so a second CLI opening that title is refused as on main (which resumed it by id)."""
+    owner = _Owner(titles={"T": "local-old"}, frozen={"local-old": {"model": "m-old"}})
+    launch, conn = _classic_launch(monkeypatch, owner)
+    try:
+        leases = []
+        assert launch(create_title="T", model="m-old", leases=leases).session_id == "local-old"
+        assert leases[-1] == ("claim", "local-old")
+        leases = []
+        fresh = launch(create_title="Fresh", model="m1", leases=leases)
+        assert leases[-1] == ("claim", fresh.session_id) and fresh.session_id.startswith("local-")
+        with pytest.raises(SystemExit) as refused:  # another live CLI holds the session the title raced into
+            launch(create_title="T", model="m-old", leases=[], owned_elsewhere={"local-old"})
+        assert refused.value.code == 1
+    finally:
+        conn.close()
 
 
 def test_bare_continue_finds_the_last_session_the_cli_created(tmp_path, monkeypatch):

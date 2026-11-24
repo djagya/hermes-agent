@@ -1531,8 +1531,9 @@ class HermesCLI(CLIBacktrackMixin, CLIInitMixin, CLITuiRuntimeMixin, CLIProcessN
             relaunch(self._pending_relaunch, preserve_inherited=False)
 
 
-def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills, required_skills=None):
-    """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
+def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills, required_skills=None, create_title=None):
+    """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload.
+    ``create_title`` (``-c <title> --create-if-missing`` with no such session): the gateway session this CLI opens is created with that title."""
     toolsets_list = None
     if isinstance(toolsets, str) and toolsets:
         toolsets_list = [t.strip() for t in toolsets.split(",")]
@@ -1579,6 +1580,7 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
         if emit_partial_update_hint(e):
             sys.exit(1)
         raise
+    cli._create_title = create_title
     if not toolsets:
         cli._explicit_toolsets = False  # the gateway resolves the default and coding posture itself
     # Only a typed -t is checked against a resumed session's frozen toolsets.
@@ -1716,6 +1718,7 @@ def main(
     output_format: str = "text",
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    create_title: str | None = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -1784,7 +1787,7 @@ def main(
         quiet = True
     cli = _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
                                verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills,
-                               required_skills=required_skills)
+                               required_skills=required_skills, create_title=create_title)
 
     # Join the background worktree creation before anything consumes TERMINAL_CWD.
     # A requested worktree whose setup failed aborts: never silently run without isolation.

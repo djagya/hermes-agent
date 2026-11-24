@@ -120,6 +120,110 @@ def test_incidents_list_newest_instant_first_across_dst_fall_back(monkeypatch, t
     assert [row["id"] for row in inc.list_incidents()] == [later, earlier]
 
 
+def _run_tokens(rng):
+    """One run's worth of per-run tokens, drawn from the alphabets the tools that make them use."""
+    import string
+    alnum, hexdigits = string.ascii_letters + string.digits, "0123456789abcdef"
+
+    def draw(alphabet, n):
+        return "".join(rng.choice(alphabet) for _ in range(n))
+
+    stamp = f"2026-11-{rng.randint(10, 28)}T{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}Z"
+    return {
+        "tmp10": draw(alnum, 10),  # bare mktemp: $TMPDIR/tmp.XXXXXXXXXX
+        "py": "tmp" + draw(string.ascii_lowercase + string.digits + "_", 8),  # tempfile.mkdtemp()
+        "pyfile": "tmp" + draw(string.ascii_lowercase + string.digits + "_", 8) + ".json",  # mkstemp(suffix=)
+        "sha": draw(hexdigits, 64), "sha1": draw(hexdigits, 40), "md5": draw(hexdigits, 32),
+        "bytes": rng.randint(10, 9_999_999),
+        "stamp": stamp,
+        "compact": stamp.replace("-", "").replace(":", ""),
+        "clock": f"{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}",
+        "asctime": f"{stamp[:10]} {stamp[11:19]},{rng.randint(0, 999):03d}",  # Python logging's default
+        "secs": rng.randint(1, 3000),
+    }
+
+
+_PER_RUN_TEMPLATE = (
+    "script failed: {asctime} ERROR manifest rejected at /tmp/{py}/scripts/sync.mjs:12:34\n"
+    "log /var/folders/ab/cd12/T/tmp.{tmp10} and /private/tmp/{py}/out.json at {clock}, /tmp/{pyfile}.gz; "
+    "{clock}: manifest missing; "
+    "receipt /srv/receipts/{compact}.json sha256={sha} sha1={sha1} md5={md5} ({bytes} bytes) "
+    "started {stamp}, waited {secs}s"
+)
+
+_TRACEBACK = ("Script exited with code 1\nstderr:\nTraceback (most recent call last):\n"
+              '  File "/opt/data/scripts/dekra_scan.py", line 212, in <module>\n    main()\n'
+              '  File "/opt/data/scripts/dekra_scan.py", line 198, in main\n    scan(account)\n')
+
+# Two different failures of one job that must never share a signature: every collision a review round found.
+_MUST_DIFFER = (
+    ("open /var/data/a.sqlite3 failed", "open /var/data/a.sqlite4 failed"),
+    ("open data.sqlite failed: HTTP 502", "open data.config failed: HTTP 503"),
+    ("E: Version '1:20.0' for 'demo' was not found", "E: Version '1:30.0' for 'demo' was not found"),
+    ("  12:34  error  'x' is not defined  no-undef", "  56:07  error  'x' is not defined  no-undef"),
+    ("TypeError: manifest rejected at sync.mjs:12:34", "TypeError: manifest rejected at sync.mjs:12:35"),
+    ("TypeError: manifest rejected at sync.mjs:12:19", "TypeError: manifest rejected at sync.mjs:13:19"),
+    ("at /tmp/worktree.aB3xY9/scripts/sync.mjs:12:34", "at /tmp/worktree.aB3xY9/scripts/sync.mjs:13:34"),
+    ("open /tmp/sums.sha256sum failed", "open /tmp/sums.sha512sum failed"),
+    ("Could not find database with ID: 59833787-2cf9-4fdf-8782-e53db20768a5.",
+     "Could not find database with ID: 1b2c3d4e-5f60-4a7b-8c9d-0e1f2a3b4c5d."),
+    (_TRACEBACK + "KeyError: 'messages'", _TRACEBACK + "RefreshError: invalid_grant"),  # the cause is last
+    ("The model `gpt-4o-2024-05-13` does not exist", "The model `gpt-4o-2024-08-06` does not exist"),
+    ("Unsupported api-version 2024-02-15-preview", "Unsupported api-version 2024-08-01-preview"),
+    ("denied: '/tmp/tmpk3j2h1g0.json'", "denied: '/tmp/tmpk3j2h1g0.csv'"),
+    ("open /tmp/report.2024q1 failed", "open /tmp/report.2024q2 failed"),
+    ("open /tmp/model.v2beta1 failed", "open /tmp/model.v2beta2 failed"),
+    ("link 10:20:30:ab:cd:ef down", "link 10:20:31:ab:cd:ef down"),
+    ("crashed builtins.KeyError: 'k'", "crashed builtins.EOFError: 'k'"),
+    ("process exited 0xc0000005", "process exited 0xc0000409"),
+    ("exit status c0000005", "exit status c0000409"),
+    ("script exited with code 1234567", "script exited with code 7654321"),
+    ("script exited with code 137", "script exited with code 143"),
+    ("pkg 1.2.345678 rejected", "pkg 1.2.345679 rejected"),
+    ("expected 01:20 got 01:25", "expected 01:30 got 01:25"),
+    ("import pkg.Module1 failed", "import pkg.Module2 failed"),
+    ("HEAD at abc1234 failed", "HEAD at def5678 failed"),
+    ("open /srv/data/Report2024.csv failed", "open /srv/data/Report2025.csv failed"),
+    ("missing /tmp/build.log", "missing /tmp/cache.db"),
+    ("missing /tmp/build1.log", "missing /tmp/build2.log"),
+    ("open /tmp/Report2024.csv failed", "open /tmp/Report2025.csv failed"),
+    ("open /tmp/a.sqlite3 failed", "open /tmp/a.sqlite4 failed"),
+    ("2026-11-24T10:00:00,404,/api failed", "2026-11-24T10:00:00,500,/api failed"),
+    ("at 10:00:00,5 rows rejected", "at 10:00:00,6 rows rejected"),
+    ("open /tmp/report.202401 failed", "open /tmp/report.202402 failed"),
+    ("open /tmp/data.SQLITE3 failed", "open /tmp/data.SQLITE4 failed"),
+    ("disk full: 512 MiB left", "disk full: 768 MiB left"),
+)
+
+
+def test_signature_ignores_per_run_tokens_and_keeps_meaningful_ones(monkeypatch, tmp_path):
+    """The same failure with fresh per-run tokens (bare mktemp's 10-character names, Python tempfile
+    names, clocks, timestamps, digests, byte counts, durations) is ONE signature, so the
+    repeat-alert cooldown applies. Two failures that differ in a meaningful token are two: a shared
+    signature with a closed incident would hide the second one for good."""
+    import random
+    inc = _point_db(monkeypatch, tmp_path)
+    rng = random.Random(1123)
+    sigs = {inc._error_signature("job-1", _PER_RUN_TEMPLATE.format(**_run_tokens(rng))) for _ in range(500)}
+    assert len(sigs) == 1, sigs
+    base = _PER_RUN_TEMPLATE.format(**_run_tokens(rng))
+    for other in (base.replace("manifest rejected", "schema rejected"), base.replace("sync.mjs:12", "sync.mjs:13"),
+                  base.replace("script failed", "script crashed")):
+        assert inc._error_signature("job-1", other) not in sigs
+    assert inc._error_signature("job-2", base) not in sigs  # same text, other job
+    shared = [(a, b) for a, b in _MUST_DIFFER if inc._error_signature("j", a) == inc._error_signature("j", b)]
+    assert not shared, shared
+
+
+def test_signature_of_a_huge_error_is_linear(monkeypatch, tmp_path):
+    """Script stderr is not bounded before the signature: a long temp-path component must not backtrack."""
+    import time
+    inc = _point_db(monkeypatch, tmp_path)
+    started = time.monotonic()
+    inc._error_signature("job-1", "/tmp/" + "a" * 200_000 + " failed")
+    assert time.monotonic() - started < 2.0
+
+
 def test_same_signature_dedups_same_incident(monkeypatch, tmp_path):
     inc = _point_db(monkeypatch, tmp_path)
 
@@ -183,6 +287,9 @@ def test_failure_type_classification(monkeypatch, tmp_path):
         ("Provider read timed out after 60s", "timeout"),
         ("authentication failed: invalid API key", "auth"),
         ("HTTP 429: rate limit exceeded", "rate_limit"),
+        ("RateLimitError: Too Many Requests", "rate_limit"),
+        ("google.api_core.exceptions.ResourceExhausted: RESOURCE_EXHAUSTED", "rate_limit"),
+        ("google.api_core.exceptions.ResourceExhausted: too many concurrent requests", "rate_limit"),
         ("configuration validation blocked the run", "config"),
         ("script exited with code 1", "script"),
         ("agent crashed mid-conversation", "agent"),
@@ -190,6 +297,15 @@ def test_failure_type_classification(monkeypatch, tmp_path):
     ]
     for error, expected in cases:
         assert inc._classify_failure_type(error) == expected, (error, expected)
+
+
+def test_bare_quota_is_not_a_rate_limit(monkeypatch, tmp_path):
+    """An error that merely mentions "quota" (disk, calendar, mailbox) is not labelled ``rate_limit``;
+    a real 429 that mentions it still is."""
+    inc = _point_db(monkeypatch, tmp_path)
+    for error in ("disk quota exceeded writing /var/out", "calendar quota check skipped", "mailbox quota full"):
+        assert inc._classify_failure_type(error) != "rate_limit", error
+    assert inc._classify_failure_type("Codex provider quota exhausted (429); retry after 900s") == "rate_limit"
 
 
 def test_auth_type_requires_runtime_auth_evidence(monkeypatch, tmp_path):

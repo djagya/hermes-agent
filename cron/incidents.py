@@ -34,7 +34,9 @@ INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
 # the job's subject, not runtime evidence, so keyword classification would invent a cause.
 AGENT_REPORTED_FAILURE_TYPE = "agent_reported"
 _FAILURE_TYPE_ORDER = (
-    ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
+    # Rate-limit evidence only: HTTP 429, its reason phrase, or the SDK's ``RateLimitError`` class. A bare
+    # "quota" is not a signal (it labelled spending, disk and calendar quota errors ``rate_limit``).
+    ("rate_limit", (r"\b429\b", "rate limit", "ratelimit", "rate_limit", "too many requests", "usage limit", "resource_exhausted", "resourceexhausted")),
     ("timeout", ("timeout", "timed out")),
     # Runtime auth evidence only: a bare "auth" substring matched agent prose ("OAuth",
     # "scoped-auth route", "authorized") and mislabelled ordinary verdicts as credential failures.
@@ -52,12 +54,35 @@ _FAILURE_TYPE_ORDER = (
     ("agent", ("agent", "model", "provider", "inference")),
 )
 MAX_ERROR_CHARS = 500
-_MAX_SIGNATURE_ERROR_CHARS = 200
-# Measured durations ("idle for 603s", "retry in 12.5 seconds") differ run to run for the same
-# failure, so they are masked out of the signature. Status codes and other numbers still count.
-_DURATION_RE = re.compile(
-    r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b"
-)
+# Per-run tokens differ for the same failure, so they are masked out of the signature (one incident per
+# real error, not per run). Allow-list only: a mask that over-matches merges two real errors, and a
+# closed incident then hides the second one for good, so only shapes that cannot carry meaning are
+# masked. Date-and-time timestamps (a bare date, as in gpt-4o-2024-05-13, counts), HH:MM:SS clocks, 32-64 hex digests and ids, "N bytes" and
+# measured durations ("idle for 603s", "retry in 12.5 seconds"). Short SHAs, file:LINE:COL, versions,
+# exit codes and other numbers count.
+_PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
+    (r"\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+|,\d{3}(?![\d,]))?)?(?:z|[+-]\d{2}:?\d{2})?", "#t"),
+    (r"\b\d{8}[t_-]\d{6}z?\b", "#t"),
+    (r"(?<![:\w.])\d{2}:\d{2}:\d{2}(?:\.\d+|,\d{3}(?![\d,]))?(?!\d|:[\da-f])", "#t"),
+    (r"\b[0-9a-f]{32,64}\b", "#h"),
+    (r"\b\d+\s*bytes?\b", "#b"),
+    (r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b", "#s"),
+))
+# Temp names by context and template: the entry right under a temp root (``/tmp``, ``/var/tmp``,
+# ``/private/tmp``, macOS ``$TMPDIR`` ``/var/folders/*/*/T``) is masked only when it is Python's
+# ``tempfile`` name (``tmp`` + 8 of ``[a-z0-9_]``; a dot-led ``suffix=`` such as ``.tar.gz`` is kept) or bare
+# ``mktemp``'s ``tmp.XXXXXXXXXX``.
+# A named template (``worktree.XXXXXX``) is not guessed at: its random part looks like a stable name
+# (``report.2024q1``), and one extra alert per run is the safe error. Linear on any error length.
+# no-tmp: ok — matches temp roots in error text; writes nothing there
+_TEMP_ENTRY_RE = re.compile(r"(?<![\w.-])((?:/private)?(?:/tmp|/var/tmp|/var/folders/[^/\s]+/[^/\s]+/T)/)([^/\s:;,'\"()]+)")
+_TEMP_NAME_RE = re.compile(r"tmp(?:[a-z\d_]{8}((?:\.[A-Za-z\d]{1,10})*)|\.[A-Za-z\d]{10})")
+
+
+def _mask_temp_entry(match: re.Match) -> str:
+    name = _TEMP_NAME_RE.fullmatch(match.group(2))
+    return match.group(1) + ("#" + (name.group(1) or "") if name else match.group(2))
+
 
 _lock = threading.RLock()
 
@@ -141,8 +166,10 @@ def _redact_error(error: str) -> str:
 
 
 def _error_signature(job_id: str, error: str) -> str:
-    """Dedup key: stable for same job + same normalized error prefix."""
-    normalized = _DURATION_RE.sub("#s", _normalize_error(error))[:_MAX_SIGNATURE_ERROR_CHARS]
+    """Dedup key: stable for same job + same error once per-run tokens are masked."""
+    normalized = _normalize_error(_TEMP_ENTRY_RE.sub(_mask_temp_entry, str(error or "")))
+    for pattern, mask in _PER_RUN_TOKENS:
+        normalized = pattern.sub(mask, normalized)
     return hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()[:12]
 
 

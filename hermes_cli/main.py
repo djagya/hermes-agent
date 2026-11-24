@@ -1335,13 +1335,12 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
                 # "send to this named thread, making it if needed" — without it
                 # a quiet send to a not-yet-existing session silently no-ops.
                 # --create-if-missing: no session matches the title — create a new session with that title
-                # and proceed. See #86794. The classic CLI's gateway writes it (the single writer);
-                # the TUI keeps main's local row.
-                if use_tui:
-                    new_sid = _create_titled_session(continue_val)
-                else:
-                    from hermes_cli.gateway_session_store import create_titled_session
-                    new_sid = create_titled_session(continue_val)
+                # and proceed. See #86794. The classic CLI creates it when it opens its gateway session, from
+                # the same launch policy a later `-c <title>` resume is checked against (one computation).
+                if not use_tui:
+                    args.create_title = continue_val
+                    return
+                new_sid = _create_titled_session(continue_val)
                 if new_sid:
                     args.resume = new_sid
                 else:
@@ -1678,6 +1677,7 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or safe_mode,
         "ignore_user_config": getattr(args, "ignore_user_config", False) or safe_mode,
         "compact": getattr(args, "compact", False),
+        "create_title": getattr(args, "create_title", None),
         **{k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH + (("api_key", None), ("base_url", None))},
     }
     kwargs = {k: v for k, v in kwargs.items() if v is not None}

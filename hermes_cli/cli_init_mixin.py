@@ -107,7 +107,7 @@ def lease_handed_over(cli, held):
         cli._claim_active_session("cli", stderr=True)
         raise
     if not cli._claim_active_session("cli", stderr=True):
-        raise RuntimeError("session_already_owned")
+        raise SystemExit(1)  # the claim printed why: another live owner holds the session
 
 
 class CLIInitMixin:
@@ -460,7 +460,10 @@ class CLIInitMixin:
         if getattr(self, "_gateway_session_open", False) or not isinstance(store, GatewaySessionStore):
             return
         launch = _gateway_launch(self)
-        held = getattr(self, "_resumed", False) and getattr(self, "_active_session_lease", None) is not None
+        # A titled create may land on an existing session (a title that raced in): hand the lease over as a
+        # resume does, so it names the session this CLI ends up on.
+        held = ((getattr(self, "_resumed", False) or getattr(self, "_create_title", None))
+                and getattr(self, "_active_session_lease", None) is not None)
         _record_shell_hook_consent()
         with lease_handed_over(self, held):
             sid = store.open_session(self, launch)

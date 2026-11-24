@@ -141,7 +141,10 @@ class GatewaySessionStore:
 
     def open_session(self, cli, launch=None):
         """Create (or resume) the gateway session for this CLI and adopt its id. A resume target the
-        gateway does not know is left as is: main's own "Session not found" path reports it."""
+        gateway does not know is left as is: main's own "Session not found" path reports it.
+        ``cli._create_title`` (``-c <title> --create-if-missing``) creates the titled session from this
+        same ``launch``, then runs the resume's own check on it: the owner resolves a title that appeared
+        meanwhile to that existing session, which is refused unless its launch matches."""
         key = self.connection.launch_api_key = (launch or {}).get("api_key") or None
         self.connection.launch_api_key_typed = key is not None and key == getattr(cli, "_typed_api_key", None)
         if getattr(cli, "_resumed", False):
@@ -151,12 +154,26 @@ class GatewaySessionStore:
                 if str(exc) in RESUME_REFUSALS:
                     return None
                 raise
-            # The CLI sends a coding-posture toolset pick and an env-folded ignore_rules too; only a typed
-            # -t / --ignore-rules is checked.
-            _check_resume_launch({**(launch or {}), "toolsets": getattr(cli, "_typed_toolsets", None),
-                                  "ignore_rules": getattr(cli, "_explicit_ignore_rules", None) or None}, snapshot)
+            _check_cli_launch(cli, launch, snapshot)
             return self._adopt(snapshot)
-        return self.create(launch)
+        title = getattr(cli, "_create_title", None)
+        if not title:
+            return self.create(launch)
+        try:
+            sid = self.create(launch, title=title, record_cwd=False)
+            if self.connection.launch_api_key:
+                # A title that raced in was created without this key: open it as a keyed resume does,
+                # so the owner binds the key or refuses a session launched without it (as main did).
+                sid = self._adopt(self.connection.resume(self.call, sid, typed=self.connection.launch_api_key_typed))
+            _check_cli_launch(cli, launch, self.snapshots[sid])
+        except GatewayClientError as exc:
+            logger.warning("Failed to create titled session %r on the gateway: %s", title, exc)
+            print(f"No session found matching '{title}' and a new titled session could not be created: {exc}",
+                  file=sys.stderr)
+            raise SystemExit(1) from None
+        # A title that raced into an existing session is that session: resume its history, as main did.
+        cli._resumed = bool(self.snapshots[sid].get("messages"))
+        return sid
 
     def create(self, launch=None, title=None, *, record_cwd=True):
         """``session.create`` with the launch policy (and ``title``: the owner's resolve -> create ->
@@ -165,8 +182,9 @@ class GatewaySessionStore:
         from agent.session_source import CLI_FAMILY_SOURCES, create_surface, session_source_for
         params = _creation_policy(launch or {})
         params["cwd"] = _launch_cwd()
-        # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source.
-        params["source"] = create_surface(session_source_for("cli"))
+        # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source; a titled
+        # row (``--create-if-missing``) is always ``cli``, as main's ``_create_titled_session`` wrote it.
+        params["source"] = "cli" if title else create_surface(session_source_for("cli"))
         # Main's row stamp (run_agent._launch_cwd_for_session): this process's cwd (``-w`` never
         # chdirs, so the repo root), only for a CLI-family label on a local terminal backend.
         local = (os.getenv("TERMINAL_ENV") or "local").strip().lower() in ("", "local")
@@ -515,6 +533,13 @@ def _classic_only_policy(launch):
 
 # Flags a resume may only repeat (``toolsets`` arrives here only from an explicit ``-t``).
 _RESUME_CHECKED = _LAUNCH_POLICY
+
+
+def _check_cli_launch(cli, launch, snapshot):
+    """:func:`_check_resume_launch` for this CLI's ``launch``. The CLI sends a coding-posture toolset pick
+    and an env-folded ignore_rules too; only a typed -t / --ignore-rules is checked."""
+    _check_resume_launch({**(launch or {}), "toolsets": getattr(cli, "_typed_toolsets", None),
+                          "ignore_rules": getattr(cli, "_explicit_ignore_rules", None) or None}, snapshot)
 
 
 def _check_resume_launch(launch, snapshot):

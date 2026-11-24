@@ -107,7 +107,9 @@ class _NoStreamConsumer(RuntimeError):
 
 
 class _ExecApprovalDeclined(RuntimeError):
-    """The connector refused the approval card's destination.
+    """The approval prompt cannot be shown: the connector refused the card's destination, or the
+    surface cannot push a prompt at all (the API server's ``send()`` is a stub) and no session
+    authority answers it.
 
     Raised (not returned) so it propagates out of `_approval_notify_sync` to
     `_await_gateway_decision`, whose notify-failure path drops the central
@@ -747,8 +749,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from gateway.run import _approval_send_outcome, _interim_metadata, _redact_approval_command
         from gateway.run_turn_runner_approval_settle import register_timeout_notice
         from gateway.run_turn_runner_approval_text import approval_text_prompt
+        from gateway.wake import adapter_supports_push
         ctx = self._ctx
         adapter = ctx._status_adapter
+        if self._approval_owner is None and not adapter_supports_push(adapter):
+            # Nobody can see a prompt here and nobody else answers it: refuse now, not at the timeout.
+            raise _ExecApprovalDeclined("exec approval undeliverable: this surface cannot show a prompt")
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.
