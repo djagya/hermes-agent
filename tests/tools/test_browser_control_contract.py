@@ -25,7 +25,7 @@ CONTRACT_PATH = ROOT / "tests/fixtures/browser_control/control-v1.json"
 # info for locked clients), 2026-11-11; plus only the Hermes.paymentSurfaceHolders entry of monolith
 # fix/payment-claim-holders (build C1, 2026-11-18); plus Hermes.paymentSurfaceTicket and Hermes.adoptPaymentSurface
 # (D-0878 a, 2026-11-24), written here first: the monolith contract takes these two entries as they stand
-CONTRACT_SHA256 = "823c0e0988066a13503d2088f1331905873abca2d66bba07ab6d059e4b2ebdf1"
+CONTRACT_SHA256 = "0d5802b46caf6176c3598a7773e63253724f509bb02b06d430831c87f9f8e027"
 # The body the fork's handback route reads for B10, as declared by control-v1.
 HANDOFF_ENDED_BODY = ["event", "session_id", "slot_id", "lease_id", "reason_code", "event_id"]
 
