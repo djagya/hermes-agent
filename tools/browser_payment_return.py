@@ -64,8 +64,8 @@ _DETECTED_NEXT = (
     "Never press Pay or Buy here; a new purchase needs a new approval from him.")
 _CLEAR_NEXT = (
     f"{RETURNED}; no placed order shows on it. No approval from before counts: before any Pay press, ask him for a "
-    "fresh approval of this purchase (fill the card again with the current cart, or, when the page takes no card "
-    "any more, his explicit go in chat and owner_go true).")
+    "fresh approval of this purchase: fill the card again with the current cart (a new approval card). When the page "
+    "takes no card any more, ask him to press Pay himself in the tab (owner_go does not count after a return).")
 
 
 async def _ticket(sup: Any) -> Optional[str]:

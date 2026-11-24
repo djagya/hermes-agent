@@ -216,6 +216,8 @@ def test_after_a_return_with_no_order_pay_needs_a_fresh_approval_and_is_pressed_
     # the approval from before the take is refused for the press after the return
     stale = flow.press("JETZT KAUFEN")
     assert stale["error_type"] == surface.GO_REQUIRED and "no approval from before counts" in stale["error"]
+    told = flow.press("JETZT KAUFEN", owner_go=True)  # D-0922 a: his word in chat does not count after a return
+    assert told["error_type"] == surface.GO_REQUIRED and "press Pay himself" in told["error"]
     assert flow.presses() == []
     # a fresh approval: the owner approves a new card fill (a new approval card), its total bound
     assert surface.claim_payment_surface(sup, INSPECTED) is None
@@ -230,8 +232,8 @@ def test_after_a_return_the_order_the_owner_placed_is_detected_and_pay_is_never_
     flow = _returned(env, paid=True)
     listed = flow.act()
     assert listed["returned"] is True and listed["payment_detected"] is True and "payment_done" in listed["next"]
-    out = flow.press("Jetzt kaufen", owner_go=True)  # even with the owner's word, and on any Pay-like control
-    assert out["error_type"] == detect.SPENT and "came back to Hermes" in out["error"] and "Tell" in out["error"]
+    out = flow.press("Jetzt kaufen", owner_go=True)  # the owner's word does not count after a return (D-0922 a)
+    assert out["error_type"] == surface.GO_REQUIRED and "payment_done" in out["error"]
     sup = flow.sup()
     assert surface.claim_payment_surface(sup, INSPECTED) is None  # nor after a new fill in this lock
     assert surface.record_approved_total(sup, 2266, "EUR", ("TOP", "L0"), shop.SHOP) is True
@@ -300,7 +302,7 @@ def _spans(monkeypatch, ctl_of):
 
 def test_any_failed_slow_or_unanswered_adoption_or_check_call_ends_in_no_press_and_a_message(env, monkeypatch):
     """Whole input: fill, Sera's Pay press (the checkout stays), take, return, list, press Pay with the owner's
-    fresh go. With every call answered that second press goes out. Then each call of the adoption and of the
+    fresh approval (a new card fill). With every call answered that second press goes out. Then each call of the adoption and of the
     press's order check (the reads the detection itself forgives included: the pressed control's state, a released
     object), one at a time, fails, answers late or never answers: no press after the return, a refusal that tells
     Sera what to tell the owner, and no fault was a no-op. The listing's own check reports the same as null."""
@@ -317,7 +319,12 @@ def test_any_failed_slow_or_unanswered_adoption_or_check_call_ends_in_no_press_a
         flow = _returned(env, pressed=True)
         flow.ctl.fault = fault
         listed = flow.act()
-        out = flow.press("JETZT KAUFEN", owner_go=True) if listed.get("payment_detected") is False else listed
+        if listed.get("payment_detected") is not False:
+            return flow, listed, listed
+        sup = flow.sup()  # the owner's fresh approval: a new card fill (D-0922 a)
+        assert surface.claim_payment_surface(sup, INSPECTED) is None
+        assert surface.record_approved_total(sup, 2266, "EUR", ("TOP", "L0"), shop.SHOP) is True
+        out = flow.press("JETZT KAUFEN")
         return flow, listed, out
 
     flow, listed, out = run()

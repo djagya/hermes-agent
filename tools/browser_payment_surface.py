@@ -1152,8 +1152,8 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
 
     if gate.approved is UNBOUND:  # r4 C8: the card covered Pay but its total is not bound: never the owner_go path
         return _refusal(TOTAL_UNBOUND, _TOTAL_UNBOUND_TEXT)
-    if gate.approved is None and not gate.owner_go:
-        returned = gate.gen is not None and gate.gen.returned  # before anything is read on the page
+    returned = gate.gen is not None and gate.gen.returned  # before anything is read on the page
+    if gate.approved is None and (returned or not gate.owner_go):  # D-0922 a: after a return only a new card counts
         return _refusal(GO_REQUIRED, _RETURNED_GO_TEXT if returned else _GO_REQUIRED_TEXT)
     page_sid, tree, child_sessions, listed = await _list_all(sup)
     element = None
@@ -1405,8 +1405,8 @@ _RETURNED_GO_TEXT = (
     "it, or the connection was replaced), so no approval from before counts and nothing was pressed. If "
     "payment_controls says payment_detected true, the order already went through: call payment_done and never press "
     "Pay. Otherwise Pay needs a fresh approval from him for this purchase, given after the return: fill the card "
-    "again with the current cart (a new approval card), or, when the page takes no card any more, ask him in chat "
-    "and call payment_click with owner_go true only after his explicit go.")
+    "again with the current cart (a new approval card). His word in chat (owner_go) does not count here: when the "
+    "page takes no card any more, ask him to press Pay himself in the tab.")
 _TOTAL_UNBOUND_TEXT = (
     "The owner's card covered one Pay press, but Hermes could not bind its approved total to this payment lock, so it "
     "cannot check the total before the press. Nothing was pressed, and owner_go does not change this. Stop and tell "
