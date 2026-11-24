@@ -7,6 +7,7 @@ subclass (logger name, disk-watch hooks) on top of it.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,8 @@ _ISS_OMITTING_ISSUERS = frozenset({"https://api.figma.com"})
 # Authorization-server metadata documents the SDK tries in its 401 branch (RFC 8414 / OIDC discovery).
 _ASM_DISCOVERY_PATHS = ("/.well-known/oauth-authorization-server", "/.well-known/openid-configuration")
 _DISCOVERY_CONTEXT_LEAD = "Could not read authorization-server metadata"
+# RFC 6749 §5.2 token-endpoint errors that say the refresh token or the client itself is dead.
+_DEAD_GRANT_ERRORS = frozenset({"invalid_grant", "invalid_client", "unauthorized_client"})
 
 
 def _default_auth_request_user_agent() -> str:
@@ -85,8 +88,9 @@ class HermesProviderMixin:
     - Any 2xx token/refresh response is accepted; token bodies never leak into errors/logs."""
 
     _hermes_logger: logging.Logger = logger
-    # Outcome of the last refresh attempt (see ``_handle_refresh_response``).
-    _hermes_refresh_inconclusive: bool = False
+    # The RFC 6749 error of the last refresh the authorization server refused as a dead grant or
+    # client (see _refusal_error); None after any other outcome.
+    _hermes_refresh_refused: str | None = None
 
     def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser", **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -454,11 +458,7 @@ class HermesProviderMixin:
             ok = await self._hermes_handle_refresh_response(response)
         finally:
             await self._hermes_release_refresh_fence()
-        # Only a 4xx refusal says the grant is dead. A 5xx, a throttle (408/425/429) or an
-        # unreadable 2xx says nothing about it: the refresh token on disk may still be good.
-        status = response.status_code
-        self._hermes_refresh_inconclusive = not ok and not (
-            400 <= status < 500 and status not in (408, 425, 429))
+        self._hermes_refresh_refused = None if ok else await _refusal_error(response)
         return ok
 
     async def _hermes_handle_refresh_response(self, response) -> bool:
@@ -528,6 +528,20 @@ class HermesProviderMixin:
         self.context.current_tokens = previous_tokens
         self.context.update_token_expiry(previous_tokens)
         return False
+
+
+async def _refusal_error(response) -> str | None:
+    """The ``error`` of a token-endpoint refusal that proves the grant or client dead: an RFC 6749 §5.2
+    JSON body naming ``invalid_grant``, ``invalid_client`` or ``unauthorized_client`` on a 400/401.
+    Anything else (a WAF or proxy page, a throttle, a 5xx, an unknown error) says nothing about the
+    refresh token on disk, which may still be good."""
+    if response.status_code not in (400, 401):
+        return None
+    try:
+        error = json.loads(await response.aread()).get("error")
+    except (ValueError, AttributeError):  # not JSON, or not an object
+        return None
+    return error if isinstance(error, str) and error in _DEAD_GRANT_ERRORS else None
 
 
 def _metadata_issuer(context: Any) -> str | None:

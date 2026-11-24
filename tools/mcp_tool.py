@@ -439,12 +439,11 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         # (revoked credentials, dead endpoint) that must not run the job tool-less forever.
         self._park_reason: Optional[str] = None
         self._last_park_line: Optional[str] = None  # last park WARNING text; identical re-parks log at DEBUG
-        # (token storage, credential stamp) while parked on an OAuth failure; see _arm_auth_park.
+        # (run-task context, credential snapshot) while parked on an OAuth failure; see _arm_auth_park.
         self._auth_park: Optional[tuple] = None
-        # Credential snapshot taken when an OAuth server parks on an auth failure; the unattended
-        # self-probe stays asleep until it differs (None = not an auth park, probe on schedule).
-        self._auth_park_credentials: Optional[tuple] = None
-        self._attempt_credentials: Optional[tuple] = None  # same snapshot, taken as each attempt starts
+        # The token endpoint refused the grant: the timed self-probe, too, waits for new credentials.
+        self._auth_park_gates_probe = False
+        self._attempt_credentials: Optional[tuple] = None  # the snapshot as this attempt started
         # Digest of the resolved inputs the transport last connected with; a cross-profile adopter
         # must resolve the same digest in its own scope. None until the transport publishes it.
         self._resolved_identity: Optional[str] = None

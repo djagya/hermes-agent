@@ -4,6 +4,7 @@ and tool deregistration. Origin state and patchable helpers are read through ``_
 ``mock.patch("tools.mcp_tool.X")`` keeps working."""
 
 import asyncio
+import contextvars
 import logging
 import time
 from dataclasses import dataclass
@@ -218,12 +219,11 @@ class MCPServerRunMixin:
                     "self-probe until it is re-enabled", self.name)
                 paused = True
                 continue
-            # An OAuth auth-failure park promises "parking until credentials change": until a new
-            # token/client file (`hermes mcp login` from another process) or an edited endpoint/auth
-            # config appears, the probe can only replay the dead refresh token (a 400 at the token
-            # endpoint) and then fail the non-interactive authorize step, every interval.
-            if (outcome == "self-probe" and self._auth_park_credentials is not None
-                    and self._oauth_credential_snapshot() == self._auth_park_credentials):
+            # The token endpoint refused the grant: until a new token/client file (`hermes mcp
+            # login` from another process) or an edited endpoint/auth config appears, the probe
+            # can only replay the dead grant, every interval.
+            if (outcome == "self-probe" and self._auth_park_gates_probe
+                    and await self._credential_snapshot() == self._auth_park[1]):
                 logger.debug("MCP server '%s': parked on authentication; credentials unchanged, "
                              "skipping self-probe", self.name)
                 continue
@@ -250,26 +250,43 @@ class MCPServerRunMixin:
 
     def _oauth_credential_snapshot(self) -> tuple:
         """What an OAuth re-authorization changes: the stat of this server's token and client
-        files plus its endpoint/auth config on disk. Stat only; no token bytes are read."""
+        files plus a digest of its endpoint/auth config as the bound secret scope renders it. No
+        token bytes are read. Callers bind the owner's FRESH scope, as a rebuild does, so a
+        ``${VAR}`` edited in the profile's ``.env`` counts."""
+        import hashlib
+
         from tools import mcp_tool_config as _config
         from tools.mcp_oauth import HermesTokenStorage
 
-        storage = HermesTokenStorage(self.name)
         entry = (_config._load_mcp_config() or {}).get(self.name) or {}
-        return storage.credential_stamp(), repr([entry.get(k) for k in self._REMOTE_REBIND_KEYS])
+        config = repr([entry.get(k) for k in self._REMOTE_REBIND_KEYS]).encode()
+        return HermesTokenStorage(self.name).credential_stamp(), hashlib.sha256(config).hexdigest()
 
-    def _arm_auth_probe_park(self, root: BaseException) -> None:
-        """Gate the self-probe of an OAuth auth-failure park (see ``_park``) on the credentials the
-        failed attempt STARTED with, so a login that landed while it was in flight still wakes
-        the probe. Not armed when the last token refresh was inconclusive (the authorization
-        server answered 5xx or throttled): the refresh token may still be good, and only the
-        timed probe can find out once the server recovers."""
-        if self._attempt_credentials is None or not _errors._is_auth_error(root):
-            return  # not an OAuth server (no snapshot was taken), or not an auth failure
-        from tools.mcp_oauth_manager import get_manager
+    async def _credential_snapshot(self) -> tuple:
+        """``_oauth_credential_snapshot`` from the run task, under the owner's fresh scope."""
+        from tools.mcp_tool_discovery import _install_owner_secret_scope
 
-        if not get_manager().refresh_was_inconclusive(self.name):
-            self._auth_park_credentials = self._attempt_credentials
+        scope_token = await _install_owner_secret_scope()
+        try:
+            return self._oauth_credential_snapshot()
+        finally:
+            if scope_token is not None:
+                from agent.secret_scope import reset_secret_scope
+                reset_secret_scope(scope_token)
+
+    def _credentials_changed_since(self, auth_park: tuple) -> bool:
+        """Discovery's twin of the self-probe's check: whether the credentials differ from those
+        of *auth_park* (``_auth_park``). Read in the run task's context (owner home and secret
+        scope): discovery runs in its caller's, which for an adopted connection is another
+        profile's."""
+        from tools.mcp_tool_discovery import _owner_secret_scope
+
+        def _snapshot() -> tuple:
+            with _owner_secret_scope():
+                return self._oauth_credential_snapshot()
+
+        context, snapshot = auth_park
+        return context.copy().run(_snapshot) != snapshot
 
     def _still_configured_enabled(self) -> bool:
         """Whether ``mcp_servers`` on disk still wants this server connected: entry present
@@ -398,11 +415,18 @@ class MCPServerRunMixin:
                             from agent.secret_scope import reset_secret_scope
                             reset_secret_scope(scope_token)
                 rebuild = True
-                self._auth_park = None
-                # Every attempt starts ungated; only an auth-failure park of THIS attempt re-arms.
-                self._auth_park_credentials = None
-                self._attempt_credentials = (
-                    self._oauth_credential_snapshot() if self._auth_type == "oauth" else None)
+                # Every attempt starts unparked; only an auth failure of THIS attempt re-arms.
+                auth_park, self._auth_park, self._auth_park_gates_probe = self._auth_park, None, False
+                self._attempt_credentials = None
+                if self._auth_type == "oauth":
+                    from tools.mcp_oauth_manager import get_manager
+
+                    get_manager().take_refresh_refusal(self.name)  # a refusal counts for one attempt only
+                    self._attempt_credentials = await self._credential_snapshot()
+                    if auth_park is not None and auth_park[1] != self._attempt_credentials:
+                        # Woken by new credentials: the cached provider holds the old client, tokens
+                        # and oauth config (it is rebuilt only for a new URL), so build a fresh one.
+                        get_manager().evict(self.name)
                 run_transport = self._run_http if self._is_http() else self._run_stdio
                 self._resolved_identity = None  # the transport publishes the inputs it connects with
                 if not await self._on_clean_return(await run_transport(config), budget):
@@ -498,6 +522,16 @@ class MCPServerRunMixin:
         """Transport raised: classify, then run the initial-connect or reconnect ladder. False = exit."""
         # Unwrap anyio TaskGroup wrappers: the group's str() hides the root cause.
         root = _errors._unwrap_exception_group(exc)
+        # A refresh the token endpoint refused as a dead grant decides this failure, whatever the
+        # resource answered after it: the SDK still sends the request, and a 403 or 5xx there would
+        # be retried or parked on a timer that can only replay the dead grant.
+        refused = None
+        if self._attempt_credentials is not None:
+            from tools.mcp_oauth_manager import get_manager
+
+            refused = get_manager().take_refresh_refusal(self.name)
+        if refused and not self._shutdown_event.is_set():
+            return await self._park_refused_grant(exc, root, refused, budget)
         failure_class = _errors._classify_mcp_failure(root)
         if self._is_recycled_stdio():
             logger.warning("MCP server '%s': lazy reconnect after stdio recycle failed, marking unavailable "
@@ -542,8 +576,7 @@ class MCPServerRunMixin:
                       else "connection with a permanent error, parking without retries")
             self._log_park("MCP server '%s' failed initial %s (state: connecting → parked): %s: %s",
                            self.name, detail, type(root).__name__, root)
-            self._arm_auth_park(root)
-            self._arm_auth_probe_park(root)
+            await self._arm_auth_park(root)
             return await self._park_initial_failure(exc, "after permanent initial failure", budget)
         budget.initial_retries += 1
         if budget.initial_retries > _core._MAX_INITIAL_CONNECT_RETRIES:
@@ -591,20 +624,37 @@ class MCPServerRunMixin:
         self._log_park(
             "MCP server '%s' hit a permanent error, parking without retries; will self-probe after %ds, backing off to 1h "
             "(state: connected → parked): %s: %s", self.name, _core._PARKED_RETRY_INTERVAL, type(root).__name__, root)
-        self._arm_auth_park(root)
-        self._arm_auth_probe_park(root)
+        await self._arm_auth_park(root)
         return await self._park_and_rearm("from parked state (permanent error)", budget)
 
-    def _arm_auth_park(self, root: BaseException) -> None:
+    async def _park_refused_grant(self, exc: Exception, root: BaseException, refused: str,
+                                  budget: _RetryBudget) -> bool:
+        """The token endpoint refused this server's grant or client (*refused* is its RFC 6749
+        error): park until credentials change, the timed self-probe included."""
+        self._log_park(
+            "MCP server '%s': the authorization server refused its token refresh (%s), parking until "
+            "credentials change; re-authenticate with `hermes mcp login %s` (state: %s → parked): %s: %s",
+            self.name, refused, self.name, "connected" if self._ever_connected else "connecting",
+            type(root).__name__, root)
+        await self._arm_auth_park(root, refused=True)
+        if self._ever_connected:
+            return await self._park_and_rearm("from parked state (permanent error)", budget)
+        return await self._park_initial_failure(exc, "after permanent initial failure", budget)
+
+    async def _arm_auth_park(self, root: BaseException, *, refused: bool = False) -> None:
         """Record the OAuth credentials an auth-failure park failed with. Until a re-authorization
         rewrites them, a discovery pass has nothing new to try: every nudge replayed the same rejected
         refresh token, so a backend building agents (each one re-runs discovery while no server is
-        connected) hit the authorization server once per session, enough for a rate-limit ban."""
-        if self._auth_type == "oauth" and _errors._is_auth_error(root):
-            from hermes_constants import get_hermes_home
-            from tools.mcp_oauth import HermesTokenStorage
-            storage = HermesTokenStorage(self.name, hermes_home=get_hermes_home())
-            self._auth_park = (storage, storage.credential_stamp())
+        connected) hit the authorization server once per session, enough for a rate-limit ban.
+        *refused* (the token endpoint refused the grant) gates the timed self-probe too."""
+        if self._attempt_credentials is None or not (refused or _errors._is_auth_error(root)):
+            return  # not an OAuth server (no snapshot was taken), or not an auth failure
+        # A refused refresh stores nothing, so against the attempt-start snapshot only a login that
+        # landed during the attempt differs. Any other auth failure may have stored a refreshed
+        # token of its own: snapshot now, or every discovery pass would take it for a login.
+        snapshot = self._attempt_credentials if refused else await self._credential_snapshot()
+        self._auth_park = (contextvars.copy_context(), snapshot)
+        self._auth_park_gates_probe = refused
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
