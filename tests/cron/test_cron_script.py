@@ -669,6 +669,25 @@ class TestRunJobEnvVarCleanup:
         assert os.environ.get("HERMES_SESSION_CHAT_NAME") is None
 
 
+class TestNoRealLaunchctl:
+    def test_launchctl_seam_is_refused_not_run(self, monkeypatch, _no_real_gateway_spawn):
+        """A cron test must never reach the real ``launchctl``: it registers a launchd job that
+        outlives pytest (seen 3 times on 2026-11-24). The seam refuses and teardown fails the test."""
+        import subprocess
+
+        import hermes_cli.gateway_launchd_runtime as launchd_runtime
+        from hermes_cli.gateway_runtime_service import RuntimeStartError
+
+        def real_launchctl(*args, **kwargs):
+            raise AssertionError("real launchctl ran")
+
+        monkeypatch.setattr(subprocess, "run", real_launchctl)
+        with pytest.raises(RuntimeStartError):
+            launchd_runtime._launchctl("list", timeout=1)
+        assert len(_no_real_gateway_spawn) == 1  # teardown would fail the test
+        _no_real_gateway_spawn.clear()
+
+
 class TestScriptTimeoutTreeKill:
     """Phase 4a (#85125): a script timeout must leave zero living descendants."""
 
