@@ -270,6 +270,101 @@ def test_after_a_return_the_order_the_owner_placed_is_detected_and_pay_is_never_
     assert detect.detected(sup)["evidence"] == "confirmation_text"
 
 
+def _fresh_approval(flow):
+    """The owner approves a new card fill (a new approval card) with its total bound (D-0922 a)."""
+    sup = flow.sup()
+    assert surface.claim_payment_surface(sup, INSPECTED) is None
+    assert surface.record_approved_total(sup, 2266, "EUR", ("TOP", "L0"), shop.SHOP) is True
+    return sup
+
+
+def test_after_a_return_a_confirmation_the_owners_payment_opened_in_a_new_tab_is_detected(env):
+    """Codex H2: while the owner had the tab, the checkout opened a payment step tab, and that tab opened the
+    confirmation (an opener chain; Sera never pressed, so no tab of hers is recorded). The check reads every shop tab
+    the payment tab's chain opened: the order is detected and even a fresh approval presses nothing."""
+    flow = _returned(env)
+    flow.ctl.popups.update({"STEP": ("TAB", shop.SHOP + "/zahlung", "Hilfe und Kontakt"),
+                            "BANK": ("STEP", "https://bank.test/3ds", "Vielen Dank für Ihre Bestellung!"),
+                            "DANKE": ("STEP", shop.SHOP + "/danke", "Vielen Dank für Ihre Bestellung! Nr. 10023")})
+    listed = flow.act()
+    assert listed["payment_detected"] is True and "payment_done" in listed["next"]
+    sup = _fresh_approval(flow)
+    assert flow.press("JETZT KAUFEN")["error_type"] == detect.SPENT and flow.presses() == []
+    assert detect.detected(sup)["where"] == "new_tab" and detect.detected(sup)["tab"] == "DANKE"
+    read = {c[2]["targetId"] for c in flow.ctl.calls if c[1] == "Target.attachToTarget"}
+    assert "BANK" not in read, "another site's tab is never read"
+
+
+@pytest.mark.parametrize("where", ["top", "new_tab"])
+def test_after_a_return_order_wording_hermes_cannot_be_sure_of_presses_nothing(env, where):
+    """GLM M1: the owner paid; the confirmation says "Your order has been received. Payment successful." (order
+    wording a checkout's own service text can carry too, no thank-you sentence or order number) on the payment tab
+    or in a tab his payment opened, and Sera never pressed Pay: Hermes cannot tell, so payment_detected is null and
+    even a fresh approval presses nothing."""
+    flow = _returned(env)
+    text = "Your order has been received. Payment successful."
+    if where == "top":
+        flow.ctl.page.page.update({"title": "Order", "text": text})
+        flow.ctl.page.rows = list(PAID_ROWS)
+    else:
+        flow.ctl.popups["DONE"] = ("TAB", shop.SHOP + "/order-received/123/", text)
+    listed = flow.act()
+    assert listed["payment_detected"] is None and "could not check" in listed["next"]
+    _fresh_approval(flow)
+    out = flow.press("Jetzt kaufen" if where == "top" else "JETZT KAUFEN")
+    assert out["error_type"] == "payment_return_unchecked" and flow.presses() == []
+
+
+def test_after_a_return_a_checkouts_own_service_text_is_no_order(env):
+    """GLM M1's other side: the checkout itself (its purchase button still listed) says what happens once the order
+    is placed: no order shows, and a fresh approval presses Pay once."""
+    flow = _returned(env)
+    flow.ctl.page.page["text"] = shop.CART["text"] + " Once your order has been placed you will receive an email."
+    assert flow.act()["payment_detected"] is False
+    _fresh_approval(flow)
+    assert flow.press("JETZT KAUFEN")["pay_pressed"] is True and len(flow.presses()) == 1
+
+
+def test_after_a_return_a_pressed_pay_control_that_no_longer_resolves_is_gone(env):
+    """GLM M2: Sera pressed Pay on a single-page checkout, the owner finished the payment and the shop removed the
+    control: Chrome answers DOM.resolveNode with "No node with given id found", which means gone (not a failed read),
+    so the thank-you sentence on the same document is the order."""
+    flow = _returned(env, paid=True, pressed=True)
+    flow.ctl.page.shown = None
+    assert flow.act()["payment_detected"] is True
+    _fresh_approval(flow)
+    assert flow.press("Jetzt kaufen")["error_type"] == detect.SPENT and len(flow.presses()) == 1
+
+
+def test_after_a_return_a_shops_confirm_dialog_is_never_accepted_until_a_fresh_approvals_press(env):
+    """Codex H1: a shop's own "Place order?" confirm waits on the payment tab after the return. Accepting it could
+    place the order without a fresh approval: refused (Sera asks the owner to answer it); dismissing still works."""
+    flow = _returned(env)
+    assert flow.act()["returned"] is True
+    sup, ws = flow.sup(), flow.ctl.native
+
+    def confirm():
+        event = {"method": "Page.javascriptDialogOpening", "sessionId": "S-page",
+                 "params": {"type": "confirm", "message": "Bestellung absenden?", "url": shop.SHOP + "/checkout/",
+                            "frameId": "TOP", "defaultPrompt": ""}}
+        ws.loop.call_soon_threadsafe(ws.queue.put_nowait, json.dumps(event))
+        wait_until(lambda: sup.snapshot().pending_dialogs, what="the confirm is held")
+        return sup.snapshot().pending_dialogs[0].id
+
+    def answer(dialog_id, accept):
+        return json.loads(vault_tool._payment_dialog_action(flow.task, dialog_id, accept))
+
+    def answered():
+        return [c[2] for c in flow.ctl.calls if c[1] == "Page.handleJavaScriptDialog"]
+
+    dialog_id = confirm()
+    out = answer(dialog_id, True)
+    assert out["error_type"] == "payment_dialog_returned" and "answer it himself" in out["error"]
+    _fresh_approval(flow)  # a fresh card alone does not do it either: only her Pay press after it
+    assert answer(dialog_id, True)["error_type"] == "payment_dialog_returned" and answered() == []
+    assert answer(dialog_id, False)["answered"] == "dismiss" and answered() == [{"accept": False}]
+
+
 def test_without_the_adoption_in_control_the_returned_payment_is_lost_not_foreign(env):
     """An older control (no ticket, no adoption): the record still moves to the new supervisor, so Sera is told to
     have the owner check the order, and nothing is pressed; once the lock ends the supervisor attaches as usual."""
