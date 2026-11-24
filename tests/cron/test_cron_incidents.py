@@ -197,8 +197,8 @@ _MUST_DIFFER = (
 
 
 def test_signature_ignores_per_run_tokens_and_keeps_meaningful_ones(monkeypatch, tmp_path):
-    """The same failure with fresh per-run tokens (mktemp's 6- and 10-character names, Python tempfile
-    names, clocks, timestamps, digests, UUIDs, byte counts, durations) is ONE signature, so the
+    """The same failure with fresh per-run tokens (bare mktemp's 10-character names, Python tempfile
+    names, clocks, timestamps, digests, byte counts, durations) is ONE signature, so the
     repeat-alert cooldown applies. Two failures that differ in a meaningful token are two: a shared
     signature with a closed incident would hide the second one for good."""
     import random
