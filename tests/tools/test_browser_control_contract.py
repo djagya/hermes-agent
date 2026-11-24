@@ -23,8 +23,9 @@ CONTRACT_PATH = ROOT / "tests/fixtures/browser_control/control-v1.json"
 # capture-guard view payment_surface), 2026-11-10; feat/pay-lockdown-20261111 @ 2f9f1f8031 (slot lockdown:
 # claim {tabs}, status {locked, native, tabs, unverified}, locked.commands; dbcfa2a404: origin-only target
 # info for locked clients), 2026-11-11; plus only the Hermes.paymentSurfaceHolders entry of monolith
-# fix/payment-claim-holders (build C1, 2026-11-18)
-CONTRACT_SHA256 = "02ca07acedd384971ad63dc7b67cdaa396a43fd48e59171ed28d0239a61b8e61"
+# fix/payment-claim-holders (build C1, 2026-11-18); plus Hermes.paymentSurfaceTicket and Hermes.adoptPaymentSurface
+# (D-0878 a, 2026-11-24), written here first: the monolith contract takes these two entries as they stand
+CONTRACT_SHA256 = "823c0e0988066a13503d2088f1331905873abca2d66bba07ab6d059e4b2ebdf1"
 # The body the fork's handback route reads for B10, as declared by control-v1.
 HANDOFF_ENDED_BODY = ["event", "session_id", "slot_id", "lease_id", "reason_code", "event_id"]
 
@@ -119,12 +120,13 @@ def test_durable_handback_seams_match_control(contract):
 
 
 def test_a9_payment_surface_cdp_methods_match_the_fork(contract):
+    from tools import browser_payment_return as taken_back
     from tools import browser_payment_surface as surface
 
     table = contract["cdp_methods"]
-    assert set(table["methods"]) == {surface.CLAIM_METHOD, surface.STATUS_METHOD, surface.HOLDERS_METHOD}
-    assert table["methods"][surface.CLAIM_METHOD]["errors"] == [surface.UNAVAILABLE]
-    assert table["methods"][surface.HOLDERS_METHOD]["errors"] == [surface.UNAVAILABLE]
+    refusable = {surface.CLAIM_METHOD, surface.HOLDERS_METHOD, taken_back.TICKET_METHOD, taken_back.ADOPT_METHOD}
+    assert set(table["methods"]) == refusable | {surface.STATUS_METHOD}
+    assert all(table["methods"][method]["errors"] == [surface.UNAVAILABLE] for method in refusable)
     assert surface.LOCKED in table["errors"]
     # the fork's native-socket lock mirrors control's locked allowlist exactly
     assert frozenset(table["locked"]["commands"]) == surface.LOCKED_COMMANDS

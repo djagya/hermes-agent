@@ -56,6 +56,13 @@ def spent_refusal(gen: Any) -> Optional[dict]:
     where = " in a new tab" if by.get("where") == "new_tab" else ""
     caption = by.get("caption") or "a Pay-like control"
     why = _EVIDENCE_TEXT.get(by.get("evidence"), "order evidence")
+    if by.get("returned"):  # D-0878: found by the order check after the owner returned the tab
+        return {"success": False, "error_type": SPENT,
+                "error": ("An order was detected on the payment tab when it came back to Hermes (the owner, Danil, "
+                          f"had taken it over; {why}{where}), so nothing was pressed and no approval is open. Tell "
+                          "him the order looks placed, and call payment_done: it reads the confirmation and ends "
+                          "the lock. Never press Pay or Buy here again; a new purchase needs a new approval from "
+                          "him.")}
     return {"success": False, "error_type": SPENT,
             "error": (f"A payment was detected for this approval (after the press on \"{caption}\": {why}{where}), so "
                       "nothing was pressed. Call payment_done; a new purchase needs a new approval from the owner "
@@ -251,6 +258,13 @@ async def before_press(sup: Any, gate: Any, page_sid: str, deadline: float) -> t
         return {"success": False, "error_type": INFLIGHT, "error": _INFLIGHT_TEXT}, None
     def budget() -> float:
         return max(0.1, min(_BEFORE_SCAN_S, deadline - time.monotonic()))
+
+    if gen is not None and gen.returned:  # D-0878: the owner had the tab: an order check that was read in full
+        from tools.browser_payment_return import check
+
+        refused = await check(sup, gate, page_sid, budget())
+        if refused:
+            return refused, None
 
     found = mine = None
     try:

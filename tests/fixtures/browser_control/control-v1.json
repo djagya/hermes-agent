@@ -935,6 +935,22 @@
           "payment_surface_unavailable"
         ],
         "rules": "answered only to the slot's native connection after a confirmed claim; additive: the claim reply is unchanged, and a runtime that does not ask it keeps reading the whole owning set"
+      },
+      "Hermes.paymentSurfaceTicket": {
+        "params": "none",
+        "result": "ticket (64 lowercase hex characters, random: the lock's adoption ticket; each call makes a new one and the earlier one stops working)",
+        "errors": [
+          "payment_surface_unavailable"
+        ],
+        "rules": "answered only to the slot's native connection while the slot is locked; the ticket lives in control's memory only (never stored, logged or shown on any route) and ends with the lock (release, temporary-profile wipe, human clear) and with a control restart; additive: a runtime that does not ask it keeps today's behaviour"
+      },
+      "Hermes.adoptPaymentSurface": {
+        "params": "ticket (the string Hermes.paymentSurfaceTicket returned); no other key",
+        "result": "adopted=true, locked=true, tabs (the slot's whole owning set, as in the claim reply)",
+        "errors": [
+          "payment_surface_unavailable"
+        ],
+        "rules": "makes this connection the locked slot's native connection (not filtered, able to extend the set with a claim) when all of these hold: the slot is locked, the lock has no native connection (its socket closed: a human take, a lost socket), this connection belongs to the slot's live agent lease, and the ticket equals the lock's current ticket (compared in constant time); the adoption spends the ticket; every other connection stays filtered; anything else (unlocked, a live native connection, a wrong, spent or missing ticket, another lease, after a control restart) is refused and changes nothing; the lock's start time, its owning set and the payment hold ceiling are unchanged"
       }
     },
     "errors": {

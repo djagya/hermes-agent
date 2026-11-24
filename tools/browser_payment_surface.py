@@ -289,6 +289,9 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
         others = others - holders if holders is not None else others
     _start_record(supervisor, gen, old, held_before, pressing_at_start, owned, bool(others), ws,
                   _merchant_identity(inspected))
+    from tools.browser_payment_return import keep_ticket
+
+    keep_ticket(supervisor, loop, ws)  # D-0878: what a later connection of this process adopts the lock with
     # dlz (lockdown §2): the payment tab and its card documents, for browser_vault payment_done.
     from tools.browser_payment_done import record_payment
 
@@ -339,6 +342,7 @@ def _start_record(supervisor: Any, gen: Any, old: Any, held_before: bool, pressi
             rec = _GENS[supervisor] = _LockGen(known=not (pressing_at_start or others or (still_held and not carry)))
             if carry:
                 rec.presses, rec.pressed = old.presses, old.pressed
+            rec.returned = old is not None and old.returned and still_held  # D-0878: the lock, not the approval
             replaced = old.serial if old is not None else 0
         rec.owned, rec.ws, rec.merchant = owned, ws, merchant
         _RECORD_SEQ += 1
@@ -1078,13 +1082,16 @@ def _public(controls: list) -> list:
 
 
 async def _controls(sup: Any) -> dict:
+    from tools.browser_payment_return import report
+
     nonce = secrets.token_hex(8)
-    _page_sid, _tree, child_sessions, listed = await _list_all(sup, nonce)
+    page_sid, _tree, child_sessions, listed = await _list_all(sup, nonce)
     try:
         controls = [c for _f, _s, _a, cs, _l in listed for c in cs]
         with _LOCK:
             _ISSUED[sup] = {c["ref"]: c["_spec"] for c in controls}
-        return {"success": True, "documents": len(listed), "controls": _public(controls)}
+        return {"success": True, "documents": len(listed), "controls": _public(controls),
+                **await report(sup, page_sid)}  # D-0878: after a return, whether an order already went through
     finally:
         await _release(sup, child_sessions, listed)
 
@@ -1146,7 +1153,8 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
     if gate.approved is UNBOUND:  # r4 C8: the card covered Pay but its total is not bound: never the owner_go path
         return _refusal(TOTAL_UNBOUND, _TOTAL_UNBOUND_TEXT)
     if gate.approved is None and not gate.owner_go:
-        return _refusal(GO_REQUIRED, _GO_REQUIRED_TEXT)  # before anything is read on the page
+        returned = gate.gen is not None and gate.gen.returned  # before anything is read on the page
+        return _refusal(GO_REQUIRED, _RETURNED_GO_TEXT if returned else _GO_REQUIRED_TEXT)
     page_sid, tree, child_sessions, listed = await _list_all(sup)
     element = None
     sid = ""
@@ -1359,6 +1367,7 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             if checked:  # r4 C7: a press checked against this approval (not owner_go)
                 gen.admitted = True
             if pay_press:
+                gen.returned = False  # D-0878: from this press on, the detection around presses reads the order
                 gen.pay_at, gen.pay_base = (top, time.monotonic()), base
                 if (node and node[0] == top) or gen.pay_node is None:
                     gen.pay_node, gen.pay_caption = node, caption
@@ -1391,6 +1400,13 @@ _GO_REQUIRED_TEXT = (
     "(vault.payment_pay_once), or this lock's approval is not known to this Hermes process (after a restart or a "
     "replaced browser connection). Ask the owner (Danil) in chat; only after his explicit go for this purchase call "
     "payment_click again with owner_go true.")
+_RETURNED_GO_TEXT = (
+    "This payment came back to Hermes on a new browser connection (the owner, Danil, took the tab over and returned "
+    "it, or the connection was replaced), so no approval from before counts and nothing was pressed. If "
+    "payment_controls says payment_detected true, the order already went through: call payment_done and never press "
+    "Pay. Otherwise Pay needs a fresh approval from him for this purchase, given after the return: fill the card "
+    "again with the current cart (a new approval card), or, when the page takes no card any more, ask him in chat "
+    "and call payment_click with owner_go true only after his explicit go.")
 _TOTAL_UNBOUND_TEXT = (
     "The owner's card covered one Pay press, but Hermes could not bind its approved total to this payment lock, so it "
     "cannot check the total before the press. Nothing was pressed, and owner_go does not change this. Stop and tell "
@@ -1702,7 +1718,8 @@ class _LockGen:
     held other tabs. Read and written under ``_LOCK``."""
 
     __slots__ = ("admitted", "approved", "known", "merchant", "native_lost", "owned", "paid", "paid_by", "pay_at",
-                 "pay_base", "pay_caption", "pay_node", "pay_tabs", "pressed", "presses", "serial", "ws")
+                 "pay_base", "pay_caption", "pay_node", "pay_tabs", "pressed", "presses", "returned", "serial",
+                 "ticket", "ws")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
@@ -1741,6 +1758,12 @@ class _LockGen:
         # (the strong order wording the document showed before it; the detection counts only what is new)
         self.pay_base: Optional[dict] = None
         self.pay_tabs: Optional[frozenset] = None  # G3: the tabs this approval's Pay-like presses opened
+        # D-0878 (``browser_payment_return``): control's adoption ticket for this lock (memory only; None: a take of
+        # the tab cannot be taken back), and whether the owner had the tab and returned it: no approval from before
+        # the return counts, and the order check runs before a Pay-like press and with every listing, until the
+        # next Pay-like press is booked
+        self.ticket: Optional[str] = None
+        self.returned = False
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)

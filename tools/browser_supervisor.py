@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import threading
@@ -103,6 +104,11 @@ def _cdp_reconnect_is_handshake_race(redial_failures: int) -> bool:
     """The first failed dial after a live session is Chrome's known reconnect handshake race
     (``InvalidMessage`` while the endpoint re-arms); log it at debug and warn from the second."""
     return redial_failures == 1
+
+
+# dlz (D-0878): a caller that must know every CDP call of its own task was answered (the order check after a
+# Return to Sera) sets a list here; each call that raises (an error reply, a timeout, a closed socket) adds its method.
+CDP_FAILURES: contextvars.ContextVar = contextvars.ContextVar("cdp_failures", default=None)
 
 
 class _LoopUnavailable(RuntimeError):
@@ -469,6 +475,10 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             with contextlib.suppress(Exception):
                 loop.close()
             self._set_active(False)
+            with contextlib.suppress(Exception):  # dlz (D-0878): a payment lock record outlives its supervisor
+                from tools.browser_payment_return import park
+
+                park(self)
 
     def _fail_start(self, e: BaseException) -> bool:
         """Propagate ``e`` to ``start()`` if we never got ready; True if it was consumed."""
@@ -625,6 +635,12 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             logger.warning("CDP supervisor %s: native payment connection lost during a payment lock; status only "
                            "until the lock ends (payment actions answer payment_native_lost)", self.task_id)
             return "lost"
+        from tools.browser_payment_return import take_back
+
+        if not await take_back(self):  # dlz (D-0878): a record the task's last supervisor left, not adopted
+            logger.warning("CDP supervisor %s: the payment lock of this task could not be taken back; status only "
+                           "until the lock ends (payment actions answer payment_native_lost)", self.task_id)
+            return "lost"
         try:
             from tools.browser_payment_done import has_payment
 
@@ -711,6 +727,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
     async def _attach_initial_page(self) -> None:
         """Attach the first page target that answers, else a new blank one. One crashed tab first in
         the list used to fail the whole supervisor, and with it every vault fill."""
+        if self._page_session_id:  # dlz (D-0878): take_back attached the payment tab it adopted
+            return
         # dlz: B15: one deadline for the whole initial attach (start()'s, or a fresh start budget on a
         # reconnect); existing tabs get what is left after the createTarget reserve.
         deadline = self._attach_deadline if not self._ready_event.is_set() and self._attach_deadline \
@@ -742,18 +760,24 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
     async def _cdp(self, method: str, params: Optional[dict[str, Any]] = None, *,
                    session_id: Optional[str] = None, timeout: Optional[float] = 10.0) -> dict[str, Any]:
         """Send a CDP command and await its response."""
-        if self._ws is None:
-            raise RuntimeError("supervisor WebSocket is not connected")
-        call_id, self._next_call_id = self._next_call_id, self._next_call_id + 1
-        payload: dict[str, Any] = {"id": call_id, "method": method}
-        payload.update({k: v for k, v in (("params", params), ("sessionId", session_id)) if v})
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending_calls[call_id] = fut
-        await self._ws.send(json.dumps(payload))
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
-        finally:
-            self._pending_calls.pop(call_id, None)
+            if self._ws is None:
+                raise RuntimeError("supervisor WebSocket is not connected")
+            call_id, self._next_call_id = self._next_call_id, self._next_call_id + 1
+            payload: dict[str, Any] = {"id": call_id, "method": method}
+            payload.update({k: v for k, v in (("params", params), ("sessionId", session_id)) if v})
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
+            self._pending_calls[call_id] = fut
+            await self._ws.send(json.dumps(payload))
+            try:
+                return await asyncio.wait_for(fut, timeout=timeout)
+            finally:
+                self._pending_calls.pop(call_id, None)
+        except BaseException:
+            failed = CDP_FAILURES.get()
+            if failed is not None:
+                failed.append(method)
+            raise
 
     async def _read_loop(self) -> None:
         """Continuously dispatch incoming CDP frames (responses → futures, events → handlers)."""

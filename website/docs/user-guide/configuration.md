@@ -3211,6 +3211,12 @@ After pressing Pay, the agent calls `browser_vault` with `action: payment_done`.
 
 If no safe confirmation page appears in time, the result is `payment_confirmation_not_reached` with the site (origin) the tab is on. The lock stays, and nothing is clicked, closed or retried. Hermes never presses Pay again on its own.
 
+### Taking the payment tab over and returning it
+
+If you take the payment tab over (browser handoff) while a card payment holds the lock, and then return it, the agent takes the payment back: its new browser connection adopts the lock, which browser-control allows only with a one-time ticket it gave Hermes' own connection when the lock started. If the adoption is not confirmed (an older browser-control, a restart, a timeout), every payment action answers `payment_native_lost` and nothing is pressed.
+
+After a return, `payment_controls` reports `returned: true` and `payment_detected`. Hermes first looks for an order on the shop's page with the same detection it runs after a Pay press (with no earlier press of its own, only a thank-you sentence or an order number counts). If it finds one, you paid yourself: the agent tells you, calls `payment_done`, and never presses Pay (`payment_already_made`). If the check cannot be read in full, nothing is pressed (`payment_return_unchecked`). An approval you gave before taking over never carries over: Pay needs a fresh approval from you, either a new card fill (a new approval card) or, when the page takes no card any more, your explicit go in chat.
+
 ### Custom smart-approval policy
 
 `approvals.smart_policy` lets you append your own rules to the smart-approval reviewer's instructions. When set, the text is added to the guardian LLM's system prompt (the trusted channel — never alongside the untrusted command text), so you can tighten or relax its judgment for your environment without editing code:
