@@ -343,6 +343,9 @@ def _start_record(supervisor: Any, gen: Any, old: Any, held_before: bool, pressi
             if carry:
                 rec.presses, rec.pressed = old.presses, old.pressed
             rec.returned = old is not None and old.returned and still_held  # D-0878: the lock, not the approval
+            if rec.returned:  # D-0922 a: and what the order check knows of Sera's Pay presses in this lock moves too
+                rec.pay_base, rec.pay_caption, rec.pay_node, rec.pay_tabs = (
+                    old.pay_base, old.pay_caption, old.pay_node, old.pay_tabs)
             replaced = old.serial if old is not None else 0
         rec.owned, rec.ws, rec.merchant = owned, ws, merchant
         _RECORD_SEQ += 1
