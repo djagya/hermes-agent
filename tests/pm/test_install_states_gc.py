@@ -194,3 +194,62 @@ def test_state_used_while_another_orphan_is_removed_is_kept(tmp_path, monkeypatc
     monkeypatch.setattr(pm.install_states.shutil, "rmtree", remove_then_launch)
     assert collect_orphan_install_states(installs) == [deleted]
     assert (used / "environments" / "gen" / "venv").is_dir()
+
+
+def test_claude_worktree_checkout_is_provably_deleted_only_while_its_worktrees_dir_exists(tmp_path):
+    """``<repo>/.claude/worktrees/<name>`` is proved deleted like ``.worktrees/<name>``; when the
+    ``worktrees`` dir is itself gone (an unmounted repo) nothing is proved, and a ``worktrees``
+    dir outside ``.claude`` proves nothing."""
+    installs = tmp_path / "home" / "installs"
+    (tmp_path / "repo" / ".claude" / "worktrees").mkdir(parents=True)
+    (tmp_path / "other" / "worktrees").mkdir(parents=True)
+    gone = _state(installs, "aaaa", tmp_path / "repo" / ".claude" / "worktrees" / "gone")
+    alive_root = tmp_path / "repo" / ".claude" / "worktrees" / "alive"
+    alive_root.mkdir()
+    alive = _state(installs, "bbbb", alive_root)
+    parent_gone = _state(installs, "cccc", tmp_path / "unmounted" / ".claude" / "worktrees" / "gone")
+    not_claude = _state(installs, "dddd", tmp_path / "other" / "worktrees" / "gone")
+    assert collect_orphan_install_states(installs) == [gone]
+    assert not gone.exists() and all(p.is_dir() for p in (alive, parent_gone, not_claude))
+
+
+def _sync_home(tmp_path):
+    from hermes_constants import set_hermes_home_override
+
+    home = tmp_path / "home"
+    home.mkdir()
+    return home, set_hermes_home_override(home)
+
+
+def test_sync_reclaims_the_state_of_deleted_claude_worktrees(tmp_path):
+    from hermes_cli.venv_sync import collect_superseded_generations
+    from hermes_constants import reset_hermes_home_override
+
+    home, token = _sync_home(tmp_path)
+    try:
+        worktrees = tmp_path / "repo" / ".claude" / "worktrees"
+        worktrees.mkdir(parents=True)
+        current_root = worktrees / "current"
+        current_root.mkdir()
+        current = _state(home / "installs", "aaaa", current_root)
+        gone = _state(home / "installs", "bbbb", worktrees / "gone")
+        collect_superseded_generations(current_root)
+    finally:
+        reset_hermes_home_override(token)
+    assert current.is_dir() and not gone.exists()
+
+
+def test_sync_survives_a_failing_install_state_reclaim(tmp_path, monkeypatch):
+    import pm.install_states
+    from hermes_cli.venv_sync import collect_superseded_generations
+    from hermes_constants import reset_hermes_home_override
+
+    def boom(_installs):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(pm.install_states, "collect_orphan_install_states", boom)
+    _home, token = _sync_home(tmp_path)
+    try:
+        assert collect_superseded_generations(tmp_path / "repo") is None
+    finally:
+        reset_hermes_home_override(token)
