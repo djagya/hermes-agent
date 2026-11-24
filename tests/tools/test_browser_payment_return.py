@@ -228,6 +228,21 @@ def test_after_a_return_with_no_order_pay_needs_a_fresh_approval_and_is_pressed_
     assert "returned" not in flow.act(), "from the press on, the detection around presses reads the order"
 
 
+def test_after_a_return_owner_go_never_presses_after_a_fill_only_re_fill_or_a_second_return(env):
+    """D-0922 a: only a new approval card counts after a return. A re-fill whose card bound no total (the page takes
+    no card any more, or the card was fill-only) leaves Pay to the owner, and so does a second take and return."""
+    flow = _returned(env, pressed=True)
+    assert flow.act()["payment_detected"] is False
+    assert surface.claim_payment_surface(flow.sup(), INSPECTED) is None  # a re-fill, no total bound
+    for _ in range(2):
+        out = flow.press("JETZT KAUFEN", owner_go=True)
+        assert out["error_type"] == surface.GO_REQUIRED and "press Pay himself" in out["error"]
+        flow.take()
+        flow.give_back()
+        assert flow.act()["returned"] is True
+    assert len(flow.presses()) == 1, "only Sera's press from before the first take"
+
+
 def test_after_a_return_the_order_the_owner_placed_is_detected_and_pay_is_never_pressed(env):
     flow = _returned(env, paid=True)
     listed = flow.act()
