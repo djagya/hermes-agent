@@ -225,13 +225,17 @@ def test_a_dead_grant_parks_until_credentials_change_whatever_the_resource_answe
                          ids=["pre-registered", "pre-registered-device"])
 def test_a_pre_registered_client_does_not_wake_its_own_park(tmp_path, monkeypatch, auth_server, oauth):
     """Provider setup rewrites the pre-registered client file on every build; that is not a
-    credential change, or each timed wake would evict, rebuild and replay the dead grant."""
+    credential change, or each timed wake (and each discovery) would evict, rebuild and replay
+    the dead grant."""
     home = tmp_path / "home"
     _profile(home, auth_server, oauth=oauth)
     monkeypatch.setenv("HERMES_HOME", str(home))
     auth_server.token, auth_server.resource = DEAD_GRANT, 401
 
     async def scenario(task, state):
+        await async_wait_until(lambda: task._auth_park is not None, what="the server never parked")
+        assert not task._credentials_changed_since(task._auth_park), \
+            "discovery would wake the park on its own provider setup"
         await _stays_parked(state, auth_server)
         assert state["calls"] == 1
 
@@ -401,3 +405,17 @@ def test_only_an_rfc6749_dead_grant_error_is_a_verdict(status, body, error):
     content = json.dumps(body).encode() if isinstance(body, dict) else body
     response = httpx.Response(status, content=content, request=httpx.Request("POST", "http://127.0.0.1/token"))
     assert asyncio.run(_refusal_error(response)) == error
+
+
+def test_a_login_in_the_same_attempt_ends_the_refusal(tmp_path, monkeypatch, auth_server):
+    """The refresh was refused, then the user logged in through the browser flow and the session
+    connected: a network blip after that parks as a dead grant only if the stale refusal survived."""
+    from mcp.shared.auth import OAuthToken
+    from tools.mcp_oauth_manager import get_manager
+
+    home = _profile(tmp_path / "home", auth_server)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    provider = get_manager().get_or_build_provider("srv", f"{auth_server.base}/mcp", {})
+    provider._hermes_refresh_refused = "invalid_grant"
+    asyncio.run(provider._store_tokens(OAuthToken(access_token="A2", token_type="Bearer", refresh_token="R2")))
+    assert get_manager().take_refresh_refusal("srv") is None

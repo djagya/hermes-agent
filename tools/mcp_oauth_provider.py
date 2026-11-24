@@ -424,6 +424,7 @@ class HermesProviderMixin:
         enforce_refresh_token_issuer(self.context)
 
     async def _store_tokens(self, token_response) -> None:
+        self._hermes_refresh_refused = None  # fresh tokens (a login, a refresh) end any refusal
         self.context.current_tokens = token_response
         self.context.update_token_expiry(token_response)
         bind_issuer_from_context(self.context)
