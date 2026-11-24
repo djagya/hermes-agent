@@ -74,6 +74,7 @@ _PER_RUN_TOKENS = tuple((re.compile(pattern), mask) for pattern, mask in (
 # ``mktemp``'s ``tmp.XXXXXXXXXX``.
 # A named template (``worktree.XXXXXX``) is not guessed at: its random part looks like a stable name
 # (``report.2024q1``), and one extra alert per run is the safe error. Linear on any error length.
+# no-tmp: ok — matches temp roots in error text; writes nothing there
 _TEMP_ENTRY_RE = re.compile(r"(?<![\w.-])((?:/private)?(?:/tmp|/var/tmp|/var/folders/[^/\s]+/[^/\s]+/T)/)([^/\s:;,'\"()]+)")
 _TEMP_NAME_RE = re.compile(r"tmp(?:[a-z\d_]{8}((?:\.[A-Za-z\d]{1,10})*)|\.[A-Za-z\d]{10})")
 
