@@ -22,7 +22,8 @@ def _transcript():
                      {"role": "assistant", "content": f"a{i} " + "detail " * 1500}]
     messages.append({"role": "user", "content": "build the pdf"})
     calls = [("skill_view", '{"name":"pdf"}', "P" * 9000)]
-    calls += [("terminal", '{"cmd":"ls"}', ch * 9000) for ch in "AB"]
+    # Enough bulky output after the skill that it falls outside the 8k-token recency look-back.
+    calls += [("terminal", '{"cmd":"ls"}', ch * 9000) for ch in "ABC"]
     calls += [("terminal", '{"cmd":"ls"}', "ok")] * 5
     for i, (tool, args, content) in enumerate(calls):
         messages += [

@@ -32,7 +32,7 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.context_compressor_durable import DurableStateMixin
 from agent.context_compressor_prellm import PreLlmSkipMixin
 from agent.context_compressor_window import CompactionWindowMixin, summary_view
-from agent.context_compressor_prune import ProactivePruneMixin, delegate_stub, stub_arguments, terminal_stub
+from agent.context_compressor_prune import ProactivePruneMixin, delegate_stub, stub_arguments, terminal_stub, volume_recent_start
 from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.context_compressor_sampling import SummaryInputSamplingMixin
 from agent.context_compressor_prompt_rules import EPISTEMIC_STANCE_RULE, UNVERIFIED_HYPOTHESES_SECTION, _today_for_prompt
@@ -999,10 +999,8 @@ def _build_anchor_index(turns: list[dict[str, Any]]) -> str:
     )
 
 
-# Message-count window (distinct from the token-based tail boundary) in which a
-# just-loaded skill_view body must survive the Phase-1 prune.
-# A skill_view call within this many trailing messages counts as "just loaded": its full instruction body
-# must survive the Phase-1 prune even when the token-budget boundary would otherwise demote it (#32106).
+# Message-count floor (distinct from the token-based tail boundary) for a just-loaded skill_view body to survive the
+# Phase-1 prune even when the token-budget boundary would demote it (#32106). ProactivePruneMixin extends it by volume.
 _SKILL_PRUNE_RECENT_WINDOW = 10
 
 
@@ -1023,14 +1021,14 @@ def _skill_view_call_sites(messages: list[dict[str, Any]]) -> list[tuple[int, st
     return sites
 
 
-def _collect_protected_skill_names(messages: list[dict[str, Any]], prune_boundary: int) -> set[str]:
+def _collect_protected_skill_names(messages: list[dict[str, Any]], prune_boundary: int, recent_token_budget: int) -> set[str]:
     """Skill names (lower-cased) whose skill_view bodies must survive Phase-1 demotion.
     Recently loaded, loaded inside the protected tail, or named by a tail user message. Applies to
     Phase-1/2 only; the Pass-4 pressure demotion ignores it."""
     total = len(messages)
     if not total:
         return set()
-    recent_start = max(0, total - _SKILL_PRUNE_RECENT_WINDOW)
+    recent_start = volume_recent_start(messages, _SKILL_PRUNE_RECENT_WINDOW, recent_token_budget)
     tail_start = max(0, prune_boundary)
     tail_user_texts = [
         m["content"].lower() for m in messages[tail_start:]
@@ -3158,7 +3156,7 @@ class ContextCompressor(
         # Just-loaded / tail-referenced skills keep full skill_view bodies through the ordinary passes.
         # Without this, a skill loaded moments before a compaction can be demoted to metadata while the
         # model still believes its instructions are in context. See #32106.
-        protected_skills = _collect_protected_skill_names(result, prune_boundary)
+        protected_skills = _collect_protected_skill_names(result, prune_boundary, self._skill_recency_tokens())
         # Pass 2: summarize old tool results. Tool-call arguments are canonical execution
         # records and are never rewritten; summary input is bounded separately by
         # _render_tool_call_for_summary().

@@ -16,6 +16,8 @@ from typing import Any, Optional
 logger = logging.getLogger("agent.context_compressor")
 # Reclaim gate on an already-expired provider cache: there is no cache break to amortize.
 _COLD_CACHE_MIN_RECLAIM_TOKENS = 16_000
+# Look-back, in tokens, over which a just-loaded skill_view body stays protected from the Phase-1 prune.
+_SKILL_RECENT_BUDGET_TOKENS = 8_000
 
 
 def _cc():
@@ -87,11 +89,31 @@ def _keep_running_turn(
     return [*pruned[:turn_start], *messages[turn_start:]], _changed_rows(messages[turn_start:], pruned[turn_start:])
 
 
+def volume_recent_start(messages: list[dict], floor_count: int, budget_tokens: int) -> int:
+    """Index from which a skill_view call counts as just loaded: the last ``floor_count`` messages, or every
+    trailing message whose newest-first running token estimate fits ``budget_tokens``, whichever reaches back
+    further. The estimate charges skill bodies and tool-call arguments, so one bulky turn ends the extension."""
+    estimate = _cc()._estimate_msg_budget_tokens
+    start, tokens = max(0, len(messages) - floor_count), 0
+    for i in range(len(messages) - 1, -1, -1):
+        tokens += estimate(messages[i])
+        if tokens > budget_tokens:
+            break
+        start = min(start, i)
+    return start
+
+
 class ProactivePruneMixin:
     """``ContextCompressor`` mixin: the deterministic, no-LLM tool-result prune and its commit."""
 
     # The host skips this prune for a session with no store row (batch runs): their originals live nowhere else.
     prune_needs_session_store = True
+
+    def _skill_recency_tokens(self) -> int:
+        """The skill look-back: 8k tokens, capped at the tail's share of the input window so a small model
+        keeps a small look-back (0 for an absent or zero window: only the message-count floor applies)."""
+        window = self._effective_input_window(getattr(self, "context_length", 0) or 0, getattr(self, "max_tokens", None))
+        return min(_SKILL_RECENT_BUDGET_TOKENS, int(window * _cc().TAIL_MAX_CONTEXT_FRACTION))
 
     def would_proactively_prune(self, current_tokens: int | None = None) -> bool:
         """Configured on AND above its trigger: the two state-free preconditions
