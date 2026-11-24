@@ -162,6 +162,8 @@ _MUST_DIFFER = (
     ("TypeError: manifest rejected at sync.mjs:12:19", "TypeError: manifest rejected at sync.mjs:13:19"),
     ("at /tmp/worktree.aB3xY9/scripts/sync.mjs:12:34", "at /tmp/worktree.aB3xY9/scripts/sync.mjs:13:34"),
     ("open /tmp/sums.sha256sum failed", "open /tmp/sums.sha512sum failed"),
+    ("The model `gpt-4o-2024-05-13` does not exist", "The model `gpt-4o-2024-08-06` does not exist"),
+    ("Unsupported api-version 2024-02-15-preview", "Unsupported api-version 2024-08-01-preview"),
     ("denied: '/tmp/tmpk3j2h1g0.json'", "denied: '/tmp/tmpk3j2h1g0.csv'"),
     ("open /tmp/report.2024q1 failed", "open /tmp/report.2024q2 failed"),
     ("open /tmp/model.v2beta1 failed", "open /tmp/model.v2beta2 failed"),
