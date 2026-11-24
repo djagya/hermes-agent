@@ -17,11 +17,12 @@ import pytest
 import websockets
 
 from tests.tools import test_browser_payment_detect as shop
-from tests.tools.test_browser_payment_done import STRIPE
+from tests.tools.test_browser_payment_done import STRIPE, frame_tree
 from tests.tools.test_browser_payment_native_recovery import FakeWS
 from tests.tools.test_browser_payment_surface_honesty import _row
 from tests.waiting import wait_until
 from tools import browser_payment_detect as detect
+from tools import browser_payment_order_evidence as evidence
 from tools import browser_payment_surface as surface
 from tools import browser_supervisor as bs
 from tools import browser_vault_tool as vault_tool
@@ -51,6 +52,7 @@ class Control:
         self.lock, self.native, self.ticket, self.adopts = set(), None, None, True
         self.fault, self.fired = None, False  # (index in ``calls``, "fail" | "slow" | "never"): that call's reply
         self.adopt_reply = None  # what a granted adoption answers instead
+        self.popups = {}  # target id -> (opener id, url, text): tabs the payment tab's page opened
 
     async def connect(self, url, **_kwargs):
         if url != LEASE % self.lease:
@@ -98,10 +100,21 @@ class Control:
         if locked and ws is not self.native and method != "Target.getTargets":
             raise RuntimeError("payment_surface_locked")  # the splice's filter on every connection but the native
         if method == "Target.attachToTarget":
-            return {"sessionId": "S-page" if params["targetId"] == "TAB" else "S-other"}
+            tab = params["targetId"]
+            return {"sessionId": "S-page" if tab == "TAB" else f"S-{tab}" if tab in self.popups else "S-other"}
+        popup = self.popups.get((sid or "")[2:])
+        if popup and method == "Page.getFrameTree":
+            return frame_tree(((sid + "-TOP", sid + "-L", popup[1], shop.SHOP, ""),))
+        if popup and method == "Runtime.evaluate" and params.get("expression") == evidence.SCAN_JS:
+            return {"result": {"type": "object", "value": evidence.wording("", popup[2])}}
+        if popup:
+            return {"executionContextId": 9} if method == "Page.createIsolatedWorld" else {}
         if method == "Target.closeTarget" and params.get("targetId") == "TAB":
             self.lock, self.native, self.ticket = set(), None, None
         out = self.page.answer(method, params, sid)
+        if method == "Target.getTargets":
+            out["targetInfos"] += [{"targetId": tab, "type": "page", "openerId": opener, "url": url}
+                                   for tab, (opener, url, _text) in self.popups.items()]
         if method == "Page.getFrameTree":  # as Chrome answers it: every frame with its origin
             origins = {row[0]: row[3] for row in self.page.tree}
             nodes = [out["frameTree"]]
@@ -298,12 +311,13 @@ def test_a_second_take_and_return_is_taken_back_again(env):
 
 
 def _spans(monkeypatch, ctl_of):
-    """Which calls (indexes in the control's log) each adoption and each order check sent."""
+    """Which calls (indexes in the control's log) each adoption, each order check and each press's look before the
+    press sent."""
     from tools import browser_payment_return as ret
 
-    spans = {"take_back": [], "check": []}
-    for name in spans:
-        def spy(*args, _real=getattr(ret, name), _name=name):
+    spans = {"take_back": [], "check": [], "before_press": []}
+    for module, name in ((ret, "take_back"), (ret, "check"), (detect, "before_press")):
+        def spy(*args, _real=getattr(module, name), _name=name):
             async def run():
                 start = len(ctl_of().calls)
                 try:
@@ -311,16 +325,21 @@ def _spans(monkeypatch, ctl_of):
                 finally:
                     spans[_name].append(range(start, len(ctl_of().calls)))
             return run()
-        monkeypatch.setattr(ret, name, spy)
+        monkeypatch.setattr(module, name, spy)
     return spans
 
 
+RELEASES = {"Runtime.releaseObject", "Target.detachFromTarget"}  # they free a handle after a read that answered
+
+
 def test_any_failed_slow_or_unanswered_adoption_or_check_call_ends_in_no_press_and_a_message(env, monkeypatch):
-    """Whole input: fill, Sera's Pay press (the checkout stays), take, return, list, press Pay with the owner's
-    fresh approval (a new card fill). With every call answered that second press goes out. Then each call of the adoption and of the
-    press's order check (the reads the detection itself forgives included: the pressed control's state, a released
-    object), one at a time, fails, answers late or never answers: no press after the return, a refusal that tells
-    Sera what to tell the owner, and no fault was a no-op. The listing's own check reports the same as null."""
+    """Whole input: fill, Sera's Pay press (the checkout stays), take (the checkout opens a help tab on the shop and a
+    bank tab while the owner has it), return, list, press Pay with the owner's fresh approval (a new card fill). With
+    every call answered that second press goes out. Then each call of the adoption and of the press's look before the
+    press (the one order check: the top document, the pressed control's state, the opened tab), one at a time,
+    fails, answers late or never answers: no press after the return, a refusal that tells Sera what to tell the
+    owner, and no fault was a no-op. A failed release of a handle after a read that answered changes nothing. The
+    listing's own check reports the same as null."""
     from tools import browser_payment_return as ret
 
     monkeypatch.setattr(ret, "_CALL_TIMEOUT_S", 0.2)
@@ -332,6 +351,8 @@ def test_any_failed_slow_or_unanswered_adoption_or_check_call_ends_in_no_press_a
         for found in spans.values():
             found.clear()
         flow = _returned(env, pressed=True)
+        flow.ctl.popups.update({"HELP": ("TAB", shop.SHOP + "/hilfe", "Hilfe und Kontakt"),
+                                "BANK": ("TAB", "https://bank.test/3ds", "Bitte bestätigen Sie die Zahlung")})
         flow.ctl.fault = fault
         listed = flow.act()
         if listed.get("payment_detected") is not False:
@@ -344,19 +365,24 @@ def test_any_failed_slow_or_unanswered_adoption_or_check_call_ends_in_no_press_a
 
     flow, listed, out = run()
     assert out["success"] is True and out["pay_pressed"] is True and len(flow.presses()) == 2
-    adoption, listing_check, press_check = spans["take_back"][-1], spans["check"][0], spans["check"][-1]
-    methods = [flow.ctl.calls[at][1] for at in press_check]
+    adoption, listing_check, press_look = spans["take_back"][-1], spans["check"][0], spans["before_press"][-1]
+    methods = [flow.ctl.calls[at][1] for at in press_look]
     assert len(spans["check"]) == 3 and [flow.ctl.calls[at][1] for at in adoption] == [
         ADOPT, "Target.attachToTarget", "Page.enable", "Runtime.enable", "Target.setAutoAttach", TICKET]
-    assert {"Page.getFrameTree", "Runtime.evaluate", "DOM.resolveNode", "Runtime.releaseObject"} <= set(methods)
-    for at, kind in [(at, kind) for at in (*adoption, *press_check) for kind in ("fail", "slow", "never")]:
+    for at, kind in [(at, kind) for at in (*adoption, *press_look) for kind in ("fail", "slow", "never")]:
         flow, listed, out = run((at, kind))
         where = f"call {at} ({flow.ctl.calls[at][1]}) {kind}"
-        assert flow.ctl.fired and len(flow.presses()) == 1, where  # Sera's press before the take, none after
+        assert flow.ctl.fired, where
+        if kind == "fail" and flow.ctl.calls[at][1] in RELEASES:
+            assert out["pay_pressed"] is True and len(flow.presses()) == 2, where
+            continue
+        assert len(flow.presses()) == 1, where  # Sera's press before the take, none after
         if at in adoption:
             assert out["error_type"] == surface.NATIVE_LOST and "check the order" in out["error"], where
         else:
             assert out["error_type"] == ret.RETURN_UNCHECKED and "nothing was pressed" in out["error"], where
+    assert {"Page.getFrameTree", "Runtime.evaluate", "DOM.resolveNode", "Runtime.callFunctionOn", "Target.getTargets",
+            "Target.attachToTarget", *RELEASES} <= set(methods), methods
     flow, listed, out = run((listing_check[0], "fail"))  # Sera is told not to press (a press runs its own check)
     assert flow.ctl.fired and listed["success"] is True and listed["payment_detected"] is None
     assert "could not check" in listed["next"] and "Do not press" in listed["next"] and len(flow.presses()) == 1
