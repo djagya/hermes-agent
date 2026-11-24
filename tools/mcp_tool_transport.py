@@ -636,6 +636,10 @@ class MCPServerTransportMixin:
         connect_timeout = config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)
         common = (url, headers, connect_timeout, config.get("ssl_verify", True), _resolve_client_cert(self.name, config),
                   self._build_oauth_auth(url, config), bool(config.get("strict_redirect_headers")))
+        if self._attempt_credentials is not None:
+            # Provider setup writes its own files (a pre-registered client.json): this attempt's
+            # baseline is what the setup left, so only a change made after it counts as a login.
+            self._attempt_credentials = await self._credential_snapshot()
         if config.get("transport") == "sse":
             return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
         if self._sse_fallback:

@@ -649,8 +649,8 @@ class MCPServerRunMixin:
         *refused* (the token endpoint refused the grant) gates the timed self-probe too."""
         if self._attempt_credentials is None or not (refused or _errors._is_auth_error(root)):
             return  # not an OAuth server (no snapshot was taken), or not an auth failure
-        # A refused refresh stores nothing, so against the attempt-start snapshot only a login that
-        # landed during the attempt differs. Any other auth failure may have stored a refreshed
+        # A refused refresh stores nothing, so against the snapshot taken once the attempt's provider
+        # was set up only a login that landed during the attempt differs. Any other auth failure may have stored a refreshed
         # token of its own: snapshot now, or every discovery pass would take it for a login.
         snapshot = self._attempt_credentials if refused else await self._credential_snapshot()
         self._auth_park = (contextvars.copy_context(), snapshot)

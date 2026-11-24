@@ -124,11 +124,11 @@ def _fast_park(monkeypatch):
             sock.close()
 
 
-def _write_config(home, server, user_agent="ua-1"):
+def _write_config(home, server, user_agent="ua-1", oauth=""):
     (home / "config.yaml").write_text(
         "mcp_servers:\n  srv:\n"
         f"    url: {server.base}/mcp\n    auth: oauth\n    connect_timeout: 5\n"
-        f"    oauth:\n      user_agent: '{user_agent}'\n", encoding="utf-8")
+        f"    oauth:\n      user_agent: '{user_agent}'\n{oauth}", encoding="utf-8")
 
 
 def _write_tokens(home, server, refresh_token="R1"):
@@ -213,6 +213,23 @@ def test_a_dead_grant_parks_until_credentials_change_whatever_the_resource_answe
     home = _profile(tmp_path / "home", auth_server)
     monkeypatch.setenv("HERMES_HOME", str(home))
     auth_server.token, auth_server.resource = token, resource
+
+    async def scenario(task, state):
+        await _stays_parked(state, auth_server)
+        assert state["calls"] == 1
+
+    _run(scenario)
+
+
+@pytest.mark.parametrize("oauth", ["      client_id: client-1\n", "      client_id: client-1\n      flow: device\n"],
+                         ids=["pre-registered", "pre-registered-device"])
+def test_a_pre_registered_client_does_not_wake_its_own_park(tmp_path, monkeypatch, auth_server, oauth):
+    """Provider setup rewrites the pre-registered client file on every build; that is not a
+    credential change, or each timed wake would evict, rebuild and replay the dead grant."""
+    home = tmp_path / "home"
+    _profile(home, auth_server, oauth=oauth)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    auth_server.token, auth_server.resource = DEAD_GRANT, 401
 
     async def scenario(task, state):
         await _stays_parked(state, auth_server)
