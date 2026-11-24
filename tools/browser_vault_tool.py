@@ -116,7 +116,7 @@ def _ensure_supervisor(task_id: str):
         return None
 
 
-def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
+def _eval_js_secret(task_id: str, expression: str, frame_session: Optional[str] = None) -> Dict[str, Any]:
     """Evaluate a SECRET-BEARING JS expression. Supervisor CDP-WS only.
 
     Fails closed: there is deliberately NO fallback to the agent-browser CLI
@@ -155,7 +155,7 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
-    sup = supervisor.evaluate_runtime(expression)
+    sup = supervisor.evaluate_runtime(expression, frame_session=frame_session)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {
@@ -194,7 +194,7 @@ def _current_page_origin(task_id: str) -> Optional[str]:
 # Per kind: a JS probe that is truthy on a tab holding the form this kind fills.
 _TAB_PROBES = {
     "login": "!!document.querySelector('input[type=password]')",
-    "payment": "!!document.querySelector('input[autocomplete^=cc-], [name*=card i], [placeholder*=card i], [name*=cvc i], [name*=cvv i]')",
+    "payment": "!!document.querySelector('input[autocomplete^=cc-], [name*=card i], [placeholder*=card i], [name*=cvc i], [name*=cvv i], iframe[src*=\"js.stripe.com\"]')",
     "address": "!!document.querySelector('input[autocomplete^=address-], [autocomplete=postal-code], [name*=address i], [name*=zip i], [name*=postal i]')",
 }
 
@@ -239,7 +239,10 @@ def browser_vault_list() -> str:
             continue
         for meta in metas:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
-                     "origin": meta.origin, "available": meta.kind == "login" or bool(meta.origin)}
+                     "origin": meta.origin,
+                     "available": meta.kind == "login" or meta.kind == "payment" or bool(meta.origin)}
+            if meta.kind == "payment":
+                entry["binding"] = "checkout" if not meta.origin else "origin"
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
@@ -397,7 +400,9 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                        "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
 
-def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
+def browser_vault_fill(handle: str, task_id: Optional[str] = None, *, currency: object = None,
+                       amount: object = None, recipient: object = None, items: object = None,
+                       submit: bool = False) -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -441,6 +446,13 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                     "in the desktop app open Settings → Credential Vault."
                 ),
             }
+        )
+    if meta.kind == "payment" and not meta.origin:
+        from tools.browser_vault_payment import fill_unbound_card
+
+        return fill_unbound_card(
+            handle=handle, label=meta.label, backend=backend, task_id=effective_task_id,
+            currency=currency, amount=amount, recipient=recipient, items=items, submit=bool(submit),
         )
     if meta.kind != "login" and not meta.origin:
         return json.dumps({"success": False, "error_type": "no_origin",
@@ -623,11 +635,12 @@ BROWSER_VAULT_FILL_SCHEMA = {
     "description": (
         "Fill the CURRENT browser page from a vault handle (see browser_vault_list): a login item fills ONLY "
         "the password field (type the identifier/username yourself first with the browser's input tool); a "
-        "payment item fills card number/name/expiry/CVC after the user confirms in their UI; an address item "
-        "fills the address fields. Values are resolved server-side and never appear in the conversation. "
-        "Refused unless the page origin exactly matches the item's bound origin (re-checked atomically at "
-        "fill time). If a password manager is locked the user is prompted to unlock first. Never retry a "
-        "payment_declined result."
+        "payment item bound to one origin fills card fields only there, after the user confirms. A payment "
+        "item with binding checkout (a 1Password card) is not tied to a merchant: pass currency, amount, "
+        "recipient and items, and the user confirms that exact charge once. submit=true then clicks one "
+        "enabled pay button. Stripe hosted fields on js.stripe.com are filled in their frame; other hosted "
+        "frames are refused. Values are resolved server-side and never appear in the conversation. "
+        "A filled or submitted result is not merchant acceptance. Never retry payment_declined or payment_replay."
     ),
     "parameters": {
         "type": "object",
@@ -635,7 +648,17 @@ BROWSER_VAULT_FILL_SCHEMA = {
             "handle": {
                 "type": "string",
                 "description": "Handle from browser_vault_list (vault_… local, op:… 1Password, bw:… Bitwarden)",
-            }
+            },
+            "currency": {"type": "string", "description": "ISO currency, e.g. EUR. Required for a checkout-bound card."},
+            "amount": {"type": "string", "description": "Exact charge with two decimals, e.g. 94.26. Required for a checkout-bound card."},
+            "recipient": {"type": "string", "description": "Who receives the purchase. Required for a checkout-bound card."},
+            "items": {
+                "type": "array",
+                "description": "Line items the user is confirming. Required for a checkout-bound card.",
+                "items": {"type": "object", "properties": {"label": {"type": "string"}, "count": {"type": "integer"}},
+                          "required": ["label", "count"]},
+            },
+            "submit": {"type": "boolean", "description": "After a confirmed fill, click the single enabled pay button once."},
         },
         "required": ["handle"],
     },
@@ -715,9 +738,21 @@ def _handle_vault_unlock(args: Dict[str, Any], **kwargs) -> str:
     return browser_vault_unlock(str(args.get("backend") or ""))
 
 
+def _as_submit(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return False
+
+
 def _handle_vault_fill(args: Dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
-    return _fenced_page_op(tid, lambda: browser_vault_fill(handle=str(args.get("handle") or ""), task_id=tid))
+    return _fenced_page_op(tid, lambda: browser_vault_fill(
+        handle=str(args.get("handle") or ""), task_id=tid, currency=args.get("currency"),
+        amount=args.get("amount"), recipient=args.get("recipient"), items=args.get("items"),
+        submit=_as_submit(args.get("submit")),
+    ))
 
 
 from tools.registry import no_cache_check_fn, registry  # noqa: E402

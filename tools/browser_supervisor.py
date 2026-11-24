@@ -214,16 +214,24 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         return {"ok": True, "dialog": dialog.to_dict()}
 
     def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
-                         await_promise: bool = True, timeout: float = 10.0) -> Dict[str, Any]:
+                         await_promise: bool = True, timeout: float = 10.0,
+                         frame_session: Optional[str] = None) -> Dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
+        ``frame_session`` evaluates in an already-attached OOPIF session instead of the
+        top page. Unknown sessions are refused before any CDP call.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
         semantics); non-serializable objects come back as a description string."""
+        with self._state_lock:
+            page_session = self._page_session_id
+            known_sessions = {frame.cdp_session_id for frame in self._frames.values() if frame.cdp_session_id}
+            active = self._active
+        if frame_session is not None and frame_session != page_session and frame_session not in known_sessions:
+            return _fail("unknown frame session")
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
-        with self._state_lock:
-            active, session_id = self._active, self._page_session_id
+        session_id = frame_session or page_session
         if not active:
             return _fail("supervisor is not active")
         if not session_id:

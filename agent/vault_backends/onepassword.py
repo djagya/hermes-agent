@@ -1,11 +1,13 @@
-"""1Password Login items as a vault backend (``op`` CLI).
+"""1Password logins and credit cards as a vault backend (``op`` CLI).
 
 Unlock: ``op signin --raw`` with the master password on stdin (desktop-app
 integration or account-level auth) mints an ``OP_SESSION_<account>`` token.
 A configured service-account token skips the prompt entirely (headless).
-List: ``op item list --categories Login --format json`` → title, urls,
-username, vault. Resolve: ``op item get <id> --vault <vault> ...`` so
-service-account authentication works as well as interactive sessions.
+List: ``op item list --categories Login`` and ``--categories "Credit Card"``.
+Logins need a website. Cards are payment metadata with no merchant origin and
+no card values. Resolve: ``op item get <id> --vault <vault>`` so service-account
+authentication works as well as interactive sessions. Card fields come from the
+item's own field ids and types, not from a login password.
 """
 
 from __future__ import annotations
@@ -13,9 +15,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from agent.secret_sources.base import run_cli
 from agent.secret_sources.onepassword import _OP_ENV_ALLOWLIST, _scrub, find_op
@@ -102,30 +105,56 @@ class OnePasswordLoginBackend(LoginBackend):
     def list_items(self) -> List[VaultItemMeta]:
         if not self.is_unlocked():
             return []
-        args = ["item", "list", "--categories", "Login", "--format", "json"]
         configured_vault = str(self.cfg.get("vault") or "").strip()
+        seen: set[str] = set()
+        out: List[VaultItemMeta] = []
+        for category in ("Login", "Credit Card"):
+            try:
+                raw = self._list_category(category, configured_vault)
+            except UnlockRequired:
+                raise
+            except Exception as exc:
+                if category == "Login":
+                    raise
+                logger.warning("1Password %s list failed: %s", category, str(exc)[:200])
+                continue
+            for item in raw:
+                if isinstance(item, dict):
+                    self._append_listed_item(item, configured_vault, seen, out)
+        return out
+
+    def _list_category(self, category: str, configured_vault: str) -> List[dict]:
+        args = ["item", "list", "--categories", category, "--format", "json"]
         if configured_vault:
             args += ["--vault", configured_vault]
         raw = json.loads(self._run(*args) or "[]")
-        out: List[VaultItemMeta] = []
-        for item in raw if isinstance(raw, list) else []:
-            urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
-            origins = _all_origins(urls)
-            if not origins:
-                continue
-            item_id = str(item.get("id") or "").strip()
-            if not item_id:
-                continue
-            vault = item.get("vault") if isinstance(item.get("vault"), dict) else {}
-            vault_id = str(vault.get("id") or configured_vault).strip()
-            handle = f"{self.prefix}{vault_id}:{item_id}" if vault_id else f"{self.prefix}{item_id}"
-            username = str(item.get("additional_information") or "").strip() or None
+        return raw if isinstance(raw, list) else []
+
+    def _append_listed_item(self, item: dict, configured_vault: str, seen: set[str], out: List[VaultItemMeta]) -> None:
+        item_id = str(item.get("id") or "").strip()
+        if not item_id or item_id in seen:
+            return
+        vault = item.get("vault") if isinstance(item.get("vault"), dict) else {}
+        vault_id = str(vault.get("id") or configured_vault).strip()
+        handle = f"{self.prefix}{vault_id}:{item_id}" if vault_id else f"{self.prefix}{item_id}"
+        if _is_credit_card(item):
+            seen.add(item_id)
+            # A saved website on a card is not a merchant binding. The checkout grant names the merchant.
             out.append(VaultItemMeta(
-                id=handle, kind="login", label=str(item.get("title") or origins[0]),
-                origin=origins[0], created_at=str(item.get("created_at") or ""),
-                identifier_type="username" if username else None, identifier=username,
-                allowed_origins=_web_origins(origins)))
-        return out
+                id=handle, kind="payment", label=str(item.get("title") or "Card"),
+                origin=None, created_at=str(item.get("created_at") or ""), allowed_origins=()))
+            return
+        urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
+        origins = _all_origins(urls)
+        if not origins:
+            return
+        seen.add(item_id)
+        username = str(item.get("additional_information") or "").strip() or None
+        out.append(VaultItemMeta(
+            id=handle, kind="login", label=str(item.get("title") or origins[0]),
+            origin=origins[0], created_at=str(item.get("created_at") or ""),
+            identifier_type="username" if username else None, identifier=username,
+            allowed_origins=_web_origins(origins)))
 
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
         requested_vault, requested_item = _split_handle(handle, self.prefix)
@@ -165,6 +194,32 @@ class OnePasswordLoginBackend(LoginBackend):
             return None
         return code if code.isdigit() else None
 
+    def resolve_secret(self, handle: str) -> Dict[str, str]:
+        meta = self.get_meta(handle)
+        if meta is None:
+            raise RuntimeError("vault item disappeared before it could be read")
+        if meta.kind != "payment":
+            return {"password": self.resolve_password(handle)}
+        vault_id, item_id = self._resolve_handle(handle)
+        args = ["item", "get", item_id, "--format", "json", "--reveal"]
+        if vault_id:
+            args += ["--vault", vault_id]
+        raw = self._run(*args)
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError:
+            raise RuntimeError("1Password returned an unreadable card item") from None
+        finally:
+            raw = ""
+        if not isinstance(item, dict):
+            raise RuntimeError("1Password returned an unreadable card item")
+        return payment_from_item(item)
+
+
+def _is_credit_card(item: dict) -> bool:
+    category = str(item.get("category") or "").upper().replace(" ", "_").replace("-", "_")
+    return category in {"CREDIT_CARD", "CREDITCARD"}
+
 
 def _web_origins(origins: List[str]) -> tuple:
     """Fill targets are browser pages, so app URIs (``androidapp://`` etc.) never
@@ -195,3 +250,85 @@ def _split_handle(handle: str, prefix: str) -> Tuple[Optional[str], str]:
     payload = handle[len(prefix):] if handle.startswith(prefix) else handle
     vault_id, separator, item_id = payload.partition(":")
     return (vault_id or None, item_id) if separator else (None, payload)
+
+
+_CVC_IDS = {"cvv", "cvc", "verificationnumber", "securitycode"}
+_CVC_LABEL = re.compile(r"verification|cvc|cvv|security code|card code", re.I)
+_NUMBER_IDS = {"ccnum", "creditcardnumber", "cardnumber"}
+_HOLDER_IDS = {"cardholder", "cardholdername", "ccname"}
+_EXPIRY_IDS = {"expiry", "expirydate", "expiredate"}
+_POSTAL_IDS = {"zip", "postal", "postalcode", "billingpostalcode"}
+
+
+def _iter_fields(item: dict) -> Iterable[dict]:
+    for field in item.get("fields") or []:
+        if isinstance(field, dict):
+            yield field
+    for section in item.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        for field in section.get("fields") or []:
+            if isinstance(field, dict):
+                yield field
+
+
+def _field_text(field: dict) -> str:
+    value = field.get("value")
+    if value is None or isinstance(value, (dict, list, bool)):
+        return ""
+    return str(value).strip()
+
+
+def split_expiry(value: str) -> Optional[Tuple[str, str]]:
+    """Return ``(month, year)`` from a 1Password month/year value. ``YYYYMM`` is the CLI's form."""
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) == 6 and int(digits[:4]) >= 2000:
+        month, year = digits[4:6], digits[:4]
+    elif len(digits) == 4:
+        month, year = digits[:2], "20" + digits[2:]
+    else:
+        return None
+    if not 1 <= int(month) <= 12:
+        return None
+    return month, year
+
+
+def payment_from_item(item: dict) -> Dict[str, str]:
+    """Map a revealed Credit Card item onto ``PAYMENT_FIELDS`` keys. Never reads a login password or PIN."""
+    number = holder = cvc = expiry = postal = ""
+    for field in _iter_fields(item):
+        fid = re.sub(r"[^a-z0-9]", "", str(field.get("id") or "").lower())
+        label = str(field.get("label") or "")
+        ftype = str(field.get("type") or "").upper()
+        text = _field_text(field)
+        if not text or fid == "pin":
+            continue
+        if ftype == "CREDIT_CARD_NUMBER" or fid in _NUMBER_IDS:
+            number = re.sub(r"[\s-]", "", text)
+        elif fid in _CVC_IDS or (ftype == "CONCEALED" and _CVC_LABEL.search(label)):
+            cvc = re.sub(r"\s+", "", text)
+        elif fid in _EXPIRY_IDS or (
+            ftype == "MONTH_YEAR" and "valid" not in fid and "valid" not in label.lower()
+            and "expir" in f"{fid} {label.lower()}"
+        ):
+            expiry = text
+        elif fid in _HOLDER_IDS or "cardholder" in label.lower():
+            holder = text
+        elif fid in _POSTAL_IDS or "postal" in label.lower() or label.lower() == "zip":
+            postal = text
+    parsed = split_expiry(expiry)
+    out: Dict[str, str] = {}
+    if number:
+        out["card_number"] = number
+    if holder:
+        out["cardholder_name"] = holder
+    if parsed:
+        out["exp_month"], out["exp_year"] = parsed
+    if cvc:
+        out["cvc"] = cvc
+    if postal:
+        out["billing_postal_code"] = postal
+    missing = [name for name in ("card_number", "exp_month", "exp_year", "cvc") if name not in out]
+    if missing:
+        raise RuntimeError("card item is missing required fields: " + ", ".join(missing))
+    return out

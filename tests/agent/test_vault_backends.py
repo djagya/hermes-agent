@@ -273,3 +273,86 @@ def test_onepassword_backend_env_forwards_config_directory(monkeypatch):
     backend = OnePasswordLoginBackend({"enabled": True})
 
     assert backend._env(None)["OP_CONFIG_DIR"] == "/tmp/op-config"
+
+
+_PAN = "4111111111111111"
+
+
+def _card_detail():
+    return {"id": "card1", "category": "CREDIT_CARD", "fields": [
+        {"id": "cardholder", "label": "cardholder name", "type": "STRING", "value": "A User"},
+        {"id": "ccnum", "label": "number", "type": "CREDIT_CARD_NUMBER", "value": _PAN},
+        {"id": "expiry", "label": "expiry date", "type": "MONTH_YEAR", "value": "202710"},
+        {"id": "validFrom", "label": "valid from", "type": "MONTH_YEAR", "value": "202001"},
+        {"id": "cvv", "label": "verification number", "type": "CONCEALED", "value": "123"},
+        {"id": "pin", "label": "PIN", "type": "CONCEALED", "value": "9999"},
+        {"id": "password", "label": "password", "type": "CONCEALED", "value": "not-the-card"},
+    ]}
+
+
+def test_onepassword_credit_card_is_payment_metadata_and_resolves_by_field_id():
+    """A card is not a login: list shows no PAN, last4, or merchant binding, and get uses the card's own fields."""
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+
+    backend = OnePasswordLoginBackend({"enabled": True, "vault": "vault-123"})
+    calls = []
+
+    def fake_run(*args):
+        calls.append(args)
+        if args[:4] == ("item", "list", "--categories", "Login"):
+            return json.dumps([{"id": "login1", "title": "Example", "category": "LOGIN",
+                                "additional_information": "jane@example.com", "vault": {"id": "vault-123"},
+                                "urls": [{"href": "https://example.com/login"}]}])
+        if args[:4] == ("item", "list", "--categories", "Credit Card"):
+            return json.dumps([{"id": "card1", "title": "N26 Sera Credit Card", "category": "CREDIT_CARD",
+                                "additional_information": "4242", "created_at": "2026-01-01T00:00:00Z",
+                                "vault": {"id": "vault-123"}, "urls": [{"href": "https://bank.example/card"}]}])
+        if args[:2] == ("item", "get"):
+            return json.dumps(_card_detail())
+        raise AssertionError(args)
+
+    with patch.object(OnePasswordLoginBackend, "is_unlocked", return_value=True), \
+         patch.object(backend, "_run", side_effect=fake_run):
+        metas = {meta.id: meta for meta in backend.list_items()}
+        secret = backend.resolve_secret("op:vault-123:card1")
+
+    assert metas["op:vault-123:login1"].kind == "login"
+    card = metas["op:vault-123:card1"]
+    assert card.kind == "payment" and card.origin is None and card.allowed_origins == ()
+    listed = json.dumps(card.to_dict())
+    assert _PAN not in listed and "4242" not in listed
+    assert secret["card_number"] == _PAN
+    assert secret["exp_month"] == "10" and secret["exp_year"] == "2027"
+    assert secret["cvc"] == "123" and secret["cardholder_name"] == "A User"
+    assert "password" not in secret and "9999" not in secret.values()
+    gets = [call for call in calls if call[:2] == ("item", "get")]
+    assert len(gets) == 1
+    assert "--vault" in gets[0] and "vault-123" in gets[0]
+    assert "--reveal" in gets[0] and "label=password" not in gets[0]
+
+
+def test_card_payload_ignores_pin_and_does_not_echo_values_on_failure():
+    from agent.vault_backends.onepassword import payment_from_item
+
+    broken = _card_detail()
+    broken["fields"] = [field for field in broken["fields"] if field["id"] != "cvv"]
+    with pytest.raises(RuntimeError, match="cvc") as raised:
+        payment_from_item(broken)
+    assert _PAN not in str(raised.value)
+
+
+def test_credit_card_list_failure_keeps_logins():
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+
+    backend = OnePasswordLoginBackend({"enabled": True})
+
+    def fake_run(*args):
+        if args[3] == "Credit Card":
+            raise RuntimeError("category unavailable")
+        return json.dumps([{"id": "login1", "title": "Example", "category": "LOGIN",
+                            "vault": {"id": "vault-123"}, "urls": [{"href": "https://example.com"}]}])
+
+    with patch.object(OnePasswordLoginBackend, "is_unlocked", return_value=True), \
+         patch.object(backend, "_run", side_effect=fake_run):
+        metas = backend.list_items()
+    assert [meta.kind for meta in metas] == ["login"]
