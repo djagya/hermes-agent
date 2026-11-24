@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import contextvars
 import json
 import logging
 import threading
@@ -104,11 +103,6 @@ def _cdp_reconnect_is_handshake_race(redial_failures: int) -> bool:
     """The first failed dial after a live session is Chrome's known reconnect handshake race
     (``InvalidMessage`` while the endpoint re-arms); log it at debug and warn from the second."""
     return redial_failures == 1
-
-
-# dlz (D-0878): a caller that must know every CDP call of its own task was answered (the order check after a
-# Return to Sera) sets a list here; each call that raises (an error reply, a timeout, a closed socket) adds its method.
-CDP_FAILURES: contextvars.ContextVar = contextvars.ContextVar("cdp_failures", default=None)
 
 
 class _LoopUnavailable(RuntimeError):
@@ -760,24 +754,18 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
     async def _cdp(self, method: str, params: Optional[dict[str, Any]] = None, *,
                    session_id: Optional[str] = None, timeout: Optional[float] = 10.0) -> dict[str, Any]:
         """Send a CDP command and await its response."""
+        if self._ws is None:
+            raise RuntimeError("supervisor WebSocket is not connected")
+        call_id, self._next_call_id = self._next_call_id, self._next_call_id + 1
+        payload: dict[str, Any] = {"id": call_id, "method": method}
+        payload.update({k: v for k, v in (("params", params), ("sessionId", session_id)) if v})
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_calls[call_id] = fut
+        await self._ws.send(json.dumps(payload))
         try:
-            if self._ws is None:
-                raise RuntimeError("supervisor WebSocket is not connected")
-            call_id, self._next_call_id = self._next_call_id, self._next_call_id + 1
-            payload: dict[str, Any] = {"id": call_id, "method": method}
-            payload.update({k: v for k, v in (("params", params), ("sessionId", session_id)) if v})
-            fut: asyncio.Future = asyncio.get_running_loop().create_future()
-            self._pending_calls[call_id] = fut
-            await self._ws.send(json.dumps(payload))
-            try:
-                return await asyncio.wait_for(fut, timeout=timeout)
-            finally:
-                self._pending_calls.pop(call_id, None)
-        except BaseException:
-            failed = CDP_FAILURES.get()
-            if failed is not None:
-                failed.append(method)
-            raise
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._pending_calls.pop(call_id, None)
 
     async def _read_loop(self) -> None:
         """Continuously dispatch incoming CDP frames (responses → futures, events → handlers)."""
