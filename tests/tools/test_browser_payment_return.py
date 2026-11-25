@@ -563,6 +563,7 @@ def test_detected_order_in_returned_lock_never_leads_to_close_and_refill(env):
     assert PRESSED % "1 time" in card and APPROVE in card and len(flow.presses()) == 1
     out, card = flow.card_fill()
     assert out["success"] is True and DETECTED in card
+    assert DETECTED in flow.card_fill("decline")[1], "the new lock keeps it"
     assert flow.press("JETZT KAUFEN")["pay_pressed"] is True and len(flow.presses()) == 2
 
 
