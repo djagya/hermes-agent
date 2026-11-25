@@ -974,7 +974,7 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     lost = native_lost_refusal(supervisor)  # build C4: the confirmation cannot be read on this socket
     if lost:
         return lost
-    from tools.browser_payment_return import RETURNED_REFILL, refills, settle
+    from tools.browser_payment_return import RETURNED_REFILL, settle, way_out
 
     payment, refused = _payment_for(supervisor)
     if refused:
@@ -1021,8 +1021,8 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     if page is None:
         # The tab is still locked: like browser-control for every agent connection, report its site only
         # (a locked page's title and path could carry what a planted script copied there).
-        return _refusal("payment_confirmation_not_reached",  # D-0961: after a return the way out is not the owner
-                        _NOT_REACHED + (RETURNED_REFILL if refills(supervisor) else _NOT_REACHED_ASK),
+        return _refusal("payment_confirmation_not_reached",  # D-0961: after a return (no detected order) not the owner
+                        _NOT_REACHED + (RETURNED_REFILL if way_out(supervisor, "") else _NOT_REACHED_ASK),
                         url=_shown_origin(seen.get("url", "")), title="", reason=reason, lock_released=False, **told,
                         **_dialog_report(supervisor))
     settle(supervisor)  # D-0878: the purchase is finished; the task's next lock is no returned one
@@ -1113,13 +1113,13 @@ def payment_close(supervisor: Any) -> dict:
     tab is opened first only when the browser would otherwise be left without one. ``pressed_in_lock``: whether a
     payment_click of this Hermes process started a press during this lock (not whether that press was Pay); null
     when this process did not hold the lock since it started, so it cannot know (see ``admit_close``)."""
-    from tools.browser_payment_return import RETURNED_CLOSED, refills
+    from tools.browser_payment_return import RETURNED_CLOSED, way_out
     from tools.browser_payment_surface import _FENCE_WAIT_S, _claim_lock, admit_close, end_close
 
     loop = getattr(supervisor, "_loop", None)
     if loop is None or not loop.is_running():
         return _refusal("supervisor_required", "The supervised browser is not attached; nothing was done.")
-    refill = refills(supervisor)  # D-0961: read before the close ends the record
+    refill = way_out(supervisor, "")  # D-0961: read before the close ends the record
     lock = _claim_lock(supervisor)  # one claim, dialog answer or recovery call at a time
     if not lock.acquire(timeout=_FENCE_WAIT_S):
         return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)

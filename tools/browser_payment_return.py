@@ -27,11 +27,9 @@ payment's lock record (weak-keyed by that supervisor) used to end with it; the t
   what the checkout needs, as on a lock that was never returned (D-0961: no step is left to the owner). A page past
   the card step (the fill finds no card fields; :func:`press_page`: the record's merchant shows the stated total and
   a Pay-like control) gets the same card in its press-only form; the tap binds the total as a fill's would.
-- **Any other page** (no card form, or the total gone before a press; :func:`way_out`): payment_done on an order
-  confirmation or a bank step, or first of all once Sera pressed Pay since the take back; else the base way out
-  (``RETURNED_REFILL``). That the payment came back, Sera's Pay presses and a detected order belong to the task
-  (``_RETURNED``): that fill's card still says them. Once an order was detected in it, Sera is never sent to close
-  and fill again: the base texts hold ("ask the user", "do not pay again").
+- **Any other page** (:func:`way_out`): payment_done first (an order confirmation, a bank step, or Sera pressed Pay
+  since the take back), else the base way out (``RETURNED_REFILL``); after a detected order the base texts. That the
+  payment came back, Sera's Pay presses and a detected order belong to the task (``_RETURNED``): that card says them.
 
 The same holds when the supervisor was replaced for another reason while the lock held (the texts say so).
 """
@@ -243,30 +241,16 @@ def settle(sup: Any) -> None:
         _RETURNED.pop(getattr(sup, "task_id", None), None)
 
 
-def _refills(gen: Any) -> bool:
-    """Must hold ``surface._LOCK``. ``gen`` came back after a return and no order was detected in its payment."""
-    return gen is not None and gen.returned and not (gen.paid or gen.ordered)
-
-
-def refills(sup: Any) -> bool:
-    """payment_done and payment_close after a return: ``RETURNED_REFILL`` / ``RETURNED_CLOSED`` instead of the base
-    "ask the user" / "do not pay again", unless an order was detected (then the base texts hold)."""
-    with surface._LOCK:
-        return _refills(_record(sup))
-
-
 def way_out(sup: Any, stop: str) -> str:
-    """``stop`` (what happened, nothing pressed or written) and the way on, when ``sup``'s lock came back and no order
-    was detected in its payment; else "" (the caller's base text holds). After a Pay press since the take back
-    (``pay_at``): payment_done first, which waits through a bank step; else ``RETURNED_REFILL``."""
+    """``stop`` and the way on when ``sup``'s lock came back and no order was detected in its payment (payment_done
+    first after a Pay press since the take back, else closing and filling again); else "" (the base text holds)."""
     with surface._LOCK:
         gen = _record(sup)
-        if not _refills(gen):
+        if gen is None or gen.paid or gen.ordered:
             return ""
         pressed = gen.pay_at is not None
     return stop + (PAY_DONE_FIRST if pressed else "If the page shows an order confirmation or a bank or 3-D Secure "
                                                   "step, call browser_vault payment_done. Otherwise " + RETURNED_REFILL)
-
 
 def awaits_approval(sup: Any) -> bool:
     """``sup``'s lock record came back after a return and no fresh approval is bound to it (a shop's confirm
@@ -298,8 +282,8 @@ def observe(sup: Any) -> dict:
     """Before a card fill's approval card is built (tool thread): the card's facts of a return
     (``PaymentPromptFacts.returned`` and ``pay_presses``), ``{}`` when neither ``sup`` nor its task has a returned one.
     ``returned``: the one bounded, value-free read of the payment tab's top document (two booleans leave the page):
-    ``"seen"`` (order wording), ``"not_seen"``, or ``"unread"`` (failed or timed out; not read again); ``"ordered"``
-    without a read once an order was detected in this payment (a fresh checkout's page would read as none).
+    ``"seen"`` (order wording), ``"not_seen"``, or ``"unread"`` (failed or timed out; not read again); ``"ordered"``,
+    unread, once an order was detected in this payment (a fresh checkout would read as none).
     ``pay_presses``: Sera's Pay-like presses in this lock (None: unknown). For the card only."""
     with surface._LOCK:
         gen = _record(sup) or _RETURNED.get(getattr(sup, "task_id", None))
