@@ -366,7 +366,7 @@ async def test_pay_once_only_when_the_page_check_matched_the_stated_total(state,
                                                  approver=OWNER)
     buttons = [b for row in adapter._bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard for b in row]
     assert buttons[0].text == (APPROVE_LABEL if pays else APPROVE_LABEL_FILL_ONLY)
-    assert next(iter(adapter._approval_cards.values()))["fill_only"] is not pays
+    assert ("Pay needs your go in chat" in next(iter(adapter._approval_cards.values()))["approved"]) is not pays
     coro, query = _tap(adapter, buttons[0].callback_data, chat_id=OWNER_ID, message_id=int(result.message_id))
     await coro
     assert ("Pay needs your go in chat" in query.answer.call_args.kwargs["text"]) is not pays
@@ -418,7 +418,7 @@ async def test_with_the_pay_once_switch_off_every_card_is_fill_only(made, now, m
                                                  approver=OWNER)
     buttons = [b for row in adapter._bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard for b in row]
     assert buttons[0].text == APPROVE_LABEL_FILL_ONLY
-    assert next(iter(adapter._approval_cards.values()))["fill_only"] is True
+    assert "Pay needs your go in chat" in next(iter(adapter._approval_cards.values()))["approved"]
     coro, query = _tap(adapter, buttons[0].callback_data, chat_id=OWNER_ID, message_id=int(result.message_id))
     await coro
     assert "Pay needs your go in chat" in query.answer.call_args.kwargs["text"]

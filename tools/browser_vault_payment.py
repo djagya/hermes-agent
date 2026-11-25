@@ -6,6 +6,7 @@ import contextvars
 import json
 import logging
 import re
+import secrets
 import time
 
 from agent.vault_backends import BackendError
@@ -287,6 +288,9 @@ _LOCKED_NEXT = (
     "payment_close (it closes the payment tab and ends the lock), open the checkout again, then call fill once more; "
     "it shows a new approval prompt. If the fill stops like this a second time, stop and tell the user."
 )
+# D-0878: the inspection refused a fill in a lock that came back after a return, and no press-only card applies
+_RETURNED_STOP = ("This page takes no card fill and has no Pay press the owner can be asked to approve, so nothing was "
+                  "read or written. ")
 _PAGE_CHANGED_LOCKED = (
     "The checkout changed after it was inspected (navigation, re-render or a different frame), so no card "
     "field was written and nothing was submitted. " + _LOCKED_NEXT
@@ -394,6 +398,16 @@ _REVISION_UNAVAILABLE_ON_READ = (
     "so it was dropped and no card field was written. Nothing was submitted. Tell the user; do not retry on "
     "your own."
 )
+
+
+def _browser_changed(task_id: str) -> dict:
+    """The approval's browser is no longer this task's: after a return (D-0961, ``came_back``) Sera fills again for a
+    new card, or retries while the payment is still on its way back; otherwise she tells the user."""
+    from tools.browser_payment_return import came_back
+
+    returned = came_back(task_id)
+    return {"success": False, "error_type": "payment_browser_changed", **({"returned": True} if returned else {}),
+            "error": returned or _BROWSER_CHANGED}
 
 
 _BROWSER_CHANGED_LOCKED = (
@@ -607,7 +621,7 @@ def _ownership_refusal(vault, task_id: str, supervisor, inspected, lease: str) -
     prompt is still this task's lease, control confirms the agent holds it, and the supervisor that inspected
     the page is the live one. A Bot Desktop human takeover refuses too. None = may proceed."""
     if vault._is_managed():
-        changed = {"success": False, "error_type": "payment_browser_changed", "error": _BROWSER_CHANGED}
+        changed = _browser_changed(task_id)
         # The route first: a new lease must not even get a supervisor attached on this path.
         if not lease or _route_lease(task_id) != lease or inspected.owner is not supervisor:
             return changed
@@ -724,7 +738,7 @@ def _lock_aware(result: dict, locked: bool, text: str = "") -> dict:
     """A zero-write stop with the lock-aware text when ``locked`` (nothing else changes): ``text``, else the one for its
     error type."""
     text = text or _LOCKED_TEXTS.get(result.get("error_type"), "")
-    if locked and text and not _wrote(result):
+    if locked and text and not _wrote(result) and not result.get("returned"):  # returned: the next call takes it back
         result["error"] = text
     return result
 
@@ -1080,7 +1094,7 @@ def _guard_capture(vault, task_id: str, lease: str, strict: bool) -> tuple:
     # dlz: the guard protects the approved lease only: a route replaced meanwhile (another browser
     # operation during the freshness pass) is not the browser this approval was for.
     if str(route.get("lease") or "") != lease:
-        return {"success": False, "error_type": "payment_browser_changed", "error": _BROWSER_CHANGED}, None
+        return _browser_changed(task_id), None
     refused = _set_control_capture_guard(route, strict=strict)
     if refused:
         return refused, None
@@ -1152,6 +1166,70 @@ def _claim_and_readmit(vault, task_id: str, supervisor, inspected, lease: str) -
     return _lock_aware(_expired(), vault._is_managed()) if time.monotonic() >= inspected.expires_at else None
 
 
+def _inspect(supervisor, vault, meta, stated, merchant_origin: str, bound: tuple, frame_origins: tuple, witness: dict):
+    """The fill's inspection: ``(inspection, policy)`` (policy None on the reviewed pass), or a typed result dict
+    (discovery's, or D-0961's press-only card when there is no card form at all and the payment came back after a
+    return: the reviewed pass found none and the discovery is off, found no unreviewed form, or found no card control
+    at all). Raises the inspection's refusal otherwise; a coverage refusal in a lock that came back with the way on
+    as its text (``way_out``)."""
+    try:
+        return supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
+                                          **witness), None
+    except PaymentPolicyError as exc:
+        try:
+            return _discover(supervisor, vault, exc, merchant_origin, bound, frame_origins, witness)
+        except PaymentPolicyError as refused:
+            if not _is_coverage_refusal(exc):  # a merchant mismatch (a bank page) or a changed page: as it is
+                raise
+            past = type(refused) is PaymentPolicyError or getattr(refused, "no_card_controls", False) is True
+            pressed = _press_only(supervisor, meta, stated) if past else None
+            if pressed is not None:
+                return pressed
+            from tools.browser_payment_return import way_out
+
+            text = way_out(supervisor, _RETURNED_STOP)
+            if not text:  # never returned, or an order was detected: the refusal as it is
+                raise
+            raise PaymentDestinationError(getattr(refused, "error_type", "payment_policy_refused"), text,
+                                          getattr(refused, "detail", None)) from None
+
+
+def _press_only(supervisor, meta, stated) -> dict | None:
+    """D-0961: the fill found no card form, and the payment came back after a return (``browser_payment_return``).
+    When the page is past the card step (``press_page``), the approval card's press-only form: the same facts but the
+    fill, the same gateway path and window; the owner's tap binds the stated total to the lock as a fill's would.
+    None: not this case (the fill's own refusal stands)."""
+    from tools.browser_payment_return import PRESS_APPROVED, bind_press, observe, press_page
+    from tools.browser_supervisor_payment import INSPECTION_WINDOW_S
+    from tools.payment_consent_prompt import PageMatch, PaymentPromptFacts, pays_once, request_payment_approval
+
+    page = press_page(supervisor, *_cents(stated)) if stated is not None else None
+    if page is None:
+        return None
+    gen, top, merchant = page
+    expires_at = time.monotonic() + INSPECTION_WINDOW_S
+    try:
+        facts = PaymentPromptFacts(ref=secrets.token_hex(16), card_label=meta.label, merchant_origin=merchant,
+                                   receiving=(), expires_in_s=INSPECTION_WINDOW_S, cart=stated,
+                                   page_match=PageMatch("matched", "the merchant page"), press_only=True,
+                                   **observe(supervisor))
+    except Exception:  # health: allow BLE001 -- facts out of bounds: no prompt, nothing bound
+        return None
+    if not pays_once(facts):
+        return None
+    consent = request_payment_approval(facts, timeout_seconds=INSPECTION_WINDOW_S)
+    if not consent.accepted:
+        refusal = _consent_not_given(consent.verdict, consent.reason)
+        if consent.detail:
+            refusal["error"] += " " + consent.detail
+        return refusal
+    if time.monotonic() >= expires_at:
+        return _expired()
+    if not pays_once(facts) or not bind_press(supervisor, gen, *_cents(stated), top, merchant):
+        return _browser_changed(supervisor.task_id)
+    return {"success": True, "press_only": True, "message": PRESS_APPROVED}
+
+
 def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, strict: bool = False,
                  cart=None, approve_origins=None, holder_name=None, billing_postal_code=None) -> str:
     """Native card fill after the owner's approval. ``strict`` (the unreviewed-destination feature): a managed
@@ -1219,16 +1297,12 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         frame_origins = effective_frame_origins(meta.payment_frame_origins)
         stated = _stated_cart(cart) if cart is not None else None
         witness = {"cart": _cents(stated)} if stated is not None else {}
-        policy = None  # (enabled, generation, strict) captured for the discovery inspection (B6)
         at["step"] = "inspect"
-        try:
-            inspected = supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
-                                                   **witness)
-        except PaymentPolicyError as exc:
-            found = _discover(supervisor, vault, exc, merchant_origin, bound, frame_origins, witness)
-            if isinstance(found, dict):
-                return json.dumps(found)
-            inspected, policy = found
+        # policy: (enabled, generation, strict) captured for the discovery inspection (B6)
+        found = _inspect(supervisor, vault, meta, stated, merchant_origin, bound, frame_origins, witness)
+        if isinstance(found, dict):
+            return json.dumps(found)
+        inspected, policy = found
         unreviewed = bool(getattr(inspected, "unreviewed_origins", ()))
         strict = strict or unreviewed
         if unreviewed:
@@ -1244,8 +1318,12 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         auto = _arm_auto(supervisor, inspected)
         prompt = inspected.prompt()
         # dlz: the owner-only payment card (tools.payment_consent_prompt): every fact or no prompt.
+        # D-0942 a: after a return the card says what one read of the page saw and how often Sera pressed Pay
+        from tools.browser_payment_return import observe
+
         try:
-            facts = facts_for_inspection(inspected, card_label=meta.label, cart=stated, supplied=tuple(supplied))
+            facts = facts_for_inspection(inspected, card_label=meta.label, cart=stated, supplied=tuple(supplied),
+                                         **observe(supervisor))
         except Exception:  # health: allow BLE001 -- facts out of bounds: no prompt, no fill
             facts = None
         consent = (request_payment_approval(facts, timeout_seconds=_remaining_seconds(inspected)) if facts is not None

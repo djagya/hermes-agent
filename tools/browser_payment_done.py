@@ -435,8 +435,8 @@ _NOT_REACHED = ("No order confirmation was reached on the payment tab within the
                 "The browser stays locked; nothing was clicked, closed or retried. Press Pay again only when the page "
                 "shows the payment failed or was declined. "
                 "url shows the site the tab is on (origin only while locked). If a bank check is waiting, ask the "
-                "user to finish it, then call payment_done again; otherwise ask the user (payment_close closes the "
-                "payment tab and ends the lock, without a confirmation snapshot).")
+                "user to finish it, then call payment_done again; otherwise ")
+_NOT_REACHED_ASK = "ask the user (payment_close closes the payment tab and ends the lock, without a confirmation snapshot)."
 _TAB_GONE = ("The payment tab is no longer open, so there is no confirmation page to read. Nothing was done. "
              "lock_released says whether browser control has unlocked the browser; check the order with the "
              "shop or the user's email.")
@@ -931,6 +931,11 @@ def payment_dialog(supervisor: Any, dialog_id: Any, accept: Any) -> dict:
         return _refusal("payment_dialog_not_payment_tab", _DIALOG_NOT_PAYMENT_TAB)
     if accept and not on_shop:
         return _refusal("payment_dialog_not_shop_page", _DIALOG_NOT_SHOP)
+    from tools.browser_payment_return import RETURNED_NEXT, awaits_approval
+
+    if accept and awaits_approval(supervisor):  # D-0878: a shop's confirm may place the order: a fresh approval first
+        return _refusal("payment_dialog_returned", "Nothing was done (it may place the order); dismiss it (accept "
+                                                   "false). " + RETURNED_NEXT)
     try:
         out = supervisor.respond_to_dialog("accept" if accept else "dismiss", dialog_id=dialog.id)
     except Exception as exc:  # health: allow BLE001 -- CDP text can quote the page; fixed type only
@@ -969,6 +974,8 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     lost = native_lost_refusal(supervisor)  # build C4: the confirmation cannot be read on this socket
     if lost:
         return lost
+    from tools.browser_payment_return import RETURNED_REFILL, settle, way_out
+
     payment, refused = _payment_for(supervisor)
     if refused:
         return refused
@@ -1014,8 +1021,11 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     if page is None:
         # The tab is still locked: like browser-control for every agent connection, report its site only
         # (a locked page's title and path could carry what a planted script copied there).
-        return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=_shown_origin(seen.get("url", "")),
-                        title="", reason=reason, lock_released=False, **told, **_dialog_report(supervisor))
+        return _refusal("payment_confirmation_not_reached",  # D-0961: after a return (no order, no Pay press since) not the owner; D-0984 a: after a press, ask
+                        _NOT_REACHED + (RETURNED_REFILL if way_out(supervisor, "") else _NOT_REACHED_ASK),
+                        url=_shown_origin(seen.get("url", "")), title="", reason=reason, lock_released=False, **told,
+                        **_dialog_report(supervisor))
+    settle(supervisor)  # D-0878: the purchase is finished; the task's next lock is no returned one
     context = page.pop("browser_context", None)
     raw_url = page["url"]  # the tab must open exactly this; only what is returned to the model is scrubbed
     page = _redacted_page(page)  # dlz: while the payment window is still open, before the release below
@@ -1103,6 +1113,7 @@ def payment_close(supervisor: Any) -> dict:
     tab is opened first only when the browser would otherwise be left without one. ``pressed_in_lock``: whether a
     payment_click of this Hermes process started a press during this lock (not whether that press was Pay); null
     when this process did not hold the lock since it started, so it cannot know (see ``admit_close``)."""
+    from tools.browser_payment_return import RETURNED_CLOSED, way_out
     from tools.browser_payment_surface import _FENCE_WAIT_S, _claim_lock, admit_close, end_close
 
     loop = getattr(supervisor, "_loop", None)
@@ -1124,7 +1135,9 @@ def payment_close(supervisor: Any) -> dict:
         if not admitted:  # dlz (Opus r2): never close the tab under a payment_click still on the wire
             return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
         try:
-            return {**_close_admitted(supervisor, loop, release), "pressed_in_lock": pressed}
+            refill = way_out(supervisor, "")  # D-0961: read before the close ends the record
+            out = {**_close_admitted(supervisor, loop, release), "pressed_in_lock": pressed}
+            return {**out, "note": RETURNED_CLOSED} if refill and out.get("note") == _CLOSE_DONE else out
         finally:
             end_close()
     finally:

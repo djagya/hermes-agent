@@ -144,7 +144,10 @@ class PaymentDestinationError(PaymentPolicyError):
     """dlz: a typed refusal with a fixed ``error_type``, a fixed message and a sanitized ``detail`` (origins,
     field tokens and counts only; never a frame URL, label or page text). Raised for the unreviewed-destination
     discovery (``payment_fields_unsupported`` / ``payment_fields_ambiguous``) and for a page over the traversal
-    bounds on either path (``payment_page_too_large``)."""
+    bounds on either path (``payment_page_too_large``). ``no_card_controls``: the discovery found no card control in
+    any document (D-0961: a page past the card step), as opposed to a form it cannot fill."""
+
+    no_card_controls = False
 
     def __init__(self, error_type: str, message: str, detail: dict | None = None):
         super().__init__(message)

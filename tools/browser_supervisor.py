@@ -259,6 +259,15 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             if self._thread.is_alive():
                 _shutdown_socket(self._ws or ws)
         self._set_active(False)
+        self._park_payment()  # the socket is closed by now, even when the thread outlived the join
+
+    def _park_payment(self) -> None:
+        """dlz (D-0878): this supervisor's payment lock record waits for the task's next one. Called once it can
+        send nothing more and before it leaves the registry, so a replacement always finds the record."""
+        with contextlib.suppress(Exception):
+            from tools.browser_payment_return import park
+
+            park(self)
 
     def _set_active(self, value: bool) -> None:
         with self._state_lock:
@@ -501,6 +510,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             return False
         logger.warning("CDP supervisor %s: stopped after %s failed reconnect attempts: %s",
                        self.task_id, failures, _redact_cdp_error_text(e))
+        self._park_payment()
         if SUPERVISOR_REGISTRY.get(self.task_id) is self:
             SUPERVISOR_REGISTRY._pop(self.task_id)
         return True
@@ -530,6 +540,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                     # dlz: B14: the lease ended; one line, leave the registry, no 5-try redial loop.
                     logger.info("CDP supervisor %s: lease ended (gate refused the redial with 403); stopping",
                                 self.task_id)
+                    self._park_payment()
                     if SUPERVISOR_REGISTRY.get(self.task_id) is self:
                         SUPERVISOR_REGISTRY._pop(self.task_id)
                     return
@@ -625,6 +636,12 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             logger.warning("CDP supervisor %s: native payment connection lost during a payment lock; status only "
                            "until the lock ends (payment actions answer payment_native_lost)", self.task_id)
             return "lost"
+        from tools.browser_payment_return import take_back
+
+        if not await take_back(self):  # dlz (D-0878): a record the task's last supervisor left, not adopted
+            logger.warning("CDP supervisor %s: the payment lock of this task could not be taken back; status only "
+                           "until the lock ends (payment actions answer payment_native_lost)", self.task_id)
+            return "lost"
         try:
             from tools.browser_payment_done import has_payment
 
@@ -711,6 +728,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
     async def _attach_initial_page(self) -> None:
         """Attach the first page target that answers, else a new blank one. One crashed tab first in
         the list used to fail the whole supervisor, and with it every vault fill."""
+        if self._page_session_id:  # dlz (D-0878): take_back attached the payment tab it adopted
+            return
         # dlz: B15: one deadline for the whole initial attach (start()'s, or a fresh start budget on a
         # reconnect); existing tabs get what is left after the createTarget reserve.
         deadline = self._attach_deadline if not self._ready_event.is_set() and self._attach_deadline \
@@ -819,15 +838,18 @@ class _SupervisorRegistry:
                      dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S,
                      start_timeout: float = SUPERVISOR_START_TIMEOUT_S) -> CDPSupervisor:
         """Idempotently ensure a supervisor runs for ``(task_id, cdp_url)``; one bound to a
-        different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced."""
+        different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced. dlz (D-0878): so
+        is one that dialled before its task's payment lock record was parked (``browser_payment_return.stranded``):
+        the replacement takes the record back on its first dial, so every later call (a payment action) adopts it."""
         from hermes_constants import hermes_home_key
+        from tools.browser_payment_return import stranded
         home = hermes_home_key()
         with self._lock:
             existing = self._by_task.get(task_id)
             if existing is not None:
                 thread, loop = existing._thread, existing._loop
                 healthy = thread is not None and thread.is_alive() and loop is not None and loop.is_running()
-                if existing.cdp_url == cdp_url and healthy:
+                if existing.cdp_url == cdp_url and healthy and not stranded(existing):
                     return existing
                 self._by_task.pop(task_id, None)
         if existing is not None:

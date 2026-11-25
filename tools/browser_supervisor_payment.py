@@ -361,7 +361,8 @@ def _receiving(candidates: list, merchant: str, allowed: tuple) -> list:
 def _discovery_documents(candidates: list, merchant: str, allowed: tuple, inspected_frames: int,
                          summary: dict | None = None) -> tuple:
     """``_card_documents`` for the discovery inspection, with its refusals typed: nothing complete is
-    ``payment_fields_unsupported`` (a count only: ad origins are never implied as destinations); duplicates, two
+    ``payment_fields_unsupported`` (a count only: ad origins are never implied as destinations; ``no_card_controls``
+    when no document holds a card control at all); duplicates, two
     hosted origins, too many documents or mixed expiry shapes are ``payment_fields_ambiguous`` (origins and tokens).
     The exact-once rules are ``_card_documents``' own, not weakened."""
     unreviewed = frozenset(c[3] for c in candidates if c[3] != merchant and c[3] not in allowed)
@@ -372,9 +373,11 @@ def _discovery_documents(candidates: list, merchant: str, allowed: tuple, inspec
         incomplete = str(exc) in ("Incomplete or ambiguous card fields", "Missing card expiry fields")
         if not candidates or (incomplete and len(tokens) == len(set(tokens))):
             # dlz (11-18): with what the inspection saw (counts and card field tokens only, ``_summary``).
-            raise PaymentDestinationError("payment_fields_unsupported", FIELDS_UNSUPPORTED,
-                                          {"unreviewed_frames_inspected": inspected_frames,
-                                           **({"inspection": summary} if summary else {})}) from None
+            refused = PaymentDestinationError("payment_fields_unsupported", FIELDS_UNSUPPORTED,
+                                              {"unreviewed_frames_inspected": inspected_frames,
+                                               **({"inspection": summary} if summary else {})})
+            refused.no_card_controls = not candidates
+            raise refused from None
         raise PaymentDestinationError("payment_fields_ambiguous", FIELDS_AMBIGUOUS,
                                       {"receiving_origins": _receiving(candidates, merchant, allowed)}) from None
 

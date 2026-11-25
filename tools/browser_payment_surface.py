@@ -289,6 +289,9 @@ def _claim_serialized(supervisor: Any, inspected: Any, loop: Any, tab: str) -> O
         others = others - holders if holders is not None else others
     _start_record(supervisor, gen, old, held_before, pressing_at_start, owned, bool(others), ws,
                   _merchant_identity(inspected))
+    from tools.browser_payment_return import keep_ticket
+
+    keep_ticket(supervisor, loop, ws)  # D-0878: what a later connection of this process adopts the lock with
     # dlz (lockdown §2): the payment tab and its card documents, for browser_vault payment_done.
     from tools.browser_payment_done import record_payment
 
@@ -319,8 +322,11 @@ def _start_record(supervisor: Any, gen: Any, old: Any, held_before: bool, pressi
     old record never had a confirmed claim) or a click was running when the claim began; build C r2 (P7): when the old
     lock still holds and its record was known, the new record carries its presses instead. Either is unknown when
     the owning set holds a page that is not this claim's tab or its holder (``others``). build C r4: ``merchant``
-    (``_merchant_identity``) is kept with the record."""
+    (``_merchant_identity``) is kept with the record. D-0878: while the old lock still holds, the new record also
+    keeps that the lock was returned and that an order was detected in it."""
     global _RECORD_SEQ
+    from tools.browser_payment_return import resume
+
     with _LOCK:
         if not held_before:
             if gen is None or _GENS.get(supervisor) is not gen:
@@ -338,9 +344,13 @@ def _start_record(supervisor: Any, gen: Any, old: Any, held_before: bool, pressi
                      and bool(owned & old.owned))
             rec = _GENS[supervisor] = _LockGen(known=not (pressing_at_start or others or (still_held and not carry)))
             if carry:
-                rec.presses, rec.pressed = old.presses, old.pressed
+                rec.presses, rec.pressed, rec.pay_presses = old.presses, old.pressed, old.pay_presses
+            if old is not None and still_held:  # D-0878: what belongs to the lock, not to the approval: it was
+                # returned, and an order was detected in it (a re-fill or a way back to the checkout never forgets it)
+                rec.returned, rec.paid, rec.paid_by = old.returned, old.paid, old.paid_by
             replaced = old.serial if old is not None else 0
         rec.owned, rec.ws, rec.merchant = owned, ws, merchant
+        resume(supervisor, rec)  # D-0878: that the task's payment was returned outlasts its lock
         _RECORD_SEQ += 1
         if rec.serial == 0:
             rec.serial = _RECORD_SEQ
@@ -530,7 +540,8 @@ def native_lost_refusal(supervisor: Any) -> Optional[dict]:
     - this process's lock record says so (its claim socket was replaced, or control reported the lock held by
       another connection) and control does not prove the slot unlocked; or
     - build C r2 (P6): this process holds no claim on this supervisor (a replaced supervisor, a restarted gateway)
-      and control reports the slot locked with this socket not native: ``payment_lock_foreign`` instead.
+      and control reports the slot locked with this socket not native: ``payment_lock_foreign`` instead (to retry
+      when a record of this task waits to be taken back: ``browser_payment_return.stranded``).
     An unlocked slot is never "lost": the action then answers as it does without a payment."""
     with _LOCK:
         gen = _GENS.get(supervisor) if supervisor in _HELD else None
@@ -553,7 +564,12 @@ def native_lost_refusal(supervisor: Any) -> Optional[dict]:
                 gen.native_lost = True
             return _refusal(NATIVE_LOST, NATIVE_LOST_TEXT)
         foreign = state == "locked" and supervisor in _NOT_NATIVE and gen is None
-    return _refusal(LOCK_FOREIGN, LOCK_FOREIGN_TEXT) if foreign else None
+    if not foreign:
+        return None
+    from tools import browser_payment_return as ret
+
+    # D-0878: a record of this task was parked after this supervisor dialled: the next call takes it back
+    return _refusal(LOCK_FOREIGN, ret.LOCK_MOVING if ret.stranded(supervisor) else LOCK_FOREIGN_TEXT)
 
 
 LOCK_FOREIGN = "payment_lock_foreign"
@@ -1078,13 +1094,15 @@ def _public(controls: list) -> list:
 
 
 async def _controls(sup: Any) -> dict:
+    from tools.browser_payment_return import report
+
     nonce = secrets.token_hex(8)
     _page_sid, _tree, child_sessions, listed = await _list_all(sup, nonce)
     try:
         controls = [c for _f, _s, _a, cs, _l in listed for c in cs]
         with _LOCK:
             _ISSUED[sup] = {c["ref"]: c["_spec"] for c in controls}
-        return {"success": True, "documents": len(listed), "controls": _public(controls)}
+        return {"success": True, "documents": len(listed), "controls": _public(controls), **report(sup)}
     finally:
         await _release(sup, child_sessions, listed)
 
@@ -1145,8 +1163,11 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
 
     if gate.approved is UNBOUND:  # r4 C8: the card covered Pay but its total is not bound: never the owner_go path
         return _refusal(TOTAL_UNBOUND, _TOTAL_UNBOUND_TEXT)
-    if gate.approved is None and not gate.owner_go:
-        return _refusal(GO_REQUIRED, _GO_REQUIRED_TEXT)  # before anything is read on the page
+    returned = gate.gen is not None and gate.gen.returned  # before anything is read on the page
+    if gate.approved is None and (returned or not gate.owner_go):  # D-0922 a: after a return only a new card counts
+        from tools.browser_payment_return import RETURNED_NEXT
+
+        return _refusal(GO_REQUIRED, "Nothing was pressed. " + RETURNED_NEXT if returned else _GO_REQUIRED_TEXT)
     page_sid, tree, child_sessions, listed = await _list_all(sup)
     element = None
     sid = ""
@@ -1352,20 +1373,20 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             from tools.browser_payment_detect import spent_refusal
 
             return spent_refusal(gen)
-        progress.extend(("checked" if checked else "go", _BOOKED))
+        progress.append("checked" if checked else "go")  # booked: from here the press counts, whatever its outcome
         if gen is not None:  # the admission above proved it is still this supervisor's current record
             gen.pressed = True
             gen.presses += 1
             if checked:  # r4 C7: a press checked against this approval (not owner_go)
                 gen.admitted = True
             if pay_press:
+                gen.pay_presses += 1
                 gen.pay_at, gen.pay_base = (top, time.monotonic()), base
                 if (node and node[0] == top) or gen.pay_node is None:
                     gen.pay_node, gen.pay_caption = node, caption
     return None
 
 
-_BOOKED = object()  # in ``progress``: the press was booked at its dispatch
 PAY_PRESSED_NEXT = (
     "Read the page. If it shows an order confirmation, call payment_done. If it shows another step (a confirm, "
     "3-D Secure, a dialog), continue.")
@@ -1599,8 +1620,6 @@ async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, elemen
     pressed with the caption check only. build G2 (Codex P1-1): a Pay-like press (``pay_like``) on a top document on a
     payment provider's or card origin (the fill's frames moved there after Pay) is no bank step: it keeps the total
     check, as in the live build (where a provider's page after Pay was refused outright)."""
-    from tools.browser_supervisor_payment import _page_match, _valid_pin
-
     cents, currency, fid, loader, merchant = gate.approved
     top = await _top_frame(sup, page_sid)
     no = _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT)
@@ -1613,12 +1632,18 @@ async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, elemen
             return no, top
         if cross_site(top[2], merchant) and not (pay_like and _provider_site(sup, top[2])):
             return None, top
+    return (None, top) if await shows_total(sup, page_sid, top, cents, currency) else (no, top)
+
+
+async def shows_total(sup: Any, page_sid: str, top: tuple, cents: int, currency: str) -> bool:
+    """Top document ``top`` shows the total ``matched`` by the fill's own rule and passes the Pay check, and is still
+    the top document after the read."""
+    from tools.browser_supervisor_payment import _page_match, _valid_pin
+
     pin, page_ok = await _page_total(sup, page_sid, top[0], cents, currency)
     if (await _top_frame(sup, page_sid))[:2] != top[:2]:  # the document changed during the read
-        return no, top
-    if not page_ok or not _valid_pin(pin) or _page_match([("merchant page", pin)], cents)[0] != "matched":
-        return no, top
-    return None, top
+        return False
+    return page_ok and _valid_pin(pin) and _page_match([("merchant page", pin)], cents)[0] == "matched"
 
 
 def _bank_challenge(sup: Any, clicked: tuple, merchant: str) -> bool:
@@ -1701,8 +1726,9 @@ class _LockGen:
     press may have landed in it), when control already reported the slot locked, or when control's lock already
     held other tabs. Read and written under ``_LOCK``."""
 
-    __slots__ = ("admitted", "approved", "known", "merchant", "native_lost", "owned", "paid", "paid_by", "pay_at",
-                 "pay_base", "pay_caption", "pay_node", "pay_tabs", "pressed", "presses", "serial", "ws")
+    __slots__ = ("admitted", "approved", "known", "merchant", "native_lost", "ordered", "owned", "paid", "paid_by",
+                 "pay_at", "pay_base", "pay_caption", "pay_node", "pay_presses", "pay_tabs", "pressed", "presses",
+                 "returned", "serial", "ticket", "ws")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
@@ -1723,8 +1749,8 @@ class _LockGen:
         self.admitted = False
         # build G1 (owner 2026-11-19: detect the payment, never limit presses): order evidence was found after a
         # Pay-like press of this approval (``browser_payment_detect``): the approval is spent, and every later
-        # Pay-like press in this record is refused; ``paid_by``: which press and what evidence. A new fill starts a
-        # new record (a new approval).
+        # Pay-like press in this record is refused; ``paid_by``: which press and what evidence. D-0878: it belongs to
+        # the lock: a re-fill's new record keeps it while the old lock still holds (``_start_record``).
         self.paid = False
         self.paid_by: Optional[dict] = None
         # build C r4: (top frame id, loader, merchant origin) of the checkout this record's claim was for, kept apart
@@ -1741,6 +1767,15 @@ class _LockGen:
         # (the strong order wording the document showed before it; the detection counts only what is new)
         self.pay_base: Optional[dict] = None
         self.pay_tabs: Optional[frozenset] = None  # G3: the tabs this approval's Pay-like presses opened
+        # D-0878 (``browser_payment_return``): control's adoption ticket for this lock (memory only; None: a take of
+        # the tab cannot be taken back), whether the owner had the tab and returned it during this lock (then only
+        # a new approval card counts, never owner_go), and the Pay-like presses booked in this lock (carried with
+        # ``presses``, and from the task's returned payment before this lock; the card after a return names them),
+        # and whether an order was detected in an earlier lock of that returned payment (the card names it)
+        self.ticket: Optional[str] = None
+        self.returned = False
+        self.pay_presses = 0
+        self.ordered = False
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
@@ -1759,8 +1794,10 @@ def pressing() -> bool:
 def admit_close(supervisor: Any) -> tuple[bool, Optional[bool]]:
     """payment_close's admission: ``(False, None)`` while any payment_click of this process runs (nothing may be
     closed). Otherwise the close is marked running, so no click starts until ``end_close``, and the second value
-    is ``pressed_in_lock``: True or False only when this process held this supervisor's lock since it started
-    (and saw it whole); None when that is unknown (a replaced supervisor, a restart, an unlock read in between)."""
+    is ``pressed_in_lock``: True or False only when this process held this lock's record since the lock started (and
+    saw it whole; a record taken back after a return keeps it: Hermes' own presses, never the owner's while he had
+    the tab); None when that is unknown (a restart, a supervisor holding no record of the lock, an unlock read in
+    between)."""
     global _CLOSING_N
     with _LOCK:
         if _PRESSING_N > 0:
@@ -1785,7 +1822,8 @@ def pay_press(supervisor: Any) -> Optional[dict]:
 def presses_in_lock(supervisor: Any) -> Optional[int]:
     """How many payment_click presses this process started in this supervisor's current lock (a press that may have
     landed counts), so Sera and the owner can see a second Pay before it happens. None when unknown, on the same
-    terms as ``pressed_in_lock`` (a restart, a replaced supervisor, an unlock read in between)."""
+    terms as ``pressed_in_lock`` (a restart, a supervisor holding no record of the lock, an unlock read in between;
+    a record taken back after a return keeps its count)."""
     with _LOCK:
         gen = _GENS.get(supervisor) if supervisor in _HELD else None
         return gen.presses if gen is not None and gen.known else None
@@ -1835,11 +1873,13 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
     try:
         out = _with_dialog(supervisor, _run(
             supervisor, lambda deadline: _click(supervisor, spec, progress, deadline, gate), progress))
+        if out.get("error_type") == TOTAL_CHANGED:  # D-0961: after a return the way out is not the owner
+            from tools.browser_payment_return import way_out
+
+            out["error"] = way_out(supervisor, "Nothing was pressed: the page no longer shows the approved total. ") \
+                or out["error"]
     finally:
         with _LOCK:  # build C r2 (P2): the press itself was booked at its dispatch (_book_press)
-            if progress and _BOOKED not in progress and gen is not None and _GENS.get(supervisor) is gen:
-                gen.pressed = True  # a press marked outside _book_press still counts (never admits, never pays)
-                gen.presses += 1
             _PRESSING_N = max(0, _PRESSING_N - 1)
             _PRESSING[supervisor] = max(0, _PRESSING.get(supervisor, 0) - 1)
     if out.get("success"):

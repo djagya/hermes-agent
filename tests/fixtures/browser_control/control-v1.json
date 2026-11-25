@@ -131,8 +131,28 @@
       "code": "stale",
       "status": 403
     },
+    "handoff_link_revoked": {
+      "code": "stale",
+      "status": 403
+    },
     "handoff_lease_changed": {
       "code": "stale",
+      "status": 403
+    },
+    "handoff_link_returned": {
+      "code": "stale",
+      "status": 403
+    },
+    "handoff_link_ended": {
+      "code": "stale",
+      "status": 403
+    },
+    "handoff_not_waiting": {
+      "code": "stale",
+      "status": 403
+    },
+    "handoff_instruction_invalid": {
+      "code": "scope_denied",
       "status": 403
     },
     "handoff_session_unavailable": {
@@ -273,14 +293,15 @@
       "auth": "controller",
       "body": [
         "lease_id",
-        "command_token"
+        "command_token",
+        "revoke_unused_handoff (optional bool, the holder's explicit release only: withdraws this lease's handoff links nobody has opened, then releases)"
       ],
       "reply": "released, closed_transports",
       "errors": [
         "lease_ended",
         "token_not_current",
         "fence_down",
-        "handoff_pending (deferred, not an error: the lease is kept until the handoff link is used or expires; treat as released-later, do not retry; deferred=true)",
+        "handoff_pending (deferred, not an error: the lease is kept until the handoff link is used or expires; treat as released-later, do not retry; deferred=true; revocable=true when nobody opened the link, so revoke_unused_handoff=true frees the slot now)",
         "slot_transient"
       ],
       "lanes": [
@@ -311,13 +332,15 @@
         "lease_id",
         "command_token",
         "ttl",
-        "target_id"
+        "target_id",
+        "instruction (optional: Sera's one line for the human, plain text, at most 120 characters; shown as her quote on the handoff page and the board)"
       ],
       "reply": "url, expires_in, target_id",
       "errors": [
         "lease_ended",
         "token_not_current",
-        "fence_down"
+        "fence_down",
+        "handoff_instruction_invalid"
       ],
       "lanes": [
         "private"
@@ -432,13 +455,39 @@
       "body": [
         "slot_id"
       ],
-      "reply": "lease view of the human lease",
+      "reply": "lease view of the human lease (taken_from_idle: true when the slot was idle)",
       "errors": [
         "slot_busy_human",
         "slot_not_active",
         "slot_parked",
         "slot_transient",
-        "handover_failed"
+        "handover_failed",
+        "pool_exhausted",
+        "cdp_not_ready"
+      ],
+      "lanes": [
+        "private"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/handoff/open",
+      "auth": "human",
+      "body": [
+        "slot_id"
+      ],
+      "reply": "ok, slot_id + the handoff session cookie (browser_handoff, Path=/handoff); then GET /handoff/control. Only for a handoff waiting on the slot for the signed-in principal (a live link, or one that expired unused while Sera still holds that exact lease and made no browser call since); the same exact-tab take as /handoff/consume, which the link then no longer opens",
+      "errors": [
+        "handoff_not_waiting",
+        "handoff_lease_changed",
+        "cdp_relay_missing",
+        "slot_busy_human",
+        "slot_parked",
+        "slot_transient",
+        "cdp_not_ready",
+        "handover_failed",
+        "fence_down"
       ],
       "lanes": [
         "private"
@@ -452,7 +501,7 @@
       "body": [
         "slot_id | lease_id+command_token"
       ],
-      "reply": "agent lease view",
+      "reply": "agent lease view; a lease taken from idle: returned, released, state, taken_from_idle, closed_transports (the slot is released, no agent lease)",
       "errors": [
         "lease_ended",
         "token_not_current",
@@ -527,6 +576,21 @@
     },
     {
       "method": "POST",
+      "path": "/human/handoff-open",
+      "auth": "human",
+      "body": [
+        "slot_id"
+      ],
+      "reply": "same as /v1/handoff/open (public lane: ok only, plus the cookie)",
+      "errors": [],
+      "lanes": [
+        "private",
+        "public"
+      ],
+      "refusal": "json"
+    },
+    {
+      "method": "POST",
       "path": "/human/resume",
       "auth": "human",
       "body": [
@@ -582,6 +646,9 @@
       "errors": [
         "handoff_unavailable",
         "handoff_link_expired",
+        "handoff_link_revoked",
+        "handoff_link_returned",
+        "handoff_link_ended",
         "handoff_lease_changed",
         "handoff_origin_denied",
         "handoff_held",
@@ -935,6 +1002,22 @@
           "payment_surface_unavailable"
         ],
         "rules": "answered only to the slot's native connection after a confirmed claim; additive: the claim reply is unchanged, and a runtime that does not ask it keeps reading the whole owning set"
+      },
+      "Hermes.paymentSurfaceTicket": {
+        "params": "none",
+        "result": "ticket (64 lowercase hex characters, random: the lock's adoption ticket; each call makes a new one and the earlier one stops working)",
+        "errors": [
+          "payment_surface_unavailable"
+        ],
+        "rules": "answered only to the slot's native connection while the slot is locked; the ticket lives in control's memory only (never stored, logged or shown on any route) and ends with the lock (release, temporary-profile wipe, human clear) and with a control restart; additive: a runtime that does not ask it keeps today's behaviour"
+      },
+      "Hermes.adoptPaymentSurface": {
+        "params": "ticket (the string Hermes.paymentSurfaceTicket returned); no other key",
+        "result": "adopted=true, locked=true, tabs (the slot's whole owning set, as in the claim reply)",
+        "errors": [
+          "payment_surface_unavailable"
+        ],
+        "rules": "makes this connection the locked slot's native connection (not filtered, able to extend the set with a claim) when all of these hold: the slot is locked, the lock has no native connection (its socket closed: a human take, a lost socket), this connection belongs to the slot's live agent lease, and the ticket equals the lock's current ticket (compared in constant time); the adoption spends the ticket; every other connection stays filtered; anything else (unlocked, a live native connection, a wrong, spent or missing ticket, another lease, after a control restart) is refused and changes nothing; the lock's start time, its owning set and the payment hold ceiling are unchanged"
       }
     },
     "errors": {
