@@ -680,6 +680,27 @@ def test_park_after_registry_stop_is_adopted_on_next_payment_action(env, monkeyp
     assert flow.ctl.native is flow.ctl.sockets[-1] and flow.task not in ret._PARKED
 
 
+def test_a_press_marked_after_its_record_was_parked_still_counts(monkeypatch):
+    """Round-5 noticed 3: the supervisor ends (its record parked) while a click it admitted still runs; a press that
+    click marks outside the dispatch booking is counted on its record, so the next fresh card names it."""
+    from tests.tools import test_browser_payment_done as done_tests
+
+    sup = done_tests._claimed(done_tests._Unlocking([done_tests.CHECKOUT], status=dict(done_tests.LOCKED_TAB)))
+    sup.task_id = f"t-parked-click-{next(_ids)}"
+
+    def run(supervisor, factory, progress=None):
+        ret.park(supervisor)  # the supervisor ended meanwhile
+        progress.append(True)  # the press went out
+        return {"success": True}
+
+    monkeypatch.setattr(surface, "_run", run)
+    done_tests._issue(sup)
+    surface.payment_click(sup, "c1-0123456789")
+    with surface._LOCK:
+        gen, _payments = ret._PARKED.pop(sup.task_id)
+    assert gen.presses == 1 and gen.pressed is True
+
+
 def _card(returned, cart=True, receiving=(prompt.ReceivingOrigin(STRIPE, "reviewed", ("cc-number",)),), **kwargs):
     facts = prompt.PaymentPromptFacts(
         ref="f" * 32, card_label="Card", merchant_origin=shop.SHOP, expires_in_s=300, returned=returned,

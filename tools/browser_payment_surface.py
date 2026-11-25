@@ -1364,7 +1364,7 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             from tools.browser_payment_detect import spent_refusal
 
             return spent_refusal(gen)
-        progress.append("checked" if checked else "go")  # booked: from here the press counts, whatever its outcome
+        progress.extend(("checked" if checked else "go", _BOOKED))
         if gen is not None:  # the admission above proved it is still this supervisor's current record
             gen.pressed = True
             gen.presses += 1
@@ -1378,6 +1378,7 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
     return None
 
 
+_BOOKED = object()  # in ``progress``: the press was booked at its dispatch
 PAY_PRESSED_NEXT = (
     "Read the page. If it shows an order confirmation, call payment_done. If it shows another step (a confirm, "
     "3-D Secure, a dialog), continue.")
@@ -1860,7 +1861,10 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
         out = _with_dialog(supervisor, _run(
             supervisor, lambda deadline: _click(supervisor, spec, progress, deadline, gate), progress))
     finally:
-        with _LOCK:  # build C r2 (P2): the press itself was booked in its record at its dispatch (_book_press)
+        with _LOCK:  # build C r2 (P2): the press itself was booked at its dispatch (_book_press)
+            if progress and _BOOKED not in progress and gen is not None:  # D-0878: on its record, parked or not
+                gen.pressed = True  # a press marked outside _book_press still counts (never admits, never pays)
+                gen.presses += 1
             _PRESSING_N = max(0, _PRESSING_N - 1)
             _PRESSING[supervisor] = max(0, _PRESSING.get(supervisor, 0) - 1)
     if out.get("success"):
