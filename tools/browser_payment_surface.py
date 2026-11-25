@@ -1726,8 +1726,8 @@ class _LockGen:
     press may have landed in it), when control already reported the slot locked, or when control's lock already
     held other tabs. Read and written under ``_LOCK``."""
 
-    __slots__ = ("admitted", "approved", "known", "merchant", "native_lost", "owned", "paid", "paid_by", "pay_at",
-                 "ordered", "pay_base", "pay_caption", "pay_node", "pay_presses", "pay_tabs", "pressed", "presses",
+    __slots__ = ("admitted", "approved", "known", "merchant", "native_lost", "ordered", "owned", "paid", "paid_by",
+                 "pay_at", "pay_base", "pay_caption", "pay_node", "pay_presses", "pay_tabs", "pressed", "presses",
                  "returned", "serial", "ticket", "ws")
 
     def __init__(self, known: bool):
