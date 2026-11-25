@@ -67,6 +67,7 @@ TYPED_APPROVE_HELD = ("A card payment is waiting: only the owner's Approve butto
 RETURNED_LINES = {
     "seen": "Order wording seen on the checked page.",
     "not_seen": "No order wording seen on the checked page.",
+    "new": "This is a new checkout; Hermes did not see the page Sera pressed Pay on.",
     "unread": "Hermes could not check the page for order wording.",
     "ordered": "Sera detected an order in this payment before; check your e-mail or bank.",
 }
@@ -235,7 +236,7 @@ class PaymentPromptFacts:
             raise FactsInvalid("supplied fields must be holder_name or billing_postal_code")
         object.__setattr__(self, "supplied_fields", tuple(n for n in SUPPLIED_FIELD_NAMES if n in supplied))
         if self.returned not in ("", *RETURNED_LINES):
-            raise FactsInvalid("returned must be empty, seen, not_seen, unread or ordered")
+            raise FactsInvalid("returned must be empty, seen, not_seen, new, unread or ordered")
         if self.pay_presses is not None and not (type(self.pay_presses) is int
                                                  and 0 <= self.pay_presses <= 999):
             raise FactsInvalid("pay_presses must be None or a small count")
@@ -368,7 +369,8 @@ def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
     if facts.returned:
         lines += ["This payment came back to Sera (you returned its tab, or her browser connection was replaced). "
                   + bold(RETURNED_LINES[facts.returned])
-                  + " This check only advises: Hermes cannot tell whether you already paid.", ""]
+                  + ("" if facts.returned == "ordered" else
+                     " This check only advises: Hermes cannot tell whether you already paid."), ""]
         n = facts.pay_presses
         if n != 0:  # Sera's own presses before: the owner's "not already paid" does not cover them
             who = ("Hermes does not know whether Sera already pressed Pay" if n is None else

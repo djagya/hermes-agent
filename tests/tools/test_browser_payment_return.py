@@ -611,6 +611,41 @@ def test_returned_total_changed_after_press_points_to_payment_done(env):
     assert "payment_close" not in out["error"] and len(flow.presses()) == 1
 
 
+NEW_CHECKOUT = "<b>This is a new checkout; Hermes did not see the page Sera pressed Pay on.</b>"
+
+
+def test_card_after_reopen_does_not_reassure_about_fresh_checkout(env):
+    """Opus r10 Low 1: after payment_close and the checkout again the page read is of a new page, so its "no order
+    wording" is no comfort: the card says so instead. Inside the returned lock it is still the page read. The
+    detected-order line stands alone (no "only advises" after it)."""
+    flow = _returned(env, pressed=True, shows=SHIPPING)
+    assert flow.card_fill(past=True)[1] is None
+    assert flow.close()["lock_released"] is True
+    _reopen(flow)
+    out, card = flow.card_fill()
+    assert out["success"] is True and NEW_CHECKOUT in card and "No order wording" not in card, card
+    assert "came back to Sera" in card and PRESSED % "1 time" in card
+    out, card = _returned(env).card_fill()
+    assert "<b>No order wording seen on the checked page.</b>" in card and "new checkout" not in card
+    flow = _returned(env)
+    _detected_not_reached(flow, env.monkeypatch)
+    assert flow.close()["lock_released"] is True
+    _reopen(flow)
+    card = flow.card_fill("decline")[1]
+    assert DETECTED in card and "only advises" not in card and "new checkout" not in card, card
+
+
+def test_no_press_only_card_after_detected_order(env):
+    """Opus r10 Low 3: a lock whose order was detected gets no press-only card (the fill's base refusal stands),
+    though a fill started a new approval and the page still shows the total and an enabled Pay."""
+    flow = _returned(env, pressed=True)
+    assert PRESS_ONLY in flow.card_fill("decline", past=True)[1]
+    with surface._LOCK:
+        ret._record(flow.sup()).paid = True
+    out, card = flow.card_fill(past=True)
+    assert card is None and out["error_type"] == "payment_fields_unsupported" and len(flow.presses()) == 1, out
+
+
 def test_close_then_refill_after_return_keeps_warning_lines(env):
     """Approach r8 Medium: Sera pressed Pay once, the owner took the tab and returned it on a page that takes no
     fill. payment_close and the checkout again: the next card still asks him to confirm he has not already paid and
@@ -985,7 +1020,8 @@ def test_the_approval_card_after_a_return(monkeypatch):
     monkeypatch.setattr(prompt, "payment_pay_once_enabled", lambda: True)
     for state, line in prompt.RETURNED_LINES.items():
         card, facts = _card(state)
-        assert APPROVE in card and f"<b>{line}</b> This check only advises" in card and "pays once" not in card
+        assert APPROVE in card and f"<b>{line}</b>" in card and "pays once" not in card
+        assert ("This check only advises" in card) is (state != "ordered")
         assert prompt.scope_line(facts) == APPROVE and APPROVE in prompt.render_plain(facts)
         assert "Sera presses through its steps" in card and "already pressed" not in card
     assert PRESSED % "3 times" in _card("seen", pay_presses=3)[0]

@@ -282,11 +282,14 @@ def observe(sup: Any) -> dict:
     """Before a card fill's approval card is built (tool thread): the card's facts of a return
     (``PaymentPromptFacts.returned`` and ``pay_presses``), ``{}`` when neither ``sup`` nor its task has a returned one.
     ``returned``: the one bounded, value-free read of the payment tab's top document (two booleans leave the page):
-    ``"seen"`` (order wording), ``"not_seen"``, or ``"unread"`` (failed or timed out; not read again); ``"ordered"``,
+    ``"seen"`` (order wording), ``"not_seen"``, ``"new"`` (none seen, on a new checkout), or ``"unread"`` (failed or
+    timed out; not read again); ``"ordered"``,
     unread, once an order was detected in this payment (a fresh checkout would read as none).
     ``pay_presses``: Sera's Pay-like presses in this lock (None: unknown). For the card only."""
     with surface._LOCK:
-        gen = _record(sup) or _RETURNED.get(getattr(sup, "task_id", None))
+        gen = _record(sup)
+        fresh = gen is None  # a new checkout after payment_close: its page is not the one Sera pressed Pay on
+        gen = gen or _RETURNED.get(getattr(sup, "task_id", None))
         if gen is None:
             return {}
         presses = gen.pay_presses if gen.known else None
@@ -297,7 +300,8 @@ def observe(sup: Any) -> dict:
     except Exception as exc:  # health: allow BLE001 -- unread: the card says it could not check (the type only)
         logger.info("payment return: page not read for the approval card (%s)", type(exc).__name__)
         scan = None
-    return {"returned": "unread" if scan is None else "seen" if scan["order"] else "not_seen", "pay_presses": presses}
+    state = "unread" if scan is None else "seen" if scan["order"] else "new" if fresh else "not_seen"
+    return {"returned": state, "pay_presses": presses}
 
 
 async def _press_page(sup: Any, cents: int, currency: str, merchant: str) -> Optional[tuple]:
@@ -320,8 +324,8 @@ def press_page(sup: Any, cents: int, currency: str) -> Optional[tuple]:
     check) and an enabled Pay-like control; else None (also when the read fails)."""
     with surface._LOCK:
         gen = _record(sup)
-        if gen is None or gen.admitted or gen.native_lost or not gen.merchant:
-            return None
+        if gen is None or gen.admitted or gen.native_lost or gen.paid or not gen.merchant:
+            return None  # a detected order: no press-only card, the fill's refusal stands
         merchant = gen.merchant[2]
     try:
         top = surface._wait(_press_page(sup, cents, currency, merchant), sup._loop, timeout=surface._ACTION_TIMEOUT_S)

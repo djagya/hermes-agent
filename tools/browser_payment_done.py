@@ -1119,7 +1119,6 @@ def payment_close(supervisor: Any) -> dict:
     loop = getattr(supervisor, "_loop", None)
     if loop is None or not loop.is_running():
         return _refusal("supervisor_required", "The supervised browser is not attached; nothing was done.")
-    refill = way_out(supervisor, "")  # D-0961: read before the close ends the record
     lock = _claim_lock(supervisor)  # one claim, dialog answer or recovery call at a time
     if not lock.acquire(timeout=_FENCE_WAIT_S):
         return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
@@ -1136,6 +1135,7 @@ def payment_close(supervisor: Any) -> dict:
         if not admitted:  # dlz (Opus r2): never close the tab under a payment_click still on the wire
             return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
         try:
+            refill = way_out(supervisor, "")  # D-0961: read before the close ends the record
             out = {**_close_admitted(supervisor, loop, release), "pressed_in_lock": pressed}
             return {**out, "note": RETURNED_CLOSED} if refill and out.get("note") == _CLOSE_DONE else out
         finally:
