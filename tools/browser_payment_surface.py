@@ -323,8 +323,11 @@ def _start_record(supervisor: Any, gen: Any, old: Any, held_before: bool, pressi
     lock still holds and its record was known, the new record carries its presses instead. Either is unknown when
     the owning set holds a page that is not this claim's tab or its holder (``others``). build C r4: ``merchant``
     (``_merchant_identity``) is kept with the record. D-0878: while the old lock still holds, the new record also
-    keeps that the lock was returned and that an order was detected in it."""
+    keeps that the lock was returned and that an order was detected in it; that the task's payment was returned
+    outlasts the lock (``browser_payment_return.carry``)."""
     global _RECORD_SEQ
+    from tools.browser_payment_return import carry
+
     with _LOCK:
         if not held_before:
             if gen is None or _GENS.get(supervisor) is not gen:
@@ -348,6 +351,7 @@ def _start_record(supervisor: Any, gen: Any, old: Any, held_before: bool, pressi
                 rec.returned, rec.paid, rec.paid_by = old.returned, old.paid, old.paid_by
             replaced = old.serial if old is not None else 0
         rec.owned, rec.ws, rec.merchant = owned, ws, merchant
+        carry(supervisor, rec)
         _RECORD_SEQ += 1
         if rec.serial == 0:
             rec.serial = _RECORD_SEQ
@@ -1401,8 +1405,9 @@ APPROVAL_CHANGED = "payment_approval_changed"
 _TOTAL_CHANGED_TEXT = (
     "Hermes could not confirm that the merchant's checkout page still shows the total the owner approved (it changed, "
     "is no longer clear, or the checkout page is not the one that was filled), so nothing was pressed and the lock "
-    "stays. Stop: do not press Pay or anything else, do not retry, and tell the owner (Danil) what you see. A "
-    "different total needs a new approval: payment_close, then fill again with the current cart.")
+    "stays. Stop: do not press Pay or anything else and do not retry. If the page shows an order confirmation, call "
+    "payment_done. Otherwise the checkout needs a new approval: payment_close, open the checkout again, then fill "
+    "again with the current cart.")
 _GO_REQUIRED_TEXT = (
     "Hermes holds no approved total for Pay in this payment lock, so nothing was pressed. Either the card was fill-only "
     "(no stated total, or the page check did not match it), Pay-once approvals are switched off "
@@ -1767,7 +1772,7 @@ class _LockGen:
         # D-0878 (``browser_payment_return``): control's adoption ticket for this lock (memory only; None: a take of
         # the tab cannot be taken back), whether the owner had the tab and returned it during this lock (then only
         # a new approval card counts, never owner_go), and the Pay-like presses booked in this lock (carried with
-        # ``presses``; the card after a return names them)
+        # ``presses``, and from the task's returned payment before this lock; the card after a return names them)
         self.ticket: Optional[str] = None
         self.returned = False
         self.pay_presses = 0
@@ -1868,10 +1873,6 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
     try:
         out = _with_dialog(supervisor, _run(
             supervisor, lambda deadline: _click(supervisor, spec, progress, deadline, gate), progress))
-        if out.get("error_type") == TOTAL_CHANGED and gate.gen is not None and gate.gen.returned:
-            from tools.browser_payment_return import RETURNED_AGAIN
-
-            out = _refusal(TOTAL_CHANGED, "Nothing was pressed. " + RETURNED_AGAIN)  # D-0961: nothing left to the owner
     finally:
         with _LOCK:  # build C r2 (P2): the press itself was booked at its dispatch (_book_press)
             _PRESSING_N = max(0, _PRESSING_N - 1)

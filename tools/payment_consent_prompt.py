@@ -365,7 +365,7 @@ def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
                   "fields go. Check every origin below.", ""]
     lines += [bold(esc(scope_line(facts))), ""]
     if facts.returned:
-        lines += ["This tab came back to Sera (you returned it, or her browser connection was replaced). "
+        lines += ["This payment came back to Sera (you returned its tab, or her browser connection was replaced). "
                   + bold(RETURNED_LINES[facts.returned])
                   + " This check only advises: Hermes cannot tell whether you already paid.", ""]
         n = facts.pay_presses

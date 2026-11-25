@@ -1021,6 +1021,9 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
         # (a locked page's title and path could carry what a planted script copied there).
         return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=_shown_origin(seen.get("url", "")),
                         title="", reason=reason, lock_released=False, **told, **_dialog_report(supervisor))
+    from tools.browser_payment_return import settle
+
+    settle(supervisor)  # D-0878: the purchase is finished: nothing of a return is carried to the task's next lock
     context = page.pop("browser_context", None)
     raw_url = page["url"]  # the tab must open exactly this; only what is returned to the model is scrubbed
     page = _redacted_page(page)  # dlz: while the payment window is still open, before the release below
