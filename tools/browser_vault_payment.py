@@ -1178,16 +1178,16 @@ def _inspect(supervisor, vault, meta, stated, merchant_origin: str, bound: tuple
             past = type(refused) is PaymentPolicyError or getattr(refused, "no_card_controls", False) is True
             pressed = _press_only(supervisor, meta, stated) if past and _is_coverage_refusal(exc) else None
             if pressed is None:
-                raise _returned_again(refused, supervisor.task_id)
+                raise _returned_again(refused, supervisor)
             return pressed
 
 
-def _returned_again(refused: PaymentPolicyError, task_id: str) -> PaymentPolicyError:
+def _returned_again(refused: PaymentPolicyError, supervisor) -> PaymentPolicyError:
     """D-0961: a page with no card control at all (the thank-you page after the owner paid) after a return: Sera reads
     it and calls payment_done or fills again, the owner is not asked to enter anything. Any other refusal stands."""
     from tools.browser_payment_return import RETURNED_AGAIN, came_back
 
-    if getattr(refused, "no_card_controls", False) is not True or not came_back(task_id):
+    if getattr(refused, "no_card_controls", False) is not True or not came_back(supervisor.task_id):
         return refused
     again = PaymentDestinationError(refused.error_type, "Nothing was read or written. " + RETURNED_AGAIN, refused.detail)
     again.no_card_controls = True
