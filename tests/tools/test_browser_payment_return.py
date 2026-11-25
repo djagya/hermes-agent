@@ -333,6 +333,10 @@ def test_returned_past_card_step_gets_press_only_card_then_presses(env):
     out, card = flow.card_fill("decline", past=True)
     assert out["error_type"] == "payment_declined" and PRESS_ONLY in card
     assert flow.press("JETZT KAUFEN")["error_type"] == surface.GO_REQUIRED and len(flow.presses()) == 1
+    # a second return while the card waits, adopted before the tap: that tap binds nothing
+    out, card = flow.card_fill(past=True, during=lambda _i: (flow.take(), flow.give_back(), flow.act()))
+    assert out["error_type"] == "payment_browser_changed" and PRESS_ONLY in card
+    assert flow.press("JETZT KAUFEN")["error_type"] == surface.GO_REQUIRED and len(flow.presses()) == 1
     out, card = flow.card_fill(past=True)
     assert out["success"] is True and out["press_only"] is True and "payment_controls" in out["message"]
     assert PRESS_ONLY in card and PRESSED % "1 time" in card and "<b>No order wording seen on the checked page." in card
