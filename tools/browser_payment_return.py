@@ -28,7 +28,7 @@ payment's lock record (weak-keyed by that supervisor) used to end with it; the t
   the card step (the fill finds no card fields; :func:`press_page`: the record's merchant shows the stated total and
   a Pay-like control) gets the same card in its press-only form; the tap binds the total as a fill's would.
 - **Any other page** (no card form, or the total gone before a press; :func:`way_out`): payment_done on an order
-  confirmation or a bank step, or first of all once Sera pressed Pay in this payment; else the base way out
+  confirmation or a bank step, or first of all once Sera pressed Pay since the take back; else the base way out
   (``RETURNED_REFILL``). That the payment came back, Sera's Pay presses and a detected order belong to the task
   (``_RETURNED``): that fill's card still says them. Once an order was detected in it, Sera is never sent to close
   and fill again: the base texts hold ("ask the user", "do not pay again").
@@ -74,9 +74,8 @@ RETURNED_REFILL = (  # the one way out of a returned lock on a page that takes n
     "call browser_vault payment_close (it closes the payment tab and ends the lock), open the checkout again, then "
     "fill once more: that approval card still says the payment came back and how often you pressed Pay. If this "
     "happens a second time, stop and tell the user.")
-PAY_DONE_FIRST = ("You already pressed Pay in this payment (or Hermes cannot tell): call browser_vault payment_done "
-                  "first (it waits through a bank or 3-D Secure step and reads the order confirmation); its answer "
-                  "says how to go on.")
+PAY_DONE_FIRST = ("You pressed Pay since the payment came back: call browser_vault payment_done first (it waits "
+                  "through a bank or 3-D Secure step and reads the order confirmation); its answer says how to go on.")
 RETURNED_CLOSED = ("The payment tab was closed without a confirmation. Open the checkout again and fill: its approval "
                    "card tells the owner that this payment came back and how often you pressed Pay, and he decides.")
 LOCK_MOVING = (
@@ -258,13 +257,13 @@ def refills(sup: Any) -> bool:
 
 def way_out(sup: Any, stop: str) -> str:
     """``stop`` (what happened, nothing pressed or written) and the way on, when ``sup``'s lock came back and no order
-    was detected in its payment; else "" (the caller's base text holds). After a Pay press of Sera in this payment
-    (or when Hermes does not know): payment_done first, which waits through a bank step; else ``RETURNED_REFILL``."""
+    was detected in its payment; else "" (the caller's base text holds). After a Pay press since the take back
+    (``pay_at``): payment_done first, which waits through a bank step; else ``RETURNED_REFILL``."""
     with surface._LOCK:
         gen = _record(sup)
         if not _refills(gen):
             return ""
-        pressed = gen.pay_presses or not gen.known
+        pressed = gen.pay_at is not None
     return stop + (PAY_DONE_FIRST if pressed else "If the page shows an order confirmation or a bank or 3-D Secure "
                                                   "step, call browser_vault payment_done. Otherwise " + RETURNED_REFILL)
 

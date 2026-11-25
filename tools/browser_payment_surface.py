@@ -1873,11 +1873,11 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
     try:
         out = _with_dialog(supervisor, _run(
             supervisor, lambda deadline: _click(supervisor, spec, progress, deadline, gate), progress))
-        if out.get("error_type") == TOTAL_CHANGED and gate.gen is not None:
+        if out.get("error_type") == TOTAL_CHANGED:  # D-0961: after a return the way out is not the owner
             from tools.browser_payment_return import way_out
 
-            out["error"] = way_out(gate.gen, "Nothing was pressed: the page no longer shows the approved total. ") \
-                or out["error"]  # D-0961: after a return the way out is not the owner
+            out["error"] = way_out(supervisor, "Nothing was pressed: the page no longer shows the approved total. ") \
+                or out["error"]
     finally:
         with _LOCK:  # build C r2 (P2): the press itself was booked at its dispatch (_book_press)
             _PRESSING_N = max(0, _PRESSING_N - 1)
