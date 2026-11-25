@@ -166,13 +166,14 @@ class Flow:
         return json.loads(vault_tool._payment_surface_action(self.task, ref, **kwargs))
 
     def press(self, caption, **kwargs):
-        """payment_controls, then payment_click on the shop page's control ``caption`` (a refusal of either)."""
+        """payment_controls, then payment_click on the top document's control ``caption`` (a refusal of either)."""
         listed = self.act()
         if not listed.get("success"):
             return listed
         with surface._LOCK:
             issued = dict(surface._ISSUED.get(self.sup()) or {})
-        refs = [r for r, spec in issued.items() if spec[0] == "TOP|L0" and spec[3] == caption]
+        key = "|".join(self.ctl.page.tree[0][:2])
+        refs = [r for r, spec in issued.items() if spec[0] == key and spec[3] == caption]
         assert len(refs) == 1, (caption, sorted(issued.values()), listed)
         return self.act(refs[0], **kwargs)
 
@@ -308,6 +309,22 @@ def test_after_a_return_two_clicks_admitted_under_one_approval_book_one_pay_pres
     assert surface._book_press(sup, gate, True, True, [])["error_type"] == ret.PRESS_USED
     assert surface._book_press(sup, gate, True, False, []) is None, "a press that is not Pay-like"
     assert surface._book_press(sup, gate, True, True, [], bank=True) is None and gen.presses == 3
+
+
+def test_after_a_return_the_banks_step_after_the_one_pay_press_still_goes(env):
+    """3-D Secure: the approved Pay press leads to the bank's page (another site), whose "Bestätigen" is pressed as
+    before. Back on the checkout (the bank declined), its Pay button is not pressed again under that approval."""
+    from tests.tools.test_browser_payment_done import ACS
+
+    flow = _returned(env)
+    assert flow.card_fill()[0]["success"] is True
+    flow.ctl.page.after = {"tree": ACS, "rows": [_row("Bestätigen")]}
+    assert flow.press("JETZT KAUFEN")["pay_pressed"] is True
+    flow.ctl.page.after = {"tree": (("TOP", "L5", shop.SHOP + "/checkout/", shop.SHOP, ""),),
+                           "rows": list(shop.SUNDAY_ROWS)}
+    bank = flow.press("Bestätigen")
+    assert bank["success"] is True and bank["pay_pressed"] is True and len(flow.presses()) == 2
+    assert flow.press("JETZT KAUFEN")["error_type"] == ret.PRESS_USED and len(flow.presses()) == 2
 
 
 @pytest.mark.parametrize("shows, tabs, line, seen", [
