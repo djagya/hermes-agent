@@ -769,7 +769,7 @@ def test_pay_is_admitted_only_while_the_merchant_page_shows_the_approved_total(p
         assert out["success"] is True and len(_presses(sup)) == 1
         return
     assert out == {"success": False, "error_type": "payment_total_changed", "error": surface._TOTAL_CHANGED_TEXT}
-    assert "nothing was pressed" in out["error"] and "tell the owner (Danil)" in out["error"]
+    assert "nothing was pressed" in out["error"] and "payment_close" in out["error"] and "tell the" not in out["error"]
     assert not _presses(sup) and surface.locally_locked(sup)  # nothing pressed, the lock kept
     assert surface.presses_in_lock(sup) == 0
 

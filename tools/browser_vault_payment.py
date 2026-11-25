@@ -407,7 +407,7 @@ def _browser_changed(task_id: str) -> dict:
 
     returned = came_back(task_id)
     return {"success": False, "error_type": "payment_browser_changed", **({"returned": True} if returned else {}),
-            "error": "Nothing was written or pressed. " + returned if returned else _BROWSER_CHANGED}
+            "error": returned or _BROWSER_CHANGED}
 
 
 _BROWSER_CHANGED_LOCKED = (

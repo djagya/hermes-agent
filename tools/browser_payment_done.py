@@ -1021,8 +1021,8 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     if page is None:
         # The tab is still locked: like browser-control for every agent connection, report its site only
         # (a locked page's title and path could carry what a planted script copied there).
-        way_out = RETURNED_REFILL if returned(supervisor) else _NOT_REACHED_ASK  # D-0961: not left to the owner
-        return _refusal("payment_confirmation_not_reached", _NOT_REACHED + way_out,
+        return _refusal("payment_confirmation_not_reached",  # D-0961: after a return the way out is not the owner
+                        _NOT_REACHED + (RETURNED_REFILL if returned(supervisor) else _NOT_REACHED_ASK),
                         url=_shown_origin(seen.get("url", "")), title="", reason=reason, lock_released=False, **told,
                         **_dialog_report(supervisor))
     settle(supervisor)  # D-0878: the purchase is finished; the task's next lock is no returned one

@@ -72,8 +72,8 @@ RETURNED_REFILL = (  # the one way out of a returned lock on a page that takes n
     "fill once more: that approval card still says the payment came back and how often you pressed Pay. If this "
     "happens a second time, stop and tell the user.")
 LOCK_MOVING = (
-    "The owner has this payment's tab, or it is moving to a new browser connection of this task (he returned it, or "
-    "the connection was replaced), so nothing was read, written or pressed. Retry this call: once the tab is back, "
+    "Nothing was read, written or pressed: the owner has this payment's tab, or it is moving to a new browser "
+    "connection of this task (he returned it, or the connection was replaced). Retry this call: once the tab is back, "
     "the next payment call takes the payment back.")
 PRESS_APPROVED = ("The owner approved pressing Pay on this page as it is (nothing was filled: the card is already "
                   "entered). Call payment_controls and press what the checkout needs.")
@@ -139,14 +139,15 @@ def stranded(sup: Any) -> bool:
 
 
 def came_back(task_id: str) -> str:
-    """What a stop that wrote nothing says next: ``RETURNED_NEXT`` when a lock record of ``task_id`` came back (held,
-    not lost), ``LOCK_MOVING`` while one waits to be taken back (the owner may still have the tab), else ``""``."""
+    """What a stop that wrote nothing says: ``RETURNED_NEXT`` when a lock record of ``task_id`` came back (held, not
+    lost), ``LOCK_MOVING`` while one waits to be taken back (the owner may still have the tab), else ``""``."""
     with surface._LOCK:
         parked = _PARKED.get(task_id)
         if parked is not None:
             return "" if parked[0].native_lost else LOCK_MOVING
-        return RETURNED_NEXT if any(getattr(s, "task_id", None) == task_id and g.returned and not g.native_lost
-                                    for s, g in list(surface._GENS.items()) if s in surface._HELD) else ""
+        held = any(getattr(s, "task_id", None) == task_id and g.returned and not g.native_lost
+                   for s, g in list(surface._GENS.items()) if s in surface._HELD)
+        return "Nothing was written or pressed. " + RETURNED_NEXT if held else ""
 
 
 def _adopted(result: Any, tab: str) -> Optional[frozenset]:

@@ -452,10 +452,60 @@ def _walk(flow, out, card, past=False, order=False, pressed=False):
             out, card = flow.card_fill("decline", past=past)
 
 
-@pytest.mark.parametrize("state", ["card form", "Pay page", "thank-you page", "shipping step", "total changed after a press",
-                                   "discovery off", "CVC-only form", "payment_done tried on the shipping step",
-                                   "second return while a card waits",
-                                   "second return while the card is read", "lock met before the take back"])
+def _total_gone(flow, monkeypatch):
+    """Her approved press went out; the shop then shows a page without the total, and she presses again."""
+    assert flow.card_fill(past=True)[0]["press_only"] is True and flow.press("JETZT KAUFEN")["pay_pressed"] is True
+    flow.ctl.page.pin = NO_TOTAL
+    out = flow.press("JETZT KAUFEN")
+    assert out["error_type"] == surface.TOTAL_CHANGED and len(flow.presses()) == 1, out
+    return out
+
+
+def _done_tried(flow, monkeypatch):
+    out = json.loads(vault_tool._payment_done_action(flow.task, ""))
+    assert out["error_type"] == "payment_confirmation_not_reached" and "otherwise ask the user" not in out["error"], out
+    return out
+
+
+def _second_return(flow, monkeypatch, reading=False):
+    """The owner takes the tab again and returns it while the card waits, or (``reading``) after its claim."""
+    again = lambda _i: (flow.take(), flow.give_back(), flow.act())
+    if reading:
+        monkeypatch.setattr(bvp, "validate_card", lambda secret: (again(None), secret)[1])
+    out = flow.card_fill(during=None if reading else again)[0]
+    monkeypatch.setattr(bvp, "validate_card", lambda secret: secret)
+    assert out["error_type"] == "payment_browser_changed" and out["returned"] is True, out
+    return out
+
+
+def _late_adoption(flow, monkeypatch):
+    """A supervisor that dialled before the record was parked meets the lock as another connection's."""
+    with surface._LOCK:
+        parked = ret._PARKED.pop(flow.task)
+    assert flow.act()["error_type"] == surface.LOCK_FOREIGN, "nothing parked yet: a foreign lock, as before"
+    with surface._LOCK:
+        ret._PARKED[flow.task] = parked
+    out = surface.native_lost_refusal(bs.SUPERVISOR_REGISTRY.get(flow.task))
+    assert out["error_type"] == surface.LOCK_FOREIGN, out
+    return out
+
+
+_STATES = {  # what the tab shows at the return, Sera pressed Pay before it, the fill's ``past``, her first call (None: the fill)
+    "card form": (None, False, False, None),
+    "Pay page": (None, True, True, None),
+    "thank-you page": (THANKS, False, True, None),
+    "shipping step": (SHIPPING, True, True, None),
+    "discovery off": (SHIPPING, False, True, None),
+    "CVC-only form": (None, False, "cvc", None),
+    "total changed after a press": (None, False, True, _total_gone),
+    "payment_done tried on the shipping step": (SHIPPING, True, True, _done_tried),
+    "second return while a card waits": (None, False, False, _second_return),
+    "second return while the card is read": (None, False, False, lambda f, m: _second_return(f, m, reading=True)),
+    "lock met before the take back": (None, False, False, _late_adoption),
+}
+
+
+@pytest.mark.parametrize("state", list(_STATES))
 def test_every_page_a_returned_payment_can_be_on_leads_to_a_fresh_card_or_payment_done(env, monkeypatch, state):
     """D-0961 (owner 2026-11-25: "i don't want to do amy manual work at all"), approach r8: whatever the payment tab
     shows after the return, and whenever a second return or a late adoption cuts in, the answers lead Sera to a
@@ -463,44 +513,12 @@ def test_every_page_a_returned_payment_can_be_on_leads_to_a_fresh_card_or_paymen
     press-only card is the base one (payment_close, the checkout again, fill), and its card still warns."""
     if state == "discovery off":
         monkeypatch.setattr(bvp, "destination_policy", lambda: (False, "gen", False))
-    shows = THANKS if state == "thank-you page" else SHIPPING if "shipping" in state or state == "discovery off" else None
-    flow = _returned(env, pressed=state in ("Pay page", "shipping step"), shows=shows)
-    again = lambda _i: (flow.take(), flow.give_back(), flow.act())
-    past = {"card form": False, "CVC-only form": "cvc", "total changed after a press": True}.get(state, True)
-    pressed = state in ("Pay page", "shipping step", "total changed after a press")
-    if state == "total changed after a press":  # her approved press went out; the shop then shows another page
-        assert flow.card_fill(past=True)[0]["press_only"] is True
-        assert flow.press("JETZT KAUFEN")["pay_pressed"] is True
-        flow.ctl.page.pin = NO_TOTAL
-        out, card = flow.press("JETZT KAUFEN"), None
-        assert out["error_type"] == surface.TOTAL_CHANGED and len(flow.presses()) == 1, out
-    elif state == "payment_done tried on the shipping step":
-        out, card = json.loads(vault_tool._payment_done_action(flow.task, "")), None
-        assert out["error_type"] == "payment_confirmation_not_reached" and "otherwise ask the user" not in out["error"]
-    elif state == "second return while a card waits":
-        out, card = flow.card_fill(during=again)[0], None
-        assert out["error_type"] == "payment_browser_changed", out
-        past = False
-    elif state == "second return while the card is read":  # after the claim, under the lock
-        monkeypatch.setattr(bvp, "validate_card", lambda secret: (again(None), secret)[1])
-        out, card = flow.card_fill()[0], None
-        assert out["error_type"] == "payment_browser_changed" and out["returned"] is True, out
-        monkeypatch.setattr(bvp, "validate_card", lambda secret: secret)
-        past = False
-    elif state == "lock met before the take back":  # a supervisor that dialled before the record was parked
-        with surface._LOCK:
-            parked = ret._PARKED.pop(flow.task)
-        assert flow.act()["error_type"] == surface.LOCK_FOREIGN, "nothing parked yet: a foreign lock, as before"
-        with surface._LOCK:
-            ret._PARKED[flow.task] = parked
-        out, card = surface.native_lost_refusal(bs.SUPERVISOR_REGISTRY.get(flow.task)), None
-        assert out["error_type"] == surface.LOCK_FOREIGN, out
-        past = False
-    else:
-        out, card = flow.card_fill("decline", past=past)
-    assert _walk(flow, out, card, past, order=state == "thank-you page", pressed=pressed) == (
-        "payment_done" if state == "thank-you page" else "card")
-    if state == "thank-you page":
+    shows, pressed, past, first = _STATES[state]
+    flow = _returned(env, pressed=pressed, shows=shows)
+    out, card = (first(flow, monkeypatch), None) if first else flow.card_fill("decline", past=past)
+    end = _walk(flow, out, card, past, order=shows is THANKS, pressed=bool(flow.presses()))
+    assert end == ("payment_done" if shows is THANKS else "card")
+    if shows is THANKS:
         _reopen(flow)  # the purchase is finished: the task's next one is no returned payment
         assert "came back" not in flow.card_fill()[1]
 
@@ -591,6 +609,8 @@ def test_after_a_return_a_card_that_was_not_approved_shown_or_filled_presses_not
         "expired": "payment_consent_expired", "card_from_before": "payment_browser_changed"}.get(how), out
     if how == "fill_only":
         assert "Pay needs a new card that covers it" in card and APPROVE not in card and "go in chat" not in card
+    if how == "card_from_before":  # middle r8 L3: not adopted yet, he may still have the tab
+        assert "Retry this call" in out["error"] and "came back" not in out["error"], out
     for owner_go in (False, True):
         refused = flow.press("JETZT KAUFEN", owner_go=owner_go)
         assert refused["error_type"] == surface.GO_REQUIRED and "fill the card again" in refused["error"]
