@@ -838,15 +838,18 @@ class _SupervisorRegistry:
                      dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S,
                      start_timeout: float = SUPERVISOR_START_TIMEOUT_S) -> CDPSupervisor:
         """Idempotently ensure a supervisor runs for ``(task_id, cdp_url)``; one bound to a
-        different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced."""
+        different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced. dlz (D-0878): so
+        is one that dialled before its task's payment lock record was parked (``browser_payment_return.stranded``):
+        the replacement takes the record back on its first dial, so every later call (a payment action) adopts it."""
         from hermes_constants import hermes_home_key
+        from tools.browser_payment_return import stranded
         home = hermes_home_key()
         with self._lock:
             existing = self._by_task.get(task_id)
             if existing is not None:
                 thread, loop = existing._thread, existing._loop
                 healthy = thread is not None and thread.is_alive() and loop is not None and loop.is_running()
-                if existing.cdp_url == cdp_url and healthy:
+                if existing.cdp_url == cdp_url and healthy and not stranded(existing):
                     return existing
                 self._by_task.pop(task_id, None)
         if existing is not None:

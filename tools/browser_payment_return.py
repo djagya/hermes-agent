@@ -60,9 +60,6 @@ RETURNED_NEXT = (
     "the card again with the current cart (when the page is past the card step, go back to it first). Its approval "
     "card tells him what the page shows now and asks him to confirm he has not already paid; his Approve covers the "
     "presses this checkout needs. If he says he already paid, call payment_done.")
-SEEN_NOTE = ("The payment tab showed order wording when it came back to Hermes, and the approval card told the owner "
-             "(Danil) so. Say it in chat too: the page may already show a placed order; if he paid himself, call "
-             "payment_done and press nothing.")
 
 
 async def _ticket(sup: Any) -> Optional[str]:
@@ -111,6 +108,17 @@ def park(supervisor: Any) -> None:
         while len(_PARKED) > _MAX_PARKED:
             _PARKED.pop(next(iter(_PARKED)))
     logger.info("payment lock record %d left to its task (its supervisor ended)", gen.serial)
+
+
+def stranded(sup: Any) -> bool:
+    """A lock record of ``sup``'s task was parked after ``sup`` dialled (it lost a start race to the supervisor that
+    took the record back, or a stop parked it late): ``sup`` holds no record and serves the lock as another
+    connection's. ``get_or_start`` replaces it; the replacement takes the record back on its first dial."""
+    with surface._LOCK:
+        if getattr(sup, "task_id", None) not in _PARKED or sup in surface._HELD:
+            return False
+    with sup._state_lock:
+        return not sup._active
 
 
 def _adopted(result: Any, tab: str) -> Optional[frozenset]:

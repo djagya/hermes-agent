@@ -1245,14 +1245,13 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         prompt = inspected.prompt()
         # dlz: the owner-only payment card (tools.payment_consent_prompt): every fact or no prompt.
         # D-0942 a: after a return the card says what one read of the page saw and how often Sera pressed Pay
-        from tools.browser_payment_return import SEEN_NOTE, observe
+        from tools.browser_payment_return import observe
 
         try:
             facts = facts_for_inspection(inspected, card_label=meta.label, cart=stated, supplied=tuple(supplied),
                                          **observe(supervisor))
         except Exception:  # health: allow BLE001 -- facts out of bounds: no prompt, no fill
             facts = None
-        seen = {"order_wording_seen": SEEN_NOTE} if facts is not None and facts.returned == "seen" else {}
         consent = (request_payment_approval(facts, timeout_seconds=_remaining_seconds(inspected)) if facts is not None
                    else PaymentConsent("unavailable", "unavailable", UNAVAILABLE_FACTS))
         if not consent.accepted:
@@ -1261,7 +1260,7 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             refusal = _consent_not_given(consent.verdict, consent.reason)
             if consent.detail:
                 refusal["error"] += " " + consent.detail
-            return json.dumps({**refusal, **seen})
+            return json.dumps(refusal)
         if time.monotonic() >= inspected.expires_at:
             return json.dumps(_expired())
         # dlz (B6): the switch and its policy generation, re-read after the accept.
@@ -1353,8 +1352,8 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             _log_commit(result)
             locked = _post_claim_locked(vault, supervisor)
             _commit_text(result, locked=locked)
-            return json.dumps({**_describe_result(result, backend, inspected, fills, prompt, bound_revision,
-                                                  unreviewed, stated, locked, from_agent), **seen})
+            return json.dumps(_describe_result(result, backend, inspected, fills, prompt, bound_revision,
+                                               unreviewed, stated, locked, from_agent))
     except BackendError as exc:
         if type(exc) is BackendError:  # unclassified op failure: keep the opaque refusal below
             return json.dumps(_fill_refused(at["step"]))
