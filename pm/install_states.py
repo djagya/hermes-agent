@@ -26,10 +26,12 @@ its state. One unused for longer is rebuilt by ``hermes pm repair`` / the next a
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import os
 import shutil
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -74,7 +76,9 @@ def _retention_seconds(data_root: Path) -> float | None:
     return days * 86400 if isinstance(days, (int, float)) and days > 0 else None
 
 
-def _is_orphan(state: Path, data_root: Path, retention: float | None) -> bool:
+def _is_orphan(state: Path, data_root: Path, retention: Callable[[], float | None]) -> bool:
+    """*retention* is read only for a root that is missing but not provably deleted, so a provable
+    deletion needs no config (the bare launcher Python has no ruamel) and a sync reads none."""
     record = state / "inputs" / ".project-root"
     if not state.is_dir() or not record.is_file():
         return False
@@ -84,8 +88,10 @@ def _is_orphan(state: Path, data_root: Path, retention: float | None) -> bool:
         return False
     if not root or Path(root).exists():
         return False
-    return _provably_deleted(Path(root), data_root) or (
-        retention is not None and time.time() - _last_used(state) > retention)
+    if _provably_deleted(Path(root), data_root):
+        return True
+    limit = retention()
+    return limit is not None and time.time() - _last_used(state) > limit
 
 
 def orphan_install_states(installs: Path) -> list[Path]:
@@ -94,7 +100,7 @@ def orphan_install_states(installs: Path) -> list[Path]:
     if not installs.is_dir():
         return []
     data_root = installs.resolve().parent
-    retention = _retention_seconds(installs.parent)
+    retention = functools.cache(lambda: _retention_seconds(installs.parent))
     return [state for state in sorted(installs.iterdir()) if _is_orphan(state, data_root, retention)]
 
 
@@ -157,7 +163,7 @@ def collect_orphan_install_states(installs: Path) -> list[Path]:
     if not installs.is_dir():
         return []
     data_root = installs.resolve().parent
-    retention = _retention_seconds(installs.parent)
+    retention = functools.cache(lambda: _retention_seconds(installs.parent))
     removed: list[Path] = []
     for state in [s for s in sorted(installs.iterdir()) if _is_orphan(s, data_root, retention)]:
         with _install_lock(state) as locked:
@@ -197,5 +203,5 @@ def reclaim_orphan_install_states() -> None:
         reclaimed = collect_orphan_install_states(installs_root())
         if reclaimed:
             logger.info("Reclaimed %d dependency state dir(s) of deleted checkouts", len(reclaimed))
-    except Exception:
+    except (Exception, SystemExit):  # a config backend that is unavailable exits
         logger.debug("Orphan install-state reclaim failed", exc_info=True)
