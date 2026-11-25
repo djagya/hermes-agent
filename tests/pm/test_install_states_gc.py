@@ -253,3 +253,34 @@ def test_sync_survives_a_failing_install_state_reclaim(tmp_path, monkeypatch):
         assert collect_superseded_generations(tmp_path / "repo") is None
     finally:
         reset_hermes_home_override(token)
+
+
+def _retention_unavailable(monkeypatch, exc):
+    def boom(_data_root):
+        raise exc
+
+    monkeypatch.setattr("pm.install_states._retention_seconds", boom)
+
+
+def test_provable_orphan_reclaimed_without_config_loader(tmp_path, monkeypatch):
+    """A provable deletion needs no retention: the bare launcher Python (no ruamel) reclaims it."""
+    installs = tmp_path / "home" / "installs"
+    gone = _state(installs, "aaaa", tmp_path / "home" / "cache" / "scratch" / "gone")
+    _retention_unavailable(monkeypatch, ModuleNotFoundError("No module named 'ruamel'"))
+    assert collect_orphan_install_states(installs) == [gone] and not gone.exists()
+
+
+def test_reclaim_never_exits_the_caller(tmp_path, monkeypatch):
+    """A config backend that is unavailable exits (``SystemExit``); the best-effort reclaim, run at
+    the end of an install or sync, swallows that."""
+    from hermes_constants import reset_hermes_home_override
+    from pm.install_states import reclaim_orphan_install_states
+
+    home, token = _sync_home(tmp_path)
+    try:
+        kept = _state(home / "installs", "aaaa", tmp_path / "unmounted" / "checkout")
+        _retention_unavailable(monkeypatch, SystemExit(1))
+        reclaim_orphan_install_states()
+    finally:
+        reset_hermes_home_override(token)
+    assert kept.is_dir()
