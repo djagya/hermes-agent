@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import re
 import secrets
 import threading
 import time
@@ -31,6 +32,7 @@ from tools import browser_payment_detect as detect
 from tools import browser_payment_return as ret
 from tools import browser_payment_surface as surface
 from tools import browser_supervisor as bs
+from tools import browser_supervisor_payment as sp
 from tools import browser_vault_payment as bvp
 from tools import browser_vault_tool as vault_tool
 from tools import payment_consent_prompt as prompt
@@ -191,7 +193,8 @@ class Flow:
         """Sera fills the card (again) through the real ``fill_payment``: ``(its result, the approval card as the
         owner saw it or None)``. ``answer``: the owner's (accept, decline, cancel: no answer in time); ``during``: runs
         while the card waits; ``commit``: whether the fill itself then succeeds; ``past``: the page has no card form
-        (past the card step)."""
+        (True: past the card step, no card control at all; "cvc": a saved card's CVC-only form in a hosted frame).
+        The discovery pass (on by default, as live) ends as the real one does on such a page."""
         sup, cards = self.sup(), []
         inspected = SimpleNamespace(
             **vars(INSPECTED), consumed=False, owner=sup, frame_origin=STRIPE, operation_id="f" * 32,
@@ -199,9 +202,12 @@ class Flow:
             merchant_match="matched", prompt=lambda: {"merchant_origin": shop.SHOP, "target_origin": STRIPE,
                                                       "fields": ["cc-number"], "checks": []})
 
-        def inspect(*a, **k):
+        def inspect(*a, unreviewed=False, **k):
             if not sup.snapshot().active:  # as the real inspection: it reads the attached payment tab
                 raise bvp.PaymentPolicyError("Supervised browser required")
+            if past and unreviewed:
+                cvc = (("CVC", "s", "o", "https://pay.example", (SimpleNamespace(token="cc-csc"),)),)
+                sp._discovery_documents(list(cvc if past == "cvc" else ()), shop.SHOP, (), 1)
             if past:
                 raise bvp.PaymentPolicyError("Missing, ambiguous or split payment documents")
             return inspected
@@ -235,6 +241,8 @@ def env(monkeypatch):
     monkeypatch.setattr(surface, "_SETTLE_S", 0.02)
     monkeypatch.setattr(surface, "_SETTLE_POLL_S", 0.01)
     monkeypatch.setattr(vault_tool, "_is_managed", lambda: True)
+    # the live config (monolith hermes/identity/config.yaml: vault.payment_destination_consent: true)
+    monkeypatch.setattr(bvp, "destination_policy", lambda: (True, "gen", False))
     monkeypatch.setattr("tools.browser_use_cli.vault_route",
                         lambda task_id: {"lease": "l", "cdp": LEASE % env.ctl.lease, "token": "t"})
     monkeypatch.setattr("tools.browser_control_route._lease_alive", lambda url, lease: True)
@@ -324,11 +332,12 @@ def test_returned_card_names_earlier_press(env):
     assert flow.press("JETZT KAUFEN", owner_go=True)["error_type"] == surface.GO_REQUIRED and len(flow.presses()) == 3
 
 
-def test_returned_past_card_step_gets_press_only_card_then_presses(env):
-    """D-0961: after the return the page is past the card step (no card form; the total and Pay on the shop's page).
-    The fill gives the same card without the fill: declined, nothing is bound; approved, Pay is pressed. A page with
-    no Pay-like control (the thank-you page after the owner paid), one that does not show the total, and a lock that
-    was never returned get no such card: the fill's refusal stands."""
+def test_press_only_card_offered_with_discovery_on(env):
+    """D-0961, with the live config (discovery on: it finds no card control at all on this page): after the return
+    the page is past the card step (no card form; the total and Pay on the shop's page). The fill gives the same card
+    without the fill: declined, nothing is bound; approved, Pay is pressed. A page with no Pay-like control (the
+    thank-you page after the owner paid), one that does not show the total, and a lock that was never returned get no
+    such card: the fill's refusal stands."""
     flow = _returned(env, pressed=True)
     out, card = flow.card_fill("decline", past=True)
     assert out["error_type"] == "payment_declined" and PRESS_ONLY in card
@@ -350,7 +359,92 @@ def test_returned_past_card_step_gets_press_only_card_then_presses(env):
         if not shows:  # never returned
             other.fill()
         out, card = other.card_fill(past=True)
-        assert card is None and out["error_type"] == "payment_policy_refused" and other.presses() == [], out
+        assert card is None and out["error_type"] == "payment_fields_unsupported" and other.presses() == [], out
+
+
+def test_press_only_card_offered_with_discovery_off(env):
+    """The same card with discovery off: the reviewed pass's coverage refusal leads to it."""
+    env.monkeypatch.setattr(bvp, "destination_policy", lambda: (False, "gen", False))
+    flow = _returned(env)
+    out, card = flow.card_fill(past=True)
+    assert out["success"] is True and out["press_only"] is True and PRESS_ONLY in card
+    assert flow.press("JETZT KAUFEN")["pay_pressed"] is True and len(flow.presses()) == 1
+
+
+def test_incomplete_card_form_with_discovery_on_keeps_refusal(env):
+    """A form discovery finds but cannot fill (a saved card's CVC-only form) is not a page past the card step: no
+    press-only card, its refusal stands, nothing is bound or pressed."""
+    flow = _returned(env)
+    out, card = flow.card_fill(past="cvc")
+    assert card is None and out["error_type"] == "payment_fields_unsupported", out
+    assert flow.press("JETZT KAUFEN")["error_type"] == surface.GO_REQUIRED and flow.presses() == []
+
+
+def _reload(flow):
+    """The shop's page loads again as a new top document (same frame, new loader)."""
+    old = flow.ctl.page.tree
+    flow.ctl.page.tree = ((old[0][0], "L9", *old[0][2:]),) + tuple(old[1:])
+
+
+def test_press_only_after_reload_before_press_gets_new_card(env):
+    """Opus r6 L2: the press-only approval binds the top document it was read in. That document reloads before the
+    first press: the press is refused and Sera is sent to fill again, which gives a fresh press-only card; after its
+    tap she presses. Once a press of an approval was admitted, no further press-only card replaces it."""
+    flow = _returned(env, pressed=True)
+    assert flow.card_fill(past=True)[0]["press_only"] is True
+    _reload(flow)
+    first = flow.press("JETZT KAUFEN")
+    assert first["error_type"] == surface.TOTAL_CHANGED and "fill the card again" in first["error"], first
+    assert len(flow.presses()) == 1
+    out, card = flow.card_fill(past=True)
+    assert out["press_only"] is True and PRESS_ONLY in card and PRESSED % "1 time" in card, out
+    assert flow.press("JETZT KAUFEN")["pay_pressed"] is True and len(flow.presses()) == 2
+    out, card = flow.card_fill(past=True)
+    assert card is None and out["error_type"] == "payment_fields_unsupported", out
+
+
+_HANDS_OFF = re.compile(r"tell (the user|him|the owner)|himself|yourself|by hand|go in chat|unless danil|ask the owner",
+                        re.IGNORECASE)
+
+
+def test_no_return_answer_hands_a_step_to_the_user(env, monkeypatch):
+    """D-0961 (owner 2026-11-25: "i don't want to do amy manual work at all"): each answer Sera can get after a return
+    says what she does next, never to hand a step to the owner: a second return while a card waits (fill and
+    press-only), the one call that meets the lock before the payment is taken back, a press refused because the
+    approved page reloaded, and the owner's toast after a fill-only card."""
+    answers = {}
+    flow = _returned(env)
+    again = lambda _i: (flow.take(), flow.give_back(), flow.act())  # noqa: E731
+    out, card = flow.card_fill(during=again)
+    assert out["error_type"] == "payment_browser_changed" and card is not None, out
+    answers["fill, second return"] = out["error"]
+    out, card = flow.card_fill(past=True, during=again)
+    assert out["error_type"] == "payment_browser_changed" and PRESS_ONLY in card, out
+    answers["press-only, second return"] = out["error"]
+    assert flow.card_fill(past=True)[0]["press_only"] is True
+    _reload(flow)
+    out = flow.press("JETZT KAUFEN")
+    assert out["error_type"] == surface.TOTAL_CHANGED, out
+    answers["reloaded before the first press"] = out["error"]
+    # a supervisor that dialled before the record was parked meets the lock as another connection's
+    late = _returned(env)
+    with surface._LOCK:
+        parked = ret._PARKED.pop(late.task)
+    assert late.act()["error_type"] == surface.LOCK_FOREIGN, "nothing parked yet: a foreign lock, as before"
+    with surface._LOCK:
+        ret._PARKED[late.task] = parked
+    out = surface.native_lost_refusal(bs.SUPERVISOR_REGISTRY.get(late.task))
+    assert out["error_type"] == surface.LOCK_FOREIGN and "Retry this call" in out["error"], out
+    answers["lock met before the take back"] = out["error"]
+    assert late.act()["returned"] is True, "the retry takes the payment back"
+    toast = prompt.approved_toast(_card("seen", cart=False)[1])
+    assert toast == "Approved: Sera fills the card. Pay needs a new card that covers it.", toast
+    answers["toast, fill-only card"] = toast
+    for where, text in answers.items():
+        assert re.search(r"fill the card again|retry this call|new card", text, re.IGNORECASE), (where, text)
+        assert not _HANDS_OFF.search(text), (where, text)
+    schema = json.dumps(vault_tool.BROWSER_VAULT_SCHEMA)
+    assert "payment is moving to a new connection, retry the call" in schema
 
 
 @pytest.mark.parametrize("shows, tabs, line", [
@@ -678,27 +772,6 @@ def test_park_after_registry_stop_is_adopted_on_next_payment_action(env, monkeyp
     listed = flow.act()
     assert listed["success"] is True and listed["returned"] is True, listed
     assert flow.ctl.native is flow.ctl.sockets[-1] and flow.task not in ret._PARKED
-
-
-def test_a_press_marked_after_its_record_was_parked_still_counts(monkeypatch):
-    """Round-5 noticed 3: the supervisor ends (its record parked) while a click it admitted still runs; a press that
-    click marks outside the dispatch booking is counted on its record, so the next fresh card names it."""
-    from tests.tools import test_browser_payment_done as done_tests
-
-    sup = done_tests._claimed(done_tests._Unlocking([done_tests.CHECKOUT], status=dict(done_tests.LOCKED_TAB)))
-    sup.task_id = f"t-parked-click-{next(_ids)}"
-
-    def run(supervisor, factory, progress=None):
-        ret.park(supervisor)  # the supervisor ended meanwhile
-        progress.append(True)  # the press went out
-        return {"success": True}
-
-    monkeypatch.setattr(surface, "_run", run)
-    done_tests._issue(sup)
-    surface.payment_click(sup, "c1-0123456789")
-    with surface._LOCK:
-        gen, _payments = ret._PARKED.pop(sup.task_id)
-    assert gen.presses == 1 and gen.pressed is True
 
 
 def _card(returned, cart=True, receiving=(prompt.ReceivingOrigin(STRIPE, "reviewed", ("cc-number",)),), **kwargs):

@@ -397,6 +397,16 @@ _REVISION_UNAVAILABLE_ON_READ = (
 )
 
 
+def _browser_changed(task_id: str) -> dict:
+    """The approval's browser is no longer this task's: after a return (D-0961: the payment comes back on the next
+    call, ``came_back``) Sera fills again for a new card; otherwise she tells the user."""
+    from tools.browser_payment_return import RETURNED_NEXT, came_back
+
+    returned = came_back(task_id)
+    return {"success": False, "error_type": "payment_browser_changed", **({"returned": True} if returned else {}),
+            "error": "Nothing was written or pressed. " + RETURNED_NEXT if returned else _BROWSER_CHANGED}
+
+
 _BROWSER_CHANGED_LOCKED = (
     "The browser this approval was for is no longer the one Hermes controls for this task (the lease ended, a "
     "human took over, or the browser connection was replaced), so no card field was written and nothing was "
@@ -608,7 +618,7 @@ def _ownership_refusal(vault, task_id: str, supervisor, inspected, lease: str) -
     prompt is still this task's lease, control confirms the agent holds it, and the supervisor that inspected
     the page is the live one. A Bot Desktop human takeover refuses too. None = may proceed."""
     if vault._is_managed():
-        changed = {"success": False, "error_type": "payment_browser_changed", "error": _BROWSER_CHANGED}
+        changed = _browser_changed(task_id)
         # The route first: a new lease must not even get a supervisor attached on this path.
         if not lease or _route_lease(task_id) != lease or inspected.owner is not supervisor:
             return changed
@@ -725,7 +735,7 @@ def _lock_aware(result: dict, locked: bool, text: str = "") -> dict:
     """A zero-write stop with the lock-aware text when ``locked`` (nothing else changes): ``text``, else the one for its
     error type."""
     text = text or _LOCKED_TEXTS.get(result.get("error_type"), "")
-    if locked and text and not _wrote(result):
+    if locked and text and not _wrote(result) and not result.get("returned"):  # returned: the next call takes it back
         result["error"] = text
     return result
 
@@ -1081,7 +1091,7 @@ def _guard_capture(vault, task_id: str, lease: str, strict: bool) -> tuple:
     # dlz: the guard protects the approved lease only: a route replaced meanwhile (another browser
     # operation during the freshness pass) is not the browser this approval was for.
     if str(route.get("lease") or "") != lease:
-        return {"success": False, "error_type": "payment_browser_changed", "error": _BROWSER_CHANGED}, None
+        return _browser_changed(task_id), None
     refused = _set_control_capture_guard(route, strict=strict)
     if refused:
         return refused, None
@@ -1156,7 +1166,8 @@ def _claim_and_readmit(vault, task_id: str, supervisor, inspected, lease: str) -
 def _inspect(supervisor, vault, meta, stated, merchant_origin: str, bound: tuple, frame_origins: tuple, witness: dict):
     """The fill's inspection: ``(inspection, policy)`` (policy None on the reviewed pass), or a typed result dict
     (discovery's, or D-0961's press-only card when there is no card form at all and the payment came back after a
-    return). Raises the inspection's refusal otherwise."""
+    return: the reviewed pass found none and the discovery is off, found no unreviewed form, or found no card control
+    at all; a form it cannot fill keeps its refusal). Raises the inspection's refusal otherwise."""
     try:
         return supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
                                           **witness), None
@@ -1164,8 +1175,8 @@ def _inspect(supervisor, vault, meta, stated, merchant_origin: str, bound: tuple
         try:
             return _discover(supervisor, vault, exc, merchant_origin, bound, frame_origins, witness)
         except PaymentPolicyError as refused:
-            pressed = (_press_only(supervisor, meta, stated)
-                       if type(refused) is PaymentPolicyError and _is_coverage_refusal(exc) else None)
+            past = type(refused) is PaymentPolicyError or getattr(refused, "no_card_controls", False) is True
+            pressed = _press_only(supervisor, meta, stated) if past and _is_coverage_refusal(exc) else None
             if pressed is None:
                 raise
             return pressed
@@ -1203,7 +1214,7 @@ def _press_only(supervisor, meta, stated) -> dict | None:
     if time.monotonic() >= expires_at:
         return _expired()
     if not pays_once(facts) or not bind_press(supervisor, gen, *_cents(stated), top, merchant):
-        return {"success": False, "error_type": "payment_browser_changed", "error": _BROWSER_CHANGED}
+        return _browser_changed(supervisor.task_id)
     return {"success": True, "press_only": True, "message": PRESS_APPROVED}
 
 

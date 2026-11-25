@@ -945,8 +945,18 @@ def _balanced(sup=None):
     return not surface.pressing() and not surface.closing()
 
 
+def _book(supervisor, progress):
+    """The press goes out as in production: booked at its dispatch (``_book_press``) on the lock record and approval
+    payment_click admitted it with."""
+    with surface._LOCK:
+        gen = surface._GENS.get(supervisor) if supervisor in surface._HELD else None
+        gate = surface._Gate(gen.approved if gen else None, bool(gen and gen.admitted), False,
+                             surface._EPOCHS.get(supervisor, 0), gen)
+    assert surface._book_press(supervisor, gate, False, False, progress) is None
+
+
 def _pressing_run(supervisor, factory, progress=None):
-    progress.append(True)  # the press went out
+    _book(supervisor, progress)  # the press went out
     return {"success": True}
 
 
@@ -957,7 +967,7 @@ def test_payment_close_waits_for_a_payment_click_that_is_still_running(monkeypat
 
     def click_running(supervisor, factory, progress=None):
         seen.append(done.payment_close(sup))  # a parallel payment_close while the click runs
-        progress.append(True)  # the press went out
+        _book(supervisor, progress)  # the press went out
         return {"success": True}
 
     monkeypatch.setattr(surface, "_run", click_running)
@@ -987,7 +997,7 @@ def test_payment_close_and_payment_click_are_admitted_one_at_a_time(monkeypatch,
         if order == "click_first":
             inside.set()
             go.wait(5)
-        progress.append(True)
+        _book(supervisor, progress)
         presses.append([c[1] for c in sup.sent("Target.closeTarget")])
         return {"success": True}
 
@@ -1091,7 +1101,7 @@ def test_a_stale_click_never_marks_a_later_lock(monkeypatch):
     sup = _claimed(_Unlocking([CHECKOUT], status=dict(LOCKED_TAB)))
 
     def stale_click(supervisor, factory, progress=None):
-        progress.append(True)  # the press of the first lock went out
+        _book(supervisor, progress)  # the press of the first lock went out
         sup.status = dict(UNLOCKED)
         assert surface.lock_status(sup) == "unlocked"  # the first lock ends (e.g. the owner's clear)
         sup.status = dict(LOCKED_TAB)

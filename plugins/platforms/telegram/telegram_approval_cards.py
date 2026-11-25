@@ -62,7 +62,7 @@ class TelegramApprovalCardsMixin:
 
     def _arm_approval_card(self, nonce: str, kind: str, msg: Any, *, chat_id: str, session_key: str,
                            request_id: Optional[str], choices, approver: Optional[str] = None,
-                           text: str = "", fill_only: bool = False, press_only: bool = False) -> None:
+                           text: str = "", approved: str = "") -> None:
         """Record the card once it was sent: its identity is the sent message itself."""
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 
@@ -71,7 +71,7 @@ class TelegramApprovalCardsMixin:
             cards.pop(next(iter(cards)))
         cards[nonce] = {
             "kind": kind, "session_key": session_key, "request_id": request_id, "choices": tuple(choices),
-            "approver": approver, "text": text, "fill_only": fill_only, "press_only": press_only,
+            "approver": approver, "text": text, "approved": approved,
             "chat_id": _scalar(getattr(msg, "chat_id", None)) or _scalar(normalize_telegram_chat_id(chat_id)),
             "message_id": _scalar(getattr(msg, "message_id", None)),
             "thread_id": _scalar(getattr(msg, "message_thread_id", None)),
@@ -130,7 +130,7 @@ class TelegramApprovalCardsMixin:
         chat only when *requester* (the turn's sender) is the approver himself."""
         from gateway.platforms.base import SendResult
         from tools.payment_consent_prompt import (
-            DENY_LABEL, PromptIncomplete, approve_label, pays_once, render_html)
+            DENY_LABEL, PromptIncomplete, approve_label, approved_toast, render_html)
         from plugins.platforms.telegram.adapter import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 
@@ -157,7 +157,7 @@ class TelegramApprovalCardsMixin:
             def on_sent(msg):
                 self._arm_approval_card(nonce, "pa", msg, chat_id=chat_id, session_key=session_key,
                                         request_id=request_id, choices=("once", "deny"), approver=approver,
-                                        text=text, fill_only=not pays_once(facts), press_only=facts.press_only)
+                                        text=text, approved=approved_toast(facts))
             return text, keyboard, on_sent
         return await self._send_prompt("send_payment_approval", chat_id, metadata, build, parse_mode=ParseMode.HTML,
                                        thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode,
@@ -254,9 +254,6 @@ class TelegramApprovalCardsMixin:
         if not count:
             label = "Expired or already answered: nothing was approved."
         else:
-            approved = ("Approved: Sera fills the card. Pay needs your go in chat." if record.get("fill_only")
-                        else "Approved: Sera presses Pay once." if record.get("press_only")
-                        else "Approved: Sera fills the card and presses Pay once.")
-            label = approved if choice == "once" else "Denied: nothing will be filled or paid."
+            label = record["approved"] if choice == "once" else "Denied: nothing will be filled or paid."
         await answer_callback(query, label)
         await edit_keeping_prompt(self, query, label)

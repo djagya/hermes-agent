@@ -62,6 +62,15 @@ RETURNED_NEXT = (
     "the card again with the current cart (on a page past the card step the same call asks him only to approve the "
     "Pay press). Its approval card tells him what the page shows now and asks him to confirm he has not already paid; "
     "his Approve covers the presses this checkout needs. If he says he already paid, call payment_done.")
+RETURNED_CHANGED = (
+    "Hermes could not confirm that the page still shows what the owner approved on the document he approved (it "
+    "changed or loaded again before the first press), so nothing was pressed and the lock stays. Fill the card again "
+    "with the current cart: the same call gives him a new approval card (on a page past the card step, for the Pay "
+    "press only).")
+LOCK_MOVING = (
+    "This payment is moving to a new browser connection of this task (the owner returned the payment tab, or the "
+    "connection was replaced), so nothing was read or pressed. Retry this call: the next payment call takes the "
+    "payment back.")
 PRESS_APPROVED = ("The owner approved pressing Pay on this page as it is (nothing was filled: the card is already "
                   "entered). Call payment_controls and press what the checkout needs.")
 
@@ -123,6 +132,17 @@ def stranded(sup: Any) -> bool:
             return False
     with sup._state_lock:
         return not sup._active
+
+
+def came_back(task_id: str) -> bool:
+    """A lock record of ``task_id`` came back after a return (held, not lost) or waits for the task's next supervisor
+    to take it back: a stop that wrote nothing tells Sera to fill again (``RETURNED_NEXT``), never to hand it on."""
+    with surface._LOCK:
+        parked = _PARKED.get(task_id)
+        if parked is not None:
+            return not parked[0].native_lost
+        return any(getattr(s, "task_id", None) == task_id and g.returned and not g.native_lost
+                   for s, g in list(surface._GENS.items()) if s in surface._HELD)
 
 
 def _adopted(result: Any, tab: str) -> Optional[frozenset]:
@@ -249,11 +269,12 @@ async def _press_page(sup: Any, cents: int, currency: str, merchant: str) -> Opt
 
 def press_page(sup: Any, cents: int, currency: str) -> Optional[tuple]:
     """D-0961 (tool thread): the fill found no card fields. ``(record, top document, merchant)`` when ``sup``'s returned
-    record waits for its fresh approval and the payment tab's top document is on the record's merchant, shows the
-    total (the first press's own check) and an enabled Pay-like control; else None (also when the read fails)."""
+    record admitted no press under its current approval (none yet, or its bound page loaded again before the first
+    press) and the payment tab's top document is on the record's merchant, shows the total (the first press's own
+    check) and an enabled Pay-like control; else None (also when the read fails)."""
     with surface._LOCK:
         gen = _record(sup)
-        if gen is None or gen.approved is not None or gen.native_lost or not gen.merchant:
+        if gen is None or gen.admitted or gen.native_lost or not gen.merchant:
             return None
         merchant = gen.merchant[2]
     try:
@@ -265,10 +286,11 @@ def press_page(sup: Any, cents: int, currency: str) -> Optional[tuple]:
 
 
 def bind_press(sup: Any, gen: Any, cents: int, currency: str, top: tuple, merchant: str) -> bool:
-    """The owner's tap on the press-only card: the total and top document bound to ``gen`` as a fill's tap binds them,
-    while ``gen`` is still ``sup``'s returned record waiting for its approval (else nothing: a second return)."""
+    """The owner's tap on the press-only card: the total and top document bound to ``gen`` as a fill's tap binds them
+    (replacing an approval that admitted no press), while ``gen`` is still ``sup``'s returned record (else nothing: a
+    second return) and no press was admitted since the card was offered."""
     with surface._LOCK:
-        if _record(sup) is not gen or gen.approved is not None or gen.native_lost \
+        if _record(sup) is not gen or gen.admitted or gen.native_lost \
                 or not surface._valid_checkout(top, merchant):
             return False
         gen.approved = (cents, currency, *top, merchant)

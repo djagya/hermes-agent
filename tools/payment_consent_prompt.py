@@ -315,11 +315,15 @@ def pays_once(facts: PaymentPromptFacts) -> bool:
             and payment_pay_once_enabled())
 
 
+def _pay_go(facts: PaymentPromptFacts) -> str:
+    return "Pay needs a new card that covers it" if facts.returned else "Pay needs your go in chat"
+
+
 def scope_line(facts: PaymentPromptFacts) -> str:
     """What one Approve tap does, in plain words: the fill and exactly one Pay press of this checkout, or (no
     stated total, a total the page check did not match, or ``vault.payment_pay_once`` off) the fill only. After a
     return (``facts.returned``) the owner's go in chat does not count: only a card that covers Pay does."""
-    go = "Pay needs a new card that covers it" if facts.returned else "Pay needs your go in chat"
+    go = _pay_go(facts)
     if facts.cart is None:
         return (f"Approve: Sera fills the card only, at {facts.merchant_origin}. No total was stated, so this "
                 f"does not cover pressing Pay: {go}.")
@@ -428,6 +432,15 @@ def summary(facts: PaymentPromptFacts) -> str:
 def approve_label(facts: PaymentPromptFacts) -> str:
     """The card's Approve button."""
     return APPROVE_LABEL_PRESS if facts.press_only else APPROVE_LABEL if pays_once(facts) else APPROVE_LABEL_FILL_ONLY
+
+
+def approved_toast(facts: PaymentPromptFacts) -> str:
+    """What the owner sees right after his Approve tap: what that tap covers, as the card says it."""
+    if facts.press_only:
+        return "Approved: Sera presses Pay once."
+    if pays_once(facts):
+        return "Approved: Sera fills the card and presses Pay once."
+    return f"Approved: Sera fills the card. {_pay_go(facts)}."
 
 
 @dataclass(frozen=True)
