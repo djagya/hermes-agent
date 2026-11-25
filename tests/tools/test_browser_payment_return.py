@@ -444,7 +444,8 @@ def _walk(flow, out, card, past=False, order=False, pressed=False):
         elif order and "payment_done" in text:
             out = json.loads(vault_tool._payment_done_action(flow.task, ""))
         elif "payment_close" in text:
-            assert flow.close()["lock_released"] is True, text
+            closed = flow.close()
+            assert closed["lock_released"] is True and "fill" in closed["note"] and "tell the" not in closed["note"]
             _reopen(flow)
             out, card = flow.card_fill("decline")  # the walk ends at the card: his answer is his
         else:

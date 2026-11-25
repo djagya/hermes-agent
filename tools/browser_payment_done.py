@@ -1113,11 +1113,13 @@ def payment_close(supervisor: Any) -> dict:
     tab is opened first only when the browser would otherwise be left without one. ``pressed_in_lock``: whether a
     payment_click of this Hermes process started a press during this lock (not whether that press was Pay); null
     when this process did not hold the lock since it started, so it cannot know (see ``admit_close``)."""
+    from tools.browser_payment_return import RETURNED_CLOSED, report
     from tools.browser_payment_surface import _FENCE_WAIT_S, _claim_lock, admit_close, end_close
 
     loop = getattr(supervisor, "_loop", None)
     if loop is None or not loop.is_running():
         return _refusal("supervisor_required", "The supervised browser is not attached; nothing was done.")
+    returned = report(supervisor)  # D-0961: read before the close ends the record
     lock = _claim_lock(supervisor)  # one claim, dialog answer or recovery call at a time
     if not lock.acquire(timeout=_FENCE_WAIT_S):
         return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
@@ -1134,7 +1136,8 @@ def payment_close(supervisor: Any) -> dict:
         if not admitted:  # dlz (Opus r2): never close the tab under a payment_click still on the wire
             return _refusal("payment_close_busy", _CLOSE_BUSY, closed_tabs=0, lock_released=False)
         try:
-            return {**_close_admitted(supervisor, loop, release), "pressed_in_lock": pressed}
+            out = {**_close_admitted(supervisor, loop, release), "pressed_in_lock": pressed}
+            return {**out, "note": RETURNED_CLOSED} if returned and out.get("note") == _CLOSE_DONE else out
         finally:
             end_close()
     finally:

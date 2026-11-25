@@ -71,6 +71,8 @@ RETURNED_REFILL = (  # the one way out of a returned lock on a page that takes n
     "call browser_vault payment_close (it closes the payment tab and ends the lock), open the checkout again, then "
     "fill once more: that approval card still says the payment came back and how often you pressed Pay. If this "
     "happens a second time, stop and tell the user.")
+RETURNED_CLOSED = ("The payment tab was closed without a confirmation. Open the checkout again and fill: its approval "
+                   "card tells the owner that this payment came back and how often you pressed Pay, and he decides.")
 LOCK_MOVING = (
     "Nothing was read, written or pressed: the owner has this payment's tab, or it is moving to a new browser "
     "connection of this task (he returned it, or the connection was replaced). Retry this call: once the tab is back, "
