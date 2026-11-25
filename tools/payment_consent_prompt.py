@@ -52,7 +52,8 @@ _UNSAFE_TEXT_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u206
 APPROVE_LABEL = "Approve: fill + Pay once"
 # No total was stated: the card is fill-only, Pay needs the owner's go in chat.
 APPROVE_LABEL_FILL_ONLY = "Approve: fill only"
-APPROVE_LABEL_PRESS = "Approve: Pay once"  # D-0961: the press-only card (nothing to fill)
+APPROVE_LABEL_PRESS = "Approve: Pay"  # D-0961: the press-only card (nothing to fill); a return only
+APPROVE_LABEL_RETURNED = "Approve: fill + Pay"  # a returned card: Sera presses what the checkout needs (D-0961)
 DENY_LABEL = "Deny"
 # The session's chat, when it is someone else's private chat (the card went to the owner's own chat).
 GROUP_NOTICE = "Card-fill approval sent to the owner privately."
@@ -434,14 +435,20 @@ def summary(facts: PaymentPromptFacts) -> str:
 
 def approve_label(facts: PaymentPromptFacts) -> str:
     """The card's Approve button."""
-    return APPROVE_LABEL_PRESS if facts.press_only else APPROVE_LABEL if pays_once(facts) else APPROVE_LABEL_FILL_ONLY
+    if facts.press_only:
+        return APPROVE_LABEL_PRESS
+    if not pays_once(facts):
+        return APPROVE_LABEL_FILL_ONLY
+    return APPROVE_LABEL_RETURNED if facts.returned else APPROVE_LABEL
 
 
 def approved_toast(facts: PaymentPromptFacts) -> str:
     """What the owner sees right after his Approve tap: what that tap covers, as the card says it."""
     if facts.press_only:
-        return "Approved: Sera presses Pay once."
+        return "Approved: Sera presses Pay for this purchase."
     if pays_once(facts):
+        if facts.returned:
+            return "Approved: Sera fills the card and presses Pay for this purchase."
         return "Approved: Sera fills the card and presses Pay once."
     return f"Approved: Sera fills the card. {_pay_go(facts)}."
 

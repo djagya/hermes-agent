@@ -27,8 +27,9 @@ payment's lock record (weak-keyed by that supervisor) used to end with it; the t
   what the checkout needs, as on a lock that was never returned (D-0961: no step is left to the owner). A page past
   the card step (the fill finds no card fields; :func:`press_page`: the record's merchant shows the stated total and
   a Pay-like control) gets the same card in its press-only form; the tap binds the total as a fill's would.
-- **Any other page** (:func:`way_out`): payment_done first (an order confirmation, a bank step, or Sera pressed Pay
-  since the take back), else the base way out (``RETURNED_REFILL``); after a detected order the base texts. That the
+- **Any other page** (:func:`way_out`): payment_done for an order confirmation or a bank step, else the base way
+  out (``RETURNED_REFILL``); after a detected order, or once Sera pressed Pay since the take back (D-0984 a: the
+  owner is asked whether the order went through, and she does not buy again), the base texts. That the
   payment came back, Sera's Pay presses and a detected order belong to the task (``_RETURNED``): that card says them.
 
 The same holds when the supervisor was replaced for another reason while the lock held (the texts say so).
@@ -72,8 +73,6 @@ RETURNED_REFILL = (  # the one way out of a returned lock on a page that takes n
     "call browser_vault payment_close (it closes the payment tab and ends the lock), open the checkout again, then "
     "fill once more: that approval card still says the payment came back and how often you pressed Pay. If this "
     "happens a second time, stop and tell the user.")
-PAY_DONE_FIRST = ("You pressed Pay since the payment came back: call browser_vault payment_done first (it waits "
-                  "through a bank or 3-D Secure step and reads the order confirmation); its answer says how to go on.")
 RETURNED_CLOSED = ("The payment tab was closed without a confirmation. Open the checkout again and fill: its approval "
                    "card tells the owner that this payment came back and how often you pressed Pay, and he decides.")
 LOCK_MOVING = (
@@ -242,15 +241,14 @@ def settle(sup: Any) -> None:
 
 
 def way_out(sup: Any, stop: str) -> str:
-    """``stop`` and the way on when ``sup``'s lock came back and no order was detected in its payment (payment_done
-    first after a Pay press since the take back, else closing and filling again); else "" (the base text holds)."""
+    """``stop`` and the way on (closing and filling again) when ``sup``'s lock came back and no order was detected in
+    its payment and Sera pressed no Pay since; else "" (the base text holds: she asks the owner, D-0984 a)."""
     with surface._LOCK:
         gen = _record(sup)
-        if gen is None or gen.paid or gen.ordered:
+        if gen is None or gen.paid or gen.ordered or gen.pay_at is not None:
             return ""
-        pressed = gen.pay_at is not None
-    return stop + (PAY_DONE_FIRST if pressed else "If the page shows an order confirmation or a bank or 3-D Secure "
-                                                  "step, call browser_vault payment_done. Otherwise " + RETURNED_REFILL)
+    return stop + ("If the page shows an order confirmation or a bank or 3-D Secure step, call browser_vault "
+                   "payment_done. Otherwise " + RETURNED_REFILL)
 
 def awaits_approval(sup: Any) -> bool:
     """``sup``'s lock record came back after a return and no fresh approval is bound to it (a shop's confirm

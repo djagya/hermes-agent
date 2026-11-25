@@ -440,13 +440,13 @@ def _walk(flow, out, card, past=False, order=False, pressed=False):
             assert (PRESSED % "1 time" in card) is pressed and ("already pressed" in card) is pressed, card
             return "card"
         text = out.get("error") or out["next"]
-        if text.endswith(done._NOT_REACHED_ASK):
-            return "user"
+        if text.endswith(done._NOT_REACHED_ASK) or text == surface._TOTAL_CHANGED_TEXT:
+            return "user"  # D-0984 a: after a Pay press since the return (or a detected order) she asks him
         assert text not in seen and not _HANDS_OFF.search(text) and call < 2, (call, seen, text)
         seen.append(text)
         if "Retry this call" in text:
             out = flow.act()
-        elif ret.PAY_DONE_FIRST in text or order and "payment_done" in text:
+        elif order and "payment_done" in text:
             out = json.loads(vault_tool._payment_done_action(flow.task, ""))
         elif "payment_close" in text:
             closed = flow.close()
@@ -539,7 +539,7 @@ def test_every_page_a_returned_payment_can_be_on_leads_to_a_fresh_card_or_paymen
     flow = _returned(env, pressed=pressed, shows=shows)
     out, card = (first(flow, monkeypatch), None) if first else flow.card_fill("decline", past=past)
     end = _walk(flow, out, card, past, order=shows is THANKS, pressed=bool(flow.presses()))
-    assert end == ("payment_done" if shows is THANKS else "user" if first is _detected_not_reached else "card")
+    assert end == ("payment_done" if shows is THANKS else "user" if first in (_detected_not_reached, _total_gone) else "card")
     if shows is THANKS:
         _reopen(flow)  # the purchase is finished: the task's next one is no returned payment
         assert "came back" not in flow.card_fill()[1]
@@ -554,7 +554,7 @@ def test_detected_order_in_returned_lock_never_leads_to_close_and_refill(env):
     out = _detected_not_reached(flow, env.monkeypatch)
     assert out["error"] == done._NOT_REACHED + done._NOT_REACHED_ASK, out
     out, card = flow.card_fill(past=True)
-    assert card is None and ret.RETURNED_REFILL not in out["error"] and ret.PAY_DONE_FIRST not in out["error"], out
+    assert card is None and ret.RETURNED_REFILL not in out["error"], out
     closed = flow.close()
     assert closed["lock_released"] is True and closed["note"] == done._CLOSE_DONE, closed
     _reopen(flow)
@@ -567,10 +567,10 @@ def test_detected_order_in_returned_lock_never_leads_to_close_and_refill(env):
     assert flow.press("JETZT KAUFEN")["pay_pressed"] is True and len(flow.presses()) == 2
 
 
-def test_returned_fill_on_bank_page_points_to_payment_done(env):
+def test_returned_fill_on_bank_page_keeps_the_base_refusal(env):
     """Opus r9 M: after a return the payment tab is on a bank's 3-D Secure page (another origin): the fill's refusal
     is the base one, as on a lock never returned (never payment_close). A shop page that takes no fill after Sera's
-    Pay press since the take back sends her to payment_done first."""
+    Pay press since the take back keeps the base refusal too (D-0984 a: no close and fill again)."""
     flow = _returned(env, pressed=True)
     out, card = flow.card_fill(past="bank")
     assert card is None and out["error"] == "Merchant origin mismatch; inspect the checkout and request fresh consent."
@@ -578,7 +578,7 @@ def test_returned_fill_on_bank_page_points_to_payment_done(env):
     flow.ctl.page.page.update(SHIPPING["page"])
     flow.ctl.page.rows, flow.ctl.page.pin = list(SHIPPING["rows"]), NO_TOTAL
     out, card = flow.card_fill(past=True)
-    assert card is None and ret.PAY_DONE_FIRST in out["error"] and "payment_close" not in out["error"], out
+    assert card is None and "payment_close" not in out["error"] and ret.RETURNED_REFILL not in out["error"], out
     assert len(flow.presses()) == 2
 
 
@@ -593,12 +593,28 @@ def test_never_returned_total_changed_keeps_base_text(env):
     assert out["error_type"] == surface.TOTAL_CHANGED and out["error"] == surface._TOTAL_CHANGED_TEXT
     assert "tell the owner (Danil) what you see" in out["error"] and "open the checkout again" not in out["error"]
     out, card = flow.card_fill(past=True)
-    assert card is None and bvp._RETURNED_STOP not in out["error"] and ret.PAY_DONE_FIRST not in out["error"], out
+    assert card is None and bvp._RETURNED_STOP not in out["error"], out
 
 
-def test_returned_total_changed_after_press_points_to_payment_done(env):
+def test_unconfirmed_press_after_return_asks_the_user_not_refill(env):
+    """D-0984 a ("984 - a"): after a return Sera pressed Pay (the fresh approval) and the confirmation did not come:
+    payment_done not reached answers "ask the user", and payment_close the base note, never close and fill again.
+    If he then says it did not go through and she opens the checkout again, her next card still says it came back
+    and that she pressed Pay once."""
+    flow = _returned(env)
+    assert flow.card_fill(past=True)[0]["press_only"] is True and flow.press("JETZT KAUFEN")["pay_pressed"] is True
+    out = json.loads(vault_tool._payment_done_action(flow.task, ""))
+    assert out["error"] == done._NOT_REACHED + done._NOT_REACHED_ASK and ret.RETURNED_REFILL not in out["error"], out
+    closed = flow.close()
+    assert closed["lock_released"] is True and closed["note"] == done._CLOSE_DONE, closed
+    _reopen(flow)
+    out, card = flow.card_fill("decline")
+    assert out["error_type"] == "payment_declined" and "came back to Sera" in card and PRESSED % "1 time" in card, card
+
+
+def test_returned_total_changed_after_press_keeps_base_text(env):
     """After a return, payment_total_changed before any press of the fresh approval: payment_close and the checkout
-    again, with the "a second time, stop" bound; after its Pay press went out: payment_done first."""
+    again, with the "a second time, stop" bound; after its Pay press went out: the base text (she tells the owner)."""
     flow = _returned(env)
     assert flow.card_fill(past=True)[0]["press_only"] is True
     _reload(flow)
@@ -607,8 +623,8 @@ def test_returned_total_changed_after_press_points_to_payment_done(env):
     assert flow.card_fill(past=True)[0]["press_only"] is True and flow.press("JETZT KAUFEN")["pay_pressed"] is True
     flow.ctl.page.pin = NO_TOTAL
     out = flow.press("JETZT KAUFEN")
-    assert out["error_type"] == surface.TOTAL_CHANGED and ret.PAY_DONE_FIRST in out["error"], out
-    assert "payment_close" not in out["error"] and len(flow.presses()) == 1
+    assert out["error_type"] == surface.TOTAL_CHANGED and out["error"] == surface._TOTAL_CHANGED_TEXT, out
+    assert ret.RETURNED_REFILL not in out["error"] and len(flow.presses()) == 1
 
 
 NEW_CHECKOUT = "<b>This is a new checkout; Hermes did not see the page Sera pressed Pay on.</b>"
@@ -1045,4 +1061,10 @@ def test_the_approval_card_after_a_return(monkeypatch):
     assert PRESS_ONLY in card and "<b>No order wording seen" in card and PRESSED % "1 time" in card
     assert "One tap covers one purchase" in card and "Card fields go to" not in card and "Card: " not in card
     assert prompt.render_plain(facts).startswith("No card field is filled.") and prompt.summary(facts).startswith("Press Pay on")
-    assert prompt.approve_label(facts) == prompt.APPROVE_LABEL_PRESS and prompt.pays_once(facts)
+    assert prompt.approve_label(facts) == "Approve: Pay" and prompt.pays_once(facts)
+    assert prompt.approved_toast(facts) == "Approved: Sera presses Pay for this purchase."
+    returned = _card("seen")[1]  # a returned fill + Pay: purchase-scoped, no "once"; never returned: as it was
+    assert prompt.approve_label(returned) == "Approve: fill + Pay"
+    assert prompt.approved_toast(returned) == "Approved: Sera fills the card and presses Pay for this purchase."
+    assert prompt.approve_label(_card("")[1]) == "Approve: fill + Pay once"
+    assert prompt.approved_toast(_card("")[1]) == "Approved: Sera fills the card and presses Pay once."
