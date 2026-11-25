@@ -578,7 +578,7 @@ def test_returned_fill_on_bank_page_keeps_the_base_refusal(env):
     flow.ctl.page.page.update(SHIPPING["page"])
     flow.ctl.page.rows, flow.ctl.page.pin = list(SHIPPING["rows"]), NO_TOTAL
     out, card = flow.card_fill(past=True)
-    assert card is None and "payment_close" not in out["error"] and ret.RETURNED_REFILL not in out["error"], out
+    assert card is None and bvp._RETURNED_STOP not in out["error"] and ret.RETURNED_REFILL not in out["error"], out
     assert len(flow.presses()) == 2
 
 
