@@ -262,20 +262,12 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
         self._park_payment()  # the socket is closed by now, even when the thread outlived the join
 
     def _park_payment(self) -> None:
-        """dlz (D-0878): a payment lock record outlives its supervisor: it waits for the task's next one
-        (``browser_payment_return.park``). Called once this supervisor can send nothing more and before a
-        replacement can exist: at the end of :meth:`stop` and before :meth:`_leave_registry` unregisters it."""
+        """dlz (D-0878): this supervisor's payment lock record waits for the task's next one. Called once it can
+        send nothing more and before it leaves the registry, so a replacement always finds the record."""
         with contextlib.suppress(Exception):
             from tools.browser_payment_return import park
 
             park(self)
-
-    def _leave_registry(self) -> None:
-        """The connection is gone for good (its lease ended, or the reconnect budget is spent): park the payment
-        record first, so the replacement a later call starts always finds it, then unregister."""
-        self._park_payment()
-        if SUPERVISOR_REGISTRY.get(self.task_id) is self:
-            SUPERVISOR_REGISTRY._pop(self.task_id)
 
     def _set_active(self, value: bool) -> None:
         with self._state_lock:
@@ -518,7 +510,9 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
             return False
         logger.warning("CDP supervisor %s: stopped after %s failed reconnect attempts: %s",
                        self.task_id, failures, _redact_cdp_error_text(e))
-        self._leave_registry()
+        self._park_payment()
+        if SUPERVISOR_REGISTRY.get(self.task_id) is self:
+            SUPERVISOR_REGISTRY._pop(self.task_id)
         return True
 
     async def _run(self) -> None:
@@ -546,7 +540,9 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin, PaymentSupervisi
                     # dlz: B14: the lease ended; one line, leave the registry, no 5-try redial loop.
                     logger.info("CDP supervisor %s: lease ended (gate refused the redial with 403); stopping",
                                 self.task_id)
-                    self._leave_registry()
+                    self._park_payment()
+                    if SUPERVISOR_REGISTRY.get(self.task_id) is self:
+                        SUPERVISOR_REGISTRY._pop(self.task_id)
                     return
                 reconnect_failures += 1
                 redial_failures += 1

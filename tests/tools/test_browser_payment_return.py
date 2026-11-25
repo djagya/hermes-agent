@@ -301,7 +301,7 @@ def test_after_a_return_only_the_fresh_cards_approval_presses_and_then_what_the_
 def test_returned_card_names_earlier_press(env):
     """Opus M1: Sera pressed Pay before the take, and its order went unseen (another tab, an e-mail later, an
     uncertain press). The fresh card says so, and payment_controls counts it; a re-fill and a second return keep
-    counting."""
+    counting. A second return also voids the fresh approval, and owner_go never counts again in this lock."""
     flow = _returned(env, pressed=True)
     assert flow.act()["presses_in_lock"] == 1
     out, card = flow.card_fill()
@@ -309,8 +309,12 @@ def test_returned_card_names_earlier_press(env):
     assert flow.press("JETZT KAUFEN")["pay_pressed"] is True
     assert PRESSED % "2 times" in flow.card_fill()[1], "a re-fill in the same lock"
     flow.take()
-    flow.ctl.lease = 3  # Return to Sera again
-    assert flow.act()["presses_in_lock"] == 2 and PRESSED % "2 times" in flow.card_fill()[1]
+    flow.ctl.lease = 3  # Return to Sera again, the re-fill's approval unused
+    assert flow.act()["presses_in_lock"] == 2 and flow.ctl.native is flow.ctl.sockets[2]
+    assert flow.press("JETZT KAUFEN")["error_type"] == surface.GO_REQUIRED and len(flow.presses()) == 2
+    assert PRESSED % "2 times" in flow.card_fill()[1] and flow.press("JETZT KAUFEN")["pay_pressed"] is True
+    assert surface.claim_payment_surface(flow.sup(), INSPECTED) is None  # a later fill that bound no total
+    assert flow.press("JETZT KAUFEN", owner_go=True)["error_type"] == surface.GO_REQUIRED and len(flow.presses()) == 3
 
 
 @pytest.mark.parametrize("shows, tabs, line, seen", [
@@ -372,18 +376,6 @@ def test_after_a_return_a_card_that_was_not_approved_shown_or_filled_presses_not
         refused = flow.press("JETZT KAUFEN", owner_go=owner_go)
         assert refused["error_type"] == surface.GO_REQUIRED and "fill the card again" in refused["error"]
     assert len(flow.presses()) == (0 if how == "card_from_before" else 1), "only Sera's press before the take"
-
-
-def test_a_second_return_voids_the_fresh_approval_and_owner_go_never_counts_again_in_this_lock(env):
-    flow = _returned(env)
-    assert flow.card_fill()[0]["success"] is True
-    flow.take()
-    flow.ctl.lease = 3  # Return to Sera again
-    assert flow.act()["returned"] is True and flow.ctl.native is flow.ctl.sockets[2]
-    assert flow.press("JETZT KAUFEN")["error_type"] == surface.GO_REQUIRED and flow.presses() == []
-    assert flow.card_fill()[0]["success"] is True and flow.press("JETZT KAUFEN")["pay_pressed"] is True
-    assert surface.claim_payment_surface(flow.sup(), INSPECTED) is None  # a later fill that bound no total
-    assert flow.press("JETZT KAUFEN", owner_go=True)["error_type"] == surface.GO_REQUIRED and len(flow.presses()) == 1
 
 
 @pytest.mark.parametrize("returned", [True, False])
@@ -569,25 +561,18 @@ def test_replacement_during_403_cleanup_adopts_parked_record(env, monkeypatch):
 
 
 def test_a_stop_that_outlives_its_join_still_parks_the_record(env, monkeypatch):
-    """Opus L1: the supervisor is stopped (replaced) and its thread outlives the join (held in its exit by the test):
-    the record is parked when stop() returns, so the next supervisor takes it back."""
+    """Opus L1: the supervisor is replaced and its thread outlives stop()'s join (held in its exit by the test): the
+    record is parked when stop() returns, so the next supervisor takes it back."""
     flow = Flow(env)
-    first = flow.fill()
-    held, go_on = threading.Event(), threading.Event()
+    first, go_on = flow.fill(), threading.Event()
     real_active = first._set_active
-
-    def set_active(value):
-        if threading.current_thread() is first._thread:
-            held.set()
-            go_on.wait(10)
-        real_active(value)
-
-    monkeypatch.setattr(first, "_set_active", set_active)
+    monkeypatch.setattr(first, "_set_active", lambda value: (
+        threading.current_thread() is not first._thread or go_on.wait(10), real_active(value)))
     flow.ctl.lease, flow.ctl.native = 2, None  # the connection is replaced; the old lease's sockets are gone
     try:
         bs.SUPERVISOR_REGISTRY._pop(flow.task)
         first.stop(timeout=0.2)
-        assert held.is_set() and first._thread.is_alive() and flow.task in ret._PARKED
+        assert first._thread.is_alive() and flow.task in ret._PARKED
         assert flow.act()["returned"] is True and flow.sup() is not first
     finally:
         go_on.set()

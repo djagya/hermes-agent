@@ -9,15 +9,14 @@ payment's lock record (weak-keyed by that supervisor) used to end with it; the t
   (``Hermes.paymentSurfaceTicket``, answered on the lock's native connection only) and keeps it with the lock
   record, in memory only. It proves to control that a later connection belongs to the process that made the claim:
   model code can read a lease token, never this.
-- **Park.** A supervisor whose thread ends while it holds a lock record leaves the record to its task
-  (:func:`park`).
+- **Park.** A supervisor that is done (stopped, or its connection is gone for good) leaves its lock record to its
+  task (:func:`park`) before it leaves the registry, so a replacement always finds it.
 - **Take back.** The task's next supervisor takes that record on its first dial (:func:`take_back`) and sends
   ``Hermes.adoptPaymentSurface {ticket}``. Control confirmed (this socket is now the lock's native connection) and
-  the payment tab attached: the record is live on this socket, marked ``returned``, with no approval and with the
-  presses Sera made in the lock still counted. Anything else
-  (no ticket, an older control, a refusal, a timeout, another reply, a failed attach): the record is lost for good
-  (it stays lost on every later supervisor too), every payment action answers ``payment_native_lost`` and nothing
-  is pressed.
+  the payment tab attached: the record is live on this socket, marked ``returned``, with no approval and with
+  Sera's presses in the lock still counted. Anything else (no ticket, an older control, a refusal, a timeout,
+  another reply, a failed attach): the record is lost for good (it stays lost on every later supervisor too), every
+  payment action answers ``payment_native_lost`` and nothing is pressed.
 - **Fresh approval** (D-0922 a, D-0942 a, D-0961). The record comes back without its approved total and stays
   ``returned`` until the lock ends. owner_go does not count on it: only a new card fill lets Sera press Pay, and
   until its approval is bound she accepts no confirm dialog of the shop (:func:`awaits_approval`). Before that fill's

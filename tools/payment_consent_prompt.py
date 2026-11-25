@@ -70,7 +70,6 @@ RETURNED_LINES = {
 }
 RETURNED_APPROVE = ("Approve confirms you have not already paid this purchase. Sera fills the card and presses Pay "
                     "for {total} {currency}.")
-_MAX_PAY_PRESSES = 999
 
 PAGE_MATCH_LINES = {
     "matched": "Page check: the page shows this total (text check only).",
@@ -233,7 +232,7 @@ class PaymentPromptFacts:
         if self.returned not in ("", *RETURNED_LINES):
             raise FactsInvalid("returned must be empty, seen, not_seen or unread")
         if self.pay_presses is not None and not (type(self.pay_presses) is int
-                                                 and 0 <= self.pay_presses <= _MAX_PAY_PRESSES):
+                                                 and 0 <= self.pay_presses <= 999):
             raise FactsInvalid("pay_presses must be None or a small count")
 
     def to_dict(self) -> dict:
@@ -345,15 +344,6 @@ def supplied_line(facts: PaymentPromptFacts) -> str:
             f"{'it' if len(names) == 1 else 'them'}).")
 
 
-def pay_presses_line(presses: Optional[int]) -> str:
-    """The returned card's line on Sera's earlier Pay presses in this payment (``presses`` > 0 or None)."""
-    if presses is None:
-        return ("Hermes does not know whether Sera already pressed Pay in this payment; check your e-mail or bank "
-                "before you approve.")
-    return (f"Sera already pressed Pay {presses} time{'s' if presses != 1 else ''} in this payment; check your e-mail "
-            "or bank before you approve.")
-
-
 def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
     """The card body, one fact per line, in the order the owner reads it."""
     lines = [bold("Approve card payment?"), ""]
@@ -365,8 +355,11 @@ def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
         lines += ["This tab came back to Sera (you returned it, or her browser connection was replaced). "
                   + bold(RETURNED_LINES[facts.returned])
                   + " This check only advises: Hermes cannot tell whether you already paid.", ""]
-        if facts.pay_presses != 0:
-            lines += [bold(esc(pay_presses_line(facts.pay_presses))), ""]
+        n = facts.pay_presses
+        if n != 0:  # Sera's own presses before: the owner's "not already paid" does not cover them
+            who = ("Hermes does not know whether Sera already pressed Pay" if n is None else
+                   f"Sera already pressed Pay {n} time{'s' if n != 1 else ''}")
+            lines += [bold(who + " in this payment; check your e-mail or bank before you approve."), ""]
     lines += [f"Card: {bold(esc(facts.card_label))}",
               f"Merchant (top-level page): {code(facts.merchant_origin)}",
               "Card fields go to:"]
