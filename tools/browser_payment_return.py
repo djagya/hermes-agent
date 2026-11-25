@@ -235,7 +235,7 @@ def observe(sup: Any) -> dict:
 
 
 async def _press_page(sup: Any, cents: int, currency: str, merchant: str) -> Optional[tuple]:
-    page_sid, tree, child_sessions, listed = await surface._list_all(sup)
+    page_sid, _tree, child_sessions, listed = await surface._list_all(sup)
     try:
         top = await surface._top_frame(sup, page_sid)
         pay = any(fid == top[0] and not c["disabled"] and surface._pay_press(c["role"], c["text"])

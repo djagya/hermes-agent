@@ -1153,6 +1153,24 @@ def _claim_and_readmit(vault, task_id: str, supervisor, inspected, lease: str) -
     return _lock_aware(_expired(), vault._is_managed()) if time.monotonic() >= inspected.expires_at else None
 
 
+def _inspect(supervisor, vault, meta, stated, merchant_origin: str, bound: tuple, frame_origins: tuple, witness: dict):
+    """The fill's inspection: ``(inspection, policy)`` (policy None on the reviewed pass), or a typed result dict
+    (discovery's, or D-0961's press-only card when there is no card form at all and the payment came back after a
+    return). Raises the inspection's refusal otherwise."""
+    try:
+        return supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
+                                          **witness), None
+    except PaymentPolicyError as exc:
+        try:
+            return _discover(supervisor, vault, exc, merchant_origin, bound, frame_origins, witness)
+        except PaymentPolicyError as refused:
+            pressed = (_press_only(supervisor, meta, stated)
+                       if type(refused) is PaymentPolicyError and _is_coverage_refusal(exc) else None)
+            if pressed is None:
+                raise
+            return pressed
+
+
 def _press_only(supervisor, meta, stated) -> dict | None:
     """D-0961: the fill found no card form, and the payment came back after a return (``browser_payment_return``).
     When the page is past the card step (``press_page``), the approval card's press-only form: the same facts but the
@@ -1256,23 +1274,12 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         frame_origins = effective_frame_origins(meta.payment_frame_origins)
         stated = _stated_cart(cart) if cart is not None else None
         witness = {"cart": _cents(stated)} if stated is not None else {}
-        policy = None  # (enabled, generation, strict) captured for the discovery inspection (B6)
         at["step"] = "inspect"
-        try:
-            inspected = supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
-                                                   **witness)
-        except PaymentPolicyError as exc:
-            try:
-                found = _discover(supervisor, vault, exc, merchant_origin, bound, frame_origins, witness)
-            except PaymentPolicyError as refused:  # D-0961: no card form at all; a returned payment past the card step
-                pressed = (_press_only(supervisor, meta, stated)
-                           if type(refused) is PaymentPolicyError and _is_coverage_refusal(exc) else None)
-                if pressed is None:
-                    raise
-                return json.dumps(pressed)
-            if isinstance(found, dict):
-                return json.dumps(found)
-            inspected, policy = found
+        # policy: (enabled, generation, strict) captured for the discovery inspection (B6)
+        found = _inspect(supervisor, vault, meta, stated, merchant_origin, bound, frame_origins, witness)
+        if isinstance(found, dict):
+            return json.dumps(found)
+        inspected, policy = found
         unreviewed = bool(getattr(inspected, "unreviewed_origins", ()))
         strict = strict or unreviewed
         if unreviewed:
