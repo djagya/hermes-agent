@@ -543,7 +543,9 @@ def test_any_failed_slow_or_unanswered_call_after_a_return_ends_in_at_most_one_p
             assert len(spans["_wording"]) == 1 and out["success"] is True and first["pay_pressed"] is True, where
             assert second["error_type"] == ret.PRESS_USED, where
         elif at in dispatch:  # the press was booked at its dispatch: its outcome is unknown, the approval is used
-            assert first["success"] is (kind == "slow") or first["error_type"] == "payment_click_uncertain", where
+            if kind != "slow":  # a late answer may still arrive inside the action's time
+                assert first["error_type"] == "payment_click_uncertain" and "Do NOT click again" in first["error"], where
+            assert first.get("pay_pressed") is True or first["error_type"] == "payment_click_uncertain", where
             assert second["error_type"] == ret.PRESS_USED, where
         elif first.get("pay_pressed"):
             assert second["error_type"] == ret.PRESS_USED, where
