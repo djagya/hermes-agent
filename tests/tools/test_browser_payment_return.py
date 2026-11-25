@@ -432,6 +432,16 @@ def test_no_return_answer_hands_a_step_to_the_user(env, monkeypatch):
     out = flow.press("JETZT KAUFEN")
     assert out["error_type"] == surface.TOTAL_CHANGED, out
     answers["reloaded before the first press"] = out["error"]
+    out, card = flow.card_fill(past=True)
+    assert out["press_only"] is True and flow.press("JETZT KAUFEN")["pay_pressed"] is True
+    flow.ctl.page.pin = {"state": "not_found", "labelled": [], "stated": 0, "unclear": False}  # the total is gone
+    out = flow.press("JETZT KAUFEN")
+    assert out["error_type"] == surface.TOTAL_CHANGED and len(flow.presses()) == 1, out
+    answers["total gone after a press went out"] = out["error"]
+    thanks = _returned(env, shows={"page": shop.THANKS, "rows": [_row("Weiter einkaufen", role="link")]})
+    out, card = thanks.card_fill(past=True)
+    assert card is None and out["error_type"] == "payment_fields_unsupported", out
+    answers["thank-you page, no card form"] = out["error"]
     # a supervisor that dialled before the record was parked meets the lock as another connection's
     late = _returned(env)
     with surface._LOCK:
@@ -448,6 +458,8 @@ def test_no_return_answer_hands_a_step_to_the_user(env, monkeypatch):
     answers["toast, fill-only card"] = toast
     for where, text in answers.items():
         assert re.search(r"fill the card again|retry this call|new card", text, re.IGNORECASE), (where, text)
+        if "page" in where or "press went out" in where:
+            assert "payment_done" in text, (where, text)
         assert not _HANDS_OFF.search(text), (where, text)
     schema = json.dumps(vault_tool.BROWSER_VAULT_SCHEMA)
     assert "payment is moving to a new connection, retry the call" in schema

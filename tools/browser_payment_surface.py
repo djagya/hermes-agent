@@ -1868,10 +1868,10 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
     try:
         out = _with_dialog(supervisor, _run(
             supervisor, lambda deadline: _click(supervisor, spec, progress, deadline, gate), progress))
-        if out.get("error_type") == TOTAL_CHANGED and gate.gen is not None and gate.gen.returned and not gate.admitted:
-            from tools.browser_payment_return import RETURNED_CHANGED
+        if out.get("error_type") == TOTAL_CHANGED and gate.gen is not None and gate.gen.returned:
+            from tools.browser_payment_return import RETURNED_AGAIN
 
-            out = _refusal(TOTAL_CHANGED, RETURNED_CHANGED)  # D-0961: a new card, nothing left to the owner
+            out = _refusal(TOTAL_CHANGED, "Nothing was pressed. " + RETURNED_AGAIN)  # D-0961: nothing left to the owner
     finally:
         with _LOCK:  # build C r2 (P2): the press itself was booked at its dispatch (_book_press)
             _PRESSING_N = max(0, _PRESSING_N - 1)

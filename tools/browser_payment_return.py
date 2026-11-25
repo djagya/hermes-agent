@@ -62,11 +62,9 @@ RETURNED_NEXT = (
     "the card again with the current cart (on a page past the card step the same call asks him only to approve the "
     "Pay press). Its approval card tells him what the page shows now and asks him to confirm he has not already paid; "
     "his Approve covers the presses this checkout needs. If he says he already paid, call payment_done.")
-RETURNED_CHANGED = (
-    "Hermes could not confirm that the page still shows what the owner approved on the document he approved (it "
-    "changed or loaded again before the first press), so nothing was pressed and the lock stays. Fill the card again "
-    "with the current cart: the same call gives him a new approval card (on a page past the card step, for the Pay "
-    "press only).")
+RETURNED_AGAIN = (
+    "The payment came back to Sera. Read the page: if it shows an order confirmation, call payment_done; otherwise go "
+    "back to the card or review step and fill the card again for a new approval card.")
 LOCK_MOVING = (
     "This payment is moving to a new browser connection of this task (the owner returned the payment tab, or the "
     "connection was replaced), so nothing was read or pressed. Retry this call: the next payment call takes the "
