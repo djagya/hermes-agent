@@ -394,7 +394,7 @@ def test_press_only_after_reload_before_press_gets_new_card(env):
     assert flow.card_fill(past=True)[0]["press_only"] is True
     _reload(flow)
     first = flow.press("JETZT KAUFEN")
-    assert first["error_type"] == surface.TOTAL_CHANGED and "fill the card again" in first["error"], first
+    assert first["error_type"] == surface.TOTAL_CHANGED and "fill the card again" in first["error"].lower(), first
     assert len(flow.presses()) == 1
     out, card = flow.card_fill(past=True)
     assert out["press_only"] is True and PRESS_ONLY in card and PRESSED % "1 time" in card, out
@@ -410,7 +410,7 @@ _HANDS_OFF = re.compile(r"tell (the user|him|the owner)|himself|yourself|by hand
 def test_no_return_answer_hands_a_step_to_the_user(env, monkeypatch):
     """D-0961 (owner 2026-11-25: "i don't want to do amy manual work at all"): each answer Sera can get after a return
     says what she does next, never to hand a step to the owner: a second return while a card waits (fill and
-    press-only), the one call that meets the lock before the payment is taken back, a press refused because the
+    press-only) or while the card is read under the lock, the one call that meets the lock before the payment is taken back, a press refused because the
     approved page reloaded, and the owner's toast after a fill-only card."""
     answers = {}
     flow = _returned(env)
@@ -421,6 +421,12 @@ def test_no_return_answer_hands_a_step_to_the_user(env, monkeypatch):
     out, card = flow.card_fill(past=True, during=again)
     assert out["error_type"] == "payment_browser_changed" and PRESS_ONLY in card, out
     answers["press-only, second return"] = out["error"]
+    real = bvp.validate_card
+    monkeypatch.setattr(bvp, "validate_card", lambda secret: (again(None), secret)[1])  # after the claim
+    out, card = flow.card_fill()
+    assert out["error_type"] == "payment_browser_changed" and out["returned"] is True, out
+    answers["card read under the lock, second return"] = out["error"]
+    monkeypatch.setattr(bvp, "validate_card", real)
     assert flow.card_fill(past=True)[0]["press_only"] is True
     _reload(flow)
     out = flow.press("JETZT KAUFEN")
