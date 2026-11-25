@@ -258,9 +258,10 @@ worktrees:
   archive_max_file_mb: 50      # untracked files above this are not archived; their tree is kept
   archive_retention_days: 30   # 0 keeps archives forever
   max_total_gb: 0              # optional budget for idle trees; oldest are archived + removed first
-  install_state_retention_days: 14  # dependency state of a missing checkout outside .worktrees/ and
-                               # the data root, unused this long, is reclaimed; 0 keeps it forever.
+  install_state_retention_days: 14  # dependency state of a missing checkout outside .worktrees/,
+                               # .claude/worktrees/ and the data root, unused this long, is reclaimed; 0 keeps it forever.
                                # Read from the root profile's config: its profiles share installs/
+                               # A dependency sync or `pm install` (and the startup pruner) triggers the reclaim.
 ```
 
 There is no limit on how many trees may exist: hundreds of parallel subagents
