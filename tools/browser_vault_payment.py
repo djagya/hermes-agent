@@ -288,12 +288,9 @@ _LOCKED_NEXT = (
     "payment_close (it closes the payment tab and ends the lock), open the checkout again, then call fill once more; "
     "it shows a new approval prompt. If the fill stops like this a second time, stop and tell the user."
 )
-# D-0878 (r9): the inspection refused a fill in a lock that came back after a return, and no press-only card applies.
-_RETURNED_STOP = (
-    "This page takes no card fill (no complete card form Hermes can fill, or not the checkout the card is for) and "
-    "has no Pay press the owner can be asked to approve, so nothing was read or written. If it shows an order "
-    "confirmation, call browser_vault payment_done. Otherwise: " + _LOCKED_NEXT
-)
+# D-0878: the inspection refused a fill in a lock that came back after a return, and no press-only card applies
+_RETURNED_STOP = ("This page takes no card fill and has no Pay press the owner can be asked to approve, so nothing was "
+                  "read or written. If it shows an order confirmation, call browser_vault payment_done. Otherwise ")
 _PAGE_CHANGED_LOCKED = (
     "The checkout changed after it was inspected (navigation, re-render or a different frame), so no card "
     "field was written and nothing was submitted. " + _LOCKED_NEXT
@@ -1173,8 +1170,7 @@ def _inspect(supervisor, vault, meta, stated, merchant_origin: str, bound: tuple
     """The fill's inspection: ``(inspection, policy)`` (policy None on the reviewed pass), or a typed result dict
     (discovery's, or D-0961's press-only card when there is no card form at all and the payment came back after a
     return: the reviewed pass found none and the discovery is off, found no unreviewed form, or found no card control
-    at all). Raises the inspection's refusal otherwise; in a lock that came back after a return it says the way out
-    (``_RETURNED_STOP``: Sera cannot check the page there), with its type and detail."""
+    at all). Raises the inspection's refusal otherwise, in a lock that came back with the way out as its text."""
     try:
         return supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
                                           **witness), None
@@ -1186,12 +1182,12 @@ def _inspect(supervisor, vault, meta, stated, merchant_origin: str, bound: tuple
             pressed = _press_only(supervisor, meta, stated) if past and _is_coverage_refusal(exc) else None
             if pressed is not None:
                 return pressed
-            from tools.browser_payment_return import report
+            from tools.browser_payment_return import RETURNED_REFILL, report
 
-            if not report(supervisor):  # no lock of this task that came back: the refusal as it is
+            if not report(supervisor):  # no lock that came back after a return: the refusal as it is
                 raise
-            raise PaymentDestinationError(getattr(refused, "error_type", "payment_policy_refused"), _RETURNED_STOP,
-                                          getattr(refused, "detail", None)) from None
+            raise PaymentDestinationError(getattr(refused, "error_type", "payment_policy_refused"),
+                                          _RETURNED_STOP + RETURNED_REFILL, getattr(refused, "detail", None)) from None
 
 
 def _press_only(supervisor, meta, stated) -> dict | None:

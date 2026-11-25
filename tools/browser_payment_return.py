@@ -27,10 +27,8 @@ payment's lock record (weak-keyed by that supervisor) used to end with it; the t
   what the checkout needs, as on a lock that was never returned (D-0961: no step is left to the owner). A page past
   the card step (the fill finds no card fields; :func:`press_page`: the record's merchant shows the stated total and
   a Pay-like control) gets the same card in its press-only form; the tap binds the total as a fill's would.
-- **The way out is the base one** (r9). ``returned`` and the Pay presses belong to the task (``_RETURNED``), not to
-  one lock: on a page that takes neither a fill nor a press-only card Sera calls payment_done (an order confirmation)
-  or payment_close, opens the checkout again and fills, and that card still says the payment came back and how often
-  she pressed Pay. Only payment_done's confirmation ends it; an order detected in a lock stays with that lock.
+- **Any other page**: payment_done on an order confirmation, else the base way out (``RETURNED_REFILL``). That the
+  payment came back and Sera's Pay presses belong to the task (``_RETURNED``): that fill's card still says both.
 
 The same holds when the supervisor was replaced for another reason while the lock held (the texts say so).
 """
@@ -57,19 +55,22 @@ _MAX_PARKED = 64
 # task id -> (lock record, its payments): left by a supervisor that ended, until the task's next one dials.
 # Read and written under ``surface._LOCK``.
 _PARKED: dict = {}
-# task id -> the task's latest lock record that came back after a return (its lock may have ended: payment_close),
-# until payment_done reads the order confirmation: the task's next lock starts from it (:func:`resume`). Same lock.
+# task id -> the task's latest returned lock record (its lock may have ended: payment_close), until payment_done
+# reads the order confirmation: the task's next lock starts from it (:func:`resume`). Under ``surface._LOCK``.
 _RETURNED: dict = {}
 
 _OBSERVE_TIMEOUT_S = 6.0  # the one read of the page before a fresh approval card (unread: the card says so)
-RETURNED = ("This payment came back to Hermes on a new browser connection (the owner, Danil, took the tab over and "
-            "returned it, or the connection was replaced)")
 RETURNED_NEXT = (
-    f"{RETURNED}. No approval from before counts and owner_go does not count: before any Pay press or confirm, fill "
-    "the card again with the current cart (on a page past the card step the same call asks him only to approve the "
-    "Pay press). Its approval card tells him what the page shows now and asks him to confirm he has not already paid; "
-    "his Approve covers the presses this checkout needs. If the page shows an order confirmation, call payment_done "
-    "instead; a fill this page cannot take says how to go on.")
+    "This payment came back to Hermes on a new browser connection (the owner, Danil, took the tab over and returned "
+    "it, or the connection was replaced). No approval from before counts and owner_go does not count: before any Pay "
+    "press or confirm, fill the card again with the current cart (on a page past the card step the same call asks him "
+    "only to approve the Pay press). Its approval card tells him what the page shows now and asks him to confirm he "
+    "has not already paid; his Approve covers the presses this checkout needs. If the page shows an order "
+    "confirmation, call payment_done instead; a fill this page cannot take says how to go on.")
+RETURNED_REFILL = (  # the one way out of a returned lock on a page that takes no fill and shows no order
+    "call browser_vault payment_close (it closes the payment tab and ends the lock), open the checkout again, then "
+    "fill once more: that approval card still says the payment came back and how often you pressed Pay. If this "
+    "happens a second time, stop and tell the user.")
 LOCK_MOVING = (
     "The owner has this payment's tab, or it is moving to a new browser connection of this task (he returned it, or "
     "the connection was replaced), so nothing was read, written or pressed. Retry this call: once the tab is back, "
@@ -119,17 +120,11 @@ def park(supervisor: Any) -> None:
     with done._LOCK:
         payments = done._PAYMENTS.pop(supervisor, None) or {}
     with surface._LOCK:
-        _keep(_PARKED, supervisor.task_id, (gen, payments))
+        _PARKED.pop(supervisor.task_id, None)
+        _PARKED[supervisor.task_id] = (gen, payments)
+        while len(_PARKED) > _MAX_PARKED:
+            _PARKED.pop(next(iter(_PARKED)))
     logger.info("payment lock record %d left to its task (its supervisor ended)", gen.serial)
-
-
-def _keep(table: dict, task_id: str, value: Any) -> None:
-    """``table[task_id] = value`` as its newest entry, the oldest dropped past ``_MAX_PARKED``. Must hold
-    ``surface._LOCK``."""
-    table.pop(task_id, None)
-    table[task_id] = value
-    while len(table) > _MAX_PARKED:
-        table.pop(next(iter(table)))
 
 
 def stranded(sup: Any) -> bool:
@@ -144,9 +139,8 @@ def stranded(sup: Any) -> bool:
 
 
 def came_back(task_id: str) -> str:
-    """What a stop that wrote nothing tells Sera instead of handing it on: ``RETURNED_NEXT`` when a lock record of
-    ``task_id`` came back after a return (held, not lost), ``LOCK_MOVING`` while one waits for the task's next
-    supervisor to take it back (the owner may still have the tab), else ``""``."""
+    """What a stop that wrote nothing says next: ``RETURNED_NEXT`` when a lock record of ``task_id`` came back (held,
+    not lost), ``LOCK_MOVING`` while one waits to be taken back (the owner may still have the tab), else ``""``."""
     with surface._LOCK:
         parked = _PARKED.get(task_id)
         if parked is not None:
@@ -207,7 +201,9 @@ async def take_back(sup: Any) -> bool:
     with surface._LOCK:
         gen.ws, gen.owned, gen.returned, gen.ticket = ws, owned, True, ticket
         gen.approved, gen.admitted, gen.pay_at = None, False, None
-        _keep(_RETURNED, sup.task_id, gen)
+        _RETURNED[sup.task_id] = gen
+        while len(_RETURNED) > _MAX_PARKED:
+            _RETURNED.pop(next(iter(_RETURNED)))
     sup._page_session_id = sid
     logger.warning("payment lock record %d taken back after a return (owning ids %d); its approval is void",
                    gen.serial, len(owned))
@@ -221,22 +217,18 @@ def _record(sup: Any) -> Any:
 
 
 def resume(sup: Any, rec: Any) -> None:
-    """``rec``: the lock record ``sup``'s confirmed claim just started. When the task's payment came back after a
-    return and has not reached payment_done, ``rec`` is returned too and counts on from that record's Pay presses
-    (unknown stays unknown), whether its lock still holds (a re-fill) or ended (payment_close and the checkout
-    again). An order detected in a lock is not carried past it. Must hold ``surface._LOCK``."""
+    """Must hold ``surface._LOCK``. ``rec``: the record ``sup``'s confirmed claim just started. While the task's
+    returned payment has not reached payment_done, ``rec`` is returned too and counts its Pay presses on (unknown stays
+    unknown), also after that lock ended (payment_close, the checkout again). A detected order ends with its lock."""
     old = _RETURNED.get(getattr(sup, "task_id", None))
-    if old is None or old is rec:
-        return
-    if not rec.returned:  # not this lock's re-fill, which ``_start_record`` carried
-        rec.returned, rec.known = True, rec.known and old.known
-        rec.pay_presses += old.pay_presses
-    _keep(_RETURNED, sup.task_id, rec)
+    if old is not None:
+        if not rec.returned:  # not that lock's own re-fill, which ``_start_record`` carried
+            rec.returned, rec.known, rec.pay_presses = True, rec.known and old.known, rec.pay_presses + old.pay_presses
+        _RETURNED[sup.task_id] = rec
 
 
 def settle(sup: Any) -> None:
-    """payment_done read the order confirmation: the purchase is finished, and the task's next lock starts as any
-    other."""
+    """payment_done read the order confirmation: the task's next lock starts as any other."""
     with surface._LOCK:
         _RETURNED.pop(getattr(sup, "task_id", None), None)
 
@@ -269,8 +261,7 @@ async def _wording(sup: Any) -> Optional[dict]:
 
 def observe(sup: Any) -> dict:
     """Before a card fill's approval card is built (tool thread): the card's facts of a return
-    (``PaymentPromptFacts.returned`` and ``pay_presses``), ``{}`` when ``sup`` holds no returned record and its task
-    has none from a lock that ended (``_RETURNED``).
+    (``PaymentPromptFacts.returned`` and ``pay_presses``), ``{}`` when neither ``sup`` nor its task has a returned one.
     ``returned``: the one bounded, value-free read of the payment tab's top document (two booleans leave the page):
     ``"seen"`` (order wording), ``"not_seen"``, or ``"unread"`` (failed or timed out; not read again).
     ``pay_presses``: Sera's Pay-like presses in this lock (None: unknown). For the card only."""

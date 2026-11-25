@@ -435,8 +435,8 @@ _NOT_REACHED = ("No order confirmation was reached on the payment tab within the
                 "The browser stays locked; nothing was clicked, closed or retried. Press Pay again only when the page "
                 "shows the payment failed or was declined. "
                 "url shows the site the tab is on (origin only while locked). If a bank check is waiting, ask the "
-                "user to finish it, then call payment_done again; otherwise ask the user (payment_close closes the "
-                "payment tab and ends the lock, without a confirmation snapshot).")
+                "user to finish it, then call payment_done again; otherwise ")
+_NOT_REACHED_ASK = "ask the user (payment_close closes the payment tab and ends the lock, without a confirmation snapshot)."
 _TAB_GONE = ("The payment tab is no longer open, so there is no confirmation page to read. Nothing was done. "
              "lock_released says whether browser control has unlocked the browser; check the order with the "
              "shop or the user's email.")
@@ -974,6 +974,8 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     lost = native_lost_refusal(supervisor)  # build C4: the confirmation cannot be read on this socket
     if lost:
         return lost
+    from tools.browser_payment_return import RETURNED_REFILL, report as returned, settle
+
     payment, refused = _payment_for(supervisor)
     if refused:
         return refused
@@ -1019,11 +1021,11 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     if page is None:
         # The tab is still locked: like browser-control for every agent connection, report its site only
         # (a locked page's title and path could carry what a planted script copied there).
-        return _refusal("payment_confirmation_not_reached", _NOT_REACHED, url=_shown_origin(seen.get("url", "")),
-                        title="", reason=reason, lock_released=False, **told, **_dialog_report(supervisor))
-    from tools.browser_payment_return import settle
-
-    settle(supervisor)  # D-0878: the purchase is finished: nothing of a return is carried to the task's next lock
+        way_out = RETURNED_REFILL if returned(supervisor) else _NOT_REACHED_ASK  # D-0961: not left to the owner
+        return _refusal("payment_confirmation_not_reached", _NOT_REACHED + way_out,
+                        url=_shown_origin(seen.get("url", "")), title="", reason=reason, lock_released=False, **told,
+                        **_dialog_report(supervisor))
+    settle(supervisor)  # D-0878: the purchase is finished; the task's next lock is no returned one
     context = page.pop("browser_context", None)
     raw_url = page["url"]  # the tab must open exactly this; only what is returned to the model is scrubbed
     page = _redacted_page(page)  # dlz: while the payment window is still open, before the release below

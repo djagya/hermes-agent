@@ -453,7 +453,8 @@ def _walk(flow, out, card, past=False, order=False, pressed=False):
 
 
 @pytest.mark.parametrize("state", ["card form", "Pay page", "thank-you page", "shipping step", "total changed after a press",
-                                   "discovery off", "CVC-only form", "second return while a card waits",
+                                   "discovery off", "CVC-only form", "payment_done tried on the shipping step",
+                                   "second return while a card waits",
                                    "second return while the card is read", "lock met before the take back"])
 def test_every_page_a_returned_payment_can_be_on_leads_to_a_fresh_card_or_payment_done(env, monkeypatch, state):
     """D-0961 (owner 2026-11-25: "i don't want to do amy manual work at all"), approach r8: whatever the payment tab
@@ -462,7 +463,7 @@ def test_every_page_a_returned_payment_can_be_on_leads_to_a_fresh_card_or_paymen
     press-only card is the base one (payment_close, the checkout again, fill), and its card still warns."""
     if state == "discovery off":
         monkeypatch.setattr(bvp, "destination_policy", lambda: (False, "gen", False))
-    shows = {"thank-you page": THANKS, "shipping step": SHIPPING, "discovery off": SHIPPING}.get(state)
+    shows = THANKS if state == "thank-you page" else SHIPPING if "shipping" in state or state == "discovery off" else None
     flow = _returned(env, pressed=state in ("Pay page", "shipping step"), shows=shows)
     again = lambda _i: (flow.take(), flow.give_back(), flow.act())
     past = {"card form": False, "CVC-only form": "cvc", "total changed after a press": True}.get(state, True)
@@ -473,6 +474,9 @@ def test_every_page_a_returned_payment_can_be_on_leads_to_a_fresh_card_or_paymen
         flow.ctl.page.pin = NO_TOTAL
         out, card = flow.press("JETZT KAUFEN"), None
         assert out["error_type"] == surface.TOTAL_CHANGED and len(flow.presses()) == 1, out
+    elif state == "payment_done tried on the shipping step":
+        out, card = json.loads(vault_tool._payment_done_action(flow.task, "")), None
+        assert out["error_type"] == "payment_confirmation_not_reached" and "otherwise ask the user" not in out["error"]
     elif state == "second return while a card waits":
         out, card = flow.card_fill(during=again)[0], None
         assert out["error_type"] == "payment_browser_changed", out
