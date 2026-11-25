@@ -6,6 +6,7 @@ import contextvars
 import json
 import logging
 import re
+import secrets
 import time
 
 from agent.vault_backends import BackendError
@@ -1152,6 +1153,42 @@ def _claim_and_readmit(vault, task_id: str, supervisor, inspected, lease: str) -
     return _lock_aware(_expired(), vault._is_managed()) if time.monotonic() >= inspected.expires_at else None
 
 
+def _press_only(supervisor, meta, stated) -> dict | None:
+    """D-0961: the fill found no card form, and the payment came back after a return (``browser_payment_return``).
+    When the page is past the card step (``press_page``), the approval card's press-only form: the same facts but the
+    fill, the same gateway path and window; the owner's tap binds the stated total to the lock as a fill's would.
+    None: not this case (the fill's own refusal stands)."""
+    from tools.browser_payment_return import PRESS_APPROVED, bind_press, observe, press_page
+    from tools.browser_supervisor_payment import INSPECTION_WINDOW_S
+    from tools.payment_consent_prompt import PageMatch, PaymentPromptFacts, pays_once, request_payment_approval
+
+    page = press_page(supervisor, *_cents(stated)) if stated is not None else None
+    if page is None:
+        return None
+    gen, top, merchant = page
+    expires_at = time.monotonic() + INSPECTION_WINDOW_S
+    try:
+        facts = PaymentPromptFacts(ref=secrets.token_hex(16), card_label=meta.label, merchant_origin=merchant,
+                                   receiving=(), expires_in_s=INSPECTION_WINDOW_S, cart=stated,
+                                   page_match=PageMatch("matched", "the merchant page"), press_only=True,
+                                   **observe(supervisor))
+    except Exception:  # health: allow BLE001 -- facts out of bounds: no prompt, nothing bound
+        return None
+    if not pays_once(facts):
+        return None
+    consent = request_payment_approval(facts, timeout_seconds=INSPECTION_WINDOW_S)
+    if not consent.accepted:
+        refusal = _consent_not_given(consent.verdict, consent.reason)
+        if consent.detail:
+            refusal["error"] += " " + consent.detail
+        return refusal
+    if time.monotonic() >= expires_at:
+        return _expired()
+    if not pays_once(facts) or not bind_press(supervisor, gen, *_cents(stated), top, merchant):
+        return {"success": False, "error_type": "payment_browser_changed", "error": _BROWSER_CHANGED}
+    return {"success": True, "press_only": True, "message": PRESS_APPROVED}
+
+
 def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, strict: bool = False,
                  cart=None, approve_origins=None, holder_name=None, billing_postal_code=None) -> str:
     """Native card fill after the owner's approval. ``strict`` (the unreviewed-destination feature): a managed
@@ -1225,7 +1262,14 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
             inspected = supervisor.inspect_payment(merchant_origin, bound_origins=bound, frame_origins=frame_origins,
                                                    **witness)
         except PaymentPolicyError as exc:
-            found = _discover(supervisor, vault, exc, merchant_origin, bound, frame_origins, witness)
+            try:
+                found = _discover(supervisor, vault, exc, merchant_origin, bound, frame_origins, witness)
+            except PaymentPolicyError as refused:  # D-0961: no card form at all; a returned payment past the card step
+                pressed = (_press_only(supervisor, meta, stated)
+                           if type(refused) is PaymentPolicyError and _is_coverage_refusal(exc) else None)
+                if pressed is None:
+                    raise
+                return json.dumps(pressed)
             if isinstance(found, dict):
                 return json.dumps(found)
             inspected, policy = found

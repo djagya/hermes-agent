@@ -52,6 +52,7 @@ _UNSAFE_TEXT_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u206
 APPROVE_LABEL = "Approve: fill + Pay once"
 # No total was stated: the card is fill-only, Pay needs the owner's go in chat.
 APPROVE_LABEL_FILL_ONLY = "Approve: fill only"
+APPROVE_LABEL_PRESS = "Approve: Pay once"  # D-0961: the press-only card (nothing to fill)
 DENY_LABEL = "Deny"
 # The session's chat, when it is someone else's private chat (the card went to the owner's own chat).
 GROUP_NOTICE = "Card-fill approval sent to the owner privately."
@@ -68,8 +69,7 @@ RETURNED_LINES = {
     "not_seen": "No order wording seen on the checked page.",
     "unread": "Hermes could not check the page for order wording.",
 }
-RETURNED_APPROVE = ("Approve confirms you have not already paid this purchase. Sera fills the card and presses Pay "
-                    "for {total} {currency}.")
+RETURNED_APPROVE = "Approve confirms you have not already paid this purchase. Sera {does} for {total} {currency}{note}."
 
 PAGE_MATCH_LINES = {
     "matched": "Page check: the page shows this total (text check only).",
@@ -200,6 +200,9 @@ class PaymentPromptFacts:
     # with it, Sera's Pay presses in this payment so far (None: Hermes does not know).
     returned: str = ""
     pay_presses: Optional[int] = 0
+    # D-0961: a returned payment whose page is past the card step: nothing is filled (no receiving origins), the
+    # tap covers pressing Pay for the stated total the page shows.
+    press_only: bool = False
 
     def __post_init__(self):
         if not isinstance(self.ref, str) or not _REF_RE.fullmatch(self.ref):
@@ -208,8 +211,9 @@ class PaymentPromptFacts:
         if not isinstance(self.merchant_origin, str) or not self.merchant_origin:
             raise FactsInvalid("merchant origin must be text")
         receiving = tuple(r if isinstance(r, ReceivingOrigin) else ReceivingOrigin(**r) for r in self.receiving)
-        if not receiving or len(receiving) > MAX_ORIGINS or len({r.origin for r in receiving}) != len(receiving):
-            raise FactsInvalid(f"there must be 1-{MAX_ORIGINS} distinct receiving origins")
+        if (not receiving) != (self.press_only is True) or len(receiving) > MAX_ORIGINS \
+                or len({r.origin for r in receiving}) != len(receiving):
+            raise FactsInvalid(f"there must be 1-{MAX_ORIGINS} distinct receiving origins (none: press-only)")
         object.__setattr__(self, "receiving", receiving)
         if type(self.expires_in_s) is not int or not 1 <= self.expires_in_s <= 600:
             raise FactsInvalid("expires_in_s must be 1-600 seconds")
@@ -234,6 +238,8 @@ class PaymentPromptFacts:
         if self.pay_presses is not None and not (type(self.pay_presses) is int
                                                  and 0 <= self.pay_presses <= 999):
             raise FactsInvalid("pay_presses must be None or a small count")
+        if type(self.press_only) is not bool or self.press_only and not (self.returned and page_match.state == "matched"):
+            raise FactsInvalid("a press-only card is for a returned payment whose page shows the stated total")
 
     def to_dict(self) -> dict:
         return {
@@ -249,6 +255,7 @@ class PaymentPromptFacts:
             "supplied_fields": list(self.supplied_fields),
             "returned": self.returned,
             "pay_presses": self.pay_presses,
+            "press_only": self.press_only,
         }
 
     @classmethod
@@ -257,7 +264,7 @@ class PaymentPromptFacts:
             raise FactsInvalid("payment facts must be a mapping")
         expected = {"ref", "card_label", "merchant_origin", "receiving", "expires_in_s", "cart", "page_match",
                     "unreviewed", "pay_once_on"}
-        if set(data) - {"supplied_fields", "returned", "pay_presses"} != expected:
+        if set(data) - {"supplied_fields", "returned", "pay_presses", "press_only"} != expected:
             raise FactsInvalid("payment facts have missing or unknown keys")
         return cls(**{**data, "receiving": tuple(data["receiving"] or ()),
                       "supplied_fields": tuple(data.get("supplied_fields") or ())})
@@ -324,7 +331,9 @@ def scope_line(facts: PaymentPromptFacts) -> str:
                 f"{facts.cart.total} {facts.cart.currency} clearly as the page's total, so this does not cover "
                 f"pressing Pay: {go}.")
     if facts.returned:
-        return RETURNED_APPROVE.format(total=facts.cart.total, currency=facts.cart.currency)
+        return RETURNED_APPROVE.format(
+            does="presses Pay" if facts.press_only else "fills the card and presses Pay", total=facts.cart.total,
+            currency=facts.cart.currency, note=" (the card is already entered on the page)" if facts.press_only else "")
     return (f"Approve: Sera fills the card and pays once for {facts.cart.total} {facts.cart.currency} "
             f"at {facts.merchant_origin}.")
 
@@ -360,9 +369,11 @@ def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
             who = ("Hermes does not know whether Sera already pressed Pay" if n is None else
                    f"Sera already pressed Pay {n} time{'s' if n != 1 else ''}")
             lines += [bold(who + " in this payment; check your e-mail or bank before you approve."), ""]
-    lines += [f"Card: {bold(esc(facts.card_label))}",
-              f"Merchant (top-level page): {code(facts.merchant_origin)}",
-              "Card fields go to:"]
+    if not facts.press_only:
+        lines += [f"Card: {bold(esc(facts.card_label))}"]
+    lines += [f"Merchant (top-level page): {code(facts.merchant_origin)}"]
+    if facts.receiving:
+        lines.append("Card fields go to:")
     for r in facts.receiving:
         lines.append(f"• {code(r.origin)} ({r.status}): {esc(', '.join(r.fields))}")
     if supplied := supplied_line(facts):
@@ -377,8 +388,8 @@ def _lines(facts: PaymentPromptFacts, esc, bold, code) -> list[str]:
         where = f" Checked on {esc(facts.page_match.where)}." if facts.page_match.where else ""
         lines.append(esc(PAGE_MATCH_LINES[facts.page_match.state]) + where)
     go = "a new card that covers it" if facts.returned else "your go in chat"
-    covers = ("One tap covers one fill and one purchase at this checkout (Sera presses through its steps); any other payment "
-              "needs a new approval."
+    covers = (f"One tap covers {'' if facts.press_only else 'one fill and '}one purchase at this checkout (Sera presses "
+              "through its steps); any other payment needs a new approval."
               if pays_once(facts) else
               f"One tap covers one fill only: pressing Pay needs {go}. Any other payment needs a new approval.")
     lines += ["", f"{covers} Expires in {facts.expires_in_s} s.",
@@ -405,11 +416,18 @@ def render_plain(facts: PaymentPromptFacts) -> str:
     """The same facts as plain text, for logs, hooks and the approval record (never shown as a prompt)."""
     targets = ", ".join(r.origin for r in facts.receiving)
     plain = _lines(facts, lambda s: s, lambda s: s, lambda s: s)
-    return "\n".join([f"Card fields will be sent to {targets}.", *plain])
+    return "\n".join([f"Card fields will be sent to {targets}." if targets else "No card field is filled.", *plain])
 
 
 def summary(facts: PaymentPromptFacts) -> str:
+    if facts.press_only:
+        return f"Press Pay on {facts.merchant_origin}"
     return f"Fill '{facts.card_label}' on {facts.merchant_origin}"
+
+
+def approve_label(facts: PaymentPromptFacts) -> str:
+    """The card's Approve button."""
+    return APPROVE_LABEL_PRESS if facts.press_only else APPROVE_LABEL if pays_once(facts) else APPROVE_LABEL_FILL_ONLY
 
 
 @dataclass(frozen=True)

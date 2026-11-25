@@ -24,7 +24,9 @@ payment's lock record (weak-keyed by that supervisor) used to end with it; the t
   bounded); the card says what it saw ("Order wording seen on the checked page", none seen, or not read), how often
   Sera already pressed Pay in this lock, and that Approve confirms the owner has not already paid. The read only
   advises: it never refuses a press and never spends the record. The owner's tap is the answer; after it Sera presses
-  what the checkout needs, as on a lock that was never returned (D-0961: no step is left to the owner).
+  what the checkout needs, as on a lock that was never returned (D-0961: no step is left to the owner). A page past
+  the card step (the fill finds no card fields; :func:`press_page`: the record's merchant shows the stated total and
+  a Pay-like control) gets the same card in its press-only form; the tap binds the total as a fill's would.
 
 The same holds when the supervisor was replaced for another reason while the lock held (the texts say so).
 """
@@ -57,9 +59,11 @@ RETURNED = ("This payment came back to Hermes on a new browser connection (the o
             "returned it, or the connection was replaced)")
 RETURNED_NEXT = (
     f"{RETURNED}. No approval from before counts and owner_go does not count: before any Pay press or confirm, fill "
-    "the card again with the current cart (when the page is past the card step, go back to it first). Its approval "
-    "card tells him what the page shows now and asks him to confirm he has not already paid; his Approve covers the "
-    "presses this checkout needs. If he says he already paid, call payment_done.")
+    "the card again with the current cart (on a page past the card step the same call asks him only to approve the "
+    "Pay press). Its approval card tells him what the page shows now and asks him to confirm he has not already paid; "
+    "his Approve covers the presses this checkout needs. If he says he already paid, call payment_done.")
+PRESS_APPROVED = ("The owner approved pressing Pay on this page as it is (nothing was filled: the card is already "
+                  "entered). Call payment_controls and press what the checkout needs.")
 
 
 async def _ticket(sup: Any) -> Optional[str]:
@@ -228,3 +232,44 @@ def observe(sup: Any) -> dict:
         logger.info("payment return: page not read for the approval card (%s)", type(exc).__name__)
         scan = None
     return {"returned": "unread" if scan is None else "seen" if scan["order"] else "not_seen", "pay_presses": presses}
+
+
+async def _press_page(sup: Any, cents: int, currency: str, merchant: str) -> Optional[tuple]:
+    page_sid, tree, child_sessions, listed = await surface._list_all(sup)
+    try:
+        top = await surface._top_frame(sup, page_sid)
+        pay = any(fid == top[0] and not c["disabled"] and surface._pay_press(c["role"], c["text"])
+                  for fid, _sid, _arr, controls, _loader in listed for c in controls)
+        good = pay and surface._origin_of(top[2]) == merchant and await surface.shows_total(sup, page_sid, top, cents,
+                                                                                             currency)
+        return tuple(top[:2]) if good else None
+    finally:
+        await surface._release(sup, child_sessions, listed)
+
+
+def press_page(sup: Any, cents: int, currency: str) -> Optional[tuple]:
+    """D-0961 (tool thread): the fill found no card fields. ``(record, top document, merchant)`` when ``sup``'s returned
+    record waits for its fresh approval and the payment tab's top document is on the record's merchant, shows the
+    total (the first press's own check) and an enabled Pay-like control; else None (also when the read fails)."""
+    with surface._LOCK:
+        gen = _record(sup)
+        if gen is None or gen.approved is not None or gen.native_lost or not gen.merchant:
+            return None
+        merchant = gen.merchant[2]
+    try:
+        top = surface._wait(_press_page(sup, cents, currency, merchant), sup._loop, timeout=surface._ACTION_TIMEOUT_S)
+    except Exception as exc:  # health: allow BLE001 -- unread: no press-only card (the fill's refusal stands)
+        logger.info("payment return: page past the card step not read (%s)", type(exc).__name__)
+        return None
+    return (gen, top, merchant) if top else None
+
+
+def bind_press(sup: Any, gen: Any, cents: int, currency: str, top: tuple, merchant: str) -> bool:
+    """The owner's tap on the press-only card: the total and top document bound to ``gen`` as a fill's tap binds them,
+    while ``gen`` is still ``sup``'s returned record waiting for its approval (else nothing: a second return)."""
+    with surface._LOCK:
+        if _record(sup) is not gen or gen.approved is not None or gen.native_lost \
+                or not surface._valid_checkout(top, merchant):
+            return False
+        gen.approved = (cents, currency, *top, merchant)
+        return True

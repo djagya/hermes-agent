@@ -1611,8 +1611,6 @@ async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, elemen
     pressed with the caption check only. build G2 (Codex P1-1): a Pay-like press (``pay_like``) on a top document on a
     payment provider's or card origin (the fill's frames moved there after Pay) is no bank step: it keeps the total
     check, as in the live build (where a provider's page after Pay was refused outright)."""
-    from tools.browser_supervisor_payment import _page_match, _valid_pin
-
     cents, currency, fid, loader, merchant = gate.approved
     top = await _top_frame(sup, page_sid)
     no = _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT)
@@ -1625,12 +1623,18 @@ async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, elemen
             return no, top
         if cross_site(top[2], merchant) and not (pay_like and _provider_site(sup, top[2])):
             return None, top
+    return (None, top) if await shows_total(sup, page_sid, top, cents, currency) else (no, top)
+
+
+async def shows_total(sup: Any, page_sid: str, top: tuple, cents: int, currency: str) -> bool:
+    """Top document ``top`` shows the total ``matched`` by the fill's own rule and passes the Pay check, and is still
+    the top document after the read."""
+    from tools.browser_supervisor_payment import _page_match, _valid_pin
+
     pin, page_ok = await _page_total(sup, page_sid, top[0], cents, currency)
     if (await _top_frame(sup, page_sid))[:2] != top[:2]:  # the document changed during the read
-        return no, top
-    if not page_ok or not _valid_pin(pin) or _page_match([("merchant page", pin)], cents)[0] != "matched":
-        return no, top
-    return None, top
+        return False
+    return page_ok and _valid_pin(pin) and _page_match([("merchant page", pin)], cents)[0] == "matched"
 
 
 def _bank_challenge(sup: Any, clicked: tuple, merchant: str) -> bool:
