@@ -326,8 +326,9 @@ def test_returned_card_names_earlier_press(env):
 
 def test_returned_past_card_step_gets_press_only_card_then_presses(env):
     """D-0961: after the return the page is past the card step (no card form; the total and Pay on the shop's page).
-    The fill gives the same card without the fill: declined, nothing is bound; approved, Pay is pressed. A thank-you
-    page (no Pay control, no total) and a lock that was never returned get no such card: the fill's refusal stands."""
+    The fill gives the same card without the fill: declined, nothing is bound; approved, Pay is pressed. A page with
+    no Pay-like control (the thank-you page after the owner paid), one that does not show the total, and a lock that
+    was never returned get no such card: the fill's refusal stands."""
     flow = _returned(env, pressed=True)
     out, card = flow.card_fill("decline", past=True)
     assert out["error_type"] == "payment_declined" and PRESS_ONLY in card
@@ -339,9 +340,10 @@ def test_returned_past_card_step_gets_press_only_card_then_presses(env):
     assert "Card fields go to" not in card and "Card: " not in card and "fills the card" not in card
     assert "next" not in flow.act(), "the tap bound the total"
     assert flow.press("JETZT KAUFEN")["pay_pressed"] is True and len(flow.presses()) == 2
-    for returned in (True, False):  # the owner paid himself (the thank-you page); a lock never returned
-        other = _returned(env, shows=dict(PAID)) if returned else Flow(env)
-        if not returned:
+    no_total = {"state": "not_found", "labelled": [], "stated": 0, "unclear": False}
+    for shows in ({"page": shop.THANKS, "rows": [_row("Weiter einkaufen", role="link")]}, {"pin": no_total}, None):
+        other = _returned(env, shows=shows) if shows else Flow(env)
+        if not shows:  # never returned
             other.fill()
         out, card = other.card_fill(past=True)
         assert card is None and out["error_type"] == "payment_policy_refused" and other.presses() == [], out
@@ -643,7 +645,8 @@ def test_concurrent_get_or_start_loser_park_is_adopted_on_next_payment_action(en
     monkeypatch.setattr(bs.CDPSupervisor, "start", start)
     raced = flow.act()
     loser, winner = started
-    assert raced["error_type"] == surface.LOCK_FOREIGN and flow.sup() is winner and flow.task in ret._PARKED
+    assert raced["error_type"] == surface.LOCK_FOREIGN and bs.SUPERVISOR_REGISTRY.get(flow.task) is winner
+    assert flow.task in ret._PARKED and not loser._thread.is_alive()
     listed = flow.act()
     assert listed["success"] is True and listed["returned"] is True, listed
     assert flow.sup() not in (loser, winner) and flow.ctl.native is flow.ctl.sockets[-1]
@@ -707,5 +710,5 @@ def test_the_approval_card_after_a_return(monkeypatch):
     card, facts = _card("not_seen", pay_presses=1, press_only=True, receiving=())  # D-0961: past the card step
     assert PRESS_ONLY in card and "<b>No order wording seen" in card and PRESSED % "1 time" in card
     assert "One tap covers one purchase" in card and "Card fields go to" not in card and "Card: " not in card
-    assert prompt.render_plain(facts).startswith("No card field is filled.") and "presses Pay" in prompt.summary(facts)
+    assert prompt.render_plain(facts).startswith("No card field is filled.") and prompt.summary(facts).startswith("Press Pay on")
     assert prompt.approve_label(facts) == prompt.APPROVE_LABEL_PRESS and prompt.pays_once(facts)
