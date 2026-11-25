@@ -324,9 +324,9 @@ def _start_record(supervisor: Any, gen: Any, old: Any, held_before: bool, pressi
     the owning set holds a page that is not this claim's tab or its holder (``others``). build C r4: ``merchant``
     (``_merchant_identity``) is kept with the record. D-0878: while the old lock still holds, the new record also
     keeps that the lock was returned and that an order was detected in it; that the task's payment was returned
-    outlasts the lock (``browser_payment_return.carry``)."""
+    outlasts the lock (``browser_payment_return.resume``)."""
     global _RECORD_SEQ
-    from tools.browser_payment_return import carry
+    from tools.browser_payment_return import resume
 
     with _LOCK:
         if not held_before:
@@ -351,7 +351,7 @@ def _start_record(supervisor: Any, gen: Any, old: Any, held_before: bool, pressi
                 rec.returned, rec.paid, rec.paid_by = old.returned, old.paid, old.paid_by
             replaced = old.serial if old is not None else 0
         rec.owned, rec.ws, rec.merchant = owned, ws, merchant
-        carry(supervisor, rec)
+        resume(supervisor, rec)
         _RECORD_SEQ += 1
         if rec.serial == 0:
             rec.serial = _RECORD_SEQ

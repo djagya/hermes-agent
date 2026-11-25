@@ -58,7 +58,7 @@ _MAX_PARKED = 64
 # Read and written under ``surface._LOCK``.
 _PARKED: dict = {}
 # task id -> the task's latest lock record that came back after a return (its lock may have ended: payment_close),
-# until payment_done reads the order confirmation: the task's next lock starts from it (:func:`carry`). Same lock.
+# until payment_done reads the order confirmation: the task's next lock starts from it (:func:`resume`). Same lock.
 _RETURNED: dict = {}
 
 _OBSERVE_TIMEOUT_S = 6.0  # the one read of the page before a fresh approval card (unread: the card says so)
@@ -220,7 +220,7 @@ def _record(sup: Any) -> Any:
     return gen if gen is not None and gen.returned else None
 
 
-def carry(sup: Any, rec: Any) -> None:
+def resume(sup: Any, rec: Any) -> None:
     """``rec``: the lock record ``sup``'s confirmed claim just started. When the task's payment came back after a
     return and has not reached payment_done, ``rec`` is returned too and counts on from that record's Pay presses
     (unknown stays unknown), whether its lock still holds (a re-fill) or ended (payment_close and the checkout

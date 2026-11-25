@@ -29,6 +29,7 @@ from tests.tools.test_browser_payment_native_recovery import FakeWS
 from tests.tools.test_browser_payment_surface_honesty import _row
 from tests.waiting import wait_until
 from tools import browser_payment_detect as detect
+from tools import browser_payment_done as done
 from tools import browser_payment_return as ret
 from tools import browser_payment_surface as surface
 from tools import browser_supervisor as bs
@@ -189,6 +190,9 @@ class Flow:
     def presses(self):
         return [c for c in self.ctl.calls if c[1] == "Input.dispatchMouseEvent" and c[2].get("type") == "mousePressed"]
 
+    def close(self):
+        return json.loads(vault_tool._payment_close_action(self.task))
+
     def card_fill(self, answer="accept", commit=True, cart=CART, during=None, past=False):
         """Sera fills the card (again) through the real ``fill_payment``: ``(its result, the approval card as the
         owner saw it or None)``. ``answer``: the owner's (accept, decline, cancel: no answer in time); ``during``: runs
@@ -240,6 +244,8 @@ def env(monkeypatch):
     monkeypatch.setattr(bs, "PAYMENT_RECOVERY_POLL_S", 0.05)
     monkeypatch.setattr(surface, "_SETTLE_S", 0.02)
     monkeypatch.setattr(surface, "_SETTLE_POLL_S", 0.01)
+    monkeypatch.setattr(done, "_WAIT_S", 2.0)
+    monkeypatch.setattr(done, "_POLL_S", 0.05)
     monkeypatch.setattr(vault_tool, "_is_managed", lambda: True)
     # the live config (monolith hermes/identity/config.yaml: vault.payment_destination_consent: true)
     monkeypatch.setattr(bvp, "destination_policy", lambda: (True, "gen", False))
@@ -353,8 +359,7 @@ def test_press_only_card_offered_with_discovery_on(env):
     assert "Card fields go to" not in card and "Card: " not in card and "fills the card" not in card
     assert "next" not in flow.act(), "the tap bound the total"
     assert flow.press("JETZT KAUFEN")["pay_pressed"] is True and len(flow.presses()) == 2
-    no_total = {"state": "not_found", "labelled": [], "stated": 0, "unclear": False}
-    for shows in ({"page": shop.THANKS, "rows": [_row("Weiter einkaufen", role="link")]}, {"pin": no_total}, None):
+    for shows in (THANKS, {"pin": NO_TOTAL}, None):
         other = _returned(env, shows=shows) if shows else Flow(env)
         if not shows:  # never returned
             other.fill()
@@ -394,7 +399,7 @@ def test_press_only_after_reload_before_press_gets_new_card(env):
     assert flow.card_fill(past=True)[0]["press_only"] is True
     _reload(flow)
     first = flow.press("JETZT KAUFEN")
-    assert first["error_type"] == surface.TOTAL_CHANGED and "fill the card again" in first["error"].lower(), first
+    assert first["error_type"] == surface.TOTAL_CHANGED and "payment_close" in first["error"], first
     assert len(flow.presses()) == 1
     out, card = flow.card_fill(past=True)
     assert out["press_only"] is True and PRESS_ONLY in card and PRESSED % "1 time" in card, out
@@ -403,66 +408,129 @@ def test_press_only_after_reload_before_press_gets_new_card(env):
     assert card is None and out["error_type"] == "payment_fields_unsupported", out
 
 
-_HANDS_OFF = re.compile(r"tell (the user|him|the owner)|himself|yourself|by hand|go in chat|unless danil|ask the owner",
+_HANDS_OFF = re.compile(r"tell (him|the owner)|himself|yourself|by hand|go in chat|unless danil|ask the owner",
                         re.IGNORECASE)
+PIN = {"state": "matched", "labelled": [2266], "stated": 1, "unclear": False}  # the page shows the stated total
+NO_TOTAL = {"state": "not_found", "labelled": [], "stated": 0, "unclear": False}
+SHIPPING = {"page": {"title": "Versand", "text": "Lieferadresse"}, "rows": [_row("Weiter zur Zahlung")], "pin": NO_TOTAL}
+THANKS = {"page": shop.THANKS, "rows": [_row("Weiter einkaufen", role="link")], "tree": shop.SAME_DOC}  # no card frame
 
 
-def test_no_return_answer_hands_a_step_to_the_user(env, monkeypatch):
-    """D-0961 (owner 2026-11-25: "i don't want to do amy manual work at all"): each answer Sera can get after a return
-    says what she does next, never to hand a step to the owner: a second return while a card waits (fill and
-    press-only) or while the card is read under the lock, the one call that meets the lock before the payment is taken back, a press refused because the
-    approved page reloaded, and the owner's toast after a fill-only card."""
-    answers = {}
-    flow = _returned(env)
+def _reopen(flow):
+    """After payment_close Sera's turn ends (its supervisor with it) and she opens the checkout again: the card form."""
+    bs.SUPERVISOR_REGISTRY.stop(flow.task)
+    page = flow.ctl.page
+    page.tab_open, page.tree, page.rows, page.pin = True, shop.CHECKOUT, list(shop.SUNDAY_ROWS), dict(PIN)
+    page.page.update(shop.CART)
+
+
+def _walk(flow, out, card, past=False, order=False, pressed=False):
+    """Sera carries out the step each answer names. Within three calls (``out`` is the first one's answer) she holds
+    a fresh approval card that names the return and her Pay press, or payment_done handed the order over; no answer
+    comes twice and none hands a step to the owner."""
+    seen = []
+    for call in range(3):
+        if out.get("order_evidence"):
+            return "payment_done"
+        if card is not None:
+            assert "came back to Sera" in card and (APPROVE in card or PRESS_ONLY in card), card
+            assert (PRESSED % "1 time" in card) is pressed and ("already pressed" in card) is pressed, card
+            return "card"
+        text = out.get("error") or out["next"]
+        assert text not in seen and not _HANDS_OFF.search(text) and call < 2, (call, seen, text)
+        seen.append(text)
+        if "Retry this call" in text:
+            out = flow.act()
+        elif order and "payment_done" in text:
+            out = json.loads(vault_tool._payment_done_action(flow.task, ""))
+        elif "payment_close" in text:
+            assert flow.close()["lock_released"] is True, text
+            _reopen(flow)
+            out, card = flow.card_fill("decline")  # the walk ends at the card: his answer is his
+        else:
+            assert "fill the card again" in text, (call, text)
+            out, card = flow.card_fill("decline", past=past)
+
+
+@pytest.mark.parametrize("state", ["card form", "Pay page", "thank-you page", "shipping step", "total changed after a press",
+                                   "discovery off", "CVC-only form", "second return while a card waits",
+                                   "second return while the card is read", "lock met before the take back"])
+def test_every_page_a_returned_payment_can_be_on_leads_to_a_fresh_card_or_payment_done(env, monkeypatch, state):
+    """D-0961 (owner 2026-11-25: "i don't want to do amy manual work at all"), approach r8: whatever the payment tab
+    shows after the return, and whenever a second return or a late adoption cuts in, the answers lead Sera to a
+    fresh approval card or to payment_done (``_walk``); the way out of a page that takes neither a fill nor a
+    press-only card is the base one (payment_close, the checkout again, fill), and its card still warns."""
+    if state == "discovery off":
+        monkeypatch.setattr(bvp, "destination_policy", lambda: (False, "gen", False))
+    shows = {"thank-you page": THANKS, "shipping step": SHIPPING, "discovery off": SHIPPING}.get(state)
+    flow = _returned(env, pressed=state in ("Pay page", "shipping step"), shows=shows)
     again = lambda _i: (flow.take(), flow.give_back(), flow.act())
-    out, card = flow.card_fill(during=again)
-    assert out["error_type"] == "payment_browser_changed" and card is not None, out
-    answers["fill, second return"] = out["error"]
-    out, card = flow.card_fill(past=True, during=again)
-    assert out["error_type"] == "payment_browser_changed" and PRESS_ONLY in card, out
-    answers["press-only, second return"] = out["error"]
-    real = bvp.validate_card
-    monkeypatch.setattr(bvp, "validate_card", lambda secret: (again(None), secret)[1])  # after the claim
+    past = {"card form": False, "CVC-only form": "cvc", "total changed after a press": True}.get(state, True)
+    pressed = state in ("Pay page", "shipping step", "total changed after a press")
+    if state == "total changed after a press":  # her approved press went out; the shop then shows another page
+        assert flow.card_fill(past=True)[0]["press_only"] is True
+        assert flow.press("JETZT KAUFEN")["pay_pressed"] is True
+        flow.ctl.page.pin = NO_TOTAL
+        out, card = flow.press("JETZT KAUFEN"), None
+        assert out["error_type"] == surface.TOTAL_CHANGED and len(flow.presses()) == 1, out
+    elif state == "second return while a card waits":
+        out, card = flow.card_fill(during=again)[0], None
+        assert out["error_type"] == "payment_browser_changed", out
+        past = False
+    elif state == "second return while the card is read":  # after the claim, under the lock
+        monkeypatch.setattr(bvp, "validate_card", lambda secret: (again(None), secret)[1])
+        out, card = flow.card_fill()[0], None
+        assert out["error_type"] == "payment_browser_changed" and out["returned"] is True, out
+        monkeypatch.setattr(bvp, "validate_card", lambda secret: secret)
+        past = False
+    elif state == "lock met before the take back":  # a supervisor that dialled before the record was parked
+        with surface._LOCK:
+            parked = ret._PARKED.pop(flow.task)
+        assert flow.act()["error_type"] == surface.LOCK_FOREIGN, "nothing parked yet: a foreign lock, as before"
+        with surface._LOCK:
+            ret._PARKED[flow.task] = parked
+        out, card = surface.native_lost_refusal(bs.SUPERVISOR_REGISTRY.get(flow.task)), None
+        assert out["error_type"] == surface.LOCK_FOREIGN, out
+        past = False
+    else:
+        out, card = flow.card_fill("decline", past=past)
+    assert _walk(flow, out, card, past, order=state == "thank-you page", pressed=pressed) == (
+        "payment_done" if state == "thank-you page" else "card")
+    if state == "thank-you page":
+        _reopen(flow)  # the purchase is finished: the task's next one is no returned payment
+        assert "came back" not in flow.card_fill()[1]
+
+
+def test_close_then_refill_after_return_keeps_warning_lines(env):
+    """Approach r8 Medium: Sera pressed Pay once, the owner took the tab and returned it on a page that takes no
+    fill. payment_close and the checkout again: the next card still asks him to confirm he has not already paid and
+    names her press (D-0942 a), his word in chat still does not count, and the count goes on; only payment_done's
+    confirmation ends that, and a lock that never came back starts as before."""
+    flow = _returned(env, pressed=True, shows=SHIPPING)
+    assert flow.card_fill(past=True)[1] is None
+    assert flow.close()["lock_released"] is True
+    _reopen(flow)
+    out, card = flow.card_fill(cart=None)  # a fill-only card: no total bound
+    assert out["success"] is True and "came back to Sera" in card and PRESSED % "1 time" in card, card
+    assert flow.press("JETZT KAUFEN", owner_go=True)["error_type"] == surface.GO_REQUIRED and len(flow.presses()) == 1
     out, card = flow.card_fill()
-    assert out["error_type"] == "payment_browser_changed" and out["returned"] is True, out
-    answers["card read under the lock, second return"] = out["error"]
-    monkeypatch.setattr(bvp, "validate_card", real)
-    assert flow.card_fill(past=True)[0]["press_only"] is True
-    _reload(flow)
-    out = flow.press("JETZT KAUFEN")
-    assert out["error_type"] == surface.TOTAL_CHANGED, out
-    answers["reloaded before the first press"] = out["error"]
-    out, card = flow.card_fill(past=True)
-    assert out["press_only"] is True and flow.press("JETZT KAUFEN")["pay_pressed"] is True
-    flow.ctl.page.pin = {"state": "not_found", "labelled": [], "stated": 0, "unclear": False}  # the total is gone
-    out = flow.press("JETZT KAUFEN")
-    assert out["error_type"] == surface.TOTAL_CHANGED and len(flow.presses()) == 1, out
-    answers["total gone after a press went out"] = out["error"]
-    thanks = _returned(env, shows={"page": shop.THANKS, "rows": [_row("Weiter einkaufen", role="link")]})
-    out, card = thanks.card_fill(past=True)
-    assert card is None and out["error_type"] == "payment_fields_unsupported", out
-    answers["thank-you page, no card form"] = out["error"]
-    # a supervisor that dialled before the record was parked meets the lock as another connection's
-    late = _returned(env)
-    with surface._LOCK:
-        parked = ret._PARKED.pop(late.task)
-    assert late.act()["error_type"] == surface.LOCK_FOREIGN, "nothing parked yet: a foreign lock, as before"
-    with surface._LOCK:
-        ret._PARKED[late.task] = parked
-    out = surface.native_lost_refusal(bs.SUPERVISOR_REGISTRY.get(late.task))
-    assert out["error_type"] == surface.LOCK_FOREIGN and "Retry this call" in out["error"], out
-    answers["lock met before the take back"] = out["error"]
-    assert late.act()["returned"] is True, "the retry takes the payment back"
-    toast = prompt.approved_toast(_card("seen", cart=False)[1])
-    assert toast == "Approved: Sera fills the card. Pay needs a new card that covers it.", toast
-    answers["toast, fill-only card"] = toast
-    for where, text in answers.items():
-        assert re.search(r"fill the card again|retry this call|new card", text, re.IGNORECASE), (where, text)
-        if "page" in where or "press went out" in where:
-            assert "payment_done" in text, (where, text)
-        assert not _HANDS_OFF.search(text), (where, text)
-    schema = json.dumps(vault_tool.BROWSER_VAULT_SCHEMA)
-    assert "payment is moving to a new connection, retry the call" in schema
+    assert out["success"] is True and APPROVE in card and PRESSED % "1 time" in card, card
+    listed = flow.act()
+    assert listed["returned"] is True and listed["presses_in_lock"] == 0, "this lock's own presses"
+    assert flow.press("JETZT KAUFEN")["pay_pressed"] is True and len(flow.presses()) == 2
+    assert flow.close()["lock_released"] is True  # once more, now with two presses
+    _reopen(flow)
+    flow.ctl.page.after = dict(PAID)
+    assert PRESSED % "2 times" in flow.card_fill()[1] and flow.press("JETZT KAUFEN")["payment_detected"] is True
+    assert json.loads(vault_tool._payment_done_action(flow.task, ""))["success"] is True
+    _reopen(flow)
+    out, card = flow.card_fill()
+    assert out["success"] is True and "came back" not in card and "already pressed" not in card
+    other = Flow(env)  # a payment that never came back: payment_close and a re-fill give the card as before
+    other.fill()
+    assert other.press("JETZT KAUFEN")["pay_pressed"] is True and other.close()["lock_released"] is True
+    _reopen(other)
+    assert "came back" not in other.card_fill()[1]
 
 
 @pytest.mark.parametrize("shows, tabs, line", [
@@ -815,6 +883,8 @@ def test_the_approval_card_after_a_return(monkeypatch):
     payload = facts.to_dict()
     payload.pop("returned"), payload.pop("pay_presses")  # a payload from before these fields
     assert prompt.PaymentPromptFacts.from_dict(payload) == facts
+    assert prompt.approved_toast(_card("seen", cart=False)[1]) == ("Approved: Sera fills the card. Pay needs a new "
+                                                                    "card that covers it.")
     for fill_only in (_card("seen", cart=False)[0], _card("not_seen", pay_once_on=False)[0]):
         assert "Pay needs a new card that covers it" in fill_only and "go in chat" not in fill_only
         assert "already paid this purchase" not in fill_only and "yourself" not in fill_only
