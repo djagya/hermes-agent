@@ -68,6 +68,7 @@ RETURNED_LINES = {
     "seen": "Order wording seen on the checked page.",
     "not_seen": "No order wording seen on the checked page.",
     "unread": "Hermes could not check the page for order wording.",
+    "ordered": "Sera detected an order in this payment before; check your e-mail or bank.",
 }
 RETURNED_APPROVE = "Approve confirms you have not already paid this purchase. Sera {does} for {total} {currency}{note}."
 
@@ -234,7 +235,7 @@ class PaymentPromptFacts:
             raise FactsInvalid("supplied fields must be holder_name or billing_postal_code")
         object.__setattr__(self, "supplied_fields", tuple(n for n in SUPPLIED_FIELD_NAMES if n in supplied))
         if self.returned not in ("", *RETURNED_LINES):
-            raise FactsInvalid("returned must be empty, seen, not_seen or unread")
+            raise FactsInvalid("returned must be empty, seen, not_seen, unread or ordered")
         if self.pay_presses is not None and not (type(self.pay_presses) is int
                                                  and 0 <= self.pay_presses <= 999):
             raise FactsInvalid("pay_presses must be None or a small count")

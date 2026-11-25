@@ -1404,9 +1404,8 @@ APPROVAL_CHANGED = "payment_approval_changed"
 _TOTAL_CHANGED_TEXT = (
     "Hermes could not confirm that the merchant's checkout page still shows the total the owner approved (it changed, "
     "is no longer clear, or the checkout page is not the one that was filled), so nothing was pressed and the lock "
-    "stays. Stop: do not press Pay or anything else and do not retry. If the page shows an order confirmation, call "
-    "payment_done. Otherwise the checkout needs a new approval: payment_close, open the checkout again, then fill "
-    "again with the current cart.")
+    "stays. Stop: do not press Pay or anything else, do not retry, and tell the owner (Danil) what you see. A "
+    "different total needs a new approval: payment_close, then fill again with the current cart.")
 _GO_REQUIRED_TEXT = (
     "Hermes holds no approved total for Pay in this payment lock, so nothing was pressed. Either the card was fill-only "
     "(no stated total, or the page check did not match it), Pay-once approvals are switched off "
@@ -1728,8 +1727,8 @@ class _LockGen:
     held other tabs. Read and written under ``_LOCK``."""
 
     __slots__ = ("admitted", "approved", "known", "merchant", "native_lost", "owned", "paid", "paid_by", "pay_at",
-                 "pay_base", "pay_caption", "pay_node", "pay_presses", "pay_tabs", "pressed", "presses", "returned",
-                 "serial", "ticket", "ws")
+                 "ordered", "pay_base", "pay_caption", "pay_node", "pay_presses", "pay_tabs", "pressed", "presses",
+                 "returned", "serial", "ticket", "ws")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
@@ -1771,10 +1770,12 @@ class _LockGen:
         # D-0878 (``browser_payment_return``): control's adoption ticket for this lock (memory only; None: a take of
         # the tab cannot be taken back), whether the owner had the tab and returned it during this lock (then only
         # a new approval card counts, never owner_go), and the Pay-like presses booked in this lock (carried with
-        # ``presses``, and from the task's returned payment before this lock; the card after a return names them)
+        # ``presses``, and from the task's returned payment before this lock; the card after a return names them),
+        # and whether an order was detected in an earlier lock of that returned payment (the card names it)
         self.ticket: Optional[str] = None
         self.returned = False
         self.pay_presses = 0
+        self.ordered = False
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
@@ -1872,6 +1873,11 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
     try:
         out = _with_dialog(supervisor, _run(
             supervisor, lambda deadline: _click(supervisor, spec, progress, deadline, gate), progress))
+        if out.get("error_type") == TOTAL_CHANGED and gate.gen is not None:
+            from tools.browser_payment_return import way_out
+
+            out["error"] = way_out(gate.gen, "Nothing was pressed: the page no longer shows the approved total. ") \
+                or out["error"]  # D-0961: after a return the way out is not the owner
     finally:
         with _LOCK:  # build C r2 (P2): the press itself was booked at its dispatch (_book_press)
             _PRESSING_N = max(0, _PRESSING_N - 1)

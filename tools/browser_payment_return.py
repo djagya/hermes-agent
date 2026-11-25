@@ -27,8 +27,11 @@ payment's lock record (weak-keyed by that supervisor) used to end with it; the t
   what the checkout needs, as on a lock that was never returned (D-0961: no step is left to the owner). A page past
   the card step (the fill finds no card fields; :func:`press_page`: the record's merchant shows the stated total and
   a Pay-like control) gets the same card in its press-only form; the tap binds the total as a fill's would.
-- **Any other page**: payment_done on an order confirmation, else the base way out (``RETURNED_REFILL``). That the
-  payment came back and Sera's Pay presses belong to the task (``_RETURNED``): that fill's card still says both.
+- **Any other page** (no card form, or the total gone before a press; :func:`way_out`): payment_done on an order
+  confirmation or a bank step, or first of all once Sera pressed Pay in this payment; else the base way out
+  (``RETURNED_REFILL``). That the payment came back, Sera's Pay presses and a detected order belong to the task
+  (``_RETURNED``): that fill's card still says them. Once an order was detected in it, Sera is never sent to close
+  and fill again: the base texts hold ("ask the user", "do not pay again").
 
 The same holds when the supervisor was replaced for another reason while the lock held (the texts say so).
 """
@@ -71,6 +74,9 @@ RETURNED_REFILL = (  # the one way out of a returned lock on a page that takes n
     "call browser_vault payment_close (it closes the payment tab and ends the lock), open the checkout again, then "
     "fill once more: that approval card still says the payment came back and how often you pressed Pay. If this "
     "happens a second time, stop and tell the user.")
+PAY_DONE_FIRST = ("You already pressed Pay in this payment (or Hermes cannot tell): call browser_vault payment_done "
+                  "first (it waits through a bank or 3-D Secure step and reads the order confirmation); its answer "
+                  "says how to go on.")
 RETURNED_CLOSED = ("The payment tab was closed without a confirmation. Open the checkout again and fill: its approval "
                    "card tells the owner that this payment came back and how often you pressed Pay, and he decides.")
 LOCK_MOVING = (
@@ -222,11 +228,13 @@ def _record(sup: Any) -> Any:
 def resume(sup: Any, rec: Any) -> None:
     """Must hold ``surface._LOCK``. ``rec``: the record ``sup``'s confirmed claim just started. While the task's
     returned payment has not reached payment_done, ``rec`` is returned too and counts its Pay presses on (unknown stays
-    unknown), also after that lock ended (payment_close, the checkout again). A detected order ends with its lock."""
+    unknown), also after that lock ended (payment_close, the checkout again). A detected order's refusal of Pay ends
+    with its lock; that one was detected (``ordered``) does not."""
     old = _RETURNED.get(getattr(sup, "task_id", None))
     if old is not None:
         if not rec.returned:  # not that lock's own re-fill, which ``_start_record`` carried
             rec.returned, rec.known, rec.pay_presses = True, rec.known and old.known, rec.pay_presses + old.pay_presses
+        rec.ordered = rec.ordered or old.ordered or old.paid
         _RETURNED[sup.task_id] = rec
 
 
@@ -234,6 +242,31 @@ def settle(sup: Any) -> None:
     """payment_done read the order confirmation: the task's next lock starts as any other."""
     with surface._LOCK:
         _RETURNED.pop(getattr(sup, "task_id", None), None)
+
+
+def _refills(gen: Any) -> bool:
+    """Must hold ``surface._LOCK``. ``gen`` came back after a return and no order was detected in its payment."""
+    return gen is not None and gen.returned and not (gen.paid or gen.ordered)
+
+
+def refills(sup: Any) -> bool:
+    """payment_done and payment_close after a return: ``RETURNED_REFILL`` / ``RETURNED_CLOSED`` instead of the base
+    "ask the user" / "do not pay again", unless an order was detected (then the base texts hold)."""
+    with surface._LOCK:
+        return _refills(_record(sup))
+
+
+def way_out(sup: Any, stop: str) -> str:
+    """``stop`` (what happened, nothing pressed or written) and the way on, when ``sup``'s lock came back and no order
+    was detected in its payment; else "" (the caller's base text holds). After a Pay press of Sera in this payment
+    (or when Hermes does not know): payment_done first, which waits through a bank step; else ``RETURNED_REFILL``."""
+    with surface._LOCK:
+        gen = _record(sup)
+        if not _refills(gen):
+            return ""
+        pressed = gen.pay_presses or not gen.known
+    return stop + (PAY_DONE_FIRST if pressed else "If the page shows an order confirmation or a bank or 3-D Secure "
+                                                  "step, call browser_vault payment_done. Otherwise " + RETURNED_REFILL)
 
 
 def awaits_approval(sup: Any) -> bool:
@@ -266,13 +299,16 @@ def observe(sup: Any) -> dict:
     """Before a card fill's approval card is built (tool thread): the card's facts of a return
     (``PaymentPromptFacts.returned`` and ``pay_presses``), ``{}`` when neither ``sup`` nor its task has a returned one.
     ``returned``: the one bounded, value-free read of the payment tab's top document (two booleans leave the page):
-    ``"seen"`` (order wording), ``"not_seen"``, or ``"unread"`` (failed or timed out; not read again).
+    ``"seen"`` (order wording), ``"not_seen"``, or ``"unread"`` (failed or timed out; not read again); ``"ordered"``
+    without a read once an order was detected in this payment (a fresh checkout's page would read as none).
     ``pay_presses``: Sera's Pay-like presses in this lock (None: unknown). For the card only."""
     with surface._LOCK:
         gen = _record(sup) or _RETURNED.get(getattr(sup, "task_id", None))
         if gen is None:
             return {}
         presses = gen.pay_presses if gen.known else None
+        if gen.paid or gen.ordered:
+            return {"returned": "ordered", "pay_presses": presses}
     try:
         scan = surface._wait(_wording(sup), sup._loop, timeout=_OBSERVE_TIMEOUT_S)
     except Exception as exc:  # health: allow BLE001 -- unread: the card says it could not check (the type only)
