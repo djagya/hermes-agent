@@ -43,6 +43,8 @@ INSPECTED = SimpleNamespace(page_id="TAB", merchant_origin=shop.SHOP, tree=shop.
 PAID = {"page": shop.THANKS, "rows": [_row("Weiter einkaufen", role="link"), _row("Jetzt kaufen", role="link", i=1)]}
 CART = {"items": [{"description": "16 Pakete", "quantity": 1}], "total": "22.66", "currency": "EUR"}
 APPROVE = "Approve confirms you have not already paid this purchase. Sera fills the card and presses Pay for 22.66 EUR."
+PRESS_ONLY = ("Approve confirms you have not already paid this purchase. Sera presses Pay for 22.66 EUR (the card is "
+              "already entered on the page).")
 PRESSED = "<b>Sera already pressed Pay %s in this payment; check your e-mail or bank before you approve.</b>"
 META = SimpleNamespace(id="h", kind="payment", label="Card", allowed_origins=(shop.SHOP,), origin=None,
                        payment_scope="bound", payment_frame_origins=())
@@ -92,6 +94,8 @@ class Control:
         return reply
 
     def answer(self, ws, method, params, sid):
+        if self.native is not None and self.native.closed:  # the lock's native connection ended; the lock stays
+            self.native = None
         locked = bool(self.lock)
         if method == surface.CLAIM_METHOD:
             if locked and ws is not self.native:
@@ -183,10 +187,11 @@ class Flow:
     def presses(self):
         return [c for c in self.ctl.calls if c[1] == "Input.dispatchMouseEvent" and c[2].get("type") == "mousePressed"]
 
-    def card_fill(self, answer="accept", commit=True, cart=CART, during=None):
+    def card_fill(self, answer="accept", commit=True, cart=CART, during=None, past=False):
         """Sera fills the card (again) through the real ``fill_payment``: ``(its result, the approval card as the
         owner saw it or None)``. ``answer``: the owner's (accept, decline, cancel: no answer in time); ``during``: runs
-        while the card waits; ``commit``: whether the fill itself then succeeds."""
+        while the card waits; ``commit``: whether the fill itself then succeeds; ``past``: the page has no card form
+        (past the card step)."""
         sup, cards = self.sup(), []
         inspected = SimpleNamespace(
             **vars(INSPECTED), consumed=False, owner=sup, frame_origin=STRIPE, operation_id="f" * 32,
@@ -197,6 +202,8 @@ class Flow:
         def inspect(*a, **k):
             if not sup.snapshot().active:  # as the real inspection: it reads the attached payment tab
                 raise bvp.PaymentPolicyError("Supervised browser required")
+            if past:
+                raise bvp.PaymentPolicyError("Missing, ambiguous or split payment documents")
             return inspected
 
         sup.inspect_payment, sup.payment_is_current = inspect, lambda i: True
@@ -283,7 +290,7 @@ def test_after_a_return_only_the_fresh_cards_approval_presses_and_then_what_the_
     # the fresh card (D-0942 a): what the page showed, and what his tap confirms
     scans = len([c for c in flow.ctl.calls if c[1] == "Runtime.evaluate"])
     out, card = flow.card_fill()
-    assert out["success"] is True and "order_wording_seen" not in out
+    assert out["success"] is True
     assert APPROVE in card and "<b>No order wording seen on the checked page.</b> This check only advises" in card
     assert "Sera presses through its steps" in card and "already pressed Pay" not in card
     assert "go in chat" not in card and "yourself" not in card
@@ -317,17 +324,40 @@ def test_returned_card_names_earlier_press(env):
     assert flow.press("JETZT KAUFEN", owner_go=True)["error_type"] == surface.GO_REQUIRED and len(flow.presses()) == 3
 
 
-@pytest.mark.parametrize("shows, tabs, line, seen", [
+def test_returned_past_card_step_gets_press_only_card_then_presses(env):
+    """D-0961: after the return the page is past the card step (no card form; the total and Pay on the shop's page).
+    The fill gives the same card without the fill: declined, nothing is bound; approved, Pay is pressed. A thank-you
+    page (no Pay control, no total) and a lock that was never returned get no such card: the fill's refusal stands."""
+    flow = _returned(env, pressed=True)
+    out, card = flow.card_fill("decline", past=True)
+    assert out["error_type"] == "payment_declined" and PRESS_ONLY in card
+    assert flow.press("JETZT KAUFEN")["error_type"] == surface.GO_REQUIRED and len(flow.presses()) == 1
+    out, card = flow.card_fill(past=True)
+    assert out["success"] is True and out["press_only"] is True and "payment_controls" in out["message"]
+    assert PRESS_ONLY in card and PRESSED % "1 time" in card and "<b>No order wording seen on the checked page." in card
+    assert "One tap covers one purchase at this checkout (Sera presses through its steps)" in card
+    assert "Card fields go to" not in card and "Card: " not in card and "fills the card" not in card
+    assert "next" not in flow.act(), "the tap bound the total"
+    assert flow.press("JETZT KAUFEN")["pay_pressed"] is True and len(flow.presses()) == 2
+    for returned in (True, False):  # the owner paid himself (the thank-you page); a lock never returned
+        other = _returned(env, shows=dict(PAID)) if returned else Flow(env)
+        if not returned:
+            other.fill()
+        out, card = other.card_fill(past=True)
+        assert card is None and out["error_type"] == "payment_policy_refused" and other.presses() == [], out
+
+
+@pytest.mark.parametrize("shows, tabs, line", [
     # the owner paid: thank-you and order number inline, next to the still enabled Pay button
     ({"page": {"text": shop.CART["text"] + " Vielen Dank für Ihre Bestellung! Bestellnummer 10023"}}, {},
-     "Order wording seen on the checked page.", True),
+     "Order wording seen on the checked page."),
     # the owner paid: the confirmation is in a tab he opened himself, or a noopener tab; the checkout looks untouched
-    ({}, {"DANKE": (None, shop.SHOP + "/danke")}, "No order wording seen on the checked page.", False),
+    ({}, {"DANKE": (None, shop.SHOP + "/danke")}, "No order wording seen on the checked page."),
     # nobody paid: the checkout's own service text reads as order wording
     ({"page": {"text": shop.CART["text"] + " Once your order has been placed you will receive an email."}}, {},
-     "Order wording seen on the checked page.", True),
+     "Order wording seen on the checked page."),
 ])
-def test_what_the_page_shows_after_a_return_only_changes_the_cards_line(env, shows, tabs, line, seen):
+def test_what_the_page_shows_after_a_return_only_changes_the_cards_line(env, shows, tabs, line):
     """D-0942 a: inline confirmation next to an enabled Pay, a manual or noopener confirmation tab and ordinary
     checkout service wording neither permit nor refuse a press: without the owner's tap nothing is pressed, with it
     Pay is pressed."""
@@ -336,10 +366,9 @@ def test_what_the_page_shows_after_a_return_only_changes_the_cards_line(env, sho
     assert flow.press("JETZT KAUFEN")["error_type"] == surface.GO_REQUIRED
     out, card = flow.card_fill("decline")
     assert out["error_type"] == "payment_declined" and f"<b>{line}</b>" in card and APPROVE in card
-    assert ("order_wording_seen" in out) is seen and (not seen or "Say it in chat" in out["order_wording_seen"])
     assert flow.press("JETZT KAUFEN")["error_type"] == surface.GO_REQUIRED and flow.presses() == []
     out, card = flow.card_fill()
-    assert out["success"] is True and f"<b>{line}</b>" in card and ("order_wording_seen" in out) is seen
+    assert out["success"] is True and f"<b>{line}</b>" in card
     assert flow.press("JETZT KAUFEN")["pay_pressed"] is True and len(flow.presses()) == 1
     assert {c[2]["targetId"] for c in flow.ctl.calls if c[1] == "Target.attachToTarget"} == {"TAB"}
 
@@ -476,8 +505,21 @@ def _spans(monkeypatch, ctl_of):
     return spans
 
 
-def test_any_failed_slow_or_unanswered_call_after_a_return_never_hides_a_press(env, monkeypatch):
+def _strand(flow):
+    """The task's registered supervisor dialled before the record was parked (a lost start race, a late park): it
+    found no record and serves the lock as another connection's."""
+    with surface._LOCK:
+        parked = ret._PARKED.pop(flow.task)
+    assert flow.act()["error_type"] == surface.LOCK_FOREIGN
+    with surface._LOCK:
+        ret._PARKED[flow.task] = parked
+
+
+@pytest.mark.parametrize("stranded", [False, True])
+def test_any_failed_slow_or_unanswered_call_after_a_return_never_hides_a_press(env, monkeypatch, stranded):
     """Whole input: fill, Sera's Pay press (the checkout stays), take, return, the fresh card, the owner's tap, Pay.
+    ``stranded``: the adoption is made from that payment action (the card's fill), on the supervisor that replaces
+    a registered one which dialled before the record was parked.
     Then each call of the adoption, of the card's read of the page and of the approved click, one at a time, fails,
     answers late or never answers. A fault in the adoption: the payment is lost, no card, nothing pressed. A fault in
     the read: the card says it could not check (the read is not repeated), still names Sera's earlier press, and the
@@ -495,6 +537,8 @@ def test_any_failed_slow_or_unanswered_call_after_a_return_never_hides_a_press(e
         for found in spans.values():
             found.clear()
         flow = _returned(env, pressed=True)
+        if stranded:
+            _strand(flow)
         flow.ctl.fault = fault
         out, card = flow.card_fill()
         return flow, out, card, flow.press("JETZT KAUFEN")
@@ -507,8 +551,9 @@ def test_any_failed_slow_or_unanswered_call_after_a_return_never_hides_a_press(e
     assert [flow.ctl.calls[at][1] for at in read] == ["Page.getFrameTree", "Page.createIsolatedWorld", "Runtime.evaluate"]
     dispatch = [at for at in click if flow.ctl.calls[at][1] == "Input.dispatchMouseEvent"][-2:]
     assert [flow.ctl.calls[at][2]["type"] for at in dispatch] == ["mousePressed", "mouseReleased"]
-    faults = [(at, kind) for at in (*adoption, *read, *dispatch) for kind in ("fail", "slow", "never")]
-    faults += [(at, "fail") for at in click if at not in dispatch]
+    faults = [(at, kind) for at in (*adoption, *(() if stranded else (*read, *dispatch)))
+              for kind in ("fail", "slow", "never")]
+    faults += [(at, "fail") for at in click if at not in dispatch and not stranded]
     for at, kind in faults:
         flow, out, card, first = run((at, kind))
         where = f"call {at} ({flow.ctl.calls[at][1]}) {kind}"
@@ -578,10 +623,60 @@ def test_a_stop_that_outlives_its_join_still_parks_the_record(env, monkeypatch):
         go_on.set()
 
 
-def _card(returned, cart=True, **kwargs):
+def test_concurrent_get_or_start_loser_park_is_adopted_on_next_payment_action(env, monkeypatch):
+    """Round-5 open question 3: two starts for the task at once after the return. The one that dials first takes the
+    record back; the other registers first, finds no record and serves the lock as another connection's; the first is
+    then stopped as the loser and parks the record. Sera's next payment action adopts it."""
+    flow = Flow(env)
+    flow.fill()
+    flow.take()
+    flow.give_back()
+    real_start, started = bs.CDPSupervisor.start, []
+
+    def start(self, *args, **kwargs):
+        real_start(self, *args, **kwargs)
+        started.append(self)
+        if len(started) == 1:  # the adopter; before it registers, a concurrent call starts and registers another
+            assert self in surface._HELD and flow.task not in ret._PARKED
+            bs.SUPERVISOR_REGISTRY.get_or_start(self.task_id, self.cdp_url)
+
+    monkeypatch.setattr(bs.CDPSupervisor, "start", start)
+    raced = flow.act()
+    loser, winner = started
+    assert raced["error_type"] == surface.LOCK_FOREIGN and flow.sup() is winner and flow.task in ret._PARKED
+    listed = flow.act()
+    assert listed["success"] is True and listed["returned"] is True, listed
+    assert flow.sup() not in (loser, winner) and flow.ctl.native is flow.ctl.sockets[-1]
+    assert flow.card_fill()[0]["success"] is True and flow.press("JETZT KAUFEN")["pay_pressed"] is True
+
+
+def test_park_after_registry_stop_is_adopted_on_next_payment_action(env, monkeypatch):
+    """Round-5 open question 3: the connection is replaced (a registry stop) while Sera's next call starts the
+    replacement. It dials before stop() has parked the record, finds none and serves the lock as another
+    connection's. Once the record is parked, her next payment action adopts it."""
+    flow = Flow(env)
+    first, parking, go_on = flow.fill(), threading.Event(), threading.Event()
+    real_park = first._park_payment
+    monkeypatch.setattr(first, "_park_payment", lambda: (parking.set(), go_on.wait(10), real_park()))
+    flow.ctl.lease = 2  # the connection is replaced: the old lease's dials are refused from now
+    stopper = threading.Thread(target=bs.SUPERVISOR_REGISTRY.stop, args=(flow.task,))
+    stopper.start()
+    try:
+        assert parking.wait(10) and flow.task not in ret._PARKED
+        assert flow.act()["error_type"] == surface.LOCK_FOREIGN
+    finally:
+        go_on.set()
+        stopper.join(10)
+    assert flow.task in ret._PARKED
+    listed = flow.act()
+    assert listed["success"] is True and listed["returned"] is True, listed
+    assert flow.ctl.native is flow.ctl.sockets[-1] and flow.task not in ret._PARKED
+
+
+def _card(returned, cart=True, receiving=(prompt.ReceivingOrigin(STRIPE, "reviewed", ("cc-number",)),), **kwargs):
     facts = prompt.PaymentPromptFacts(
         ref="f" * 32, card_label="Card", merchant_origin=shop.SHOP, expires_in_s=300, returned=returned,
-        receiving=(prompt.ReceivingOrigin(STRIPE, "reviewed", ("cc-number",)),),
+        receiving=receiving,
         cart=prompt.StatedCart((prompt.CartItem("16 Pakete", 1),), "22.66", "EUR") if cart else None,
         page_match=prompt.PageMatch("matched" if cart else "not_checked"), **kwargs)
     return prompt.render_html(prompt.PaymentPromptFacts.from_dict(facts.to_dict()), budget_utf16=4096), facts
@@ -604,6 +699,13 @@ def test_the_approval_card_after_a_return(monkeypatch):
     for fill_only in (_card("seen", cart=False)[0], _card("not_seen", pay_once_on=False)[0]):
         assert "Pay needs a new card that covers it" in fill_only and "go in chat" not in fill_only
         assert "already paid this purchase" not in fill_only and "yourself" not in fill_only
-    for bad in ({"returned": "paid"}, {"returned": "seen", "pay_presses": -1}, {"returned": "seen", "pay_presses": True}):
+    for bad in ({"returned": "paid"}, {"returned": "seen", "pay_presses": -1}, {"returned": "seen", "pay_presses": True},
+                {"returned": "seen", "press_only": True}, {"returned": "", "press_only": True, "receiving": ()},
+                {"returned": "seen", "press_only": True, "receiving": (), "cart": False}):
         with pytest.raises(prompt.FactsInvalid):
             _card(**bad)
+    card, facts = _card("not_seen", pay_presses=1, press_only=True, receiving=())  # D-0961: past the card step
+    assert PRESS_ONLY in card and "<b>No order wording seen" in card and PRESSED % "1 time" in card
+    assert "One tap covers one purchase" in card and "Card fields go to" not in card and "Card: " not in card
+    assert prompt.render_plain(facts).startswith("No card field is filled.") and "presses Pay" in prompt.summary(facts)
+    assert prompt.approve_label(facts) == prompt.APPROVE_LABEL_PRESS and prompt.pays_once(facts)
