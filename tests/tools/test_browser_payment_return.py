@@ -414,7 +414,7 @@ def test_no_return_answer_hands_a_step_to_the_user(env, monkeypatch):
     approved page reloaded, and the owner's toast after a fill-only card."""
     answers = {}
     flow = _returned(env)
-    again = lambda _i: (flow.take(), flow.give_back(), flow.act())  # noqa: E731
+    again = lambda _i: (flow.take(), flow.give_back(), flow.act())
     out, card = flow.card_fill(during=again)
     assert out["error_type"] == "payment_browser_changed" and card is not None, out
     answers["fill, second return"] = out["error"]
