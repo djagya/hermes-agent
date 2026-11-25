@@ -1244,12 +1244,12 @@ def fill_payment(backend, meta, task_id: str, merchant_origin: str = "", *, stri
         auto = _arm_auto(supervisor, inspected)
         prompt = inspected.prompt()
         # dlz: the owner-only payment card (tools.payment_consent_prompt): every fact or no prompt.
-        # D-0942 a: after the owner returned the payment tab, the card says what one read of the page saw
+        # D-0942 a: after a return the card says what one read of the page saw and how often Sera pressed Pay
         from tools.browser_payment_return import SEEN_NOTE, observe
 
         try:
             facts = facts_for_inspection(inspected, card_label=meta.label, cart=stated, supplied=tuple(supplied),
-                                         returned=observe(supervisor))
+                                         **observe(supervisor))
         except Exception:  # health: allow BLE001 -- facts out of bounds: no prompt, no fill
             facts = None
         seen = {"order_wording_seen": SEEN_NOTE} if facts is not None and facts.returned == "seen" else {}

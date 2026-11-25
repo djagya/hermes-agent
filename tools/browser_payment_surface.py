@@ -342,7 +342,7 @@ def _start_record(supervisor: Any, gen: Any, old: Any, held_before: bool, pressi
                      and bool(owned & old.owned))
             rec = _GENS[supervisor] = _LockGen(known=not (pressing_at_start or others or (still_held and not carry)))
             if carry:
-                rec.presses, rec.pressed = old.presses, old.pressed
+                rec.presses, rec.pressed, rec.pay_presses = old.presses, old.pressed, old.pay_presses
             if old is not None and still_held:  # D-0878: what belongs to the lock, not to the approval: it was
                 # returned, and an order was detected in it (a re-fill or a way back to the checkout never forgets it)
                 rec.returned, rec.paid, rec.paid_by = old.returned, old.paid, old.paid_by
@@ -1191,9 +1191,9 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         if refused:
             return refused
         await _same_document(sup, sid, fid, loader)
-        top, bank = None, False
+        top = None
         if gate.approved is not None:  # B1: the approved total, read before every press
-            refused, top, bank = await _pay_gate(sup, page_sid, gate, clicked, element, sid, pay_like)
+            refused, top = await _pay_gate(sup, page_sid, gate, clicked, element, sid, pay_like)
             if refused:
                 return refused
         kept = None
@@ -1207,7 +1207,7 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         refused = await _press_now(sup, deadline, (page_sid, sid, fid, loader, element, tree, child_sessions),
                                    (x2, y2, outer2), top, lambda: _book_press(
                                        sup, gate, gate.approved is not None, pay_like, progress, node=node,
-                                       caption=_caption(control["text"], sup), top=tree[0][0], base=kept, bank=bank),
+                                       caption=_caption(control["text"], sup), top=tree[0][0], base=kept),
                                    gate.approved is not None,
                                    last=(lambda: detect.last_check(sup, gate, page_sid, kept)) if pay_like else None)
         if refused:
@@ -1347,7 +1347,7 @@ def _admission_holds(sup: Any, gate: _Gate) -> bool:
 
 
 def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress: list, *, node: Any = None,
-                caption: str = "", top: Any = None, base: Optional[dict] = None, bank: bool = False) -> Optional[dict]:
+                caption: str = "", top: Any = None, base: Optional[dict] = None) -> Optional[dict]:
     """build C r2 (P2): right before mousePressed, in one step under ``_LOCK``: the admission still holds (r4 C2) and,
     for a Pay-like press, no payment was detected for this approval (build G1); then the press is booked in its lock
     record (``presses``, ``pressed``, r4 C7 ``admitted``), so a listing during the press or its settle already counts
@@ -1355,9 +1355,6 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
     frame id (``pay_at``, the in-flight guard) and, on that top document or as the first one, ``node`` ``(frame id,
     loader, backendNodeId, origin + path)`` and its redacted ``caption`` (``pay_press``: payment_done's identity
     veto); ``base``: the document and strong-wording boolean read right before the press (``pay_base``, build G2).
-    D-0942 a: on a record that came back after a return, the approval covers one Pay-like press of the checkout:
-    with one booked (``pay_at``; booked here, at dispatch, so a press whose outcome is unknown counts), a second is
-    refused unless it is a bank's step (``bank``, ``_pay_gate``).
     ``gen`` is None when this process saw no lock of this supervisor: nothing to book then."""
     with _LOCK:
         if not _admission_holds(sup, gate):
@@ -1367,10 +1364,6 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             from tools.browser_payment_detect import spent_refusal
 
             return spent_refusal(gen)
-        if pay_press and not bank and gen is not None and gen.returned and gen.pay_at is not None:
-            from tools.browser_payment_return import PRESS_USED, PRESS_USED_TEXT
-
-            return _refusal(PRESS_USED, PRESS_USED_TEXT)
         progress.extend(("checked" if checked else "go", _BOOKED))
         if gen is not None:  # the admission above proved it is still this supervisor's current record
             gen.pressed = True
@@ -1378,6 +1371,7 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             if checked:  # r4 C7: a press checked against this approval (not owner_go)
                 gen.admitted = True
             if pay_press:
+                gen.pay_presses += 1
                 gen.pay_at, gen.pay_base = (top, time.monotonic()), base
                 if (node and node[0] == top) or gen.pay_node is None:
                     gen.pay_node, gen.pay_caption = node, caption
@@ -1605,8 +1599,7 @@ async def _top_frame(sup: Any, sid: str) -> tuple:
 
 async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, element: str, sid: str,
                     pay_like: bool = False) -> tuple:
-    """B1 (owner 2026-11-13): ``(None, top, bank)`` when this press may go out (``bank``: as a bank's step, without
-    a merchant total), else ``(payment_total_changed, top, False)``.
+    """B1 (owner 2026-11-13): ``(None, top)`` when this press may go out, else ``(payment_total_changed, top)``.
     ``clicked``: the pressed control's document ``(frame id, loader, url, is the top)``.
 
     Every press: the control's own caption holds no amount but the approved total (r4 C1), and the top document is
@@ -1625,20 +1618,20 @@ async def _pay_gate(sup: Any, page_sid: str, gate: _Gate, clicked: tuple, elemen
     top = await _top_frame(sup, page_sid)
     no = _refusal(TOTAL_CHANGED, _TOTAL_CHANGED_TEXT)
     if top[0] != fid or not await _caption_holds(sup, sid, element, cents, currency):
-        return no, top, False
+        return no, top
     if top[1] == loader and gate.admitted and _bank_challenge(sup, clicked, merchant):
-        return None, top, True
+        return None, top
     if top[1] != loader:
         if not gate.admitted:
-            return no, top, False
+            return no, top
         if cross_site(top[2], merchant) and not (pay_like and _provider_site(sup, top[2])):
-            return None, top, True
+            return None, top
     pin, page_ok = await _page_total(sup, page_sid, top[0], cents, currency)
     if (await _top_frame(sup, page_sid))[:2] != top[:2]:  # the document changed during the read
-        return no, top, False
+        return no, top
     if not page_ok or not _valid_pin(pin) or _page_match([("merchant page", pin)], cents)[0] != "matched":
-        return no, top, False
-    return None, top, False
+        return no, top
+    return None, top
 
 
 def _bank_challenge(sup: Any, clicked: tuple, merchant: str) -> bool:
@@ -1722,8 +1715,8 @@ class _LockGen:
     held other tabs. Read and written under ``_LOCK``."""
 
     __slots__ = ("admitted", "approved", "known", "merchant", "native_lost", "owned", "paid", "paid_by", "pay_at",
-                 "pay_base", "pay_caption", "pay_node", "pay_tabs", "pressed", "presses", "returned", "serial",
-                 "ticket", "ws")
+                 "pay_base", "pay_caption", "pay_node", "pay_presses", "pay_tabs", "pressed", "presses", "returned",
+                 "serial", "ticket", "ws")
 
     def __init__(self, known: bool):
         self.known, self.pressed, self.presses = known, False, 0  # presses: admitted presses (a press may count twice never)
@@ -1763,10 +1756,12 @@ class _LockGen:
         self.pay_base: Optional[dict] = None
         self.pay_tabs: Optional[frozenset] = None  # G3: the tabs this approval's Pay-like presses opened
         # D-0878 (``browser_payment_return``): control's adoption ticket for this lock (memory only; None: a take of
-        # the tab cannot be taken back), and whether the owner had the tab and returned it during this lock: then
-        # only a new approval card counts (never owner_go), and it covers one Pay-like press of the checkout
+        # the tab cannot be taken back), whether the owner had the tab and returned it during this lock (then only
+        # a new approval card counts, never owner_go), and the Pay-like presses booked in this lock (carried with
+        # ``presses``; the card after a return names them)
         self.ticket: Optional[str] = None
         self.returned = False
+        self.pay_presses = 0
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)

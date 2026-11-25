@@ -13,20 +13,19 @@ payment's lock record (weak-keyed by that supervisor) used to end with it; the t
   (:func:`park`).
 - **Take back.** The task's next supervisor takes that record on its first dial (:func:`take_back`) and sends
   ``Hermes.adoptPaymentSurface {ticket}``. Control confirmed (this socket is now the lock's native connection) and
-  the payment tab attached: the record is live on this socket, marked ``returned``, with no approval. Anything else
+  the payment tab attached: the record is live on this socket, marked ``returned``, with no approval and with the
+  presses Sera made in the lock still counted. Anything else
   (no ticket, an older control, a refusal, a timeout, another reply, a failed attach): the record is lost for good
   (it stays lost on every later supervisor too), every payment action answers ``payment_native_lost`` and nothing
   is pressed.
-- **Fresh approval** (D-0922 a, D-0942 a). The record comes back without its approved total and stays ``returned``
-  until the lock ends. owner_go does not count on it: only a new card fill lets Sera press Pay. Before that fill's
+- **Fresh approval** (D-0922 a, D-0942 a, D-0961). The record comes back without its approved total and stays
+  ``returned`` until the lock ends. owner_go does not count on it: only a new card fill lets Sera press Pay, and
+  until its approval is bound she accepts no confirm dialog of the shop (:func:`awaits_approval`). Before that fill's
   approval card is built, the payment tab's top document is read once (:func:`observe`: the value-free wording scan,
-  bounded); the card says what it saw ("Order wording seen on the checked page", none seen, or not read) and that
-  Approve confirms the owner has not already paid. The read only advises: it never refuses a press and never spends
-  the record. The owner's tap is the answer.
-- **One Pay press.** An approval given on a returned record covers one Pay-like press of the checkout, booked at its
-  dispatch (``surface._book_press``): a second one is refused (``payment_press_used``) whatever the first one's
-  outcome was; only a bank's step after it (3-D Secure) still goes. On a page past the card step Sera asks the owner
-  to press Pay himself, and she accepts no confirm dialog of the shop before her one press (:func:`awaits_press`).
+  bounded); the card says what it saw ("Order wording seen on the checked page", none seen, or not read), how often
+  Sera already pressed Pay in this lock, and that Approve confirms the owner has not already paid. The read only
+  advises: it never refuses a press and never spends the record. The owner's tap is the answer; after it Sera presses
+  what the checkout needs, as on a lock that was never returned (D-0961: no step is left to the owner).
 
 The same holds when the supervisor was replaced for another reason while the lock held (the texts say so).
 """
@@ -58,18 +57,13 @@ _OBSERVE_TIMEOUT_S = 6.0  # the one read of the page before a fresh approval car
 RETURNED = ("This payment came back to Hermes on a new browser connection (the owner, Danil, took the tab over and "
             "returned it, or the connection was replaced)")
 RETURNED_NEXT = (
-    f"{RETURNED}. No approval from before counts and owner_go does not count: before any Pay press, fill the card "
-    "again with the current cart. Its approval card tells him what the page shows now and asks him to confirm he "
-    "has not already paid; his Approve covers one Pay press. When the page takes no card any more, ask him to press "
-    "Pay himself in the tab. If he says he already paid, call payment_done.")
+    f"{RETURNED}. No approval from before counts and owner_go does not count: before any Pay press or confirm, fill "
+    "the card again with the current cart (when the page is past the card step, go back to it first). Its approval "
+    "card tells him what the page shows now and asks him to confirm he has not already paid; his Approve covers the "
+    "presses this checkout needs. If he says he already paid, call payment_done.")
 SEEN_NOTE = ("The payment tab showed order wording when it came back to Hermes, and the approval card told the owner "
              "(Danil) so. Say it in chat too: the page may already show a placed order; if he paid himself, call "
              "payment_done and press nothing.")
-PRESS_USED = "payment_press_used"
-PRESS_USED_TEXT = (
-    f"{RETURNED}, and the one Pay press his fresh approval covered was already sent (whatever came of it), so "
-    "nothing was pressed. Call payment_done to read where the payment tab is. If no order shows, tell him and ask: "
-    "another Pay press needs a new approval card (fill the card again), or he presses Pay himself in the tab.")
 
 
 async def _ticket(sup: Any) -> Optional[str]:
@@ -135,9 +129,9 @@ async def take_back(sup: Any) -> bool:
     """On ``sup``'s fresh socket, before anything is attached. False: the task's parked lock record moved to ``sup``
     and could not be adopted, so it is lost (status only; ``payment_native_lost``). True: nothing was parked, or
     control made this socket the lock's native connection, the payment tab is attached (``sup._page_session_id``)
-    and control gave the next ticket (it spent the old one): the record is ``returned``, without its approval, and
-    its presses are unknown. Raises only when cancelled (the record stays with ``sup``, on another socket's claim:
-    lost unless a later supervisor's adoption is confirmed)."""
+    and control gave the next ticket (it spent the old one): the record is ``returned``, without its approval; its
+    presses stay counted (all of them were booked in it). Raises only when cancelled (the record stays with ``sup``,
+    on another socket's claim: lost unless a later supervisor's adoption is confirmed)."""
     from tools import browser_payment_done as done
     from tools.browser_supervisor import PAGE_ATTACH_TIMEOUT_S
 
@@ -170,14 +164,12 @@ async def take_back(sup: Any) -> bool:
         logger.warning("payment lock record %d not taken back (%s)", gen.serial, type(exc).__name__)
         return False
     with surface._LOCK:
-        gen.ws, gen.owned, gen.returned, gen.known, gen.ticket = ws, owned, True, False, ticket
+        gen.ws, gen.owned, gen.returned, gen.ticket = ws, owned, True, ticket
         gen.approved, gen.admitted, gen.pay_at = None, False, None
     sup._page_session_id = sid
     logger.warning("payment lock record %d taken back after a return (owning ids %d); its approval is void",
                    gen.serial, len(owned))
     return True
-
-
 
 
 def _record(sup: Any) -> Any:
@@ -186,12 +178,12 @@ def _record(sup: Any) -> Any:
     return gen if gen is not None and gen.returned else None
 
 
-def awaits_press(sup: Any) -> bool:
-    """``sup``'s lock record came back after a return and no Pay-like press under a fresh approval is booked yet
-    (a shop's confirm accepted now could place the order without one)."""
+def awaits_approval(sup: Any) -> bool:
+    """``sup``'s lock record came back after a return and no fresh approval is bound to it (a shop's confirm
+    accepted now could place the order without one)."""
     with surface._LOCK:
         gen = _record(sup)
-        return gen is not None and gen.pay_at is None
+        return gen is not None and gen.approved is None
 
 
 def report(sup: Any) -> dict:
@@ -212,16 +204,20 @@ async def _wording(sup: Any) -> Optional[dict]:
     return await scan_document(sup, sid, await surface._top_frame(sup, sid)) if sid else None
 
 
-def observe(sup: Any) -> str:
-    """Before a card fill's approval card is built (tool thread). ``""``: ``sup`` holds no returned record. Else
-    the one bounded, value-free read of the payment tab's top document (two booleans leave the page): ``"seen"``
-    (order wording), ``"not_seen"``, or ``"unread"`` (failed or timed out; not read again). For the card only."""
+def observe(sup: Any) -> dict:
+    """Before a card fill's approval card is built (tool thread): the card's facts of a return
+    (``PaymentPromptFacts.returned`` and ``pay_presses``), ``{}`` when ``sup`` holds no returned record.
+    ``returned``: the one bounded, value-free read of the payment tab's top document (two booleans leave the page):
+    ``"seen"`` (order wording), ``"not_seen"``, or ``"unread"`` (failed or timed out; not read again).
+    ``pay_presses``: Sera's Pay-like presses in this lock (None: unknown). For the card only."""
     with surface._LOCK:
-        if _record(sup) is None:
-            return ""
+        gen = _record(sup)
+        if gen is None:
+            return {}
+        presses = gen.pay_presses if gen.known else None
     try:
         scan = surface._wait(_wording(sup), sup._loop, timeout=_OBSERVE_TIMEOUT_S)
     except Exception as exc:  # health: allow BLE001 -- unread: the card says it could not check (the type only)
         logger.info("payment return: page not read for the approval card (%s)", type(exc).__name__)
         scan = None
-    return "unread" if scan is None else "seen" if scan["order"] else "not_seen"
+    return {"returned": "unread" if scan is None else "seen" if scan["order"] else "not_seen", "pay_presses": presses}

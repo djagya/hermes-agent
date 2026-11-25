@@ -902,10 +902,10 @@ _DIALOG_NOT_PAYMENT_TAB = ("That confirm does not come from the payment tab's ow
                            "tab, or an unknown source), so Hermes does not answer it. Nothing was done; ask the user.")
 _DIALOG_NOT_SHOP = ("That confirm is not on the shop's own page (e.g. a bank or payment-provider page), so Hermes "
                     "does not accept it; it can only be dismissed (accept false). Nothing was done; ask the user.")
-_DIALOG_RETURNED = ("This payment came back to Hermes after the owner (Danil) took the tab over, and no Pay press "
-                    "of yours under a fresh approval is booked since, so Hermes does not accept a confirm here: it may "
-                    "place the order. Nothing was done. Tell Danil a confirm waits on the payment tab and ask him to "
-                    "answer it himself in the tab.")
+_DIALOG_RETURNED = ("This payment came back to Hermes on a new browser connection, and no fresh approval of the owner "
+                    "(Danil) is bound since, so Hermes does not accept a confirm here: it may place the order. Nothing "
+                    "was done. Dismiss it (accept false), fill the card again for a fresh approval card, and after his "
+                    "Approve press what the checkout needs.")
 _DIALOG_FAILED = ("The dialog could not be answered (it may have closed already); it is not retried. Call "
                   "payment_controls or payment_done to see where the payment tab is.")
 
@@ -935,9 +935,9 @@ def payment_dialog(supervisor: Any, dialog_id: Any, accept: Any) -> dict:
         return _refusal("payment_dialog_not_payment_tab", _DIALOG_NOT_PAYMENT_TAB)
     if accept and not on_shop:
         return _refusal("payment_dialog_not_shop_page", _DIALOG_NOT_SHOP)
-    from tools.browser_payment_return import awaits_press
+    from tools.browser_payment_return import awaits_approval
 
-    if accept and awaits_press(supervisor):  # D-0878: a shop's confirm may place the order: her approved press first
+    if accept and awaits_approval(supervisor):  # D-0878: a shop's confirm may place the order: a fresh approval first
         return _refusal("payment_dialog_returned", _DIALOG_RETURNED)
     try:
         out = supervisor.respond_to_dialog("accept" if accept else "dismiss", dialog_id=dialog.id)
