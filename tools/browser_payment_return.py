@@ -17,29 +17,27 @@ payment's lock record (weak-keyed by that supervisor) used to end with it; the t
   (no ticket, an older control, a refusal, a timeout, another reply, a failed attach): the record is lost for good
   (it stays lost on every later supervisor too), every payment action answers ``payment_native_lost`` and nothing
   is pressed.
-- **Order check.** While a record is ``returned`` (until its next Pay-like press is booked), every Pay-like press
-  and every payment_controls listing first runs one order check (:func:`check`) on the payment tab and every shop tab
-  it opened, with the detection's own scan and judge. Three answers: an order shows (``payment_already_made``: the
-  owner paid himself; the record is spent), no order shows (the press may go on, with the check's look as its
-  baseline), or it cannot tell (a read failed or timed out, a page changed under it, or order wording that may be a
-  checkout's own text): nothing is pressed (``payment_return_unchecked``).
-- **Fresh approval** (D-0922 a). The record comes back without its approved total, and owner_go does not count on a
-  returned record: only a new card fill (a new approval card; its record stays ``returned``) lets Sera press Pay.
-  On a page past the card step Sera asks the owner to press Pay himself, and she never accepts a shop's confirm
-  dialog until her next Pay press after a fresh approval.
+- **Fresh approval** (D-0922 a, D-0942 a). The record comes back without its approved total and stays ``returned``
+  until the lock ends. owner_go does not count on it: only a new card fill lets Sera press Pay. Before that fill's
+  approval card is built, the payment tab's top document is read once (:func:`observe`: the value-free wording scan,
+  bounded); the card says what it saw ("Order wording seen on the checked page", none seen, or not read) and that
+  Approve confirms the owner has not already paid. The read only advises: it never refuses a press and never spends
+  the record. The owner's tap is the answer.
+- **One Pay press.** An approval given on a returned record covers one Pay-like press of the checkout, booked at its
+  dispatch (``surface._book_press``): a second one is refused (``payment_press_used``) whatever the first one's
+  outcome was; only a bank's step after it (3-D Secure) still goes. On a page past the card step Sera asks the owner
+  to press Pay himself, and she accepts no confirm dialog of the shop before her one press (:func:`awaits_press`).
 
 The same holds when the supervisor was replaced for another reason while the lock held (the texts say so).
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import time
 from typing import Any, Optional
 
-from tools import browser_payment_detect as detect
 from tools import browser_payment_surface as surface
 
 logger = logging.getLogger("tools.browser_payment_surface")
@@ -56,22 +54,22 @@ _MAX_PARKED = 64
 # Read and written under ``surface._LOCK``.
 _PARKED: dict = {}
 
-RETURN_UNCHECKED = "payment_return_unchecked"
+_OBSERVE_TIMEOUT_S = 6.0  # the one read of the page before a fresh approval card (unread: the card says so)
 RETURNED = ("This payment came back to Hermes on a new browser connection (the owner, Danil, took the tab over and "
             "returned it, or the connection was replaced)")
-_UNCHECKED_TEXT = (
-    f"{RETURNED}, and Hermes could not check whether an order already went through (the page did not answer in full "
-    "or in time, changed during the check, or shows order wording that may be the checkout's own text), so nothing "
-    "was pressed. Do not press Pay or Buy. Call payment_controls once more; if payment_detected is still null, tell "
-    "Danil that the check could not tell and ask him to look at the tab, the shop's e-mail and his bank. If he says "
-    "the order went through, call payment_done (it reads the confirmation itself).")
-_DETECTED_NEXT = (
-    f"{RETURNED}, and the page shows an order was placed (payment_detected): tell him, and call payment_done now. "
-    "Never press Pay or Buy here; a new purchase needs a new approval from him.")
-_CLEAR_NEXT = (
-    f"{RETURNED}; no placed order shows on it. No approval from before counts: before any Pay press, ask him for a "
-    "fresh approval of this purchase: fill the card again with the current cart (a new approval card). When the page "
-    "takes no card any more, ask him to press Pay himself in the tab (owner_go does not count after a return).")
+RETURNED_NEXT = (
+    f"{RETURNED}. No approval from before counts and owner_go does not count: before any Pay press, fill the card "
+    "again with the current cart. Its approval card tells him what the page shows now and asks him to confirm he "
+    "has not already paid; his Approve covers one Pay press. When the page takes no card any more, ask him to press "
+    "Pay himself in the tab. If he says he already paid, call payment_done.")
+SEEN_NOTE = ("The payment tab showed order wording when it came back to Hermes, and the approval card told the owner "
+             "(Danil) so. Say it in chat too: the page may already show a placed order; if he paid himself, call "
+             "payment_done and press nothing.")
+PRESS_USED = "payment_press_used"
+PRESS_USED_TEXT = (
+    f"{RETURNED}, and the one Pay press his fresh approval covered was already sent (whatever came of it), so "
+    "nothing was pressed. Call payment_done to read where the payment tab is. If no order shows, tell him and ask: "
+    "another Pay press needs a new approval card (fill the card again), or he presses Pay himself in the tab.")
 
 
 async def _ticket(sup: Any) -> Optional[str]:
@@ -180,110 +178,50 @@ async def take_back(sup: Any) -> bool:
     return True
 
 
-def _opened_tabs(infos: Any, roots: frozenset) -> list:
-    """The page targets whose opener chain leads to a payment tab (opened before or while the owner had it), with
-    their target info: ``[(target id, url)]``."""
-    pages = {t.get("targetId"): t for t in infos if isinstance(t, dict) and t.get("type") == "page"}
-    chain = set(roots)
-    while more := {tid for tid, t in pages.items() if tid not in chain and t.get("openerId") in chain}:
-        chain |= more
-    return sorted((tid, str(pages[tid].get("url") or "")) for tid in chain - roots)
 
 
-async def _look(sup: Any, gate: Any, page_sid: str) -> tuple:
-    """The one order check of a returned record: ``(found or None, mine)``; raises when it cannot tell (null).
-
-    Read: the payment tab's top document when it is a shop page (as in the detection, no other page is evidence),
-    then every shop tab whose opener chain leads to the payment tab (a confirmation the owner's payment opened in a
-    new tab). Each read must answer in full; a document replaced during the read raises. ``mine``: the top
-    document's booleans (``before_press``'s baseline for the press). A document is judged by the detection's full
-    rules; its order evidence is ``found`` only when it is sure: a strong class (a thank-you sentence, an order
-    number; on the document a look kept from a Pay-like press of this process saw, one that look did not see), or, on
-    a tab, any order wording when Sera's own Pay press opened that tab. The owner had the tab, so a new document is
-    not that press's result, and other order wording (a cart's service text reads the same as "Order confirmed")
-    raises: the owner looks, and payment_done never closes a cart as paid. A document without order wording, or
-    still showing the pressed Pay control or a purchase button, is no order (None). The top document's evidence is
-    ``strong`` for payment_done (its card-frame rule) only against such a look."""
-    from tools import browser_payment_done as done
-    from tools.browser_payment_order_evidence import judge, scan_document
-
-    gen = gate.gen
-    top = await surface._top_frame(sup, page_sid)
-    mine = {"doc": tuple(top[:2]), "strong": None}
-    if detect._shop_page(sup, gate, top[2]):
-        scan = await scan_document(sup, page_sid, top)
-        if scan is None:
-            raise surface.SurfaceRefused("order wording not read")
-        mine["strong"] = scan["strong"]
-        pay, base = surface.pay_press(sup), gen.pay_base
-        evidence, _reason, _strong = await judge(sup, page_sid, top, scan, done.checkout_like_now(sup, top, pay),
-                                                 pay, True, None, strict=True)
-        if evidence is not None:
-            if not await detect._still_the_shop(sup, gate, page_sid, top):
-                raise surface.SurfaceRefused("the page changed during the check")
-            same = base is not None and tuple(base.get("doc") or ()) == tuple(top[:2])
-            if not (scan["strong"] and (not same or base.get("strong") is False)):
-                raise surface.SurfaceRefused("order wording that may be the checkout's own")
-            return {"where": "top", "frame": top[0], "loader": top[1], "evidence": evidence,
-                    "strong": base is not None}, mine
-    roots = done.payment_tabs(sup)
-    infos = (await sup._cdp("Target.getTargets"))["result"]["targetInfos"]
-    for tab, url in _opened_tabs(infos, roots):
-        if not detect._shop_page(sup, gate, url):
-            continue
-        sid, temporary = await done._tab_session(sup, tab)
-        try:
-            found = await detect._scan_tab(sup, gate, sid, strict=True)
-        finally:
-            if temporary:
-                await sup._release_payment_sessions({"tab": sid})
-        if found and not (found["strong"] or tab in (gen.pay_tabs or ())):
-            raise surface.SurfaceRefused("order wording in a tab that may be the shop's own")
-        if found:
-            return {"where": "new_tab", "tab": tab, **found}, mine
-    return None, mine
+def _record(sup: Any) -> Any:
+    """``sup``'s current lock record when it came back after a return, else None. Must hold ``surface._LOCK``."""
+    gen = surface._GENS.get(sup) if sup in surface._HELD else None
+    return gen if gen is not None and gen.returned else None
 
 
-async def check(sup: Any, gate: Any, page_sid: str, budget: float) -> tuple:
-    """The order check of a returned record (``gate.gen``), within ``budget`` seconds: ``(refusal or None, mine)``.
-    No refusal: it was read in full and no order shows; ``mine`` is the baseline for the press (``before_press``).
-    Else the refusal for a press: ``payment_already_made`` (found now or before: the record is spent) or
-    ``payment_return_unchecked`` (a read of the check failed or timed out, or the page shows order wording Hermes
-    cannot be sure of)."""
-    gen = gate.gen
-    if gen.paid:
-        return detect.spent_refusal(gen), None
-    try:
-        found, mine = await asyncio.wait_for(_look(sup, gate, page_sid), timeout=max(0.1, budget))
-    except Exception as exc:  # health: allow BLE001 -- unread: nothing is pressed (the type only; CDP text quotes pages)
-        logger.info("payment return: order check not read (%s)", type(exc).__name__)
-        return surface._refusal(RETURN_UNCHECKED, _UNCHECKED_TEXT), None
-    if found is None:
-        return None, mine
-    if not detect._spend(sup, gate, {**found, "returned": True}, ""):
-        logger.info("payment return: order check not read (record replaced)")
-        return surface._refusal(RETURN_UNCHECKED, _UNCHECKED_TEXT), None
-    return detect.spent_refusal(gen), None
-
-
-def returned(sup: Any) -> bool:
-    """Whether ``sup``'s lock record came back after a return and no Pay-like press was booked since."""
+def awaits_press(sup: Any) -> bool:
+    """``sup``'s lock record came back after a return and no Pay-like press under a fresh approval is booked yet
+    (a shop's confirm accepted now could place the order without one)."""
     with surface._LOCK:
-        gen = surface._GENS.get(sup) if sup in surface._HELD else None
-        return gen is not None and gen.returned
+        gen = _record(sup)
+        return gen is not None and gen.pay_at is None
 
 
-async def report(sup: Any, page_sid: str) -> dict:
-    """What payment_controls adds for a returned record (nothing otherwise): ``returned``, ``payment_detected``
-    (true, false, or null when the check was not read) and what to do next."""
+def report(sup: Any) -> dict:
+    """What payment_controls adds for a returned record (nothing otherwise): ``returned``, and what to do next
+    while no fresh approval is bound."""
     with surface._LOCK:
-        gen = surface._GENS.get(sup) if sup in surface._HELD else None
-        if gen is None or not gen.returned:
+        gen = _record(sup)
+        if gen is None:
             return {}
-        gate = surface._Gate(gen.approved, gen.admitted, False, surface._EPOCHS.get(sup, 0), gen)
-    refused, _mine = await check(sup, gate, page_sid, detect._BEFORE_SCAN_S)
-    detected = None if refused and refused["error_type"] == RETURN_UNCHECKED else bool(refused)
-    out = {"returned": True, "payment_detected": detected}
-    if detected is not False or gate.approved is None:  # a fresh approval is bound: nothing more to ask for
-        out["next"] = {True: _DETECTED_NEXT, False: _CLEAR_NEXT, None: _UNCHECKED_TEXT}[detected]
-    return out
+        return {"returned": True, **({"next": RETURNED_NEXT} if gen.approved is None else {})}
+
+
+async def _wording(sup: Any) -> Optional[dict]:
+    from tools.browser_payment_order_evidence import scan_document
+
+    with sup._state_lock:
+        sid = sup._page_session_id if sup._active else None
+    return await scan_document(sup, sid, await surface._top_frame(sup, sid)) if sid else None
+
+
+def observe(sup: Any) -> str:
+    """Before a card fill's approval card is built (tool thread). ``""``: ``sup`` holds no returned record. Else
+    the one bounded, value-free read of the payment tab's top document (two booleans leave the page): ``"seen"``
+    (order wording), ``"not_seen"``, or ``"unread"`` (failed or timed out; not read again). For the card only."""
+    with surface._LOCK:
+        if _record(sup) is None:
+            return ""
+    try:
+        scan = surface._wait(_wording(sup), sup._loop, timeout=_OBSERVE_TIMEOUT_S)
+    except Exception as exc:  # health: allow BLE001 -- unread: the card says it could not check (the type only)
+        logger.info("payment return: page not read for the approval card (%s)", type(exc).__name__)
+        scan = None
+    return "unread" if scan is None else "seen" if scan["order"] else "not_seen"

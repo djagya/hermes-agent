@@ -157,22 +157,15 @@ async def _scan(sup: Any, sid: str, frame_id: str) -> Optional[dict]:
     return value
 
 
-_GONE = "No node with given id found"  # Chrome's answer to DOM.resolveNode once the node was removed and collected
-
-
-async def _pay_control_shown(sup: Any, sid: str, frame_id: str, node: int, strict: bool = False) -> bool:
+async def _pay_control_shown(sup: Any, sid: str, frame_id: str, node: int) -> bool:
     """Whether the pressed Pay element (``node``, a backendNodeId of this document) is still connected and rendered.
-    A node that no longer resolves is gone; a resolved node whose state cannot be read counts as still there.
-    ``strict`` (D-0878, the order check after a return): only Chrome's own "no node" answer means gone; any other
-    failed read raises."""
+    A node that no longer resolves is gone; a resolved node whose state cannot be read counts as still there."""
     try:
         ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": frame_id, "worldName": "hermes-payment-done"},
                               session_id=sid))["result"]["executionContextId"]
         obj = (await sup._cdp("DOM.resolveNode", {"backendNodeId": node, "executionContextId": ctx},
                               session_id=sid))["result"]["object"]["objectId"]
     except Exception as exc:  # health: allow BLE001 -- a node that does not resolve is not on the page any more
-        if strict and not (isinstance(exc, RuntimeError) and _GONE in str(exc)):
-            raise
         logger.info("payment_done: pressed Pay control not resolved (%s)", type(exc).__name__)
         return False
     try:
@@ -180,8 +173,6 @@ async def _pay_control_shown(sup: Any, sid: str, frame_id: str, node: int, stric
                                                            "returnByValue": True}, session_id=sid))["result"]
         return (reply.get("result") or {}).get("value") is not False
     except Exception as exc:  # health: allow BLE001 -- unread state of a resolved node: still there (fails closed)
-        if strict:
-            raise
         logger.info("payment_done: pressed Pay control not read (%s)", type(exc).__name__)
         return True
     finally:
@@ -206,7 +197,7 @@ async def scan_document(sup: Any, sid: str, row: tuple) -> Optional[dict]:
 
 
 async def judge(sup: Any, sid: str, row: tuple, scan: dict, checkout: bool, pay: Optional[dict],
-                need_wording: bool = False, before: Optional[dict] = None, strict: bool = False) -> tuple:
+                need_wording: bool = False, before: Optional[dict] = None) -> tuple:
     """``(evidence, reason, strong)`` for a scanned document: ``("confirmation_text" | "new_document", None, ...)`` for
     a confirmation, else ``(None, reason code, False)``; ``strong``: the evidence rests on a thank-you sentence or an
     order number. ``row``: the candidate's top frame row; ``checkout``: it is checkout-like (the caller knows the
@@ -214,12 +205,11 @@ async def judge(sup: Any, sid: str, row: tuple, scan: dict, checkout: bool, pay:
     (build G1, the payment detection after a Pay-like press): a new document needs order wording too. ``before``
     (build G2, the detection): ``{"doc": (frame id, loader), "strong": bool}`` read right before the press; on that
     very document only a strong class that was absent before the press counts (a checkout's own service text reads as
-    order wording and is there before the press); any other document keeps the full rules. ``strict``: a read that
-    fails raises (``_pay_control_shown``)."""
+    order wording and is there before the press); any other document keeps the full rules."""
     if scan["failure"]:
         return None, "failure_wording", False
     if (pay is not None and isinstance(pay.get("node"), int) and (pay.get("frame"), pay.get("loader")) == row[:2]
-            and await _pay_control_shown(sup, sid, row[0], pay["node"], strict)):
+            and await _pay_control_shown(sup, sid, row[0], pay["node"])):
         return None, "pay_control_shown", False
     same = before is not None and tuple(before.get("doc") or ()) == tuple(row[:2])
     strong = scan["strong"]

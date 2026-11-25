@@ -56,13 +56,6 @@ def spent_refusal(gen: Any) -> Optional[dict]:
     where = " in a new tab" if by.get("where") == "new_tab" else ""
     caption = by.get("caption") or "a Pay-like control"
     why = _EVIDENCE_TEXT.get(by.get("evidence"), "order evidence")
-    if by.get("returned"):  # D-0878: found by the order check after the owner returned the tab
-        return {"success": False, "error_type": SPENT,
-                "error": ("An order was detected on the payment tab when it came back to Hermes (the owner, Danil, "
-                          f"had taken it over; {why}{where}), so nothing was pressed and no approval is open. Tell "
-                          "him the order looks placed, and call payment_done: it reads the confirmation and ends "
-                          "the lock. Never press Pay or Buy here again; a new purchase needs a new approval from "
-                          "him.")}
     return {"success": False, "error_type": SPENT,
             "error": (f"A payment was detected for this approval (after the press on \"{caption}\": {why}{where}), so "
                       "nothing was pressed. Call payment_done; a new purchase needs a new approval from the owner "
@@ -156,26 +149,18 @@ async def page_tabs(sup: Any) -> Optional[frozenset]:
         return None
 
 
-async def _scan_tab(sup: Any, gate: Any, sid: str, strict: bool = False) -> Optional[dict]:
-    """A tab's order evidence, or None. ``strict`` (D-0878, the order check after a return): a document not read in
-    full, or replaced during the read, raises instead."""
+async def _scan_tab(sup: Any, gate: Any, sid: str) -> Optional[dict]:
     from tools.browser_payment_order_evidence import judge, scan_document
-    from tools.browser_payment_surface import SurfaceRefused, _top_frame
+    from tools.browser_payment_surface import _top_frame
 
     row = await _top_frame(sup, sid)
     if not _shop_page(sup, gate, row[2]):
         return None
     scan = await scan_document(sup, sid, row)
-    if scan is None and strict:
-        raise SurfaceRefused("order wording not read")
     if scan is None:
         return None
     evidence, _reason, strong = await judge(sup, sid, row, scan, False, None, True)
-    if evidence is None:
-        return None
-    if not await _still_the_shop(sup, gate, sid, row):
-        if strict:
-            raise SurfaceRefused("the tab changed during the check")
+    if evidence is None or not await _still_the_shop(sup, gate, sid, row):
         return None
     return {"evidence": evidence, "strong": strong}
 
@@ -267,10 +252,6 @@ async def before_press(sup: Any, gate: Any, page_sid: str, deadline: float) -> t
     def budget() -> float:
         return max(0.1, min(_BEFORE_SCAN_S, deadline - time.monotonic()))
 
-    if gen is not None and gen.returned:  # D-0878: the owner had the tab: one order check, read in full, whose look
-        from tools.browser_payment_return import check  # at the top document is also this press's baseline
-
-        return await check(sup, gate, page_sid, budget())
     found = mine = None
     try:
         found, mine = await asyncio.wait_for(
