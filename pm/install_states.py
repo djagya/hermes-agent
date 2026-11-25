@@ -11,8 +11,8 @@ The state dir records the checkout it belongs to in ``inputs/.project-root`` (wr
 checkout is gone: a data root shared with a container (``-v ~/.hermes:/opt/data``) or an
 unmounted volume records paths this process cannot see. So a dir is an orphan only when its
 checkout sat where this process can see that it was deleted -- under the data root that owns
-``installs/`` (scratch clones, the runtime checkout) or directly in a ``.worktrees/`` dir that
-still exists. Removal still fails closed on anything a live process could hold: the install
+``installs/`` (scratch clones, the runtime checkout) or directly in a ``.worktrees/`` or ``.claude/worktrees/`` dir
+that still exists. Removal still fails closed on anything a live process could hold: the install
 lock, or a dependency / PM runtime generation lease.
 
 A checkout elsewhere (``~/.cache/review-1/head``, a scratch clone outside the data root) can never
@@ -26,10 +26,12 @@ its state. One unused for longer is rebuilt by ``hermes pm repair`` / the next a
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import os
 import shutil
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -38,7 +40,9 @@ logger = logging.getLogger(__name__)
 def _provably_deleted(root: Path, data_root: Path) -> bool:
     if root.exists():
         return False
-    return root.is_relative_to(data_root) or (root.parent.name == ".worktrees" and root.parent.is_dir())
+    parent = root.parent
+    in_worktrees_dir = parent.name == ".worktrees" or (parent.name == "worktrees" and parent.parent.name == ".claude")
+    return root.is_relative_to(data_root) or (in_worktrees_dir and parent.is_dir())
 
 
 def _last_used(state: Path) -> float:
@@ -72,7 +76,9 @@ def _retention_seconds(data_root: Path) -> float | None:
     return days * 86400 if isinstance(days, (int, float)) and days > 0 else None
 
 
-def _is_orphan(state: Path, data_root: Path, retention: float | None) -> bool:
+def _is_orphan(state: Path, data_root: Path, retention: Callable[[], float | None]) -> bool:
+    """*retention* is read only for a root that is missing but not provably deleted, so a provable
+    deletion needs no config (the bare launcher Python has no ruamel) and a sync reads none."""
     record = state / "inputs" / ".project-root"
     if not state.is_dir() or not record.is_file():
         return False
@@ -82,8 +88,10 @@ def _is_orphan(state: Path, data_root: Path, retention: float | None) -> bool:
         return False
     if not root or Path(root).exists():
         return False
-    return _provably_deleted(Path(root), data_root) or (
-        retention is not None and time.time() - _last_used(state) > retention)
+    if _provably_deleted(Path(root), data_root):
+        return True
+    limit = retention()
+    return limit is not None and time.time() - _last_used(state) > limit
 
 
 def orphan_install_states(installs: Path) -> list[Path]:
@@ -92,7 +100,7 @@ def orphan_install_states(installs: Path) -> list[Path]:
     if not installs.is_dir():
         return []
     data_root = installs.resolve().parent
-    retention = _retention_seconds(installs.parent)
+    retention = functools.cache(lambda: _retention_seconds(installs.parent))
     return [state for state in sorted(installs.iterdir()) if _is_orphan(state, data_root, retention)]
 
 
@@ -155,7 +163,7 @@ def collect_orphan_install_states(installs: Path) -> list[Path]:
     if not installs.is_dir():
         return []
     data_root = installs.resolve().parent
-    retention = _retention_seconds(installs.parent)
+    retention = functools.cache(lambda: _retention_seconds(installs.parent))
     removed: list[Path] = []
     for state in [s for s in sorted(installs.iterdir()) if _is_orphan(s, data_root, retention)]:
         with _install_lock(state) as locked:
@@ -183,3 +191,17 @@ def collect_orphan_install_states(installs: Path) -> list[Path]:
         if not state.exists():
             removed.append(state)
     return removed
+
+
+def reclaim_orphan_install_states() -> None:
+    """Best-effort :func:`collect_orphan_install_states` of this home's ``installs/``, for
+    maintenance that must never block or fail its caller (a launch, a sync). Holds nothing
+    another process holds, so a busy state is skipped, not waited for."""
+    try:
+        from pm.environments import installs_root
+
+        reclaimed = collect_orphan_install_states(installs_root())
+        if reclaimed:
+            logger.info("Reclaimed %d dependency state dir(s) of deleted checkouts", len(reclaimed))
+    except (Exception, SystemExit):  # a config backend that is unavailable exits
+        logger.debug("Orphan install-state reclaim failed", exc_info=True)

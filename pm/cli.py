@@ -413,6 +413,9 @@ def cmd_install(args) -> int:
     # only once the venv, and on Windows ARM64 its build tools, succeeded.
     if not failed:
         _install_defaults(defaults, verify=not trust_recorded)
+        from pm.install_states import reclaim_orphan_install_states
+
+        reclaim_orphan_install_states()  # `run_tests.sh` syncs here, not via collect_superseded_generations
     if full_closure and not failed:
         from pm.environments import activation_inputs_dir, record_activation_inputs
 

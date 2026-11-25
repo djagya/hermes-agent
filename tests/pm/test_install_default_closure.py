@@ -156,3 +156,16 @@ def test_default_install_carries_the_computer_use_driver_wherever_it_builds():
         assert ("cua-driver" in defaults) == (driver.missing_reason(target) is None), target
     assert "cua-driver" not in default_packages(
         lock.names(), target="linux-x64", declined_names=frozenset({"cua-driver"}))
+
+
+def test_cmd_install_reclaims_deleted_claude_worktree_state(install_spy, tmp_path):
+    from pm.environments import installs_root
+
+    worktrees = tmp_path / "repo" / ".claude" / "worktrees"
+    worktrees.mkdir(parents=True)
+    state = installs_root() / "deadbeef"
+    (state / "inputs").mkdir(parents=True)
+    (state / "inputs" / ".project-root").write_text(str(worktrees / "removed"), encoding="utf-8")
+    (state / "environments" / "gen" / "venv").mkdir(parents=True)
+    assert pm.cli.cmd_install(argparse.Namespace(names=None, tools_only=False)) == 0
+    assert not state.exists()

@@ -169,9 +169,12 @@ def _no_real_gateway_spawn(monkeypatch):
                          (runtime_start, "start_gateway_job"),
                          (runtime_start, "start_detached_replacement"),
                          (launchd_runtime, "start_gateway_job"),
+                         # The one place the real launchctl runs: a start seam a test patches itself
+                         # (or one added later) still cannot register a job that outlives pytest.
+                         (launchd_runtime, "_launchctl"),
                          (runtime_service, "start_existing_gateway_service")):
         monkeypatch.setattr(module, name, _refuse(f"{module.__name__}.{name}"))
-    yield
+    yield attempts
     if attempts:
         pytest.fail(f"cron test tried to start a real gateway via {attempts[0]}; stub "
                     "cron.scheduler_authority.run_canonical_job (see the cron_owner fixture) "

@@ -131,7 +131,8 @@ def sync(project_root: Path | None = None, *, check: bool = False) -> dict:
 
 
 def collect_superseded_generations(project_root: Path) -> None:
-    """Collect what a publish just superseded, as the Docker boot already does.
+    """Collect what a publish just superseded, as the Docker boot already does, and the
+    dependency state of checkouts that are gone.
 
     Without this only a manual `hermes pm gc` reclaimed old environments. Safe
     right after a sync: the collectors skip leased, selected and day-young
@@ -141,8 +142,12 @@ def collect_superseded_generations(project_root: Path) -> None:
 
     from hermes_cli.runtime_state import collect_generations
     from pm.environments import install_state_dir
+    from pm.install_states import reclaim_orphan_install_states
     from pm.runtime import collect_runtime_generations
 
+    # Also the state of deleted checkouts (worktrees, scratch clones): every one carries a full
+    # environment, and a developer host that syncs often otherwise piles up tens of GB.
+    reclaim_orphan_install_states()
     try:
         removed = collect_generations(project_root) + collect_runtime_generations(
             install_state_dir(project_root) / "pm-runtime")

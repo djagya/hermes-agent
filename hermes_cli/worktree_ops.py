@@ -1120,26 +1120,14 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     trees are skipped; dead locks are unlocked first. Phases: ``_prune_candidates`` ->
     ``_classify_prune_candidates`` -> ``_reap_prune_verdicts`` -> ``_prune_orphaned_branches``.
     """
+    from pm.install_states import reclaim_orphan_install_states
+
     try:
         _prune_stale_worktree_trees(repo_root, max_age_hours)
     finally:
-        _reclaim_orphan_install_states()
-
-
-def _reclaim_orphan_install_states() -> None:
-    """Trees removed by any path (the prune pass, `git worktree remove` by hand, `rm -rf` of a
-    scratch clone) leave their ~200 MB dependency state under <home>/installs/; reclaim it on
-    every pass, including the early returns where no tree is old enough to prune. Startup
-    maintenance must never block a launch; the traceback goes to the debug log."""
-    try:
-        from pm.environments import installs_root
-        from pm.install_states import collect_orphan_install_states
-
-        reclaimed = collect_orphan_install_states(installs_root())
-        if reclaimed:
-            logger.info("Reclaimed %d dependency state dir(s) of deleted checkouts", len(reclaimed))
-    except Exception:
-        logger.debug("Orphan install-state reclaim failed", exc_info=True)
+        # Trees removed by any path (this pass, `git worktree remove` by hand, `rm -rf` of a
+        # scratch clone) leave their dependency state: reclaim it on every pass.
+        reclaim_orphan_install_states()
 
 
 def _prune_stale_worktree_trees(repo_root: str, max_age_hours: int) -> None:
