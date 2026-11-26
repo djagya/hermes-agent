@@ -21,6 +21,7 @@ from tests.agent import fake_op
 from tools import browser_vault_account as account
 from tools import browser_vault_signup as signup
 from tools import browser_vault_tool as vault
+from tools.registry import registry
 
 ORIGIN = "https://shop.example"
 HANDLE = "op:vault-h:abc"
@@ -33,7 +34,8 @@ GENERATED = "Gen-pw_9f3kQ7zL-20x!"  # what the fake 1Password generated and read
 def new_password_field(**changes):
     return dict({"autocomplete": "new-password", "formIndex": 0, "index": 1, "name": "password", "label": "New password",
                  "type": "password", "pageUrl": ORIGIN + "/reset-password?token=t", "rendered": True,
-                 "formAction": ORIGIN + "/reset-password"}, **changes)
+                 "formAction": ORIGIN + "/reset-password",
+                 "formText": "Reset your password New password Confirm password Save"}, **changes)
 
 
 CONFIRM = new_password_field(index=2, name="confirm-password", label="Confirm password")
@@ -87,7 +89,8 @@ def page(monkeypatch):
 
 
 def call(action, **args):
-    return json.loads(vault._handle_vault({"action": action, **args}, task_id="t1"))
+    """The tool as the agent calls it: registry dispatch of browser_vault."""
+    return json.loads(registry.dispatch("browser_vault", {"action": action, **args}, task_id="t1"))
 
 
 def saved_password(page):
@@ -189,6 +192,16 @@ def test_symbols_false_after_an_uncertain_reset_generates_a_new_password(page):
     assert page.backend.generate_login.call_args.kwargs["symbols"] is False
 
 
+def test_symbols_false_again_fills_the_saved_password_that_already_has_none(page):
+    """r3 Low 5: only a pending password WITH symbols is replaced when the call asks for none."""
+    working = vault._eval_js_secret.side_effect
+    vault._eval_js_secret.side_effect = RuntimeError("cdp closed")
+    call("reset_password", handle=HANDLE, symbols=False)
+    vault._eval_js_secret.side_effect = working
+    assert call("reset_password", handle=HANDLE, symbols=False)["success"] is True
+    assert page.backend.generate_login.call_count == 1
+
+
 def test_a_reset_that_was_filled_does_not_pin_the_next_one_to_the_old_password(page):
     assert call("reset_password", handle=HANDLE)["success"] is True
     assert call("reset_password", handle=HANDLE)["success"] is True
@@ -218,9 +231,9 @@ def test_reset_refuses_before_saving(page):
      new_password_field(index=2, pageUrl=ORIGIN + "/register", formAction=ORIGIN + "/register",
                         name="confirm-password", label="Confirm password")],
     [new_password_field(name="registrationPassword", label="Password")],
-    [new_password_field(pageUrl=ORIGIN + "/welcome", formAction=ORIGIN + "/welcome", context="Create your account")],
+    [new_password_field(pageUrl=ORIGIN + "/welcome", formAction=ORIGIN + "/welcome", formText="Create your account")],
     [new_password_field(pageUrl=ORIGIN + "/register?next=/reset", formAction=ORIGIN + "/register",
-                        context="Reset your password")],
+                        formText="Reset your password")],
 ], ids=["register-route", "registration-field", "form-text", "register-route-beats-reset-words"])
 def test_a_registration_page_is_not_a_reset_and_nothing_is_saved(page, controls):
     """Opus A1: autocomplete=new-password alone must not turn a sign-up form into a no-approval reset."""
@@ -231,19 +244,61 @@ def test_a_registration_page_is_not_a_reset_and_nothing_is_saved(page, controls)
     vault._eval_js_secret.assert_not_called()
 
 
-@pytest.mark.parametrize("footer", ["Don't have an account? Sign up", "Not a member? Join now"])
-def test_a_reset_page_offering_sign_up_in_its_form_text_is_still_a_reset(page, footer):
-    """r2 MEDIUM: the reset route outweighs registration words found only in the form's text."""
-    page.state.controls = [new_password_field(pageUrl=ORIGIN + "/password/reset?token=abc",
-                                              formAction=ORIGIN + "/password/reset", name="pw",
-                                              context="Reset your password New password Save " + footer)]
+def _form(path, action="", label="Password", text="", form=True):
+    """One password field as the inspection reports it: ``text`` is its form text (links and plain buttons already
+    left out by the inspection; None = oversized or unreadable)."""
+    return [new_password_field(pageUrl=ORIGIN + path, formAction=ORIGIN + action if action else "", label=label,
+                               name="password", formText=text, formIndex=0 if form else None)]
+
+
+# The approach review's probes and the r3 review's signup forms: each one filled a sign-up form with no approval on
+# 5a12e6985c (or refused the last two real reset pages).
+_SIGNUP_FORMS = {
+    "modal-forgot": _form("/?modal=forgot-password", text="Create your account Email Password Sign up Already have "
+                          "an account?", form=False),
+    "hash-forgot": _form("/#/forgot", text="Sign up Email Password Create account", form=False),
+    "return_to": _form("/users/new?return_to=/password/reset", "/users", text="Sign up Email Password"),
+    "preset": _form("/welcome?plan=preset", text="Create your account Password", form=False),
+    "create-a-password-unreadable": _form("/", label="Create a password", text=None, form=False),
+    "get-started": _form("/get-started", label="Choose a password", text="Get started Email Choose a password "
+                         "Continue"),
+    "start-free-trial": _form("/start", label="Set your password", text="Start your free trial Work email Set your "
+                              "password Continue"),
+    "hostile-reset-path": _form("/reset", text="Create your account Name Email Password Sign up"),
+    "root-posting-to-reset": _form("/", "/api/reset", text="Join us today Email Password Join"),
+    "older-inspection": [{k: v for k, v in _form("/password/reset?token=abc")[0].items() if k != "formText"}],
+}
+
+
+@pytest.mark.parametrize("case", list(_SIGNUP_FORMS))
+def test_a_signup_form_dressed_as_a_reset_is_refused_through_the_tool_and_nothing_is_saved_or_written(page, case):
+    page.state.controls = _SIGNUP_FORMS[case]
+    out = call("reset_password", identifier="jane@x.test")
+    assert out["success"] is False and out["reason"] in ("registration_page", "form_text_unreadable")
+    assert out["error_type"] == ("registration_page" if out["reason"] == "registration_page"
+                                 else "reset_target_unsupported")
+    page.backend.generate_login.assert_not_called()
+    vault._eval_js_secret.assert_not_called()
+
+
+@pytest.mark.parametrize("controls", [
+    _form("/password/reset?token=abc", "/password/reset", label="New password",
+          text="Reset your password New password Save Don't have an account?"),
+    _form("/", label="New password", text="Choose a new password New password Save Don't have an account?",
+          form=False),
+    _form("/users/password/edit?reset_password_token=abc", "/users/password", label="New password",
+          text="Change your password New password Change my password"),
+], ids=["reset-with-sign-up-link", "spa-root-new-password-with-sign-up-link", "devise"])
+def test_a_reset_page_whose_sign_up_offer_is_a_link_is_filled(page, controls):
+    """r2 MEDIUM: "Don't have an account? Sign up" is a link, which the inspection leaves out of the form text."""
+    page.state.controls = controls
     out = call("reset_password", handle=HANDLE)
     assert out["success"] is True and page.backend.generate_login.call_count == 1
 
 
 def test_a_new_password_form_without_reset_evidence_is_not_filled(page):
     page.state.controls = [new_password_field(pageUrl=ORIGIN + "/account/security", formAction=ORIGIN + "/account/x",
-                                              label="Password", name="pw")]
+                                              label="Password", name="pw", formText="Password Save")]
     out = call("reset_password", identifier="jane@x.test")
     assert (out["error_type"], out["reason"]) == ("reset_target_unsupported", "no_reset_evidence")
     page.backend.generate_login.assert_not_called()

@@ -29,6 +29,7 @@ from tools import browser_vault_signup as signup
 _PASSWORD_LENGTH = 20
 # (handle, origin) of passwords 1Password generated and saved that the page has not confirmed holding: a retry
 # fills the saved one instead of generating another (the site may already have taken the first). In memory, bounded.
+# The value: whether that password has symbols (symbols=false then makes a new one only when it does).
 _PENDING: dict[tuple[str, str], bool] = {}
 
 
@@ -72,6 +73,17 @@ def _login_meta(backend: Any, handle: str) -> tuple[Any, Optional[str]]:
     return meta, None
 
 
+_RESET_REFUSALS = {  # reset_page_refusal's reason: (error_type, text)
+    "registration_page": ("registration_page", "This is a registration (sign-up) page, not a password reset. A sign-up "
+                          "password is filled with fill purpose=signup, which asks the user."),
+    "form_text_unreadable": ("reset_target_unsupported", "This page's form could not be read whole (too long or "
+                             "unreadable), so it cannot be told apart from a sign-up form. A sign-up form takes fill "
+                             "purpose=signup (it asks the user); otherwise ask the user once."),
+    "no_reset_evidence": ("reset_target_unsupported", "Nothing on this page (its address, the field's label or the "
+                          "form's text) says it chooses a new password. Open the emailed reset link."),
+}
+
+
 def _reset_page(handle: str, tid: str, identifier: str) -> tuple[Optional[tuple], Optional[str]]:
     """``((backend, origin, nonce, bind, target, classified), None)`` once the page is a choose-a-new-password page
     this call may write, else ``(None, refusal)``. Nothing is saved or written yet."""
@@ -107,14 +119,9 @@ def _reset_page(handle: str, tid: str, identifier: str) -> tuple[Optional[tuple]
     target, refusal = signup.targets("reset", raw_controls)
     if refusal:
         return None, refusal
-    if (why := reset_page_refusal(target)) == "registration_page":
-        return None, _refuse("registration_page", "This is a registration (sign-up) page, not a password reset. A "
-                             "sign-up password is filled with fill purpose=signup, which asks the user. Nothing "
-                             "was saved or written.")
-    if why:
-        return None, _refuse("reset_target_unsupported", "Nothing on this page (its address or the field's label) "
-                             "says it chooses a new password. Open the emailed reset link. Nothing was saved or "
-                             "written.", reason=why)
+    if why := reset_page_refusal(target):
+        error_type, text = _RESET_REFUSALS[why]
+        return None, _refuse(error_type, text + " Nothing was saved or written.", reason=why)
     return (backend, origin, nonce, bind, target, classified), None
 
 
@@ -126,7 +133,7 @@ def reset_password(handle: str, task_id: Optional[str], *, identifier: str = "",
         return refusal
     backend, origin, nonce, bind, target, classified = page
     key = (handle, origin)
-    if handle and not rotate and symbols and key in _PENDING:  # symbols=false: the site refused the saved one
+    if handle and not rotate and key in _PENDING and (symbols or not _PENDING[key]):  # else the site refused symbols
         saved = handle  # an earlier call saved a password the page may not hold: fill that one again
     else:
         saved, refusal = _generate(backend, handle, origin, identifier.strip(), label.strip(),
@@ -135,7 +142,7 @@ def reset_password(handle: str, task_id: Optional[str], *, identifier: str = "",
         if refusal:
             return refusal
         _PENDING.pop(key, None)
-        _PENDING[(saved, origin)] = True
+        _PENDING[(saved, origin)] = symbols
         while len(_PENDING) > 32:
             _PENDING.pop(next(iter(_PENDING)))
     out = _fill_saved(backend, saved, origin, tid, nonce, bind, target, classified, created=not handle)
