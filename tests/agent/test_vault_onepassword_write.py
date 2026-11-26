@@ -157,6 +157,25 @@ def test_totp_is_added_once_and_a_key_hermes_did_not_write_is_never_overwritten(
         assert [c["argv"][1] for c in fake.calls()[before:]] == ["get"]
 
 
+@pytest.mark.parametrize("stored_query, new_query, nothing_to_do", [
+    ("algorithm=SHA256&digits=8&period=60", "", False),  # the page now reissues the same seed with default settings
+    ("", "algorithm=SHA256&digits=8&period=60", False),
+    ("", "period=60", False),
+    ("digits=8", "", False),
+    ("algorithm=sha256", "algorithm=SHA1", False),
+    ("algorithm=SHA1&digits=6&period=30", "", True),  # explicit defaults mean the same as none
+    ("period=60&digits=8", "digits=8&period=60&algorithm=SHA1", True),
+])
+def test_the_same_key_with_other_settings_is_replaced_not_skipped(op, stored_query, new_query, nothing_to_do):
+    backend, fake = op
+    uri = lambda query: f"otpauth://totp/Shop:jane?secret={KEY}" + (f"&{query}" if query else "")  # noqa: E731
+    fake.use(with_fields({"id": "h", "label": "Hermes authenticator", "type": "OTP", "value": uri(stored_query)}))
+    before = len(fake.calls())
+    assert backend.add_totp(HANDLE, uri(new_query)) is (not nothing_to_do)
+    assert [c["argv"][1] for c in fake.calls()[before:]] == (["get"] if nothing_to_do else ["get", "edit"])
+    assert otp_fields(fake.item()) == [("Hermes authenticator", uri(stored_query if nothing_to_do else new_query))]
+
+
 def test_an_unconfirmed_key_hermes_wrote_is_replaced_and_kept_as_previous_in_the_same_call(op):
     backend, fake = op
     old = f"otpauth://totp/Shop:jane?secret={OLD_KEY}"

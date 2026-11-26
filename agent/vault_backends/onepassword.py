@@ -414,7 +414,8 @@ class OnePasswordLoginBackend(LoginBackend):
     def add_totp(self, handle: str, seed: str) -> bool:
         """Store ``seed`` (an otpauth:// URI or a base32 key) in the item's "Hermes authenticator" one-time-password
         field with one ``op item edit`` field assignment: op changes that field only, so a passkey, files and every
-        other field stay as they are. False when the item already holds this key (nothing written). A key in any
+        other field stay as they are. False when the item already holds this key with the same algorithm, digits and
+        period (nothing written; the same key with other settings is replaced like a new one). A key in any
         other one-time-password field is never touched (:class:`TotpAlreadySet`); a different key in Hermes's own
         field (an enrolment the site may never have confirmed) is replaced, and in the same call kept in a concealed
         "Hermes previous authenticator key <hash>" field (its own label per old key, so a later replace keeps it
@@ -423,8 +424,9 @@ class OnePasswordLoginBackend(LoginBackend):
         where = ["--vault", vault_id] if vault_id else []
         fields = [f for f in self._revealed(item_id, vault_id).get("fields") or [] if isinstance(f, dict)]
         held = [f for f in fields if str(f.get("type") or "").upper() == "OTP" and str(f.get("value") or "").strip()]
-        if any(totp_key(str(f["value"])) == totp_key(seed) for f in held):
-            return False
+        if any(totp_key(str(f["value"])) == totp_key(seed) and _totp_settings(str(f["value"])) == _totp_settings(seed)
+               for f in held):
+            return False  # the same key with the same settings: nothing to do (other settings are replaced below)
         mine = [f for f in held if _is_hermes_field(f)]
         if len(mine) != len(held):
             raise TotpAlreadySet(self.display_name)
@@ -500,6 +502,21 @@ def totp_key(value: str) -> str:
         except ValueError:  # a malformed candidate is no key; the parser's message may quote it, so say nothing
             return ""
     return "".join(value.split()).replace("-", "").rstrip("=").upper()
+
+
+def _totp_settings(value: str) -> tuple[str, str, str]:
+    """The algorithm, digits and period an authenticator key (an otpauth:// URI or a bare key) means, with the
+    defaults (SHA1, 6, 30) for what it does not say."""
+    from urllib.parse import parse_qs, urlsplit
+
+    query: dict = {}
+    if value.strip().lower().startswith("otpauth://"):
+        try:
+            query = parse_qs(urlsplit(value.strip()).query)
+        except ValueError:
+            pass
+    pick = lambda name, default: ((query.get(name) or [""])[0].strip() or default)  # noqa: E731
+    return pick("algorithm", "SHA1").upper(), pick("digits", "6"), pick("period", "30")
 
 
 def _login_password(item: object, backend: str) -> str:
