@@ -18,7 +18,6 @@ from agent.vault_backends.base import (
     BackendError,
     BackendNetwork,
     BackendRateLimited,
-    BackendTimeout,
     ItemNotFound,
     LoginBackend,
     UnlockRequired,
@@ -27,7 +26,7 @@ from agent.vault_backends.base import (
 )
 
 __all__ = [
-    "BackendAuthExpired", "BackendError", "BackendNetwork", "BackendRateLimited", "BackendTimeout",
+    "BackendAuthExpired", "BackendError", "BackendNetwork", "BackendRateLimited",
     "ItemNotFound",
     "LoginBackend", "UnlockRequired", "backend_for_handle", "enabled_backends",
 ]

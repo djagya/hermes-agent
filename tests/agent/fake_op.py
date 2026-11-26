@@ -46,7 +46,7 @@ def save(code=0, out=None, err=None):
     if code == 0 and argv[:2] in (["item", "edit"], ["item", "create"]) and os.path.exists(late):
         if open(late).read() == "hang":  # applied, then the call never returns
             time.sleep(20)
-        code, out, err = 1, None, "[ERROR] Get https://x.1password.com: dial tcp 1.2.3.4:443: i/o timeout"
+        code, out, err = 1, None, "[ERROR] Post https://x.1password.com: read tcp 10.0.0.2:51234->1.2.3.4:443: read: connection reset by peer"
     if out is not None:
         print(out)
     if err is not None:

@@ -28,7 +28,6 @@ from agent.vault_backends.base import (
     BackendError,
     BackendNetwork,
     BackendRateLimited,
-    BackendTimeout,
     ItemNotFound,
     LoginBackend,
     UnlockRequired,
@@ -58,7 +57,7 @@ _AUTH_MARKERS = ("unauthorized", "invalid token", "token expired", "expired toke
 _SESSION_MARKERS = ("session", "sign in", "not signed in")
 _NETWORK_MARKERS = ("dial tcp", "no such host", "connection refused", "connection reset", "network is unreachable",
                     "i/o timeout", "timed out", "timeout", "tls handshake", "could not connect", "eof",
-                    "temporary failure in name resolution")
+                    "temporary failure in name resolution", "deadline exceeded")
 
 
 def clear_list_cache() -> None:
@@ -140,7 +139,7 @@ class OnePasswordLoginBackend(LoginBackend):
             failure = str(exc)
         if proc is None:
             if "timed out" in failure:
-                raise BackendTimeout(self.display_name, f"op timed out after {_TIMEOUT:.0f}s")
+                raise BackendNetwork(self.display_name, f"op timed out after {_TIMEOUT:.0f}s")
             raise RuntimeError(failure)
         if proc.returncode != 0:
             err = _scrub(proc.stderr or "")
@@ -473,7 +472,7 @@ def _op_would_match(field: Any) -> bool:
     """``op item edit 'Hermes authenticator[otp]=...'`` (no section) takes any field in any section whose label
     equals the name ignoring spaces, or whose id is that name. Case: op's rule is not checked here, so any case
     counts (a field too many is refused, never overwritten)."""
-    squash = lambda text: str(text or "").replace(" ", "").casefold()  # noqa: E731
+    squash = lambda text: str(text or "").replace(" ", "").casefold()
     return isinstance(field, dict) and (squash(field.get("label")) == squash(_TOTP_LABEL)
                                         or field.get("id") == _TOTP_LABEL)
 

@@ -12,7 +12,7 @@ import json
 import pytest
 
 from agent.vault_backends import onepassword
-from agent.vault_backends.base import BackendError, BackendTimeout
+from agent.vault_backends.base import BackendError, BackendNetwork
 from agent.vault_backends.onepassword import (
     OnePasswordLoginBackend, TotpAlreadySet, TotpFieldConflict, clear_list_cache, totp_key,
 )
@@ -131,7 +131,7 @@ def test_a_timed_out_write_leaves_the_key_in_no_exception_of_the_chain_nor_the_l
     monkeypatch.setattr(onepassword, "_TIMEOUT", 1.0)
     with pytest.raises(Exception) as failed:
         backend.add_totp(HANDLE, KEY_URI)
-    assert getattr(failed.value, "error_type", "") == "vault_network" and isinstance(failed.value, BackendTimeout)
+    assert getattr(failed.value, "error_type", "") == "vault_network"
     for exc in _chain(failed.value):
         text = repr(exc) + str(exc) + repr(exc.args) + repr({k: v for k, v in vars(exc).items()})
         assert KEY not in text and OLD_KEY not in text, type(exc)
@@ -240,15 +240,13 @@ def test_a_write_op_applied_but_failed_to_answer_does_not_leave_the_old_listing_
     backend, fake = op
     assert [m.id for m in backend.list_items()] == [HANDLE]  # the listing is cached now
     fake.flag("late", late)
-    expected = BackendTimeout if late == "hang" else onepassword.BackendNetwork
-    with pytest.raises(expected) as failed:
+    with pytest.raises(BackendNetwork):
         if write == "create":
             backend.generate_login("", origin="https://new.example", username="jane")
         elif write == "edit":
             backend.generate_login(HANDLE, origin="https://shop.example")
         else:
             backend.add_totp(HANDLE, KEY_URI)
-    assert isinstance(failed.value, BackendTimeout) == (late == "hang")
     if write == "create":  # the fake op applied the create: a fresh backend must see it
         fresh = OnePasswordLoginBackend({"enabled": True, "binary_path": str(fake.exe)})
         fresh._service_token = "service-token"
@@ -259,6 +257,17 @@ def test_a_write_op_applied_but_failed_to_answer_does_not_leave_the_old_listing_
         assert sum(1 for c in fake.calls() if c["argv"][:2] == ["item", "list"]) == before + 1
 
 
-def test_the_timeout_advice_does_not_say_retry_in_a_minute():
-    text = BackendTimeout("1Password", "").message()
-    assert "Retry once in a minute" not in text and "action=list" in text and "may have been applied" in text
+def test_a_read_that_times_out_keeps_the_retry_then_tell_danil_advice(op, monkeypatch):
+    """r7 middle review M1: a read (bank login fill, card fill) that times out wrote nothing, so its advice must
+    not say a write may have been applied; it keeps the bounded "retry once, then tell Danil"."""
+    backend, _fake = op
+
+    def timed_out(*_a, **_k):
+        raise RuntimeError("op timed out")
+
+    monkeypatch.setattr(onepassword, "run_cli", timed_out)
+    onepassword.clear_list_cache()
+    with pytest.raises(BackendNetwork) as failed:
+        backend.list_items()
+    text = failed.value.message()
+    assert "tell Danil" in text and "may have been applied" not in text

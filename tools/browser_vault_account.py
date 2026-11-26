@@ -241,8 +241,9 @@ def _generate(backend: Any, handle: str, origin: str, identifier: str, label: st
     except BackendNetwork as exc:  # a timeout or a lost connection: the write may have been applied
         return "", _refuse(exc.error_type, f"{backend.display_name}: {_UNFINISHED} The new password MAY have been "
                            f"saved. {not_filled}", saved="unknown",
-                           next="Call browser_vault action=list and look for a login for this site before saving "
-                                "another one: if there is one, call reset_password with that handle (it fills that "
+                           next="Call browser_vault action=list and look for a login for this site whose username "
+                                "is this account's (or the handle you passed) before saving another one: if there "
+                                "is one, call reset_password with that handle (it fills that "
                                 "item's saved password if one is pending, else generates one); if there is none, "
                                 "call reset_password again without a handle.")
     except BackendError as exc:
