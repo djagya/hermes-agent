@@ -515,7 +515,7 @@ def _totp_settings(value: str) -> tuple[str, str, str]:
             query = parse_qs(urlsplit(value.strip()).query)
         except ValueError:
             pass
-    pick = lambda name, default: ((query.get(name) or [""])[0].strip() or default)  # noqa: E731
+    pick = lambda name, default: ((query.get(name) or [""])[0].strip() or default)
     return pick("algorithm", "SHA1").upper(), pick("digits", "6"), pick("period", "30")
 
 

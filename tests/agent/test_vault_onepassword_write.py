@@ -168,7 +168,7 @@ def test_totp_is_added_once_and_a_key_hermes_did_not_write_is_never_overwritten(
 ])
 def test_the_same_key_with_other_settings_is_replaced_not_skipped(op, stored_query, new_query, nothing_to_do):
     backend, fake = op
-    uri = lambda query: f"otpauth://totp/Shop:jane?secret={KEY}" + (f"&{query}" if query else "")  # noqa: E731
+    uri = lambda query: f"otpauth://totp/Shop:jane?secret={KEY}" + (f"&{query}" if query else "")
     fake.use(with_fields({"id": "h", "label": "Hermes authenticator", "type": "OTP", "value": uri(stored_query)}))
     before = len(fake.calls())
     assert backend.add_totp(HANDLE, uri(new_query)) is (not nothing_to_do)

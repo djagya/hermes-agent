@@ -301,7 +301,7 @@ def test_real_chromium_inspection_gives_the_same_form_text_and_decision():
                               "--window-size=1280,800", "--dump-dom", "file://" + path],
                              capture_output=True, text=True, timeout=180, check=False)
     assert run.returncode == 0, run.stderr[-2000:]
-    out = re.search(r'<pre id="out">(.*?)</pre>', run.stdout, re.S)
+    out = re.search(r'<pre id="out">(.*?)</pre>', run.stdout, re.DOTALL)
     assert out, run.stdout[-2000:]
     rows = _split(pages, json.loads(html.unescape(out.group(1))))
     mismatched = [(p, [r.get("formText") for r in rows[p] if r["type"] == "password"], expected_form_text(p))
