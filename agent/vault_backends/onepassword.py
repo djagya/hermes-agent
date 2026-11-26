@@ -14,8 +14,8 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -124,22 +124,28 @@ class OnePasswordLoginBackend(LoginBackend):
         if not _unlock.store_session_token(self.name, token, generation):
             raise RuntimeError("1Password was locked while unlocking; try again")
 
-    def _run(self, *args: str, secret: str = "") -> str:
-        """op's stdout; a failure raises its typed cause with op's stderr (``secret``, the value a write sent, cut
-        out of it before it is kept)."""
+    def _run(self, *args: str, secret: tuple[str, ...] = ()) -> str:
+        """op's stdout; a failure raises its typed cause with op's stderr (each ``secret``, a value a write sent in
+        argv, cut out of it in any case before it is kept). The raised error is made after the failed call's own
+        exception is gone, so nothing reachable from it (``__context__``, ``__cause__``) holds the argv."""
         token = None if self._service_token else _unlock.get_session_token(self.name)
         if not self._service_token and not token:
             raise UnlockRequired(self)
+        proc, failure = None, ""
         try:
             proc = run_cli([str(self._op()), *args], env=self._env(token), timeout=_TIMEOUT, label="op",
                            timeout_message="op timed out", stdin=subprocess.DEVNULL)
-        except RuntimeError as exc:
-            if "timed out" in str(exc):
-                raise BackendNetwork(self.display_name, f"op timed out after {_TIMEOUT:.0f}s") from None
-            raise
+        except RuntimeError as exc:  # its cause (TimeoutExpired) carries the argv: keep only the message
+            failure = str(exc)
+        if proc is None:
+            if "timed out" in failure:
+                raise BackendNetwork(self.display_name, f"op timed out after {_TIMEOUT:.0f}s")
+            raise RuntimeError(failure)
         if proc.returncode != 0:
             err = _scrub(proc.stderr or "")
-            raise self._classify(err.replace(secret, "[REDACTED]") if secret else err)
+            for value in filter(None, secret):
+                err = re.sub(re.escape(value), "[REDACTED]", err, flags=re.IGNORECASE)
+            raise self._classify(err)
         return proc.stdout or ""
 
     def _classify(self, err: str) -> Exception:
@@ -402,39 +408,29 @@ class OnePasswordLoginBackend(LoginBackend):
         return f"{self.prefix}{vault_id}:{item_id}"
 
     def add_totp(self, handle: str, seed: str) -> bool:
-        """Store ``seed`` (an otpauth:// URI or a base32 key) in the item's one-time-password field. False when the
-        item already holds this key (nothing written). Another key held in a field Hermes did not write is never
-        overwritten (:class:`TotpAlreadySet`); one Hermes wrote earlier (an enrolment the site may never have
-        confirmed) is replaced and kept in a concealed "previous" field. An item that may hold a passkey is
-        refused: an op JSON template replaces the whole item, passkey included."""
+        """Store ``seed`` (an otpauth:// URI or a base32 key) in the item's "Hermes authenticator" one-time-password
+        field with one ``op item edit`` field assignment: op changes that field only, so a passkey, files and every
+        other field stay as they are. False when the item already holds this key (nothing written). A key in any
+        other one-time-password field is never touched (:class:`TotpAlreadySet`); a different key in Hermes's own
+        field (an enrolment the site may never have confirmed) is replaced, and in the same call kept in the
+        concealed "Hermes previous authenticator key" field. The key is in op's argv for that one call only."""
         vault_id, item_id = self._resolve_handle(handle)
-        item = self._revealed(item_id, vault_id)
-        if _may_hold_passkey(item):
-            raise PasskeyItem(self.display_name)
-        fields = item.setdefault("fields", [])
-        otp = [f for f in fields if isinstance(f, dict) and f.get("type") == "OTP"]
-        held = [f for f in otp if str(f.get("value") or "").strip()]
-        mine = next((f for f in held if f.get("id") == _TOTP_FIELD_ID), None)
+        where = ["--vault", vault_id] if vault_id else []
+        held = [f for f in self._revealed(item_id, vault_id).get("fields") or [] if isinstance(f, dict)
+                and str(f.get("type") or "").upper() == "OTP" and str(f.get("value") or "").strip()]
         if any(totp_key(str(f["value"])) == totp_key(seed) for f in held):
             return False
-        if held and mine is None:
+        mine = [f for f in held if _is_hermes_field(f)]
+        if len(mine) != len(held):
             raise TotpAlreadySet(self.display_name)
-        if mine is not None:
-            fields.append({"id": "TOTP_prev_" + hashlib.sha256(str(mine["value"]).encode()).hexdigest()[:8],
-                           "type": "CONCEALED", "label": "previous authenticator key (unconfirmed)",
-                           "value": mine["value"]})
-            mine["value"] = seed
-        else:
-            empty = next(iter(otp), None)  # an empty one-time-password field takes the key before a second is added
-            if empty is not None:
-                empty["value"] = seed
-            else:
-                fields.append({"id": _TOTP_FIELD_ID, "type": "OTP", "label": "one-time password", "value": seed})
-        self._write(["item", "edit", item_id, *(["--vault", vault_id] if vault_id else [])], item, seed)
+        old = str(mine[0]["value"]) if mine else ""
+        assign = [f"{_TOTP_LABEL}[otp]={seed}"] + ([f"{_PREVIOUS_LABEL}[password]={old}"] if old else [])
+        self._run("item", "edit", item_id, *where, *assign, secret=(seed, totp_key(seed), old))
+        self.invalidate_listing()
         return True
 
     def _revealed(self, item_id: str, vault_id: Optional[str]) -> dict:
-        """The whole item, values included: an edit template replaces the item, so every field goes back as read."""
+        """The item with its field values (read only: no write sends it back)."""
         raw = self._run("item", "get", item_id, *(["--vault", vault_id] if vault_id else []), "--format", "json",
                         "--reveal")
         try:
@@ -445,42 +441,16 @@ class OnePasswordLoginBackend(LoginBackend):
             raise BackendError(self.display_name, "op item get returned no JSON item")
         return item
 
-    def _write(self, args: list[str], item: dict, secret: str) -> None:
-        """Run ``op <args> --template <file>``: the item JSON (with ``secret``) sits in a mode-600 file inside a
-        private temp dir (tmpfs under /dev/shm when it exists, so a SIGKILL leftover is gone at reboot; it stays
-        until then, an accepted residual) that is removed afterwards, never in argv or env. op's error text keeps
-        no copy of the secret, and its answer (which echoes values) is dropped."""
-        shm = _SHM if os.path.isdir(_SHM) and os.access(_SHM, os.W_OK) else None
-        with tempfile.TemporaryDirectory(prefix="hermes-op-", dir=shm) as tmp:
-            path = os.path.join(tmp, "item.json")
-            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as fh:
-                json.dump(item, fh)
-            self._run(*args, "--template", path, "--format", "json", secret=secret)
-        self.invalidate_listing()
+
+# Labels of the fields add_totp writes (no ".", "=" or backslash, which op's assignment syntax would need
+# escaped). The field is Hermes's by its label at item level: op assigns the ids.
+_TOTP_LABEL = "Hermes authenticator"
+_PREVIOUS_LABEL = "Hermes previous authenticator key"
 
 
-_TOTP_FIELD_ID = "TOTP_hermes"
-_SHM = "/dev/shm"  # tmpfs on Linux: a template left by a killed process is gone at reboot
-# The field types op documents. Anything else (a passkey, a type a newer op adds) is not known to survive a JSON
-# template round trip, so the item is not written.
-_KNOWN_FIELD_TYPES = {"STRING", "EMAIL", "CONCEALED", "URL", "OTP", "DATE", "MONTH_YEAR", "MENU", "PHONE", "ADDRESS",
-                      "CREDIT_CARD_TYPE", "CREDIT_CARD_NUMBER", "GENDER", "REFERENCE", "SSHKEY"}
-
-
-def _may_hold_passkey(item: dict) -> bool:
-    """True when the item JSON names a passkey or has a field or section of a type this code does not know."""
-    fields = [f for f in item.get("fields") or [] if isinstance(f, dict)]
-    sections = [s for s in item.get("sections") or [] if isinstance(s, dict)]
-    named = [str(x.get(k) or "") for x in fields + sections for k in ("id", "label", "type")]
-    return (any("passkey" in n.lower() for n in named) or
-            any(str(f.get("type") or "STRING").upper() not in _KNOWN_FIELD_TYPES for f in fields))
-
-
-class PasskeyItem(BackendError):
-    error_type = "item_has_passkey"
-    advice = ("this login may hold a passkey (or a field type Hermes cannot copy safely), and writing the item would "
-              "erase it, so nothing was saved or entered. Leave the item as it is; adding an authenticator to it "
-              "is the user's call.")
+def _is_hermes_field(field: dict) -> bool:
+    section = field.get("section") if isinstance(field.get("section"), dict) else {}
+    return field.get("label") == _TOTP_LABEL and not section.get("label")
 
 
 class TotpAlreadySet(BackendError):

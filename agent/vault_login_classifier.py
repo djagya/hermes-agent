@@ -568,6 +568,8 @@ _RE_RESET_ROUTE = re.compile(r"reset|recover|forgot|setpassword|newpassword|choo
 _RE_RESET_LABEL = re.compile(
     r"\b(?:new|choose|set|create)\s+(?:a\s+|your\s+)?password\b|\bneues\s+passwort\b|\bnouveau\s+mot\s+de\s+passe\b"
     r"|\bnieuw\s+wachtwoord\b|\bnueva\s+contrasena\b|\bnuova\s+password\b|\bpassword\s+reset\b")
+# A route naming a forgotten password: outweighs registration words found only in the form's text.
+_RE_FORGOT_ROUTE = re.compile(r"reset|recover|forgot")
 # Old/current password wording: a change-password form, never a reset target (the old password is not ours to set).
 _RESET_OLD_RE = r"\b(?:old|current|existing|previous)\s*password\b|(?:old|current|existing)pass"
 
@@ -650,23 +652,25 @@ def select_signup_targets_detailed(controls: list[LoginControl],
     return SignupTargets(target, confirm), ""
 
 
-def _registration_evidence(target: LoginControl) -> bool:
-    """Registration words in the route (page or form action), the field's name, or its form's text."""
+def _registration_evidence(target: LoginControl, *, form_text: bool = True) -> bool:
+    """Registration words in the route (page or form action), the field's name, or (``form_text``) its form's
+    text."""
     route_words = _normalize_text(_route_text(target.page_url, target.form_action))
     return bool(_RE_REGISTER_WORDS.search(route_words) or _RE_REGISTER_SQUASHED.search(route_words.replace(" ", ""))
                 or _RE_REGISTER_SQUASHED.search(_camel_words(target.name).replace(" ", ""))
-                or _RE_REGISTER_WORDS.search(_normalize_text(target.context)))
+                or (form_text and _RE_REGISTER_WORDS.search(_normalize_text(target.context))))
 
 
 def reset_page_refusal(targets: SignupTargets) -> str:
     """The strict gate of ``browser_vault reset_password``, which asks nobody: ``"registration_page"`` when the
-    page shows registration evidence, ``"no_reset_evidence"`` unless the route or the field's label says it
+    page shows registration evidence (in its form's text only when the route names no reset: a reset form may
+    offer "Don't have an account? Sign up"), ``"no_reset_evidence"`` unless the route or the field's label says it
     chooses a new password (``autocomplete=new-password`` alone, which sign-up forms carry too, is not enough),
     else ``""``. ``fill purpose=reset`` keeps its looser selection because it asks the user first."""
     field = targets.primary
-    if _registration_evidence(field):
-        return "registration_page"
     squashed = _normalize_text(_route_text(field.page_url, field.form_action)).replace(" ", "")
+    if _registration_evidence(field, form_text=not _RE_FORGOT_ROUTE.search(squashed)):
+        return "registration_page"
     if _RE_RESET_ROUTE.search(squashed) or _RE_RESET_LABEL.search(_camel_words(field.label + " " + field.name)):
         return ""
     return "no_reset_evidence"

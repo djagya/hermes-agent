@@ -1,5 +1,7 @@
 """Vault-value registry redaction: digit values leave no oracle; short-lived codes expire (agent.redact_vault)."""
 
+import pytest
+
 
 class TestVaultDigitValuesLeaveNoOracle:
     """r8 (owner policy: card values never reach the model): a pure-digit vault value is masked by length,
@@ -226,11 +228,16 @@ class TestVaultRedactionByAudience:
             redact.clear_vault_redaction_values()
 
 
-def test_an_authenticator_setup_link_is_never_shown_even_unregistered():
+@pytest.mark.parametrize("page", [
+    'scan <a href="otpauth://totp/Shop:jane?secret=JBSWY3DPEHPK3PXP&issuer=Shop">link</a> or type it',
+    "OTPAUTH://TOTP/SHOP:JANE?SECRET=JBSWY3DPEHPK3PXP",  # upper case (r2 review Low)
+    '<img src="https://qr.example/c?data=otpauth%3A%2F%2Ftotp%2FShop%3Ajane%3Fsecret%3DJBSWY3DPEHPK3PXP">',
+    "data=otpauth%3a%2f%2ftotp%2fShop%3fsecret%3dJBSWY3DPEHPK3PXP",  # URL-encoded, lower-case escapes
+], ids=["link", "upper-case", "url-encoded", "url-encoded-lower"])
+def test_an_authenticator_setup_link_is_never_shown_even_unregistered(page):
     """J-0643 (Opus A2): a setup page read before enroll_totp must not hand the model the seed."""
     from agent.redact import redact_sensitive_text
 
-    page = 'scan <a href="otpauth://totp/Shop:jane?secret=JBSWY3DPEHPK3PXP&issuer=Shop">link</a> or type it'
     for audience in ("browser", "model", "log"):
         out = redact_sensitive_text(page, force=True, vault=audience)
         assert "JBSWY3DPEHPK3PXP" not in out and "otpauth://[REDACTED]" in out

@@ -126,7 +126,7 @@ def reset_password(handle: str, task_id: Optional[str], *, identifier: str = "",
         return refusal
     backend, origin, nonce, bind, target, classified = page
     key = (handle, origin)
-    if handle and not rotate and key in _PENDING:
+    if handle and not rotate and symbols and key in _PENDING:  # symbols=false: the site refused the saved one
         saved = handle  # an earlier call saved a password the page may not hold: fill that one again
     else:
         saved, refusal = _generate(backend, handle, origin, identifier.strip(), label.strip(),
@@ -152,8 +152,8 @@ def _fill_saved(backend: Any, saved: str, origin: str, tid: str, nonce: str, bin
 
     done = {"saved": True, "handle": saved, "created": created}
     retry = ("Check the page: if it still shows the new-password form, call reset_password once more with this "
-             "handle (it fills the same saved password). Use rotate=true only when the site refused that password "
-             "(symbols=false if it rejects symbols).")
+             "handle (it fills the same saved password). Use rotate=true only when the site refused that password, or "
+             "symbols=false (also a new password) when it rejects symbols.")
     try:
         password = backend.resolve_password(saved)
     except Exception as exc:  # health: allow BLE001 -- typed or not, the password is saved and nothing is filled
