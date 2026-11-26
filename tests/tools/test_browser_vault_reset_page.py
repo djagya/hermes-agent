@@ -49,7 +49,7 @@ class Page:
     heading: str
     para: str
     label: str
-    submit: str  # "input:<value>" renders an <input type=submit>
+    submit: str  # "input:<value>" renders an <input type=submit>, "button:<text>" a <button type=button> (the only submit)
     nav: str  # "", "link", "button", "role-link"
     heading_outside: bool  # the heading sits in the form's card, outside the form
     email: bool
@@ -89,7 +89,8 @@ _SIGNUP_TEXTS = [("Create your account", "", "Sign up"), ("Get started", "Work e
                  ("Start your free trial", "", "Continue"), ("Konto erstellen", "", "Weiter"),
                  ("Créer un compte", "", "Continuer"), ("Account aanmaken", "", "Doorgaan"),
                  ("Crear una cuenta", "", "Continuar"), ("Crea un account", "", "Continua"),
-                 ("Join us today", "", "Join"), ("Welcome", "", "Create account"), ("Welcome", "", "input:Sign up")]
+                 ("Join us today", "", "Join"), ("Welcome", "", "Create account"), ("Welcome", "", "input:Sign up"),
+                 ("Welcome", "", "button:Create account"), ("Welcome", "", "button:Sign up")]
 _SIGNUP_LABELS = ("Password", "Create a password", "Choose a password", "New password")
 # A sign-up page that names itself nowhere is told apart only by the missing reset evidence (no reset path segment,
 # no "new password"): the verdict's accepted residual is the same page with such evidence, so it is not generated.
@@ -138,6 +139,7 @@ def _tree(page: Page) -> tuple:
     content += [el("LABEL", "Confirm password"), field("password", "password_confirmation", "Confirm password")] \
         if page.confirm else []
     content.append(el("INPUT", type="submit", value=page.submit[6:]) if page.submit.startswith("input:")
+                   else el("BUTTON", page.submit[7:], htmlType="button") if page.submit.startswith("button:")
                    else el("BUTTON", page.submit))
     if page.nav:
         words, (tag, text, props) = _NAV[page.nav]
@@ -152,11 +154,14 @@ def _tree(page: Page) -> tuple:
 
 
 def expected_form_text(page: Page) -> Optional[str]:
-    """What the inspection must report: the page's rendered text without links and plain buttons."""
+    """What the inspection must report: the page's rendered text without links and plain buttons, except that a
+    button[type=button] stays when the page has no other submit control (it is the submit)."""
     if page.state != "readable":
         return None
+    only_button = page.submit.startswith("button:")
     words = [page.heading, page.para, "Email" if page.email else "", page.label,
-             "Confirm password" if page.confirm else "", page.submit.removeprefix("input:"), _NAV[page.nav][0] if page.nav else ""]
+             "Confirm password" if page.confirm else "", page.submit.removeprefix("input:").removeprefix("button:"),
+             _NAV[page.nav][0] if page.nav else "", _NAV[page.nav][1][1] if only_button and page.nav == "button" else ""]
     return " ".join(w for w in words if w)
 
 

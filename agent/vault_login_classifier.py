@@ -1261,19 +1261,25 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     return { context: t !== null && t.length <= BLOCK_MAX ? t : "" };
   };
   // Form text for the reset gate (password fields only): the same block's rendered text WITHOUT links, [role=link]
-  // and button[type=button] (navigation such as "Don't have an account? Sign up"), submit buttons' values kept;
+  // and button[type=button] (navigation such as "Don't have an account? Sign up"), submit buttons' values kept; a
+  // button[type=button] is kept when the block has no other submit control, because then it IS the submit;
   // around a form, the nearest h1-h3 / [role=heading] of its card (up to 4 ancestors, the largest within the cap):
   // the last one before the form, else the first after it. null when the block is oversized or unreadable.
-  const NAV = "a,[role=link],button[type=button]";
+  const NAV = "a,[role=link]";
   const HEADING = "h1,h2,h3,[role=heading]";
   const shown = (e) => { const s = getComputedStyle(e); return s.display !== "none" && s.visibility === "visible"; };
+  const submits = (e) => {
+    const t = String(e.tagName === "BUTTON" ? e.getAttribute("type") || "submit" : e.type).toLowerCase();
+    return shown(e) && (e.tagName === "BUTTON" ? t !== "button" && t !== "reset" : e.tagName === "INPUT" && (t === "submit" || t === "image"));
+  };
   const navFree = (root) => {
     const parts = [];
+    const skip = Array.from(root.querySelectorAll("*")).some(submits) ? NAV + ",button[type=button]" : NAV;
     (function walk(n) {
       const lit = getComputedStyle(n).visibility === "visible";
       for (const c of n.childNodes) {
         if (c.nodeType === 3) { if (lit) parts.push(c.data); continue; }
-        if (c.nodeType !== 1 || c.matches(NAV) || getComputedStyle(c).display === "none") continue;
+        if (c.nodeType !== 1 || c.matches(skip) || getComputedStyle(c).display === "none") continue;
         if (c.tagName === "INPUT" && c.type === "submit" && shown(c)) parts.push(c.value || "");
         walk(c);
       }
