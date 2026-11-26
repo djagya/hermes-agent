@@ -14,7 +14,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from agent.vault_backends.base import BackendNetwork
+from agent.vault_backends.base import BackendError, BackendNetwork
 from agent.vault_backends.onepassword import OnePasswordLoginBackend, TotpAlreadySet, clear_list_cache
 from agent.vault_login_classifier import SIGNUP_OUTCOMES
 from tests.agent import fake_op
@@ -122,7 +122,7 @@ def test_the_field_length_and_the_symbols_option_reach_the_generator(page):
     assert (kwargs["length"], kwargs["symbols"]) == (12, False)
 
 
-@pytest.mark.parametrize("failure", [BackendNetwork("1Password", "dial tcp"), RuntimeError("op: boom")])
+@pytest.mark.parametrize("failure", [BackendError("1Password", "op failed"), RuntimeError("op: boom")])
 def test_a_failed_save_writes_nothing_to_the_page(page, failure, caplog):
     page.backend.generate_login.side_effect = failure
     out = call("reset_password", handle=HANDLE)
@@ -412,8 +412,7 @@ def test_enroll_saves_the_key_then_enters_the_code_it_mints(page, caplog):
     assert KEY not in json.dumps(out) and KEY not in caplog.text
 
 
-@pytest.mark.parametrize("failure", [TotpAlreadySet("1Password"), BackendNetwork("1Password", "timeout"),
-                                     RuntimeError(KEY_URI)])
+@pytest.mark.parametrize("failure", [TotpAlreadySet("1Password"), RuntimeError(KEY_URI)])
 def test_a_key_that_was_not_saved_is_never_confirmed(page, failure):
     page.state.controls = [CODE_FIELD]
     page.backend.add_totp.side_effect = failure
@@ -606,9 +605,8 @@ def test_enroll_totp_on_a_fake_op_keeps_the_passkey_and_every_other_field(page, 
         assert json.dumps(code) in page.written[-1]
 
 
-@pytest.fixture
-def hanging_op(page, tmp_path, monkeypatch):
-    """The page fixture's fake page with a real backend on a fake ``op`` whose item edits time out."""
+def _real_backend_on_fake_op(page, tmp_path, monkeypatch):
+    """The page fixture's fake page with a real backend on a fake ``op``."""
     from agent.vault_backends import onepassword
 
     fake = fake_op.install(tmp_path / "op", OP_ITEM)
@@ -619,7 +617,23 @@ def hanging_op(page, tmp_path, monkeypatch):
     backend._service_token = "service-token"
     monkeypatch.setattr("agent.vault_backends.backend_for_handle", Mock(return_value=backend))
     monkeypatch.setattr(vault, "_meta_relisted", Mock(return_value=page.meta))
+    return fake
+
+
+@pytest.fixture
+def hanging_op(page, tmp_path, monkeypatch):
+    """An op whose item edits time out."""
+    fake = _real_backend_on_fake_op(page, tmp_path, monkeypatch)
     fake.flag("hang")
+    yield fake
+    clear_list_cache()
+
+
+@pytest.fixture
+def network_op(page, tmp_path, monkeypatch):
+    """An op that applies an item edit, then fails with a network error (not a timeout of ours)."""
+    fake = _real_backend_on_fake_op(page, tmp_path, monkeypatch)
+    fake.flag("late", "network")
     yield fake
     clear_list_cache()
 
@@ -629,6 +643,7 @@ def test_an_op_timeout_while_saving_the_password_says_it_may_have_been_saved(pag
     out = call("reset_password", handle=HANDLE)
     assert out["success"] is False and out["saved"] == "unknown" and out["error_type"] == "vault_network"
     assert "MAY have been saved" in out["error"] and "action=list" in out["next"] and "before saving another" in out["next"]
+    assert "changed password" not in out["next"] and "without a handle" in out["next"]
     vault._eval_js_secret.assert_not_called()
 
 
@@ -637,4 +652,23 @@ def test_an_op_timeout_while_saving_the_key_says_it_may_have_been_saved(page, ha
     out = call("enroll_totp", handle=HANDLE)
     assert out["success"] is False and out["saved"] == "unknown" and "MAY have been saved" in out["error"]
     assert KEY not in json.dumps(out) and "enroll_totp once more" in out["next"]
+    vault._eval_js_secret.assert_not_called()
+
+
+def test_a_network_error_after_the_password_write_was_applied_says_saved_unknown_and_list_first(page, network_op):
+    """r7 LOW: any BackendNetwork on a write (not only our own timeout) may follow an applied write."""
+    out = call("reset_password", handle=HANDLE)
+    assert out["success"] is False and out["saved"] == "unknown" and out["error_type"] == "vault_network"
+    assert "MAY have been saved" in out["error"] and "Retry once in a minute" not in out["error"]
+    assert "action=list" in out["next"] and "with that handle" in out["next"] and "without a handle" in out["next"]
+    assert "changed password" not in out["next"]
+    vault._eval_js_secret.assert_not_called()
+
+
+def test_a_network_error_after_the_key_write_was_applied_says_saved_unknown(page, network_op):
+    page.state.controls, page.state.keys = [CODE_FIELD], {"uris": [KEY_URI], "keys": [KEY]}
+    out = call("enroll_totp", handle=HANDLE)
+    assert out["success"] is False and out["saved"] == "unknown" and "MAY have been saved" in out["error"]
+    assert "Retry once in a minute" not in out["error"] and KEY not in json.dumps(out)
+    assert "enroll_totp once more" in out["next"]
     vault._eval_js_secret.assert_not_called()

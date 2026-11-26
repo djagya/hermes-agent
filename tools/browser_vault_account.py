@@ -34,6 +34,9 @@ _PASSWORD_LENGTH = 20
 _PENDING: dict[tuple[str, str], bool] = {}
 
 
+_UNFINISHED = "the call did not finish (network failure or timeout), so the write may have been applied."
+
+
 def _refuse(error_type: str, error: str, **extra: Any) -> str:
     return json.dumps({"success": False, "error_type": error_type, "error": error, **extra})
 
@@ -229,18 +232,19 @@ def _generate(backend: Any, handle: str, origin: str, identifier: str, label: st
               symbols: bool) -> tuple[str, Optional[str]]:
     """``(handle, None)`` once 1Password holds a freshly generated password, else ``("", refusal)``: nothing is
     filled then."""
-    from agent.vault_backends import BackendError, BackendTimeout, UnlockRequired
+    from agent.vault_backends import BackendError, BackendNetwork, UnlockRequired
 
     not_filled = "Nothing was filled into the page, so the site's password is unchanged."
     try:
         return backend.generate_login(handle, origin=origin, username=identifier, title=label, length=length,
                                       symbols=symbols), None
-    except BackendTimeout as exc:  # the request may have been applied: not "saved: false"
-        return "", _refuse(exc.error_type, f"{exc.message()} The new password MAY have been saved. {not_filled}",
-                           saved="unknown",
-                           next="Call browser_vault action=list and look for a login for this site (a copy made "
-                                "just now, or this handle with a changed password) before saving another one: if "
-                                "there is one, call reset_password with its handle; only otherwise try again.")
+    except BackendNetwork as exc:  # a timeout or a lost connection: the write may have been applied
+        return "", _refuse(exc.error_type, f"{backend.display_name}: {_UNFINISHED} The new password MAY have been "
+                           f"saved. {not_filled}", saved="unknown",
+                           next="Call browser_vault action=list and look for a login for this site before saving "
+                                "another one: if there is one, call reset_password with that handle (it fills that "
+                                "item's saved password if one is pending, else generates one); if there is none, "
+                                "call reset_password again without a handle.")
     except BackendError as exc:
         return "", _refuse(exc.error_type, f"{exc.message()} {not_filled}", saved=False)
     except UnlockRequired:
@@ -331,7 +335,7 @@ _KEY_REASONS = {
 
 def enroll_totp(handle: str, task_id: Optional[str]) -> str:
     from agent.redact import register_vault_redaction_value
-    from agent.vault_backends import BackendError, BackendTimeout, UnlockRequired
+    from agent.vault_backends import BackendError, BackendNetwork, UnlockRequired
     from tools import browser_vault_tool as vault
 
     tid = task_id or "default"
@@ -368,9 +372,10 @@ def enroll_totp(handle: str, task_id: Optional[str]) -> str:
     not_entered = "No code was entered, so the site's authenticator is not switched on."
     try:
         added = backend.add_totp(handle, key)
-    except BackendTimeout as exc:  # the key may be stored: say so
-        return _refuse(exc.error_type, f"{exc.message()} The key MAY have been saved. {not_entered}",
-                       saved="unknown", next="Call enroll_totp once more: a key that was stored is not written twice.")
+    except BackendNetwork as exc:  # a timeout or a lost connection: the key may be stored
+        return _refuse(exc.error_type, f"{backend.display_name}: {_UNFINISHED} The key MAY have been saved. "
+                       f"{not_entered}", saved="unknown",
+                       next="Call enroll_totp once more: a key that was stored is not written twice.")
     except BackendError as exc:
         return _refuse(exc.error_type, f"{exc.message()} {not_entered}", saved=False)
     except UnlockRequired:
