@@ -258,7 +258,7 @@ def _generate(backend: Any, handle: str, origin: str, identifier: str, label: st
 
 # Reads the authenticator key a setup page shows: every otpauth:// URI in an attribute (a link, the QR image's
 # alt or data) or in an element's own text, and every element whose whole text (or a readonly input's value) is
-# a base32 key: 16+ characters of A-Z / 2-7, one case, grouped by spaces or dashes or holding a digit. Read only,
+# a base32 key as shown (A-Z / 2-7, one case, a digit 2-7, groups of 4 if grouped) in a rendered element. Read only,
 # by the non-secret eval; Python keeps no value it does not store. The script checks the page origin itself, right
 # before reading (a redirect after Python's own check must not supply another site's key).
 _KEY_JS = r"""(() => {
@@ -273,6 +273,20 @@ _KEY_JS = r"""(() => {
       try { if (e.tagName === "IFRAME" && e.contentDocument && e.contentDocument.location.origin === location.origin) walk(e.contentDocument); } catch (_) {}
     }
   })(document);
+  // A key looks like one: A-Z2-7 only (one case), 16+ characters, a digit 2-7 in it, and if grouped, groups of 4
+  // (the last 1-4). A heading or a phrase ("TWO-FACTOR AUTHENTICATION") is none of these.
+  const looksLikeKey = (t) => {
+    const body = t.replace(/=+$/, ""), k = body.replace(/[\s-]/g, "");
+    if (!/^[A-Za-z2-7]{16,128}$/.test(k) || !/[2-7]/.test(k) || (t !== t.toUpperCase() && t !== t.toLowerCase())) return false;
+    const groups = body.split(/[\s-]+/);
+    return groups.length === 1 || groups.every((g, i) => i < groups.length - 1 ? g.length === 4 : g.length >= 1 && g.length <= 4);
+  };
+  // Not the page's title, an option, anything in <head>, or an element nobody sees.
+  const shown = (e) => {
+    for (let n = e; n; n = n.parentElement) if (/^(TITLE|OPTION|HEAD)$/.test(n.tagName)) return false;
+    const r = e.getBoundingClientRect(), s = getComputedStyle(e);
+    return e.getClientRects().length > 0 && (r.width > 0 || r.height > 0) && s.visibility !== "hidden";
+  };
   const uriIn = (v) => { const at = v.indexOf("otpauth://"); if (at >= 0) add(uris, v.slice(at).split(/[\s"'<>]/)[0]); };
   for (const root of roots) {
     for (const e of root.querySelectorAll("*")) {
@@ -280,9 +294,7 @@ _KEY_JS = r"""(() => {
       if (e.children.length && e.tagName !== "INPUT") continue;
       const t = (e.tagName === "INPUT" ? (e.readOnly ? e.value : "") : (e.textContent || "")).trim();
       uriIn(t);
-      const k = t.replace(/[\s-]/g, "");
-      if (t.length <= 160 && /^[A-Za-z2-7]{16,128}=*$/.test(k) && (t === t.toUpperCase() || t === t.toLowerCase()) &&
-          (/[\s-]/.test(t) || /[2-7]/.test(k))) add(keys, t);
+      if (t.length <= 160 && looksLikeKey(t) && shown(e)) add(keys, t);
     }
   }
   return JSON.stringify({ uris, keys });

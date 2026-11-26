@@ -444,6 +444,51 @@ def test_enroll_without_a_readable_key_names_the_reason(page):
     page.backend.add_totp.assert_not_called()
 
 
+def _keys_on(page_nodes: str) -> dict:
+    """What the key reader (the real script) finds on a synthetic page, run in node."""
+    from tests.tools.test_browser_vault_plain_code import _NODE, _need_node
+    src = _NODE.replace("@@PAGE@@", "[" + page_nodes + "]").replace("@@INSPECT@@", account.key_js("https://accounts.example.test"))
+    src = src.replace("@@BETWEEN@@", "").replace("@@FILL@@", "null")
+    run = subprocess.run([_need_node()], input=src, text=True, capture_output=True, timeout=30, check=False)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)["rows"]
+
+
+def _text(*texts: str, tag: str = "P", **props) -> str:
+    return ", ".join(f"h({json.dumps(tag)}, {json.dumps(dict(props, text=t))})" for t in texts)
+
+
+@pytest.mark.parametrize("phrase", ["TWO-FACTOR AUTHENTICATION", "VERIFY AND ACTIVATE", "or enter the key manually",
+                                    "UNITED STATES OF AMERICA", "SECURITYSETTINGSPAGE", "JBSWY3DPEHPK3PX-P", "JBSW Y3DP EHPK3PXP"])
+def test_a_heading_or_phrase_is_not_a_key_and_a_qr_only_page_refuses_with_nothing_written(page, phrase):
+    found = _keys_on(_text(phrase))
+    assert found["keys"] == []
+    assert account.page_key(found)[2] == "no_key_on_page"
+    page.state.keys = found
+    out = call("enroll_totp", handle=HANDLE)
+    assert out["reason"] == "no_key_on_page"
+    page.backend.add_totp.assert_not_called()
+    vault._eval_js_secret.assert_not_called()
+
+
+@pytest.mark.parametrize("shown", ["JBSW Y3DP EHPK 3PXP", "JBSWY3DPEHPK3PXP", "jbsw-y3dp-ehpk-3pxp", "JBSW Y3DP EHPK 3PXP ABC2"])
+def test_a_key_as_the_page_shows_it_is_read_even_beside_a_phrase(shown):
+    found = _keys_on(_text("TWO-FACTOR AUTHENTICATION", "or enter the key manually", shown, "UNITED STATES OF AMERICA"))
+    assert found["keys"] == [shown]
+    assert account.page_key(found)[2] == ""
+
+
+@pytest.mark.parametrize("where", [
+    'h("HEAD", {}, h("TITLE", {"text": "JBSWY3DPEHPK3PXP"}))',
+    'h("SELECT", {}, h("OPTION", {"text": "JBSWY3DPEHPK3PXP"}))',
+    'h("DIV", {"style": {"display": "none"}, "rect": {"width": 0, "height": 0}}, h("P", {"text": "JBSWY3DPEHPK3PXP"}))',
+    'h("P", {"text": "JBSWY3DPEHPK3PXP", "style": {"visibility": "hidden"}})',
+    'h("P", {"text": "JBSWY3DPEHPK3PXP", "rect": {"width": 0, "height": 0}})'])
+def test_a_key_the_user_cannot_see_is_not_read(where):
+    assert _keys_on(where)["keys"] == []
+    assert _keys_on(where + ", " + _text("KRSXG5CTMVRXEZLU"))["keys"] == ["KRSXG5CTMVRXEZLU"]
+
+
 def test_a_saved_key_whose_code_field_is_missing_says_it_was_saved(page):
     page.state.controls = []
     out = call("enroll_totp", handle=HANDLE)
