@@ -108,7 +108,7 @@ def test_a_new_item_gets_an_op_generated_password_and_no_password_crosses_argv_o
     assert handle == "op:vault-h:new-item"
     (create,) = calls()
     assert create["argv"][:8] == ["item", "create", "--category", "login", "--vault", "Hermes", "--title", "Shop"]
-    assert "--generate-password=20,letters,digits,symbols" in create["argv"] and "--template" not in create["argv"]
+    assert "--generate-password=letters,digits,symbols,20" in create["argv"] and "--template" not in create["argv"]
     assert create["argv"][create["argv"].index("--url") + 1] == "https://shop.example"
     assert "username=jane@x.test" in create["argv"] and not any(GENERATED in a for a in create["argv"])
     assert backend.resolve_password(handle) == GENERATED  # read back through the ordinary path
@@ -120,7 +120,7 @@ def test_an_existing_item_is_edited_with_only_the_generate_flag_so_a_passkey_sur
     assert backend.generate_login("op:vault-123:abc", origin="https://shop.example", length=12, symbols=False) == \
         "op:vault-123:abc"
     (edit,) = calls()  # no `item get --reveal`, no template: nothing but the password field can change
-    assert edit["argv"] == ["item", "edit", "abc", "--vault", "vault-123", "--generate-password=12,letters,digits"]
+    assert edit["argv"] == ["item", "edit", "abc", "--vault", "vault-123", "--generate-password=letters,digits,12"]
     assert backend.resolve_password("op:vault-123:abc") == GENERATED
 
 

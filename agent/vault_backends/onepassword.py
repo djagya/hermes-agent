@@ -379,7 +379,7 @@ class OnePasswordLoginBackend(LoginBackend):
         untouched: ``op item edit --generate-password`` sets only the password field), or, without a handle, create
         a Login item for ``origin`` in the configured vault (default ``Hermes``) with one. Returns the item's
         handle. No password crosses this process: op generates it and :meth:`resolve_password` reads it back."""
-        recipe = f"--generate-password={length},letters,digits" + (",symbols" if symbols else "")
+        recipe = "--generate-password=letters,digits" + (",symbols" if symbols else "") + f",{length}"  # op help order
         if handle:
             vault_id, item_id = self._resolve_handle(handle)
             self._run("item", "edit", item_id, *(["--vault", vault_id] if vault_id else []), recipe)
