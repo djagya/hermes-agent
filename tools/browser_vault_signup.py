@@ -180,18 +180,18 @@ def outcome_tokens() -> dict[str, str]:
     return new_signup_outcome_tokens()
 
 
-_NO_SUBMIT = "Nothing was submitted. Do not submit the form and do not retry the fill; tell the user."
+NO_SUBMIT = "Nothing was submitted. Do not submit the form and do not retry the fill; tell the user."
 _FAILURES = {
     "signup_fill_partial": "The fill stopped part-way: the form changed or a write failed between fields, so up to "
                            "fields_possibly_written of the approved password fields may hold the password. "
-                           + _NO_SUBMIT,
+                           + NO_SUBMIT,
     "signup_form_changed": "The password was written into every approved field, but afterwards the form no longer "
                            "matched what was approved (a field, its type or role, the form or its action changed, or "
-                           "another password or code field appeared), so the fill cannot be confirmed. " + _NO_SUBMIT,
+                           "another password or code field appeared), so the fill cannot be confirmed. " + NO_SUBMIT,
     "signup_fields_not_retained": "The password was written, but after the page settled at least one approved field "
-                                  "no longer held it (field_retention names which). " + _NO_SUBMIT,
+                                  "no longer held it (field_retention names which). " + NO_SUBMIT,
     "signup_fill_uncertain": "The browser did not return a verifiable answer: one or more password fields may have "
-                             "been written. " + _NO_SUBMIT,
+                             "been written. " + NO_SUBMIT,
 }
 _ROLES = ("new-password", "confirm-password")
 

@@ -165,7 +165,9 @@ def reset_password(handle: str, task_id: Optional[str], *, identifier: str = "",
         out["next"] = ("Submit the form; the site then uses the new password, which is saved in 1Password under "
                        "handle. Sign in with fill and this handle.")
     else:
-        out["next"] = "The new password is saved in 1Password under handle, but the page may not hold it. Do not submit. " + retry
+        out["error"] = out.get("error", "").replace(signup.NO_SUBMIT, "Nothing was submitted. Do not submit the form.")
+        out["next"] = ("The new password is saved in 1Password under handle, but the page may not hold it. Do not "
+                       "submit. " + retry)
     return json.dumps(out)
 
 

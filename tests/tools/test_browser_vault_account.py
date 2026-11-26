@@ -6,13 +6,15 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from agent.vault_backends.base import BackendNetwork
-from agent.vault_backends.onepassword import TotpAlreadySet
+from agent.vault_backends.onepassword import PasskeyItem, TotpAlreadySet
 from agent.vault_login_classifier import SIGNUP_OUTCOMES
 from tools import browser_vault_account as account
 from tools import browser_vault_signup as signup
@@ -23,6 +25,7 @@ HANDLE = "op:vault-h:abc"
 TOKENS = {outcome: f"hv-test-{n:02d}" for n, outcome in enumerate(SIGNUP_OUTCOMES)}
 KEY = "JBSWY3DPEHPK3PXP"
 KEY_URI = f"otpauth://totp/Shop:jane?secret={KEY}&issuer=Shop"
+GENERATED = "Gen-pw_9f3kQ7zL-20x!"  # what the fake 1Password generated and reads back
 
 
 def new_password_field(**changes):
@@ -45,7 +48,8 @@ def page(monkeypatch):
                            has_otp=False)
     backend = SimpleNamespace(
         name="onepassword", display_name="1Password", needs_unlock=False, get_meta=Mock(return_value=meta),
-        save_login=Mock(side_effect=lambda handle, **kw: events.append("save") or (handle or "op:vault-h:new")),
+        generate_login=Mock(side_effect=lambda handle, **kw: events.append("save") or (handle or "op:vault-h:new")),
+        resolve_password=Mock(return_value=GENERATED),
         add_totp=Mock(side_effect=lambda handle, key: events.append("save") or True),
         resolve_otp=Mock(side_effect=lambda handle: events.append("mint") or "123456"))
     monkeypatch.setattr("agent.vault_backends.backend_for_handle", Mock(return_value=backend))
@@ -54,6 +58,7 @@ def page(monkeypatch):
     monkeypatch.setattr(vault, "_fill_page_origin", Mock(return_value=ORIGIN))
     monkeypatch.setattr(vault, "_focus_bound_origin", Mock(return_value=None))
     monkeypatch.setattr(vault, "_current_page_origin", Mock(return_value=ORIGIN))
+    account._PENDING.clear()
     state = SimpleNamespace(controls=[new_password_field(), CONFIRM], keys={"uris": [KEY_URI], "keys": [KEY]})
 
     def read(task, script):
@@ -84,38 +89,42 @@ def call(action, **args):
 
 
 def saved_password(page):
-    return page.backend.save_login.call_args.kwargs["password"]
+    return page.backend.resolve_password.return_value
 
 
-def test_reset_saves_the_new_password_before_it_is_written_and_never_returns_it(page, caplog):
+def test_reset_generates_and_saves_the_password_before_it_is_written_and_never_returns_it(page, caplog):
     caplog.set_level(logging.DEBUG)
     out = call("reset_password", identifier="jane@x.test", label="Shop")
     assert out["success"] and out["saved"] and out["created"] and out["handle"] == "op:vault-h:new"
-    assert page.events == ["redact", "save", "write"]
-    password = saved_password(page)
-    assert len(password) == 20 and password in page.redacted
-    assert page.backend.save_login.call_args.kwargs | {"password": "-"} == {
-        "origin": ORIGIN, "password": "-", "username": "jane@x.test", "title": "Shop"}
-    assert json.dumps(password) in page.written[0] and out["filled_fields"] == 2  # new password + confirmation
-    assert password not in json.dumps(out) and password not in caplog.text
+    assert page.events == ["save", "redact", "write"]  # op generates it: nothing to redact until it is read back
+    assert GENERATED in page.redacted
+    assert page.backend.generate_login.call_args.kwargs == {
+        "origin": ORIGIN, "username": "jane@x.test", "title": "Shop", "length": 20, "symbols": True}
+    assert json.dumps(GENERATED) in page.written[0] and out["filled_fields"] == 2  # new password + confirmation
+    assert GENERATED not in json.dumps(out) and GENERATED not in caplog.text
 
 
 def test_reset_of_an_existing_item_updates_that_item(page):
     out = call("reset_password", handle=HANDLE)
     assert out["success"] and out["handle"] == HANDLE and out["created"] is False
-    assert page.backend.save_login.call_args.args == (HANDLE,)
+    assert page.backend.generate_login.call_args.args == (HANDLE,)
 
 
-@pytest.mark.parametrize("failure", [BackendNetwork("1Password", "dial tcp"), RuntimeError("op: {password}")])
+def test_the_field_length_and_the_symbols_option_reach_the_generator(page):
+    page.state.controls = [new_password_field(maxLength=12), dict(CONFIRM, maxLength=12)]
+    call("reset_password", handle=HANDLE, symbols=False)
+    kwargs = page.backend.generate_login.call_args.kwargs
+    assert (kwargs["length"], kwargs["symbols"]) == (12, False)
+
+
+@pytest.mark.parametrize("failure", [BackendNetwork("1Password", "dial tcp"), RuntimeError("op: boom")])
 def test_a_failed_save_writes_nothing_to_the_page(page, failure, caplog):
-    def fail(handle, **kw):
-        raise type(failure)(*(a.format(password=kw["password"]) for a in failure.args)) if isinstance(
-            failure, RuntimeError) else failure
-    page.backend.save_login.side_effect = fail
+    page.backend.generate_login.side_effect = failure
     out = call("reset_password", handle=HANDLE)
     assert out["success"] is False and out["saved"] is False and "Nothing was filled" in out["error"]
     assert "write" not in page.events
-    assert saved_password(page) not in json.dumps(out) + caplog.text
+    page.backend.resolve_password.assert_not_called()
+    assert "boom" not in json.dumps(out) + caplog.text
 
 
 @pytest.mark.parametrize("transport", ["error", "raise", "garbled"])
@@ -128,7 +137,56 @@ def test_a_failed_write_after_the_save_says_the_item_was_saved(page, transport):
     out = call("reset_password", handle=HANDLE)
     assert out["success"] is False and out["saved"] is True and out["handle"] == HANDLE
     assert out["error_type"] == "reset_fill_uncertain" and "Do not submit" in out["next"]
+    assert "do not retry the fill" not in out["error"] and "once more" in out["next"]  # the failure text says retry once
     assert saved_password(page) not in json.dumps(out)
+
+
+@pytest.mark.parametrize("trouble", ["uncertain_fill", "origin_moved", "page_unavailable_after_save"])
+def test_a_retry_after_an_uncertain_reset_fills_the_same_saved_password_never_a_new_one(page, trouble):
+    """Codex B1 / Opus B3: the first request may have reached the site, so a retry fills what was saved."""
+    working = vault._eval_js_secret.side_effect
+    if trouble == "uncertain_fill":
+        vault._eval_js_secret.side_effect = RuntimeError("cdp closed")
+    else:
+        seen = iter(["https://elsewhere.example" if trouble == "origin_moved" else None])
+        def origin(task):
+            value = next(seen, ORIGIN)
+            if value is None:
+                raise vault._PageUnavailable("page_unavailable", "no page")
+            return value
+        vault._current_page_origin.side_effect = origin
+    first = call("reset_password", handle=HANDLE)
+    assert first["saved"] is True and first["handle"] == HANDLE and first["success"] is False
+    assert not (first.get("next") or "").startswith("Submit")
+    vault._eval_js_secret.side_effect = working
+    vault._current_page_origin.side_effect = None
+    vault._current_page_origin.return_value = ORIGIN
+    retry = call("reset_password", handle=first["handle"])
+    assert retry["success"] is True
+    assert page.backend.generate_login.call_count == 1  # the retry did not generate another password
+    assert json.dumps(GENERATED) in page.written[-1]
+
+
+def test_rotate_generates_a_new_password_after_an_uncertain_one(page):
+    working = vault._eval_js_secret.side_effect
+    vault._eval_js_secret.side_effect = RuntimeError("cdp closed")
+    call("reset_password", handle=HANDLE)
+    vault._eval_js_secret.side_effect = working
+    assert call("reset_password", handle=HANDLE, rotate=True)["success"] is True
+    assert page.backend.generate_login.call_count == 2
+
+
+def test_a_reset_that_was_filled_does_not_pin_the_next_one_to_the_old_password(page):
+    assert call("reset_password", handle=HANDLE)["success"] is True
+    assert call("reset_password", handle=HANDLE)["success"] is True
+    assert page.backend.generate_login.call_count == 2
+
+
+def test_a_saved_password_that_cannot_be_read_back_is_reported_saved_and_not_filled(page):
+    page.backend.resolve_password.side_effect = BackendNetwork("1Password", "timeout")
+    out = call("reset_password", handle=HANDLE)
+    assert out["success"] is False and out["saved"] is True and out["handle"] == HANDLE
+    assert "write" not in page.events
 
 
 def test_reset_refuses_before_saving(page):
@@ -138,8 +196,32 @@ def test_reset_refuses_before_saving(page):
     assert call("reset_password", handle=HANDLE)["error_type"] == "reset_target_unsupported"
     page.meta.allowed_origins = ["https://other.example"]
     assert call("reset_password", handle=HANDLE)["error_type"] == "origin_mismatch"
-    page.backend.save_login.assert_not_called()
+    page.backend.generate_login.assert_not_called()
     vault._eval_js_secret.assert_not_called()
+
+
+@pytest.mark.parametrize("controls", [
+    [new_password_field(pageUrl=ORIGIN + "/register", formAction=ORIGIN + "/register", label="Password"),
+     new_password_field(index=2, pageUrl=ORIGIN + "/register", formAction=ORIGIN + "/register",
+                        name="confirm-password", label="Confirm password")],
+    [new_password_field(name="registrationPassword", label="Password")],
+    [new_password_field(context="Create your account")],
+], ids=["register-route", "registration-field", "form-text"])
+def test_a_registration_page_is_not_a_reset_and_nothing_is_saved(page, controls):
+    """Opus A1: autocomplete=new-password alone must not turn a sign-up form into a no-approval reset."""
+    page.state.controls = controls
+    out = call("reset_password", identifier="jane@x.test")
+    assert out["error_type"] == "registration_page"
+    page.backend.generate_login.assert_not_called()
+    vault._eval_js_secret.assert_not_called()
+
+
+def test_a_new_password_form_without_reset_evidence_is_not_filled(page):
+    page.state.controls = [new_password_field(pageUrl=ORIGIN + "/account/security", formAction=ORIGIN + "/account/x",
+                                              label="Password", name="pw")]
+    out = call("reset_password", identifier="jane@x.test")
+    assert (out["error_type"], out["reason"]) == ("reset_target_unsupported", "no_reset_evidence")
+    page.backend.generate_login.assert_not_called()
 
 
 @pytest.mark.parametrize("action", ["reset_password", "enroll_totp"])
@@ -196,7 +278,7 @@ def test_a_saved_key_whose_code_field_is_missing_says_it_was_saved(page):
 
 @pytest.mark.parametrize("found, stored", [
     ({"uris": [KEY_URI], "keys": ["jbsw y3dp ehpk 3pxp"]}, KEY_URI),
-    ({"uris": [], "keys": ["jbsw y3dp ehpk 3pxp"]}, "jbsw y3dp ehpk 3pxp"),
+    ({"uris": [], "keys": ["jbsw y3dp ehpk 3pxp"]}, KEY),  # stored upper-cased, without spaces
     ({"uris": ["otpauth://hotp/x?secret=" + KEY], "keys": []}, ""),  # counter-based: not a TOTP
     ({"uris": [], "keys": ["ABCDEFGHIJKLMNOP"]}, "ABCDEFGHIJKLMNOP"),
     ({"uris": [], "keys": ["SHORT234"]}, ""),
@@ -204,11 +286,6 @@ def test_a_saved_key_whose_code_field_is_missing_says_it_was_saved(page):
 ])
 def test_page_key_choice(found, stored):
     assert account.page_key(found)[0] == stored
-
-
-def test_generated_passwords_fit_the_field():
-    assert len(account.new_password(12)) == 12 and len(account.new_password(4)) == 8
-    assert len(account.new_password(None)) == 20
 
 
 @pytest.mark.parametrize("chat", [True, False])
@@ -223,3 +300,64 @@ def test_code_messages_send_sera_to_the_mailbox_first_and_let_her_type_codes(mon
     assert "yourself with browser tools" in hint and hint.find("mailbox") < hint.find("ask the")
     description = vault.BROWSER_VAULT_SCHEMA["description"]
     assert "CVC or code" not in description and "One-time codes are not secrets" in description
+
+
+def test_a_passkey_item_is_refused_and_nothing_is_entered(page):
+    page.state.controls = [CODE_FIELD]
+    page.backend.add_totp.side_effect = PasskeyItem("1Password")
+    out = call("enroll_totp", handle=HANDLE)
+    assert out["error_type"] == "item_has_passkey" and out["saved"] is False
+    page.backend.resolve_otp.assert_not_called()
+    vault._eval_js_secret.assert_not_called()
+
+
+# The real extraction script on a synthetic page, in node: `els` are {tag, attrs, text}; the page's origin is set.
+_PAGE_JS = r"""
+const els = @@SPEC@@.map((s) => ({ tagName: s.tag.toUpperCase(), attrs: s.attrs || {}, children: [], readOnly: false,
+  textContent: s.text || "", shadowRoot: null,
+  getAttributeNames() { return Object.keys(this.attrs); }, getAttribute(a) { return this.attrs[a] ?? null; } }));
+global.window = { location: { origin: @@ORIGIN@@ } };
+global.document = { querySelectorAll: () => els };
+process.stdout.write(JSON.stringify(@@SCRIPT@@));
+"""
+
+
+def run_key_script(script, els, origin=ORIGIN):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for the synthetic page")
+    src = _PAGE_JS.replace("@@SPEC@@", json.dumps(els)).replace("@@ORIGIN@@", json.dumps(origin)).replace(
+        "@@SCRIPT@@", script)
+    run = subprocess.run([node], input=src, text=True, capture_output=True, timeout=20, check=False)
+    assert run.returncode == 0, run.stderr
+    return run.stdout
+
+
+def test_the_key_script_checks_the_origin_itself_so_a_redirect_stores_nothing(page):
+    """Codex A3: the page moved between the origin check and the read; its foreign key must not be saved."""
+    els = [{"tag": "a", "attrs": {"href": KEY_URI}}]
+    page.state.controls = [CODE_FIELD]
+    vault._eval_js.side_effect = lambda task, script: {"success": True, "result": run_key_script(
+        script, els, origin="https://evil.example")} if "otpauth://" in script else {
+        "success": True, "result": json.dumps(page.state.controls)}
+    out = call("enroll_totp", handle=HANDLE)
+    assert out["error_type"] == "origin_changed"
+    page.backend.add_totp.assert_not_called()
+    # the same page on the expected origin is read
+    vault._eval_js.side_effect = lambda task, script: {"success": True, "result": run_key_script(script, els)} \
+        if "otpauth://" in script else {"success": True, "result": json.dumps(page.state.controls)}
+    assert call("enroll_totp", handle=HANDLE)["success"] is True
+    assert page.backend.add_totp.call_args.args == (HANDLE, KEY_URI)
+
+
+def test_a_malformed_setup_link_leaks_neither_through_an_exception_nor_the_result(page, caplog):
+    """Codex A2: `otpauth://[<seed>]/totp` made urlsplit raise with the seed in its message, before registration."""
+    seed = "JBSWY3DPEHPK3PXP"
+    els = [{"tag": "img", "attrs": {"alt": f"otpauth://[{seed}]/totp"}}]
+    page.state.controls = [CODE_FIELD]
+    vault._eval_js.side_effect = lambda task, script: {"success": True, "result": run_key_script(script, els)} \
+        if "otpauth://" in script else {"success": True, "result": json.dumps(page.state.controls)}
+    out = call("enroll_totp", handle=HANDLE)
+    assert out["success"] is False and out["error_type"] == "totp_key_not_found"
+    assert seed not in json.dumps(out) + caplog.text
+    page.backend.add_totp.assert_not_called()
