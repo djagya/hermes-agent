@@ -55,6 +55,7 @@ class Page:
     email: bool
     confirm: bool
     state: str = "readable"  # or "oversized", "unreadable" (a throwing innerText: synthetic DOM only)
+    confirm_name: str = "password_confirmation"  # the name/id of the confirmation field
 
 
 _NAV = {"": (), "link": ("Don't have an account?", ("A", "Sign up", {})),
@@ -96,6 +97,9 @@ _SIGNUP_LABELS = ("Password", "Create a password", "Choose a password", "New pas
 # no "new password"): the verdict's accepted residual is the same page with such evidence, so it is not generated.
 _QUIET_KINDS = ("modal forgot", "return_to", "preset", "root", "root posting to reset")
 _QUIET_LABELS = ("Password", "Create a password", "Choose a password", "Set your password")
+# Neutral text and a reset-looking primary label: only the confirmation field's name tells the pages apart.
+_RESET_CONFIRM_NAMES = ("password_confirmation", "new_password_confirm")
+_SIGNUP_CONFIRM_NAMES = ("signup_confirm_password", "registerPasswordConfirm")
 
 
 def generate() -> list[Page]:
@@ -115,6 +119,14 @@ def generate() -> list[Page]:
                                                                  _SIGNUP_LABELS):
         pages.append(Page("signup", name, url, action, "Create your account", "", label, "Continue", "link", False,
                           True, False, state))
+    for confirm_name, nav in itertools.product(_RESET_CONFIRM_NAMES, _NAV):
+        url, action = _RESET_KINDS["token path"][:2]
+        pages.append(Page("reset", "token path", url, action, "", "", "New password", "Save", nav, False, False, True,
+                          confirm_name=confirm_name))
+    for confirm_name, nav in itertools.product(_SIGNUP_CONFIRM_NAMES, _NAV):
+        url, action = _SIGNUP_KINDS["hostile reset path"]
+        pages.append(Page("signup", "hostile reset path", url, action, "", "", "New password", "Save", nav, False,
+                          False, True, confirm_name=confirm_name))
     return pages
 
 
@@ -136,7 +148,7 @@ def _tree(page: Page) -> tuple:
     content += [el("P", FILLER)] if page.state == "oversized" else []
     content += [el("LABEL", "Email"), field("email", "email", "Email")] if page.email else []
     content += [el("LABEL", page.label), field("password", "password", page.label)]
-    content += [el("LABEL", "Confirm password"), field("password", "password_confirmation", "Confirm password")] \
+    content += [el("LABEL", "Confirm password"), field("password", page.confirm_name, "Confirm password")] \
         if page.confirm else []
     content.append(el("INPUT", type="submit", value=page.submit[6:]) if page.submit.startswith("input:")
                    else el("BUTTON", page.submit[7:], htmlType="button") if page.submit.startswith("button:")
@@ -221,7 +233,7 @@ def _python_rows(page: Page) -> list[dict]:
                 "formText": expected_form_text(page)}
     rows = [row("password", page.label, 1)]
     if page.confirm:
-        rows.append(row("password_confirmation", "Confirm password", 2))
+        rows.append(row(page.confirm_name, "Confirm password", 2))
     if page.email:
         rows.append({"type": "email", "name": "email email", "label": "Email", "autocomplete": "email",
                      "formIndex": 0 if page.action else None, "index": 0, "rendered": True, "visible": True})

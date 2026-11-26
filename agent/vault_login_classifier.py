@@ -712,7 +712,8 @@ def reset_page_refusal(targets: SignupTargets) -> str:
     field = targets.primary
     where = _normalize_text(_route_paths(field.page_url, field.form_action)) + " " + _camel_words(field.name)
     if (_names_registration(where) or _RE_REGISTER_SQUASHED.search(where.replace(" ", ""))
-            or any(_names_registration(_camel_words(c.label)) for c in targets.controls)
+            or any(_names_registration(_camel_words(c.label + " " + c.name))
+                   or _RE_REGISTER_SQUASHED.search(_camel_words(c.name).replace(" ", "")) for c in targets.controls)
             or (field.form_text is not None and _names_registration(field.form_text))):
         return "registration_page"
     path = _route_paths(field.page_url)
