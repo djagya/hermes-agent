@@ -15,3 +15,10 @@ ce120ede6a9cf13fc073427401dc702dd5e5633c:tests/fixtures/provider_wire_snapshot_v
 ce120ede6a9cf13fc073427401dc702dd5e5633c:tests/fixtures/provider_wire_snapshot_variants.json:generic-api-key:7786
 da0b4467c86d9f5911f1dc796bdc205d48e8e69a:tests/hermes_cli/test_user_provider_mixed_case_key.py:generic-api-key:45
 f02ba87b8cea274117a91842f95c3a3c185dffd2:tests/agent/test_fork_memory_under_checkpoint_gate.py:generic-api-key:166
+# logins lane (#204) TOTP test seeds flagged by generic-api-key (checked 2026-11-26: base32 of "TestSecretSuperSeare",
+# "abcdefghijklmnopqrst" and "TestSecret", no real key). Exact fingerprints only.
+53e98b8df1e160a67b2116284052fafede839523:tests/agent/test_vault_onepassword_write.py:generic-api-key:176
+0227ff59a890b391f5e123794aa0e1bb1522bdb0:tests/agent/test_vault_onepassword_write.py:generic-api-key:22
+5a12e6985cfc42dceba8ce84b55dc77513f71bc2:tests/tools/test_browser_vault_account.py:generic-api-key:395
+f4f777c93e7805ac7d25aa320d604709e904e46d:tests/agent/test_vault_onepassword_write.py:generic-api-key:190
+d8f63ebe09476496dd6a899cd10b4745fa61c6b3:tests/tools/test_browser_vault_account.py:generic-api-key:185
