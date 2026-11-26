@@ -38,7 +38,9 @@ from agent.vault_payment_policy import PaymentPolicyError, destination_consent_e
 
 from tools.browser_vault_context import (fill_context, plugin_errors_as_refusal, saved_origins, snapshot_refusal,
                                          write_backend_code)
-from tools.browser_vault_outcome import LOGIN_REASONS, fill_reasons, frames_refusal, log_outcome, login_write_result
+from tools.browser_vault_outcome import (
+    LOGIN_REASONS, fill_reasons, frames_refusal, log_outcome, login_write_result, on_bank_slot,
+)
 from tools.browser_vault_recovery import enter_recovery_code
 
 logger = logging.getLogger(__name__)
@@ -792,7 +794,7 @@ def browser_vault_enter_code(
         filled = _filled_count(parsed, len(fills))
         if filled is None:
             return json.dumps(_FILL_UNVERIFIED)
-        challenge = challenge_fields(parsed)
+        challenge = challenge_fields(parsed, on_bank_slot(effective_task_id))
         if not filled:
             reasons = fill_reasons(parsed, len(fills))
             return json.dumps({"success": False, "error_type": "code_not_written", "filled_fields": 0,
@@ -1170,12 +1172,12 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
                            "error": err})
 
     if signup_target is not None:  # its answer is one of this fill's outcome tokens, never page JSON
-        return signup.finish(fill_result.get("result"), backend.name, meta.kind, page_origin, signup_target, tokens,
-                             purpose)
+        return signup.with_challenge(effective_task_id, signup.finish(
+            fill_result.get("result"), backend.name, meta.kind, page_origin, signup_target, tokens, purpose))
     parsed, refusal = _parse_fill_result(fill_result, page_origin, refusal_tag)
     if refusal:
         return refusal
-    return login_write_result(parsed, fills, settle, backend, meta, page_origin)
+    return login_write_result(parsed, fills, settle, backend, meta, page_origin, on_bank_slot(effective_task_id))
 
 
 _TAB_PROBES["letter"] = "!!document.querySelector('input[type=password], input[type=text], input:not([type])')"

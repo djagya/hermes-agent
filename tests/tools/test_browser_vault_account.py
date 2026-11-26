@@ -317,6 +317,77 @@ def test_a_new_password_form_without_reset_evidence_is_not_filled(page):
     page.backend.generate_login.assert_not_called()
 
 
+def test_a_sign_up_label_on_a_reset_route_is_a_registration_page_and_nothing_is_saved(page):
+    """Codex M1: the field's own placeholder / label names the sign-up; the route and the form text do not."""
+    page.state.controls = [new_password_field(pageUrl=ORIGIN + "/reset", formAction=ORIGIN + "/reset", name="field",
+                                              label="Sign up \u2014 New password", formText="Continue")]
+    out = call("reset_password", identifier="jane@x.test")
+    assert out["error_type"] == "registration_page" and out["reason"] == "registration_page"
+    page.backend.generate_login.assert_not_called()
+    vault._eval_js_secret.assert_not_called()
+
+
+def test_a_page_that_turns_into_a_sign_up_form_while_the_password_is_generated_is_not_filled(page):
+    """Codex M2: the strict reset decision is made again on a fresh inspection right before the write."""
+    signup_form = [new_password_field(name="signupPassword", label="New password", formText="Sign up"),
+                   dict(CONFIRM, name="signupConfirm", formText="Sign up")]
+
+    def save_then_swap(handle, **kw):
+        page.events.append("save")
+        page.state.controls = signup_form  # an SPA reuses the form while op works
+        return handle
+
+    page.backend.generate_login.side_effect = save_then_swap
+    out = call("reset_password", handle=HANDLE)
+    assert out["success"] is False and out["reason"] == "registration_page" and out["error_type"] == "registration_page"
+    assert out["saved"] is True and out["handle"] == HANDLE and "saved in 1Password" in out["error"]
+    vault._eval_js_secret.assert_not_called()
+    assert "write" not in page.events and saved_password(page) not in json.dumps(out)
+
+
+def test_the_reset_write_goes_to_the_fresh_inspection_not_the_first_one(page):
+    """The page re-rendered (new field indexes) while op worked: the write uses the fresh inspection's fields."""
+    def save_then_move(handle, **kw):
+        page.state.controls = [new_password_field(index=7), dict(CONFIRM, index=8)]
+        return handle
+
+    page.backend.generate_login.side_effect = save_then_move
+    assert call("reset_password", handle=HANDLE)["success"] is True
+    assert "7" in page.written[0].split('"indices": [')[1].split("]")[0] and "8" in page.written[0]
+
+
+def test_a_reset_page_with_a_puzzle_captcha_says_so(page):
+    """Codex Low: the fixed captcha signal reaches the reset writer's result, as it does the login fill's."""
+    plain = vault._eval_js.side_effect
+    vault._eval_js.side_effect = lambda task, script: (
+        {"success": True, "result": "captcha_puzzle"} if "recaptcha" in script else plain(task, script))
+    out = call("reset_password", handle=HANDLE)
+    assert out["success"] is True and out["challenge"] == "captcha_puzzle" and "handoff" in out["challenge_next"]
+
+
+def test_an_invisible_check_on_a_non_bank_slot_points_to_shopping_and_a_forged_answer_is_ignored(page):
+    plain = vault._eval_js.side_effect
+    for answer, challenge in (("captcha_invisible", "captcha_invisible"), ("<b>x</b>", None)):
+        vault._eval_js.side_effect = lambda task, script, a=answer: (
+            {"success": True, "result": a} if "recaptcha" in script else plain(task, script))
+        out = call("reset_password", handle=HANDLE)
+        assert out.get("challenge") == challenge
+        assert challenge is None or "shopping" in out["challenge_next"]
+
+
+@pytest.mark.parametrize("slot", ["", None, "sensitive-2"])
+@pytest.mark.parametrize("action", ["reset_password", "enroll_totp"])
+def test_an_unknown_or_sensitive_slot_is_refused_before_anything_is_read(page, action, slot):
+    """Opus B1: the bank rule fails closed: no slot id at all is refused like a sensitive one."""
+    vault_route = __import__("tools.browser_use_cli", fromlist=["vault_route"]).vault_route
+    vault_route.return_value = {"slot_id": slot} if slot is not None else {}
+    out = call(action, handle=HANDLE)
+    assert out["error_type"] == "bank_account_refused"
+    vault._eval_js.assert_not_called()
+    page.backend.get_meta.assert_not_called()
+    assert page.events == []
+
+
 @pytest.mark.parametrize("action", ["reset_password", "enroll_totp"])
 def test_sensitive_slots_are_refused_before_anything_is_read(page, action):
     vault_route = __import__("tools.browser_use_cli", fromlist=["vault_route"]).vault_route
@@ -533,3 +604,37 @@ def test_enroll_totp_on_a_fake_op_keeps_the_passkey_and_every_other_field(page, 
         assert out["success"] is True and out["key"] == ("already_stored" if case == "spaced-replay" else "stored")
         (code,) = state["minted"]
         assert json.dumps(code) in page.written[-1]
+
+
+@pytest.fixture
+def hanging_op(page, tmp_path, monkeypatch):
+    """The page fixture's fake page with a real backend on a fake ``op`` whose item edits time out."""
+    from agent.vault_backends import onepassword
+
+    fake = fake_op.install(tmp_path / "op", OP_ITEM)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(onepassword, "_TIMEOUT", 1.0)
+    clear_list_cache()
+    backend = OnePasswordLoginBackend({"enabled": True, "binary_path": str(fake.exe)})
+    backend._service_token = "service-token"
+    monkeypatch.setattr("agent.vault_backends.backend_for_handle", Mock(return_value=backend))
+    monkeypatch.setattr(vault, "_meta_relisted", Mock(return_value=page.meta))
+    fake.flag("hang")
+    yield fake
+    clear_list_cache()
+
+
+def test_an_op_timeout_while_saving_the_password_says_it_may_have_been_saved(page, hanging_op):
+    """Opus B2: after a timeout the item may be written: not "saved: false", and look in the vault before a new one."""
+    out = call("reset_password", handle=HANDLE)
+    assert out["success"] is False and out["saved"] == "unknown" and out["error_type"] == "vault_network"
+    assert "MAY have been saved" in out["error"] and "action=list" in out["next"] and "before saving another" in out["next"]
+    vault._eval_js_secret.assert_not_called()
+
+
+def test_an_op_timeout_while_saving_the_key_says_it_may_have_been_saved(page, hanging_op):
+    page.state.controls, page.state.keys = [CODE_FIELD], {"uris": [KEY_URI], "keys": [KEY]}
+    out = call("enroll_totp", handle=HANDLE)
+    assert out["success"] is False and out["saved"] == "unknown" and "MAY have been saved" in out["error"]
+    assert KEY not in json.dumps(out) and "enroll_totp once more" in out["next"]
+    vault._eval_js_secret.assert_not_called()

@@ -74,6 +74,11 @@ class BackendNetwork(BackendError):
               "minute; if it fails again, tell Danil.")
 
 
+class BackendTimeout(BackendNetwork):
+    """The call ran out of time after it was sent: a write may have been applied (``BackendNetwork`` also covers
+    a connection that never opened, where nothing was)."""
+
+
 class LoginBackend(ABC):
     name: str                # config key: local | onepassword | bitwarden
     display_name: str        # user-facing

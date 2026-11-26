@@ -698,7 +698,8 @@ def reset_page_refusal(targets: SignupTargets) -> str:
     """The strict gate of ``browser_vault reset_password``, which asks nobody. One ordered check, no override:
 
     1. ``registration_page``: registration words in the page's path or hash-route path, the form action's path, the
-       field's name, or the field's ``form_text`` (links and plain buttons already left out by the inspection);
+       field's name or label (label, placeholder, aria text, title), or the field's ``form_text`` (links and plain
+       buttons already left out by the inspection);
     2. ``login_page``: a login/sign-in path segment (any of several languages) and no reset segment in the same
        path: "/login?reset=1" is a sign-in page that says it was reset, never a choose-a-new-password page;
     3. ``form_text_unreadable``: no ``form_text`` (oversized, unreadable, an older inspection);
@@ -711,6 +712,7 @@ def reset_page_refusal(targets: SignupTargets) -> str:
     field = targets.primary
     where = _normalize_text(_route_paths(field.page_url, field.form_action)) + " " + _camel_words(field.name)
     if (_names_registration(where) or _RE_REGISTER_SQUASHED.search(where.replace(" ", ""))
+            or _names_registration(_camel_words(field.label))
             or (field.form_text is not None and _names_registration(field.form_text))):
         return "registration_page"
     path = _route_paths(field.page_url)

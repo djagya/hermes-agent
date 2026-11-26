@@ -19,7 +19,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.secret_sources.base import run_cli
 from agent.secret_sources.onepassword import _OP_ENV_ALLOWLIST, _scrub, find_op
@@ -28,6 +28,7 @@ from agent.vault_backends.base import (
     BackendError,
     BackendNetwork,
     BackendRateLimited,
+    BackendTimeout,
     ItemNotFound,
     LoginBackend,
     UnlockRequired,
@@ -139,7 +140,7 @@ class OnePasswordLoginBackend(LoginBackend):
             failure = str(exc)
         if proc is None:
             if "timed out" in failure:
-                raise BackendNetwork(self.display_name, f"op timed out after {_TIMEOUT:.0f}s")
+                raise BackendTimeout(self.display_name, f"op timed out after {_TIMEOUT:.0f}s")
             raise RuntimeError(failure)
         if proc.returncode != 0:
             err = _scrub(proc.stderr or "")
@@ -417,13 +418,16 @@ class OnePasswordLoginBackend(LoginBackend):
         too). The key is in op's argv for that one call only."""
         vault_id, item_id = self._resolve_handle(handle)
         where = ["--vault", vault_id] if vault_id else []
-        held = [f for f in self._revealed(item_id, vault_id).get("fields") or [] if isinstance(f, dict)
-                and str(f.get("type") or "").upper() == "OTP" and str(f.get("value") or "").strip()]
+        fields = [f for f in self._revealed(item_id, vault_id).get("fields") or [] if isinstance(f, dict)]
+        held = [f for f in fields if str(f.get("type") or "").upper() == "OTP" and str(f.get("value") or "").strip()]
         if any(totp_key(str(f["value"])) == totp_key(seed) for f in held):
             return False
         mine = [f for f in held if _is_hermes_field(f)]
         if len(mine) != len(held):
             raise TotpAlreadySet(self.display_name)
+        if any(not (_is_hermes_field(f) and str(f.get("type") or "").upper() == "OTP")
+               for f in fields if _op_would_match(f)):
+            raise TotpFieldConflict(self.display_name)  # the assignment would overwrite and retype that field
         old = str(mine[0]["value"]) if mine else ""
         assign = [f"{_TOTP_LABEL}[otp]={seed}"] + ([f"{_previous_label(old)}[password]={old}"] if old else [])
         self._run("item", "edit", item_id, *where, *assign, secret=(seed, totp_key(seed), old, totp_key(old)))
@@ -457,6 +461,21 @@ def _previous_label(old: str) -> str:
 def _is_hermes_field(field: dict) -> bool:
     section = field.get("section") if isinstance(field.get("section"), dict) else {}
     return field.get("label") == _TOTP_LABEL and not section.get("label")
+
+
+def _op_would_match(field: Any) -> bool:
+    """``op item edit 'Hermes authenticator[otp]=...'`` (no section) takes any field in any section whose label
+    equals the name ignoring spaces, or whose id is that name. Case: op's rule is not checked here, so any case
+    counts (a field too many is refused, never overwritten)."""
+    squash = lambda text: str(text or "").replace(" ", "").casefold()  # noqa: E731
+    return isinstance(field, dict) and (squash(field.get("label")) == squash(_TOTP_LABEL)
+                                        or field.get("id") == _TOTP_LABEL)
+
+
+class TotpFieldConflict(BackendError):
+    error_type = "totp_field_conflict"
+    advice = ("this login already has a field named \"Hermes authenticator\" that is not a one-time-password field "
+              "Hermes wrote, and saving the key would overwrite it, so nothing was saved or entered. Tell the user.")
 
 
 class TotpAlreadySet(BackendError):

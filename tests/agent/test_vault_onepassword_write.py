@@ -12,8 +12,10 @@ import json
 import pytest
 
 from agent.vault_backends import onepassword
-from agent.vault_backends.base import BackendError
-from agent.vault_backends.onepassword import OnePasswordLoginBackend, TotpAlreadySet, clear_list_cache, totp_key
+from agent.vault_backends.base import BackendError, BackendTimeout
+from agent.vault_backends.onepassword import (
+    OnePasswordLoginBackend, TotpAlreadySet, TotpFieldConflict, clear_list_cache, totp_key,
+)
 from tests.agent import fake_op
 
 pytestmark = pytest.mark.platforms("posix")  # the fake op is a shebang script
@@ -129,7 +131,7 @@ def test_a_timed_out_write_leaves_the_key_in_no_exception_of_the_chain_nor_the_l
     monkeypatch.setattr(onepassword, "_TIMEOUT", 1.0)
     with pytest.raises(Exception) as failed:
         backend.add_totp(HANDLE, KEY_URI)
-    assert getattr(failed.value, "error_type", "") == "vault_network"
+    assert getattr(failed.value, "error_type", "") == "vault_network" and isinstance(failed.value, BackendTimeout)
     for exc in _chain(failed.value):
         text = repr(exc) + str(exc) + repr(exc.args) + repr({k: v for k, v in vars(exc).items()})
         assert KEY not in text and OLD_KEY not in text, type(exc)
@@ -204,3 +206,26 @@ def test_an_empty_one_time_password_field_is_left_alone(op):
 def test_a_malformed_key_candidate_is_no_key_and_its_parser_text_is_not_raised():
     assert totp_key("otpauth://[JBSWY3DPEHPK3PXP]/totp") == ""
     assert totp_key("otpauth://totp/x?secret=jbsw y3dp") == "JBSWY3DP"
+
+
+_SECTION = {"id": "s1", "label": "Recovery"}
+
+
+@pytest.mark.parametrize("name, field", [
+    ("string", {"id": "n1", "label": "Hermes authenticator", "type": "STRING", "value": "my own note"}),
+    ("concealed", {"id": "n1", "label": "Hermes authenticator", "type": "CONCEALED", "value": "hunter2"}),
+    ("spaces-ignored", {"id": "n1", "label": "HermesAuthenticator", "type": "STRING", "value": "x"}),
+    ("other-case", {"id": "n1", "label": "hermes Authenticator", "type": "CONCEALED", "value": "x"}),
+    ("in-a-section", {"id": "n1", "label": "Hermes authenticator", "type": "CONCEALED", "value": "x", "section": _SECTION}),
+    ("sectioned-otp", {"id": "n1", "label": "Hermes authenticator", "type": "OTP", "value": "", "section": _SECTION}),
+])
+def test_a_field_op_would_take_for_the_key_name_that_hermes_did_not_write_is_never_overwritten(op, name, field):
+    """Codex M3: the one-field assignment retypes and overwrites any field op matches for "Hermes authenticator"
+    (any section when unique, spaces ignored); a STRING or CONCEALED one is the user's."""
+    backend, fake = op
+    fake.use(with_fields(field))
+    before = fake.item()
+    with pytest.raises(TotpFieldConflict) as refused:
+        backend.add_totp(HANDLE, KEY_URI)
+    assert refused.value.error_type == "totp_field_conflict" and KEY not in str(refused.value)
+    assert not [c for c in fake.calls() if c["argv"][1] == "edit"] and fake.item() == before

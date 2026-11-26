@@ -132,3 +132,25 @@ def test_login_result_reports_the_captcha_with_its_next_step(challenge):
 @pytest.mark.parametrize("forged", ["captcha_text ", "<b>x</b>", 1, None, ["captcha_puzzle"]])
 def test_a_page_forged_challenge_is_never_echoed(forged):
     assert challenge_fields({"challenge": forged}) == {}
+
+
+def test_the_invisible_check_advice_keeps_a_bank_on_its_own_slot():
+    """Opus A1: "sign in from the shopping slot" is for non-bank accounts; a sensitive* tab gets a handoff."""
+    plain = challenge_fields({"challenge": "captcha_invisible"})
+    bank = challenge_fields({"challenge": "captcha_invisible"}, bank=True)
+    assert "shopping" in plain["challenge_next"] and "shopping" not in bank["challenge_next"]
+    assert "browser_control handoff" in bank["challenge_next"] and "another slot" in bank["challenge_next"]
+    assert challenge_fields({"challenge": "captcha_puzzle"}, bank=True) == challenge_fields({"challenge": "captcha_puzzle"})
+
+
+@pytest.mark.parametrize("slot, bank", [("sensitive-2", True), ("", True), ("shopping", False)])
+def test_a_login_fill_result_picks_the_advice_by_the_tab_slot(monkeypatch, slot, bank):
+    from tools.browser_vault_outcome import on_bank_slot
+
+    monkeypatch.setattr("tools.browser_use_cli.vault_route", lambda task: {"slot_id": slot})
+    assert on_bank_slot("t1") is bank
+    meta = SimpleNamespace(kind="login", has_otp=False)
+    out = json.loads(login_write_result({"filled": 1, "reasons": ["written"], "challenge": "captcha_invisible"},
+                                        [{"token": "current-password"}], 0, SimpleNamespace(name="op"), meta, ORIGIN,
+                                        on_bank_slot("t1")))
+    assert ("shopping" not in out["challenge_next"]) is bank

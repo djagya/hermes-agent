@@ -251,3 +251,22 @@ def finish(raw: Any, backend_name: str, kind: str, page_origin: str, target: Any
                                           else "Submit the form; the site then uses the saved password.")})
     return _failure("signup_fields_not_retained", base, filled_fields=bits.count("1"),
                     field_retention={f: ("held" if b == "1" else "lost") for f, b in zip(fields, bits)})
+
+
+def with_challenge(task_id: str, result: str) -> str:
+    """``result`` plus ``challenge`` / ``challenge_next`` when the page shows a captcha after the write (the login
+    fill reads it inside its own script; the signup writer answers one token, so this is one more non-secret
+    read). A failed read adds nothing."""
+    from agent.vault_captcha import CAPTCHA_JS, challenge_fields
+    from tools import browser_vault_tool as vault
+    from tools.browser_vault_outcome import on_bank_slot
+
+    try:
+        read = vault._eval_js(task_id, "(" + CAPTCHA_JS + ")()")
+        code = read.get("result") if read.get("success") else None
+        if isinstance(code, str) and code.startswith('"'):
+            code = json.loads(code)
+        extra = challenge_fields({"challenge": code}, on_bank_slot(task_id))
+        return json.dumps({**json.loads(result), **extra}) if extra else result
+    except Exception:  # health: allow BLE001 -- the captcha note is advice; the write result stands without it
+        return result
