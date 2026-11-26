@@ -259,14 +259,13 @@ def with_challenge(task_id: str, result: str) -> str:
     read). A failed read adds nothing."""
     from agent.vault_captcha import CAPTCHA_JS, challenge_fields
     from tools import browser_vault_tool as vault
-    from tools.browser_vault_outcome import on_bank_slot
 
     try:
         read = vault._eval_js(task_id, "(" + CAPTCHA_JS + ")()")
         code = read.get("result") if read.get("success") else None
         if isinstance(code, str) and code.startswith('"'):
             code = json.loads(code)
-        extra = challenge_fields({"challenge": code}, on_bank_slot(task_id))
+        extra = challenge_fields({"challenge": code})
         return json.dumps({**json.loads(result), **extra}) if extra else result
     except Exception:  # health: allow BLE001 -- the captcha note is advice; the write result stands without it
         return result

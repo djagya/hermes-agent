@@ -84,7 +84,7 @@ def on_bank_slot(task_id: str) -> bool:
 
 
 def login_write_result(parsed: Any, fills: list[dict[str, Any]], settle: int, backend: Any, meta: Any,
-                       page_origin: str, bank: bool = False) -> str:
+                       page_origin: str) -> str:
     """The tool result for a login/address/card-field write the page answered (not signup/reset)."""
     from tools import browser_vault_tool as vault
 
@@ -94,7 +94,7 @@ def login_write_result(parsed: Any, fills: list[dict[str, Any]], settle: int, ba
     reasons = fill_reasons(parsed, len(fills))
     from agent.vault_captcha import challenge_fields
 
-    base = {"backend": backend.name, "kind": meta.kind, "origin": page_origin, **challenge_fields(parsed, bank)}
+    base = {"backend": backend.name, "kind": meta.kind, "origin": page_origin, **challenge_fields(parsed)}
     pw_at = next((i for i, f in enumerate(fills) if f["token"] == "current-password"), None)
     password_missed = reasons is not None and pw_at is not None and reasons[pw_at] != "written"
     if filled == 0 or password_missed:

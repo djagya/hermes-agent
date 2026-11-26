@@ -19,13 +19,10 @@ CHALLENGES = {
                        "Turnstile). Do not click submit again and again: wait a few seconds for it to clear by "
                        "itself, then send the user a browser_control handoff for this tab."),
     "captcha_invisible": ("The site runs an invisible bot check (reCAPTCHA badge). Submit once; if nothing "
-                          "happens, the check blocked this browser: do not click again; sign in from the "
-                          "persistent shopping slot, or send the user a browser_control handoff."),
+                          "happens, the check blocked this browser: do not click again; send the user a "
+                          "browser_control handoff for this tab; for a non-bank account on a non-sensitive slot you "
+                          "may instead sign in from the shopping slot."),
 }
-# A bank-like (sensitive*) slot never hands its account to another slot.
-BANK_INVISIBLE = ("The site runs an invisible bot check (reCAPTCHA badge). Submit once; if nothing happens, the check "
-                  "blocked this browser: do not click again and do not move a bank to another slot; send the user a "
-                  "browser_control handoff for this tab.")
 
 # A JS function expression answering "captcha_puzzle", "captcha_text", "captcha_invisible" or "" for the page: the
 # document, its open shadow roots and its shown same-origin frames (the roots the fill writes into; each element is
@@ -74,10 +71,9 @@ CAPTCHA_JS = r"""(() => {
 })"""
 
 
-def challenge_fields(parsed: Any, bank: bool = False) -> dict[str, str]:
-    """``{"challenge": code, "challenge_next": advice}`` when the write script saw a captcha, else ``{}``. ``bank``:
-    the tab is on a bank-like slot (the invisible-check advice then keeps the bank where it is)."""
+def challenge_fields(parsed: Any) -> dict[str, str]:
+    """``{"challenge": code, "challenge_next": advice}`` when the write script saw a captcha, else ``{}``."""
     code = parsed.get("challenge") if isinstance(parsed, dict) else None
     if not (isinstance(code, str) and code in CHALLENGES):
         return {}
-    return {"challenge": code, "challenge_next": BANK_INVISIBLE if bank and code == "captcha_invisible" else CHALLENGES[code]}
+    return {"challenge": code, "challenge_next": CHALLENGES[code]}
