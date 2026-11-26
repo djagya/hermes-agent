@@ -361,3 +361,14 @@ def test_a_malformed_setup_link_leaks_neither_through_an_exception_nor_the_resul
     assert out["success"] is False and out["error_type"] == "totp_key_not_found"
     assert seed not in json.dumps(out) + caplog.text
     page.backend.add_totp.assert_not_called()
+
+
+def test_enrolment_texts_keep_the_key_and_the_backup_codes_out_of_the_model_context(page):
+    """Opus A2 / B1: no page text or screenshot while the key shows (call enroll_totp next), none while backup or
+    recovery codes show; the schema carries it as well as the result."""
+    page.state.controls = [CODE_FIELD]
+    out = call("enroll_totp", handle=HANDLE)
+    assert "do not read the page or take a screenshot" in out["next"] and "recovery codes" in out["next"]
+    description = vault.BROWSER_VAULT_SCHEMA["description"]
+    assert "call enroll_totp next" in description and "screenshot while it is visible" in description
+    assert "recovery codes show" in description
