@@ -645,12 +645,31 @@ def select_signup_targets_detailed(controls: list[LoginControl],
     path_register = bool(_RE_REGISTER_WORDS.search(path_words) or _RE_REGISTER_SQUASHED.search(path_words.replace(" ", "")))
     if _RE_LOGIN_ROUTE.search(path_words) and not path_register:
         return None, "login_route"
-    route_register = bool(_RE_REGISTER_WORDS.search(route_words) or _RE_REGISTER_SQUASHED.search(squashed))
-    field_register = bool(_RE_REGISTER_SQUASHED.search(_camel_words(target.name).replace(" ", "")))
-    form_register = bool(_RE_REGISTER_WORDS.search(_normalize_text(target.context)))
-    if not (route_register or field_register or form_register):
+    if not _registration_evidence(target):
         return None, "no_registration_evidence"
     return SignupTargets(target, confirm), ""
+
+
+def _registration_evidence(target: LoginControl) -> bool:
+    """Registration words in the route (page or form action), the field's name, or its form's text."""
+    route_words = _normalize_text(_route_text(target.page_url, target.form_action))
+    return bool(_RE_REGISTER_WORDS.search(route_words) or _RE_REGISTER_SQUASHED.search(route_words.replace(" ", ""))
+                or _RE_REGISTER_SQUASHED.search(_camel_words(target.name).replace(" ", ""))
+                or _RE_REGISTER_WORDS.search(_normalize_text(target.context)))
+
+
+def reset_page_refusal(targets: SignupTargets) -> str:
+    """The strict gate of ``browser_vault reset_password``, which asks nobody: ``"registration_page"`` when the
+    page shows registration evidence, ``"no_reset_evidence"`` unless the route or the field's label says it
+    chooses a new password (``autocomplete=new-password`` alone, which sign-up forms carry too, is not enough),
+    else ``""``. ``fill purpose=reset`` keeps its looser selection because it asks the user first."""
+    field = targets.primary
+    if _registration_evidence(field):
+        return "registration_page"
+    squashed = _normalize_text(_route_text(field.page_url, field.form_action)).replace(" ", "")
+    if _RE_RESET_ROUTE.search(squashed) or _RE_RESET_LABEL.search(_camel_words(field.label + " " + field.name)):
+        return ""
+    return "no_reset_evidence"
 
 
 def select_signup_targets(controls: list[LoginControl]) -> Optional[SignupTargets]:

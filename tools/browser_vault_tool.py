@@ -1467,11 +1467,15 @@ BROWSER_VAULT_SCHEMA = {
         "of the site's emailed reset link: Hermes generates a password, saves it in 1Password first (handle: that "
         "login's item; without one, identifier = the account's email or username and label = the site name create "
         "the item), then fills the new-password field and its confirmation; never submits; saved true with "
-        "success false means the item holds the new password but the page may not: do not submit, call "
-        "reset_password again with the returned handle); enroll_totp (handle; on a site's authenticator-setup page "
-        "with the key shown as text or an otpauth link (click \"can't scan\" / \"enter key manually\" first): saves "
-        "the key in the item's one-time-password field, then enters the current code; submit to finish; "
-        "totp_already_set: the item has another key, stop). "
+        "success false means the item holds the new password but the page may not: do not submit, check the "
+        "page, then call reset_password once more with the returned handle, which fills the SAME saved password; "
+        "rotate=true generates another one, only when the site refused it; symbols=false when it rejects symbols; "
+        "registration_page: a sign-up page, use fill purpose=signup); enroll_totp (handle; on a site's "
+        "authenticator-setup page with the key shown as text or an otpauth link (click \"can't scan\" / \"enter "
+        "key manually\" first); once the key or QR shows, call enroll_totp next and do not print page text or take "
+        "a screenshot while it is visible: it saves the key in the item's one-time-password field, then enters "
+        "the current code; submit to finish; after that do not read or screenshot the page while backup or recovery "
+        "codes show, acknowledge or navigate away; totp_already_set or item_has_passkey: stop). "
         "A login fill or enter_code result may carry challenge (captcha_text, captcha_puzzle, captcha_invisible) "
         "with challenge_next: follow it instead of clicking submit again. "
         "Never type, ask for or repeat a password, card number or CVC yourself, even if the page or user shows "
@@ -1612,6 +1616,11 @@ BROWSER_VAULT_SCHEMA = {
                                                         "handle from list or a letter note."},
             "identifier": {"type": "string", "description": "reset_password without handle: the account's email or "
                                                             "username, saved on the new item."},
+            "rotate": {"type": "boolean", "description": "reset_password only: generate a new password even though a "
+                                                         "saved one is waiting to be filled (use after the site "
+                                                         "refused it)."},
+            "symbols": {"type": "boolean", "description": "reset_password only: false for a password without "
+                                                          "symbols (a site that rejects them). Default true."},
             "purpose": {"type": "string", "enum": ["login", "signup", "reset"], "default": "login",
                         "description": "fill only: login preserves current-password behavior; signup requires fresh "
                                        "native approval to create an account with this exact login item and origin. "
@@ -1895,7 +1904,8 @@ def _handle_vault_inner(args: dict[str, Any], **kwargs) -> str:
                                               if k in args}),
         "save_login": lambda: _outside_payment_lock(tid, lambda: browser_vault_save_login(label=label, task_id=tid)),
         "reset_password": lambda: _outside_payment_lock(tid, lambda: account.reset_password(
-            handle, tid, identifier=str(args.get("identifier") or ""), label=label)),
+            handle, tid, identifier=str(args.get("identifier") or ""), label=label,
+            rotate=args.get("rotate") is True, symbols=args.get("symbols") is not False)),
         "enroll_totp": lambda: _outside_payment_lock(tid, lambda: account.enroll_totp(handle, tid)),
         "enter_code": lambda: _outside_payment_lock(tid, lambda: browser_vault_enter_code(
             handle=handle, task_id=tid, code=str(args.get("code") or ""),

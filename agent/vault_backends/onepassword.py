@@ -373,31 +373,28 @@ class OnePasswordLoginBackend(LoginBackend):
         return code if code.isdigit() else None
 
     # ── writes (D-1085 authenticator enrolment, D-1086 password reset) ─────
-    def save_login(self, handle: str, *, origin: str, password: str, username: str = "", title: str = "") -> str:
-        """Set ``password`` on the Login item ``handle`` (adding ``origin`` to its websites when missing), or,
-        without a handle, create a Login item for ``origin`` in the configured vault (default ``Hermes``).
-        Returns the item's handle. The password reaches op only inside a template file (:meth:`_write`)."""
+    def generate_login(self, handle: str, *, origin: str, username: str = "", title: str = "", length: int = 20,
+                       symbols: bool = True) -> str:
+        """Give the Login item ``handle`` a password op generates (the item's other fields, passkey and files are
+        untouched: ``op item edit --generate-password`` sets only the password field), or, without a handle, create
+        a Login item for ``origin`` in the configured vault (default ``Hermes``) with one. Returns the item's
+        handle. No password crosses this process: op generates it and :meth:`resolve_password` reads it back."""
+        recipe = f"--generate-password={length},letters,digits" + (",symbols" if symbols else "")
         if handle:
             vault_id, item_id = self._resolve_handle(handle)
-            item = self._revealed(item_id, vault_id)
-            fields = item.setdefault("fields", [])
-            pw = [f for f in fields if isinstance(f, dict) and (f.get("purpose") == "PASSWORD" or f.get("id") == "password")]
-            if not pw:
-                fields.append(pw_field := {"id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password"})
-                pw = [pw_field]
-            for f in pw:
-                f["value"] = password
-            urls = item.setdefault("urls", [])
-            if origin not in _all_origins([str(u.get("href") or "") for u in urls if isinstance(u, dict)]):
-                urls.append({"href": origin})
-            self._write(["item", "edit", item_id, *(["--vault", vault_id] if vault_id else [])], item, password)
+            self._run("item", "edit", item_id, *(["--vault", vault_id] if vault_id else []), recipe)
+            self.invalidate_listing()
             return f"{self.prefix}{vault_id}:{item_id}" if vault_id else handle
         vault = str(self.cfg.get("vault") or "").strip() or "Hermes"
-        item = {"category": "LOGIN", "fields": [
-            {"id": "username", "type": "STRING", "purpose": "USERNAME", "label": "username", "value": username},
-            {"id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password", "value": password}]}
-        created = self._write(["item", "create", "--vault", vault, "--title", title or origin.split("://")[-1],
-                               "--url", origin], item, password)
+        out = self._run("item", "create", "--category", "login", "--vault", vault, "--title",
+                        title or origin.split("://")[-1], "--url", origin, recipe, "--format", "json",
+                        f"username={username}")
+        self.invalidate_listing()
+        try:
+            created = json.loads(out)
+        except ValueError:
+            created = None
+        created = created if isinstance(created, dict) else {}
         vault_ref = created.get("vault") if isinstance(created.get("vault"), dict) else {}
         item_id, vault_id = str(created.get("id") or ""), str(vault_ref.get("id") or "")
         if not item_id or not vault_id:
@@ -406,17 +403,33 @@ class OnePasswordLoginBackend(LoginBackend):
 
     def add_totp(self, handle: str, seed: str) -> bool:
         """Store ``seed`` (an otpauth:// URI or a base32 key) in the item's one-time-password field. False when the
-        item already holds this key (nothing written); :class:`TotpAlreadySet` when it holds another one: an
-        authenticator the site may still use is never overwritten."""
+        item already holds this key (nothing written). Another key held in a field Hermes did not write is never
+        overwritten (:class:`TotpAlreadySet`); one Hermes wrote earlier (an enrolment the site may never have
+        confirmed) is replaced and kept in a concealed "previous" field. An item that may hold a passkey is
+        refused: an op JSON template replaces the whole item, passkey included."""
         vault_id, item_id = self._resolve_handle(handle)
         item = self._revealed(item_id, vault_id)
+        if _may_hold_passkey(item):
+            raise PasskeyItem(self.display_name)
         fields = item.setdefault("fields", [])
-        held = {totp_key(str(f.get("value") or "")) for f in fields if isinstance(f, dict) and f.get("type") == "OTP"}
-        if totp_key(seed) in held:
+        otp = [f for f in fields if isinstance(f, dict) and f.get("type") == "OTP"]
+        held = [f for f in otp if str(f.get("value") or "").strip()]
+        mine = next((f for f in held if f.get("id") == _TOTP_FIELD_ID), None)
+        if any(totp_key(str(f["value"])) == totp_key(seed) for f in held):
             return False
-        if held:
+        if held and mine is None:
             raise TotpAlreadySet(self.display_name)
-        fields.append({"id": "TOTP_hermes", "type": "OTP", "label": "one-time password", "value": seed})
+        if mine is not None:
+            fields.append({"id": "TOTP_prev_" + hashlib.sha256(str(mine["value"]).encode()).hexdigest()[:8],
+                           "type": "CONCEALED", "label": "previous authenticator key (unconfirmed)",
+                           "value": mine["value"]})
+            mine["value"] = seed
+        else:
+            empty = next(iter(otp), None)  # an empty one-time-password field takes the key before a second is added
+            if empty is not None:
+                empty["value"] = seed
+            else:
+                fields.append({"id": _TOTP_FIELD_ID, "type": "OTP", "label": "one-time password", "value": seed})
         self._write(["item", "edit", item_id, *(["--vault", vault_id] if vault_id else [])], item, seed)
         return True
 
@@ -432,21 +445,42 @@ class OnePasswordLoginBackend(LoginBackend):
             raise BackendError(self.display_name, "op item get returned no JSON item")
         return item
 
-    def _write(self, args: list[str], item: dict, secret: str) -> dict:
+    def _write(self, args: list[str], item: dict, secret: str) -> None:
         """Run ``op <args> --template <file>``: the item JSON (with ``secret``) sits in a mode-600 file inside a
-        private temp dir that is removed afterwards, never in argv or env. op's error text keeps no copy of the
-        secret, and its answer (which echoes values) is reduced to the item's ids by the caller."""
-        with tempfile.TemporaryDirectory(prefix="hermes-op-") as tmp:
+        private temp dir (tmpfs under /dev/shm when it exists, so a SIGKILL leftover is gone at reboot; it stays
+        until then, an accepted residual) that is removed afterwards, never in argv or env. op's error text keeps
+        no copy of the secret, and its answer (which echoes values) is dropped."""
+        shm = _SHM if os.path.isdir(_SHM) and os.access(_SHM, os.W_OK) else None
+        with tempfile.TemporaryDirectory(prefix="hermes-op-", dir=shm) as tmp:
             path = os.path.join(tmp, "item.json")
             with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as fh:
                 json.dump(item, fh)
-            out = self._run(*args, "--template", path, "--format", "json", secret=secret)
+            self._run(*args, "--template", path, "--format", "json", secret=secret)
         self.invalidate_listing()
-        try:
-            created = json.loads(out)
-        except ValueError:
-            created = None
-        return created if isinstance(created, dict) else {}
+
+
+_TOTP_FIELD_ID = "TOTP_hermes"
+_SHM = "/dev/shm"  # tmpfs on Linux: a template left by a killed process is gone at reboot
+# The field types op documents. Anything else (a passkey, a type a newer op adds) is not known to survive a JSON
+# template round trip, so the item is not written.
+_KNOWN_FIELD_TYPES = {"STRING", "EMAIL", "CONCEALED", "URL", "OTP", "DATE", "MONTH_YEAR", "MENU", "PHONE", "ADDRESS",
+                      "CREDIT_CARD_TYPE", "CREDIT_CARD_NUMBER", "GENDER", "REFERENCE", "SSHKEY"}
+
+
+def _may_hold_passkey(item: dict) -> bool:
+    """True when the item JSON names a passkey or has a field or section of a type this code does not know."""
+    fields = [f for f in item.get("fields") or [] if isinstance(f, dict)]
+    sections = [s for s in item.get("sections") or [] if isinstance(s, dict)]
+    named = [str(x.get(k) or "") for x in fields + sections for k in ("id", "label", "type")]
+    return (any("passkey" in n.lower() for n in named) or
+            any(str(f.get("type") or "STRING").upper() not in _KNOWN_FIELD_TYPES for f in fields))
+
+
+class PasskeyItem(BackendError):
+    error_type = "item_has_passkey"
+    advice = ("this login may hold a passkey (or a field type Hermes cannot copy safely), and writing the item would "
+              "erase it, so nothing was saved or entered. Leave the item as it is; adding an authenticator to it "
+              "is the user's call.")
 
 
 class TotpAlreadySet(BackendError):
@@ -461,7 +495,10 @@ def totp_key(value: str) -> str:
     from urllib.parse import parse_qs, urlsplit
 
     if value.strip().lower().startswith("otpauth://"):
-        value = (parse_qs(urlsplit(value.strip()).query).get("secret") or [""])[0]
+        try:
+            value = (parse_qs(urlsplit(value.strip()).query).get("secret") or [""])[0]
+        except ValueError:  # a malformed candidate is no key; the parser's message may quote it, so say nothing
+            return ""
     return "".join(value.split()).replace("-", "").rstrip("=").upper()
 
 

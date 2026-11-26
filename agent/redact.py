@@ -609,6 +609,7 @@ def _redact_telegram_token(match: re.Match) -> str:
             return match.group(0)
     return f"{boundary}{match.group('bot') or ''}{match.group('id')}:***"
 
+_OTPAUTH_RE = re.compile(r"otpauth://\S+", re.IGNORECASE)
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
 # A base64-encoded PEM private key: kubeconfig's ``client-key-data`` and the ``*_b64``
 # fields around it (``kubectl config view --raw``, cloud-init, CI secrets). The name is
@@ -1494,6 +1495,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         return text
     # Vault secrets are a hard model-egress boundary: scrubbed regardless of the redact_secrets preference.
     text = redact_registered_vault_values(text, audience=vault)
+    if "otpauth://" in text:  # an authenticator setup link carries the seed: never shown, registered or not
+        text = _OTPAUTH_RE.sub("otpauth://[REDACTED]", text)
     if not (force or _redact_enabled()):
         return text
     # ``secret_file`` is authoritative: a caller that classified the source as secret-bearing must not

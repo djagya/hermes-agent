@@ -224,3 +224,13 @@ class TestVaultRedactionByAudience:
             assert "unter-42-pw" not in out, out
         finally:
             redact.clear_vault_redaction_values()
+
+
+def test_an_authenticator_setup_link_is_never_shown_even_unregistered():
+    """J-0643 (Opus A2): a setup page read before enroll_totp must not hand the model the seed."""
+    from agent.redact import redact_sensitive_text
+
+    page = 'scan <a href="otpauth://totp/Shop:jane?secret=JBSWY3DPEHPK3PXP&issuer=Shop">link</a> or type it'
+    for audience in ("browser", "model", "log"):
+        out = redact_sensitive_text(page, force=True, vault=audience)
+        assert "JBSWY3DPEHPK3PXP" not in out and "otpauth://[REDACTED]" in out
