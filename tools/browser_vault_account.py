@@ -76,6 +76,8 @@ def _login_meta(backend: Any, handle: str) -> tuple[Any, Optional[str]]:
 _RESET_REFUSALS = {  # reset_page_refusal's reason: (error_type, text)
     "registration_page": ("registration_page", "This is a registration (sign-up) page, not a password reset. A sign-up "
                           "password is filled with fill purpose=signup, which asks the user."),
+    "login_page": ("reset_target_unsupported", "This is a sign-in page, not a choose-a-new-password page. Open the "
+                   "emailed reset link."),
     "form_text_unreadable": ("reset_target_unsupported", "This page's form could not be read whole (too long or "
                              "unreadable), so it cannot be told apart from a sign-up form. A sign-up form takes fill "
                              "purpose=signup (it asks the user); otherwise ask the user once."),

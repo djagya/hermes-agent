@@ -281,6 +281,18 @@ def test_a_signup_form_dressed_as_a_reset_is_refused_through_the_tool_and_nothin
     vault._eval_js_secret.assert_not_called()
 
 
+@pytest.mark.parametrize("path", ["/login?reset=1", "/users/sign_in?reset=1", "/#/signin?reset=1", "/anmelden?reset=1"])
+def test_a_sign_in_page_that_says_it_was_reset_is_refused_through_the_tool_and_nothing_is_saved(page, path):
+    """r4 Low: the page path is a sign-in route; "reset" only in its query and text is not a choose-a-new-password page."""
+    page.state.controls = _form(path, text="Your password has been reset. Sign in with your new password. Password",
+                                form=False)
+    page.state.controls[0]["autocomplete"] = ""
+    out = call("reset_password", identifier="jane@x.test")
+    assert out["success"] is False and out["reason"] == "login_page" and out["error_type"] == "reset_target_unsupported"
+    page.backend.generate_login.assert_not_called()
+    vault._eval_js_secret.assert_not_called()
+
+
 @pytest.mark.parametrize("controls", [
     _form("/password/reset?token=abc", "/password/reset", label="New password",
           text="Reset your password New password Save Don't have an account?"),

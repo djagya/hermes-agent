@@ -585,6 +585,9 @@ _RE_SIGNUP_INVITE = re.compile(r"\b(?:get started|start (?:your )?free trial|try
 # A reset/forgot/recover path segment, on the raw lower-cased path ("/preset" and "/users/new?x=/reset" are not one).
 _RE_RESET_SEGMENT = re.compile(r"(?:^|[^a-z])(?:reset|forgot(?:ten)?|recover(?:y)?)(?:[^a-z]|password|passwort|$)"
                                r"|passwordreset")
+# A sign-in route segment (reset_page_refusal): "/login?reset=1" says "reset" only in its query.
+_RE_LOGIN_SEGMENT = re.compile(r"(?:^|[^a-z])(?:log[-_]?in|sign[-_]?in|anmelden|einloggen|connexion|se-?connecter|"
+                               r"inloggen|iniciar-?sesion|accedi)(?:[^a-z]|$)")
 # The page says it sets a NEW password (label or form text); "create / choose / set a password" is sign-up wording.
 _RE_RESET_PHRASE = re.compile(
     r"\b(?:new password|password reset|reset (?:your |my |the )?password|"
@@ -696,8 +699,10 @@ def reset_page_refusal(targets: SignupTargets) -> str:
 
     1. ``registration_page``: registration words in the page's path or hash-route path, the form action's path, the
        field's name, or the field's ``form_text`` (links and plain buttons already left out by the inspection);
-    2. ``form_text_unreadable``: no ``form_text`` (oversized, unreadable, an older inspection);
-    3. fill (``""``) only on positive reset evidence: a reset/forgot/recover segment in the page's path or hash-route
+    2. ``login_page``: a login/sign-in path segment (any of several languages) and no reset segment in the same
+       path: "/login?reset=1" is a sign-in page that says it was reset, never a choose-a-new-password page;
+    3. ``form_text_unreadable``: no ``form_text`` (oversized, unreadable, an older inspection);
+    4. fill (``""``) only on positive reset evidence: a reset/forgot/recover segment in the page's path or hash-route
        path, or "new password" / "reset your password" (or its translation) in the label or the form text;
        else ``no_reset_evidence``. ``autocomplete=new-password`` and "create/choose/set a password" are sign-up
        wording too, and a query or form action never counts as reset evidence.
@@ -708,9 +713,12 @@ def reset_page_refusal(targets: SignupTargets) -> str:
     if (_names_registration(where) or _RE_REGISTER_SQUASHED.search(where.replace(" ", ""))
             or (field.form_text is not None and _names_registration(field.form_text))):
         return "registration_page"
+    path = _route_paths(field.page_url)
+    if _RE_LOGIN_SEGMENT.search(path) and not _RE_RESET_SEGMENT.search(path):
+        return "login_page"
     if field.form_text is None:
         return "form_text_unreadable"
-    if (_RE_RESET_SEGMENT.search(_route_paths(field.page_url))
+    if (_RE_RESET_SEGMENT.search(path)
             or _RE_RESET_PHRASE.search(_normalize_text(field.label + " " + field.form_text))):
         return ""
     return "no_reset_evidence"
