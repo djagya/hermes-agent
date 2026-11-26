@@ -138,7 +138,20 @@ def _reset_page(handle: str, tid: str, identifier: str) -> tuple[Optional[tuple]
     fresh, refusal = _reset_target(tid, " Nothing was saved or written.")
     if refusal:
         return None, refusal
+    if _inspected_origin(fresh[2]) != origin:  # the page moved between the origin check and the inspection
+        return None, _refuse("origin_changed", "The page left the site this call was bound to before it was read, so "
+                             "nothing was done. Nothing was saved or written.")
     return (backend, origin, fresh[2]), None
+
+
+def _inspected_origin(target: Any) -> str:
+    """The origin of the page the inspection actually read (its own document URL), or "" when unreadable."""
+    from agent.vault_store import normalize_origin
+
+    try:
+        return normalize_origin(target.primary.page_url)
+    except Exception:  # health: allow BLE001 -- an unreadable address never equals the bound origin
+        return ""
 
 
 def reset_password(handle: str, task_id: Optional[str], *, identifier: str = "", label: str = "",

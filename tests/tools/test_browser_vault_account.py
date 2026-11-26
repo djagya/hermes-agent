@@ -357,6 +357,20 @@ def test_a_page_that_turns_into_a_sign_up_form_while_the_password_is_generated_i
     assert "write" not in page.events and saved_password(page) not in json.dumps(out)
 
 
+@pytest.mark.parametrize("handle", [HANDLE, ""])
+def test_a_page_that_moves_to_another_site_before_the_inspection_is_refused_and_nothing_is_saved(page, handle):
+    """Codex M2 (final 4): the inspected page's own origin must be the origin the call was bound to."""
+    other = "https://b.example"
+    page.state.controls = [dict(c, pageUrl=other + "/reset-password?token=t", formAction=other + "/reset-password")
+                           for c in page.state.controls]
+    out = call("reset_password", handle=handle, identifier="jane@x.test")
+    assert out["success"] is False and out["error_type"] == "origin_changed"
+    assert "Nothing was saved or written." in out["error"]
+    page.backend.generate_login.assert_not_called()
+    vault._eval_js_secret.assert_not_called()
+    assert "save" not in page.events and "write" not in page.events
+
+
 def test_the_reset_write_goes_to_the_fresh_inspection_not_the_first_one(page):
     """The page re-rendered (new field indexes) while op worked: the write uses the fresh inspection's fields."""
     def save_then_move(handle, **kw):
