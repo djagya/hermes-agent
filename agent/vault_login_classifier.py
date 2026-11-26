@@ -1486,8 +1486,8 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     current origin is not reported (a forged ``found`` could carry an encoded value). ``focus()`` runs page
     handlers, so the target is re-checked after it, immediately before the value is set.
 
-    The answer is ``{"filled": n, "reasons": [one FILL_REASONS code per fill], "challenge": code}`` (``code``: the
-    captcha the page shows after the write, see :mod:`agent.vault_captcha`). With ``settle_ms`` (the login
+    The answer is ``{"filled": n, "reasons": [one FILL_REASONS code per fill]}``, plus ``"challenge"`` when the page
+    shows a captcha after the write (:mod:`agent.vault_captcha`). With ``settle_ms`` (the login
     password fill) the script then waits that long, like the signup writer, and adds ``"retained"``: how many
     written fields still hold their value (a framework that resets a controlled input clears it). A page that
     starts to navigate away during the settle (``beforeunload`` / ``pagehide``: the site auto-submitted) answers
@@ -1533,7 +1533,8 @@ _FILL_JS_TEMPLATE = """(() => {
   const fills = __FILLS__;
   const nonce = __NONCE__;
   const settleMs = __SETTLE_MS__;
-  const challenge = __CHALLENGE__;  // agent.vault_captcha: one fixed code, read when the write answers
+  const captcha = __CHALLENGE__;  // agent.vault_captcha: one fixed code, added to the answer only when a captcha shows
+  const answer = (o) => { try { const c = captcha(); if (c) o.challenge = c; } catch (_) {} return stringify(o); };
   // Stamped controls may live inside a shadow root or a same-origin frame (see the inspection script's walk):
   // collect the document and every open shadow root / same-origin frame document once, then look each stamp up.
   const sameOriginFrame = __FRAME__;
@@ -1596,7 +1597,7 @@ _FILL_JS_TEMPLATE = """(() => {
     } catch (e) { reasons.push("write_error"); }
   }
   clearStamps();
-  if (settleMs <= 0) return stringify({ filled, reasons, challenge: challenge() });
+  if (settleMs <= 0) return answer({ filled, reasons });
   // Same settle as the signup writer: frameworks reset controlled inputs on a later tick. A site that submits
   // on its own navigates now: answer before the document goes, the write itself already landed.
   return new P0((resolve) => {
@@ -1618,8 +1619,8 @@ _FILL_JS_TEMPLATE = """(() => {
         }
       } catch (_) { retained = -1; }
       done = true;
-      resolve(stringify(window.location.origin === expectedOrigin ? { filled, reasons, retained, challenge: challenge() }
-                                                                  : { filled, reasons, navigated: true }));
+      resolve(window.location.origin === expectedOrigin ? answer({ filled, reasons, retained })
+                                                        : stringify({ filled, reasons, navigated: true }));
     }, settleMs);
   });
   // (hoisted declarations, so the early no-write refusal above can use them too)

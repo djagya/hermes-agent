@@ -831,7 +831,7 @@ def _prompt_unavailable(site: str) -> str:
         # dlz (11-18): a chat (Telegram) session is not headless: the user can send the code in chat.
         return json.dumps({"success": False, "error_type": "prompt_unavailable",
                            "error": (f"{site} asks for a one-time code and this chat has no masked code prompt. "
-                                     + _READ_MAIL_FIRST + "Ask the user to send it in chat only when it went to "
+                                     + _READ_MAIL_FIRST + "Ask the user to send the code in chat only when it went to "
                                      "their phone or no mail arrived. enroll_totp on a non-bank login makes later "
                                      "codes automatic.")})
     return json.dumps({"success": False, "error_type": "prompt_unavailable",
