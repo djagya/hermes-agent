@@ -237,8 +237,11 @@ class TestVaultRedactionByAudience:
     "otpauth%3A//totp/Shop?secret=JBSWY3DPEHPK3PXP",  # only the colon encoded
     "data=otpauth%253A%252F%252Ftotp%252FShop%253Fsecret%253DJBSWY3DPEHPK3PXP",  # double-encoded
     '<a href="otpauth&#58;//totp/Shop?secret=JBSWY3DPEHPK3PXP">',  # HTML entity colon
+    '<a href="otpauth&#x3a;//totp/Shop?secret=JBSWY3DPEHPK3PXP">',  # hex entity colon, both cases, and the named one
+    '<a href="otpauth&#x3A;//totp/Shop?secret=JBSWY3DPEHPK3PXP">',
+    '<a href="otpauth&colon;//totp/Shop?secret=JBSWY3DPEHPK3PXP">',
 ], ids=["link", "upper-case", "url-encoded", "url-encoded-lower", "json-escaped", "colon-encoded", "double-encoded",
-        "html-entity"])
+        "html-entity", "hex-entity", "hex-entity-upper", "named-entity"])
 def test_an_authenticator_setup_link_is_never_shown_even_unregistered(page):
     """J-0643 (Opus A2): a setup page read before enroll_totp must not hand the model the seed."""
     from agent.redact import redact_sensitive_text
@@ -254,7 +257,11 @@ def test_an_authenticator_setup_link_is_never_shown_even_unregistered(page):
     "otpauth://totp/ACME Co:jane?issuer=ACME Co&Secret=jbswy3dpehpk3pxp",
     "data=otpauth%3A%2F%2Ftotp%2FACME Co%3Ajane%3Fsecret%253DJBSWY3DPEHPK3PXP",
     "https://qr.example/c?x=1&secret%3DJBSWY3DPEHPK3PXP",
-], ids=["space-in-label", "lower-case-seed", "encoded-with-space", "bare-encoded-secret"])
+    "otpauth://totp/ACME Co:jane?secret&#61;JBSWY3DPEHPK3PXP&issuer=ACME Co",  # "=" as an HTML entity
+    "otpauth://totp/ACME Co:jane?secret&#x3d;JBSWY3DPEHPK3PXP&issuer=ACME Co",
+    "otpauth://totp/ACME Co:jane?secret&equals;JBSWY3DPEHPK3PXP&issuer=ACME Co",
+], ids=["space-in-label", "lower-case-seed", "encoded-with-space", "bare-encoded-secret", "equals-decimal",
+        "equals-hex", "equals-named"])
 def test_a_seed_is_never_shown_when_a_space_cuts_the_setup_link(page):
     from agent.redact import redact_sensitive_text
 
