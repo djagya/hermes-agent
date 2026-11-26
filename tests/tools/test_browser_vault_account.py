@@ -478,6 +478,7 @@ def _text(*texts: str, tag: str = "P", **props) -> str:
 
 
 @pytest.mark.parametrize("phrase", ["TWO-FACTOR AUTHENTICATION", "VERIFY AND ACTIVATE", "or enter the key manually",
+                                    "AUTHENTICATIONREQUIRED",
                                     "UNITED STATES OF AMERICA", "SECURITYSETTINGSPAGE", "JBSWY3DPEHPK3PX-P", "JBSW Y3DP EHPK3PXP"])
 def test_a_heading_or_phrase_is_not_a_key_and_a_qr_only_page_refuses_with_nothing_written(page, phrase):
     found = _keys_on(_text(phrase))
@@ -490,7 +491,8 @@ def test_a_heading_or_phrase_is_not_a_key_and_a_qr_only_page_refuses_with_nothin
     vault._eval_js_secret.assert_not_called()
 
 
-@pytest.mark.parametrize("shown", ["JBSW Y3DP EHPK 3PXP", "JBSWY3DPEHPK3PXP", "jbsw-y3dp-ehpk-3pxp", "JBSW Y3DP EHPK 3PXP ABC2"])
+@pytest.mark.parametrize("shown", ["JBSW Y3DP EHPK 3PXP", "JBSWY3DPEHPK3PXP", "jbsw-y3dp-ehpk-3pxp", "JBSW Y3DP EHPK 3PXP ABC2",
+                                   "ABCD EFGH IJKL MNOP"])  # grouped: no digit needed (3 in 100 keys have none)
 def test_a_key_as_the_page_shows_it_is_read_even_beside_a_phrase(shown):
     found = _keys_on(_text("TWO-FACTOR AUTHENTICATION", "or enter the key manually", shown, "UNITED STATES OF AMERICA"))
     assert found["keys"] == [shown]

@@ -261,7 +261,7 @@ def _generate(backend: Any, handle: str, origin: str, identifier: str, label: st
 
 # Reads the authenticator key a setup page shows: every otpauth:// URI in an attribute (a link, the QR image's
 # alt or data) or in an element's own text, and every element whose whole text (or a readonly input's value) is
-# a base32 key as shown (A-Z / 2-7, one case, a digit 2-7, groups of 4 if grouped) in a rendered element. Read only,
+# a base32 key as shown (A-Z / 2-7, one case, groups of 4 if grouped, else with a digit 2-7) in a rendered element. Read only,
 # by the non-secret eval; Python keeps no value it does not store. The script checks the page origin itself, right
 # before reading (a redirect after Python's own check must not supply another site's key).
 _KEY_JS = r"""(() => {
@@ -276,13 +276,15 @@ _KEY_JS = r"""(() => {
       try { if (e.tagName === "IFRAME" && e.contentDocument && e.contentDocument.location.origin === location.origin) walk(e.contentDocument); } catch (_) {}
     }
   })(document);
-  // A key looks like one: A-Z2-7 only (one case), 16+ characters, a digit 2-7 in it, and if grouped, groups of 4
-  // (the last 1-4). A heading or a phrase ("TWO-FACTOR AUTHENTICATION") is none of these.
+  // A key looks like one: A-Z2-7 only (one case), 16+ characters; grouped, in groups of 4 (the last 1-4); one run,
+  // with a digit 2-7 in it (a key without one is shown grouped or in a link). A heading or a phrase
+  // ("TWO-FACTOR AUTHENTICATION") is none of these.
   const looksLikeKey = (t) => {
     const body = t.replace(/=+$/, ""), k = body.replace(/[\s-]/g, "");
-    if (!/^[A-Za-z2-7]{16,128}$/.test(k) || !/[2-7]/.test(k) || (t !== t.toUpperCase() && t !== t.toLowerCase())) return false;
-    const groups = body.split(/[\s-]+/);
-    return groups.length === 1 || groups.every((g, i) => i < groups.length - 1 ? g.length === 4 : g.length >= 1 && g.length <= 4);
+    if (!/^[A-Za-z2-7]{16,128}$/.test(k) || (t !== t.toUpperCase() && t !== t.toLowerCase())) return false;
+    const groups = body.trim().split(/[\s-]+/);
+    if (groups.length === 1) return /[2-7]/.test(k);
+    return groups.every((g, i) => i < groups.length - 1 ? g.length === 4 : g.length >= 1 && g.length <= 4);
   };
   // Not the page's title, an option, anything in <head>, or an element nobody sees.
   const shown = (e) => {
