@@ -83,7 +83,9 @@ def login_write_result(parsed: Any, fills: list[dict[str, Any]], settle: int, ba
     if filled is None:
         return json.dumps(vault._FILL_UNVERIFIED)
     reasons = fill_reasons(parsed, len(fills))
-    base = {"backend": backend.name, "kind": meta.kind, "origin": page_origin}
+    from agent.vault_captcha import challenge_fields
+
+    base = {"backend": backend.name, "kind": meta.kind, "origin": page_origin, **challenge_fields(parsed)}
     pw_at = next((i for i, f in enumerate(fills) if f["token"] == "current-password"), None)
     password_missed = reasons is not None and pw_at is not None and reasons[pw_at] != "written"
     if filled == 0 or password_missed:
@@ -114,7 +116,7 @@ def login_write_result(parsed: Any, fills: list[dict[str, Any]], settle: int, ba
     return json.dumps(out)
 
 
-LOGGED_ACTIONS = ("fill", "enter_code", "save_login", "letter_login")
+LOGGED_ACTIONS = ("fill", "enter_code", "save_login", "letter_login", "reset_password", "enroll_totp")
 
 
 def log_outcome(args: dict[str, Any], result: dict[str, Any]) -> None:

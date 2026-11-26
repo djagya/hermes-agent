@@ -122,6 +122,22 @@ def gate(purpose: str, raw_controls: list[Any], handle: str, label: str, page_or
     has not been resolved either way."""
     if purpose not in WRITER_PURPOSES:
         return None, None
+    target, refusal = targets(purpose, raw_controls)
+    if refusal:
+        return None, refusal
+    ask =confirm_signup_fill if purpose == "signup" else confirm_reset_fill
+    outcome = outcome_of(ask(handle, label, page_origin, paired=target.confirm is not None))
+    if outcome != "accepted":
+        return None, not_given(f"{purpose}_declined", "Signup password fill" if purpose == "signup"
+                               else "Password reset fill", outcome)
+    if current_origin() != page_origin:
+        return None, _refuse("origin_changed", "The page origin changed during approval. Nothing was written.")
+    return target, None
+
+
+def targets(purpose: str, raw_controls: list[Any]) -> tuple[Any, Optional[str]]:
+    """``(targets, refusal)`` for the new-password writer, before any approval: the page's one new-password input
+    (plus its one explicit confirmation), or a refusal with a fixed ``reason`` code."""
     from agent.vault_login_classifier import LoginControl, select_signup_targets_detailed
 
     target, reason = select_signup_targets_detailed(
@@ -129,13 +145,6 @@ def gate(purpose: str, raw_controls: list[Any], handle: str, label: str, page_or
     if target is None:
         extra = {"next": _HINTS[reason]} if reason in _HINTS else {}
         return None, _refuse(f"{purpose}_target_unsupported", _UNSUPPORTED[purpose], reason=reason, **extra)
-    ask = confirm_signup_fill if purpose == "signup" else confirm_reset_fill
-    outcome = outcome_of(ask(handle, label, page_origin, paired=target.confirm is not None))
-    if outcome != "accepted":
-        return None, not_given(f"{purpose}_declined", "Signup password fill" if purpose == "signup"
-                               else "Password reset fill", outcome)
-    if current_origin() != page_origin:
-        return None, _refuse("origin_changed", "The page origin changed during approval. Nothing was written.")
     return target, None
 
 

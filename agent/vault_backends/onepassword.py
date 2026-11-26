@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -367,6 +368,102 @@ class OnePasswordLoginBackend(LoginBackend):
         except Exception:
             return None
         return code if code.isdigit() else None
+
+    # ── writes (D-1085 authenticator enrolment, D-1086 password reset) ─────
+    def save_login(self, handle: str, *, origin: str, password: str, username: str = "", title: str = "") -> str:
+        """Set ``password`` on the Login item ``handle`` (adding ``origin`` to its websites when missing), or,
+        without a handle, create a Login item for ``origin`` in the configured vault (default ``Hermes``).
+        Returns the item's handle. The password reaches op only inside a template file (:meth:`_write`)."""
+        if handle:
+            vault_id, item_id = self._resolve_handle(handle)
+            item = self._revealed(item_id, vault_id)
+            fields = item.setdefault("fields", [])
+            pw = [f for f in fields if isinstance(f, dict) and (f.get("purpose") == "PASSWORD" or f.get("id") == "password")]
+            if not pw:
+                fields.append(pw_field := {"id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password"})
+                pw = [pw_field]
+            for f in pw:
+                f["value"] = password
+            urls = item.setdefault("urls", [])
+            if origin not in _all_origins([str(u.get("href") or "") for u in urls if isinstance(u, dict)]):
+                urls.append({"href": origin})
+            self._write(["item", "edit", item_id, *(["--vault", vault_id] if vault_id else [])], item, password)
+            return f"{self.prefix}{vault_id}:{item_id}" if vault_id else handle
+        vault = str(self.cfg.get("vault") or "").strip() or "Hermes"
+        item = {"category": "LOGIN", "fields": [
+            {"id": "username", "type": "STRING", "purpose": "USERNAME", "label": "username", "value": username},
+            {"id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password", "value": password}]}
+        created = self._write(["item", "create", "--vault", vault, "--title", title or origin.split("://")[-1],
+                               "--url", origin], item, password)
+        vault_ref = created.get("vault") if isinstance(created.get("vault"), dict) else {}
+        item_id, vault_id = str(created.get("id") or ""), str(vault_ref.get("id") or "")
+        if not item_id or not vault_id:
+            raise BackendError(self.display_name, "op item create returned no item id")
+        return f"{self.prefix}{vault_id}:{item_id}"
+
+    def add_totp(self, handle: str, seed: str) -> bool:
+        """Store ``seed`` (an otpauth:// URI or a base32 key) in the item's one-time-password field. False when the
+        item already holds this key (nothing written); :class:`TotpAlreadySet` when it holds another one: an
+        authenticator the site may still use is never overwritten."""
+        vault_id, item_id = self._resolve_handle(handle)
+        item = self._revealed(item_id, vault_id)
+        fields = item.setdefault("fields", [])
+        held = {totp_key(str(f.get("value") or "")) for f in fields if isinstance(f, dict) and f.get("type") == "OTP"}
+        if totp_key(seed) in held:
+            return False
+        if held:
+            raise TotpAlreadySet(self.display_name)
+        fields.append({"id": "TOTP_hermes", "type": "OTP", "label": "one-time password", "value": seed})
+        self._write(["item", "edit", item_id, *(["--vault", vault_id] if vault_id else [])], item, seed)
+        return True
+
+    def _revealed(self, item_id: str, vault_id: Optional[str]) -> dict:
+        """The whole item, values included: an edit template replaces the item, so every field goes back as read."""
+        raw = self._run("item", "get", item_id, *(["--vault", vault_id] if vault_id else []), "--format", "json",
+                        "--reveal")
+        try:
+            item = json.loads(raw)
+        except ValueError:
+            item = None
+        if not isinstance(item, dict):
+            raise BackendError(self.display_name, "op item get returned no JSON item")
+        return item
+
+    def _write(self, args: list[str], item: dict, secret: str) -> dict:
+        """Run ``op <args> --template <file>``: the item JSON (with ``secret``) sits in a mode-600 file inside a
+        private temp dir that is removed afterwards, never in argv or env. op's error text keeps no copy of the
+        secret, and its answer (which echoes values) is reduced to the item's ids by the caller."""
+        with tempfile.TemporaryDirectory(prefix="hermes-op-") as tmp:
+            path = os.path.join(tmp, "item.json")
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as fh:
+                json.dump(item, fh)
+            try:
+                out = self._run(*args, "--template", path, "--format", "json")
+            except BackendError as exc:
+                exc.detail = exc.detail.replace(secret, "[REDACTED]") if secret else exc.detail
+                raise
+        self.invalidate_listing()
+        try:
+            created = json.loads(out)
+        except ValueError:
+            created = None
+        return created if isinstance(created, dict) else {}
+
+
+class TotpAlreadySet(BackendError):
+    error_type = "totp_already_set"
+    advice = ("this login already has a different authenticator key, and the site may still use it, so nothing was "
+              "saved or entered. Use enter_code with this handle for its codes; replacing an authenticator is the "
+              "user's call.")
+
+
+def totp_key(value: str) -> str:
+    """The base32 key of an otpauth:// URI or a bare key, upper-cased, without spaces, dashes or padding."""
+    from urllib.parse import parse_qs, urlsplit
+
+    if value.strip().lower().startswith("otpauth://"):
+        value = (parse_qs(urlsplit(value.strip()).query).get("secret") or [""])[0]
+    return "".join(value.split()).replace("-", "").rstrip("=").upper()
 
 
 def _login_password(item: object, backend: str) -> str:
