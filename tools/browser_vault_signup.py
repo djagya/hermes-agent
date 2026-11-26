@@ -122,6 +122,22 @@ def gate(purpose: str, raw_controls: list[Any], handle: str, label: str, page_or
     has not been resolved either way."""
     if purpose not in WRITER_PURPOSES:
         return None, None
+    target, refusal = targets(purpose, raw_controls)
+    if refusal:
+        return None, refusal
+    ask =confirm_signup_fill if purpose == "signup" else confirm_reset_fill
+    outcome = outcome_of(ask(handle, label, page_origin, paired=target.confirm is not None))
+    if outcome != "accepted":
+        return None, not_given(f"{purpose}_declined", "Signup password fill" if purpose == "signup"
+                               else "Password reset fill", outcome)
+    if current_origin() != page_origin:
+        return None, _refuse("origin_changed", "The page origin changed during approval. Nothing was written.")
+    return target, None
+
+
+def targets(purpose: str, raw_controls: list[Any]) -> tuple[Any, Optional[str]]:
+    """``(targets, refusal)`` for the new-password writer, before any approval: the page's one new-password input
+    (plus its one explicit confirmation), or a refusal with a fixed ``reason`` code."""
     from agent.vault_login_classifier import LoginControl, select_signup_targets_detailed
 
     target, reason = select_signup_targets_detailed(
@@ -129,13 +145,6 @@ def gate(purpose: str, raw_controls: list[Any], handle: str, label: str, page_or
     if target is None:
         extra = {"next": _HINTS[reason]} if reason in _HINTS else {}
         return None, _refuse(f"{purpose}_target_unsupported", _UNSUPPORTED[purpose], reason=reason, **extra)
-    ask = confirm_signup_fill if purpose == "signup" else confirm_reset_fill
-    outcome = outcome_of(ask(handle, label, page_origin, paired=target.confirm is not None))
-    if outcome != "accepted":
-        return None, not_given(f"{purpose}_declined", "Signup password fill" if purpose == "signup"
-                               else "Password reset fill", outcome)
-    if current_origin() != page_origin:
-        return None, _refuse("origin_changed", "The page origin changed during approval. Nothing was written.")
     return target, None
 
 
@@ -171,18 +180,18 @@ def outcome_tokens() -> dict[str, str]:
     return new_signup_outcome_tokens()
 
 
-_NO_SUBMIT = "Nothing was submitted. Do not submit the form and do not retry the fill; tell the user."
+NO_SUBMIT = "Nothing was submitted. Do not submit the form and do not retry the fill; tell the user."
 _FAILURES = {
     "signup_fill_partial": "The fill stopped part-way: the form changed or a write failed between fields, so up to "
                            "fields_possibly_written of the approved password fields may hold the password. "
-                           + _NO_SUBMIT,
+                           + NO_SUBMIT,
     "signup_form_changed": "The password was written into every approved field, but afterwards the form no longer "
                            "matched what was approved (a field, its type or role, the form or its action changed, or "
-                           "another password or code field appeared), so the fill cannot be confirmed. " + _NO_SUBMIT,
+                           "another password or code field appeared), so the fill cannot be confirmed. " + NO_SUBMIT,
     "signup_fields_not_retained": "The password was written, but after the page settled at least one approved field "
-                                  "no longer held it (field_retention names which). " + _NO_SUBMIT,
+                                  "no longer held it (field_retention names which). " + NO_SUBMIT,
     "signup_fill_uncertain": "The browser did not return a verifiable answer: one or more password fields may have "
-                             "been written. " + _NO_SUBMIT,
+                             "been written. " + NO_SUBMIT,
 }
 _ROLES = ("new-password", "confirm-password")
 
@@ -242,3 +251,21 @@ def finish(raw: Any, backend_name: str, kind: str, page_origin: str, target: Any
                                           else "Submit the form; the site then uses the saved password.")})
     return _failure("signup_fields_not_retained", base, filled_fields=bits.count("1"),
                     field_retention={f: ("held" if b == "1" else "lost") for f, b in zip(fields, bits)})
+
+
+def with_challenge(task_id: str, result: str) -> str:
+    """``result`` plus ``challenge`` / ``challenge_next`` when the page shows a captcha after the write (the login
+    fill reads it inside its own script; the signup writer answers one token, so this is one more non-secret
+    read). A failed read adds nothing."""
+    from agent.vault_captcha import CAPTCHA_JS, challenge_fields
+    from tools import browser_vault_tool as vault
+
+    try:
+        read = vault._eval_js(task_id, "(" + CAPTCHA_JS + ")()")
+        code = read.get("result") if read.get("success") else None
+        if isinstance(code, str) and code.startswith('"'):
+            code = json.loads(code)
+        extra = challenge_fields({"challenge": code})
+        return json.dumps({**json.loads(result), **extra}) if extra else result
+    except Exception:  # health: allow BLE001 -- the captcha note is advice; the write result stands without it
+        return result

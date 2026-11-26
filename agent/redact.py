@@ -609,6 +609,12 @@ def _redact_telegram_token(match: re.Match) -> str:
             return match.group(0)
     return f"{boundary}{match.group('bot') or ''}{match.group('id')}:***"
 
+# An authenticator setup link in any spelling: plain, URL-encoded (a QR image URL carries ``otpauth%3A%2F%2F...``),
+# double-encoded, JSON-escaped (``otpauth:\/\/``), HTML-entity (``otpauth&#58;//``, ``&#x3a;``, ``&colon;``): the word and all that follows it.
+# Only when a colon (in any of those spellings) follows: ``import ... from "otpauth"`` and ``otpauth_uri(...)`` stay.
+_OTPAUTH_RE = re.compile(r"otpauth(?=:|%3A|%253A|&#0*58;?|&#x0*3a;?|&colon;|\\:|\\u003a)\S*", re.IGNORECASE)
+# The seed of a link whose label has a space (``otpauth://totp/ACME Co:jane?secret=...``, cut by the ``\S*`` above).
+_OTP_SECRET_RE = re.compile(r"(secret(?:=|%3D|%253D|&#0*61;?|&#x0*3d;?|&equals;|\\u003d))[A-Z2-7]{16,}", re.IGNORECASE)
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
 # A base64-encoded PEM private key: kubeconfig's ``client-key-data`` and the ``*_b64``
 # fields around it (``kubectl config view --raw``, cloud-init, CI secrets). The name is
@@ -1494,6 +1500,11 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         return text
     # Vault secrets are a hard model-egress boundary: scrubbed regardless of the redact_secrets preference.
     text = redact_registered_vault_values(text, audience=vault)
+    lowered = text.lower()
+    if "otpauth" in lowered:  # an authenticator setup link carries the seed: never shown, registered or not
+        text = _OTPAUTH_RE.sub("otpauth://[REDACTED]", text)
+    if "secret" in lowered:
+        text = _OTP_SECRET_RE.sub(r"\1[REDACTED]", text)
     if not (force or _redact_enabled()):
         return text
     # ``secret_file`` is authoritative: a caller that classified the source as secret-bearing must not

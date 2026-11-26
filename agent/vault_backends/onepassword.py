@@ -14,11 +14,12 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.secret_sources.base import run_cli
 from agent.secret_sources.onepassword import _OP_ENV_ALLOWLIST, _scrub, find_op
@@ -56,7 +57,7 @@ _AUTH_MARKERS = ("unauthorized", "invalid token", "token expired", "expired toke
 _SESSION_MARKERS = ("session", "sign in", "not signed in")
 _NETWORK_MARKERS = ("dial tcp", "no such host", "connection refused", "connection reset", "network is unreachable",
                     "i/o timeout", "timed out", "timeout", "tls handshake", "could not connect", "eof",
-                    "temporary failure in name resolution")
+                    "temporary failure in name resolution", "deadline exceeded")
 
 
 def clear_list_cache() -> None:
@@ -123,19 +124,28 @@ class OnePasswordLoginBackend(LoginBackend):
         if not _unlock.store_session_token(self.name, token, generation):
             raise RuntimeError("1Password was locked while unlocking; try again")
 
-    def _run(self, *args: str) -> str:
+    def _run(self, *args: str, secret: tuple[str, ...] = ()) -> str:
+        """op's stdout; a failure raises its typed cause with op's stderr (each ``secret``, a value a write sent in
+        argv, cut out of it in any case before it is kept). The raised error is made after the failed call's own
+        exception is gone, so nothing reachable from it (``__context__``, ``__cause__``) holds the argv."""
         token = None if self._service_token else _unlock.get_session_token(self.name)
         if not self._service_token and not token:
             raise UnlockRequired(self)
+        proc, failure = None, ""
         try:
             proc = run_cli([str(self._op()), *args], env=self._env(token), timeout=_TIMEOUT, label="op",
                            timeout_message="op timed out", stdin=subprocess.DEVNULL)
-        except RuntimeError as exc:
-            if "timed out" in str(exc):
-                raise BackendNetwork(self.display_name, f"op timed out after {_TIMEOUT:.0f}s") from None
-            raise
+        except RuntimeError as exc:  # its cause (TimeoutExpired) carries the argv: keep only the message
+            failure = str(exc)
+        if proc is None:
+            if "timed out" in failure:
+                raise BackendNetwork(self.display_name, f"op timed out after {_TIMEOUT:.0f}s")
+            raise RuntimeError(failure)
         if proc.returncode != 0:
-            raise self._classify(_scrub(proc.stderr or ""))
+            err = _scrub(proc.stderr or "")
+            for value in filter(None, secret):
+                err = re.sub(re.escape(value), "[REDACTED]", err, flags=re.IGNORECASE)
+            raise self._classify(err)
         return proc.stdout or ""
 
     def _classify(self, err: str) -> Exception:
@@ -367,6 +377,150 @@ class OnePasswordLoginBackend(LoginBackend):
         except Exception:
             return None
         return code if code.isdigit() else None
+
+    # ── writes (D-1085 authenticator enrolment, D-1086 password reset) ─────
+    def generate_login(self, handle: str, *, origin: str, username: str = "", title: str = "", length: int = 20,
+                       symbols: bool = True) -> str:
+        """Give the Login item ``handle`` a password op generates (the item's other fields, passkey and files are
+        untouched: ``op item edit --generate-password`` sets only the password field), or, without a handle, create
+        a Login item for ``origin`` in the configured vault (default ``Hermes``) with one. Returns the item's
+        handle. No password crosses this process: op generates it and :meth:`resolve_password` reads it back."""
+        recipe = "--generate-password=letters,digits" + (",symbols" if symbols else "") + f",{length}"  # op help order
+        if handle:
+            vault_id, item_id = self._resolve_handle(handle)
+            try:
+                self._run("item", "edit", item_id, *(["--vault", vault_id] if vault_id else []), recipe)
+            finally:  # a write that timed out may have been applied: the cached listing is stale either way
+                self.invalidate_listing()
+            return f"{self.prefix}{vault_id}:{item_id}" if vault_id else handle
+        vault = str(self.cfg.get("vault") or "").strip() or "Hermes"
+        try:
+            out = self._run("item", "create", "--category", "login", "--vault", vault, "--title",
+                            title or origin.split("://")[-1], "--url", origin, recipe, "--format", "json",
+                            f"username={username}")
+        finally:
+            self.invalidate_listing()
+        try:
+            created = json.loads(out)
+        except ValueError:
+            created = None
+        created = created if isinstance(created, dict) else {}
+        vault_ref = created.get("vault") if isinstance(created.get("vault"), dict) else {}
+        item_id, vault_id = str(created.get("id") or ""), str(vault_ref.get("id") or "")
+        if not item_id or not vault_id:
+            raise BackendError(self.display_name, "op item create returned no item id")
+        return f"{self.prefix}{vault_id}:{item_id}"
+
+    def add_totp(self, handle: str, seed: str) -> bool:
+        """Store ``seed`` (an otpauth:// URI or a base32 key) in the item's "Hermes authenticator" one-time-password
+        field with one ``op item edit`` field assignment: op changes that field only, so a passkey, files and every
+        other field stay as they are. False when the item already holds this key with the same algorithm, digits and
+        period (nothing written; the same key with other settings is replaced like a new one). A key in any
+        other one-time-password field is never touched (:class:`TotpAlreadySet`); a different key in Hermes's own
+        field (an enrolment the site may never have confirmed) is replaced, and in the same call kept in a concealed
+        "Hermes previous authenticator key <hash>" field (its own label per old key, so a later replace keeps it
+        too). The key is in op's argv for that one call only."""
+        vault_id, item_id = self._resolve_handle(handle)
+        where = ["--vault", vault_id] if vault_id else []
+        fields = [f for f in self._revealed(item_id, vault_id).get("fields") or [] if isinstance(f, dict)]
+        held = [f for f in fields if str(f.get("type") or "").upper() == "OTP" and str(f.get("value") or "").strip()]
+        # The same key is nothing to do, unless the new seed is a link that names other settings (a bare key names
+        # none, so it never replaces a stored link's 8 digits or SHA256 with the defaults).
+        linked = seed.strip().lower().startswith("otpauth:")
+        if any(totp_key(str(f["value"])) == totp_key(seed)
+               and (not linked or _totp_settings(str(f["value"])) == _totp_settings(seed)) for f in held):
+            return False
+        mine = [f for f in held if _is_hermes_field(f)]
+        if len(mine) != len(held):
+            raise TotpAlreadySet(self.display_name)
+        if any(not (_is_hermes_field(f) and str(f.get("type") or "").upper() == "OTP")
+               for f in fields if _op_would_match(f)):
+            raise TotpFieldConflict(self.display_name)  # the assignment would overwrite and retype that field
+        old = str(mine[0]["value"]) if mine else ""
+        assign = [f"{_TOTP_LABEL}[otp]={seed}"] + ([f"{_previous_label(old)}[password]={old}"] if old else [])
+        try:
+            self._run("item", "edit", item_id, *where, *assign, secret=(seed, totp_key(seed), old, totp_key(old)))
+        finally:
+            self.invalidate_listing()
+        return True
+
+    def _revealed(self, item_id: str, vault_id: Optional[str]) -> dict:
+        """The item with its field values (read only: no write sends it back)."""
+        raw = self._run("item", "get", item_id, *(["--vault", vault_id] if vault_id else []), "--format", "json",
+                        "--reveal")
+        try:
+            item = json.loads(raw)
+        except ValueError:
+            item = None
+        if not isinstance(item, dict):
+            raise BackendError(self.display_name, "op item get returned no JSON item")
+        return item
+
+
+# Labels of the fields add_totp writes (no ".", "=" or backslash, which op's assignment syntax would need
+# escaped). The field is Hermes's by its label at item level: op assigns the ids.
+_TOTP_LABEL = "Hermes authenticator"
+_PREVIOUS_LABEL = "Hermes previous authenticator key"
+
+
+def _previous_label(old: str) -> str:
+    """The field that keeps a replaced key: labelled with a short hash of that key and its settings (hex: nothing
+    to escape), so the same seed with other algorithm, digits or period keeps its own field."""
+    return f"{_PREVIOUS_LABEL} {hashlib.sha256('|'.join((totp_key(old), *_totp_settings(old))).encode()).hexdigest()[:8]}"
+
+
+def _is_hermes_field(field: dict) -> bool:
+    section = field.get("section") if isinstance(field.get("section"), dict) else {}
+    return field.get("label") == _TOTP_LABEL and not section.get("label")
+
+
+def _op_would_match(field: Any) -> bool:
+    """``op item edit 'Hermes authenticator[otp]=...'`` (no section) takes any field in any section whose label
+    equals the name ignoring spaces, or whose id is that name. Case: op's rule is not checked here, so any case
+    counts (a field too many is refused, never overwritten)."""
+    squash = lambda text: str(text or "").replace(" ", "").casefold()
+    return isinstance(field, dict) and (squash(field.get("label")) == squash(_TOTP_LABEL)
+                                        or field.get("id") == _TOTP_LABEL)
+
+
+class TotpFieldConflict(BackendError):
+    error_type = "totp_field_conflict"
+    advice = ("this login already has a field named \"Hermes authenticator\" that is not a one-time-password field "
+              "Hermes wrote, and saving the key would overwrite it, so nothing was saved or entered. Tell the user.")
+
+
+class TotpAlreadySet(BackendError):
+    error_type = "totp_already_set"
+    advice = ("this login already has a different authenticator key, and the site may still use it, so nothing was "
+              "saved or entered. Use enter_code with this handle for its codes; replacing an authenticator is the "
+              "user's call.")
+
+
+def totp_key(value: str) -> str:
+    """The base32 key of an otpauth:// URI or a bare key, upper-cased, without spaces, dashes or padding."""
+    from urllib.parse import parse_qs, urlsplit
+
+    if value.strip().lower().startswith("otpauth://"):
+        try:
+            value = (parse_qs(urlsplit(value.strip()).query).get("secret") or [""])[0]
+        except ValueError:  # a malformed candidate is no key; the parser's message may quote it, so say nothing
+            return ""
+    return "".join(value.split()).replace("-", "").rstrip("=").upper()
+
+
+def _totp_settings(value: str) -> tuple[str, str, str]:
+    """The algorithm, digits and period an authenticator key (an otpauth:// URI or a bare key) means, with the
+    defaults (SHA1, 6, 30) for what it does not say."""
+    from urllib.parse import parse_qs, urlsplit
+
+    query: dict = {}
+    if value.strip().lower().startswith("otpauth://"):
+        try:
+            query = parse_qs(urlsplit(value.strip()).query)
+        except ValueError:
+            pass
+    pick = lambda name, default: ((query.get(name) or [""])[0].strip() or default)
+    return pick("algorithm", "SHA1").upper(), pick("digits", "6"), pick("period", "30")
 
 
 def _login_password(item: object, backend: str) -> str:

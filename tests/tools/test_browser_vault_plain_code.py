@@ -243,15 +243,26 @@ class El {
     this.tagName = tag; this.parentElement = null; this.children = []; this.text = p.text || "";
     this.attrs = {}; this.type = p.type || ""; this.name = p.name || ""; this.id = p.id || "";
     this.autocomplete = p.autocomplete || ""; this.unreadable = !!p.unreadable; this.disabled = false; this.readOnly = false; this.labels = [];
-    this.maxLength = (p.maxLength ?? -1); this.value = ""; this.isConnected = true;
+    this.maxLength = (p.maxLength ?? -1); this.value = p.value || ""; this.isConnected = true; this.action = p.action || "";
     this.style = Object.assign({ display: "block", visibility: "visible", opacity: "1" }, p.style || {});
     this.rect = p.rect || { left: 10, top: 10, width: 200, height: 30, right: 210 };
     if (p.aria) this.attrs["aria-label"] = p.aria;
     if (p.placeholder) this.attrs.placeholder = p.placeholder;
+    if (p.alt) this.attrs.alt = p.alt;
+    if (p.role) this.attrs.role = p.role;
+    if (p.htmlType) this.attrs.type = p.htmlType;  // a <button>'s type ATTRIBUTE (absent = submit)
     if (p.ref) refs[p.ref] = this;
     for (const k of kids.flat()) { k.parentElement = this; this.children.push(k); }
   }
   get form() { for (let n = this.parentElement; n; n = n.parentElement) if (n.tagName === "FORM") return n; return null; }
+  get nodeType() { return 1; }
+  get childNodes() { return (this.text ? [{ nodeType: 3, data: this.text }] : []).concat(this.children); }
+  matches(sel) {  // tag, [attr=value], tag[attr=value], comma-separated: what the inspection asks
+    return sel.split(",").some((s) => {
+      const m = /^([a-z0-9]*)(?:\[([\w-]+)=([\w-]+)\])?$/i.exec(s.trim());
+      return !!m && (!m[1] || m[1].toUpperCase() === this.tagName) && (!m[2] || this.attrs[m[2]] === m[3]);
+    });
+  }
   get textContent() { return this.text + this.children.map((c) => c.textContent).join(" "); }
   get innerText() {
     if (this.unreadable) throw new Error("not readable");

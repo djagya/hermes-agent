@@ -1,5 +1,7 @@
 """Vault-value registry redaction: digit values leave no oracle; short-lived codes expire (agent.redact_vault)."""
 
+import pytest
+
 
 class TestVaultDigitValuesLeaveNoOracle:
     """r8 (owner policy: card values never reach the model): a pure-digit vault value is masked by length,
@@ -224,3 +226,58 @@ class TestVaultRedactionByAudience:
             assert "unter-42-pw" not in out, out
         finally:
             redact.clear_vault_redaction_values()
+
+
+@pytest.mark.parametrize("page", [
+    'scan <a href="otpauth://totp/Shop:jane?secret=JBSWY3DPEHPK3PXP&issuer=Shop">link</a> or type it',
+    "OTPAUTH://TOTP/SHOP:JANE?SECRET=JBSWY3DPEHPK3PXP",  # upper case (r2 review Low)
+    '<img src="https://qr.example/c?data=otpauth%3A%2F%2Ftotp%2FShop%3Ajane%3Fsecret%3DJBSWY3DPEHPK3PXP">',
+    "data=otpauth%3a%2f%2ftotp%2fShop%3fsecret%3dJBSWY3DPEHPK3PXP",  # URL-encoded, lower-case escapes
+    '{"uri": "otpauth:\\/\\/totp\\/Shop:jane?secret=JBSWY3DPEHPK3PXP"}',  # JSON-escaped slashes (r3 Low 4)
+    "otpauth%3A//totp/Shop?secret=JBSWY3DPEHPK3PXP",  # only the colon encoded
+    "data=otpauth%253A%252F%252Ftotp%252FShop%253Fsecret%253DJBSWY3DPEHPK3PXP",  # double-encoded
+    '<a href="otpauth&#58;//totp/Shop?secret=JBSWY3DPEHPK3PXP">',  # HTML entity colon
+    '<a href="otpauth&#x3a;//totp/Shop?secret=JBSWY3DPEHPK3PXP">',  # hex entity colon, both cases, and the named one
+    '<a href="otpauth&#x3A;//totp/Shop?secret=JBSWY3DPEHPK3PXP">',
+    '<a href="otpauth&colon;//totp/Shop?secret=JBSWY3DPEHPK3PXP">',
+], ids=["link", "upper-case", "url-encoded", "url-encoded-lower", "json-escaped", "colon-encoded", "double-encoded",
+        "html-entity", "hex-entity", "hex-entity-upper", "named-entity"])
+def test_an_authenticator_setup_link_is_never_shown_even_unregistered(page):
+    """J-0643 (Opus A2): a setup page read before enroll_totp must not hand the model the seed."""
+    from agent.redact import redact_sensitive_text
+
+    for audience in ("browser", "model", "log"):
+        out = redact_sensitive_text(page, force=True, vault=audience)
+        assert "JBSWY3DPEHPK3PXP" not in out and "otpauth://[REDACTED]" in out
+
+
+
+@pytest.mark.parametrize("page", [
+    "otpauth://totp/ACME Co:jane?secret=JBSWY3DPEHPK3PXP&issuer=ACME Co",  # a label with a space cuts the link
+    "otpauth://totp/ACME Co:jane?issuer=ACME Co&Secret=jbswy3dpehpk3pxp",
+    "data=otpauth%3A%2F%2Ftotp%2FACME Co%3Ajane%3Fsecret%253DJBSWY3DPEHPK3PXP",
+    "https://qr.example/c?x=1&secret%3DJBSWY3DPEHPK3PXP",
+    "otpauth://totp/ACME Co:jane?secret&#61;JBSWY3DPEHPK3PXP&issuer=ACME Co",  # "=" as an HTML entity
+    "otpauth://totp/ACME Co:jane?secret&#x3d;JBSWY3DPEHPK3PXP&issuer=ACME Co",
+    "otpauth://totp/ACME Co:jane?secret&equals;JBSWY3DPEHPK3PXP&issuer=ACME Co",
+    "otpauth://totp/ACME Co:jane?secret&#061;JBSWY3DPEHPK3PXP&issuer=ACME Co",
+    "otpauth://totp/ACME Co:jane?secret&#61JBSWY3DPEHPK3PXP&issuer=ACME Co",
+    '{"u": "otpauth\\u003a//totp/ACME Co:jane?secret\\u003dJBSWY3DPEHPK3PXP"}',
+], ids=["space-in-label", "lower-case-seed", "encoded-with-space", "bare-encoded-secret", "equals-decimal",
+        "equals-hex", "equals-named", "equals-zero-padded", "equals-no-semicolon", "json-unicode-escape"])
+def test_a_seed_is_never_shown_when_a_space_cuts_the_setup_link(page):
+    from agent.redact import redact_sensitive_text
+
+    for audience in ("browser", "model", "log"):
+        assert "jbswy3dpehpk3pxp" not in redact_sensitive_text(page, force=True, vault=audience).lower()
+
+
+@pytest.mark.parametrize("code", [
+    'import * as OTPAuth from "otpauth";',
+    "const uri = otpauth_uri(secret, issuer);",
+    "require('otpauth').TOTP",
+], ids=["import", "function-name", "require"])
+def test_source_code_that_only_names_the_otpauth_library_is_left_alone(code):
+    from agent.redact import redact_sensitive_text
+
+    assert redact_sensitive_text(code, force=True, vault="model") == code

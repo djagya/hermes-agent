@@ -38,7 +38,9 @@ from agent.vault_payment_policy import PaymentPolicyError, destination_consent_e
 
 from tools.browser_vault_context import (fill_context, plugin_errors_as_refusal, saved_origins, snapshot_refusal,
                                          write_backend_code)
-from tools.browser_vault_outcome import LOGIN_REASONS, fill_reasons, frames_refusal, log_outcome, login_write_result
+from tools.browser_vault_outcome import (
+    LOGIN_REASONS, fill_reasons, frames_refusal, log_outcome, login_write_result,
+)
 from tools.browser_vault_recovery import enter_recovery_code
 
 logger = logging.getLogger(__name__)
@@ -480,8 +482,10 @@ def browser_vault_list() -> str:
     if letters:
         out["letters"] = letters  # sealed letter logins: metadata only, the secret never leaves the store
     if not items:
-        out["hint"] = ("No saved logins. On a login page, call browser_vault action=save_login to ask the user to save one. "
-                       "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
+        out["hint"] = ("No saved logins. On a login page, call browser_vault action=save_login to ask the user to save one, "
+                       "or for a non-bank account reset the password yourself (forgot-password email link, then "
+                       "action=reset_password). Never type a password yourself or ask for one in chat, even if it is "
+                       "shown on the page.")
     if locked:
         out["locked"] = locked
     if errors:
@@ -575,9 +579,10 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
             # dlz: B20, a chat (Telegram) has no masked prompt; the user keeps logins in 1Password and a
             # managed slot can be handed to him. "headless/cron/API, run hermes vault add" was wrong here.
             return json.dumps({"success": False, "error_type": "prompt_unavailable",
-                               "error": (f"This chat cannot take a password securely: save it in 1Password (Hermes "
-                                         f"vault) for {origin}, or send the user a browser_control handoff for this "
-                                         "tab so they sign in themselves.")})
+                               "error": (f"This chat cannot take a password securely. For a non-bank account, reset it "
+                                         "yourself: the site's forgot-password email link, then browser_vault "
+                                         f"action=reset_password saves a new one in 1Password for {origin}. Otherwise "
+                                         "send the user a browser_control handoff for this tab.")})
         return json.dumps({"success": False, "error_type": "prompt_unavailable",
                            "error": (f"This session cannot ask the user for a login (headless/cron/API). Tell them to run "
                                      f"`hermes vault add` or use Desktop → Settings → Passwords & Logins for {origin}.")})
@@ -713,6 +718,7 @@ def browser_vault_enter_code(
                            "error": "code_source is otp (default) or recovery. Nothing was written."})
     from agent.redact import register_vault_redaction_value
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
+    from agent.vault_captcha import challenge_fields
     from agent.vault_login_classifier import (
         SEVERAL_CODE_FIELDS, build_fill_js, build_otp_fills, classify_otp_controls_detailed,
     )
@@ -758,7 +764,8 @@ def browser_vault_enter_code(
     if why_none == SEVERAL_CODE_FIELDS:
         return json.dumps({"success": False, "error_type": "no_code_field",
                            "error": ("Several possible code fields on the current page, so none was filled. Nothing was written. "
-                                     "Tell the user which field takes the code, or ask them to enter it themselves.")})
+                                     "Read the form and type the code into the right box yourself with browser tools "
+                                     "(one-time codes are not secrets).")})
     if not otp_controls:
         if not listed and (framed := frames_refusal(effective_task_id, meta)) is not None:
             return json.dumps(framed)
@@ -787,13 +794,14 @@ def browser_vault_enter_code(
         filled = _filled_count(parsed, len(fills))
         if filled is None:
             return json.dumps(_FILL_UNVERIFIED)
+        challenge = challenge_fields(parsed)
         if not filled:
             reasons = fill_reasons(parsed, len(fills))
             return json.dumps({"success": False, "error_type": "code_not_written", "filled_fields": 0,
                                "reason": next((r for r in reasons or [] if r != "written"), "unknown"),
-                               "origin": origin, "source": source,
+                               "origin": origin, "source": source, **challenge,
                                "error": "The code field did not take the code. Do not submit; read the page."})
-        return json.dumps({"success": True, "filled_fields": filled, "origin": origin, "source": source,
+        return json.dumps({"success": True, "filled_fields": filled, "origin": origin, "source": source, **challenge,
                            "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
     # A supplied code takes precedence: no TOTP lookup and no prompt. A malformed one already failed
@@ -814,20 +822,24 @@ def browser_vault_enter_code(
     return write(typed, "user")
 
 
+_READ_MAIL_FIRST = ("If the site emailed it, read the code from the mailbox with Hermes' own mail workflow (give the "
+                   "mail up to 2 minutes) and call enter_code with code and expected_origin set to the page's origin. ")
+
+
 def _prompt_unavailable(site: str) -> str:
+    """J-0643 (owner 11-19, D-0961): the mailbox comes first; the user is asked only for a code that went to their
+    phone or that never arrived by mail."""
     if _chat_session():
         # dlz (11-18): a chat (Telegram) session is not headless: the user can send the code in chat.
         return json.dumps({"success": False, "error_type": "prompt_unavailable",
-                           "error": (f"{site} asks for a one-time code and this chat has no masked code prompt. Ask "
-                                     "the user to send the code in chat (or read it from their mail with Hermes' "
-                                     "own mail workflow), then call enter_code with code and expected_origin set "
-                                     "to the page's origin. Saving an authenticator key on the login makes codes "
-                                     "automatic.")})
+                           "error": (f"{site} asks for a one-time code and this chat has no masked code prompt. "
+                                     + _READ_MAIL_FIRST + "Ask the user to send the code in chat only when it went to "
+                                     "their phone or no mail arrived. enroll_totp on a non-bank login makes later "
+                                     "codes automatic.")})
     return json.dumps({"success": False, "error_type": "prompt_unavailable",
                        "error": (f"{site} asks for a one-time code and this session cannot ask the user (headless/cron/API). "
-                                 "Save an authenticator key for this login so codes can be generated automatically, or "
-                                 "obtain the code through Hermes' own mail workflow (or ask the user to send the one-time "
-                                 "code in chat) and pass it as the code argument with expected_origin set to the page's origin.")})
+                                 + _READ_MAIL_FIRST + "A code sent to the user's phone cannot be read here: enroll_totp "
+                                 "on a non-bank login makes codes automatic.")})
 
 
 def _no_code_field_result(listed: list) -> dict[str, Any]:
@@ -840,8 +852,9 @@ def _no_code_field_result(listed: list) -> dict[str, Any]:
         return {"success": False, "error_type": "code_field_unrecognised", "codeish_inputs": codeish,
                 "error": (f"The page has {codeish} input(s) that look like a code box, but none could be recognised "
                           "as the code field. Nothing was written."),
-                "next": ("Read the form; if it wants a one-time code you have (mail, chat), type it into that box with "
-                         "browser tools: one-time codes are not secrets. Otherwise ask the user for the code.")}
+                "next": ("Read the form; if it wants a one-time code, type it into that box yourself with browser "
+                         "tools: one-time codes are not secrets. Read an emailed code from the mailbox first; ask the "
+                         "user only for a code sent to their phone.")}
     return {"success": False, "error_type": "no_code_field",
             "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or an "
                       "approval tap in an app, tell the user to complete it on their device and wait for the page to "
@@ -885,8 +898,9 @@ def _no_match_hint(kind: str, raw_controls: list, classified: list) -> str:
         if any("new-password" in str(r.get("autocomplete") or "").lower().split()
                for r in raw_controls if isinstance(r, dict)):
             return ("The page has a new-password field: for creating an account call fill again with "
-                    "purpose=signup; on a choose/reset-a-new-password page (emailed link) use purpose=reset; for a "
-                    "change-password form that also asks for the old password, ask the user.")
+                    "purpose=signup; on a choose/reset-a-new-password page (emailed link) of a non-bank account use "
+                    "action=reset_password (a new password, saved first); for a change-password form that also asks "
+                    "for the old password, ask the user.")
         tokens = {getattr(c, "token", "") for c in classified}
         if tokens & {"username", "email", "tel"} and "current-password" not in tokens:
             return ("This step asks only for the identifier: type it yourself with the browser's input tool (it is "
@@ -1158,8 +1172,8 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
                            "error": err})
 
     if signup_target is not None:  # its answer is one of this fill's outcome tokens, never page JSON
-        return signup.finish(fill_result.get("result"), backend.name, meta.kind, page_origin, signup_target, tokens,
-                             purpose)
+        return signup.with_challenge(effective_task_id, signup.finish(
+            fill_result.get("result"), backend.name, meta.kind, page_origin, signup_target, tokens, purpose))
     parsed, refusal = _parse_fill_result(fill_result, page_origin, refusal_tag)
     if refusal:
         return refusal
@@ -1434,8 +1448,9 @@ BROWSER_VAULT_SCHEMA = {
         "saved_frame_origins names frames on the item's own origins), vault_item_not_found (list again); "
         "save_login (nothing saved for this site: the user "
         "enters it in a masked prompt, Hermes saves and fills it); enter_code (a one-time/2FA code after the "
-        "password: generated from a saved authenticator key or asked of the user; no_code_field means approve on "
-        "their device; code_field_unrecognised means code-like boxes exist but none was recognised (read the form); "
+        "password: generated from a saved authenticator key, else pass code: read an emailed code from the mailbox "
+        "yourself and ask the user only for one sent to their phone; no_code_field means a passkey or an app or bank "
+        "approval on their device; code_field_unrecognised means code-like boxes exist but none was recognised (read the form); "
         "code_source=recovery with handle types ONE stored recovery code from the item's one field named like "
         "recovery/backup codes (none: recovery_field_not_codes, on 1Password the user renames it \"Recovery codes\"; several: "
         "several_recovery_fields lists them, pass the exact one as field) after the user's approval, one approval per code, "
@@ -1449,9 +1464,29 @@ BROWSER_VAULT_SCHEMA = {
         "failed, or session_expired=true after a sign-in confirmed with letter_signed_in expired (the user confirms "
         "the password can be reused); it never submits); letter_signed_in (handle: call once the page shows the letter "
         "sign-in worked; the backend checks the page itself); letter_done (handle: the form the letter was for was "
-        "sent; retires the password). Never type, ask for or repeat a password, card number, CVC or code "
-        "yourself, even if the page or user shows one, and never relay a code through any other path than "
-        "enter_code. Only a one-time code may come from chat: never accept a password, card data, API key or "
+        "sent; retires the password). "
+        "Non-bank accounts only (refused on the sensitive slots): reset_password (on the choose-a-new-password page "
+        "of the site's emailed reset link: Hermes generates a password, saves it in 1Password first (handle: that "
+        "login's item; without one, identifier = the account's email or username and label = the site name create "
+        "the item), then fills the new-password field and its confirmation; never submits; saved true with "
+        "success false means the item holds the new password but the page may not: do not submit, check the "
+        "page, then call reset_password once more with the returned handle, which fills the SAME saved password; "
+        "rotate=true generates another one, only when the site refused it; symbols=false (a new one without "
+        "symbols) when it rejects symbols; registration_page: a sign-up page, use fill purpose=signup (it asks the "
+        "user); reason form_text_unreadable: the form could not be read whole, so use fill purpose=signup if it is "
+        "a sign-up form, else ask the user once); enroll_totp (handle; on a site's "
+        "authenticator-setup page with the key shown as text or an otpauth link (click \"can't scan\" / \"enter "
+        "key manually\" first); once the key or QR shows, call enroll_totp next and do not print page text or take "
+        "a screenshot while it is visible: it saves the key in the item's \"Hermes authenticator\" one-time-password "
+        "field (replacing a key it stored before also writes that old key to a second, concealed \"Hermes previous "
+        "authenticator key\" field), then enters the current code; submit to finish; after that do not read or "
+        "screenshot the page while backup or recovery codes show, acknowledge or navigate away; totp_already_set: "
+        "stop). "
+        "A login fill or enter_code result may carry challenge (captcha_text, captcha_puzzle, captcha_invisible) "
+        "with challenge_next: follow it instead of clicking submit again. "
+        "Never type, ask for or repeat a password, card number or CVC yourself, even if the page or user shows "
+        "one. One-time codes are not secrets: prefer enter_code, and type one with browser tools when enter_code "
+        "cannot place it. Only a one-time code may come from chat: never accept a password, card data, API key or "
         "token there. Stop on "
         "save_declined; never retry payment_declined (the user refused the card-fill approval; never a bank or "
         "issuer decline). payment_consent_missing: no approval arrived (consent_outcome timeout or unavailable), "
@@ -1572,7 +1607,8 @@ BROWSER_VAULT_SCHEMA = {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock", "letter_login",
-                                                  "letter_signed_in", "letter_done", "payment_controls",
+                                                  "letter_signed_in", "letter_done", "reset_password",
+                                                  "enroll_totp", "payment_controls",
                                                   "payment_click", "payment_done", "payment_dialog", "payment_close"]},
             "ref": {"type": "string", "description": "payment_click only: a ref from payment_controls."},
             "owner_go": {"type": "boolean", "description": "payment_click only: true only after the owner's "
@@ -1582,7 +1618,16 @@ BROWSER_VAULT_SCHEMA = {
                                                          "dialog_pending confirm."},
             "dialog_id": {"type": "string", "description": "payment_dialog only: dialog_pending.id of the confirm "
                                                            "to answer."},
-            "handle": {"type": "string", "description": "fill / enter_code / letter_*: a handle from list or a letter note."},
+            "handle": {"type": "string", "description": "fill / enter_code / reset_password / enroll_totp / letter_*: a "
+                                                        "handle from list or a letter note."},
+            "identifier": {"type": "string", "description": "reset_password without handle: the account's email or "
+                                                            "username, saved on the new item."},
+            "rotate": {"type": "boolean", "description": "reset_password only: generate a new password even though a "
+                                                         "saved one is waiting to be filled (use after the site "
+                                                         "refused it)."},
+            "symbols": {"type": "boolean", "description": "reset_password only: false for a password without "
+                                                          "symbols (a site that rejects them); replaces a waiting "
+                                                          "saved password that has symbols. Default true."},
             "purpose": {"type": "string", "enum": ["login", "signup", "reset"], "default": "login",
                         "description": "fill only: login preserves current-password behavior; signup requires fresh "
                                        "native approval to create an account with this exact login item and origin. "
@@ -1634,7 +1679,7 @@ BROWSER_VAULT_SCHEMA = {
                                 "description": "Mandatory with code: the page's origin (scheme://host[:port]). The fill is refused unless it matches exactly. "
                                                "payment_done only: the shop's HTTPS origin, needed (and honoured) only when the checkout ran on a payment provider's own page; otherwise ignored (the result says so)."},
             "backend": {"type": "string", "enum": ["onepassword", "bitwarden"], "description": "unlock only."},
-            "label": {"type": "string", "description": "save_login only: short site name (default: the host)."},
+            "label": {"type": "string", "description": "save_login / reset_password: short site name (default: the host)."},
             "target": {"type": "string", "enum": ["browser", "preview"],
                        "description": "fill / save_login / enter_code: 'preview' = the Desktop in-app browser "
                                       "page beside the chat, 'browser' = the managed automation browser."},
@@ -1846,6 +1891,8 @@ def _scrub_page_fields(value: Any, redact: Any, inside: bool = False) -> Any:
 
 
 def _handle_vault_inner(args: dict[str, Any], **kwargs) -> str:
+    from tools import browser_vault_account as account
+
     tid = kwargs.get("task_id")
     action = str(args.get("action") or "")
     handle, label = str(args.get("handle") or ""), str(args.get("label") or "")
@@ -1863,6 +1910,10 @@ def _handle_vault_inner(args: dict[str, Any], **kwargs) -> str:
                                            **{k: args[k] for k in ("cart", "approve_origins", "holder_name", "billing_postal_code")
                                               if k in args}),
         "save_login": lambda: _outside_payment_lock(tid, lambda: browser_vault_save_login(label=label, task_id=tid)),
+        "reset_password": lambda: _outside_payment_lock(tid, lambda: account.reset_password(
+            handle, tid, identifier=str(args.get("identifier") or ""), label=label,
+            rotate=args.get("rotate") is True, symbols=args.get("symbols") is not False)),
+        "enroll_totp": lambda: _outside_payment_lock(tid, lambda: account.enroll_totp(handle, tid)),
         "enter_code": lambda: _outside_payment_lock(tid, lambda: browser_vault_enter_code(
             handle=handle, task_id=tid, code=str(args.get("code") or ""),
             expected_origin=str(args.get("expected_origin") or ""),
@@ -1886,8 +1937,8 @@ def _handle_vault_inner(args: dict[str, Any], **kwargs) -> str:
         return json.dumps({"success": False, "error_type": "unknown_action",
                            "error": f"Unknown action {action!r}; use list, fill, save_login, "
                                                        "enter_code, unlock, letter_login, letter_signed_in, "
-                                                       "letter_done, payment_controls, payment_click, payment_done, "
-                                                       "payment_dialog or payment_close."})
+                                                       "letter_done, reset_password, enroll_totp, payment_controls, "
+                                                       "payment_click, payment_done, payment_dialog or payment_close."})
     target = args.get("target") or "browser"
     if target == "preview":
         if action not in _PREVIEW_ACTIONS:

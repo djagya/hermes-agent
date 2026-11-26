@@ -74,6 +74,15 @@ def _not_written(meta: Any, base: dict, filled: int, reasons: Optional[list[str]
                                "once; if it fails the same way, tell the user."})
 
 
+def on_bank_slot(task_id: str) -> bool:
+    """The tab's browser slot is a sensitive* (bank-like) one, or unknown: fail closed, nothing in the vault marks
+    a bank, so an unknown slot is treated like one."""
+    from tools.browser_use_cli import vault_route
+
+    slot = str(vault_route(task_id).get("slot_id") or "")
+    return not slot or slot.startswith("sensitive")
+
+
 def login_write_result(parsed: Any, fills: list[dict[str, Any]], settle: int, backend: Any, meta: Any,
                        page_origin: str) -> str:
     """The tool result for a login/address/card-field write the page answered (not signup/reset)."""
@@ -83,7 +92,9 @@ def login_write_result(parsed: Any, fills: list[dict[str, Any]], settle: int, ba
     if filled is None:
         return json.dumps(vault._FILL_UNVERIFIED)
     reasons = fill_reasons(parsed, len(fills))
-    base = {"backend": backend.name, "kind": meta.kind, "origin": page_origin}
+    from agent.vault_captcha import challenge_fields
+
+    base = {"backend": backend.name, "kind": meta.kind, "origin": page_origin, **challenge_fields(parsed)}
     pw_at = next((i for i, f in enumerate(fills) if f["token"] == "current-password"), None)
     password_missed = reasons is not None and pw_at is not None and reasons[pw_at] != "written"
     if filled == 0 or password_missed:
@@ -114,7 +125,7 @@ def login_write_result(parsed: Any, fills: list[dict[str, Any]], settle: int, ba
     return json.dumps(out)
 
 
-LOGGED_ACTIONS = ("fill", "enter_code", "save_login", "letter_login")
+LOGGED_ACTIONS = ("fill", "enter_code", "save_login", "letter_login", "reset_password", "enroll_totp")
 
 
 def log_outcome(args: dict[str, Any], result: dict[str, Any]) -> None:
