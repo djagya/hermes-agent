@@ -389,14 +389,18 @@ class OnePasswordLoginBackend(LoginBackend):
         recipe = "--generate-password=letters,digits" + (",symbols" if symbols else "") + f",{length}"  # op help order
         if handle:
             vault_id, item_id = self._resolve_handle(handle)
-            self._run("item", "edit", item_id, *(["--vault", vault_id] if vault_id else []), recipe)
-            self.invalidate_listing()
+            try:
+                self._run("item", "edit", item_id, *(["--vault", vault_id] if vault_id else []), recipe)
+            finally:  # a write that timed out may have been applied: the cached listing is stale either way
+                self.invalidate_listing()
             return f"{self.prefix}{vault_id}:{item_id}" if vault_id else handle
         vault = str(self.cfg.get("vault") or "").strip() or "Hermes"
-        out = self._run("item", "create", "--category", "login", "--vault", vault, "--title",
-                        title or origin.split("://")[-1], "--url", origin, recipe, "--format", "json",
-                        f"username={username}")
-        self.invalidate_listing()
+        try:
+            out = self._run("item", "create", "--category", "login", "--vault", vault, "--title",
+                            title or origin.split("://")[-1], "--url", origin, recipe, "--format", "json",
+                            f"username={username}")
+        finally:
+            self.invalidate_listing()
         try:
             created = json.loads(out)
         except ValueError:
@@ -430,8 +434,10 @@ class OnePasswordLoginBackend(LoginBackend):
             raise TotpFieldConflict(self.display_name)  # the assignment would overwrite and retype that field
         old = str(mine[0]["value"]) if mine else ""
         assign = [f"{_TOTP_LABEL}[otp]={seed}"] + ([f"{_previous_label(old)}[password]={old}"] if old else [])
-        self._run("item", "edit", item_id, *where, *assign, secret=(seed, totp_key(seed), old, totp_key(old)))
-        self.invalidate_listing()
+        try:
+            self._run("item", "edit", item_id, *where, *assign, secret=(seed, totp_key(seed), old, totp_key(old)))
+        finally:
+            self.invalidate_listing()
         return True
 
     def _revealed(self, item_id: str, vault_id: Optional[str]) -> dict:

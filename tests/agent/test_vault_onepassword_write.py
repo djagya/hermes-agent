@@ -229,3 +229,36 @@ def test_a_field_op_would_take_for_the_key_name_that_hermes_did_not_write_is_nev
         backend.add_totp(HANDLE, KEY_URI)
     assert refused.value.error_type == "totp_field_conflict" and KEY not in str(refused.value)
     assert not [c for c in fake.calls() if c["argv"][1] == "edit"] and fake.item() == before
+
+
+@pytest.mark.parametrize("late", ["hang", "network"])
+@pytest.mark.parametrize("write", ["create", "edit", "totp"])
+def test_a_write_op_applied_but_failed_to_answer_does_not_leave_the_old_listing_cached(op, monkeypatch, late, write):
+    """r7 M1: the 60 s listing was cleared only after a write that returned; one that timed out (or lost the
+    connection) after it was applied left the cache without the new item."""
+    monkeypatch.setattr(onepassword, "_TIMEOUT", 1.0)
+    backend, fake = op
+    assert [m.id for m in backend.list_items()] == [HANDLE]  # the listing is cached now
+    fake.flag("late", late)
+    expected = BackendTimeout if late == "hang" else onepassword.BackendNetwork
+    with pytest.raises(expected) as failed:
+        if write == "create":
+            backend.generate_login("", origin="https://new.example", username="jane")
+        elif write == "edit":
+            backend.generate_login(HANDLE, origin="https://shop.example")
+        else:
+            backend.add_totp(HANDLE, KEY_URI)
+    assert isinstance(failed.value, BackendTimeout) == (late == "hang")
+    if write == "create":  # the fake op applied the create: a fresh backend must see it
+        fresh = OnePasswordLoginBackend({"enabled": True, "binary_path": str(fake.exe)})
+        fresh._service_token = "service-token"
+        assert [m.id for m in fresh.list_items()] == ["op:vault-h:new-item"]
+    else:  # the cache key is the same and gone: the next list reaches op again
+        before = sum(1 for c in fake.calls() if c["argv"][:2] == ["item", "list"])
+        backend.list_items()
+        assert sum(1 for c in fake.calls() if c["argv"][:2] == ["item", "list"]) == before + 1
+
+
+def test_the_timeout_advice_does_not_say_retry_in_a_minute():
+    text = BackendTimeout("1Password", "").message()
+    assert "Retry once in a minute" not in text and "action=list" in text and "may have been applied" in text

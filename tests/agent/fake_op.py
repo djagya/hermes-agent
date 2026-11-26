@@ -10,11 +10,13 @@
   contain fields with the same name": without one, a uniquely named field in any section (or none) is the match,
   and several are an error. ``--template`` or data on stdin replace the whole item: the hidden passkey is gone,
   and the call is recorded as a violation.
+- ``op item list ...``: the one item held, as a list.
 - ``op item create --category login --vault V --title T --url U --generate-password=... username=<id>``.
 
 Every call is logged with its argv (``calls()``); a ``fail`` file makes an edit fail echoing its argv on stderr
 (as op quotes a bad assignment, with the key of each authenticator value as op reads it); a ``hang`` file makes
-an edit sleep past any test timeout.
+an edit sleep past any test timeout, before it is applied; a ``late`` file ("hang" or "network") applies the edit or
+create, then sleeps past any timeout or fails with a network error.
 """
 
 from __future__ import annotations
@@ -40,6 +42,11 @@ state["calls"].append({"argv": argv, "stdin": bool(stdin)})
 def save(code=0, out=None, err=None):
     json.dump(item, open(item_path, "w", encoding="utf-8"))
     json.dump(state, open(state_path, "w", encoding="utf-8"))
+    late = os.path.join(here, "late")
+    if code == 0 and argv[:2] in (["item", "edit"], ["item", "create"]) and os.path.exists(late):
+        if open(late).read() == "hang":  # applied, then the call never returns
+            time.sleep(20)
+        code, out, err = 1, None, "[ERROR] Get https://x.1password.com: dial tcp 1.2.3.4:443: i/o timeout"
     if out is not None:
         print(out)
     if err is not None:
@@ -114,6 +121,8 @@ def assign(spec):
         match["type"] = TYPES[ftype]
     match["value"] = value
 
+if argv[:2] == ["item", "list"]:
+    save(0, out=json.dumps([item] if item else []))
 if argv[:2] == ["item", "get"]:
     if "--otp" in flags:
         otp = [f for f in item.get("fields", []) if f.get("type") == "OTP"]
@@ -185,8 +194,8 @@ def install(folder: Path, item: dict, *, passkey: bool = True) -> SimpleNamespac
     def use(new_item: dict) -> None:
         (folder / "item.json").write_text(json.dumps(new_item), encoding="utf-8")
 
-    def flag(name: str) -> None:
-        (folder / name).write_text("", encoding="utf-8")
+    def flag(name: str, text: str = "") -> None:
+        (folder / name).write_text(text, encoding="utf-8")
 
     return SimpleNamespace(exe=exe, state=state, item=stored, use=use, flag=flag,
                            calls=lambda: state()["calls"], passkey=lambda: state()["passkey"])

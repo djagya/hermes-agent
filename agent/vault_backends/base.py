@@ -78,6 +78,9 @@ class BackendTimeout(BackendNetwork):
     """The call ran out of time after it was sent: a write may have been applied (``BackendNetwork`` also covers
     a connection that never opened, where nothing was)."""
 
+    advice = ("the password-manager call ran out of time. A write may have been applied: call browser_vault "
+              "action=list to see before you repeat it.")
+
 
 class LoginBackend(ABC):
     name: str                # config key: local | onepassword | bitwarden
