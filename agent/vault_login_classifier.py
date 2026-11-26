@@ -23,7 +23,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 import itertools
 
 from agent.vault_captcha import CAPTCHA_JS
@@ -581,7 +581,8 @@ _RE_RESET_LABEL = re.compile(
     r"|\bnieuw\s+wachtwoord\b|\bnueva\s+contrasena\b|\bnuova\s+password\b|\bpassword\s+reset\b")
 # reset_page_refusal only (no approval, D-1086 a). Sign-up invitations beyond _RE_REGISTER_WORDS:
 _RE_SIGNUP_INVITE = re.compile(r"\b(?:get started|start (?:your )?free trial|try (?:it )?(?:for )?free|"
-                               r"create (?:your |a )?profile)\b")
+                               r"create (?:your |a )?profile|create (?:my |an |your )?account|open (?:an? )?account|become a member|"
+                               r"enrol+(?:ment)?)\b")
 # A reset/forgot/recover path segment, on the raw lower-cased path ("/preset" and "/users/new?x=/reset" are not one).
 _RE_RESET_SEGMENT = re.compile(r"(?:^|[^a-z])(?:reset|forgot(?:ten)?|recover(?:y)?)(?:[^a-z]|password|passwort|$)"
                                r"|passwordreset")
@@ -694,12 +695,13 @@ def _names_registration(text: str) -> bool:
     return bool(_RE_REGISTER_WORDS.search(words) or _RE_SIGNUP_INVITE.search(words))
 
 
-def reset_page_refusal(targets: SignupTargets) -> str:
+def reset_page_refusal(targets: SignupTargets, controls: Sequence[LoginControl] = ()) -> str:
     """The strict gate of ``browser_vault reset_password``, which asks nobody. One ordered check, no override:
 
     1. ``registration_page``: registration words in the page's path or hash-route path, the form action's path, the
-       name or label (label, placeholder, aria text, title) of any selected control, or the field's ``form_text`` (links and plain
-       buttons already left out by the inspection);
+       name or label (label, placeholder, aria text, title) of any selected control or of a text/email input of
+       the same form (``controls`` is every inspected control), or the field's ``form_text`` (links and plain
+       buttons already left out by the inspection; a submit control keeps its value, alt, aria-label and title);
     2. ``login_page``: a login/sign-in path segment (any of several languages) and no reset segment in the same
        path: "/login?reset=1" is a sign-in page that says it was reset, never a choose-a-new-password page;
     3. ``form_text_unreadable``: no ``form_text`` (oversized, unreadable, an older inspection);
@@ -711,9 +713,11 @@ def reset_page_refusal(targets: SignupTargets) -> str:
     ``fill purpose=reset`` keeps its looser selection because it asks the user first."""
     field = targets.primary
     where = _normalize_text(_route_paths(field.page_url, field.form_action)) + " " + _camel_words(field.name)
+    same_form = [c for c in controls if c.type in ("text", "email") and c.form_index == field.form_index]
     if (_names_registration(where) or _RE_REGISTER_SQUASHED.search(where.replace(" ", ""))
             or any(_names_registration(_camel_words(c.label + " " + c.name))
-                   or _RE_REGISTER_SQUASHED.search(_camel_words(c.name).replace(" ", "")) for c in targets.controls)
+                   or _RE_REGISTER_SQUASHED.search(_camel_words(c.name).replace(" ", ""))
+                   for c in (*targets.controls, *same_form))
             or (field.form_text is not None and _names_registration(field.form_text))):
         return "registration_page"
     path = _route_paths(field.page_url)
@@ -1272,7 +1276,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     return { context: t !== null && t.length <= BLOCK_MAX ? t : "" };
   };
   // Form text for the reset gate (password fields only): the same block's rendered text WITHOUT links, [role=link]
-  // and button[type=button] (navigation such as "Don't have an account? Sign up"), submit buttons' values kept; a
+  // and button[type=button] (navigation such as "Don't have an account? Sign up"), submit controls' value, alt, aria-label and title kept (a button's aria-label too); a
   // button[type=button] is kept when the block has no other submit control, because then it IS the submit;
   // around a form, the nearest h1-h3 / [role=heading] of its card (up to 4 ancestors, the largest within the cap):
   // the last one before the form, else the first after it. null when the block is oversized or unreadable.
@@ -1291,7 +1295,10 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       for (const c of n.childNodes) {
         if (c.nodeType === 3) { if (lit) parts.push(c.data); continue; }
         if (c.nodeType !== 1 || c.matches(skip) || getComputedStyle(c).display === "none") continue;
-        if (c.tagName === "INPUT" && c.type === "submit" && shown(c)) parts.push(c.value || "");
+        if (c.tagName === "INPUT" && (c.type === "submit" || c.type === "image") && shown(c)) {
+          parts.push(c.value || "", c.getAttribute("alt") || "", c.getAttribute("aria-label") || "", c.getAttribute("title") || "");
+        }
+        if (c.tagName === "BUTTON" && shown(c)) parts.push(c.getAttribute("aria-label") || "");
         walk(c);
       }
     })(root);

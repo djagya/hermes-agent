@@ -49,13 +49,15 @@ class Page:
     heading: str
     para: str
     label: str
-    submit: str  # "input:<value>" renders an <input type=submit>, "button:<text>" a <button type=button> (the only submit)
+    submit: str  # "input:<value>" an <input type=submit>, "image:<alt>" an <input type=image>, "aria:<label>" a <button
+    # aria-label=...>Continue</button>, "button:<text>" a <button type=button> (the only submit)
     nav: str  # "", "link", "button", "role-link"
     heading_outside: bool  # the heading sits in the form's card, outside the form
     email: bool
     confirm: bool
     state: str = "readable"  # or "oversized", "unreadable" (a throwing innerText: synthetic DOM only)
     confirm_name: str = "password_confirmation"  # the name/id of the confirmation field
+    email_name: str = "email"  # the name/id of the email field
 
 
 _NAV = {"": (), "link": ("Don't have an account?", ("A", "Sign up", {})),
@@ -91,7 +93,9 @@ _SIGNUP_TEXTS = [("Create your account", "", "Sign up"), ("Get started", "Work e
                  ("Créer un compte", "", "Continuer"), ("Account aanmaken", "", "Doorgaan"),
                  ("Crear una cuenta", "", "Continuar"), ("Crea un account", "", "Continua"),
                  ("Join us today", "", "Join"), ("Welcome", "", "Create account"), ("Welcome", "", "input:Sign up"),
-                 ("Welcome", "", "button:Create account"), ("Welcome", "", "button:Sign up")]
+                 ("Welcome", "", "button:Create account"), ("Welcome", "", "button:Sign up"),
+                 ("Become a member", "", "Continue"), ("Open an account", "", "Continue"),
+                 ("Welcome", "", "Create my account"), ("Enrol now", "", "Continue")]
 _SIGNUP_LABELS = ("Password", "Create a password", "Choose a password", "New password")
 # A sign-up page that names itself nowhere is told apart only by the missing reset evidence (no reset path segment,
 # no "new password"): the verdict's accepted residual is the same page with such evidence, so it is not generated.
@@ -100,6 +104,11 @@ _QUIET_LABELS = ("Password", "Create a password", "Choose a password", "Set your
 # Neutral text and a reset-looking primary label: only the confirmation field's name tells the pages apart.
 _RESET_CONFIRM_NAMES = ("password_confirmation", "new_password_confirm")
 _SIGNUP_CONFIRM_NAMES = ("signup_confirm_password", "registerPasswordConfirm")
+# Neutral text again: only a submit control's accessible text, or the same form's email field, tells them apart.
+_SIGNUP_SUBMITS = ("image:Sign up", "image:Create my account", "input:Register", "aria:Sign up")
+_RESET_SUBMITS = ("image:Save password", "aria:Save", "input:Update password")
+_SIGNUP_EMAIL_NAMES = ("registerEmail", "signup_email")
+_RESET_EMAIL_NAMES = ("email", "user[email]", "login")
 
 
 def generate() -> list[Page]:
@@ -127,6 +136,19 @@ def generate() -> list[Page]:
         url, action = _SIGNUP_KINDS["hostile reset path"]
         pages.append(Page("signup", "hostile reset path", url, action, "", "", "New password", "Save", nav, False,
                           False, True, confirm_name=confirm_name))
+    url, action = _SIGNUP_KINDS["hostile reset path"]
+    for submit, nav in itertools.product(_SIGNUP_SUBMITS, _NAV):
+        pages.append(Page("signup", "hostile reset path", url, action, "", "", "New password", submit, nav, False, False,
+                          False))
+    for email_name, nav in itertools.product(_SIGNUP_EMAIL_NAMES, _NAV):
+        pages.append(Page("signup", "hostile reset path", url, action, "", "", "New password", "Save", nav, False, True,
+                          False, email_name=email_name))
+    url, action = _RESET_KINDS["laravel"][:2]
+    for submit, nav in itertools.product(_RESET_SUBMITS, _NAV):
+        pages.append(Page("reset", "laravel", url, action, "", "", "New password", submit, nav, False, False, True))
+    for email_name, nav in itertools.product(_RESET_EMAIL_NAMES, _NAV):
+        pages.append(Page("reset", "laravel", url, action, "", "", "New password", "Save", nav, False, True, True,
+                          email_name=email_name))
     return pages
 
 
@@ -146,13 +168,15 @@ def _tree(page: Page) -> tuple:
     content = [el("H1", page.heading)] if page.heading and not page.heading_outside else []
     content += [el("P", page.para)] if page.para else []
     content += [el("P", FILLER)] if page.state == "oversized" else []
-    content += [el("LABEL", "Email"), field("email", "email", "Email")] if page.email else []
+    content += [el("LABEL", "Email"), field("email", page.email_name, "Email")] if page.email else []
     content += [el("LABEL", page.label), field("password", "password", page.label)]
     content += [el("LABEL", "Confirm password"), field("password", page.confirm_name, "Confirm password")] \
         if page.confirm else []
-    content.append(el("INPUT", type="submit", value=page.submit[6:]) if page.submit.startswith("input:")
-                   else el("BUTTON", page.submit[7:], htmlType="button") if page.submit.startswith("button:")
-                   else el("BUTTON", page.submit))
+    kind, _, text = page.submit.partition(":")
+    content.append({"input": lambda: el("INPUT", type="submit", value=text),
+                    "image": lambda: el("INPUT", type="image", alt=text),
+                    "aria": lambda: el("BUTTON", "Continue", aria=text),
+                    "button": lambda: el("BUTTON", text, htmlType="button")}.get(kind, lambda: el("BUTTON", page.submit))())
     if page.nav:
         words, (tag, text, props) = _NAV[page.nav]
         content += [el("P", words), el(tag, text, **props)]
@@ -165,6 +189,12 @@ def _tree(page: Page) -> tuple:
     return el("DIV", "", [card])
 
 
+def _submit_words(page: Page) -> list[str]:
+    """The submit control's text as the inspection reports it: its value, alt, aria-label, title, then its own text."""
+    kind, _, text = page.submit.partition(":")
+    return [text, "Continue"] if kind == "aria" else [text] if kind in ("input", "image", "button") else [page.submit]
+
+
 def expected_form_text(page: Page) -> Optional[str]:
     """What the inspection must report: the page's rendered text without links and plain buttons, except that a
     button[type=button] stays when the page has no other submit control (it is the submit)."""
@@ -172,7 +202,7 @@ def expected_form_text(page: Page) -> Optional[str]:
         return None
     only_button = page.submit.startswith("button:")
     words = [page.heading, page.para, "Email" if page.email else "", page.label,
-             "Confirm password" if page.confirm else "", page.submit.removeprefix("input:").removeprefix("button:"),
+             "Confirm password" if page.confirm else "", *_submit_words(page),
              _NAV[page.nav][0] if page.nav else "", _NAV[page.nav][1][1] if only_button and page.nav == "button" else ""]
     return " ".join(w for w in words if w)
 
@@ -203,7 +233,7 @@ def decide(page: Page, rows: list[dict]) -> str:
     action are the generator's (the synthetic DOM and the file:// page have their own)."""
     controls = [LoginControl.from_dict(dict(r, pageUrl=page.url, formAction=page.action or "")) for r in rows]
     targets, why = select_signup_targets_detailed(controls, "reset")
-    return why if targets is None else (reset_page_refusal(targets) or "fill")
+    return why if targets is None else (reset_page_refusal(targets, controls) or "fill")
 
 
 def wrong(pages: list[Page], rows_of) -> list[str]:
@@ -235,7 +265,7 @@ def _python_rows(page: Page) -> list[dict]:
     if page.confirm:
         rows.append(row(page.confirm_name, "Confirm password", 2))
     if page.email:
-        rows.append({"type": "email", "name": "email email", "label": "Email", "autocomplete": "email",
+        rows.append({"type": "email", "name": f"{page.email_name} {page.email_name}", "label": "Email", "autocomplete": "email",
                      "formIndex": 0 if page.action else None, "index": 0, "rendered": True, "visible": True})
     return rows
 

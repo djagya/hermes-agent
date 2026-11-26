@@ -23,7 +23,7 @@ import secrets
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
-from agent.vault_login_classifier import reset_page_refusal
+from agent.vault_login_classifier import LoginControl, reset_page_refusal
 from tools import browser_vault_signup as signup
 from tools.browser_vault_outcome import on_bank_slot
 
@@ -101,7 +101,7 @@ def _reset_target(tid: str, tail: str) -> tuple[Optional[tuple], Optional[str]]:
     target, refusal = signup.targets("reset", raw_controls)
     if refusal:
         return None, refusal
-    if why := reset_page_refusal(target):
+    if why := reset_page_refusal(target, [LoginControl.from_dict(r) for r in raw_controls if isinstance(r, dict)]):
         error_type, text = _RESET_REFUSALS[why]
         return None, _refuse(error_type, text + tail, reason=why)
     return (nonce, bind, target, classified), None

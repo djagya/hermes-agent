@@ -248,6 +248,7 @@ class El {
     this.rect = p.rect || { left: 10, top: 10, width: 200, height: 30, right: 210 };
     if (p.aria) this.attrs["aria-label"] = p.aria;
     if (p.placeholder) this.attrs.placeholder = p.placeholder;
+    if (p.alt) this.attrs.alt = p.alt;
     if (p.role) this.attrs.role = p.role;
     if (p.htmlType) this.attrs.type = p.htmlType;  // a <button>'s type ATTRIBUTE (absent = submit)
     if (p.ref) refs[p.ref] = this;
