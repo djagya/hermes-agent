@@ -215,6 +215,12 @@ def _bounded_context(raw: Any) -> str:
     return text if len(text) <= _CONTEXT_MAX else ""
 
 
+def _form_text(raw: Any) -> Optional[str]:
+    """The inspection's form text, or None when missing, not a string or oversized (no evidence either way).
+    The cap is the form's (checked in the page) plus its card's heading."""
+    return raw if isinstance(raw, str) and len(raw) <= 2 * _CONTEXT_MAX else None
+
+
 @dataclass(frozen=True)
 class LoginControl:
     """Descriptor of a visible input control, as inspected in the page."""
@@ -239,6 +245,10 @@ class LoginControl:
     # never qualifies). Matched against fixed patterns, never echoed. ``visible`` is the inspection's strict
     # visibility (rendered, not transparent, on screen).
     context: str = ""
+    # Password fields only, for reset_page_refusal: the rendered text of the field's form (or block without a form)
+    # WITHOUT links, [role=link] and button[type=button] (navigation such as "Don't have an account? Sign up"),
+    # plus the nearest heading of the card around a form. None when oversized, unreadable or not inspected.
+    form_text: Optional[str] = None
     visible: Optional[bool] = None
     # Checkout path only: supplemental text (the payment closure's aria-labelledby targets and title), kept apart
     # from the field's own name/label/placeholder. It may classify a field whose own text is silent and names no
@@ -270,6 +280,7 @@ class LoginControl:
             form_action=str(raw.get("formAction") or ""),
             rendered=raw.get("rendered") if isinstance(raw.get("rendered"), bool) else None,
             context=_bounded_context(raw.get("context")),
+            form_text=_form_text(raw.get("formText")),
             visible=raw.get("visible") if isinstance(raw.get("visible"), bool) else None,
             hint=str(raw.get("hint") or ""),
             topmost=raw.get("topmost") if isinstance(raw.get("topmost"), bool) else None,
@@ -568,8 +579,18 @@ _RE_RESET_ROUTE = re.compile(r"reset|recover|forgot|setpassword|newpassword|choo
 _RE_RESET_LABEL = re.compile(
     r"\b(?:new|choose|set|create)\s+(?:a\s+|your\s+)?password\b|\bneues\s+passwort\b|\bnouveau\s+mot\s+de\s+passe\b"
     r"|\bnieuw\s+wachtwoord\b|\bnueva\s+contrasena\b|\bnuova\s+password\b|\bpassword\s+reset\b")
-# A route naming a forgotten password: outweighs registration words found only in the form's text.
-_RE_FORGOT_ROUTE = re.compile(r"reset|recover|forgot")
+# reset_page_refusal only (no approval, D-1086 a). Sign-up invitations beyond _RE_REGISTER_WORDS:
+_RE_SIGNUP_INVITE = re.compile(r"\b(?:get started|start (?:your )?free trial|try (?:it )?(?:for )?free|"
+                               r"create (?:your |a )?profile)\b")
+# A reset/forgot/recover path segment, on the raw lower-cased path ("/preset" and "/users/new?x=/reset" are not one).
+_RE_RESET_SEGMENT = re.compile(r"(?:^|[^a-z])(?:reset|forgot(?:ten)?|recover(?:y)?)(?:[^a-z]|password|passwort|$)"
+                               r"|passwordreset")
+# The page says it sets a NEW password (label or form text); "create / choose / set a password" is sign-up wording.
+_RE_RESET_PHRASE = re.compile(
+    r"\b(?:new password|password reset|reset (?:your |my |the )?password|"
+    r"neues passwort|passwort zurucksetzen|nouveau mot de passe|reinitialiser (?:votre |le |mon )?mot de passe|"
+    r"nieuw wachtwoord|wachtwoord (?:opnieuw instellen|herstellen|resetten)|"
+    r"nueva contrasena|restablecer (?:tu |su |la )?contrasena|nuova password|reimposta(?:re)? (?:la )?password)\b")
 # Old/current password wording: a change-password form, never a reset target (the old password is not ours to set).
 _RESET_OLD_RE = r"\b(?:old|current|existing|previous)\s*password\b|(?:old|current|existing)pass"
 
@@ -647,31 +668,50 @@ def select_signup_targets_detailed(controls: list[LoginControl],
     path_register = bool(_RE_REGISTER_WORDS.search(path_words) or _RE_REGISTER_SQUASHED.search(path_words.replace(" ", "")))
     if _RE_LOGIN_ROUTE.search(path_words) and not path_register:
         return None, "login_route"
-    if not _registration_evidence(target):
+    if not (_RE_REGISTER_WORDS.search(route_words) or _RE_REGISTER_SQUASHED.search(squashed)
+            or _RE_REGISTER_SQUASHED.search(_camel_words(target.name).replace(" ", ""))
+            or _RE_REGISTER_WORDS.search(_normalize_text(target.context))):
         return None, "no_registration_evidence"
     return SignupTargets(target, confirm), ""
 
 
-def _registration_evidence(target: LoginControl, *, form_text: bool = True) -> bool:
-    """Registration words in the route (page or form action), the field's name, or (``form_text``) its form's
-    text."""
-    route_words = _normalize_text(_route_text(target.page_url, target.form_action))
-    return bool(_RE_REGISTER_WORDS.search(route_words) or _RE_REGISTER_SQUASHED.search(route_words.replace(" ", ""))
-                or _RE_REGISTER_SQUASHED.search(_camel_words(target.name).replace(" ", ""))
-                or (form_text and _RE_REGISTER_WORDS.search(_normalize_text(target.context))))
+def _route_paths(*urls: str) -> str:
+    """Each URL's path and hash-route path (``#/...``, ``#!/...``), unquoted and lower-cased; never a query."""
+    from urllib.parse import unquote, urlsplit
+
+    parts = []
+    for url in filter(None, urls):
+        split = urlsplit(url)
+        parts += [split.path, split.fragment.split("?")[0] if split.fragment.startswith(("/", "!/")) else ""]
+    return unquote(" ".join(parts)).lower()
+
+
+def _names_registration(text: str) -> bool:
+    words = _normalize_text(text)
+    return bool(_RE_REGISTER_WORDS.search(words) or _RE_SIGNUP_INVITE.search(words))
 
 
 def reset_page_refusal(targets: SignupTargets) -> str:
-    """The strict gate of ``browser_vault reset_password``, which asks nobody: ``"registration_page"`` when the
-    page shows registration evidence (in its form's text only when the route names no reset: a reset form may
-    offer "Don't have an account? Sign up"), ``"no_reset_evidence"`` unless the route or the field's label says it
-    chooses a new password (``autocomplete=new-password`` alone, which sign-up forms carry too, is not enough),
-    else ``""``. ``fill purpose=reset`` keeps its looser selection because it asks the user first."""
+    """The strict gate of ``browser_vault reset_password``, which asks nobody. One ordered check, no override:
+
+    1. ``registration_page``: registration words in the page's path or hash-route path, the form action's path, the
+       field's name, or the field's ``form_text`` (links and plain buttons already left out by the inspection);
+    2. ``form_text_unreadable``: no ``form_text`` (oversized, unreadable, an older inspection);
+    3. fill (``""``) only on positive reset evidence: a reset/forgot/recover segment in the page's path or hash-route
+       path, or "new password" / "reset your password" (or its translation) in the label or the form text;
+       else ``no_reset_evidence``. ``autocomplete=new-password`` and "create/choose/set a password" are sign-up
+       wording too, and a query or form action never counts as reset evidence.
+
+    ``fill purpose=reset`` keeps its looser selection because it asks the user first."""
     field = targets.primary
-    squashed = _normalize_text(_route_text(field.page_url, field.form_action)).replace(" ", "")
-    if _registration_evidence(field, form_text=not _RE_FORGOT_ROUTE.search(squashed)):
+    where = _normalize_text(_route_paths(field.page_url, field.form_action)) + " " + _camel_words(field.name)
+    if (_names_registration(where) or _RE_REGISTER_SQUASHED.search(where.replace(" ", ""))
+            or (field.form_text is not None and _names_registration(field.form_text))):
         return "registration_page"
-    if _RE_RESET_ROUTE.search(squashed) or _RE_RESET_LABEL.search(_camel_words(field.label + " " + field.name)):
+    if field.form_text is None:
+        return "form_text_unreadable"
+    if (_RE_RESET_SEGMENT.search(_route_paths(field.page_url))
+            or _RE_RESET_PHRASE.search(_normalize_text(field.label + " " + field.form_text))):
         return ""
     return "no_reset_evidence"
 
@@ -1220,6 +1260,51 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     const t = textOf(block);
     return { context: t !== null && t.length <= BLOCK_MAX ? t : "" };
   };
+  // Form text for the reset gate (password fields only): the same block's rendered text WITHOUT links, [role=link]
+  // and button[type=button] (navigation such as "Don't have an account? Sign up"), submit buttons' values kept;
+  // around a form, the nearest h1-h3 / [role=heading] of its card (up to 4 ancestors, the largest within the cap):
+  // the last one before the form, else the first after it. null when the block is oversized or unreadable.
+  const NAV = "a,[role=link],button[type=button]";
+  const HEADING = "h1,h2,h3,[role=heading]";
+  const shown = (e) => { const s = getComputedStyle(e); return s.display !== "none" && s.visibility === "visible"; };
+  const navFree = (root) => {
+    const parts = [];
+    (function walk(n) {
+      const lit = getComputedStyle(n).visibility === "visible";
+      for (const c of n.childNodes) {
+        if (c.nodeType === 3) { if (lit) parts.push(c.data); continue; }
+        if (c.nodeType !== 1 || c.matches(NAV) || getComputedStyle(c).display === "none") continue;
+        if (c.tagName === "INPUT" && c.type === "submit" && shown(c)) parts.push(c.value || "");
+        walk(c);
+      }
+    })(root);
+    return parts.join(" ").replace(/\\s+/g, " ").trim();
+  };
+  const headingNear = (form) => {
+    let card = null;
+    for (let up = 0, node = form; up < 4; up++) {
+      node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
+      if (!node || node.tagName === "BODY" || node.tagName === "HTML") break;
+      const t = textOf(node);
+      if (t === null || t.length > BLOCK_MAX) break;
+      card = node;
+    }
+    if (!card) return "";
+    const all = Array.from(card.querySelectorAll("*"));
+    const at = all.indexOf(form), end = at < 0 ? all.length : at + 1 + form.querySelectorAll("*").length;
+    const found = all.filter((h, i) => (i < at || i >= end) && h.matches(HEADING) && shown(h) && h.getClientRects().length);
+    const before = found.filter((h) => all.indexOf(h) < at);
+    const pick = before.length ? before[before.length - 1] : found[0];
+    return pick ? (textOf(pick) || "") : "";
+  };
+  const formTextOf = (element) => {
+    try {
+      const block = blockOf(element);
+      const raw = block ? textOf(block) : null;
+      if (raw === null || raw.length > BLOCK_MAX) return null;
+      return ((element.form ? headingNear(element.form) : "") + " " + navFree(block)).trim();
+    } catch (_) { return null; }
+  };
   const visible = __VISIBLE__;
   // Field choice inputs (never values): is the field itself on top at its centre (null: not measurable), is it
   // inside an open dialog / aria-modal container / the URL's :target, is it a search box.
@@ -1283,6 +1368,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       name: [element.name, element.id].join(" "),
       type: element.tagName === "SELECT" ? "select" : (element.type || ""),
       ...(["text", "tel", "number", "password"].includes(element.type) ? (() => { try { return contextOf(element); } catch (_) { return {}; } })() : {}),
+      ...(element.type === "password" ? { formText: formTextOf(element) } : {}),
       visible: (() => { try { return visible(element); } catch (_) { return false; } })(),
       rendered: (() => { try { return rendered(element); } catch (_) { return false; } })(),
       topmost: topmost(element),
