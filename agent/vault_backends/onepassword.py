@@ -464,8 +464,9 @@ _PREVIOUS_LABEL = "Hermes previous authenticator key"
 
 
 def _previous_label(old: str) -> str:
-    """The field that keeps a replaced key: labelled with a short hash of that key (hex: nothing to escape)."""
-    return f"{_PREVIOUS_LABEL} {hashlib.sha256(totp_key(old).encode()).hexdigest()[:8]}"
+    """The field that keeps a replaced key: labelled with a short hash of that key and its settings (hex: nothing
+    to escape), so the same seed with other algorithm, digits or period keeps its own field."""
+    return f"{_PREVIOUS_LABEL} {hashlib.sha256('|'.join((totp_key(old), *_totp_settings(old))).encode()).hexdigest()[:8]}"
 
 
 def _is_hermes_field(field: dict) -> bool:

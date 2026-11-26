@@ -198,7 +198,7 @@ def test_an_unconfirmed_key_hermes_wrote_is_replaced_and_kept_as_previous_in_the
     fields = fake.item()["fields"]
     assert otp_fields(fake.item()) == [("Hermes authenticator", KEY)]
     (previous,) = [f for f in fields if f["label"].startswith("Hermes previous authenticator key")]
-    assert previous["label"] == "Hermes previous authenticator key " + hashlib.sha256(OLD_KEY.encode()).hexdigest()[:8]
+    assert previous["label"] == "Hermes previous authenticator key " + hashlib.sha256(f"{OLD_KEY}|SHA1|6|30".encode()).hexdigest()[:8]
     assert previous["type"] == "CONCEALED" and previous["value"] == old and not previous["id"].startswith("TOTP_")
     assert fake.passkey() and not fake.state()["violations"]
 
@@ -212,6 +212,18 @@ def test_a_second_replace_keeps_every_earlier_key_in_its_own_field(op):
     kept = sorted(f["value"] for f in fake.item()["fields"] if f["label"].startswith("Hermes previous"))
     assert kept == sorted([first, second]) and otp_fields(fake.item()) == [("Hermes authenticator", third)]
     assert sum(c["argv"][1] == "edit" for c in fake.calls()) == 2  # still one op call per replace
+
+
+def test_a_second_settings_change_of_the_same_key_keeps_both_earlier_links(op):
+    """r10 Low: the previous-key label hashes the key AND its settings, so a link for the same seed with other
+    settings does not overwrite the earlier previous field."""
+    backend, fake = op
+    uri = lambda query: f"otpauth://totp/Shop:jane?secret={KEY}" + (f"&{query}" if query else "")
+    first, second, third = uri(""), uri("digits=8"), uri("period=60")
+    fake.use(with_fields({"id": "h", "label": "Hermes authenticator", "type": "OTP", "value": first}))
+    assert backend.add_totp(HANDLE, second) is True and backend.add_totp(HANDLE, third) is True
+    kept = sorted(f["value"] for f in fake.item()["fields"] if f["label"].startswith("Hermes previous"))
+    assert kept == sorted([first, second]) and otp_fields(fake.item()) == [("Hermes authenticator", third)]
 
 
 def test_a_same_named_field_in_a_section_makes_op_refuse_the_replace_and_nothing_changes(op):
