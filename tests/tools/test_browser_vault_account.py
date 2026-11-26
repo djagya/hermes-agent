@@ -290,8 +290,9 @@ def test_a_signup_form_dressed_as_a_reset_is_refused_through_the_tool_and_nothin
           text="Change your password New password Change my password"),
 ], ids=["reset-with-sign-up-link", "spa-root-new-password-with-sign-up-link", "devise"])
 def test_a_reset_page_whose_sign_up_offer_is_a_link_is_filled(page, controls):
-    """r2 MEDIUM: "Don't have an account? Sign up" is a link, which the inspection leaves out of the form text."""
-    page.state.controls = controls
+    """r2 MEDIUM: "Don't have an account? Sign up" is a link, which the inspection leaves out of the form text (the
+    plain-code ``context`` keeps it: the reset gate must not read that)."""
+    page.state.controls = [dict(c, context=c["formText"] + " Sign up") for c in controls]
     out = call("reset_password", handle=HANDLE)
     assert out["success"] is True and page.backend.generate_login.call_count == 1
 

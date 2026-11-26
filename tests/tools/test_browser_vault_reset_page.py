@@ -91,6 +91,10 @@ _SIGNUP_TEXTS = [("Create your account", "", "Sign up"), ("Get started", "Work e
                  ("Crear una cuenta", "", "Continuar"), ("Crea un account", "", "Continua"),
                  ("Join us today", "", "Join"), ("Welcome", "", "Create account"), ("Welcome", "", "input:Sign up")]
 _SIGNUP_LABELS = ("Password", "Create a password", "Choose a password", "New password")
+# A sign-up page that names itself nowhere is told apart only by the missing reset evidence (no reset path segment,
+# no "new password"): the verdict's accepted residual is the same page with such evidence, so it is not generated.
+_QUIET_KINDS = ("modal forgot", "return_to", "preset", "root", "root posting to reset")
+_QUIET_LABELS = ("Password", "Create a password", "Choose a password", "Set your password")
 
 
 def generate() -> list[Page]:
@@ -103,6 +107,9 @@ def generate() -> list[Page]:
             _SIGNUP_KINDS.items(), _SIGNUP_TEXTS, _SIGNUP_LABELS, _NAV):
         for outside in ((False, True) if action else (False,)):
             pages.append(Page("signup", name, url, action, heading, para, label, submit, nav, outside, True, False))
+    for name, label, nav in itertools.product(_QUIET_KINDS, _QUIET_LABELS, _NAV):
+        url, action = _SIGNUP_KINDS[name]
+        pages.append(Page("signup", name, url, action, "Welcome", "", label, "Continue", nav, False, True, False))
     for (name, (url, action)), state, label in itertools.product(_SIGNUP_KINDS.items(), ("oversized", "unreadable"),
                                                                  _SIGNUP_LABELS):
         pages.append(Page("signup", name, url, action, "Create your account", "", label, "Continue", "link", False,
