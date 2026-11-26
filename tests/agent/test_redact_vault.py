@@ -246,3 +246,28 @@ def test_an_authenticator_setup_link_is_never_shown_even_unregistered(page):
     for audience in ("browser", "model", "log"):
         out = redact_sensitive_text(page, force=True, vault=audience)
         assert "JBSWY3DPEHPK3PXP" not in out and "otpauth://[REDACTED]" in out
+
+
+
+@pytest.mark.parametrize("page", [
+    "otpauth://totp/ACME Co:jane?secret=JBSWY3DPEHPK3PXP&issuer=ACME Co",  # a label with a space cuts the link
+    "otpauth://totp/ACME Co:jane?issuer=ACME Co&Secret=jbswy3dpehpk3pxp",
+    "data=otpauth%3A%2F%2Ftotp%2FACME Co%3Ajane%3Fsecret%253DJBSWY3DPEHPK3PXP",
+    "https://qr.example/c?x=1&secret%3DJBSWY3DPEHPK3PXP",
+], ids=["space-in-label", "lower-case-seed", "encoded-with-space", "bare-encoded-secret"])
+def test_a_seed_is_never_shown_when_a_space_cuts_the_setup_link(page):
+    from agent.redact import redact_sensitive_text
+
+    for audience in ("browser", "model", "log"):
+        assert "jbswy3dpehpk3pxp" not in redact_sensitive_text(page, force=True, vault=audience).lower()
+
+
+@pytest.mark.parametrize("code", [
+    'import * as OTPAuth from "otpauth";',
+    "const uri = otpauth_uri(secret, issuer);",
+    "require('otpauth').TOTP",
+], ids=["import", "function-name", "require"])
+def test_source_code_that_only_names_the_otpauth_library_is_left_alone(code):
+    from agent.redact import redact_sensitive_text
+
+    assert redact_sensitive_text(code, force=True, vault="model") == code
