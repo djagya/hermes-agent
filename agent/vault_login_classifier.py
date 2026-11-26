@@ -698,7 +698,7 @@ def reset_page_refusal(targets: SignupTargets) -> str:
     """The strict gate of ``browser_vault reset_password``, which asks nobody. One ordered check, no override:
 
     1. ``registration_page``: registration words in the page's path or hash-route path, the form action's path, the
-       field's name or label (label, placeholder, aria text, title), or the field's ``form_text`` (links and plain
+       name or label (label, placeholder, aria text, title) of any selected control, or the field's ``form_text`` (links and plain
        buttons already left out by the inspection);
     2. ``login_page``: a login/sign-in path segment (any of several languages) and no reset segment in the same
        path: "/login?reset=1" is a sign-in page that says it was reset, never a choose-a-new-password page;
