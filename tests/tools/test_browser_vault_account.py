@@ -327,6 +327,18 @@ def test_a_sign_up_label_on_a_reset_route_is_a_registration_page_and_nothing_is_
     vault._eval_js_secret.assert_not_called()
 
 
+def test_a_sign_up_label_on_the_confirm_field_of_a_reset_route_is_a_registration_page(page):
+    """r7 LOW: the registration check reads the label of every control of the write set, not only the primary."""
+    page.state.controls = [new_password_field(pageUrl=ORIGIN + "/reset", formAction=ORIGIN + "/reset", name="field",
+                                              label="New password", formText="Continue"),
+                           dict(CONFIRM, pageUrl=ORIGIN + "/reset", formAction=ORIGIN + "/reset",
+                                label="Confirm password Sign up")]
+    out = call("reset_password", identifier="jane@x.test")
+    assert out["error_type"] == "registration_page" and out["reason"] == "registration_page"
+    page.backend.generate_login.assert_not_called()
+    vault._eval_js_secret.assert_not_called()
+
+
 def test_a_page_that_turns_into_a_sign_up_form_while_the_password_is_generated_is_not_filled(page):
     """Codex M2: the strict reset decision is made again on a fresh inspection right before the write."""
     signup_form = [new_password_field(name="signupPassword", label="New password", formText="Sign up"),
