@@ -713,11 +713,14 @@ def reset_page_refusal(targets: SignupTargets, controls: Sequence[LoginControl] 
     ``fill purpose=reset`` keeps its looser selection because it asks the user first."""
     field = targets.primary
     where = _normalize_text(_route_paths(field.page_url, field.form_action)) + " " + _camel_words(field.name)
-    same_form = [c for c in controls if c.type in ("text", "email") and c.form_index == field.form_index]
+    # The same form's text/email inputs, by whole words only ("registered_email" is not "register"); a field
+    # outside any form has no same form (a footer newsletter box is not part of the reset).
+    same_form = [c for c in controls if c.type in ("text", "email") and field.form_index is not None
+                 and c.form_index == field.form_index]
     if (_names_registration(where) or _RE_REGISTER_SQUASHED.search(where.replace(" ", ""))
             or any(_names_registration(_camel_words(c.label + " " + c.name))
-                   or _RE_REGISTER_SQUASHED.search(_camel_words(c.name).replace(" ", ""))
-                   for c in (*targets.controls, *same_form))
+                   or _RE_REGISTER_SQUASHED.search(_camel_words(c.name).replace(" ", "")) for c in targets.controls)
+            or any(_names_registration(_camel_words(c.label + " " + c.name)) for c in same_form)
             or (field.form_text is not None and _names_registration(field.form_text))):
         return "registration_page"
     path = _route_paths(field.page_url)

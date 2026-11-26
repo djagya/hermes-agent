@@ -270,6 +270,29 @@ def _python_rows(page: Page) -> list[dict]:
     return rows
 
 
+def _control(**fields) -> LoginControl:
+    base = {"autocomplete": "", "form_index": None, "index": 0, "label": "", "name": "", "type": "password",
+            "page_url": "https://shop.example/reset/abc", "form_text": "Choose a new password", "visible": True,
+            "rendered": True, "topmost": True}
+    return LoginControl(**{**base, **fields})
+
+
+@pytest.mark.parametrize("extra", [
+    {"form_index": None, "label": "Sign up for our newsletter", "name": "newsletter"},  # a formless footer box
+    {"form_index": None, "label": "Become a member: your email", "name": "join"},
+    {"form_index": 0, "label": "Email", "name": "registered_email"},  # "registered" is not "register"
+])
+def test_a_reset_page_with_a_newsletter_box_or_a_registered_email_field_still_fills(extra):
+    """r10 review: with no <form>, every formless input on the page counted as the same form; and the squashed
+    name check read "registered_email" as "register"."""
+    form = extra["form_index"]
+    controls = [_control(index=0, label="New password", name="password", form_index=form),
+                _control(index=1, type="email", form_text=None, **extra)]
+    targets, why = select_signup_targets_detailed(controls, "reset")
+    assert targets is not None, why
+    assert reset_page_refusal(targets, controls) == ""
+
+
 def test_generated_pages_cover_both_kinds_every_kind_and_every_chrome():
     kinds = {p.kind for p in PAGES}
     assert kinds == {"reset", "signup"} and len(PAGES) > 1000
