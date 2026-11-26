@@ -8,14 +8,16 @@ import json
 import logging
 import shutil
 import subprocess
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from agent.vault_backends.base import BackendNetwork
-from agent.vault_backends.onepassword import PasskeyItem, TotpAlreadySet
+from agent.vault_backends.onepassword import OnePasswordLoginBackend, TotpAlreadySet, clear_list_cache
 from agent.vault_login_classifier import SIGNUP_OUTCOMES
+from tests.agent import fake_op
 from tools import browser_vault_account as account
 from tools import browser_vault_signup as signup
 from tools import browser_vault_tool as vault
@@ -176,6 +178,17 @@ def test_rotate_generates_a_new_password_after_an_uncertain_one(page):
     assert page.backend.generate_login.call_count == 2
 
 
+def test_symbols_false_after_an_uncertain_reset_generates_a_new_password(page):
+    """r2 Low: symbols=false means the site refused the saved password, so the pinned one is not filled again."""
+    working = vault._eval_js_secret.side_effect
+    vault._eval_js_secret.side_effect = RuntimeError("cdp closed")
+    call("reset_password", handle=HANDLE)
+    vault._eval_js_secret.side_effect = working
+    assert call("reset_password", handle=HANDLE, symbols=False)["success"] is True
+    assert page.backend.generate_login.call_count == 2
+    assert page.backend.generate_login.call_args.kwargs["symbols"] is False
+
+
 def test_a_reset_that_was_filled_does_not_pin_the_next_one_to_the_old_password(page):
     assert call("reset_password", handle=HANDLE)["success"] is True
     assert call("reset_password", handle=HANDLE)["success"] is True
@@ -205,8 +218,10 @@ def test_reset_refuses_before_saving(page):
      new_password_field(index=2, pageUrl=ORIGIN + "/register", formAction=ORIGIN + "/register",
                         name="confirm-password", label="Confirm password")],
     [new_password_field(name="registrationPassword", label="Password")],
-    [new_password_field(context="Create your account")],
-], ids=["register-route", "registration-field", "form-text"])
+    [new_password_field(pageUrl=ORIGIN + "/welcome", formAction=ORIGIN + "/welcome", context="Create your account")],
+    [new_password_field(pageUrl=ORIGIN + "/register?next=/reset", formAction=ORIGIN + "/register",
+                        context="Reset your password")],
+], ids=["register-route", "registration-field", "form-text", "register-route-beats-reset-words"])
 def test_a_registration_page_is_not_a_reset_and_nothing_is_saved(page, controls):
     """Opus A1: autocomplete=new-password alone must not turn a sign-up form into a no-approval reset."""
     page.state.controls = controls
@@ -214,6 +229,16 @@ def test_a_registration_page_is_not_a_reset_and_nothing_is_saved(page, controls)
     assert out["error_type"] == "registration_page"
     page.backend.generate_login.assert_not_called()
     vault._eval_js_secret.assert_not_called()
+
+
+@pytest.mark.parametrize("footer", ["Don't have an account? Sign up", "Not a member? Join now"])
+def test_a_reset_page_offering_sign_up_in_its_form_text_is_still_a_reset(page, footer):
+    """r2 MEDIUM: the reset route outweighs registration words found only in the form's text."""
+    page.state.controls = [new_password_field(pageUrl=ORIGIN + "/password/reset?token=abc",
+                                              formAction=ORIGIN + "/password/reset", name="pw",
+                                              context="Reset your password New password Save " + footer)]
+    out = call("reset_password", handle=HANDLE)
+    assert out["success"] is True and page.backend.generate_login.call_count == 1
 
 
 def test_a_new_password_form_without_reset_evidence_is_not_filled(page):
@@ -302,15 +327,6 @@ def test_code_messages_send_sera_to_the_mailbox_first_and_let_her_type_codes(mon
     assert "CVC or code" not in description and "One-time codes are not secrets" in description
 
 
-def test_a_passkey_item_is_refused_and_nothing_is_entered(page):
-    page.state.controls = [CODE_FIELD]
-    page.backend.add_totp.side_effect = PasskeyItem("1Password")
-    out = call("enroll_totp", handle=HANDLE)
-    assert out["error_type"] == "item_has_passkey" and out["saved"] is False
-    page.backend.resolve_otp.assert_not_called()
-    vault._eval_js_secret.assert_not_called()
-
-
 # The real extraction script on a synthetic page, in node: `els` are {tag, attrs, text}; the page's origin is set.
 _PAGE_JS = r"""
 const els = @@SPEC@@.map((s) => ({ tagName: s.tag.toUpperCase(), attrs: s.attrs || {}, children: [], readOnly: false,
@@ -372,3 +388,80 @@ def test_enrolment_texts_keep_the_key_and_the_backup_codes_out_of_the_model_cont
     description = vault.BROWSER_VAULT_SCHEMA["description"]
     assert "call enroll_totp next" in description and "screenshot while it is visible" in description
     assert "recovery codes show" in description
+
+
+# The whole enroll_totp input on a real 1Password backend over the fake op (tests/agent/fake_op.py, modelled on
+# `op --help` only): judged from the fake's state, never from how add_totp builds its call.
+OLD_URI = "otpauth://totp/Shop:jane?secret=KRSXG5CTMVRXEZLUKN2XAZLSKNSWC4TF"
+OP_ITEM = {"id": "abc", "title": "Shop", "category": "LOGIN", "vault": {"id": "vault-h"},
+           "urls": [{"href": ORIGIN + "/login", "primary": True}], "tags": ["shopping"],
+           "sections": [{"id": "s1", "label": "Recovery"}],
+           "fields": [{"id": "username", "type": "STRING", "purpose": "USERNAME", "label": "username", "value": "jane"},
+                      {"id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password",
+                       "value": "pw-1"},
+                      {"id": "q1", "section": {"id": "s1", "label": "Recovery"}, "type": "CONCEALED", "label": "pin",
+                       "value": "4711"}]}
+_CASES = {  # case: (field already on the item, what the page shows)
+    "new": (None, {"uris": [KEY_URI], "keys": [KEY]}),
+    "spaced-replay": ({"id": "h", "label": "Hermes authenticator", "type": "OTP", "value": KEY_URI},
+                      {"uris": [], "keys": ["jbsw y3dp ehpk 3pxp"]}),
+    "foreign-otp": ({"id": "u", "label": "one-time password", "type": "OTP", "value": OLD_URI},
+                    {"uris": [KEY_URI], "keys": []}),
+    "replace": ({"id": "h", "label": "Hermes authenticator", "type": "OTP", "value": OLD_URI},
+                {"uris": [KEY_URI], "keys": []}),
+    "empty-otp-field": ({"id": "u", "label": "one-time password", "type": "OTP", "value": ""},
+                        {"uris": [KEY_URI], "keys": []}),
+}
+
+
+@pytest.mark.parametrize("case", list(_CASES))
+def test_enroll_totp_on_a_fake_op_keeps_the_passkey_and_every_other_field(page, tmp_path, monkeypatch, caplog, case):
+    """Approach CHANGE (r2 HIGH, r1 Codex A1): the key goes in as one field assignment; a passkey `item get` never
+    shows survives; the key is in one argv element and no file; the code entered is the one op minted."""
+    caplog.set_level(logging.DEBUG)
+    held, shown = _CASES[case]
+    before = dict(OP_ITEM, fields=OP_ITEM["fields"] + ([held] if held else []))
+    fake = fake_op.install(tmp_path / "op", before)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    scratch = tmp_path / "tmpdir"
+    scratch.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    clear_list_cache()
+    backend = OnePasswordLoginBackend({"enabled": True, "binary_path": str(fake.exe)})
+    backend._service_token = "service-token"
+    monkeypatch.setattr("agent.vault_backends.backend_for_handle", Mock(return_value=backend))
+    monkeypatch.setattr(vault, "_meta_relisted", Mock(return_value=page.meta))
+    page.state.controls, page.state.keys = [CODE_FIELD], shown
+    try:
+        out = call("enroll_totp", handle=HANDLE)
+    finally:
+        clear_list_cache()
+
+    state, after = fake.state(), fake.item()
+    assert state["passkey"] and not state["violations"] and not any(c["stdin"] for c in state["calls"])
+    assert list(scratch.iterdir()) == []
+    assert KEY not in json.dumps(out) + caplog.text and "KRSXG5CT" not in json.dumps(out) + caplog.text
+    edits = [c["argv"] for c in state["calls"] if c["argv"][1] == "edit"]
+    hermes = [(f["type"], f["value"]) for f in after["fields"] if f["label"] == "Hermes authenticator"]
+    if case in ("spaced-replay", "foreign-otp"):
+        assert edits == [] and after == before
+    else:
+        assert sum(KEY in a for c in state["calls"] for a in c["argv"]) == 1 and hermes == [("OTP", KEY_URI)]
+        assert [f for f in after["fields"] if "Hermes" not in f["label"]] == before["fields"][:len(OP_ITEM["fields"])] \
+            + ([held] if case == "empty-otp-field" else [])
+        assert {k: v for k, v in after.items() if k != "fields"} == {k: v for k, v in before.items() if k != "fields"}
+    if case == "replace":
+        assert [(f["type"], f["value"]) for f in after["fields"] if f["label"] == "Hermes previous authenticator key"] \
+            == [("CONCEALED", OLD_URI)]
+        assert sum("KRSXG5CT" in a for c in state["calls"] for a in c["argv"]) == 1
+    if case == "foreign-otp":
+        assert out["error_type"] == "totp_already_set" and out["saved"] is False and state["minted"] == []
+        vault._eval_js_secret.assert_not_called()
+    elif case == "empty-otp-field":  # which field op's --otp reads is unverified: no code, nothing confirmed
+        assert out["error_type"] == "totp_code_unavailable" and out["saved"] is True
+        vault._eval_js_secret.assert_not_called()
+    else:
+        assert out["success"] is True and out["key"] == ("already_stored" if case == "spaced-replay" else "stored")
+        (code,) = state["minted"]
+        assert json.dumps(code) in page.written[-1]
