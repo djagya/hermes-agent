@@ -72,50 +72,62 @@ def _login_meta(backend: Any, handle: str) -> tuple[Any, Optional[str]]:
     return meta, None
 
 
-def reset_password(handle: str, task_id: Optional[str], *, identifier: str = "", label: str = "",
-                   rotate: bool = False, symbols: bool = True) -> str:
+def _reset_page(handle: str, tid: str, identifier: str) -> tuple[Optional[tuple], Optional[str]]:
+    """``((backend, origin, nonce, bind, target, classified), None)`` once the page is a choose-a-new-password page
+    this call may write, else ``(None, refusal)``. Nothing is saved or written yet."""
     from tools import browser_vault_tool as vault
 
-    tid = task_id or "default"
     if (refusal := _bank_refusal(tid)) is not None:
-        return refusal
-    if not handle and not identifier.strip():
-        return _refuse("identifier_required", "Without a handle, pass identifier (the account's email or username) "
-                       "so the new 1Password item can sign in later. Nothing was saved or written.")
+        return None, refusal
+    if not handle and not identifier:
+        return None, _refuse("identifier_required", "Without a handle, pass identifier (the account's email or "
+                             "username) so the new 1Password item can sign in later. Nothing was saved or written.")
     backend, refusal = _writable_backend(handle)
     if refusal:
-        return refusal
+        return None, refusal
     if handle:
         meta, refusal = _login_meta(backend, handle)
         if refusal:
-            return refusal
+            return None, refusal
         origin = vault._bound_page_origin(tid, meta, "login")
         if isinstance(origin, dict):
             if origin.get("error_type") == "origin_mismatch":
                 origin["next"] = "Call reset_password without a handle to save a new item for this site."
-            return json.dumps(origin)
+            return None, json.dumps(origin)
     else:
         vault._focus_bound_origin(tid, "", "login")
         origin = vault._current_page_origin(tid)
         if not origin:
-            return _refuse("no_page", "Open the site's choose-a-new-password page first. Nothing was saved or written.")
+            return None, _refuse("no_page", "Open the site's choose-a-new-password page first. Nothing was saved "
+                                 "or written.")
     nonce, bind = secrets.token_hex(8), secrets.token_hex(8)
     raw_controls, classified, refusal = vault._inspect_fill_controls(tid, nonce, "login", bind)
     if refusal:
-        return refusal
+        return None, refusal
     target, refusal = signup.targets("reset", raw_controls)
     if refusal:
-        return refusal
+        return None, refusal
     if (why := reset_page_refusal(target)) == "registration_page":
-        return _refuse("registration_page", "This is a registration (sign-up) page, not a password reset. A sign-up "
-                       "password is filled with fill purpose=signup, which asks the user. Nothing was saved or written.")
+        return None, _refuse("registration_page", "This is a registration (sign-up) page, not a password reset. A "
+                             "sign-up password is filled with fill purpose=signup, which asks the user. Nothing "
+                             "was saved or written.")
     if why:
-        return _refuse("reset_target_unsupported", "Nothing on this page (its address or the field's label) says it "
-                       "chooses a new password. Open the emailed reset link. Nothing was saved or written.", reason=why)
+        return None, _refuse("reset_target_unsupported", "Nothing on this page (its address or the field's label) "
+                             "says it chooses a new password. Open the emailed reset link. Nothing was saved or "
+                             "written.", reason=why)
+    return (backend, origin, nonce, bind, target, classified), None
+
+
+def reset_password(handle: str, task_id: Optional[str], *, identifier: str = "", label: str = "",
+                   rotate: bool = False, symbols: bool = True) -> str:
+    tid = task_id or "default"
+    page, refusal = _reset_page(handle, tid, identifier.strip())
+    if refusal:
+        return refusal
+    backend, origin, nonce, bind, target, classified = page
     key = (handle, origin)
-    reuse = bool(handle) and not rotate and key in _PENDING
-    if reuse:
-        saved = handle
+    if handle and not rotate and key in _PENDING:
+        saved = handle  # an earlier call saved a password the page may not hold: fill that one again
     else:
         saved, refusal = _generate(backend, handle, origin, identifier.strip(), label.strip(),
                                    max(8, min(_PASSWORD_LENGTH, target.primary.max_length or _PASSWORD_LENGTH)),
@@ -126,16 +138,27 @@ def reset_password(handle: str, task_id: Optional[str], *, identifier: str = "",
         _PENDING[(saved, origin)] = True
         while len(_PENDING) > 32:
             _PENDING.pop(next(iter(_PENDING)))
-    done = {"saved": True, "handle": saved, "created": not handle}
+    out = _fill_saved(backend, saved, origin, tid, nonce, bind, target, classified, created=not handle)
+    if json.loads(out).get("success"):
+        _PENDING.pop((saved, origin), None)
+    return out
+
+
+def _fill_saved(backend: Any, saved: str, origin: str, tid: str, nonce: str, bind: str, target: Any,
+                classified: list, *, created: bool) -> str:
+    """Read the saved password back, fill it into the reset page, and say what happened. The password is in
+    1Password already, so every outcome here names ``handle`` and a way to retry."""
+    from tools import browser_vault_tool as vault
+
+    done = {"saved": True, "handle": saved, "created": created}
     retry = ("Check the page: if it still shows the new-password form, call reset_password once more with this "
              "handle (it fills the same saved password). Use rotate=true only when the site refused that password "
              "(symbols=false if it rejects symbols).")
     try:
         password = backend.resolve_password(saved)
     except Exception as exc:  # health: allow BLE001 -- typed or not, the password is saved and nothing is filled
-        error_type = getattr(exc, "error_type", "vault_read_failed")
-        return _refuse(error_type, "The new password is saved in 1Password but could not be read back, so nothing "
-                       "was filled. Call reset_password again with this handle.", **done)
+        return _refuse(getattr(exc, "error_type", "vault_read_failed"), "The new password is saved in 1Password but "
+                       "could not be read back, so nothing was filled. " + retry, **done)
     if (refusal := vault._register_redactions([password])) is not None:
         return _with(refusal, done, next=retry)
     try:
@@ -161,7 +184,6 @@ def reset_password(handle: str, task_id: Optional[str], *, identifier: str = "",
         out = json.loads(signup.finish(answer.get("result"), backend.name, "login", origin, target, tokens, "reset"))
     out.update(done)
     if out.get("success"):
-        _PENDING.pop((saved, origin), None)
         out["next"] = ("Submit the form; the site then uses the new password, which is saved in 1Password under "
                        "handle. Sign in with fill and this handle.")
     else:
