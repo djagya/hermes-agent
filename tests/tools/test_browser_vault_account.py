@@ -507,7 +507,7 @@ def test_enroll_totp_on_a_fake_op_keeps_the_passkey_and_every_other_field(page, 
             + ([held] if case == "empty-otp-field" else [])
         assert {k: v for k, v in after.items() if k != "fields"} == {k: v for k, v in before.items() if k != "fields"}
     if case == "replace":
-        assert [(f["type"], f["value"]) for f in after["fields"] if f["label"] == "Hermes previous authenticator key"] \
+        assert [(f["type"], f["value"]) for f in after["fields"] if f["label"].startswith("Hermes previous authenticator key ")] \
             == [("CONCEALED", OLD_URI)]
         assert sum("KRSXG5CT" in a for c in state["calls"] for a in c["argv"]) == 1
     if case == "foreign-otp":

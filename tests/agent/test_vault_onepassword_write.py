@@ -6,6 +6,7 @@ item template, no stdin, no temp file; a failed or timed-out write keeps no copy
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 
 import pytest
@@ -94,11 +95,13 @@ def test_a_totp_write_changes_only_its_own_field_and_keeps_the_passkey(op):
     assert sum(KEY in a for c in fake.calls() for a in c["argv"]) == 1
 
 
-@pytest.mark.parametrize("mode", ["fail", "replace-fail"])
+@pytest.mark.parametrize("mode", ["fail", "replace-fail", "replace-fail-link"])
 def test_a_failed_totp_write_keeps_no_copy_of_either_key(op, mode):
+    """op's error quotes the assignment and the key it read from a link (r3 Low 3: the old key's own form too)."""
     backend, fake = op
-    if mode == "replace-fail":
-        fake.use(with_fields({"id": "h", "label": "Hermes authenticator", "type": "OTP", "value": OLD_KEY}))
+    if mode != "fail":
+        old = OLD_KEY if mode == "replace-fail" else f"otpauth://totp/Shop:jane?secret={OLD_KEY.lower()}"
+        fake.use(with_fields({"id": "h", "label": "Hermes authenticator", "type": "OTP", "value": old}))
     fake.flag("fail")
     with pytest.raises(BackendError) as failed:
         backend.add_totp(HANDLE, KEY_URI)
@@ -161,9 +164,33 @@ def test_an_unconfirmed_key_hermes_wrote_is_replaced_and_kept_as_previous_in_the
     assert [c["argv"][1] for c in fake.calls()[before:]] == ["get", "edit"]
     fields = fake.item()["fields"]
     assert otp_fields(fake.item()) == [("Hermes authenticator", KEY)]
-    (previous,) = [f for f in fields if f["label"] == "Hermes previous authenticator key"]
+    (previous,) = [f for f in fields if f["label"].startswith("Hermes previous authenticator key")]
+    assert previous["label"] == "Hermes previous authenticator key " + hashlib.sha256(OLD_KEY.encode()).hexdigest()[:8]
     assert previous["type"] == "CONCEALED" and previous["value"] == old and not previous["id"].startswith("TOTP_")
     assert fake.passkey() and not fake.state()["violations"]
+
+
+def test_a_second_replace_keeps_every_earlier_key_in_its_own_field(op):
+    """r3 Low 2: each replaced key gets its own previous field, so a second replace does not overwrite the first."""
+    backend, fake = op
+    first, second, third = OLD_KEY, "MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43U", KEY
+    fake.use(with_fields({"id": "h", "label": "Hermes authenticator", "type": "OTP", "value": first}))
+    assert backend.add_totp(HANDLE, second) is True and backend.add_totp(HANDLE, third) is True
+    kept = sorted(f["value"] for f in fake.item()["fields"] if f["label"].startswith("Hermes previous"))
+    assert kept == sorted([first, second]) and otp_fields(fake.item()) == [("Hermes authenticator", third)]
+    assert sum(c["argv"][1] == "edit" for c in fake.calls()) == 2  # still one op call per replace
+
+
+def test_a_same_named_field_in_a_section_makes_op_refuse_the_replace_and_nothing_changes(op):
+    """op picks a field by name in any section unless several match: then the write fails as a whole (fail-safe)."""
+    backend, fake = op
+    item = with_fields({"id": "h", "label": "Hermes authenticator", "type": "OTP", "value": OLD_KEY},
+                       {"id": "n", "label": "Hermes authenticator", "type": "STRING", "value": "note",
+                        "section": {"id": "s", "label": "Notes"}})
+    fake.use(item)
+    with pytest.raises(BackendError) as failed:
+        backend.add_totp(HANDLE, KEY_URI)
+    assert fake.item() == item and KEY not in str(failed.value) and OLD_KEY not in str(failed.value)
 
 
 def test_an_empty_one_time_password_field_is_left_alone(op):

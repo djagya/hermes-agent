@@ -609,8 +609,9 @@ def _redact_telegram_token(match: re.Match) -> str:
             return match.group(0)
     return f"{boundary}{match.group('bot') or ''}{match.group('id')}:***"
 
-# An authenticator setup link, plain or URL-encoded (a QR image URL carries it as ``otpauth%3A%2F%2F...``).
-_OTPAUTH_RE = re.compile(r"otpauth(?:://|%3A%2F%2F)\S+", re.IGNORECASE)
+# An authenticator setup link in any spelling: plain, URL-encoded (a QR image URL carries ``otpauth%3A%2F%2F...``),
+# double-encoded, JSON-escaped (``otpauth:\/\/``), HTML-entity (``otpauth&#58;//``): the word and all that follows it.
+_OTPAUTH_RE = re.compile(r"otpauth\S*", re.IGNORECASE)
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
 # A base64-encoded PEM private key: kubeconfig's ``client-key-data`` and the ``*_b64``
 # fields around it (``kubectl config view --raw``, cloud-init, CI secrets). The name is

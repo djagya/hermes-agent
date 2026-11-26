@@ -233,7 +233,12 @@ class TestVaultRedactionByAudience:
     "OTPAUTH://TOTP/SHOP:JANE?SECRET=JBSWY3DPEHPK3PXP",  # upper case (r2 review Low)
     '<img src="https://qr.example/c?data=otpauth%3A%2F%2Ftotp%2FShop%3Ajane%3Fsecret%3DJBSWY3DPEHPK3PXP">',
     "data=otpauth%3a%2f%2ftotp%2fShop%3fsecret%3dJBSWY3DPEHPK3PXP",  # URL-encoded, lower-case escapes
-], ids=["link", "upper-case", "url-encoded", "url-encoded-lower"])
+    '{"uri": "otpauth:\\/\\/totp\\/Shop:jane?secret=JBSWY3DPEHPK3PXP"}',  # JSON-escaped slashes (r3 Low 4)
+    "otpauth%3A//totp/Shop?secret=JBSWY3DPEHPK3PXP",  # only the colon encoded
+    "data=otpauth%253A%252F%252Ftotp%252FShop%253Fsecret%253DJBSWY3DPEHPK3PXP",  # double-encoded
+    '<a href="otpauth&#58;//totp/Shop?secret=JBSWY3DPEHPK3PXP">',  # HTML entity colon
+], ids=["link", "upper-case", "url-encoded", "url-encoded-lower", "json-escaped", "colon-encoded", "double-encoded",
+        "html-entity"])
 def test_an_authenticator_setup_link_is_never_shown_even_unregistered(page):
     """J-0643 (Opus A2): a setup page read before enroll_totp must not hand the model the seed."""
     from agent.redact import redact_sensitive_text

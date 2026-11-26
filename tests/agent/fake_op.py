@@ -1,15 +1,20 @@
 """A fake 1Password ``op`` for vault write tests, modelled on ``op --help`` only (not on Hermes's code).
 
 - ``op item get <id> [--vault V] [--format json] [--reveal] [--otp]``: the item as JSON, never its passkey
-  (op does not print one). ``--otp`` mints the current TOTP of the item's first one-time-password field.
+  (op does not print one). ``--otp`` "outputs the primary one-time password": ASSUMED to be the item's first
+  one-time-password field in field order (the real-op check of 2026-11-26 only saw items with one or with Hermes's
+  field first); an empty one errors, the pessimistic reading, so enroll_totp's "empty field" outcome stays fail-safe.
 - ``op item edit <id> [--vault V] [--generate-password[=recipe]] [assignment ...]``: an assignment
   ``[section.]field[type]=value`` (``\\`` escapes ``.``, ``=`` and ``\\`` in names) sets that one field, adding
-  it when no field has that label. ``--template`` or data on stdin replace the whole item: the hidden passkey
-  is gone, and the call is recorded as a violation.
+  it when no field has that name. Names match ignoring spaces; the section is "optional unless multiple sections
+  contain fields with the same name": without one, a uniquely named field in any section (or none) is the match,
+  and several are an error. ``--template`` or data on stdin replace the whole item: the hidden passkey is gone,
+  and the call is recorded as a violation.
 - ``op item create --category login --vault V --title T --url U --generate-password=... username=<id>``.
 
 Every call is logged with its argv (``calls()``); a ``fail`` file makes an edit fail echoing its argv on stderr
-(as op quotes a bad assignment); a ``hang`` file makes an edit sleep past any test timeout.
+(as op quotes a bad assignment, with the key of each authenticator value as op reads it); a ``hang`` file makes
+an edit sleep past any test timeout.
 """
 
 from __future__ import annotations
@@ -88,9 +93,14 @@ def assign(spec):
     names = [re.sub(r"\\(.)", r"\1", n) for n in split_unescaped(head, ".")]
     section, label = (names[0], names[1]) if len(names) == 2 else (None, names[0])
     fields = item.setdefault("fields", [])
+    def same(a, b):
+        return (a or "").replace(" ", "") == (b or "").replace(" ", "")
     def in_section(f):
-        return ((f.get("section") or {}).get("label") or None) == section
-    match = next((f for f in fields if (f.get("label") == label or f.get("id") == label) and in_section(f)), None)
+        return section is None or same((f.get("section") or {}).get("label"), section)
+    found = [f for f in fields if (same(f.get("label"), label) or f.get("id") == label) and in_section(f)]
+    if len(found) > 1:
+        return "[ERROR] more than one field matches %r: specify its section" % label
+    match = found[0] if found else None
     if ftype == "delete":
         if match is not None:
             fields.remove(match)
@@ -132,7 +142,9 @@ if argv[:2] == ["item", "edit"]:
     if os.path.exists(os.path.join(here, "hang")):
         time.sleep(20)
     if os.path.exists(os.path.join(here, "fail")):
-        save(1, err="[ERROR] invalid field assignment: " + " ".join(positional[1:]))
+        keys = [(parse_qs(urlsplit(v).query).get("secret") or [""])[0].upper() for v in
+                (split_unescaped(spec, "=", limit=1)[-1] for spec in positional[1:]) if v.lower().startswith("otpauth://")]
+        save(1, err="[ERROR] invalid field assignment: " + " ".join(positional[1:]) + " (keys: " + ", ".join(keys) + ")")
     if "--template" in flags or stdin:  # the template replaces the whole item: the passkey is not in it
         state["violations"].append(argv)
         state["passkey"] = None
@@ -142,8 +154,12 @@ if argv[:2] == ["item", "edit"]:
         for f in item.get("fields", []):
             if f.get("purpose") == "PASSWORD":
                 f["value"] = "op-Generated-7%pw"
+    before = json.loads(json.dumps(item))
     for spec in positional[1:]:
-        assign(spec)
+        error = assign(spec)
+        if error:  # nothing of the call is applied
+            item = before
+            save(1, err=error)
     save(0, out=json.dumps(item))
 save(2, err="[ERROR] unknown command")
 '''

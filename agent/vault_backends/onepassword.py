@@ -412,8 +412,9 @@ class OnePasswordLoginBackend(LoginBackend):
         field with one ``op item edit`` field assignment: op changes that field only, so a passkey, files and every
         other field stay as they are. False when the item already holds this key (nothing written). A key in any
         other one-time-password field is never touched (:class:`TotpAlreadySet`); a different key in Hermes's own
-        field (an enrolment the site may never have confirmed) is replaced, and in the same call kept in the
-        concealed "Hermes previous authenticator key" field. The key is in op's argv for that one call only."""
+        field (an enrolment the site may never have confirmed) is replaced, and in the same call kept in a concealed
+        "Hermes previous authenticator key <hash>" field (its own label per old key, so a later replace keeps it
+        too). The key is in op's argv for that one call only."""
         vault_id, item_id = self._resolve_handle(handle)
         where = ["--vault", vault_id] if vault_id else []
         held = [f for f in self._revealed(item_id, vault_id).get("fields") or [] if isinstance(f, dict)
@@ -424,8 +425,8 @@ class OnePasswordLoginBackend(LoginBackend):
         if len(mine) != len(held):
             raise TotpAlreadySet(self.display_name)
         old = str(mine[0]["value"]) if mine else ""
-        assign = [f"{_TOTP_LABEL}[otp]={seed}"] + ([f"{_PREVIOUS_LABEL}[password]={old}"] if old else [])
-        self._run("item", "edit", item_id, *where, *assign, secret=(seed, totp_key(seed), old))
+        assign = [f"{_TOTP_LABEL}[otp]={seed}"] + ([f"{_previous_label(old)}[password]={old}"] if old else [])
+        self._run("item", "edit", item_id, *where, *assign, secret=(seed, totp_key(seed), old, totp_key(old)))
         self.invalidate_listing()
         return True
 
@@ -446,6 +447,11 @@ class OnePasswordLoginBackend(LoginBackend):
 # escaped). The field is Hermes's by its label at item level: op assigns the ids.
 _TOTP_LABEL = "Hermes authenticator"
 _PREVIOUS_LABEL = "Hermes previous authenticator key"
+
+
+def _previous_label(old: str) -> str:
+    """The field that keeps a replaced key: labelled with a short hash of that key (hex: nothing to escape)."""
+    return f"{_PREVIOUS_LABEL} {hashlib.sha256(totp_key(old).encode()).hexdigest()[:8]}"
 
 
 def _is_hermes_field(field: dict) -> bool:
