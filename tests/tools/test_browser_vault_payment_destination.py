@@ -1536,3 +1536,15 @@ def test_a_cancelled_release_after_a_commit_still_attempts_every_release_once():
 
     asyncio.run(twice())
     assert sup.attempts == ["owner-kps", "o-top", "o-kps", "absent-top", "w-top", "s-kps"]
+
+
+@pytest.mark.parametrize("total,cents", [("22.60", 2260), ("0.05", 5), ("100.00", 10000)])
+def test_cents_reads_two_decimal_totals(total, cents):
+    assert bvp._cents(SimpleNamespace(total=total, currency="EUR")) == (cents, "EUR")
+
+
+@pytest.mark.parametrize("total", ["22.6", "22", "22.660", "022.60"])
+def test_cents_refuses_other_shapes_instead_of_misreading_them(total):
+    # J-0659: "22.6" used to read as 226 cents, "22" as 22, "22.660" as 22660.
+    with pytest.raises(ValueError):
+        bvp._cents(SimpleNamespace(total=total, currency="EUR"))

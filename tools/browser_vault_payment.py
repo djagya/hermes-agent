@@ -499,6 +499,10 @@ def _stated_cart(cart):
 
 
 def _cents(stated) -> tuple:
+    """The stated total in minor units. Only ``_CART_TOTAL`` shapes (exactly two decimals) convert; any other shape
+    raises instead of becoming a different amount ("22.6" would read as 226 cents)."""
+    if not _CART_TOTAL.fullmatch(stated.total):
+        raise ValueError("the stated total must have exactly two decimals")
     return int(stated.total.replace(".", "")), stated.currency
 
 
