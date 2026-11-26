@@ -435,6 +435,25 @@ def test_a_key_that_was_not_saved_is_never_confirmed(page, failure):
     assert KEY not in json.dumps(out)
 
 
+def test_a_page_that_goes_away_before_the_second_inspection_says_the_password_is_saved(page):
+    reads = []
+    working = vault._eval_js.side_effect
+
+    def second_read_fails(task, script):
+        if "otpauth://" not in script:
+            reads.append(1)
+            if len(reads) > 1:
+                raise vault._PageUnavailable("page_unavailable", "no page")
+        return working(task, script)
+    vault._eval_js.side_effect = second_read_fails
+    out = call("reset_password", handle=HANDLE)
+    assert len(reads) == 2
+    assert out["success"] is False and out["error_type"] == "page_unavailable"
+    assert out["saved"] is True and out["handle"] == HANDLE and "reset_password once more with this handle" in out["next"]
+    vault._eval_js_secret.assert_not_called()
+    assert GENERATED not in json.dumps(out)
+
+
 def test_enroll_without_a_readable_key_names_the_reason(page):
     page.state.keys = {"uris": [], "keys": []}
     out = call("enroll_totp", handle=HANDLE)

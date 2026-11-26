@@ -194,8 +194,11 @@ def _fill_saved(backend: Any, saved: str, origin: str, tid: str, *, created: boo
                             "same saved password).")
     # The page may have changed while 1Password generated the password (an SPA turning the form into a sign-up): the
     # strict reset decision is made again on a fresh inspection, and that inspection is what is written.
-    fresh, refusal = _reset_target(tid, " Nothing was filled into the page; the new password is saved in 1Password "
-                                        "under handle.")
+    try:
+        fresh, refusal = _reset_target(tid, " Nothing was filled into the page; the new password is saved in "
+                                            "1Password under handle.")
+    except vault._PageUnavailable as exc:
+        return json.dumps({**exc.result(), **done, "next": retry})
     if refusal:
         return _with(refusal, done, next="Do not submit. If this is the reset page again, call reset_password with "
                                          "this handle (it fills the same saved password).")
