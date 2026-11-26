@@ -424,9 +424,12 @@ class OnePasswordLoginBackend(LoginBackend):
         where = ["--vault", vault_id] if vault_id else []
         fields = [f for f in self._revealed(item_id, vault_id).get("fields") or [] if isinstance(f, dict)]
         held = [f for f in fields if str(f.get("type") or "").upper() == "OTP" and str(f.get("value") or "").strip()]
-        if any(totp_key(str(f["value"])) == totp_key(seed) and _totp_settings(str(f["value"])) == _totp_settings(seed)
-               for f in held):
-            return False  # the same key with the same settings: nothing to do (other settings are replaced below)
+        # The same key is nothing to do, unless the new seed is a link that names other settings (a bare key names
+        # none, so it never replaces a stored link's 8 digits or SHA256 with the defaults).
+        linked = seed.strip().lower().startswith("otpauth:")
+        if any(totp_key(str(f["value"])) == totp_key(seed)
+               and (not linked or _totp_settings(str(f["value"])) == _totp_settings(seed)) for f in held):
+            return False
         mine = [f for f in held if _is_hermes_field(f)]
         if len(mine) != len(held):
             raise TotpAlreadySet(self.display_name)

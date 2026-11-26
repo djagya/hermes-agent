@@ -176,6 +176,18 @@ def test_the_same_key_with_other_settings_is_replaced_not_skipped(op, stored_que
     assert otp_fields(fake.item()) == [("Hermes authenticator", uri(stored_query if nothing_to_do else new_query))]
 
 
+def test_a_bare_key_never_replaces_a_stored_link_for_the_same_key_with_its_settings(op):
+    """r9 review L1: the bare key names no settings; read as the defaults it replaced an 8-digit SHA256 link the
+    site had confirmed, and the codes stopped working."""
+    backend, fake = op
+    stored = f"otpauth://totp/Shop:jane?secret={KEY}&digits=8&algorithm=SHA256"
+    fake.use(with_fields({"id": "h", "label": "Hermes authenticator", "type": "OTP", "value": stored}))
+    before = len(fake.calls())
+    assert backend.add_totp(HANDLE, KEY) is False
+    assert [c["argv"][1] for c in fake.calls()[before:]] == ["get"]
+    assert otp_fields(fake.item()) == [("Hermes authenticator", stored)]
+
+
 def test_an_unconfirmed_key_hermes_wrote_is_replaced_and_kept_as_previous_in_the_same_call(op):
     backend, fake = op
     old = f"otpauth://totp/Shop:jane?secret={OLD_KEY}"

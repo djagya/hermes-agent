@@ -260,8 +260,11 @@ def test_an_authenticator_setup_link_is_never_shown_even_unregistered(page):
     "otpauth://totp/ACME Co:jane?secret&#61;JBSWY3DPEHPK3PXP&issuer=ACME Co",  # "=" as an HTML entity
     "otpauth://totp/ACME Co:jane?secret&#x3d;JBSWY3DPEHPK3PXP&issuer=ACME Co",
     "otpauth://totp/ACME Co:jane?secret&equals;JBSWY3DPEHPK3PXP&issuer=ACME Co",
+    "otpauth://totp/ACME Co:jane?secret&#061;JBSWY3DPEHPK3PXP&issuer=ACME Co",
+    "otpauth://totp/ACME Co:jane?secret&#61JBSWY3DPEHPK3PXP&issuer=ACME Co",
+    '{"u": "otpauth\\u003a//totp/ACME Co:jane?secret\\u003dJBSWY3DPEHPK3PXP"}',
 ], ids=["space-in-label", "lower-case-seed", "encoded-with-space", "bare-encoded-secret", "equals-decimal",
-        "equals-hex", "equals-named"])
+        "equals-hex", "equals-named", "equals-zero-padded", "equals-no-semicolon", "json-unicode-escape"])
 def test_a_seed_is_never_shown_when_a_space_cuts_the_setup_link(page):
     from agent.redact import redact_sensitive_text
 

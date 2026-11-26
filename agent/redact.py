@@ -612,9 +612,9 @@ def _redact_telegram_token(match: re.Match) -> str:
 # An authenticator setup link in any spelling: plain, URL-encoded (a QR image URL carries ``otpauth%3A%2F%2F...``),
 # double-encoded, JSON-escaped (``otpauth:\/\/``), HTML-entity (``otpauth&#58;//``, ``&#x3a;``, ``&colon;``): the word and all that follows it.
 # Only when a colon (in any of those spellings) follows: ``import ... from "otpauth"`` and ``otpauth_uri(...)`` stay.
-_OTPAUTH_RE = re.compile(r"otpauth(?=:|%3A|%253A|&#58;|&#x3a;|&colon;|\\:)\S*", re.IGNORECASE)
+_OTPAUTH_RE = re.compile(r"otpauth(?=:|%3A|%253A|&#0*58;?|&#x0*3a;?|&colon;|\\:|\\u003a)\S*", re.IGNORECASE)
 # The seed of a link whose label has a space (``otpauth://totp/ACME Co:jane?secret=...``, cut by the ``\S*`` above).
-_OTP_SECRET_RE = re.compile(r"(secret(?:=|%3D|%253D|&#61;|&#x3d;|&equals;))[A-Z2-7]{16,}", re.IGNORECASE)
+_OTP_SECRET_RE = re.compile(r"(secret(?:=|%3D|%253D|&#0*61;?|&#x0*3d;?|&equals;|\\u003d))[A-Z2-7]{16,}", re.IGNORECASE)
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
 # A base64-encoded PEM private key: kubeconfig's ``client-key-data`` and the ``*_b64``
 # fields around it (``kubectl config view --raw``, cloud-init, CI secrets). The name is
