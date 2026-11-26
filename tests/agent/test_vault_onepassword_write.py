@@ -270,4 +270,4 @@ def test_a_read_that_times_out_keeps_the_retry_then_tell_danil_advice(op, monkey
     with pytest.raises(BackendNetwork) as failed:
         backend.list_items()
     text = failed.value.message()
-    assert "tell Danil" in text and "may have been applied" not in text
+    assert "Retry once in a minute; if it fails again, tell Danil." in text and "may have been applied" not in text
