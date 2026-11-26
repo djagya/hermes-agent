@@ -30,7 +30,8 @@ if "--template" in argv:
 open(os.path.join(here, "op.log"), "a").write(json.dumps(entry) + "\n")
 item_path = os.path.join(here, "item.json")
 if os.path.exists(os.path.join(here, "fail")) and argv[1] in ("create", "edit"):  # op echoing the template
-    sys.stderr.write("[ERROR] invalid item: " + entry.get("template", "") + "\n"); sys.exit(1)
+    values = [f.get("value", "") for f in json.loads(entry["template"]).get("fields", [])]
+    sys.stderr.write("[ERROR] invalid field value: " + " ".join(values) + "\n"); sys.exit(1)
 if argv[:2] == ["item", "get"]:
     print(open(item_path, encoding="utf-8").read()); sys.exit(0)
 if argv[:2] == ["item", "create"]:
@@ -114,7 +115,7 @@ def test_a_failed_write_keeps_no_copy_of_the_secret(op, write):
     exc = failed.value
     for text in (exc.detail, str(exc), exc.message(), json.dumps(exc.result())):
         assert secret not in text
-    assert "invalid item" in exc.detail  # op's own words are kept for classification
+    assert "invalid field value" in exc.detail  # op's own words are kept for classification
 
 
 def test_totp_is_added_once_and_another_key_is_never_overwritten(op):

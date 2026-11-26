@@ -124,7 +124,9 @@ class OnePasswordLoginBackend(LoginBackend):
         if not _unlock.store_session_token(self.name, token, generation):
             raise RuntimeError("1Password was locked while unlocking; try again")
 
-    def _run(self, *args: str) -> str:
+    def _run(self, *args: str, secret: str = "") -> str:
+        """op's stdout; a failure raises its typed cause with op's stderr (``secret``, the value a write sent, cut
+        out of it before it is kept)."""
         token = None if self._service_token else _unlock.get_session_token(self.name)
         if not self._service_token and not token:
             raise UnlockRequired(self)
@@ -136,7 +138,8 @@ class OnePasswordLoginBackend(LoginBackend):
                 raise BackendNetwork(self.display_name, f"op timed out after {_TIMEOUT:.0f}s") from None
             raise
         if proc.returncode != 0:
-            raise self._classify(_scrub(proc.stderr or ""))
+            err = _scrub(proc.stderr or "")
+            raise self._classify(err.replace(secret, "[REDACTED]") if secret else err)
         return proc.stdout or ""
 
     def _classify(self, err: str) -> Exception:
@@ -437,11 +440,7 @@ class OnePasswordLoginBackend(LoginBackend):
             path = os.path.join(tmp, "item.json")
             with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as fh:
                 json.dump(item, fh)
-            try:
-                out = self._run(*args, "--template", path, "--format", "json")
-            except BackendError as exc:
-                exc.detail = exc.detail.replace(secret, "[REDACTED]") if secret else exc.detail
-                raise
+            out = self._run(*args, "--template", path, "--format", "json", secret=secret)
         self.invalidate_listing()
         try:
             created = json.loads(out)
