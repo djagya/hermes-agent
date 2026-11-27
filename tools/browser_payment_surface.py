@@ -42,6 +42,7 @@ from tools.browser_payment_surface_after_pay import (  # build C r4: site rules
     _provider_site,
     cross_site,
 )
+from tools import browser_payment_again as again  # D-1209 a: the same Pay control twice
 from tools.browser_payment_press_kind import (  # build F/G1: which press is Pay-like
     CAPTION_WITHHELD,
     _pay_press,
@@ -1373,6 +1374,8 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             from tools.browser_payment_detect import spent_refusal
 
             return spent_refusal(gen)
+        if pay_press and gen is not None and (refused := again.refusal(gen, node, caption)):
+            return refused  # D-1209 a: the same Pay control again only after payment_done's pay_again
         progress.append("checked" if checked else "go")  # booked: from here the press counts, whatever its outcome
         if gen is not None:  # the admission above proved it is still this supervisor's current record
             gen.pressed = True
@@ -1382,6 +1385,7 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             if pay_press:
                 gen.pay_presses += 1
                 gen.pay_at, gen.pay_base = (top, time.monotonic()), base
+                again.book(gen, node, caption)
                 if (node and node[0] == top) or gen.pay_node is None:
                     gen.pay_node, gen.pay_caption = node, caption
     return None
@@ -1389,7 +1393,8 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
 
 PAY_PRESSED_NEXT = (
     "Read the page. If it shows an order confirmation, call payment_done. If it shows another step (a confirm, "
-    "3-D Secure, a dialog), continue.")
+    "3-D Secure, a dialog), continue. If it shows an error, call payment_done before you change anything. "
+    + again.AGAIN_RULE)
 DETECTED_NEXT = (
     "The page shows the order was placed (payment_detected): call payment_done now. Do not press Pay or Buy again: a "
     "new purchase needs a new approval from the owner (Danil).")
@@ -1726,7 +1731,7 @@ class _LockGen:
     press may have landed in it), when control already reported the slot locked, or when control's lock already
     held other tabs. Read and written under ``_LOCK``."""
 
-    __slots__ = ("admitted", "approved", "known", "merchant", "native_lost", "ordered", "owned", "paid", "paid_by",
+    __slots__ = ("admitted", "again", "approved", "known", "merchant", "native_lost", "ordered", "owned", "paid", "paid_by",
                  "pay_at", "pay_base", "pay_caption", "pay_node", "pay_presses", "pay_tabs", "pressed", "presses",
                  "returned", "serial", "ticket", "ws")
 
@@ -1776,6 +1781,7 @@ class _LockGen:
         self.returned = False
         self.pay_presses = 0
         self.ordered = False
+        self.again: Optional[again.Presses] = None  # D-1209 a: this record's Pay-like presses by control
 
 
 # supervisor -> its current lock (set by a claim that starts one, dropped when an unlock is proven)
@@ -1870,6 +1876,7 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
         return _refusal("payment_control_unknown", "ref must be one returned by the latest payment_controls and "
                                                    "not used for a press yet; call payment_controls again.")
     progress: list = []
+    out: dict = {}
     try:
         out = _with_dialog(supervisor, _run(
             supervisor, lambda deadline: _click(supervisor, spec, progress, deadline, gate), progress))
@@ -1880,6 +1887,8 @@ def payment_click(supervisor: Any, ref: str, owner_go: bool = False) -> dict:
                 or out["error"]
     finally:
         with _LOCK:  # build C r2 (P2): the press itself was booked at its dispatch (_book_press)
+            if out.get("pay_pressed") is True:  # D-1209 a: its answer came back (an uncertain press never does)
+                again.answered(gate.gen)
             _PRESSING_N = max(0, _PRESSING_N - 1)
             _PRESSING[supervisor] = max(0, _PRESSING.get(supervisor, 0) - 1)
     if out.get("success"):

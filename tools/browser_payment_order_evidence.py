@@ -157,9 +157,11 @@ async def _scan(sup: Any, sid: str, frame_id: str) -> Optional[dict]:
     return value
 
 
-async def _pay_control_shown(sup: Any, sid: str, frame_id: str, node: int) -> bool:
-    """Whether the pressed Pay element (``node``, a backendNodeId of this document) is still connected and rendered.
-    A node that no longer resolves is gone; a resolved node whose state cannot be read counts as still there."""
+async def _pay_control_shown(sup: Any, sid: str, frame_id: str, node: int, fn: str = _SHOWN,
+                             unread: bool = True) -> bool:
+    """Whether the pressed Pay element (``node``, a backendNodeId of this document) is still connected and rendered
+    (``fn`` on it; D-1209 a: also enabled). A node that no longer resolves is gone; a resolved node whose state cannot
+    be read answers ``unread`` (still there, for the confirmation's veto)."""
     try:
         ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": frame_id, "worldName": "hermes-payment-done"},
                               session_id=sid))["result"]["executionContextId"]
@@ -169,12 +171,13 @@ async def _pay_control_shown(sup: Any, sid: str, frame_id: str, node: int) -> bo
         logger.info("payment_done: pressed Pay control not resolved (%s)", type(exc).__name__)
         return False
     try:
-        reply = (await sup._cdp("Runtime.callFunctionOn", {"objectId": obj, "functionDeclaration": _SHOWN,
+        reply = (await sup._cdp("Runtime.callFunctionOn", {"objectId": obj, "functionDeclaration": fn,
                                                            "returnByValue": True}, session_id=sid))["result"]
-        return (reply.get("result") or {}).get("value") is not False
-    except Exception as exc:  # health: allow BLE001 -- unread state of a resolved node: still there (fails closed)
+        value = (reply.get("result") or {}).get("value")
+        return value is True if not unread else value is not False
+    except Exception as exc:  # health: allow BLE001 -- unread state of a resolved node: ``unread`` (fails closed)
         logger.info("payment_done: pressed Pay control not read (%s)", type(exc).__name__)
-        return True
+        return unread
     finally:
         await sup._release_payment_object(sid, obj)
 

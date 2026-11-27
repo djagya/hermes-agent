@@ -36,6 +36,7 @@ import logging
 from typing import Any, Dict, Optional
 from agent.vault_payment_policy import PaymentPolicyError, destination_consent_enabled, effective_frame_origins
 
+from tools.browser_payment_again import AGAIN_RULE
 from tools.browser_vault_context import (fill_context, plugin_errors_as_refusal, saved_origins, snapshot_refusal,
                                          write_backend_code)
 from tools.browser_vault_outcome import (
@@ -1569,8 +1570,8 @@ BROWSER_VAULT_SCHEMA = {
         "control gone; a new document or a tab the press opened: order wording). payment_detected true means the approval is spent: "
         "call payment_done; every later Pay-like press under it is refused payment_already_made (nothing pressed), and "
         "a new purchase needs a new approval. payment_in_flight: the page is still loading after the last Pay press; "
-        "wait and read it again (nothing pressed). A retry after a declined payment on the same checkout, a bank's "
-        "3-D Secure step and a confirm dialog after Pay are pressed like any step. The same holds for owner_go "
+        "wait and read it again (nothing pressed). A bank's 3-D Secure step, a confirm dialog after Pay and another "
+        "control are pressed like any step; " + AGAIN_RULE + " The same holds for owner_go "
         "presses. A card with no stated total, or whose page check did not match "
         "it, or with "
         "Pay-once switched off, says \"fill only\": "
@@ -1598,7 +1599,7 @@ BROWSER_VAULT_SCHEMA = {
         "opens it in a "
         "new tab (new_tab; browser_exec stays on its own tab: switch_tab(new_tab) there) and closes the payment tab; lock_released true means browser control confirmed the "
         "unlock, false (with note) means it did not, so follow the note. payment_confirmation_not_reached: no "
-        "confirmation within the wait (url: the tab's site only; reason: what the tab showed last), the lock stays, nothing was clicked or closed; press Pay again only when the page shows the payment failed or was declined; "
+        "confirmation within the wait (url: the tab's site only; reason: what the tab showed last), the lock stays, nothing was clicked or closed; pay_again true: the page shows the payment failed or a field was flagged, with the pressed Pay control still there and no order; "
         "follow the error (call payment_done again after the user finishes a bank check, or ask the user). "
         "fill_result_unverified: the page's answer to a fill could not be verified and a field may hold the "
         "password; do not submit or retry, tell the user."
