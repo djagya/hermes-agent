@@ -1,30 +1,31 @@
 """D-1209 a (2026-11-27): a second press on the same Pay control is Hermes' decision, not prose.
 
 Every Pay-like press booked in a lock record (``browser_payment_surface._book_press``) is kept here by identity: its
-document (frame id, loader) and element (backendNodeId; its redacted caption when the node was not read). A Pay-like
-press on a control already pressed in this record is refused (``payment_same_control``, nothing pressed) unless
-payment_done answered ``pay_again: true`` after the latest Pay-like press and no Pay-like press was booked since. A
-different control, or the same place on a new document (a new loader), is the checkout's next step and is not held.
+document (frame id, loader), its element (backendNodeId) and its redacted caption. A Pay-like press on a control
+already pressed in this record (the same document and the same element or the same caption) is refused
+(``payment_same_control``, nothing pressed) unless payment_done answered ``pay_again: true`` after the latest Pay-like
+press, no Pay-like press was booked since, and the page right before this press still holds what that answer saw:
+the same document, failure wording or a flagged field, no order wording, and no new tab. A different control, or the
+same place on a new document (a new loader), is the checkout's next step and is not held.
 
 payment_done sets ``pay_again`` only when all of these hold on its last look at the payment tab:
 
-- no order was detected in this lock (``paid``), the latest Pay-like press opened no tab, its answer came back (not
-  ``payment_click_uncertain``: that press is in ``presses`` but never ``answered``), and this process saw the whole
-  lock (``known``);
+- no order was detected in this lock (``paid``), the tabs were read right before the latest Pay-like press and no tab
+  was opened since (no new page target, none opened by a payment tab), its answer came back (not
+  ``payment_click_uncertain``), and this process saw the whole lock (``known``);
 - the tab's top document is the very document of that press (same frame and loader), its pressed element (read by
   backendNodeId) is still connected, rendered and enabled, and the top frame is not loading a navigation;
 - the document shows failure wording or a field flagged invalid (``aria-invalid``, ``:user-invalid``) that it did not
-  show right before that press, no strong order wording (a thank-you sentence, an order number), no order wording
-  that was not there before the press, and is not busy (``readyState``, ``aria-busy``); the tree is the same after
-  the reads.
+  show right before that press, no strong order wording (a thank-you sentence, an order number), no order wording at
+  all, and is not busy (``readyState``, ``aria-busy``); the tree is the same after the reads.
 
 A failed, slow or late read gives no ``pay_again``. Only booleans leave the page.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 logger = logging.getLogger("tools.browser_payment_surface")
@@ -36,7 +37,7 @@ AGAIN_RULE = ("Press the same Pay control again only when payment_done says pay_
 _SAME_CONTROL_TEXT = (
     "You already pressed this Pay control for this approval, so nothing was pressed. Call payment_done (before you "
     "change anything on the page): it says pay_again: true only when the page shows the payment failed or a field "
-    "was flagged, with this control still there and no order. Otherwise ask the owner (Danil).")
+    "was flagged, with this control still there and no order wording. Otherwise ask the owner (Danil).")
 
 # The page's own flags (one boolean each): a field flagged invalid, and the document still busy.
 FLAGS_JS = r"""(() => {
@@ -54,16 +55,19 @@ _PRESSABLE = r"""function(){ if (!this.isConnected || this.disabled === true
   return r.width >= 1 && r.height >= 1 && st.visibility === 'visible' && st.display !== 'none'; }"""
 
 
-@dataclass(frozen=True)
 class Presses:
-    """A lock record's Pay-like presses (``_LockGen.again``). ``keys``: ``(frame id, loader, backendNodeId or None,
-    caption)`` of each; ``last``: the latest one's; ``answered``: ``pay_presses`` when a Pay-like press's answer last
-    came back; ``granted``: ``(key, pay_presses)`` payment_done found ``pay_again`` for."""
+    """A lock record's Pay-like presses (``_LockGen.again``), read and written under ``_LOCK``. ``keys``: ``(frame
+    id, loader, backendNodeId or None, caption)`` of each, the latest last; ``tabs``: the page targets right before
+    the latest one (None: unread); ``answered``: its answer came back; ``granted``: the key payment_done found
+    ``pay_again`` for (dropped by the next Pay-like press)."""
 
-    keys: frozenset = frozenset()
-    last: Optional[tuple] = None
-    answered: int = -1
-    granted: Optional[tuple] = None
+    __slots__ = ("answered", "granted", "keys", "tabs")
+
+    def __init__(self) -> None:
+        self.keys: list = []
+        self.tabs: Optional[frozenset] = None
+        self.answered = False
+        self.granted: Optional[tuple] = None
 
 
 def _key(node: Any, caption: str) -> tuple:
@@ -72,44 +76,47 @@ def _key(node: Any, caption: str) -> tuple:
 
 
 def _same(a: tuple, b: tuple) -> bool:
-    """One control: the same document, and the same element (by caption when either node id is unread)."""
-    if a[:2] != b[:2]:
-        return False
-    return a[2] == b[2] if a[2] is not None and b[2] is not None else a[3] == b[3]
+    """One control: the same document, and the same element or the same caption (a re-mounted button is held too)."""
+    return a[:2] == b[:2] and ((a[2] is not None and a[2] == b[2]) or a[3] == b[3])
 
 
-def refusal(gen: Any, node: Any, caption: str) -> Optional[dict]:
-    """``payment_same_control`` for a Pay-like press on a control already pressed in ``gen`` without a ``pay_again``
-    since the latest Pay-like press, else None. Must hold ``browser_payment_surface._LOCK``."""
+def refusal(gen: Any, node: Any, caption: str, base: Optional[dict], tabs: Optional[frozenset]) -> Optional[dict]:
+    """``payment_same_control`` for a Pay-like press on a control already pressed in ``gen``, else None. A
+    ``pay_again`` for it counts only while the look right before this press (``base``, ``tabs``) still shows that
+    document with failure wording or a flagged field, no order wording and no new tab. Must hold
+    ``browser_payment_surface._LOCK``."""
     presses, key = gen.again, _key(node, caption)
     if presses is None or not any(_same(k, key) for k in presses.keys):
         return None
-    granted = presses.granted
-    if granted is not None and granted[1] == gen.pay_presses and _same(granted[0], key):
+    granted, base = presses.granted, base or {}
+    if (granted is not None and _same(granted, key) and tuple(base.get("doc") or ()) == granted[:2]
+            and base.get("signal") is True and base.get("strong") is False and base.get("order") is False
+            and tabs is not None and presses.tabs is not None and tabs <= presses.tabs):
         return None
     return {"success": False, "error_type": SAME_CONTROL, "error": _SAME_CONTROL_TEXT}
 
 
-def book(gen: Any, node: Any, caption: str) -> None:
-    """A Pay-like press booked on ``gen`` (after ``pay_presses`` counted it). Must hold ``_LOCK``."""
-    presses, key = gen.again or Presses(), _key(node, caption)
-    gen.again = replace(presses, keys=presses.keys | {key}, last=key)
+def book(gen: Any, node: Any, caption: str, tabs: Optional[frozenset]) -> None:
+    """A Pay-like press booked on ``gen`` (``tabs``: the page targets right before it). Must hold ``_LOCK``."""
+    presses = gen.again = gen.again or Presses()
+    presses.keys.append(_key(node, caption))
+    presses.tabs, presses.answered, presses.granted = tabs, False, None
 
 
 def answered(gen: Any) -> None:
     """The latest Pay-like press's answer came back to the caller (``payment_click``). Must hold ``_LOCK``."""
     if gen is not None and gen.again is not None:
-        gen.again = replace(gen.again, answered=gen.pay_presses)
+        gen.again.answered = True
 
 
 def _eligible(gen: Any, row: tuple) -> Optional[tuple]:
     """``(key, pay_presses)`` when the lock record allows a ``pay_again`` on top document ``row`` at all (module
     docstring, first two points), else None. Must hold ``_LOCK``."""
     presses, base = gen.again, gen.pay_base or {}
-    if presses is None or presses.last is None or not gen.known or gen.paid or gen.pay_tabs:
+    if presses is None or not presses.keys or not presses.answered or presses.tabs is None:
         return None
-    last = presses.last
-    if presses.answered != gen.pay_presses or tuple(last[:2]) != tuple(row[:2]) or last[2] is None:
+    last = presses.keys[-1]
+    if not gen.known or gen.paid or gen.pay_tabs or last[:2] != tuple(row[:2]) or last[2] is None:
         return None
     if tuple(base.get("doc") or ()) != tuple(row[:2]) or base.get("signal") is not False:
         return None
@@ -138,11 +145,27 @@ async def flags(sup: Any, sid: str, frame_id: str) -> Optional[dict]:
     return value
 
 
-async def signal(sup: Any, sid: str, row: tuple, scan: dict) -> Optional[bool]:
-    """Failure wording or a flagged field on document ``row`` (``scan``: its wording scan); None when unread. Read
-    right before every Pay-like press (``pay_base``): a ``pay_again`` needs it absent then."""
-    found = await flags(sup, sid, row[0])
-    return None if found is None else bool(scan["failure"] or found["invalid"])
+async def signal(sup: Any, sid: str, frame_id: str, failure: bool, bound: float) -> Optional[bool]:
+    """Failure wording (``failure``, the wording scan's) or a flagged field on the document; None when unread or
+    slower than ``bound``. Read right before every Pay-like press (``pay_base``), once no order evidence was found."""
+    if failure:
+        return True
+    try:
+        found = await asyncio.wait_for(flags(sup, sid, frame_id), bound)
+    except Exception as exc:  # health: allow BLE001 -- slow: unread, no pay_again later (fails closed)
+        logger.info("payment: page flags before the press not read (%s)", type(exc).__name__)
+        return None
+    return None if found is None else found["invalid"]
+
+
+async def _no_new_tab(sup: Any, before: frozenset) -> bool:
+    """No page target that was not there right before the press, and none a payment tab opened."""
+    from tools.browser_payment_done import payment_tabs
+
+    infos = (await sup._cdp("Target.getTargets"))["result"]["targetInfos"]
+    opener = payment_tabs(sup)
+    return all(t.get("targetId") in before and t.get("openerId") not in opener
+               for t in infos if isinstance(t, dict) and t.get("type") == "page")
 
 
 async def probe(sup: Any, sid: str, tree: tuple, child_sessions: dict) -> dict:
@@ -156,16 +179,16 @@ async def probe(sup: Any, sid: str, tree: tuple, child_sessions: dict) -> dict:
     with surface._LOCK:
         gen = _record(sup)
         token = _eligible(gen, row) if gen is not None else None
-        before = dict(gen.pay_base) if token is not None else {}
+        tabs = gen.again.tabs if token is not None else None
     if token is None or inflight(sup, gen):
         return {}
     scan = await scan_document(sup, sid, row)
     found = await flags(sup, sid, row[0]) if scan is not None else None
-    if found is None or found["busy"] or scan["strong"] or not (scan["failure"] or found["invalid"]):
+    if found is None or found["busy"] or scan["strong"] or scan["order"] or not (scan["failure"] or found["invalid"]):
         return {}
-    if scan["order"] and before.get("order") is not True:
+    if not await _no_new_tab(sup, tabs):
         return {}
-    if not await _pay_control_shown(sup, sid, row[0], token[0][2], fn=_PRESSABLE, unread=False):
+    if await _pay_control_shown(sup, sid, row[0], token[0][2], fn=_PRESSABLE) is not True:
         return {}
     if await sup._payment_tree(sid, child_sessions) != tree:
         return {}
@@ -187,6 +210,6 @@ def grant(sup: Any, token: Any) -> bool:
     with surface._LOCK:
         if _record(sup) is not gen or _eligible(gen, token[0][:2]) != token:
             return False
-        gen.again = replace(gen.again, granted=token)
+        gen.again.granted = token[0]
     logger.info("payment_done: pay_again for the latest Pay press")
     return True

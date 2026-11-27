@@ -434,7 +434,8 @@ _NOT_REACHED = ("No order confirmation was reached on the payment tab within the
                 "button), not_shop_page (a payment provider, bank (3-D Secure) or other site's page, or a card "
                 "form), loading (a page still loading or changing), page_unread (the page could not be read). "
                 "The browser stays locked; nothing was clicked, closed or retried. pay_again true: the page shows the "
-                "payment failed or a field was flagged, with the pressed Pay control still there and no order. "
+                "payment failed or a field was flagged, with the pressed Pay control still there and no order "
+                "wording. "
                 + AGAIN_RULE + " "
                 "url shows the site the tab is on (origin only while locked). If a bank check is waiting, ask the "
                 "user to finish it, then call payment_done again; otherwise ")

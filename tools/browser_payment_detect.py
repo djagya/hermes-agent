@@ -35,6 +35,7 @@ logger = logging.getLogger("tools.browser_payment_surface")
 
 _INFLIGHT_S = 45.0  # the longest a Pay-like press's navigation holds the next Pay-like press back (build G2: 45 s)
 _BEFORE_SCAN_S = 6.0  # the longest the look before a Pay-like press may take (unread: the press goes on)
+_FLAGS_S = 2.0  # D-1209 a: the page-flags read after that look (unread: no pay_again later)
 _MAX_NEW_TABS = 2
 
 SPENT = "payment_already_made"
@@ -116,11 +117,10 @@ async def _still_the_shop(sup: Any, gate: Any, sid: str, row: tuple) -> bool:
 async def _scan_top(sup: Any, gate: Any, page_sid: str, base: Optional[dict], judged: bool) -> tuple:
     """``(found or None, mine)``: the payment tab's top document read once. ``mine``: ``{"doc": (frame id, loader),
     "strong": bool or None}``, the booleans kept with a Pay-like press (None: not a shop page, or unread), and (D-1209
-    a, ``browser_payment_again``) ``order`` and ``signal`` (failure wording or a flagged field; None: unread). ``found``
+    a, ``browser_payment_again``) ``order`` and ``failure`` (the wording scan's). ``found``
     (only when ``judged``): the evidence, judged against ``base`` (the earlier look at this document; None: none read,
     which a checkout-like document cannot be judged without)."""
     from tools import browser_payment_done as done
-    from tools.browser_payment_again import signal
     from tools.browser_payment_order_evidence import judge, scan_document
     from tools.browser_payment_surface import _top_frame, pay_press
 
@@ -131,7 +131,7 @@ async def _scan_top(sup: Any, gate: Any, page_sid: str, base: Optional[dict], ju
     scan = await scan_document(sup, page_sid, top)
     if scan is None:
         return None, mine
-    mine.update(strong=scan["strong"], order=scan["order"], signal=await signal(sup, page_sid, top, scan))
+    mine.update(strong=scan["strong"], order=scan["order"], failure=scan["failure"])
     checkout = done.checkout_like_now(sup, top, pay_press(sup))
     if not judged or (checkout and base is None):
         return None, mine
@@ -246,7 +246,10 @@ async def before_press(sup: Any, gate: Any, page_sid: str, deadline: float) -> t
     now (``_scan_top``'s ``mine``), kept with the press: the document after it is judged against them. For a press
     that follows another one in this approval: the last one's navigation still loading (``payment_in_flight``), or
     order evidence shown now (spent: ``payment_already_made``), judged against the last press's booleans. Unread:
-    the press goes on (its total was read)."""
+    the press goes on (its total was read). D-1209 a: only then, on its own bound, ``signal`` (failure wording or a
+    flagged field, ``browser_payment_again``; None: unread, no pay_again later) joins ``kept``."""
+    from tools.browser_payment_again import signal
+
     gen = gate.gen
     later = gen is not None and gen.pay_at is not None
     if later and inflight(sup, gen):
@@ -268,6 +271,8 @@ async def before_press(sup: Any, gate: Any, page_sid: str, deadline: float) -> t
             logger.info("payment_click: new tabs before the press not read (%s)", type(exc).__name__)
     if found and _spend(sup, gate, found, gen.pay_caption):
         return spent_refusal(gen), None
+    if mine is not None and mine["strong"] is not None:  # the evidence was judged first; a slow read never hides it
+        mine["signal"] = await signal(sup, page_sid, mine["doc"][0], mine["failure"], min(_FLAGS_S, budget()))
     return None, mine
 
 

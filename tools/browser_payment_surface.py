@@ -1217,7 +1217,7 @@ async def _click(sup: Any, spec: tuple, progress: list, deadline: float, gate: _
         refused = await _press_now(sup, deadline, (page_sid, sid, fid, loader, element, tree, child_sessions),
                                    (x2, y2, outer2), top, lambda: _book_press(
                                        sup, gate, gate.approved is not None, pay_like, progress, node=node,
-                                       caption=_caption(control["text"], sup), top=tree[0][0], base=kept),
+                                       caption=_caption(control["text"], sup), top=tree[0][0], base=kept, tabs=tabs),
                                    gate.approved is not None,
                                    last=(lambda: detect.last_check(sup, gate, page_sid, kept)) if pay_like else None)
         if refused:
@@ -1357,14 +1357,16 @@ def _admission_holds(sup: Any, gate: _Gate) -> bool:
 
 
 def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress: list, *, node: Any = None,
-                caption: str = "", top: Any = None, base: Optional[dict] = None) -> Optional[dict]:
+                caption: str = "", top: Any = None, base: Optional[dict] = None,
+                tabs: Optional[frozenset] = None) -> Optional[dict]:
     """build C r2 (P2): right before mousePressed, in one step under ``_LOCK``: the admission still holds (r4 C2) and,
     for a Pay-like press, no payment was detected for this approval (build G1); then the press is booked in its lock
     record (``presses``, ``pressed``, r4 C7 ``admitted``), so a listing during the press or its settle already counts
     it. A refusal (nothing booked) means nothing is pressed. build G1: a Pay-like press keeps its time and ``top``
     frame id (``pay_at``, the in-flight guard) and, on that top document or as the first one, ``node`` ``(frame id,
     loader, backendNodeId, origin + path)`` and its redacted ``caption`` (``pay_press``: payment_done's identity
-    veto); ``base``: the document and strong-wording boolean read right before the press (``pay_base``, build G2).
+    veto); ``base``: the document and strong-wording boolean read right before the press (``pay_base``, build G2);
+    ``tabs``: the page targets read right before it (D-1209 a, ``browser_payment_again``; None: unread).
     ``gen`` is None when this process saw no lock of this supervisor: nothing to book then."""
     with _LOCK:
         if not _admission_holds(sup, gate):
@@ -1374,7 +1376,7 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             from tools.browser_payment_detect import spent_refusal
 
             return spent_refusal(gen)
-        if pay_press and gen is not None and (refused := again.refusal(gen, node, caption)):
+        if pay_press and gen is not None and (refused := again.refusal(gen, node, caption, base, tabs)):
             return refused  # D-1209 a: the same Pay control again only after payment_done's pay_again
         progress.append("checked" if checked else "go")  # booked: from here the press counts, whatever its outcome
         if gen is not None:  # the admission above proved it is still this supervisor's current record
@@ -1385,7 +1387,7 @@ def _book_press(sup: Any, gate: _Gate, checked: bool, pay_press: bool, progress:
             if pay_press:
                 gen.pay_presses += 1
                 gen.pay_at, gen.pay_base = (top, time.monotonic()), base
-                again.book(gen, node, caption)
+                again.book(gen, node, caption, tabs)
                 if (node and node[0] == top) or gen.pay_node is None:
                     gen.pay_node, gen.pay_caption = node, caption
     return None

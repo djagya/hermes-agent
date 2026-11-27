@@ -157,11 +157,10 @@ async def _scan(sup: Any, sid: str, frame_id: str) -> Optional[dict]:
     return value
 
 
-async def _pay_control_shown(sup: Any, sid: str, frame_id: str, node: int, fn: str = _SHOWN,
-                             unread: bool = True) -> bool:
+async def _pay_control_shown(sup: Any, sid: str, frame_id: str, node: int, fn: str = _SHOWN) -> Optional[bool]:
     """Whether the pressed Pay element (``node``, a backendNodeId of this document) is still connected and rendered
-    (``fn`` on it; D-1209 a: also enabled). A node that no longer resolves is gone; a resolved node whose state cannot
-    be read answers ``unread`` (still there, for the confirmation's veto)."""
+    (``fn`` on it; D-1209 a: ``browser_payment_again`` also asks enabled). A node that no longer resolves is gone
+    (False); a resolved node whose state cannot be read is None (the confirmation's veto counts it as still there)."""
     try:
         ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": frame_id, "worldName": "hermes-payment-done"},
                               session_id=sid))["result"]["executionContextId"]
@@ -174,10 +173,10 @@ async def _pay_control_shown(sup: Any, sid: str, frame_id: str, node: int, fn: s
         reply = (await sup._cdp("Runtime.callFunctionOn", {"objectId": obj, "functionDeclaration": fn,
                                                            "returnByValue": True}, session_id=sid))["result"]
         value = (reply.get("result") or {}).get("value")
-        return value is True if not unread else value is not False
-    except Exception as exc:  # health: allow BLE001 -- unread state of a resolved node: ``unread`` (fails closed)
+        return value if type(value) is bool else None
+    except Exception as exc:  # health: allow BLE001 -- unread state of a resolved node: None (each caller fails closed)
         logger.info("payment_done: pressed Pay control not read (%s)", type(exc).__name__)
-        return unread
+        return None
     finally:
         await sup._release_payment_object(sid, obj)
 
@@ -212,7 +211,7 @@ async def judge(sup: Any, sid: str, row: tuple, scan: dict, checkout: bool, pay:
     if scan["failure"]:
         return None, "failure_wording", False
     if (pay is not None and isinstance(pay.get("node"), int) and (pay.get("frame"), pay.get("loader")) == row[:2]
-            and await _pay_control_shown(sup, sid, row[0], pay["node"])):
+            and await _pay_control_shown(sup, sid, row[0], pay["node"]) is not False):
         return None, "pay_control_shown", False
     same = before is not None and tuple(before.get("doc") or ()) == tuple(row[:2])
     strong = scan["strong"]
