@@ -205,6 +205,13 @@ def test_provider_invalid_marks_make_the_form_incomplete():
     assert out["next"].startswith("The payment provider flagged") and "aria:" in out["next"]
 
 
+def test_a_provider_flag_with_an_empty_field_still_stops_pay_for_the_empty_field():
+    rows = _FORM + [_row(3, "x9", "Kontoinhaber Vorname")]
+    out = _report(_document(rows), CARD, locked=True, result={"success": True, "fields_invalid": {"cc-csc": "aria"}})
+    assert out["fields_left_empty"]["other_fields"] == 1
+    assert "no field is left empty" in out["next"] and "do not press Pay while a field" in out["next"]
+
+
 def test_a_stopped_fill_gets_no_form_report():
     assert _report(_document(_FORM), CARD, result={"success": False}) == {}
 

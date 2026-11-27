@@ -979,8 +979,8 @@ _FILL_AGAIN_ARGUMENT = {"cc-name": "holder_name (the name on the card)",
 _FIELDS_INVALID_NEXT = (
     "The payment provider flagged the fields in fields_invalid on the page after the fill (aria: the field's own "
     "error flag; class: the provider's error styling): tell the user which fields (by their names here). If he says "
-    "to pay anyway, press Pay with payment_click: the flag does not block it and the card's approval still covers "
-    "it (a fill-only card needs owner_go true)."
+    "to pay anyway and no field is left empty, press Pay with payment_click: the flag does not block it and the "
+    "card's approval still covers it (a fill-only card needs owner_go true)."
 )
 
 
