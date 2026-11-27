@@ -37,13 +37,14 @@ def _fast(monkeypatch):
 class AgainSup(detect_tests.ShopSup):
     """The Sunday checkout where each listed control is its own element (backendNodeId 4000 + its index), whose
     pressed element answers ``pressable`` (connected, rendered, enabled) and whose page answers ``invalid`` / ``busy``.
-    ``fault``: ``(where, kind)`` armed once the first Pay press is answered (``arm``); ``fired`` counts its hits."""
+    ``fault``: ``(where, kind)`` armed once the first Pay press is answered (``armed``; ``arm_at_release``: when a
+    press is released); ``fired`` counts its hits; a slow call takes ``slow_s``."""
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.pressable, self.invalid, self.busy, self.gone = True, False, False, False
         self.lose_release, self.popup = False, False
-        self.fault, self.armed, self.fired = None, False, 0
+        self.fault, self.armed, self.fired, self.arm_at_release, self.slow_s = None, False, 0, False, 1.3
 
     def _where(self, method, params):
         expression = params.get("expression")
@@ -52,6 +53,8 @@ class AgainSup(detect_tests.ShopSup):
                 "isolated_world": method == "Page.createIsolatedWorld",
                 "wording_scan": expression == evidence.SCAN_JS,
                 "flags": expression == again.FLAGS_JS,
+                "tabs_check": method == "Target.getTargets" and bool(self.calls)
+                and self.calls[-1][1].get("expression") == again.FLAGS_JS,
                 "resolve_node": method == "DOM.resolveNode",
                 "pressable": fn == again._PRESSABLE}
 
@@ -62,7 +65,7 @@ class AgainSup(detect_tests.ShopSup):
             if kind == "fail":
                 raise RuntimeError(f"CDP error on id=1: {method} failed")
             if kind == "slow":  # longer than payment_done's probe bound: the look times out, its answer is late
-                await asyncio.sleep(1.3)  # health: allow HX013 -- the injected fault is the slowness itself
+                await asyncio.sleep(self.slow_s)  # health: allow HX013 -- the injected fault is the slowness itself
             if kind == "state":
                 self.change()
         return await super()._cdp(method, params, session_id=session_id, timeout=timeout)
@@ -83,6 +86,8 @@ class AgainSup(detect_tests.ShopSup):
         self.page.update(THANKS)
 
     def answer(self, method, params, session_id=None):
+        if method == "Input.dispatchMouseEvent" and params.get("type") == "mouseReleased" and self.arm_at_release:
+            self.armed = True
         if method == "Input.dispatchMouseEvent" and params.get("type") == "mouseReleased" and self.lose_release:
             self.lose_release = False
             super().answer(method, params, session_id)  # the press landed; its reply is lost
@@ -152,6 +157,16 @@ def _order_wording_new(sup):  # order wording that was not there before, beside 
                                                          "Es ist ein Fehler aufgetreten."}}
 
 
+def _order_wording_before(sup):  # the checkout carries order wording before the press; failure wording after it
+    sup.page.update({**CART, "text": CART["text"] + " Your payment is processed securely."})
+    sup.after = {"page": {**CART, "text": CART["text"] + " Your payment is processed securely. Ihre Bestellung ist "
+                                                         "bei uns eingegangen. Es ist ein Fehler aufgetreten."}}
+
+
+def _remounted(sup):  # quiet page; the shop re-renders its buttons: JETZT KAUFEN is a new element, same caption
+    sup.after = {"rows": [_row("JETZT KAUFEN")]}
+
+
 def _failed_before(sup):
     sup.page.update(DECLINED)  # the failure was on the page before this press (an earlier attempt's)
 
@@ -192,6 +207,8 @@ TABLE = [
     (_quiet, True, False, SAME),
     (_confirmed_with_failure_words, True, False, SAME),
     (_order_wording_new, True, False, SAME),
+    (_order_wording_before, True, False, SAME),
+    (_remounted, False, None, SAME),  # a new node id, the same caption on the same document: the same control
     (_failed_before, True, False, SAME),
     (_control_disabled, True, False, SAME),
     (_uncertain, True, False, SAME),
@@ -233,8 +250,9 @@ def test_the_same_pay_control_goes_again_only_after_pay_again(state, ask, pay_ag
 # ------------------------------------------------------------------ faults at each read payment_done makes
 
 
-FAULTS = [(where, kind) for where in ("Target.getTargets", "isolated_world", "wording_scan", "flags", "resolve_node",
-                                      "pressable") for kind in ("fail", "slow", "state")] + [("tree_after", "state")]
+FAULTS = [(where, kind) for where in ("Target.getTargets", "isolated_world", "wording_scan", "flags", "tabs_check",
+                                      "resolve_node", "pressable")
+          for kind in ("fail", "slow", "state")] + [("tree_after", "state")]
 
 
 @pytest.mark.parametrize("fault", FAULTS, ids=[f"{w}-{k}" for w, k in FAULTS])
@@ -282,14 +300,22 @@ def test_another_pay_like_press_after_pay_again_voids_it():
     assert _pay(sup)["error_type"] == SAME, "pay_again was for the press before this one"
 
 
-def test_a_preparatory_press_after_pay_again_keeps_it():
-    """Fixing what the form flagged (a checkbox) is no Pay-like press: the same Pay then goes once."""
+def test_a_preparatory_press_after_pay_again_keeps_it_while_the_failure_shows():
+    """A checkbox is no Pay-like press: the same Pay then goes once while the page still shows the failure. Once the
+    flag is gone (the field fixed) the page right before the press shows no failure: pay_again no longer counts (r2:
+    the grant is checked again at the press; refusing costs one reply to the owner)."""
     sup = _sunday()
     sup.rows = list(detect_tests.SUNDAY_ROWS) + [_row("AGB akzeptieren", role="checkbox", i=2)]
-    assert _pay(sup, after={"invalid": True})["pay_pressed"] is True
+    assert _pay(sup, after={"page": DECLINED, "invalid": True})["pay_pressed"] is True
     assert done.payment_done(sup)["pay_again"] is True
     assert _press(sup, "AGB akzeptieren", after={"invalid": False})["success"] is True
     assert _pay(sup)["pay_pressed"] is True and len(_mouse_presses(sup)) == 3
+    sup2 = _sunday()
+    sup2.rows = list(sup.rows)
+    assert _pay(sup2, after={"invalid": True})["pay_pressed"] is True
+    assert done.payment_done(sup2)["pay_again"] is True
+    assert _press(sup2, "AGB akzeptieren", after={"invalid": False})["success"] is True
+    assert _pay(sup2)["error_type"] == SAME and len(_mouse_presses(sup2)) == 2
 
 
 # ------------------------------------------------------------------ what the gate never holds
@@ -332,3 +358,90 @@ def test_an_unread_node_is_told_by_its_caption_and_never_gets_pay_again():
     assert done.payment_done(sup)["pay_again"] is False
     assert _pay(sup)["error_type"] == SAME
     assert _press(sup, "BESTÄTIGEN")["pay_pressed"] is True
+
+
+# ------------------------------------------------------------------ r2: the evidence first, the grant checked at the press
+
+
+def test_a_slow_flags_read_never_hides_an_order_shown_before_the_next_press(monkeypatch):
+    """The order confirmed in place after the answer (the pressed control gone); the thank-you's Jetzt kaufen is
+    pressed with a page-flags read slower than the look's budget: payment_already_made, nothing pressed."""
+    monkeypatch.setattr(detect, "_BEFORE_SCAN_S", 1.0)  # stands for the 6 s budget; the flags read takes 1.3 s
+    sup = _sunday()
+    assert _pay(sup)["pay_pressed"] is True  # nothing visible yet: the order on its way
+    sup.page.update(THANKS)
+    sup.gone, sup.rows = True, [_row("Weiter einkaufen", role="link"), _row("Jetzt kaufen", role="link", i=1)]
+    sup.fault, sup.armed = ("flags", "slow"), True
+    presses = len(_mouse_presses(sup))
+    out = _press(sup, "Jetzt kaufen")
+    assert out["error_type"] == detect.SPENT and len(_mouse_presses(sup)) == presses, out
+
+
+def test_a_slow_flags_read_never_delays_the_detection_after_the_press(monkeypatch):
+    """No page-flags read after a press: a flags read slower than the answer's window cannot lose the thank-you."""
+    monkeypatch.setattr(surface, "_ACTION_TIMEOUT_S", 3.0)
+    monkeypatch.setattr(surface, "_PRESS_MARGIN_S", 1.0)
+    sup = _sunday()
+    sup.fault, sup.arm_at_release, sup.slow_s = ("flags", "slow"), True, 3.0
+    out = _pay(sup, after={"page": THANKS, "gone": True, "rows": [_row("Weiter einkaufen", role="link")]})
+    assert out["pay_pressed"] is True and out["payment_detected"] is True, out
+    with surface._LOCK:
+        assert surface._GENS[sup].paid is True
+
+
+def test_a_slow_flags_read_before_the_press_gives_no_pay_again(monkeypatch):
+    """The flags read right before the press is dropped when slower than its own bound: no pay_again later."""
+    monkeypatch.setattr(detect, "_FLAGS_S", 0.2, raising=False)
+    sup = _sunday()
+    sup.fault, sup.armed = ("flags", "slow"), True
+    assert _pay(sup, after={"invalid": True, "armed": False})["pay_pressed"] is True
+    assert done.payment_done(sup)["pay_again"] is False
+
+
+def test_an_unread_tab_list_before_the_press_gives_no_pay_again(monkeypatch):
+    async def unread(_sup):
+        return None
+
+    monkeypatch.setattr(detect, "page_tabs", unread)
+    sup = _sunday()
+    assert _pay(sup, after={"page": DECLINED, "popup": True})["pay_pressed"] is True
+    assert done.payment_done(sup)["pay_again"] is False
+    assert _pay(sup)["error_type"] == SAME
+
+
+def test_a_tab_the_press_opened_late_gives_no_pay_again():
+    """The bank's tab opens after the press's answer came back (a slow XHR, then window.open)."""
+    sup = _sunday()
+    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
+    sup.popup = True
+    assert done.payment_done(sup)["pay_again"] is False
+    assert _pay(sup)["error_type"] == SAME and len(_mouse_presses(sup)) == 1
+
+
+def _thanks_in_place(sup):  # the order confirmed in place, the Pay control kept, the failure line still there
+    sup.page.update({**CART, "text": "Vielen Dank für Ihre Bestellung! Bestellnummer 12345. Zahlung fehlgeschlagen? "
+                                     "Schreib uns."})
+
+
+def _order_number_in_place(sup):  # failure wording gone, an order number shown, the Pay control kept
+    sup.page.update({**CART, "text": CART["text"] + " Vielen Dank für Ihre Bestellung! Bestellnummer 4711."})
+
+
+def _failure_gone(sup):  # the page shows nothing any more (the order may have gone through by XHR)
+    sup.page.update(CART)
+
+
+def _new_tab(sup):  # a tab opened after payment_done's answer
+    sup.popup = True
+
+
+@pytest.mark.parametrize("change", [_thanks_in_place, _order_number_in_place, _failure_gone, _new_tab],
+                         ids=lambda f: f.__name__)
+def test_pay_again_counts_only_while_the_page_still_shows_the_failure(change):
+    """payment_done granted pay_again; before the press the page changed: the grant does not cover the press."""
+    sup = _sunday()
+    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
+    assert done.payment_done(sup)["pay_again"] is True
+    change(sup)
+    out = _pay(sup)
+    assert out["error_type"] in (SAME, detect.SPENT) and len(_mouse_presses(sup)) == 1, out
