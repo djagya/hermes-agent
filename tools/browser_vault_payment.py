@@ -945,7 +945,7 @@ def _fill_refused(step: str, code: str = "") -> dict:
 
 
 # dlz (D-0358 a, D-0360 a, 11-18): a fill that wrote every card field it found but left fields of the card form empty,
-# or that the payment form marks invalid. Fixed texts.
+# or that the payment provider flagged (aria-invalid or its error styling; D-1152 a). Fixed texts.
 _FORM_INCOMPLETE_NEXT = (
     "The form may need more fields: fill the missing non-card fields (holder name, postcode) yourself, check the "
     "page, then continue; do not press Pay until the form is complete. Never type the card number, CVC or expiry."
@@ -977,15 +977,16 @@ _FORM_OTHER_LOCKED_NEXT = (
 _FILL_AGAIN_ARGUMENT = {"cc-name": "holder_name (the name on the card)",
                         "postal-code": "billing_postal_code (the billing postcode)"}
 _FIELDS_INVALID_NEXT = (
-    "The payment form marks the fields in fields_invalid as invalid after the fill: do not press Pay; tell the user "
-    "which fields (by their names here) and let them decide."
+    "The payment provider flagged the fields in fields_invalid on the page after the fill (aria: the field's own "
+    "error flag; class: the provider's error styling): do not press Pay; tell the user which fields (by their names "
+    "here) and let them decide."
 )
 
 
 def _form_report(result: dict, inspected, fills: list, locked: bool) -> dict:
     """dlz (D-0358 a): for a successful fill, whether the card form looks complete: no card document field left
     empty (an optional card field the saved card has no value for, or a field the fill does not recognise), no frame
-    of the card's origin with an empty field and no card field, and no field the provider marks invalid. Counts and
+    of the card's origin with an empty field and no card field, and no field the payment provider flags. Counts and
     card field tokens only. An unknown blank state counts as empty."""
     if not result.get("success"):
         return {}
@@ -1006,7 +1007,7 @@ def _form_report(result: dict, inspected, fills: list, locked: bool) -> dict:
             if (k, index) not in written and empty(index):
                 card_fields.add(c.token)
     frames = int(getattr(inspected, "cardless_frames", 0) or 0)
-    invalid = result.get("fields_invalid") or []
+    invalid = result.get("fields_invalid") or {}
     complete = not (sum(by_document) or card_fields or frames or invalid)
     out: dict = {"form_complete": complete}
     if sum(by_document) or card_fields or frames:
