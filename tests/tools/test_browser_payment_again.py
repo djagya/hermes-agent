@@ -370,7 +370,8 @@ def test_a_slow_flags_read_never_hides_an_order_shown_before_the_next_press(monk
     sup = _sunday()
     assert _pay(sup)["pay_pressed"] is True  # nothing visible yet: the order on its way
     sup.page.update(THANKS)
-    sup.gone, sup.rows = True, [_row("Weiter einkaufen", role="link"), _row("Jetzt kaufen", role="link", i=1)]
+    sup.gone, sup.rows = True, [_row("Weiter einkaufen", role="link"), _row("Weiter", role="link", i=1),
+                                _row("Jetzt kaufen", role="link", i=2)]  # another element than the pressed one
     sup.fault, sup.armed = ("flags", "slow"), True
     presses = len(_mouse_presses(sup))
     out = _press(sup, "Jetzt kaufen")
