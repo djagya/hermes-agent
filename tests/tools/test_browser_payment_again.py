@@ -301,9 +301,9 @@ def test_another_pay_like_press_after_pay_again_voids_it():
 
 
 def test_a_preparatory_press_after_pay_again_keeps_it_while_the_failure_shows():
-    """A checkbox is no Pay-like press: the same Pay then goes once while the page still shows the failure. Once the
-    flag is gone (the field fixed) the page right before the press shows no failure: pay_again no longer counts (r2:
-    the grant is checked again at the press; refusing costs one reply to the owner)."""
+    """A checkbox is no Pay-like press: the same Pay then goes once. An answer given on a flagged field alone (no
+    failure wording) survives the field being fixed (the flag is gone by then); an answer given on failure wording
+    needs the failure still showing."""
     sup = _sunday()
     sup.rows = list(detect_tests.SUNDAY_ROWS) + [_row("AGB akzeptieren", role="checkbox", i=2)]
     assert _pay(sup, after={"page": DECLINED, "invalid": True})["pay_pressed"] is True
@@ -315,7 +315,13 @@ def test_a_preparatory_press_after_pay_again_keeps_it_while_the_failure_shows():
     assert _pay(sup2, after={"invalid": True})["pay_pressed"] is True
     assert done.payment_done(sup2)["pay_again"] is True
     assert _press(sup2, "AGB akzeptieren", after={"invalid": False})["success"] is True
-    assert _pay(sup2)["error_type"] == SAME and len(_mouse_presses(sup2)) == 2
+    assert _pay(sup2)["pay_pressed"] is True and len(_mouse_presses(sup2)) == 3, "flag fixed, then the same Pay"
+    sup3 = _sunday()
+    sup3.rows = list(sup.rows)
+    assert _pay(sup3, after={"page": DECLINED})["pay_pressed"] is True
+    assert done.payment_done(sup3)["pay_again"] is True
+    assert _press(sup3, "AGB akzeptieren", after={"page": CART})["success"] is True
+    assert _pay(sup3)["error_type"] == SAME and len(_mouse_presses(sup3)) == 2, "wording gone: refused"
 
 
 # ------------------------------------------------------------------ what the gate never holds
@@ -443,6 +449,24 @@ def test_pay_again_counts_only_while_the_page_still_shows_the_failure(change):
     sup = _sunday()
     assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
     assert done.payment_done(sup)["pay_again"] is True
+    change(sup)
+    out = _pay(sup)
+    assert out["error_type"] in (SAME, detect.SPENT) and len(_mouse_presses(sup)) == 1, out
+
+
+def _order_wording_only(sup):  # order wording (no thank-you sentence, no order number) beside the Pay control
+    sup.page.update({**CART, "text": CART["text"] + " Your payment is processed securely."})
+
+
+@pytest.mark.parametrize("change", [_thanks_in_place, _order_number_in_place, _order_wording_only, _new_tab],
+                         ids=lambda f: f.__name__)
+def test_a_flag_only_pay_again_still_needs_the_page_free_of_order_signs_at_the_press(change):
+    """payment_done granted pay_again on a flagged field alone; the field is fixed, then the page shows order wording,
+    strong order wording or a new tab before the press: refused (a new document is another control, not held)."""
+    sup = _sunday()
+    assert _pay(sup, after={"invalid": True})["pay_pressed"] is True
+    assert done.payment_done(sup)["pay_again"] is True
+    sup.invalid = False
     change(sup)
     out = _pay(sup)
     assert out["error_type"] in (SAME, detect.SPENT) and len(_mouse_presses(sup)) == 1, out

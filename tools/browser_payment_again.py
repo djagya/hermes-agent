@@ -5,7 +5,8 @@ document (frame id, loader), its element (backendNodeId) and its redacted captio
 already pressed in this record (the same document and the same element or the same caption) is refused
 (``payment_same_control``, nothing pressed) unless payment_done answered ``pay_again: true`` after the latest Pay-like
 press, no Pay-like press was booked since, and the page right before this press still holds what that answer saw:
-the same document, failure wording or a flagged field, no order wording, and no new tab. A different control, or the
+the same document, no order wording, and no new tab, and (for an answer given on failure wording) the failure wording
+still showing; an answer given on a flagged field alone survives the field being fixed. A different control, or the
 same place on a new document (a new loader), is the checkout's next step and is not held.
 
 payment_done sets ``pay_again`` only when all of these hold on its last look at the payment tab:
@@ -59,15 +60,17 @@ class Presses:
     """A lock record's Pay-like presses (``_LockGen.again``), read and written under ``_LOCK``. ``keys``: ``(frame
     id, loader, backendNodeId or None, caption)`` of each, the latest last; ``tabs``: the page targets right before
     the latest one (None: unread); ``answered``: its answer came back; ``granted``: the key payment_done found
-    ``pay_again`` for (dropped by the next Pay-like press)."""
+    ``pay_again`` for (dropped by the next Pay-like press); ``wording``: that answer came from failure wording, not
+    only from a flagged field."""
 
-    __slots__ = ("answered", "granted", "keys", "tabs")
+    __slots__ = ("answered", "granted", "keys", "tabs", "wording")
 
     def __init__(self) -> None:
         self.keys: list = []
         self.tabs: Optional[frozenset] = None
         self.answered = False
         self.granted: Optional[tuple] = None
+        self.wording = False
 
 
 def _key(node: Any, caption: str) -> tuple:
@@ -83,14 +86,15 @@ def _same(a: tuple, b: tuple) -> bool:
 def refusal(gen: Any, node: Any, caption: str, base: Optional[dict], tabs: Optional[frozenset]) -> Optional[dict]:
     """``payment_same_control`` for a Pay-like press on a control already pressed in ``gen``, else None. A
     ``pay_again`` for it counts only while the look right before this press (``base``, ``tabs``) still shows that
-    document with failure wording or a flagged field, no order wording and no new tab. Must hold
+    document with no order wording and no new tab, and the failure still showing when the answer came from failure
+    wording (a flag-only answer survives the field being fixed). Must hold
     ``browser_payment_surface._LOCK``."""
     presses, key = gen.again, _key(node, caption)
     if presses is None or not any(_same(k, key) for k in presses.keys):
         return None
     granted, base = presses.granted, base or {}
     if (granted is not None and _same(granted, key) and tuple(base.get("doc") or ()) == granted[:2]
-            and base.get("signal") is True and base.get("strong") is False and base.get("order") is False
+            and (base.get("signal") is True or not presses.wording) and base.get("strong") is False and base.get("order") is False
             and tabs is not None and presses.tabs is not None and tabs <= presses.tabs):
         return None
     return {"success": False, "error_type": SAME_CONTROL, "error": _SAME_CONTROL_TEXT}
@@ -192,7 +196,7 @@ async def probe(sup: Any, sid: str, tree: tuple, child_sessions: dict) -> dict:
         return {}
     if await sup._payment_tree(sid, child_sessions) != tree:
         return {}
-    return {"pay_again": token}
+    return {"pay_again": (*token, bool(scan["failure"]))}
 
 
 def grant(sup: Any, token: Any) -> bool:
@@ -201,15 +205,15 @@ def grant(sup: Any, token: Any) -> bool:
     from tools import browser_payment_surface as surface
     from tools.browser_payment_detect import inflight
 
-    if not isinstance(token, tuple):
+    if not (isinstance(token, tuple) and len(token) == 3):
         return False
     with surface._LOCK:
         gen = _record(sup)
     if gen is None or inflight(sup, gen):
         return False
     with surface._LOCK:
-        if _record(sup) is not gen or _eligible(gen, token[0][:2]) != token:
+        if _record(sup) is not gen or _eligible(gen, token[0][:2]) != token[:2]:
             return False
-        gen.again.granted = token[0]
+        gen.again.granted, gen.again.wording = token[0], token[2]
     logger.info("payment_done: pay_again for the latest Pay press")
     return True
