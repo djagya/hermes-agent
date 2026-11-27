@@ -487,32 +487,33 @@ def test_no_merchant_tab_stays_a_policy_refusal():
 # ------------------------------------------------------------------ round 2 (Codex + Opus review of build C)
 
 
-def test_a_second_pay_press_goes_while_no_payment_was_detected():
-    """G1 (owner 2026-11-19; replaces r2 P1's one-press refusal): with no payment detected, a fresh listing and a
-    press of the same Pay control goes through, the approved total read again before it; owner_go too."""
-    from tests.tools.test_browser_payment_surface import _claimed, _total_reads
+def test_the_same_pay_control_again_waits_for_pay_again():
+    """D-1209 a (replaces G1's second press by prose): with no payment detected, a fresh listing and a press of the
+    same Pay control is refused with nothing pressed, owner_go too, until payment_done says pay_again
+    (``test_browser_payment_again``)."""
+    from tests.tools.test_browser_payment_surface import _claimed
 
     sup = _claimed()  # the base probe's scenario: ROWS[0] is "Pay with card ..." on a checked approval
     first = surface.payment_click(sup, surface.payment_controls(sup)["controls"][0]["ref"])
     assert first["success"] is True and first["pay_pressed"] is True and first["payment_detected"] is False
     for owner_go in (False, True):
         listing = surface.payment_controls(sup)
-        reads = len(_total_reads(sup))
         second = surface.payment_click(sup, listing["controls"][0]["ref"], owner_go=owner_go)
-        assert second["success"] is True and second["pay_pressed"] is True
-        assert len(_total_reads(sup)) > reads, "the approved total is read before every press"
-    assert len(_mouse_presses(sup)) == 3 and surface.presses_in_lock(sup) == 3
+        assert second["error_type"] == "payment_same_control"
+    assert len(_mouse_presses(sup)) == 1 and surface.presses_in_lock(sup) == 1
 def test_preparatory_clicks_and_pay_presses_go_in_any_order():
     """G1: the terms checkbox and Continue before and after Pay, and Pay again, all go; only Pay-like presses answer
     pay_pressed. A new fill (a new approval) goes on counting."""
     sup = _claimed_effect(EffectSup())
-    for index in (TERMS, CONTINUE, PAY, TERMS, CONTINUE, PAY):
+    for index in (TERMS, CONTINUE, PAY, TERMS, CONTINUE):
         out = surface.payment_click(sup, _ref(sup, index))
         assert out["success"] is True and out.get("pay_pressed", False) is (index == PAY), index
-    assert len(_mouse_presses(sup)) == 6 and surface.presses_in_lock(sup) == 6
+    # D-1209 a: the same Pay again waits for payment_done's pay_again
+    assert surface.payment_click(sup, _ref(sup, PAY))["error_type"] == "payment_same_control"
+    assert len(_mouse_presses(sup)) == 5 and surface.presses_in_lock(sup) == 5
     _claimed_effect(sup)  # a new card fill in the same lock: a new approval card
-    assert surface.payment_click(sup, _ref(sup, PAY))["success"] is True
-    assert surface.presses_in_lock(sup) == 7, "r2 P7: the known count carries over into the new record"
+    assert surface.payment_click(sup, _ref(sup, PAY))["success"] is True, "a new approval: its Pay goes"
+    assert surface.presses_in_lock(sup) == 6, "r2 P7: the known count carries over into the new record"
 @pytest.mark.parametrize("role, caption, pay", [
     ("button", "Pay now", True), ("button", "Place order", True), ("button", "Jetzt kaufen", True),
     ("button", "Zahlungspflichtig bestellen", True), ("button", "Submit", True), ("button", "Confirm", True),
@@ -743,8 +744,9 @@ def test_after_pay_a_bank_challenge_is_pressed_whatever_its_button_says(top_case
         out, total_reads, pressed = _again(sup)
         assert out["success"] is True and pressed == 1 and total_reads == 0, (top_case, caption)
         assert surface.presses_in_lock(sup) == 2
-        # G1: back on the merchant document with no payment detected, Pay goes again (no press budget)
-        sup.tree = sup.listed = TREE
+        # G1: back on the merchant with no payment detected, Pay goes again (no press budget); D-1209 a: its
+        # documents are new ones after the bank's redirect (the same control again waits for pay_again)
+        sup.tree = sup.listed = _reloaded(TREE)
         out, _reads, pressed = _again(sup)
         assert out["success"] is True and pressed == 1, (top_case, caption)
 
@@ -798,6 +800,12 @@ def test_two_supervisors_do_not_refuse_each_others_clicks(monkeypatch):
     assert surface.payment_click(first, refs[1])["success"] is True  # the busy refusal kept the ref
 
 
+def _reloaded(tree):
+    """``tree`` with every document new (another loader): the page loaded again, so no control was pressed yet."""
+    _reloaded.n = getattr(_reloaded, "n", 0) + 1
+    return tuple(row[:1] + (f"{row[1]}-{_reloaded.n}",) + row[2:] for row in tree)
+
+
 def _go_pay_then(rows_after, tree):
     """A fill-only card (no approved total) whose Pay was pressed once with the owner's go; then the page shows
     ``tree`` with ``rows_after`` controls."""
@@ -821,7 +829,7 @@ def test_after_an_owner_go_pay_the_bank_step_and_another_pay_are_pressed(top_cas
         out, total_reads, pressed = _again(sup, owner_go=True)
         assert out["success"] is True and out["pay_pressed"] is True and pressed == 1 and total_reads == 0, caption
         for tree in (TREE, (TREE[0], PROVIDER_FRAME), (PROVIDER_TOP, TREE[1])):
-            sup.tree = sup.listed = tree
+            sup.tree = sup.listed = _reloaded(tree)  # D-1209 a: each a new document, never a pressed control again
             out, _reads, pressed = _again(sup, owner_go=True)
             assert out["success"] is True and pressed == 1, (caption, tree[0][2])
         assert surface.presses_in_lock(sup) == 5
@@ -853,11 +861,13 @@ def test_a_confirmation_dialog_after_pay_is_pressed_like_any_step():
     sup = _list_top(_RowsSup([_row("Place order")]))
     assert surface.claim_payment_surface(sup, _hosted()) is None  # the card in the provider's frame only
     surface.record_approved_total(sup, *APPROVED)
-    for caption in ("Place order", "Confirm purchase", "Confirm purchase"):
+    for caption in ("Place order", "Confirm purchase"):
         sup.rows = [_row(caption)]
         out, _reads, pressed = _again(sup, 1)  # the merchant's top document's control (after the card frame's)
         assert out["success"] is True and out["pay_pressed"] is True and pressed == 1, caption
-    assert surface.presses_in_lock(sup) == 3
+    out, _reads, pressed = _again(sup, 1)  # D-1209 a: the same control again waits for payment_done's pay_again
+    assert out["error_type"] == "payment_same_control" and pressed == 0
+    assert surface.presses_in_lock(sup) == 2
 
 
 def test_a_covered_control_in_a_hosted_card_frame_names_no_occluder():

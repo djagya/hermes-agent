@@ -1551,6 +1551,7 @@ def record_approved_total(supervisor: Any, cents: Any, currency: Any, top: Any, 
         if gen is None:
             return False
         gen.approved = (cents, currency, top[0], top[1], merchant) if good else UNBOUND
+        gen.again = None  # D-1209 a: a new approval: no control of it was pressed yet
         return good
 
 

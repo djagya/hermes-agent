@@ -341,5 +341,5 @@ def bind_press(sup: Any, gen: Any, cents: int, currency: str, top: tuple, mercha
         if _record(sup) is not gen or gen.admitted or gen.native_lost \
                 or not surface._valid_checkout(top, merchant):
             return False
-        gen.approved = (cents, currency, *top, merchant)
+        gen.approved, gen.again = (cents, currency, *top, merchant), None  # D-1209 a: as a fill's tap
         return True

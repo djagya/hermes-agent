@@ -338,6 +338,7 @@ def test_the_page_script_scans_all_visible_text_and_no_form_value():
 SUNDAY_ROWS = [_row("BESTÄTIGEN"), _row("JETZT KAUFEN", i=1)]
 DECLINED = {**CART, "text": CART["text"] + " Zahlung fehlgeschlagen. Bitte versuche es erneut."}
 SAME_DOC_CARD = (("TOP", "L0", SHOP + "/checkout/", SHOP, ""), done_tests.CHECKOUT[1])  # card frame still in the tree
+NEW_DOC = (("TOP", "L5", SHOP + "/checkout/", SHOP, ""), done_tests.CHECKOUT[1])  # the checkout as a new document
 
 
 class ShopSup(PaySup):
@@ -411,14 +412,19 @@ def test_sunday_the_method_confirm_and_the_purchase_both_go_and_the_thank_you_sp
     assert out["success"] is True and out["order_evidence"] == "confirmation_text" and out["lock_released"] is True
 
 
-def test_a_retry_after_a_decline_on_the_same_document_goes_through():
-    """No press budget: a declined payment re-renders the checkout with failure wording; JETZT KAUFEN again is
-    pressed (its total read again), and nothing is detected."""
+def test_a_retry_after_a_decline_on_the_same_document_waits_for_pay_again():
+    """D-1209 a (replaces G1's retry by prose): a declined payment re-renders the checkout with failure wording; the
+    same JETZT KAUFEN again is refused with nothing pressed until payment_done says pay_again
+    (``test_browser_payment_again``); a Pay on a new document goes, its total read again."""
     from tests.tools.test_browser_payment_surface import _total_reads
 
     sup = _sunday()
     assert _press(sup, "JETZT KAUFEN", after={"page": DECLINED})["payment_detected"] is False
+    again = _press(sup, "JETZT KAUFEN")
+    assert again["error_type"] == "payment_same_control" and "payment_done" in again["error"]
+    assert len(_mouse_presses(sup)) == 1 and surface.presses_in_lock(sup) == 1
     reads = len(_total_reads(sup))
+    sup.tree = NEW_DOC  # the shop answered the decline with a new checkout document
     again = _press(sup, "JETZT KAUFEN")
     assert again["success"] is True and again["pay_pressed"] is True and again["payment_detected"] is False
     assert len(_mouse_presses(sup)) == 2 and len(_total_reads(sup)) > reads
@@ -436,13 +442,14 @@ def test_a_changed_total_still_refuses_a_second_pay_press():
 def test_a_pay_press_while_the_last_ones_navigation_loads_is_refused_until_the_new_document_is_ready():
     """The in-flight guard: Chrome reported a navigation of the top frame that started after the Pay press and has
     not finished loading; the next Pay-like press is refused with nothing pressed (the ref stays), and goes once the
-    load stopped. A same-document navigation never holds it."""
+    load stopped. A same-document navigation never holds it. (Each Pay is on a new document: D-1209 a holds the same
+    control apart.)"""
     sup = _sunday()
-    assert _press(sup, "JETZT KAUFEN", after={"page": DECLINED})["success"] is True
+    assert _press(sup, "JETZT KAUFEN", after={"page": DECLINED, "tree": NEW_DOC})["success"] is True
     sup._on_frame_loading({"frameId": "TOP", "navigationType": "differentDocument"})
     surface.payment_controls(sup)
     with surface._LOCK:
-        ref = next(r for r, spec in surface._ISSUED[sup].items() if spec[0] == "TOP|L0" and spec[3] == "JETZT KAUFEN")
+        ref = next(r for r, spec in surface._ISSUED[sup].items() if spec[0] == "TOP|L5" and spec[3] == "JETZT KAUFEN")
     held = surface.payment_click(sup, ref)
     assert held["error_type"] == detect.INFLIGHT and "still processing the last Pay press" in held["error"]
     assert len(_mouse_presses(sup)) == 1
@@ -452,12 +459,13 @@ def test_a_pay_press_while_the_last_ones_navigation_loads_is_refused_until_the_n
     assert _press(sup, "BESTÄTIGEN")["error_type"] == detect.INFLIGHT  # any Pay-like press
     sup._on_frame_stopped({"frameId": "TOP"})
     sup._on_frame_loading({"frameId": "TOP", "navigationType": "historySameDocument"})
+    sup.tree = (("TOP", "L6", SHOP + "/checkout/", SHOP, ""), done_tests.CHECKOUT[1])
     assert _press(sup, "JETZT KAUFEN")["success"] is True and len(_mouse_presses(sup)) == 3
 
 
 def test_the_in_flight_guard_is_bounded(monkeypatch):
     sup = _sunday()
-    assert _press(sup, "JETZT KAUFEN", after={"page": DECLINED})["success"] is True
+    assert _press(sup, "JETZT KAUFEN", after={"page": DECLINED, "tree": NEW_DOC})["success"] is True
     sup._on_frame_loading({"frameId": "TOP", "navigationType": "differentDocument"})
     monkeypatch.setattr(detect, "_INFLIGHT_S", 0.0)
     assert _press(sup, "JETZT KAUFEN")["success"] is True

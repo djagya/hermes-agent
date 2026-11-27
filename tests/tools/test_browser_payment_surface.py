@@ -537,9 +537,9 @@ def test_presses_in_lock_counts_every_press_including_an_uncertain_one(outcome):
     surface.payment_click(sup, again["controls"][PREP]["ref"])  # r2 P1: a preparatory press after Pay
     listing = surface.payment_controls(sup)
     assert listing["presses_in_lock"] == 2
-    # G1 (owner 2026-11-19): no press budget: a second Pay press with no payment detected goes too, and is counted
-    surface.payment_click(sup, listing["controls"][0]["ref"])
-    assert surface.payment_controls(sup)["presses_in_lock"] == 3
+    # D-1209 a: the same Pay control again is refused (payment_done did not say pay_again): nothing more counted
+    assert surface.payment_click(sup, listing["controls"][0]["ref"])["error_type"] == "payment_same_control"
+    assert surface.payment_controls(sup)["presses_in_lock"] == 2
 
 
 def test_payment_done_reports_the_presses_read_before_it_ends_the_lock(monkeypatch):

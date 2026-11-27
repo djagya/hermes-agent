@@ -313,12 +313,13 @@ def test_after_a_return_only_the_fresh_cards_approval_presses_and_then_what_the_
     assert "go in chat" not in card and "yourself" not in card
     assert len([c for c in flow.ctl.calls if c[1] == "Runtime.evaluate"]) == scans + 1, "one read of the page"
     assert "next" not in flow.act(), "a fresh approval is bound"
-    # D-0961: then Sera presses what the checkout needs: Pay, the shop's own confirm step, Pay once more
+    # D-0961: then Sera presses what the checkout needs: Pay, the shop's own confirm step; D-1209 a: Pay once more on
+    # the same control only after payment_done's pay_again
     assert flow.press("JETZT KAUFEN")["pay_pressed"] is True
     assert flow.press("BESTÄTIGEN")["success"] is True
-    assert flow.press("JETZT KAUFEN")["pay_pressed"] is True and len(flow.presses()) == 3
+    assert flow.press("JETZT KAUFEN")["error_type"] == "payment_same_control" and len(flow.presses()) == 2
     listed = flow.act()
-    assert listed["returned"] is True and listed["presses_in_lock"] == 3, "the lock stays a returned one"
+    assert listed["returned"] is True and listed["presses_in_lock"] == 2, "the lock stays a returned one"
     assert surface.record_approved_total(first, 2266, "EUR", ("TOP", "L0"), shop.SHOP) is False, "the ended connection"
 
 

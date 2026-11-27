@@ -237,7 +237,8 @@ def test_no_handover_until_a_safe_confirmation_and_the_lock_stays(tree, snapshot
     out = done.payment_done(sup)
     assert out["error_type"] == "payment_confirmation_not_reached" and out["success"] is False
     assert out["lock_released"] is False and set(out) == {"success", "error_type", "error", "url", "title",
-                                                          "reason", "lock_released"}
+                                                          "reason", "lock_released", "pay_again"}
+    assert out["pay_again"] is False  # D-1209 a: no Pay press of this process in this lock
     # build F r2: a fixed code for what the tab showed last (never page text)
     assert out["reason"] == ("not_shop_page" if snapshot is None else "loading")
     # still locked: the tab's site only, never its title or path (exfil via document.title / location)
@@ -496,12 +497,14 @@ def test_a_3ds_page_is_clicked_only_after_the_checkouts_pay_was_admitted(first):
     sup.rows = [{"i": 0, "role": "button", "text": "Continue", "disabled": False}]
     _top_controls(sup)
     assert surface.payment_click(sup, _top_ref(sup, ACS))["success"] is True and len(presses()) == 3
-    # G1 (owner 2026-11-19): back on the merchant's checkout with no payment detected (its Pay still offered), Pay
-    # goes again, its total read again (a retry after a declined challenge)
+    # G1 (owner 2026-11-19): back on the merchant's checkout (a new document after the bank's redirect) with no
+    # payment detected (its Pay still offered), Pay goes again, its total read again (a retry after a declined
+    # challenge). D-1209 a: a new document's Pay is another control than the one pressed first.
+    back = (("TOP", "L4", SHOP + "/checkout", SHOP, ""), CHECKOUT[1])
     sup.rows = [{"i": 0, "role": "button", "text": "Pay 22.66 EUR", "disabled": False}]
-    sup.trees = [CHECKOUT]
+    sup.trees = [back]
     _top_controls(sup)
-    assert surface.payment_click(sup, _top_ref(sup, CHECKOUT))["success"] is True and len(presses()) == 4
+    assert surface.payment_click(sup, _top_ref(sup, back))["success"] is True and len(presses()) == 4
 
 
 def test_a_top_document_ref_dies_with_its_document():
