@@ -1588,7 +1588,7 @@ BROWSER_VAULT_SCHEMA = {
         "told to make (e.g. 'Place order for <amount>?'); for anything else (upsells, subscriptions, unknown) "
         "ask the user. An unanswered confirm is "
         "dismissed after the dialog timeout. On 3-D Secure or redirect pages, normally just "
-        "wait and call payment_done; click a bank page only when it asks for a button and the user agreed. "
+        "wait and call payment_done; click a bank page only when it asks for a button (his bank app's approval is his). "
         "After pressing Pay, call payment_done once; it is what ends the lock: it waits up to 120 s (through 3-D Secure and payment-provider pages) for the order "
         "confirmation on the checkout's origin (expected_origin only when the checkout ran on a payment provider's own "
         "page), then "

@@ -200,8 +200,16 @@ def test_a_locked_browser_gets_the_close_and_type_first_text():
 
 def test_provider_invalid_marks_make_the_form_incomplete():
     out = _report(_document(_FORM), CARD, result={"success": True, "fields_invalid": {"cc-csc": "aria"}})
-    assert out["form_complete"] is False and "fields_invalid" in out["next"] and "do not press Pay" in out["next"]
+    assert out["form_complete"] is False and "fields_invalid" in out["next"]
+    assert "pay anyway" in out["next"] and "payment_click" in out["next"] and "do not press Pay" not in out["next"]
     assert out["next"].startswith("The payment provider flagged") and "aria:" in out["next"]
+
+
+def test_a_provider_flag_with_an_empty_field_still_stops_pay_for_the_empty_field():
+    rows = _FORM + [_row(3, "x9", "Kontoinhaber Vorname")]
+    out = _report(_document(rows), CARD, locked=True, result={"success": True, "fields_invalid": {"cc-csc": "aria"}})
+    assert out["fields_left_empty"]["other_fields"] == 1
+    assert "no field is left empty" in out["next"] and "do not press Pay while a field" in out["next"]
 
 
 def test_a_stopped_fill_gets_no_form_report():
@@ -353,7 +361,8 @@ def test_a_native_constraint_alone_leaves_the_form_complete_and_a_provider_flag_
     flagged = fill_result(**{**_PATTERN_ONLY, "attrs": {"pattern": r"\d*", "aria-invalid": "true"}})
     assert flagged["fields_invalid"] == {"cc-number": "aria"}
     out = _report(_document(_FORM), CARD, result=flagged)
-    assert out["form_complete"] is False and "do not press Pay" in out["next"] and "provider flagged" in out["next"]
+    assert out["form_complete"] is False and "provider flagged" in out["next"]
+    assert "pay anyway" in out["next"] and "do not press Pay" not in out["next"]
 
 
 # --- records: refusals and stops name fixed codes and counts ------------------------------------------------------
