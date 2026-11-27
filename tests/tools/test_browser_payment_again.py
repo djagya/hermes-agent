@@ -62,7 +62,7 @@ class AgainSup(detect_tests.ShopSup):
             if kind == "fail":
                 raise RuntimeError(f"CDP error on id=1: {method} failed")
             if kind == "slow":  # longer than payment_done's probe bound: the look times out, its answer is late
-                await asyncio.sleep(1.3)
+                await asyncio.sleep(1.3)  # health: allow HX013 -- the injected fault is the slowness itself
             if kind == "state":
                 self.change()
         return await super()._cdp(method, params, session_id=session_id, timeout=timeout)
