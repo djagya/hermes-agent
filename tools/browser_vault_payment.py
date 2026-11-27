@@ -945,7 +945,7 @@ def _fill_refused(step: str, code: str = "") -> dict:
 
 
 # dlz (D-0358 a, D-0360 a, 11-18): a fill that wrote every card field it found but left fields of the card form empty,
-# or that the payment form marks invalid. Fixed texts.
+# or that the payment provider flagged (aria-invalid or its error styling; D-1152 a). Fixed texts.
 _FORM_INCOMPLETE_NEXT = (
     "The form may need more fields: fill the missing non-card fields (holder name, postcode) yourself, check the "
     "page, then continue; do not press Pay until the form is complete. Never type the card number, CVC or expiry."
