@@ -1898,11 +1898,12 @@ def _commit_order(i: PaymentInspection, groups: list) -> list:
 def _retention_result(documents: list) -> dict:
     """Success only when every written field of every document still holds its value after settling.
     ``documents`` pairs each document's fills with its ``retained()`` answer (None: unreadable). The
-    result names tokens, states and lengths only. dlz (11-18): ``fields_invalid`` (only when not empty) names the
-    written tokens the provider marks invalid (the closure's fixed validity code; anything else counts as unknown)."""
+    result names tokens, states and lengths only. dlz (D-1152 a): ``fields_invalid`` (only when not empty) maps each
+    written token the payment provider flags to the signal that fired, the closure's fixed code: ``aria`` (the
+    field's aria-invalid) or ``class`` (a provider invalid class); any other code is not invalid."""
     states: dict = {}
     lengths: dict = {}
-    invalid: set = set()
+    invalid: dict = {}
     held = total = 0
     for fills, answer in documents:
         answer = answer if isinstance(answer, list) and len(answer) == len(fills) else [None] * len(fills)
@@ -1913,12 +1914,12 @@ def _retention_result(documents: list) -> dict:
             total += 1
             held += state == "held"
             states[token] = state
-            if entry.get("validity") == "invalid":
-                invalid.add(token)
+            if entry.get("validity") in ("aria", "class"):
+                invalid[token] = entry["validity"]
             if state != "held":
                 length = entry.get("length")
                 lengths[token] = length if type(length) is int and 0 <= length <= 256 else 0
-    marked = {"fields_invalid": sorted(invalid)} if invalid else {}
+    marked = {"fields_invalid": dict(sorted(invalid.items()))} if invalid else {}
     if total and held == total:
         return {"success": True, "filled_fields": held, "retention_verified": True, **marked}
     return {

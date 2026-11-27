@@ -250,58 +250,18 @@ _INSPECT_TEMPLATE = r"""(() => {
   // the unknown marker (a field whose exposure cannot be judged).
   const bounded = (d, unsure) => overflow || (LIM && JSON.stringify(d).length > LIM.bytes) ? {overflow:true} :
     unsure ? {unknown:true} : d;
-  // dlz (D-0358 a, 11-18): the provider's own verdict on a written field, a fixed code: 'invalid' when the field or a
-  // close ancestor says so (aria-invalid, an HTML constraint it breaks, a provider's invalid class), 'unknown' when
-  // it cannot be read, else 'valid'. No text, no value.
-  // dlz (D-0358 a note, 11-19): ``:invalid`` stays the gate (it already leaves out readonly, disabled, fieldset-disabled
-  // and datalist fields, which the browser does not validate); the ValidityState flags only EXCUSE one HTML artefact: a
-  // ``pattern`` attribute that is present but empty, on an <input> the browser would not block anyway (no form, a
-  // novalidate form, or a form with a formnovalidate submit control). HTML then accepts only the empty string, so
-  // every filled value is a patternMismatch (Shopify's hosted cardholder-name input carries ``pattern=""`` inside a
-  // novalidate form). That is not the provider's rule.
-  // A native form without novalidate keeps it invalid (its submit never goes through); every other flag, and a
-  // mismatch against a non-empty pattern, stays invalid. Without ``el.validity`` the plain ``:invalid`` test applies.
+  // dlz (D-1152 a, 11-27): the payment provider's own verdict on a written field, a fixed code naming the signal:
+  // 'aria' when the field says aria-invalid="true", 'class' when it or one of its three nearest ancestors carries a
+  // provider invalid class, 'unknown' when a read throws, else 'valid'. The browser's HTML pattern/constraint state
+  // (:invalid, ValidityState) is not the provider's verdict and does not count. No text, no value.
   const INVALID_CLASSES = ['is-invalid','invalid','has-error','StripeElement--invalid','braintree-hosted-fields-invalid',
     'adyen-checkout__input--invalid','adyen-checkout__input--error','adyen-checkout__field--error','input--invalid',
     'field--invalid','field-error','input-error','error'];
-  const OTHER_FLAGS = ['valueMissing','typeMismatch','tooShort','tooLong','rangeUnderflow','rangeOverflow',
-    'stepMismatch','badInput','customError'];
-  // A form submits without constraint validation when it carries ``novalidate`` (the ``noValidate`` property, then the
-  // intrinsic ``Element.prototype.hasAttribute``, which a control named ``hasAttribute`` or ``noValidate`` cannot
-  // shadow) or a submit/image control with ``formnovalidate`` (the browser skips
-  // validation for a submission made with that submitter). The controls come from the field's own tree, not
-  // ``form.elements`` (which leaves out ``input type=image`` and can be shadowed by a control named ``elements``).
-  // Which control is Pay is not known here, so any other one counts, hidden or disabled: a Pay button that is
-  // disabled only until a terms box is ticked still submits later, and a wrong excuse costs a refused submit while a
-  // wrong block costs the payment.
-  const skipsValidation = el => {
-    const form = el.form;
-    if (form.noValidate === true) return true;
-    // a throw here keeps the fail-closed verdict (no excuse at all), as an unreadable form always did
-    try { if (Element.prototype.hasAttribute.call(form, 'novalidate')) return true; } catch (_) { return false; }
-    return Array.from(el.getRootNode().querySelectorAll('button[formnovalidate],input[formnovalidate]')).some(
-      c => c && c.form === form && c.formNoValidate === true && (c.type === 'submit' || c.type === 'image'));
-  };
-  const breaksConstraint = el => {
-    if (!(typeof el.matches === 'function' && el.matches(':invalid'))) return false;
-    // dlz (J-0269): the browser already calls this field :invalid, so a read that throws below keeps that verdict
-    // (the pre-excuse behaviour) instead of turning into 'unknown', which would let Pay through.
-    try {
-      const v = el.validity;
-      if (!v || typeof v !== 'object' || typeof v.valid !== 'boolean') return true;
-      const p = typeof el.getAttribute === 'function' ? el.getAttribute('pattern') : null;
-      const emptyPattern = p !== null && p !== undefined && !String(p).trim();
-      // a string compare, not instanceof: the field may live in another frame
-      const excusable = String(el.tagName).toUpperCase() === 'INPUT' && (!el.form || skipsValidation(el));
-      return !(v.patternMismatch && emptyPattern && excusable && !OTHER_FLAGS.some(k => v[k]));
-    } catch (_) { return true; }
-  };
   const validity = el => {
     try {
-      if (String(el.getAttribute('aria-invalid')||'').toLowerCase() === 'true') return 'invalid';
-      if (breaksConstraint(el)) return 'invalid';
+      if (String(el.getAttribute('aria-invalid')||'').toLowerCase() === 'true') return 'aria';
       for (let n = el, k = 0; n && n.classList && k < 4; n = n.parentElement, k++)
-        if (INVALID_CLASSES.some(c => n.classList.contains(c))) return 'invalid';
+        if (INVALID_CLASSES.some(c => n.classList.contains(c))) return 'class';
       return 'valid';
     } catch (_) { return 'unknown'; }
   };
