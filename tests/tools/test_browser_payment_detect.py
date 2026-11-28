@@ -262,8 +262,8 @@ FAILURE_PHRASES = [
 ]
 
 
-# D-1209 a: the narrow decline wording that lets the same Pay control go again (``evidence.DECLINED``), and text the
-# wide FAILURE veto matches that must not (final review #1: bare words, other features' errors, a payment pending)
+# D-1209 a: page text only ever vetoes the same Pay control's second press (approach review 2). A plain decline is no
+# veto (beside a flagged field it leaves pay_again); money taken (``evidence.TAKEN``) or a payment pending is one.
 DECLINE_PHRASES = [
     "Payment failed. Please try again.", "Your card was declined.", "Your card has been declined. Please use another card.",
     "The transaction was declined by your bank.", "Payment unsuccessful. Please try another payment method.",
@@ -278,10 +278,18 @@ DECLINE_PHRASES = [
     "Zahlungsart abgelehnt.", "Die Authentifizierung ist fehlgeschlagen.", "3D-Secure-Prüfung fehlgeschlagen.",
     "Nicht genügend Deckung auf dem Konto.",
 ]
-NOT_DECLINE_PHRASES = [
-    "Bewertungen: Laden fehlgeschlagen", "Alle Cookies abgelehnt", "Gutschein abgelehnt", "Sie haben noch keine Bestellung",
-    "An error occurred while loading recommendations",
-    "What to do if your payment failed?", "Zahlung fehlgeschlagen? Hier findest du Hilfe.",
+TAKEN_PHRASES = [  # approach review 2's probe texts: each gave pay_again at 69041cb75a
+    "Your card was charged, but saving your payment method failed.",
+    "Gift card declined. The remaining amount was charged to your credit card.",
+    "Zahlung erfolgt. Speichern der Zahlungsart fehlgeschlagen.", "Abbuchung erfolgt. Bestellung fehlgeschlagen.",
+    "Order failed to save. Your card has been charged 49.99 EUR.",
+    "Payment authorization failed for your backup card. Your primary card was charged.",
+    "Payment failed but your card may have been charged. Do not retry; contact support.",
+    "Your card was charged. Please check the highlighted field.",
+    "Payment taken. Saving your address failed: check the highlighted field.",
+    "Wir haben 49,99 EUR von Ihrer Karte abgebucht. Bitte prüfen Sie die markierten Felder.",
+    "Your payment went through.", "Der Betrag wurde Ihrem Konto belastet.", "Der Betrag wird eingezogen.",
+    "The amount was debited from your account.", "Payment captured.",
 ]
 PENDING_PHRASES = [
     "Your payment has not been confirmed yet. Please approve it in your banking app.",
@@ -303,18 +311,11 @@ def _three(found):
     return {k: found[k] for k in _THREE}
 
 
-@pytest.mark.parametrize("text", PENDING_ONLY_PHRASES)
-def test_a_payment_on_its_way_reads_as_pending_never_declined(text):
+@pytest.mark.parametrize("text", DECLINE_PHRASES + TAKEN_PHRASES + PENDING_PHRASES + PENDING_ONLY_PHRASES)
+def test_money_taken_or_pending_is_a_veto_and_a_plain_decline_is_none(text):
     found = evidence.wording("Zur Kasse", "Jetzt kaufen Noch nicht registriert? " + text)
-    assert found["pending"] is True and found["declined"] is False, found
-
-
-@pytest.mark.parametrize("text", DECLINE_PHRASES + NOT_DECLINE_PHRASES + PENDING_PHRASES)
-def test_only_a_payment_decline_with_nothing_pending_reads_as_declined(text):
-    """D-1209 a: FAILURE stays the wide veto (every row is failure wording), DECLINED is the narrow permission."""
-    found = evidence.wording("Zur Kasse", "Jetzt kaufen Noch nicht registriert? " + text)
-    assert found["failure"] is True or text in DECLINE_PHRASES  # the wide veto: each of the others granted before r6
-    assert (found["declined"] and not found["pending"]) is (text in DECLINE_PHRASES), found
+    assert found["taken"] is (text in TAKEN_PHRASES), found
+    assert found["pending"] is (text in PENDING_PHRASES + PENDING_ONLY_PHRASES), found
 
 
 @pytest.mark.parametrize("text", ORDER_PHRASES)
@@ -367,7 +368,7 @@ const scan = (title, kids) => { const document = {title, body: E('BODY', kids)};
 """
 
 
-ALL_PHRASES = (ORDER_PHRASES + SERVICE_TEXT + NOT_ORDER + FAILURE_PHRASES + DECLINE_PHRASES + NOT_DECLINE_PHRASES
+ALL_PHRASES = (ORDER_PHRASES + SERVICE_TEXT + NOT_ORDER + FAILURE_PHRASES + DECLINE_PHRASES + TAKEN_PHRASES
                + PENDING_PHRASES + PENDING_ONLY_PHRASES)
 
 

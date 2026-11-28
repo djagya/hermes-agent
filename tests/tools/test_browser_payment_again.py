@@ -1,7 +1,8 @@
 """D-1209 a (owner 2026-11-27): a second press on the same Pay control is decided by Hermes. Pressing it again is
 refused (``payment_same_control``, nothing pressed) unless payment_done answered ``pay_again: true`` after the latest
-Pay-like press. The whole input: every state Sera can see after a Pay press, each fault at each read payment_done
-makes for ``pay_again``, and the press after it. Fake supervisor and fake CDP only; synthetic data."""
+Pay-like press, which it does only for a field the form flagged after the press (page text only ever vetoes). The
+whole input: every state Sera can see after a Pay press, each fault at each read payment_done makes for ``pay_again``,
+and the press after it. Fake supervisor and fake CDP only; synthetic data."""
 
 import asyncio
 import random
@@ -141,67 +142,78 @@ def _pay(sup, after=None):
 
 
 def _declined(sup):
-    sup.after = {"page": DECLINED}  # the shop says the payment failed, its JETZT KAUFEN still there
+    sup.after = {"page": DECLINED}  # the shop says the payment failed, its JETZT KAUFEN still there, no field flagged
 
 
 def _flagged(sup):
     sup.after = {"invalid": True}  # a field the form needs is flagged after the press (aria-invalid)
 
 
+def _declined_and_flagged(sup):
+    sup.after = {"page": DECLINED, "invalid": True}  # a decline with the card field flagged (D-0961)
+
+
+def _flagged_money_taken(sup):  # approach review 2: a flag beside "charged" text
+    sup.after = {"page": {**CART, "text": CART["text"] + " Your card was charged. Please check the highlighted field."},
+                 "invalid": True}
+
+
 def _slow_in_place(sup):
     sup.after = {"busy": True}  # an XHR order still running: a spinner, the Pay control kept
 
 
-def _declined_while_busy(sup):
-    sup.after = {"page": DECLINED, "busy": True}  # failure wording while the page is still busy
+def _flagged_while_busy(sup):
+    sup.after = {"invalid": True, "busy": True}  # a flag while the page is still busy
 
 
 def _quiet(sup):
     pass  # the page shows nothing new: the order may be on its way (XHR), the Pay control kept
 
 
-def _confirmed_with_failure_words(sup):  # a real confirmation in place that also carries failure-like wording
-    sup.after = {"page": {**CART, "text": "Vielen Dank für Ihre Bestellung! Zahlung fehlgeschlagen? Schreib uns."}}
+def _confirmed_with_a_flag(sup):  # a real confirmation in place that also carries a flagged field
+    sup.after = {"page": {**CART, "text": "Vielen Dank für Ihre Bestellung! Zahlung fehlgeschlagen? Schreib uns."},
+                 "invalid": True}
 
 
-def _order_wording_new(sup):  # order wording that was not there before, beside failure wording
+def _order_wording_new(sup):  # order wording that was not there before, beside a flag
     sup.after = {"page": {**CART, "text": CART["text"] + " Ihre Bestellung ist bei uns eingegangen. "
-                                                         "Es ist ein Fehler aufgetreten."}}
+                                                         "Es ist ein Fehler aufgetreten."}, "invalid": True}
 
 
-def _order_wording_before(sup):  # the checkout carries order wording before the press; failure wording after it
+def _order_wording_before(sup):  # the checkout carries order wording before the press; a flag after it
     sup.page.update({**CART, "text": CART["text"] + " Your payment is processed securely."})
     sup.after = {"page": {**CART, "text": CART["text"] + " Your payment is processed securely. Ihre Bestellung ist "
-                                                         "bei uns eingegangen. Es ist ein Fehler aufgetreten."}}
+                                                         "bei uns eingegangen. Es ist ein Fehler aufgetreten."},
+                 "invalid": True}
 
 
 def _remounted(sup):  # quiet page; the shop re-renders its buttons: JETZT KAUFEN is a new element, same caption
     sup.after = {"rows": [_row("JETZT KAUFEN")]}
 
 
-def _failed_before(sup):
-    sup.page.update(DECLINED)  # the failure was on the page before this press (an earlier attempt's)
+def _flagged_before(sup):
+    sup.invalid = True  # the flag was on the page before this press (an earlier attempt's)
 
 
 def _control_disabled(sup):
-    sup.after = {"page": DECLINED, "pressable": False}
+    sup.after = {"invalid": True, "pressable": False}
 
 
 def _uncertain(sup):
-    sup.after, sup.lose_release = {"page": DECLINED}, True  # payment_click_uncertain
+    sup.after, sup.lose_release = {"invalid": True}, True  # payment_click_uncertain
 
 
 def _in_flight(sup):
-    sup.after = {"page": DECLINED}
+    sup.after = {"invalid": True}
     sup.loading = True  # the press started a navigation that has not finished loading
 
 
 def _popup(sup):
-    sup.after = {"page": DECLINED, "popup": True}  # the press opened a tab (a bank's redirect)
+    sup.after = {"invalid": True, "popup": True}  # the press opened a tab (a bank's redirect)
 
 
 def _bank_page(sup):
-    sup.after = {"page": DECLINED, "tree": done_tests.ACS}  # the tab went to the bank's 3-D Secure page
+    sup.after = {"invalid": True, "tree": done_tests.ACS}  # the tab went to the bank's 3-D Secure page
 
 
 def _detected(sup):  # payment_detected: the thank-you in place, the pressed control gone
@@ -211,17 +223,19 @@ def _detected(sup):  # payment_detected: the thank-you in place, the pressed con
 
 # (state, payment_done is called, pay_again, the same control's second press: None = pressed, else its refusal)
 TABLE = [
-    (_declined, True, True, None),
     (_flagged, True, True, None),
-    (_declined, False, None, SAME),  # Sera presses again without asking payment_done
+    (_declined_and_flagged, True, True, None),
+    (_declined, True, False, SAME),  # page text alone never gives pay_again
+    (_flagged, False, None, SAME),  # Sera presses again without asking payment_done
+    (_flagged_money_taken, True, False, SAME),
     (_slow_in_place, True, False, SAME),
-    (_declined_while_busy, True, False, SAME),
+    (_flagged_while_busy, True, False, SAME),
     (_quiet, True, False, SAME),
-    (_confirmed_with_failure_words, True, False, SAME),
+    (_confirmed_with_a_flag, True, False, SAME),
     (_order_wording_new, True, False, SAME),
     (_order_wording_before, True, False, SAME),
     (_remounted, False, None, SAME),  # a new node id, the same caption on the same document: the same control
-    (_failed_before, True, False, SAME),
+    (_flagged_before, True, False, SAME),
     (_control_disabled, True, False, SAME),
     (_uncertain, True, False, SAME),
     (_in_flight, True, False, detect.INFLIGHT),
@@ -231,7 +245,8 @@ TABLE = [
 ]
 
 
-@pytest.mark.parametrize("state, ask, pay_again, second", TABLE, ids=[row[0].__name__ for row in TABLE])
+@pytest.mark.parametrize("state, ask, pay_again, second", TABLE,
+                         ids=[f"{row[0].__name__}{'' if row[1] else '-no_done'}" for row in TABLE])
 def test_the_same_pay_control_goes_again_only_after_pay_again(state, ask, pay_again, second):
     sup = _sunday()
     state(sup)
@@ -295,7 +310,7 @@ def test_an_unread_node_is_the_same_control_and_never_gets_pay_again():
     sup = _sunday()
     real = sup.answer
     sup.answer = lambda m, p, s=None: {} if m == "DOM.describeNode" else real(m, p, s)
-    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
+    assert _pay(sup, after={"invalid": True})["pay_pressed"] is True
     assert done.payment_done(sup)["pay_again"] is False
     assert _pay(sup)["error_type"] == SAME
     assert _press(sup, "BESTÄTIGEN")["error_type"] == SAME and len(_mouse_presses(sup)) == 1
@@ -307,7 +322,7 @@ RETRY = "JETZT KAUFEN (erneut)"
 @pytest.mark.parametrize("unread", ["first", "second"])
 @pytest.mark.parametrize("ask", [False, True], ids=["no payment_done", "payment_done"])
 def test_a_renamed_control_with_an_unread_id_on_either_press_is_held(unread, ask):
-    """Final review #1 (Kimi): the shop renames the pressed JETZT KAUFEN after a decline (the same element, 4001), and
+    """Final review #1 (Kimi): the shop renames the pressed JETZT KAUFEN after a flag (the same element, 4001), and
     the element id of one of the two presses was not read: the same document and an unread id is the same control,
     held without pay_again, and with it too when the id at the press is unread (its element cannot be checked)."""
     sup = _sunday()
@@ -317,7 +332,7 @@ def test_a_renamed_control_with_an_unread_id_on_either_press_is_held(unread, ask
         return {} if m == "DOM.describeNode" else real(m, p, s)
 
     sup.answer = unread_id if unread == "first" else real
-    assert _pay(sup, after={"page": DECLINED, "rows": [_row("BESTÄTIGEN"), _row(RETRY, i=1)]})["pay_pressed"] is True
+    assert _pay(sup, after={"invalid": True, "rows": [_row("BESTÄTIGEN"), _row(RETRY, i=1)]})["pay_pressed"] is True
     if ask:
         assert done.payment_done(sup)["pay_again"] is (unread == "second")
     sup.answer = unread_id if unread == "second" else real
@@ -333,14 +348,18 @@ def _with(text, **after):
     return {"page": {**CART, "text": f"{CART['text']} Noch nicht registriert? {text}"}, **after}
 
 
-@pytest.mark.parametrize("text, granted", [(t, True) for t in detect_tests.DECLINE_PHRASES]
-                         + [(t, False) for t in detect_tests.NOT_DECLINE_PHRASES + detect_tests.PENDING_PHRASES])
-def test_only_a_payment_decline_lets_the_same_pay_go_again(text, granted):
-    """The permission is its own narrow decline wording, not the wide failure veto: a bare "abgelehnt" or
-    "fehlgeschlagen", another feature's error, and a payment still pending (a bank app to approve, a wait) give no
-    pay_again, and the same JETZT KAUFEN is held; a real decline (EN, DE) gives one press."""
+VETO_PHRASES = detect_tests.TAKEN_PHRASES + detect_tests.PENDING_PHRASES + detect_tests.PENDING_ONLY_PHRASES
+
+
+@pytest.mark.parametrize("flagged", [True, False], ids=["flagged", "text-only"])
+@pytest.mark.parametrize("text", detect_tests.DECLINE_PHRASES + VETO_PHRASES)
+def test_page_text_only_ever_vetoes(text, flagged):
+    """Approach review 2 (D-1260, built as a): only a field flagged after the press gives pay_again; page text never
+    does, and money taken (the reviewer's probe texts: "charged, but saving ... failed", "Abbuchung erfolgt") or a
+    payment pending vetoes it beside a flag too. A plain decline is no veto: with the flag it gives one press."""
+    granted = flagged and text in detect_tests.DECLINE_PHRASES
     sup = _sunday()
-    assert _pay(sup, after=_with(text))["pay_pressed"] is True
+    assert _pay(sup, after=_with(text, invalid=flagged))["pay_pressed"] is True
     out = done.payment_done(sup)
     assert out["pay_again"] is granted, out
     assert out["error"].endswith(done._NOT_REACHED_AGAIN) is granted  # never "ask the user" beside pay_again true
@@ -350,12 +369,35 @@ def test_only_a_payment_decline_lets_the_same_pay_go_again(text, granted):
     assert granted or out["error_type"] == SAME
 
 
-@pytest.mark.parametrize("text", detect_tests.PENDING_PHRASES)
-def test_pending_wording_beside_a_flagged_field_gives_no_pay_again(text):
+@pytest.mark.parametrize("text", VETO_PHRASES)
+def test_veto_text_shown_after_the_grant_holds_the_press(text):
+    """The vetoes are judged again right before the press: shown after payment_done's pay_again, they hold it."""
     sup = _sunday()
-    assert _pay(sup, after=_with(text, invalid=True))["pay_pressed"] is True
+    assert _pay(sup, after={"invalid": True})["pay_pressed"] is True
+    assert done.payment_done(sup)["pay_again"] is True
+    sup.page.update(_with(text)["page"])
+    presses = len(_mouse_presses(sup))
+    assert _pay(sup)["error_type"] == SAME and len(_mouse_presses(sup)) == presses
+
+
+def test_a_late_click_answer_after_an_accepted_confirm_never_counts(monkeypatch):
+    """r7 middle review low: a confirm accepted while the Pay press's answer is still on its way; the late answer
+    says nothing about the accepted confirm, so payment_done gives no pay_again (a flag shown) and the press is held."""
+    sup = _sunday()
+    real = sup.answer
+
+    def accept_during(m, p, s=None):
+        out = real(m, p, s)
+        if m == "Input.dispatchMouseEvent" and p.get("type") == "mouseReleased":
+            again.accepted(sup)  # payment_dialog accepting the shop's confirm from another call
+        return out
+
+    sup.answer = accept_during
+    assert _pay(sup, after={"invalid": True})["pay_pressed"] is True
+    sup.answer = real
     assert done.payment_done(sup)["pay_again"] is False
-    assert _pay(sup)["error_type"] == SAME
+    presses = len(_mouse_presses(sup))
+    assert _pay(sup)["error_type"] == SAME and len(_mouse_presses(sup)) == presses
 
 
 # ------------------------------------------------------------------ final review #1: two payment_done calls at once
@@ -371,7 +413,7 @@ def test_overlapping_payment_done_calls_never_store_an_older_yes(monkeypatch, an
     """A started first, B second (each its own thread); each holds at its not-reached exit until released in the
     order ``ends``. A yes is stored only from the payment_done started last; the same JETZT KAUFEN goes only then."""
     sup = _sunday()
-    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
+    assert _pay(sup, after={"invalid": True})["pay_pressed"] is True
     real = again.grant
     at = {name: threading.Event() for name in "AB"}
     go = {name: threading.Event() for name in "AB"}
@@ -434,6 +476,7 @@ def test_a_slow_flags_read_never_delays_the_detection_after_the_press(monkeypatc
 
 _FAILURE = " Zahlung fehlgeschlagen. Bitte versuche es erneut."
 _PENDING = " Bitte warten."
+_TAKEN = " Der Betrag wurde von Ihrer Karte abgebucht."
 _ORDER = {"weak": " Your payment is processed securely.", "strong": " Vielen Dank für Ihre Bestellung! Bestellnummer 4711."}
 AGB = "AGB akzeptieren"
 
@@ -441,41 +484,37 @@ AGB = "AGB akzeptieren"
 class Rule:
     """The rule in words (D-1209 a, D-1237 a, D-0961), written apart from the code: a Pay-like press on a control
     pressed before in this approval goes only when the last payment_done after the latest Pay-like press said
-    pay_again for that control and the page at the press still allows it. payment_done says pay_again only when the
-    latest press's answer came back, the page showed neither failure wording nor a flagged field right before it,
-    and now shows one of them, with no order wording, nothing busy, the control enabled and no tab a payment tab
-    opened, nothing pending. At the press a failure-wording answer needs the wording still there; a flag-only one
-    does not. A confirm accepted after a Pay press spends a pay_again, and no payment_done grants until a Pay press
-    is answered again."""
+    pay_again for that control and the page at the press shows no veto. payment_done says pay_again only when the
+    latest press's answer came back, no field was flagged right before it and one is now, with no veto: no order,
+    money-taken or pending wording, nothing busy, the control enabled and no tab a payment tab opened. Failure
+    wording changes nothing. At the press the flag need not show any more (D-0961). A confirm accepted after a Pay
+    press spends a pay_again, and no payment_done grants until a Pay press is answered again."""
 
     def __init__(self):
         self.page = {"failure": False, "invalid": False, "busy": False, "order": None, "pressable": True,
-                     "popup": False, "pending": False}
-        self.pressed, self.latest, self.answered, self.before, self.grant = set(), None, False, None, None
+                     "popup": False, "pending": False, "taken": False}
+        self.pressed, self.latest, self.answered, self.before, self.grant = set(), None, False, None, False
 
-    def _allows(self, wording):
+    def _vetoed(self):
         p = self.page
-        if p["order"] or p["busy"] or not p["pressable"] or p["popup"] or p["pending"]:
-            return False
-        return p["failure"] or (p["invalid"] if wording is None else not wording)
+        return bool(p["order"] or p["busy"] or not p["pressable"] or p["popup"] or p["pending"] or p["taken"])
 
     def press(self, caption, effect, uncertain):
-        if caption in self.pressed and not (self.grant is not None and self.latest == caption
-                                            and self._allows(self.grant)):
+        if caption in self.pressed and not (self.grant and self.latest == caption and not self._vetoed()):
             return SAME
-        self.before = (self.page["failure"], self.page["invalid"])
+        self.before = self.page["invalid"]
         self.pressed.add(caption)
-        self.latest, self.answered, self.grant = caption, not uncertain, None
+        self.latest, self.answered, self.grant = caption, not uncertain, False
         self.page.update(effect)
         return "uncertain" if uncertain else "pressed"
 
     def done(self):
-        ok = self.latest is not None and self.answered and self.before == (False, False) and self._allows(None)
-        self.grant = self.page["failure"] if ok else None
-        return ok
+        self.grant = (self.latest is not None and self.answered and not self.before and self.page["invalid"]
+                      and not self._vetoed())
+        return self.grant
 
     def accept(self):
-        self.grant, self.answered = None, False
+        self.grant, self.answered = False, False
         return True
 
     def step(self, op):
@@ -493,7 +532,7 @@ class Rule:
 def _shown(page):
     """The fake page for the rule's page."""
     text = (CART["text"] + (_FAILURE if page["failure"] else "") + _ORDER.get(page["order"], "")
-            + (_PENDING if page["pending"] else ""))
+            + (_PENDING if page["pending"] else "") + (_TAKEN if page["taken"] else ""))
     return {"page": {**CART, "text": text}, **{k: page[k] for k in ("invalid", "busy", "pressable", "popup")}}
 
 
@@ -532,40 +571,41 @@ def _start():
     return sup, Rule()
 
 
-EFFECTS = [{"failure": True}, {"invalid": True}, {"busy": True}, {}, {"failure": True, "busy": True},
-           {"failure": True, "invalid": True}, {"order": "weak", "failure": True}, {"order": "strong", "failure": True},
-           {"failure": True, "pressable": False}, {"failure": True, "popup": True}, {"failure": True, "pending": True}]
+EFFECTS = [{"failure": True}, {"invalid": True}, {"busy": True}, {}, {"invalid": True, "busy": True},
+           {"failure": True, "invalid": True}, {"order": "weak", "invalid": True}, {"order": "strong", "invalid": True},
+           {"invalid": True, "pressable": False}, {"invalid": True, "popup": True}, {"invalid": True, "pending": True},
+           {"invalid": True, "taken": True}]
 CHANGES = [{"busy": True}, {"busy": False}, {"failure": False}, {"failure": True}, {"order": "weak"},
            {"order": "strong"}, {"order": None}, {"popup": True}, {"pressable": False}, {"pressable": True},
-           {"invalid": True}, {"failure": False, "invalid": True}, {"pending": True}, {"pending": False}]
+           {"invalid": True}, {"failure": True, "invalid": True}, {"pending": True}, {"pending": False},
+           {"taken": True}, {"taken": False}]
 JK = "JETZT KAUFEN"
-NAMED = {  # the cases a reviewer found (r3 middle review H1, approach review M1) and the owner's D-0961 flag case
-    "false_after_true": (("pay", JK, {"failure": True}, False), ("done",), ("page", {"busy": True}), ("done",),
+F = {"invalid": True}
+NAMED = {  # the cases a reviewer found (r3 middle review H1, approach reviews M1) and the owner's D-0961 flag case
+    "false_after_true": (("pay", JK, F, False), ("done",), ("page", {"busy": True}), ("done",),
                          ("page", {"busy": False}), ("pay", JK, {}, False)),
-    "busy_at_the_press": (("pay", JK, {"failure": True}, False), ("done",), ("page", {"busy": True}),
-                          ("pay", JK, {}, False)),
-    "wording_gone_flag_shown": (("pay", JK, {"failure": True}, False), ("done",),
-                                ("page", {"failure": False, "invalid": True}), ("pay", JK, {}, False)),
-    "flag_fixed": (("pay", JK, {"invalid": True}, False), ("done",), ("fix",), ("pay", JK, {"failure": True}, False),
+    "busy_at_the_press": (("pay", JK, F, False), ("done",), ("page", {"busy": True}), ("pay", JK, {}, False)),
+    "failure_text_alone": (("pay", JK, {"failure": True}, False), ("done",), ("pay", JK, {}, False)),
+    "taken_beside_the_flag": (("pay", JK, {**F, "taken": True}, False), ("done",), ("pay", JK, {}, False)),
+    "taken_at_the_press": (("pay", JK, F, False), ("done",), ("page", {"taken": True}), ("pay", JK, {}, False)),
+    "flag_fixed": (("pay", JK, F, False), ("done",), ("fix",), ("pay", JK, {"failure": True}, False),
                    ("done",), ("pay", JK, {}, False)),
-    "two_controls": (("pay", "BESTÄTIGEN", {}, False), ("pay", JK, {"failure": True}, False), ("done",),
+    "two_controls": (("pay", "BESTÄTIGEN", {}, False), ("pay", JK, F, False), ("done",),
                      ("pay", "BESTÄTIGEN", {}, False), ("pay", JK, {}, False)),
-    "popup_between_grant_and_press": (("pay", JK, {"failure": True}, False), ("done",), ("page", {"popup": True}),
+    "popup_between_grant_and_press": (("pay", JK, F, False), ("done",), ("page", {"popup": True}),
                                       ("pay", JK, {}, False)),
-    "popup_before_done": (("pay", JK, {"failure": True}, False), ("page", {"popup": True}), ("done",)),
+    "popup_before_done": (("pay", JK, F, False), ("page", {"popup": True}), ("done",)),
     # final review #1 (Kimi): an accepted confirm may place the order; a payment_done after it answers again
-    "dialog_accept": (("pay", JK, {"failure": True}, False), ("done",), ("accept",), ("pay", JK, {}, False)),
-    "dialog_accept_then_done": (("pay", JK, {"failure": True}, False), ("done",), ("accept",), ("done",),
-                                ("pay", JK, {}, False)),
-    "pending_at_the_press": (("pay", JK, {"failure": True}, False), ("done",), ("page", {"pending": True}),
-                             ("pay", JK, {}, False)),
-    "flag_with_pending": (("pay", JK, {"invalid": True, "pending": True}, False), ("done",), ("pay", JK, {}, False)),
+    "dialog_accept": (("pay", JK, F, False), ("done",), ("accept",), ("pay", JK, {}, False)),
+    "dialog_accept_then_done": (("pay", JK, F, False), ("done",), ("accept",), ("done",), ("pay", JK, {}, False)),
+    "pending_at_the_press": (("pay", JK, F, False), ("done",), ("page", {"pending": True}), ("pay", JK, {}, False)),
+    "flag_with_pending": (("pay", JK, {**F, "pending": True}, False), ("done",), ("pay", JK, {}, False)),
 }
 
 
 def _generated(n=48, length=6):
     rng = random.Random(1209)
-    effects = EFFECTS + [{"failure": True}] * 4 + [{"invalid": True}] * 2  # the ones that can lead to pay_again
+    effects = EFFECTS + [{"invalid": True}] * 6  # the one that can lead to pay_again
     out = []
     for _ in range(n):
         ops = []
@@ -616,11 +656,11 @@ def test_every_sequence_does_what_the_rule_says(_short, name):
 
 
 @pytest.mark.parametrize("done_before_accept", [True, False])
-def test_accepted_confirm_then_done_does_not_grant_on_the_old_decline(_short, done_before_accept):
-    """r6 middle review M1: after pay(declined) a confirm is accepted; the page text is still the decline from before
-    the accept, so payment_done must not say pay_again and the same Pay stays refused."""
+def test_accepted_confirm_then_done_does_not_grant_on_the_old_flag(_short, done_before_accept):
+    """r6 middle review M1: after pay(flagged) a confirm is accepted; the page still shows the flag from before the
+    accept, so payment_done must not say pay_again and the same Pay stays refused."""
     sup = _sunday()
-    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
+    assert _pay(sup, after={"invalid": True})["pay_pressed"] is True
     if done_before_accept:
         assert done.payment_done(sup)["pay_again"] is True
     sup.dialogs = [done_tests._confirm("Zahlung erneut versuchen?", url=SHOP + "/checkout/")]
