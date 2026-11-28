@@ -86,10 +86,11 @@ FAILURE_SRC = (
     r"geweigerd|niet gelukt)(?!%L%)")
 # D-1209 a: what lets the same Pay control go again (``browser_payment_again``). FAILURE above is a veto and wide on
 # purpose; this is a permission and narrow: a payment, card, order or transaction word next to a decline (EN, DE; no
-# bare "abgelehnt", no generic error: "Gutschein abgelehnt", "Alle Cookies abgelehnt", "Laden fehlgeschlagen").
-_PAID = (r"payment|transaction|order|purchase|(?:your|the|credit|debit|bank) card|zahlung|bezahlung|kartenzahlung|"
-         r"zahlungsvorgang|bezahlvorgang|zahlungsversuch|transaktion|abbuchung|bestellung|(?:ihre|deine|die) karte|"
-         r"kreditkarte|debitkarte|bankkarte")
+# bare "abgelehnt", no generic error: "Gutschein abgelehnt", "Alle Cookies abgelehnt", "Laden fehlgeschlagen"; a help
+# question ("What to do if your payment failed?") is not a decline).
+_PAID = (r"payment(?: method| authori[sz]ation)?|transaction|order|purchase|(?:your|the|credit|debit|bank) card|"
+         r"zahlung|bezahlung|kartenzahlung|zahlungsvorgang|bezahlvorgang|zahlungsversuch|zahlungsart|zahlungsmethode|"
+         r"transaktion|abbuchung|bestellung|(?:ihre|deine|die) karte|kreditkarte|debitkarte|bankkarte")
 _DECLINE_FILL = r"has|have|was|were|is|been|got|unfortunately|ist|wurde|war|leider|konnte|von|der|ihrer|deiner|bank"
 _DECLINE = (r"failed|declined|unsuccessful|refused|rejected|denied|not successful|not authori[sz]ed|not accepted|"
             r"could not be (?:processed|completed|authori[sz]ed|charged)|fehlgeschlagen|abgelehnt|gescheitert|"
@@ -99,18 +100,26 @@ DECLINED_SRC = (
     r"(?:failed|declined|unsuccessful|rejected|refused)\s+(?:card\s+)?(?:payment|transaction|order|purchase)|"
     r"(?:unable to|could not|couldn['’]t|cannot|can['’]t)\s+(?:process|complete|authori[sz]e|charge)\s+"
     r"(?:your\s+|the\s+)?(?:payment|card|order|transaction|purchase)|"
-    r"(?:fehlgeschlagene|abgelehnte)\s+(?:zahlung|kartenzahlung|transaktion))(?!%L%)")
+    r"(?:fehlgeschlagene|abgelehnte)\s+(?:zahlung|kartenzahlung|transaktion)|"
+    r"(?:card|karte)\s+(?:was\s+|wurde\s+)?(?:declined|abgelehnt)|"
+    r"bank\s+declined\s+(?:your\s+|the\s+)?(?:payment|transaction|card|purchase|order)|"
+    r"3-?d[\s-]?secure(?:[\s-]+%L%+){0,2}?[\s-]+(?:failed|unsuccessful|fehlgeschlagen)|"
+    r"authentifizierung\s+(?:ist\s+|wurde\s+)?(?:fehlgeschlagen|abgelehnt)|"
+    r"insufficient\s+funds|nicht\s+genügend\s+deckung)(?!%L%)(?!\s*\?)")
 # The payment still on its way (a bank app to approve, a wait): never pay_again, whatever else the page shows.
 # "noch nicht", "not yet", "still" count only beside a payment or order word in the same sentence ("Noch nicht
 # registriert?" on a checkout is no pending payment).
 PENDING_SRC = (
     r"(?<!%L%)(?:bitte warten|please wait|do not close|don['’]t close|nicht schließen|"
     r"schließen sie (?:diese|das|dieses) (?:seite|fenster) nicht|in bearbeitung|"
-    r"wird (?:noch )?(?:bearbeitet|verarbeitet|geprüft)|being processed|ausstehend|pending|awaiting|"
+    r"wird (?:noch )?(?:bearbeitet|verarbeitet|geprüft|überprüft|durchgeführt)|being (?:processed|verified)|"
+    r"ausstehend|pending|awaiting|"
+    rf"(?:processing|verifying|waiting for)\s+(?:%L%+\s+){{0,2}}?(?:{_NOUN})|warten auf|einen moment|one moment|"
+    r"redirect%L%*|weiterleit%L%*|weitergeleit%L%*|nicht neu laden|do not (?:refresh|reload)|don['’]t (?:refresh|reload)|"
     rf"(?:{_NOUN})(?!%L%)[^.!?]{{0,80}}?(?<!%L%)(?:yet|still|noch nicht)|"
     rf"(?:not yet|noch nicht|still)(?!%L%)[^.!?]{{0,80}}?(?<!%L%)(?:{_NOUN})|"
-    r"(?:approve|confirm|authori[sz]e|bestätig%L%*|freigeb%L%*)[^.!?]{0,80}?(?<!%L%)app|"
-    r"app(?!%L%)[^.!?]{0,80}?(?<!%L%)(?:approve|confirm|authori[sz]e|bestätig|freigeb))(?!%L%)")
+    r"(?:approve|confirm|authori[sz]e|bestätig%L%*|freigeb%L%*)[^.!?]{0,80}?(?<!%L%)(?:app|smartphone|phone|handy)|"
+    r"(?:app|smartphone|phone|handy)(?!%L%)[^.!?]{0,80}?(?<!%L%)(?:approve|confirm|authori[sz]e|bestätig|freigeb))(?!%L%)")
 
 
 def _py(src: str) -> re.Pattern:

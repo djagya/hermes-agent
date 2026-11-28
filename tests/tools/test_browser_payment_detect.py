@@ -272,10 +272,16 @@ DECLINE_PHRASES = [
     "Die Zahlung war leider nicht erfolgreich.", "Ihre Zahlung konnte leider nicht durchgeführt werden.",
     "Kartenzahlung abgelehnt.", "Die Zahlung wurde von der Bank abgelehnt.",
     "Zahlung fehlgeschlagen, bitte versuche es noch einmal.",
+    # r7 (D-0961): clear declines that gave no pay_again
+    "Card declined.", "Your bank declined the payment.", "Your payment method was declined.",
+    "Payment authorization failed.", "3D Secure authentication failed", "Insufficient funds.", "Karte abgelehnt.",
+    "Zahlungsart abgelehnt.", "Die Authentifizierung ist fehlgeschlagen.", "3D-Secure-Prüfung fehlgeschlagen.",
+    "Nicht genügend Deckung auf dem Konto.",
 ]
 NOT_DECLINE_PHRASES = [
     "Bewertungen: Laden fehlgeschlagen", "Alle Cookies abgelehnt", "Gutschein abgelehnt", "Sie haben noch keine Bestellung",
     "An error occurred while loading recommendations",
+    "What to do if your payment failed?", "Zahlung fehlgeschlagen? Hier findest du Hilfe.",
 ]
 PENDING_PHRASES = [
     "Your payment has not been confirmed yet. Please approve it in your banking app.",
@@ -283,11 +289,24 @@ PENDING_PHRASES = [
     "Bitte warten: deine Bestellung ist noch nicht abgeschlossen.", "Payment not completed yet, do not close this page.",
     "Zahlung fehlgeschlagen. Bitte bestätige die Zahlung in deiner Banking-App.",
 ]
+PENDING_ONLY_PHRASES = [  # r7: a payment on its way, in words FAILURE never matched
+    "Processing your payment...", "Processing payment", "Waiting for payment confirmation",
+    "Your payment is being verified", "Zahlung wird überprüft", "Zahlung wird durchgeführt", "Einen Moment bitte...",
+    "Wir warten auf die Bestätigung Ihrer Bank.", "Redirecting to your bank...", "Please do not refresh this page.",
+    "Bitte die Seite nicht neu laden.", "Check your phone to approve the payment.",
+    "Bestätige die Zahlung auf deinem Smartphone.",
+]
 _THREE = ("order", "failure", "strong")
 
 
 def _three(found):
     return {k: found[k] for k in _THREE}
+
+
+@pytest.mark.parametrize("text", PENDING_ONLY_PHRASES)
+def test_a_payment_on_its_way_reads_as_pending_never_declined(text):
+    found = evidence.wording("Zur Kasse", "Jetzt kaufen Noch nicht registriert? " + text)
+    assert found["pending"] is True and found["declined"] is False, found
 
 
 @pytest.mark.parametrize("text", DECLINE_PHRASES + NOT_DECLINE_PHRASES + PENDING_PHRASES)
@@ -349,7 +368,7 @@ const scan = (title, kids) => { const document = {title, body: E('BODY', kids)};
 
 
 ALL_PHRASES = (ORDER_PHRASES + SERVICE_TEXT + NOT_ORDER + FAILURE_PHRASES + DECLINE_PHRASES + NOT_DECLINE_PHRASES
-               + PENDING_PHRASES)
+               + PENDING_PHRASES + PENDING_ONLY_PHRASES)
 
 
 def test_the_page_script_scans_all_visible_text_and_no_form_value():
