@@ -3,7 +3,8 @@
 ``_safe_top`` and the value-free snapshot.
 
 - A separate value-free scan of the whole rendered text (title and visible text, no form control, editable region,
-  frame or hidden subtree; not the bounded snapshot) answers two booleans: order wording found, failure wording found.
+  frame or hidden subtree; not the bounded snapshot) answers booleans: order wording found, failure wording found (and
+  for ``browser_payment_again``: a payment decline, a payment still pending).
 - Failure or negation wording ("Zahlung fehlgeschlagen", "keine Bestellung aufgegeben", "payment declined") is never
   a confirmation, on any path.
 - The pressed Pay control itself (its document, ``backendNodeId`` resolving to a connected, rendered element) still

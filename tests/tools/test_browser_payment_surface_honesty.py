@@ -761,8 +761,13 @@ def test_after_pay_a_bank_challenge_is_pressed_whatever_its_button_says(top_case
         out, total_reads, pressed = _again(sup)
         assert out["success"] is True and pressed == 1 and total_reads == 0, (top_case, caption)
         assert surface.presses_in_lock(sup) == 2
-        # G1: back on the merchant with no payment detected, Pay goes again (no press budget); D-1209 a: its
-        # documents are new ones after the bank's redirect (the same control again waits for pay_again)
+        # D-1209 a: on the same documents (no top redirect in the card-frame case) the pressed Pay now is the same
+        # control: refused until payment_done says pay_again (nothing pressed)
+        sup.tree = sup.listed = TREE
+        sup.rows = [_row("Pay now")]
+        out, _reads, pressed = _again(sup)
+        assert out["error_type"] == "payment_same_control" and pressed == 0, (top_case, caption)
+        # G1: on a reloaded page (new documents) with no payment detected, Pay goes again (no press budget)
         sup.tree = sup.listed = _reloaded(TREE)
         out, _reads, pressed = _again(sup)
         assert out["success"] is True and pressed == 1, (top_case, caption)
@@ -845,8 +850,15 @@ def test_after_an_owner_go_pay_the_bank_step_and_another_pay_are_pressed(top_cas
         sup = _go_pay_then([_row(caption)], (BANK_TOP, TREE[1]) if top_case else (TREE[0], BANK_FRAME))
         out, total_reads, pressed = _again(sup, owner_go=True)
         assert out["success"] is True and out["pay_pressed"] is True and pressed == 1 and total_reads == 0, caption
+        # D-1209 a: back on the same documents (no top redirect in the card-frame case) the pressed Pay now is the
+        # same control, refused (nothing pressed) until payment_done says pay_again; owner_go does not change that
+        sup.tree = sup.listed = TREE
+        sup.rows = [_row("Pay now")]
+        out, _reads, pressed = _again(sup, owner_go=True)
+        assert out["error_type"] == "payment_same_control" and pressed == 0, caption
+        sup.rows = [_row(caption)]
         for tree in (TREE, (TREE[0], PROVIDER_FRAME), (PROVIDER_TOP, TREE[1])):
-            sup.tree = sup.listed = _reloaded(tree)  # D-1209 a: each a new document, never a pressed control again
+            sup.tree = sup.listed = _reloaded(tree)  # a reloaded page: new documents, no control pressed on them yet
             out, _reads, pressed = _again(sup, owner_go=True)
             assert out["success"] is True and pressed == 1, (caption, tree[0][2])
         assert surface.presses_in_lock(sup) == 5
