@@ -433,15 +433,18 @@ NAMED = {  # the cases a reviewer found (r3 middle review H1, approach review M1
 
 def _generated(n=48, length=6):
     rng = random.Random(1209)
+    effects = EFFECTS + [{"failure": True}] * 4 + [{"invalid": True}] * 2  # the ones that can lead to pay_again
     out = []
     for _ in range(n):
         ops = []
         while len(ops) < length:
             r = rng.random()
             if r < 0.4:
-                ops.append(("pay", JK if r < 0.3 else "BESTÄTIGEN", rng.choice(EFFECTS), rng.random() < 0.08))
+                ops.append(("pay", JK if r < 0.3 else "BESTÄTIGEN", rng.choice(effects), rng.random() < 0.08))
                 if rng.random() < 0.6:
                     ops.append(("done",))
+                if rng.random() < 0.4:  # the same control right after its answer
+                    ops.append(("pay", ops[-2 if ops[-1] == ("done",) else -1][1], rng.choice(effects), False))
             elif r < 0.65:
                 ops.append(("done",))
             elif r < 0.9:
