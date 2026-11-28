@@ -83,6 +83,33 @@ FAILURE_SRC = (
     r"échoué|échouée|échec|refusé|refusée|n['’]a pas abouti|fallido|fallida|"
     r"rechazado|rechazada|non\s+(?:è\s+)?(?:riuscito|riuscita|andato a buon fine)|rifiutato|rifiutata|mislukt|"
     r"geweigerd|niet gelukt)(?!%L%)")
+# D-1209 a: what lets the same Pay control go again (``browser_payment_again``). FAILURE above is a veto and wide on
+# purpose; this is a permission and narrow: a payment, card, order or transaction word next to a decline (EN, DE; no
+# bare "abgelehnt", no generic error: "Gutschein abgelehnt", "Alle Cookies abgelehnt", "Laden fehlgeschlagen").
+_PAID = (r"payment|transaction|order|purchase|(?:your|the|credit|debit|bank) card|zahlung|bezahlung|kartenzahlung|"
+         r"zahlungsvorgang|bezahlvorgang|zahlungsversuch|transaktion|abbuchung|bestellung|(?:ihre|deine|die) karte|"
+         r"kreditkarte|debitkarte|bankkarte")
+_DECLINE_FILL = r"has|have|was|were|is|been|got|unfortunately|ist|wurde|war|leider|konnte|von|der|ihrer|deiner|bank"
+_DECLINE = (r"failed|declined|unsuccessful|refused|rejected|denied|not successful|not authori[sz]ed|not accepted|"
+            r"could not be (?:processed|completed|authori[sz]ed|charged)|fehlgeschlagen|abgelehnt|gescheitert|"
+            r"nicht erfolgreich|nicht autorisiert|nicht akzeptiert|nicht möglich|nicht durchgeführt|nicht verarbeitet")
+DECLINED_SRC = (
+    rf"(?<!%L%)(?:(?:{_PAID})(?:\s+(?:{_DECLINE_FILL})){{0,4}}\s+(?:{_DECLINE})|"
+    r"(?:failed|declined|unsuccessful|rejected|refused)\s+(?:card\s+)?(?:payment|transaction|order|purchase)|"
+    r"(?:unable to|could not|couldn['’]t|cannot|can['’]t)\s+(?:process|complete|authori[sz]e|charge)\s+"
+    r"(?:your\s+|the\s+)?(?:payment|card|order|transaction|purchase)|"
+    r"(?:fehlgeschlagene|abgelehnte)\s+(?:zahlung|kartenzahlung|transaktion))(?!%L%)")
+# The payment still on its way (a bank app to approve, a wait): never pay_again, whatever else the page shows.
+# "noch nicht", "not yet", "still" count only beside a payment or order word in the same sentence ("Noch nicht
+# registriert?" on a checkout is no pending payment).
+PENDING_SRC = (
+    r"(?<!%L%)(?:bitte warten|please wait|do not close|don['’]t close|nicht schließen|"
+    r"schließen sie (?:diese|das|dieses) (?:seite|fenster) nicht|in bearbeitung|"
+    r"wird (?:noch )?(?:bearbeitet|verarbeitet|geprüft)|being processed|ausstehend|pending|awaiting|"
+    rf"(?:{_NOUN})(?!%L%)[^.!?]{{0,80}}?(?<!%L%)(?:yet|still|noch nicht)|"
+    rf"(?:not yet|noch nicht|still)(?!%L%)[^.!?]{{0,80}}?(?<!%L%)(?:{_NOUN})|"
+    r"(?:approve|confirm|authori[sz]e|bestätig%L%*|freigeb%L%*)[^.!?]{0,80}?(?<!%L%)app|"
+    r"app(?!%L%)[^.!?]{0,80}?(?<!%L%)(?:approve|confirm|authori[sz]e|bestätig|freigeb))(?!%L%)")
 
 
 def _py(src: str) -> re.Pattern:
@@ -92,12 +119,15 @@ def _py(src: str) -> re.Pattern:
 ORDER = _py(ORDER_SRC)
 STRONG = _py(STRONG_SRC)
 FAILURE = _py(FAILURE_SRC)
+DECLINED = _py(DECLINED_SRC)
+PENDING = _py(PENDING_SRC)
 
 # Runs in a fresh isolated world of the candidate document: the title and every visible text node (open shadow roots
 # included; form controls, editable regions, frames, scripts and hidden subtrees skipped, as in the snapshot) up to
-# far larger bounds than the snapshot's excerpt. Only two booleans leave the page.
+# far larger bounds than the snapshot's excerpt. Only booleans (``SCAN_KEYS``) leave the page.
 SCAN_JS = r"""(() => {
-  const ORDER = new RegExp(%ORDER%, 'iu'), FAILURE = new RegExp(%FAILURE%, 'iu'), STRONG = new RegExp(%STRONG%, 'iu');
+  const ORDER = new RegExp(%ORDER%, 'iu'), FAILURE = new RegExp(%FAILURE%, 'iu'), STRONG = new RegExp(%STRONG%, 'iu'),
+    DECLINED = new RegExp(%DECLINED%, 'iu'), PENDING = new RegExp(%PENDING%, 'iu');
   const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'INPUT', 'TEXTAREA', 'SELECT', 'OPTION',
     'OPTGROUP', 'DATALIST', 'IFRAME', 'FRAME', 'FRAMESET', 'OBJECT', 'EMBED', 'CANVAS']);
   const shown = (el) => { const s = getComputedStyle(el); return !s || (s.display !== 'none' && s.visibility !== 'hidden'); };
@@ -122,10 +152,13 @@ SCAN_JS = r"""(() => {
   const root = document.body || document.documentElement;
   if (root) walk(root, 0);
   const text = out.join(' ').replace(/\s+/g, ' ');
-  return {order: ORDER.test(text), failure: FAILURE.test(text), strong: STRONG.test(text)};
-})()""".replace("%ORDER%", json.dumps(ORDER_SRC.replace("%L%", r"[\p{L}\p{N}]"))).replace(
-    "%FAILURE%", json.dumps(FAILURE_SRC.replace("%L%", r"[\p{L}\p{N}]"))).replace(
-    "%STRONG%", json.dumps(STRONG_SRC.replace("%L%", r"[\p{L}\p{N}]")))
+  return {order: ORDER.test(text), failure: FAILURE.test(text), strong: STRONG.test(text),
+          declined: DECLINED.test(text), pending: PENDING.test(text)};
+})()"""
+for _name, _src in (("ORDER", ORDER_SRC), ("FAILURE", FAILURE_SRC), ("STRONG", STRONG_SRC), ("DECLINED", DECLINED_SRC),
+                    ("PENDING", PENDING_SRC)):
+    SCAN_JS = SCAN_JS.replace(f"%{_name}%", json.dumps(_src.replace("%L%", r"[\p{L}\p{N}]")))
+SCAN_KEYS = frozenset(("order", "failure", "strong", "declined", "pending"))
 
 # On the pressed Pay element (resolved by its backendNodeId): still connected and rendered.
 _SHOWN = r"""function(){ if (!this.isConnected) return false; const r = this.getBoundingClientRect();
@@ -137,11 +170,12 @@ def wording(title: str, text: str) -> dict:
     """The scan's answer for a title and text (the page script's regexes, in Python): tests and fakes."""
     joined = " ".join(f"{title} {text}".split())
     return {"order": bool(ORDER.search(joined)), "failure": bool(FAILURE.search(joined)),
-            "strong": bool(STRONG.search(joined))}
+            "strong": bool(STRONG.search(joined)), "declined": bool(DECLINED.search(joined)),
+            "pending": bool(PENDING.search(joined))}
 
 
 async def _scan(sup: Any, sid: str, frame_id: str) -> Optional[dict]:
-    """``{"order", "failure", "strong": bool}`` from ``SCAN_JS``, or None when it is not exactly that (unread)."""
+    """``SCAN_KEYS`` booleans from ``SCAN_JS``, or None when it is not exactly that (unread)."""
     try:
         ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": frame_id, "worldName": "hermes-payment-done"},
                               session_id=sid))["result"]["executionContextId"]
@@ -151,7 +185,7 @@ async def _scan(sup: Any, sid: str, frame_id: str) -> Optional[dict]:
         logger.info("payment_done: order wording not read (%s)", type(exc).__name__)
         return None
     value = (reply.get("result") or {}).get("value") if not reply.get("exceptionDetails") else None
-    if not (isinstance(value, dict) and set(value) == {"order", "failure", "strong"}
+    if not (isinstance(value, dict) and set(value) == SCAN_KEYS
             and all(type(v) is bool for v in value.values())):
         return None
     return value
@@ -193,8 +227,8 @@ async def _purchase_button_listed(sup: Any, sid: str, row: tuple) -> bool:
 
 
 async def scan_document(sup: Any, sid: str, row: tuple) -> Optional[dict]:
-    """The value-free wording scan of the document ``row`` (``(frame id, loader, ...)``): ``{"order", "failure",
-    "strong"}`` booleans, or None (unread)."""
+    """The value-free wording scan of the document ``row`` (``(frame id, loader, ...)``): ``SCAN_KEYS`` booleans, or
+    None (unread)."""
     return await _scan(sup, sid, row[0])
 
 

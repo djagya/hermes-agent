@@ -434,12 +434,14 @@ _NOT_REACHED = ("No order confirmation was reached on the payment tab within the
                 "button), not_shop_page (a payment provider, bank (3-D Secure) or other site's page, or a card "
                 "form), loading (a page still loading or changing), page_unread (the page could not be read). "
                 "The browser stays locked; nothing was clicked, closed or retried. pay_again true: the page shows the "
-                "payment failed or a field was flagged, with the pressed Pay control still there and no order "
-                "wording. "
+                "payment was declined or a field was flagged, with the pressed Pay control still there and no order "
+                "or pending wording. "
                 + again.AGAIN_RULE + " "
                 "url shows the site the tab is on (origin only while locked). If a bank check is waiting, ask the "
                 "user to finish it, then call payment_done again; otherwise ")
 _NOT_REACHED_ASK = "ask the user (payment_close closes the payment tab and ends the lock, without a confirmation snapshot)."
+_NOT_REACHED_AGAIN = ("pay_again is true: you may press that Pay control once more (after fixing a flagged field), "
+                      "then read the page.")
 _TAB_GONE = ("The payment tab is no longer open, so there is no confirmation page to read. Nothing was done. "
              "lock_released says whether browser control has unlocked the browser; check the order with the "
              "shop or the user's email.")
@@ -942,6 +944,8 @@ def payment_dialog(supervisor: Any, dialog_id: Any, accept: Any) -> dict:
     if accept and awaits_approval(supervisor):  # D-0878: a shop's confirm may place the order: a fresh approval first
         return _refusal("payment_dialog_returned", "Nothing was done (it may place the order); dismiss it (accept "
                                                    "false). " + RETURNED_NEXT)
+    if accept:  # D-1209 a: it may place the order like a Pay press: a stored pay_again is spent before it goes out
+        again.accepted(supervisor)
     try:
         out = supervisor.respond_to_dialog("accept" if accept else "dismiss", dialog_id=dialog.id)
     except Exception as exc:  # health: allow BLE001 -- CDP text can quote the page; fixed type only
@@ -972,7 +976,7 @@ def _other_tab(supervisor: Any, payment: _Payment, expected: str, previous: Opti
 
 def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     """``browser_vault action=payment_done``: see the module docstring."""
-    again.clear(supervisor)  # D-1209 a: the stored pay_again is this call's answer (none until its not-reached exit)
+    call = again.clear(supervisor)  # D-1209 a: the stored pay_again is the latest call's answer (none until its exit)
     loop = getattr(supervisor, "_loop", None)
     if loop is None or not loop.is_running():
         return _refusal("supervisor_required", "The supervised browser is not attached; nothing was done.")
@@ -1030,10 +1034,12 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
         # The tab is still locked: like browser-control for every agent connection, report its site only
         # (a locked page's title and path could carry what a planted script copied there).
         # D-1209 a: pay_again only from the last look itself (a failed or late look gives none)
+        pay_again = again.grant(supervisor, info.get("pay_again"), call)
         return _refusal("payment_confirmation_not_reached",  # D-0961: after a return (no order, no Pay press since) not the owner; D-0984 a: after a press, ask
-                        _NOT_REACHED + (RETURNED_REFILL if way_out(supervisor, "") else _NOT_REACHED_ASK),
+                        _NOT_REACHED + (_NOT_REACHED_AGAIN if pay_again else RETURNED_REFILL if way_out(supervisor, "")
+                                        else _NOT_REACHED_ASK),
                         url=_shown_origin(seen.get("url", "")), title="", reason=reason, lock_released=False,
-                        pay_again=again.grant(supervisor, info.get("pay_again")), **told,
+                        pay_again=pay_again, **told,
                         **_dialog_report(supervisor))
     settle(supervisor)  # D-0878: the purchase is finished; the task's next lock is no returned one
     context = page.pop("browser_context", None)
