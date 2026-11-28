@@ -49,7 +49,7 @@ from tools.browser_payment_card_values import (
     register_dialog_card_values,
     slot_of,
 )
-from tools.browser_payment_again import AGAIN_RULE
+from tools import browser_payment_again as again
 from tools.browser_payment_order_evidence import order_evidence
 # parse_lock_status is re-exported: the one lock-state reader lives in browser_payment_surface.
 from tools.browser_payment_surface import _wait, lock_status, parse_lock_status, pay_press
@@ -436,7 +436,7 @@ _NOT_REACHED = ("No order confirmation was reached on the payment tab within the
                 "The browser stays locked; nothing was clicked, closed or retried. pay_again true: the page shows the "
                 "payment failed or a field was flagged, with the pressed Pay control still there and no order "
                 "wording. "
-                + AGAIN_RULE + " "
+                + again.AGAIN_RULE + " "
                 "url shows the site the tab is on (origin only while locked). If a bank check is waiting, ask the "
                 "user to finish it, then call payment_done again; otherwise ")
 _NOT_REACHED_ASK = "ask the user (payment_close closes the payment tab and ends the lock, without a confirmation snapshot)."
@@ -544,7 +544,6 @@ async def _probe(sup: Any, payment: _Payment, expected: str, previous: Optional[
     """One look at the payment tab (or ``target``: a tab where the payment detection saw the confirmation):
     ``(state, info, key)`` with state ``gone`` | ``wait`` | ``settling`` (safe, first sighting of document ``key``) |
     ``ready`` (safe twice in a row, snapshot taken and the tree unchanged after it)."""
-    from tools import browser_payment_again as again
     from tools.browser_payment_detect import detected
 
     async def retry() -> dict:  # D-1209 a: whether the page asks for the same Pay press again (pay_again)
@@ -973,6 +972,7 @@ def _other_tab(supervisor: Any, payment: _Payment, expected: str, previous: Opti
 
 def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     """``browser_vault action=payment_done``: see the module docstring."""
+    again.clear(supervisor)  # D-1209 a: the stored pay_again is this call's answer (none until its not-reached exit)
     loop = getattr(supervisor, "_loop", None)
     if loop is None or not loop.is_running():
         return _refusal("supervisor_required", "The supervised browser is not attached; nothing was done.")
@@ -1029,13 +1029,11 @@ def payment_done(supervisor: Any, expected_origin: str = "") -> dict:
     if page is None:
         # The tab is still locked: like browser-control for every agent connection, report its site only
         # (a locked page's title and path could carry what a planted script copied there).
-        from tools.browser_payment_again import grant
-
         # D-1209 a: pay_again only from the last look itself (a failed or late look gives none)
         return _refusal("payment_confirmation_not_reached",  # D-0961: after a return (no order, no Pay press since) not the owner; D-0984 a: after a press, ask
                         _NOT_REACHED + (RETURNED_REFILL if way_out(supervisor, "") else _NOT_REACHED_ASK),
                         url=_shown_origin(seen.get("url", "")), title="", reason=reason, lock_released=False,
-                        pay_again=grant(supervisor, info.get("pay_again")), **told,
+                        pay_again=again.grant(supervisor, info.get("pay_again")), **told,
                         **_dialog_report(supervisor))
     settle(supervisor)  # D-0878: the purchase is finished; the task's next lock is no returned one
     context = page.pop("browser_context", None)

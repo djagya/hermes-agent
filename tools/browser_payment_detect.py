@@ -35,7 +35,7 @@ logger = logging.getLogger("tools.browser_payment_surface")
 
 _INFLIGHT_S = 45.0  # the longest a Pay-like press's navigation holds the next Pay-like press back (build G2: 45 s)
 _BEFORE_SCAN_S = 6.0  # the longest the look before a Pay-like press may take (unread: the press goes on)
-_FLAGS_S = 2.0  # D-1209 a: the page-flags read after that look (unread: no pay_again later)
+_FLAGS_S = 2.0  # D-1209 a: the rest of the again look after that look (unread: no pay_again later)
 _MAX_NEW_TABS = 2
 
 SPENT = "payment_already_made"
@@ -241,14 +241,15 @@ async def after_press(sup: Any, gate: Any, page_sid: str, before: Optional[froze
     return bool(found) and _spend(sup, gate, found, caption)
 
 
-async def before_press(sup: Any, gate: Any, page_sid: str, deadline: float) -> tuple:
+async def before_press(sup: Any, gate: Any, page_sid: str, deadline: float, node: Any = None) -> tuple:
     """``(refusal or None, kept or None)`` right before a Pay-like press. ``kept``: the booleans of the top document
     now (``_scan_top``'s ``mine``), kept with the press: the document after it is judged against them. For a press
     that follows another one in this approval: the last one's navigation still loading (``payment_in_flight``), or
     order evidence shown now (spent: ``payment_already_made``), judged against the last press's booleans. Unread:
-    the press goes on (its total was read). D-1209 a: only then, on its own bound, ``signal`` (failure wording or a
-    flagged field, ``browser_payment_again``; None: unread, no pay_again later) joins ``kept``."""
-    from tools.browser_payment_again import signal
+    the press goes on (its total was read). D-1209 a: only then, on its own bound, the rest of
+    ``browser_payment_again.look`` (the page flags, the element ``node`` about to be pressed, the tabs) joins ``kept``
+    (unread: no pay_again, and the same control refused)."""
+    from tools.browser_payment_again import look
 
     gen = gate.gen
     later = gen is not None and gen.pay_at is not None
@@ -272,7 +273,11 @@ async def before_press(sup: Any, gate: Any, page_sid: str, deadline: float) -> t
     if found and _spend(sup, gate, found, gen.pay_caption):
         return spent_refusal(gen), None
     if mine is not None and mine["strong"] is not None:  # the evidence was judged first; a slow read never hides it
-        mine["signal"] = await signal(sup, page_sid, mine["doc"][0], mine["failure"], min(_FLAGS_S, budget()))
+        backend = node[2] if node and tuple(node[:2]) == mine["doc"] else None
+        try:
+            mine = await asyncio.wait_for(look(sup, page_sid, mine, backend), timeout=min(_FLAGS_S, budget()))
+        except Exception as exc:  # health: allow BLE001 -- unread: no pay_again later, the same control refused
+            logger.info("payment_click: page flags before the press not read (%s)", type(exc).__name__)
     return None, mine
 
 
