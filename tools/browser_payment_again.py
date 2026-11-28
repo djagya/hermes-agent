@@ -1,26 +1,23 @@
 """D-1209 a (2026-11-27): a second press on the same Pay control is Hermes' decision, not prose.
 
-Every Pay-like press booked in a lock record (``browser_payment_surface._book_press``) is kept here by identity: its
+Every Pay-like press booked in a lock record (``browser_payment_surface._book_press``) is kept by identity: its
 document (frame id, loader), its element (backendNodeId) and its redacted caption. A Pay-like press on a control
 already pressed in this record (the same document and the same element or the same caption) is refused
-(``payment_same_control``, nothing pressed) unless the last payment_done answered ``pay_again: true`` for the latest
-Pay-like press, no Pay-like press was booked since, and ``allows`` holds on the look right before this press. A
-different control, or the same place on a new document (a new loader), is the checkout's next step and is not held.
+(``payment_same_control``, nothing pressed) unless the last payment_done said ``pay_again: true`` for the latest
+Pay-like press and ``allows`` holds on the look right before this press. Another control, or the same place on a new
+document (a new loader), is the checkout's next step and is not held.
 
-One rule (``allows``) judges one look (``look``) at both moments: payment_done's last look before its
-``payment_confirmation_not_reached`` answer, and the look right before the press. It holds when the top document is
-the pressed one, it shows no strong order wording (a thank-you sentence, an order number) and no order wording at
-all, it is not busy (``readyState``, ``aria-busy``), the pressed element (read by backendNodeId) is connected,
-rendered and enabled, and no page target exists that was not there right before the latest Pay-like press (and none a
-payment tab opened); plus failure wording or a field flagged invalid (``aria-invalid``, ``:user-invalid``) at
-payment_done. At the press an answer given on failure wording needs it still showing; one given on a flagged field
-alone survives the field being fixed (D-0961).
+One rule (``allows``) judges one look (``look``) at both moments, payment_done's last look and the look right before
+the press: the pressed top document, no order wording (strong or not), not busy (``readyState``, ``aria-busy``), the
+pressed element connected, rendered and enabled, no page target new since the latest Pay-like press or opened by a
+payment tab; at payment_done failure wording or a field flagged invalid (``aria-invalid``, ``:user-invalid``). At the
+press an answer given on failure wording needs it still showing; one given on a flag alone does not (D-0961).
 
-payment_done drops the stored answer when it starts and stores one only at its not-reached exit, from its own last
-look, when also: no order was detected in this lock (``paid``), no tab a press opened was recorded, the latest press's
-answer came back (not ``payment_click_uncertain``), this process saw the whole lock (``known``), the page showed
-neither failure wording nor a flag right before that press, nothing is loading, and the tree is the same after the
-reads. Any other exit, a failed, slow or late read, gives none. Only booleans leave the page.
+payment_done drops the stored answer when it starts and stores one only at its not-reached exit (``grant``), from its
+own last look, when also: no order detected (``paid``) and no tab a press opened in this lock, the latest press
+answered (not ``payment_click_uncertain``) and seen whole by this process (``known``), neither failure wording nor a
+flag right before that press, nothing loading, the tree the same after the reads. A failed, slow or late read gives
+none. Only booleans leave the page.
 """
 
 from __future__ import annotations
@@ -56,11 +53,10 @@ _PRESSABLE = r"""function(){ if (!this.isConnected || this.disabled === true
 
 
 class Presses:
-    """A lock record's Pay-like presses (``_LockGen.again``), read and written under ``_LOCK``. ``keys``: ``(frame
-    id, loader, backendNodeId or None, caption)`` of each, the latest last; ``tabs``: the page targets right before
-    the latest one (``look``'s; None: unread); ``answered``: its answer came back; ``granted``: the key the last
-    payment_done found ``pay_again`` for (dropped by the next payment_done or Pay-like press); ``wording``: that
-    answer came from failure wording, not only from a flagged field."""
+    """A lock record's Pay-like presses (``_LockGen.again``), under ``_LOCK``. ``keys``: ``(frame id, loader,
+    backendNodeId or None, caption)`` of each, the latest last; ``tabs``: the look's tabs right before the latest one;
+    ``answered``: its answer came back; ``granted``, ``wording``: the last payment_done's ``pay_again`` (its key) and
+    whether it came from failure wording."""
 
     __slots__ = ("answered", "granted", "keys", "tabs", "wording")
 
@@ -99,23 +95,35 @@ def allows(seen: Optional[dict], doc: tuple, tabs: Optional[frozenset], wording:
 
 
 async def look(sup: Any, sid: str, seen: dict, backend: Any) -> dict:
-    """``seen`` (``{"doc": (frame id, loader)}`` and the wording scan's ``strong``, ``order``, ``failure``) with what
-    ``allows`` reads next on that document: ``FLAGS_JS``'s ``invalid`` and ``busy``, ``pressable`` (element
-    ``backend``) and ``tabs`` (``_tabs``). Nothing more is read when the scan is unread (``strong`` None) or the flags
-    are; a part unread stays out or None (``allows``: False)."""
+    """``seen`` (``doc``: frame id, loader; the wording scan's ``strong``, ``order``, ``failure``) with ``FLAGS_JS``'s
+    ``invalid`` and ``busy``, ``pressable`` (element ``backend``) and ``tabs`` (the page targets; None when a payment
+    tab opened one). Nothing is added after an unread scan (``strong`` None) or read (``allows``: False)."""
+    from tools.browser_payment_done import payment_tabs
     from tools.browser_payment_order_evidence import _pay_control_shown
 
-    if seen.get("strong") is None or (found := await flags(sup, sid, seen["doc"][0])) is None:
+    if seen.get("strong") is None:
         return seen
-    pressable = (await _pay_control_shown(sup, sid, seen["doc"][0], backend, fn=_PRESSABLE)
-                 if type(backend) is int else None)
-    return {**seen, **found, "pressable": pressable, "tabs": await _tabs(sup)}
+    try:
+        ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": seen["doc"][0], "worldName": "hermes-payment-done"},
+                              session_id=sid))["result"]["executionContextId"]
+        reply = (await sup._cdp("Runtime.evaluate", {"expression": FLAGS_JS, "contextId": ctx, "returnByValue": True},
+                                session_id=sid, timeout=10))["result"]
+        found = (reply.get("result") or {}).get("value") if not reply.get("exceptionDetails") else None
+        if not (isinstance(found, dict) and set(found) == {"invalid", "busy"} and all(type(v) is bool for v in found.values())):
+            return seen
+        pressable = await _pay_control_shown(sup, sid, seen["doc"][0], backend, fn=_PRESSABLE) if type(backend) is int else None
+        pages = [t for t in (await sup._cdp("Target.getTargets"))["result"]["targetInfos"]
+                 if isinstance(t, dict) and t.get("type") == "page"]
+    except Exception as exc:  # health: allow BLE001 -- unread: no pay_again, the same control refused (fails closed)
+        logger.info("payment: page flags or tabs not read (%s)", type(exc).__name__)
+        return seen
+    opened = any(t.get("openerId") in payment_tabs(sup) for t in pages)
+    return {**seen, **found, "pressable": pressable, "tabs": None if opened else frozenset(t.get("targetId") for t in pages)}
 
 
 def refusal(gen: Any, node: Any, caption: str, seen: Optional[dict]) -> Optional[dict]:
-    """``payment_same_control`` for a Pay-like press on a control already pressed in ``gen``, else None: the stored
-    ``pay_again`` is for this control and ``allows`` holds on ``seen`` (the look right before this press). Must hold
-    ``browser_payment_surface._LOCK``."""
+    """``payment_same_control`` for a Pay-like press on a control already pressed in ``gen`` unless the stored
+    ``pay_again`` is for it and ``allows`` holds on ``seen`` (the look right before this press). Must hold ``_LOCK``."""
     presses, key = gen.again, _key(node, caption)
     if presses is None or not any(_same(k, key) for k in presses.keys):
         return None
@@ -142,13 +150,10 @@ def _eligible(gen: Any, row: tuple) -> Optional[tuple]:
     """``(key, pay_presses)`` when the lock record allows a ``pay_again`` on top document ``row`` at all (module
     docstring, last paragraph), else None. Must hold ``_LOCK``."""
     presses, base = gen.again, gen.pay_base or {}
-    if presses is None or not presses.keys or not presses.answered or presses.tabs is None:
-        return None
-    last = presses.keys[-1]
-    if not gen.known or gen.paid or gen.pay_tabs or last[:2] != tuple(row[:2]) or last[2] is None:
-        return None
-    if tuple(base.get("doc") or ()) != tuple(row[:2]) or base.get("failure") is not False \
-            or base.get("invalid") is not False:
+    last = presses.keys[-1] if presses is not None and presses.keys else None
+    if (last is None or not presses.answered or presses.tabs is None or not gen.known or gen.paid or gen.pay_tabs
+            or last[2] is None or not last[:2] == tuple(base.get("doc") or ()) == tuple(row[:2])
+            or base.get("failure") is not False or base.get("invalid") is not False):
         return None
     return last, gen.pay_presses
 
@@ -157,36 +162,6 @@ def _record(sup: Any) -> Any:
     from tools import browser_payment_surface as surface
 
     return surface._GENS.get(sup) if sup in surface._HELD else None
-
-
-async def flags(sup: Any, sid: str, frame_id: str) -> Optional[dict]:
-    """``{"invalid", "busy": bool}`` from ``FLAGS_JS`` in a fresh isolated world of ``frame_id``, or None (unread)."""
-    try:
-        ctx = (await sup._cdp("Page.createIsolatedWorld", {"frameId": frame_id, "worldName": "hermes-payment-done"},
-                              session_id=sid))["result"]["executionContextId"]
-        reply = (await sup._cdp("Runtime.evaluate", {"expression": FLAGS_JS, "contextId": ctx, "returnByValue": True},
-                                session_id=sid, timeout=10))["result"]
-    except Exception as exc:  # health: allow BLE001 -- unread: no pay_again (fails closed)
-        logger.info("payment: page flags not read (%s)", type(exc).__name__)
-        return None
-    value = (reply.get("result") or {}).get("value") if not reply.get("exceptionDetails") else None
-    if not (isinstance(value, dict) and set(value) == {"invalid", "busy"} and all(type(v) is bool for v in value.values())):
-        return None
-    return value
-
-
-async def _tabs(sup: Any) -> Optional[frozenset]:
-    """The page targets now; None when unread or when a payment tab opened one (a bank's or a confirmation tab)."""
-    from tools.browser_payment_done import payment_tabs
-
-    try:
-        infos = (await sup._cdp("Target.getTargets"))["result"]["targetInfos"]
-    except Exception as exc:  # health: allow BLE001 -- unread: no pay_again (fails closed)
-        logger.info("payment: tabs not read (%s)", type(exc).__name__)
-        return None
-    pages = [t for t in infos if isinstance(t, dict) and t.get("type") == "page"]
-    opener = payment_tabs(sup)
-    return None if any(t.get("openerId") in opener for t in pages) else frozenset(t.get("targetId") for t in pages)
 
 
 def clear(sup: Any) -> None:
@@ -221,19 +196,18 @@ async def probe(sup: Any, sid: str, tree: tuple, child_sessions: dict) -> dict:
 
 
 def grant(sup: Any, token: Any) -> bool:
-    """payment_done's not-reached exit: store its last look's ``pay_again`` (``probe``'s token) when it still holds
-    (the same record and latest Pay-like press, no press since, nothing loading), else store none. True when stored."""
+    """payment_done's not-reached exit: store ``probe``'s token when it still holds (the same record and latest
+    Pay-like press, no press since, nothing loading). True when stored."""
     from tools import browser_payment_surface as surface
     from tools.browser_payment_detect import inflight
 
     with surface._LOCK:
         gen = _record(sup)
-    ok = isinstance(token, tuple) and len(token) == 3 and gen is not None and not inflight(sup, gen)
+    if token is None or gen is None or inflight(sup, gen):
+        return False
     with surface._LOCK:
-        if gen is None or _record(sup) is not gen or gen.again is None:
+        if _record(sup) is not gen or _eligible(gen, token[0][:2]) != token[:2]:
             return False
-        ok = ok and _eligible(gen, token[0][:2]) == token[:2]
-        gen.again.granted, gen.again.wording = (token[0], token[2]) if ok else (None, False)
-    if ok:
-        logger.info("payment_done: pay_again for the latest Pay press")
-    return ok
+        gen.again.granted, gen.again.wording = token[0], token[2]
+    logger.info("payment_done: pay_again for the latest Pay press")
+    return True
