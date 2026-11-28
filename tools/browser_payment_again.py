@@ -33,9 +33,9 @@ logger = logging.getLogger("tools.browser_payment_surface")
 
 SAME_CONTROL = "payment_same_control"
 # The one sentence every text about a second Pay press says (payment_done, the tool description).
-AGAIN_RULE = ("After a Pay press, press a Pay or Buy control for the same order again (this one, another purchase "
-              "button, or the same one on a reloaded page) only when payment_done says pay_again: true; Hermes refuses "
-              "the same control on the same page otherwise (payment_same_control).")
+AGAIN_RULE = ("After a Pay press, do not press a control that submits the same order again (the same one, a second "
+              "purchase button, or the same one on a reloaded page) unless payment_done says pay_again: true; the "
+              "checkout's next step (a different control such as a confirm or buy step) is pressed as usual.")
 _SAME_CONTROL_TEXT = (
     "You already pressed this Pay control for this approval, so nothing was pressed. Call payment_done (before you "
     "change anything on the page): it says pay_again: true only when the page shows the payment was declined or a "
