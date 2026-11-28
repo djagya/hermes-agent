@@ -5,6 +5,7 @@ makes for ``pay_again``, and the press after it. Fake supervisor and fake CDP on
 
 import asyncio
 import random
+import threading
 
 import pytest
 
@@ -288,16 +289,115 @@ def test_the_existing_refusals_come_first():
     assert _pay(sup)["error_type"] == surface.TOTAL_CHANGED and len(_mouse_presses(sup)) == 1
 
 
-def test_an_unread_node_is_told_by_its_caption_and_never_gets_pay_again():
-    """The pressed element's node id could not be read: the same caption on the same document is the same control
-    (held), another caption is another control, and payment_done cannot check the element: no pay_again."""
+def test_an_unread_node_is_the_same_control_and_never_gets_pay_again():
+    """The pressed element's node id could not be read: payment_done cannot check the element (no pay_again), and
+    every later Pay-like press on that document is the same control (held), whatever its caption (fails closed)."""
     sup = _sunday()
     real = sup.answer
     sup.answer = lambda m, p, s=None: {} if m == "DOM.describeNode" else real(m, p, s)
     assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
     assert done.payment_done(sup)["pay_again"] is False
     assert _pay(sup)["error_type"] == SAME
-    assert _press(sup, "BESTÄTIGEN")["pay_pressed"] is True
+    assert _press(sup, "BESTÄTIGEN")["error_type"] == SAME and len(_mouse_presses(sup)) == 1
+
+
+RETRY = "JETZT KAUFEN (erneut)"
+
+
+@pytest.mark.parametrize("unread", ["first", "second"])
+@pytest.mark.parametrize("ask", [False, True], ids=["no payment_done", "payment_done"])
+def test_a_renamed_control_with_an_unread_id_on_either_press_is_held(unread, ask):
+    """Final review #1 (Kimi): the shop renames the pressed JETZT KAUFEN after a decline (the same element, 4001), and
+    the element id of one of the two presses was not read: the same document and an unread id is the same control,
+    held without pay_again, and with it too when the id at the press is unread (its element cannot be checked)."""
+    sup = _sunday()
+    real = sup.answer
+
+    def unread_id(m, p, s=None):
+        return {} if m == "DOM.describeNode" else real(m, p, s)
+
+    sup.answer = unread_id if unread == "first" else real
+    assert _pay(sup, after={"page": DECLINED, "rows": [_row("BESTÄTIGEN"), _row(RETRY, i=1)]})["pay_pressed"] is True
+    if ask:
+        assert done.payment_done(sup)["pay_again"] is (unread == "second")
+    sup.answer = unread_id if unread == "second" else real
+    presses = len(_mouse_presses(sup))
+    out = _press(sup, RETRY)
+    assert out["error_type"] == SAME and len(_mouse_presses(sup)) == presses, out
+
+
+# ------------------------------------------------------------------ final review #1: what the page says
+
+
+def _with(text, **after):
+    return {"page": {**CART, "text": f"{CART['text']} Noch nicht registriert? {text}"}, **after}
+
+
+@pytest.mark.parametrize("text, granted", [(t, True) for t in detect_tests.DECLINE_PHRASES]
+                         + [(t, False) for t in detect_tests.NOT_DECLINE_PHRASES + detect_tests.PENDING_PHRASES])
+def test_only_a_payment_decline_lets_the_same_pay_go_again(text, granted):
+    """The permission is its own narrow decline wording, not the wide failure veto: a bare "abgelehnt" or
+    "fehlgeschlagen", another feature's error, and a payment still pending (a bank app to approve, a wait) give no
+    pay_again, and the same JETZT KAUFEN is held; a real decline (EN, DE) gives one press."""
+    sup = _sunday()
+    assert _pay(sup, after=_with(text))["pay_pressed"] is True
+    out = done.payment_done(sup)
+    assert out["pay_again"] is granted, out
+    assert out["error"].endswith(done._NOT_REACHED_AGAIN) is granted  # never "ask the user" beside pay_again true
+    presses = len(_mouse_presses(sup))
+    out = _pay(sup)
+    assert (out.get("pay_pressed") is True, len(_mouse_presses(sup)) - presses) == (granted, int(granted)), out
+    assert granted or out["error_type"] == SAME
+
+
+@pytest.mark.parametrize("text", detect_tests.PENDING_PHRASES)
+def test_pending_wording_beside_a_flagged_field_gives_no_pay_again(text):
+    sup = _sunday()
+    assert _pay(sup, after=_with(text, invalid=True))["pay_pressed"] is True
+    assert done.payment_done(sup)["pay_again"] is False
+    assert _pay(sup)["error_type"] == SAME
+
+
+# ------------------------------------------------------------------ final review #1: two payment_done calls at once
+
+
+@pytest.mark.parametrize("answers, ends, pressed", [
+    (("yes", "no"), "BA", False),  # Kimi's probe: the older call ends last with its yes
+    (("yes", "no"), "AB", False),
+    (("no", "yes"), "AB", True),  # the newer call's yes, ending last, stands
+    (("no", "yes"), "BA", False),  # an older no ending last clears it (fails closed)
+], ids=["older-yes-ends-last", "newer-no-ends-last", "newer-yes-ends-last", "older-no-ends-last"])
+def test_overlapping_payment_done_calls_never_store_an_older_yes(monkeypatch, answers, ends, pressed):
+    """A started first, B second (each its own thread); each holds at its not-reached exit until released in the
+    order ``ends``. A yes is stored only from the payment_done started last; the same JETZT KAUFEN goes only then."""
+    sup = _sunday()
+    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
+    real = again.grant
+    at = {name: threading.Event() for name in "AB"}
+    go = {name: threading.Event() for name in "AB"}
+    said = {}
+
+    def grant(s, token, call):
+        name = threading.current_thread().name
+        at[name].set()
+        assert go[name].wait(5)
+        said[name] = real(s, token, call)
+        return said[name]
+
+    monkeypatch.setattr(again, "grant", grant)
+    threads = {name: threading.Thread(target=done.payment_done, args=(sup,), name=name) for name in "AB"}
+    for name, answer in zip("AB", answers):
+        sup.busy = answer == "no"  # a busy page gives no pay_again
+        threads[name].start()
+        assert at[name].wait(5)
+    sup.busy = False
+    for name in ends:
+        go[name].set()
+        threads[name].join(5)
+    assert said["A"] is False and said["B"] is (answers[1] == "yes")
+    presses = len(_mouse_presses(sup))
+    out = _pay(sup)
+    assert (out.get("pay_pressed") is True, len(_mouse_presses(sup)) - presses) == (pressed, int(pressed)), out
 
 
 # ------------------------------------------------------------------ r2: the evidence first, the grant checked at the press
@@ -333,6 +433,7 @@ def test_a_slow_flags_read_never_delays_the_detection_after_the_press(monkeypatc
 # ------------------------------------------------------------------ the generator: sequences against a model of the rule
 
 _FAILURE = " Zahlung fehlgeschlagen. Bitte versuche es erneut."
+_PENDING = " Bitte warten."
 _ORDER = {"weak": " Your payment is processed securely.", "strong": " Vielen Dank für Ihre Bestellung! Bestellnummer 4711."}
 AGB = "AGB akzeptieren"
 
@@ -343,16 +444,17 @@ class Rule:
     pay_again for that control and the page at the press still allows it. payment_done says pay_again only when the
     latest press's answer came back, the page showed neither failure wording nor a flagged field right before it,
     and now shows one of them, with no order wording, nothing busy, the control enabled and no tab a payment tab
-    opened. At the press a failure-wording answer needs the wording still there; a flag-only one does not."""
+    opened, nothing pending. At the press a failure-wording answer needs the wording still there; a flag-only one
+    does not. A confirm accepted after a Pay press spends a pay_again."""
 
     def __init__(self):
         self.page = {"failure": False, "invalid": False, "busy": False, "order": None, "pressable": True,
-                     "popup": False}
+                     "popup": False, "pending": False}
         self.pressed, self.latest, self.answered, self.before, self.grant = set(), None, False, None, None
 
     def _allows(self, wording):
         p = self.page
-        if p["order"] or p["busy"] or not p["pressable"] or p["popup"]:
+        if p["order"] or p["busy"] or not p["pressable"] or p["popup"] or p["pending"]:
             return False
         return p["failure"] or (p["invalid"] if wording is None else not wording)
 
@@ -371,10 +473,26 @@ class Rule:
         self.grant = self.page["failure"] if ok else None
         return ok
 
+    def accept(self):
+        self.grant = None
+        return True
+
+    def step(self, op):
+        """What the rule says for ``op`` (None for a page change or a fix)."""
+        if op[0] == "pay":
+            return self.press(*op[1:])
+        if op[0] == "done":
+            return self.done()
+        if op[0] == "accept":
+            return self.accept()
+        self.page.update(op[1] if op[0] == "page" else {"invalid": False})
+        return None
+
 
 def _shown(page):
     """The fake page for the rule's page."""
-    text = CART["text"] + (_FAILURE if page["failure"] else "") + _ORDER.get(page["order"], "")
+    text = (CART["text"] + (_FAILURE if page["failure"] else "") + _ORDER.get(page["order"], "")
+            + (_PENDING if page["pending"] else ""))
     return {"page": {**CART, "text": text}, **{k: page[k] for k in ("invalid", "busy", "pressable", "popup")}}
 
 
@@ -397,6 +515,9 @@ def _step(sup, rule, op):
         out = done.payment_done(sup)
         assert out["error_type"] == "payment_confirmation_not_reached", out
         return out["pay_again"], rule.done()
+    if op[0] == "accept":  # the shop's own confirm ("Bestellung abschicken?") after the Pay press, accepted
+        sup.dialogs = [done_tests._confirm("Bestellung für 22,66 EUR abschicken?", url=SHOP + "/checkout/")]
+        return done.payment_dialog(sup, "d-1", True).get("answered") == "accept", rule.accept()
     rule.page.update(op[1] if op[0] == "page" else {"invalid": False})
     if op[0] == "page":
         _show(sup, rule.page)
@@ -412,10 +533,10 @@ def _start():
 
 EFFECTS = [{"failure": True}, {"invalid": True}, {"busy": True}, {}, {"failure": True, "busy": True},
            {"failure": True, "invalid": True}, {"order": "weak", "failure": True}, {"order": "strong", "failure": True},
-           {"failure": True, "pressable": False}, {"failure": True, "popup": True}]
+           {"failure": True, "pressable": False}, {"failure": True, "popup": True}, {"failure": True, "pending": True}]
 CHANGES = [{"busy": True}, {"busy": False}, {"failure": False}, {"failure": True}, {"order": "weak"},
            {"order": "strong"}, {"order": None}, {"popup": True}, {"pressable": False}, {"pressable": True},
-           {"invalid": True}, {"failure": False, "invalid": True}]
+           {"invalid": True}, {"failure": False, "invalid": True}, {"pending": True}, {"pending": False}]
 JK = "JETZT KAUFEN"
 NAMED = {  # the cases a reviewer found (r3 middle review H1, approach review M1) and the owner's D-0961 flag case
     "false_after_true": (("pay", JK, {"failure": True}, False), ("done",), ("page", {"busy": True}), ("done",),
@@ -431,6 +552,13 @@ NAMED = {  # the cases a reviewer found (r3 middle review H1, approach review M1
     "popup_between_grant_and_press": (("pay", JK, {"failure": True}, False), ("done",), ("page", {"popup": True}),
                                       ("pay", JK, {}, False)),
     "popup_before_done": (("pay", JK, {"failure": True}, False), ("page", {"popup": True}), ("done",)),
+    # final review #1 (Kimi): an accepted confirm may place the order; a payment_done after it answers again
+    "dialog_accept": (("pay", JK, {"failure": True}, False), ("done",), ("accept",), ("pay", JK, {}, False)),
+    "dialog_accept_then_done": (("pay", JK, {"failure": True}, False), ("done",), ("accept",), ("done",),
+                                ("pay", JK, {}, False)),
+    "pending_at_the_press": (("pay", JK, {"failure": True}, False), ("done",), ("page", {"pending": True}),
+                             ("pay", JK, {}, False)),
+    "flag_with_pending": (("pay", JK, {"invalid": True, "pending": True}, False), ("done",), ("pay", JK, {}, False)),
 }
 
 
@@ -494,8 +622,7 @@ def _sites():
         rule, outcomes = Rule(), []
         for i, op in enumerate(ops):
             again_press = op[0] == "pay" and op[1] in rule.pressed
-            want = (rule.press(*op[1:]) if op[0] == "pay" else rule.done() if op[0] == "done"
-                    else rule.page.update(op[1] if op[0] == "page" else {"invalid": False}))
+            want = rule.step(op)
             outcomes.append((op, want, again_press))
             if op[0] == "done" and want is True:
                 sites["done"].append((ops[:i + 1], i))

@@ -689,8 +689,25 @@ def test_detail_safe_reads_every_card_frame_against_the_top(frames, safe):
 # ------------------------------------------------------------------ round 3 (owner corrections to round 2)
 
 
+_PICK = "function(i){return this[i]}"
+
+
+def element_id(sup, method, params):
+    """D-1209 a r6: each listed control (``sup.rows``) is its own element whose backendNodeId is read, told apart by
+    its caption, as on a real page (an unread id fails closed: the same control as any earlier press on its
+    document). None for any other call."""
+    if method == "Runtime.callFunctionOn" and params.get("functionDeclaration") == _PICK:
+        return {"result": {"objectId": f"el{params['arguments'][0]['value']}"}}
+    oid = str(params.get("objectId", ""))
+    if method == "DOM.describeNode" and oid[:2] == "el" and oid[2:].isdigit():
+        caption = next((r["text"] for r in sup.rows if r["i"] == int(oid[2:])), None)
+        ids = sup.__dict__.setdefault("element_ids", {})
+        return {"node": {"backendNodeId": ids.setdefault(caption, 6000 + len(ids))}} if caption else {}
+    return None
+
+
 class _RowsSup(FakeSup):
-    """A FakeSup whose listed controls are ``rows`` (change ``rows`` between listings)."""
+    """A FakeSup whose listed controls are ``rows`` (change ``rows`` between listings), each its own element."""
 
     def __init__(self, rows):
         super().__init__()
@@ -699,7 +716,7 @@ class _RowsSup(FakeSup):
     def default(self, method, params, session):
         if method == "Runtime.callFunctionOn" and params["functionDeclaration"] == surface._DESCRIBE:
             return {"result": {"value": self.rows}}
-        return super().default(method, params, session)
+        return element_id(self, method, params) or super().default(method, params, session)
 
 
 def _row(text, role="button", i=0):

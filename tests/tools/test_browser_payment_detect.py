@@ -15,7 +15,7 @@ from tools import browser_payment_order_evidence as evidence
 from tools import browser_payment_press_kind as kind
 from tools import browser_payment_surface as surface
 from tests.tools import test_browser_payment_done as done_tests
-from tests.tools.test_browser_payment_surface_honesty import _mouse_presses, _row
+from tests.tools.test_browser_payment_surface_honesty import _mouse_presses, _row, element_id
 from tools import browser_payment_detect as detect
 from tools.browser_supervisor_frames import FrameTrackingMixin
 
@@ -262,14 +262,50 @@ FAILURE_PHRASES = [
 ]
 
 
+# D-1209 a: the narrow decline wording that lets the same Pay control go again (``evidence.DECLINED``), and text the
+# wide FAILURE veto matches that must not (final review #1: bare words, other features' errors, a payment pending)
+DECLINE_PHRASES = [
+    "Payment failed. Please try again.", "Your card was declined.", "Your card has been declined. Please use another card.",
+    "The transaction was declined by your bank.", "Payment unsuccessful. Please try another payment method.",
+    "We were unable to process your payment. Please check your card details.", "Your payment could not be processed.",
+    "Zahlung fehlgeschlagen. Bitte versuche es erneut.", "Ihre Karte wurde abgelehnt. Bitte verwende eine andere Karte.",
+    "Die Zahlung war leider nicht erfolgreich.", "Ihre Zahlung konnte leider nicht durchgeführt werden.",
+    "Kartenzahlung abgelehnt.", "Die Zahlung wurde von der Bank abgelehnt.",
+    "Zahlung fehlgeschlagen, bitte versuche es noch einmal.",
+]
+NOT_DECLINE_PHRASES = [
+    "Bewertungen: Laden fehlgeschlagen", "Alle Cookies abgelehnt", "Gutschein abgelehnt", "Sie haben noch keine Bestellung",
+    "An error occurred while loading recommendations",
+]
+PENDING_PHRASES = [
+    "Your payment has not been confirmed yet. Please approve it in your banking app.",
+    "Die Zahlung wurde noch nicht bestätigt. Bitte bestätige sie in deiner Banking-App.",
+    "Bitte warten: deine Bestellung ist noch nicht abgeschlossen.", "Payment not completed yet, do not close this page.",
+    "Zahlung fehlgeschlagen. Bitte bestätige die Zahlung in deiner Banking-App.",
+]
+_THREE = ("order", "failure", "strong")
+
+
+def _three(found):
+    return {k: found[k] for k in _THREE}
+
+
+@pytest.mark.parametrize("text", DECLINE_PHRASES + NOT_DECLINE_PHRASES + PENDING_PHRASES)
+def test_only_a_payment_decline_with_nothing_pending_reads_as_declined(text):
+    """D-1209 a: FAILURE stays the wide veto (every row is failure wording), DECLINED is the narrow permission."""
+    found = evidence.wording("Zur Kasse", "Jetzt kaufen Noch nicht registriert? " + text)
+    assert found["failure"] is True or text in DECLINE_PHRASES  # the wide veto: each of the others granted before r6
+    assert (found["declined"] and not found["pending"]) is (text in DECLINE_PHRASES), found
+
+
 @pytest.mark.parametrize("text", ORDER_PHRASES)
 def test_order_phrases(text):
-    assert evidence.wording("", text) == {"order": True, "failure": False, "strong": text in STRONG_PHRASES}
+    assert _three(evidence.wording("", text)) == {"order": True, "failure": False, "strong": text in STRONG_PHRASES}
 
 
 @pytest.mark.parametrize("text", SERVICE_TEXT)
 def test_checkout_service_text_is_order_wording_but_never_strong(text):
-    assert evidence.wording("", text) == {"order": True, "failure": False, "strong": False}
+    assert _three(evidence.wording("", text)) == {"order": True, "failure": False, "strong": False}
 
 
 @pytest.mark.parametrize("text", NOT_ORDER)
@@ -300,7 +336,7 @@ def test_failure_phrases(text):
 ])
 def test_service_text_on_a_real_thank_you_page_is_no_failure(text):
     """F r3 (Opus final M2): ordinary service text is not failure wording; the order wording still counts."""
-    assert evidence.wording("", text) == {"order": True, "failure": False, "strong": True}
+    assert _three(evidence.wording("", text)) == {"order": True, "failure": False, "strong": True}
 
 
 _SCAN_DOM = r"""
@@ -310,6 +346,10 @@ const E = (tag, kids = [], o = {}) => Object.assign({nodeType: 1, tagName: tag, 
 const getComputedStyle = (el) => el.style;
 const scan = (title, kids) => { const document = {title, body: E('BODY', kids)}; return SCAN; };
 """
+
+
+ALL_PHRASES = (ORDER_PHRASES + SERVICE_TEXT + NOT_ORDER + FAILURE_PHRASES + DECLINE_PHRASES + NOT_DECLINE_PHRASES
+               + PENDING_PHRASES)
 
 
 def test_the_page_script_scans_all_visible_text_and_no_form_value():
@@ -324,13 +364,13 @@ def test_the_page_script_scans_all_visible_text_and_no_form_value():
     script = _SCAN_DOM.replace("SCAN", evidence.SCAN_JS) + "process.stdout.write(JSON.stringify({" + ", ".join(
         f"{json.dumps(k)}: scan('Sunday', {v})" for k, v in cases.items()) + "}));"
     out = _node(script)
-    assert out["past the excerpt"] == {"order": True, "failure": False, "strong": False}
+    assert _three(out["past the excerpt"]) == {"order": True, "failure": False, "strong": False}
     for key in ("in a textarea", "hidden", "editable"):
-        assert out[key] == {"order": False, "failure": False, "strong": False}, key
+        assert set(out[key].values()) == {False}, key
     assert out["failure"]["failure"] is True and out["accented"]["failure"] is True
     phrases = _node(_SCAN_DOM.replace("SCAN", evidence.SCAN_JS) + "process.stdout.write(JSON.stringify(" + json.dumps(
-        ORDER_PHRASES + SERVICE_TEXT + NOT_ORDER + FAILURE_PHRASES) + ".map(t => scan('', [E('P', [T(t)])]))));")
-    assert phrases == [evidence.wording("", t) for t in ORDER_PHRASES + SERVICE_TEXT + NOT_ORDER + FAILURE_PHRASES]
+        ALL_PHRASES) + ".map(t => scan('', [E('P', [T(t)])]))));")
+    assert phrases == [evidence.wording("", t) for t in ALL_PHRASES]  # the page script and Python agree
 
 
 # ------------------------------------------------------------------ G1: detect the payment, no press budget
@@ -366,7 +406,7 @@ class ShopSup(PaySup):
                 else:
                     setattr(self, key, value)
             self.after = {}
-        return super().answer(method, params, session_id)
+        return element_id(self, method, params) or super().answer(method, params, session_id)
 
 
 def _sunday():
