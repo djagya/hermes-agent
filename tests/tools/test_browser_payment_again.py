@@ -377,11 +377,11 @@ def test_overlapping_payment_done_calls_never_store_an_older_yes(monkeypatch, an
     go = {name: threading.Event() for name in "AB"}
     said = {}
 
-    def grant(s, token, call):
+    def grant(s, token, *call):
         name = threading.current_thread().name
         at[name].set()
         assert go[name].wait(5)
-        said[name] = real(s, token, call)
+        said[name] = real(s, token, *call)
         return said[name]
 
     monkeypatch.setattr(again, "grant", grant)
