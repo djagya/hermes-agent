@@ -189,15 +189,15 @@ def clear(sup: Any) -> Optional[tuple]:
 
 def accepted(sup: Any) -> None:
     """payment_dialog is about to accept a confirm on the shop's page: it may place the order as a Pay press does, so
-    it counts as one more press of the latest Pay-like control (the stored ``pay_again`` dropped; a payment_done
-    after it answers for it)."""
+    it counts as one more press of the latest Pay-like control (the stored ``pay_again`` dropped, and no new one until
+    a Pay press is answered again: the page's wording from before the accept says nothing about it)."""
     from tools import browser_payment_surface as surface
 
     with surface._LOCK:
         gen = _record(sup)
         if gen is not None and gen.again is not None and gen.again.keys:
             gen.again.keys.append(gen.again.keys[-1])
-            gen.again.granted = None
+            gen.again.granted, gen.again.answered = None, False
 
 
 async def probe(sup: Any, sid: str, tree: tuple, child_sessions: dict) -> dict:

@@ -445,7 +445,8 @@ class Rule:
     latest press's answer came back, the page showed neither failure wording nor a flagged field right before it,
     and now shows one of them, with no order wording, nothing busy, the control enabled and no tab a payment tab
     opened, nothing pending. At the press a failure-wording answer needs the wording still there; a flag-only one
-    does not. A confirm accepted after a Pay press spends a pay_again."""
+    does not. A confirm accepted after a Pay press spends a pay_again, and no payment_done grants until a Pay press
+    is answered again."""
 
     def __init__(self):
         self.page = {"failure": False, "invalid": False, "busy": False, "order": None, "pressable": True,
@@ -474,7 +475,7 @@ class Rule:
         return ok
 
     def accept(self):
-        self.grant = None
+        self.grant, self.answered = None, False
         return True
 
     def step(self, op):
@@ -612,6 +613,22 @@ def test_every_sequence_does_what_the_rule_says(_short, name):
             seen["again"] += again_press and got == "pressed"
             seen["held"] += got == SAME
     assert name != "generated" or min(seen.values()) >= 5, seen  # the generator reaches each outcome
+
+
+@pytest.mark.parametrize("done_before_accept", [True, False])
+def test_accepted_confirm_then_done_does_not_grant_on_the_old_decline(_short, done_before_accept):
+    """r6 middle review M1: after pay(declined) a confirm is accepted; the page text is still the decline from before
+    the accept, so payment_done must not say pay_again and the same Pay stays refused."""
+    sup = _sunday()
+    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
+    if done_before_accept:
+        assert done.payment_done(sup)["pay_again"] is True
+    sup.dialogs = [done_tests._confirm("Zahlung erneut versuchen?", url=SHOP + "/checkout/")]
+    assert done.payment_dialog(sup, "d-1", True).get("answered") == "accept"
+    assert done.payment_done(sup)["pay_again"] is False
+    before = len(_mouse_presses(sup))
+    assert _pay(sup).get("error_type") == again.SAME_CONTROL
+    assert len(_mouse_presses(sup)) == before
 
 
 def _sites():
