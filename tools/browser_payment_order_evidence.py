@@ -4,7 +4,7 @@
 
 - A separate value-free scan of the whole rendered text (title and visible text, no form control, editable region,
   frame or hidden subtree; not the bounded snapshot) answers booleans: order wording found, failure wording found (and
-  for ``browser_payment_again``: a payment decline, a payment still pending).
+  for ``browser_payment_again``'s veto: money taken, a payment still pending).
 - Failure or negation wording ("Zahlung fehlgeschlagen", "keine Bestellung aufgegeben", "payment declined") is never
   a confirmation, on any path.
 - The pressed Pay control itself (its document, ``backendNodeId`` resolving to a connected, rendered element) still
@@ -84,28 +84,10 @@ FAILURE_SRC = (
     r"échoué|échouée|échec|refusé|refusée|n['’]a pas abouti|fallido|fallida|"
     r"rechazado|rechazada|non\s+(?:è\s+)?(?:riuscito|riuscita|andato a buon fine)|rifiutato|rifiutata|mislukt|"
     r"geweigerd|niet gelukt)(?!%L%)")
-# D-1209 a: what lets the same Pay control go again (``browser_payment_again``). FAILURE above is a veto and wide on
-# purpose; this is a permission and narrow: a payment, card, order or transaction word next to a decline (EN, DE; no
-# bare "abgelehnt", no generic error: "Gutschein abgelehnt", "Alle Cookies abgelehnt", "Laden fehlgeschlagen"; a help
-# question ("What to do if your payment failed?") is not a decline).
-_PAID = (r"payment(?: method| authori[sz]ation)?|transaction|order|purchase|(?:your|the|credit|debit|bank) card|"
-         r"zahlung|bezahlung|kartenzahlung|zahlungsvorgang|bezahlvorgang|zahlungsversuch|zahlungsart|zahlungsmethode|"
-         r"transaktion|abbuchung|bestellung|(?:ihre|deine|die) karte|kreditkarte|debitkarte|bankkarte")
-_DECLINE_FILL = r"has|have|was|were|is|been|got|unfortunately|ist|wurde|war|leider|konnte|von|der|ihrer|deiner|bank"
-_DECLINE = (r"failed|declined|unsuccessful|refused|rejected|denied|not successful|not authori[sz]ed|not accepted|"
-            r"could not be (?:processed|completed|authori[sz]ed|charged)|fehlgeschlagen|abgelehnt|gescheitert|"
-            r"nicht erfolgreich|nicht autorisiert|nicht akzeptiert|nicht möglich|nicht durchgeführt|nicht verarbeitet")
-DECLINED_SRC = (
-    rf"(?<!%L%)(?:(?:{_PAID})(?:\s+(?:{_DECLINE_FILL})){{0,4}}\s+(?:{_DECLINE})|"
-    r"(?:failed|declined|unsuccessful|rejected|refused)\s+(?:card\s+)?(?:payment|transaction|order|purchase)|"
-    r"(?:unable to|could not|couldn['’]t|cannot|can['’]t)\s+(?:process|complete|authori[sz]e|charge)\s+"
-    r"(?:your\s+|the\s+)?(?:payment|card|order|transaction|purchase)|"
-    r"(?:fehlgeschlagene|abgelehnte)\s+(?:zahlung|kartenzahlung|transaktion)|"
-    r"(?:card|karte)\s+(?:was\s+|wurde\s+)?(?:declined|abgelehnt)|"
-    r"bank\s+declined\s+(?:your\s+|the\s+)?(?:payment|transaction|card|purchase|order)|"
-    r"3-?d[\s-]?secure(?:[\s-]+%L%+){0,2}?[\s-]+(?:failed|unsuccessful|fehlgeschlagen)|"
-    r"authentifizierung\s+(?:ist\s+|wurde\s+)?(?:fehlgeschlagen|abgelehnt)|"
-    r"insufficient\s+funds|nicht\s+genügend\s+deckung)(?!%L%)(?!\s*\?)")
+# D-1209 a (``browser_payment_again``): page text only ever vetoes a second press of the same Pay control. Money
+# taken, in any sentence ("Your card was charged, but saving ... failed", "Abbuchung erfolgt"): wide on purpose, a
+# word more only refuses more.
+TAKEN_SRC = (r"(?<!%L%)(?:charged|debited|captured|taken|went through|abgebucht|belastet|eingezogen|erfolgt)(?!%L%)")
 # The payment still on its way (a bank app to approve, a wait): never pay_again, whatever else the page shows.
 # "noch nicht", "not yet", "still" count only beside a payment or order word in the same sentence ("Noch nicht
 # registriert?" on a checkout is no pending payment).
@@ -129,7 +111,7 @@ def _py(src: str) -> re.Pattern:
 ORDER = _py(ORDER_SRC)
 STRONG = _py(STRONG_SRC)
 FAILURE = _py(FAILURE_SRC)
-DECLINED = _py(DECLINED_SRC)
+TAKEN = _py(TAKEN_SRC)
 PENDING = _py(PENDING_SRC)
 
 # Runs in a fresh isolated world of the candidate document: the title and every visible text node (open shadow roots
@@ -137,7 +119,7 @@ PENDING = _py(PENDING_SRC)
 # far larger bounds than the snapshot's excerpt. Only booleans (``SCAN_KEYS``) leave the page.
 SCAN_JS = r"""(() => {
   const ORDER = new RegExp(%ORDER%, 'iu'), FAILURE = new RegExp(%FAILURE%, 'iu'), STRONG = new RegExp(%STRONG%, 'iu'),
-    DECLINED = new RegExp(%DECLINED%, 'iu'), PENDING = new RegExp(%PENDING%, 'iu');
+    TAKEN = new RegExp(%TAKEN%, 'iu'), PENDING = new RegExp(%PENDING%, 'iu');
   const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'INPUT', 'TEXTAREA', 'SELECT', 'OPTION',
     'OPTGROUP', 'DATALIST', 'IFRAME', 'FRAME', 'FRAMESET', 'OBJECT', 'EMBED', 'CANVAS']);
   const shown = (el) => { const s = getComputedStyle(el); return !s || (s.display !== 'none' && s.visibility !== 'hidden'); };
@@ -163,12 +145,12 @@ SCAN_JS = r"""(() => {
   if (root) walk(root, 0);
   const text = out.join(' ').replace(/\s+/g, ' ');
   return {order: ORDER.test(text), failure: FAILURE.test(text), strong: STRONG.test(text),
-          declined: DECLINED.test(text), pending: PENDING.test(text)};
+          taken: TAKEN.test(text), pending: PENDING.test(text)};
 })()"""
-for _name, _src in (("ORDER", ORDER_SRC), ("FAILURE", FAILURE_SRC), ("STRONG", STRONG_SRC), ("DECLINED", DECLINED_SRC),
+for _name, _src in (("ORDER", ORDER_SRC), ("FAILURE", FAILURE_SRC), ("STRONG", STRONG_SRC), ("TAKEN", TAKEN_SRC),
                     ("PENDING", PENDING_SRC)):
     SCAN_JS = SCAN_JS.replace(f"%{_name}%", json.dumps(_src.replace("%L%", r"[\p{L}\p{N}]")))
-SCAN_KEYS = frozenset(("order", "failure", "strong", "declined", "pending"))
+SCAN_KEYS = frozenset(("order", "failure", "strong", "taken", "pending"))
 
 # On the pressed Pay element (resolved by its backendNodeId): still connected and rendered.
 _SHOWN = r"""function(){ if (!this.isConnected) return false; const r = this.getBoundingClientRect();
@@ -180,7 +162,7 @@ def wording(title: str, text: str) -> dict:
     """The scan's answer for a title and text (the page script's regexes, in Python): tests and fakes."""
     joined = " ".join(f"{title} {text}".split())
     return {"order": bool(ORDER.search(joined)), "failure": bool(FAILURE.search(joined)),
-            "strong": bool(STRONG.search(joined)), "declined": bool(DECLINED.search(joined)),
+            "strong": bool(STRONG.search(joined)), "taken": bool(TAKEN.search(joined)),
             "pending": bool(PENDING.search(joined))}
 
 

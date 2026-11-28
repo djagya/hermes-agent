@@ -117,7 +117,7 @@ async def _still_the_shop(sup: Any, gate: Any, sid: str, row: tuple) -> bool:
 async def _scan_top(sup: Any, gate: Any, page_sid: str, base: Optional[dict], judged: bool) -> tuple:
     """``(found or None, mine)``: the payment tab's top document read once. ``mine``: ``{"doc": (frame id, loader),
     "strong": bool or None}``, the booleans kept with a Pay-like press (None: not a shop page, or unread), and (D-1209
-    a, ``browser_payment_again``) ``order``, ``declined`` and ``pending`` (the wording scan's). ``found``
+    a, ``browser_payment_again``) ``order``, ``taken`` and ``pending`` (the wording scan's). ``found``
     (only when ``judged``): the evidence, judged against ``base`` (the earlier look at this document; None: none read,
     which a checkout-like document cannot be judged without)."""
     from tools import browser_payment_done as done
@@ -131,7 +131,7 @@ async def _scan_top(sup: Any, gate: Any, page_sid: str, base: Optional[dict], ju
     scan = await scan_document(sup, page_sid, top)
     if scan is None:
         return None, mine
-    mine.update(strong=scan["strong"], order=scan["order"], declined=scan["declined"], pending=scan["pending"])
+    mine.update(strong=scan["strong"], order=scan["order"], taken=scan["taken"], pending=scan["pending"])
     checkout = done.checkout_like_now(sup, top, pay_press(sup))
     if not judged or (checkout and base is None):
         return None, mine

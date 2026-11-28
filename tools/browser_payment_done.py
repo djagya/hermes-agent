@@ -433,15 +433,15 @@ _NOT_REACHED = ("No order confirmation was reached on the payment tab within the
                 "with no order wording), purchase_button_shown (a page at the checkout still offers a purchase "
                 "button), not_shop_page (a payment provider, bank (3-D Secure) or other site's page, or a card "
                 "form), loading (a page still loading or changing), page_unread (the page could not be read). "
-                "The browser stays locked; nothing was clicked, closed or retried. pay_again true: the page shows the "
-                "payment was declined or a field was flagged, with the pressed Pay control still there and no order "
+                "The browser stays locked; nothing was clicked, closed or retried. pay_again true: a field the form "
+                "flagged after the Pay press, with the pressed Pay control still there and no order, payment-taken "
                 "or pending wording. "
                 + again.AGAIN_RULE + " "
                 "url shows the site the tab is on (origin only while locked). If a bank check is waiting, ask the "
                 "user to finish it, then call payment_done again; otherwise ")
 _NOT_REACHED_ASK = "ask the user (payment_close closes the payment tab and ends the lock, without a confirmation snapshot)."
-_NOT_REACHED_AGAIN = ("pay_again is true: you may press that Pay control once more (after fixing a flagged field), "
-                      "then read the page.")
+_NOT_REACHED_AGAIN = ("pay_again is true: fix the flagged field, then you may press that Pay control once more and "
+                      "read the page.")
 _TAB_GONE = ("The payment tab is no longer open, so there is no confirmation page to read. Nothing was done. "
              "lock_released says whether browser control has unlocked the browser; check the order with the "
              "shop or the user's email.")

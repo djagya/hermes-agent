@@ -1599,7 +1599,7 @@ BROWSER_VAULT_SCHEMA = {
         "opens it in a "
         "new tab (new_tab; browser_exec stays on its own tab: switch_tab(new_tab) there) and closes the payment tab; lock_released true means browser control confirmed the "
         "unlock, false (with note) means it did not, so follow the note. payment_confirmation_not_reached: no "
-        "confirmation within the wait (url: the tab's site only; reason: what the tab showed last), the lock stays, nothing was clicked or closed; pay_again true: the page shows the payment was declined or a field was flagged, with the pressed Pay control still there and no order or pending wording; " + AGAIN_RULE + " "
+        "confirmation within the wait (url: the tab's site only; reason: what the tab showed last), the lock stays, nothing was clicked or closed; pay_again true: a field the form flagged after the Pay press, with the pressed Pay control still there and no order, payment-taken or pending wording; " + AGAIN_RULE + " "
         "follow the error (call payment_done again after the user finishes a bank check, or ask the user). "
         "fill_result_unverified: the page's answer to a fill could not be verified and a field may hold the "
         "password; do not submit or retry, tell the user."
