@@ -10,12 +10,12 @@ document (a new loader), is the checkout's next step and is not held. A confirm 
 one more press of the latest Pay control (``accepted``).
 
 Only a field the form flagged invalid (``aria-invalid``, ``:user-invalid``) after the press, not before it, gives
-``pay_again`` (D-1260, built as a); page text only ever vetoes. One rule of vetoes (``allows``) judges one look (``look``) at both
-moments, payment_done's last look and the look right before the press: the pressed top document, no order wording
-(strong or not), no money-taken wording (``TAKEN``: charged, abgebucht, erfolgt ...), no pending wording (``PENDING``:
-a bank app to approve, "bitte warten"), not busy (``readyState``, ``aria-busy``), the pressed element connected,
-rendered and enabled, no page target new since the latest Pay-like press or opened by a payment tab. At the press the
-flag need not show any more (Sera fixed the field, D-0961).
+``pay_again`` (D-1260, built as a); page text only ever vetoes. One rule of vetoes (``allows``) judges one look
+(``look``) at both moments, payment_done's last look and the look right before the press: the pressed top document, no
+order wording (strong or not), no money-taken wording (``TAKEN``: charged, abgebucht, erfolgt ...), no pending wording
+(``PENDING``: a bank app to approve, "bitte warten"), not busy (``readyState``, ``aria-busy``), the pressed element
+connected, rendered and enabled, no page target new since the latest Pay-like press or opened by a payment tab. At the
+press the flag need not show any more (Sera fixed the field, D-0961).
 
 payment_done drops the stored answer when it starts (``clear``, which numbers the call) and stores one only at its
 not-reached exit (``grant``), when no later payment_done started meanwhile, from its own last look, when also: no order
@@ -32,8 +32,8 @@ from typing import Any, Optional
 logger = logging.getLogger("tools.browser_payment_surface")
 
 SAME_CONTROL = "payment_same_control"
-# The one sentence every text about a second Pay press says (payment_done, the tool description). Hermes holds the
-# same control on the same page; a second purchase button or a reloaded page is the sentence's word only.
+# The one sentence every text about a second Pay press says (payment_done, the tool description). Hermes enforces its
+# first part only; a second purchase button and a reloaded page are advice.
 AGAIN_RULE = ("After a Pay press, the same Pay control on the same page goes again only after payment_done says "
               "pay_again: true (Hermes refuses it otherwise: payment_same_control); press a second purchase button or "
               "the same order's Pay on a reloaded page only when payment_done says pay_again: true; the checkout's next "
