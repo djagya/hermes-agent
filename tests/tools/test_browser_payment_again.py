@@ -5,6 +5,7 @@ whole input: every state Sera can see after a Pay press, each fault at each read
 and the press after it. Fake supervisor and fake CDP only; synthetic data."""
 
 import asyncio
+import json
 import random
 import threading
 
@@ -191,6 +192,10 @@ def _remounted(sup):  # quiet page; the shop re-renders its buttons: JETZT KAUFE
     sup.after = {"rows": [_row("JETZT KAUFEN")]}
 
 
+def _novalidate_press_only(sup):  # Chrome's :user-invalid on a novalidate form after the press (FLAGS_JS skips it)
+    sup.after = {"invalid": False}
+
+
 def _flagged_before(sup):
     sup.invalid = True  # the flag was on the page before this press (an earlier attempt's)
 
@@ -228,6 +233,7 @@ TABLE = [
     (_declined, True, False, SAME),  # page text alone never gives pay_again
     (_flagged, False, None, SAME),  # Sera presses again without asking payment_done
     (_flagged_money_taken, True, False, SAME),
+    (_novalidate_press_only, True, False, SAME),  # aria-invalid on a novalidate form still grants: _flagged
     (_slow_in_place, True, False, SAME),
     (_flagged_while_busy, True, False, SAME),
     (_quiet, True, False, SAME),
@@ -272,6 +278,37 @@ def test_the_same_pay_control_goes_again_only_after_pay_again(state, ask, pay_ag
         assert out["error_type"] == second and len(_mouse_presses(sup)) == presses, out
         if second == SAME:
             assert "payment_done" in out["error"]
+
+
+# ------------------------------------------------------------------ which flags count (FLAGS_JS, run by node)
+
+_DOM = """
+const form = (o) => ({noValidate: !!o.novalidate, querySelector: (q) => (o.formnovalidate && q === '[formnovalidate]' ? {} : null)});
+const field = (o) => ({form: o.form ? form(o.form) : null, getClientRects: () => (o.hidden ? [] : [1])});
+const run = (aria, user) => {
+  const document = {readyState: 'complete', querySelectorAll: (q) => (q === '[aria-invalid=true]' ? aria.map(field)
+    : q === ':user-invalid' ? user.map(field) : [])};
+  return FLAGS;
+};
+"""
+PLAIN, NOVALIDATE, BUTTON = {"form": {}}, {"form": {"novalidate": True}}, {"form": {"formnovalidate": True}}
+
+
+def _invalid(aria=(), user=()):
+    script = _DOM.replace("FLAGS", again.FLAGS_JS) + f"process.stdout.write(JSON.stringify(run({json.dumps(aria)}, {json.dumps(user)}).invalid));"
+    return detect_tests._node(script)
+
+
+@pytest.mark.parametrize("aria, user, counts", [
+    ([], [PLAIN], True), ([], [{}], True),  # a browser-validated form, or a control outside any form
+    ([], [NOVALIDATE], False), ([], [BUTTON], False),  # the press alone flags it; the shop's script posts the order
+    ([], [{**PLAIN, "hidden": True}], False), ([], [NOVALIDATE, PLAIN], True),
+    ([NOVALIDATE], [], True), ([{**NOVALIDATE, "hidden": True}], [], False), ([NOVALIDATE], [NOVALIDATE], True),
+])
+def test_user_invalid_counts_only_on_a_browser_validated_form(aria, user, counts):
+    """r8 middle review: Chrome sets :user-invalid on a novalidate form when Pay is pressed; the shop's own
+    aria-invalid always counts."""
+    assert _invalid(aria, user) is counts
 
 
 # ------------------------------------------------------------------ what the gate never holds

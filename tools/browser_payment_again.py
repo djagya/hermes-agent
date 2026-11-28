@@ -44,13 +44,18 @@ _SAME_CONTROL_TEXT = (
     "this control still there and no order, payment-taken or pending wording. Otherwise ask the owner (Danil): his new "
     "approval (a new card fill approval) covers one more Pay press.")
 
-# The page's own flags (one boolean each): a field flagged invalid, and the document still busy.
+# The page's own flags (one boolean each): a field flagged invalid, and the document still busy. The pressed
+# control's own formnovalidate is not read (no handle here): a form holding one counts as script-validated.
 FLAGS_JS = r"""(() => {
   const shown = (el) => el.getClientRects().length > 0;
-  let marked;
-  try { marked = document.querySelectorAll('[aria-invalid=true],:user-invalid'); }
-  catch (e) { marked = document.querySelectorAll('[aria-invalid=true]'); }
-  return {invalid: Array.from(marked).some(shown),
+  // The shop flags a field itself (aria-invalid). Chrome's :user-invalid also fires when Pay is pressed on a form
+  // the shop validates with its own script (novalidate): there it counts only on a browser-validated form.
+  let marked = Array.from(document.querySelectorAll('[aria-invalid=true]'));
+  try {
+    marked = marked.concat(Array.from(document.querySelectorAll(':user-invalid')).filter(
+      (el) => !(el.form && (el.form.noValidate || el.form.querySelector('[formnovalidate]')))));
+  } catch (e) {}
+  return {invalid: marked.some(shown),
           busy: document.readyState !== 'complete' || Array.from(document.querySelectorAll('[aria-busy=true]')).some(shown)};
 })()"""
 # On the pressed element (resolved by its backendNodeId): connected, rendered and enabled.

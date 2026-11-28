@@ -290,6 +290,11 @@ TAKEN_PHRASES = [  # approach review 2's probe texts: each gave pay_again at 690
     "Wir haben 49,99 EUR von Ihrer Karte abgebucht. Bitte prüfen Sie die markierten Felder.",
     "Your payment went through.", "Der Betrag wurde Ihrem Konto belastet.", "Der Betrag wird eingezogen.",
     "The amount was debited from your account.", "Payment captured.",
+    # r9: money-taken wording the first list missed
+    "Zahlung war erfolgreich, aber die Bestellung konnte nicht gespeichert werden. Bitte prüfen Sie die markierten "
+    "Felder.", "Ihre Zahlung war erfolgreich", "Bezahlung abgeschlossen", "Zahlungsstatus: bezahlt",
+    "Zahlung autorisiert", "Zahlung genehmigt", "Payment approved", "Transaction approved", "Payment authorised",
+    "Amount paid", "Charge succeeded", "Transaction completed", "We've received your payment",
 ]
 PENDING_PHRASES = [
     "Your payment has not been confirmed yet. Please approve it in your banking app.",

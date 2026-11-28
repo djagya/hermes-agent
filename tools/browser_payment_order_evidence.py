@@ -87,7 +87,11 @@ FAILURE_SRC = (
 # D-1209 a (``browser_payment_again``): page text only ever vetoes a second press of the same Pay control. Money
 # taken, in any sentence ("Your card was charged, but saving ... failed", "Abbuchung erfolgt"): wide on purpose, a
 # word more only refuses more.
-TAKEN_SRC = (r"(?<!%L%)(?:charged|debited|captured|taken|went through|abgebucht|belastet|eingezogen|erfolgt)(?!%L%)")
+TAKEN_SRC = (r"(?<!%L%)(?:charged|debited|captured|taken|went through|abgebucht|belastet|eingezogen|erfolgt|"
+             # the status words alone are no money taken after "not"/"nicht" ("nicht erfolgreich", "not completed")
+             r"(?<!nicht )(?<!not )(?:paid|approved|authori[sz]ed|deducted|billed|succeeded|successful|completed?|"
+             r"received|bezahlt|gezahlt|genehmigt|autorisiert|freigegeben|verbucht|abgerechnet|reserviert|vorgemerkt|"
+             r"erfolgreich|abgeschlossen))(?!%L%)")
 # The payment still on its way (a bank app to approve, a wait): never pay_again, whatever else the page shows.
 # "noch nicht", "not yet", "still" count only beside a payment or order word in the same sentence ("Noch nicht
 # registriert?" on a checkout is no pending payment).
