@@ -428,6 +428,9 @@ NAMED = {  # the cases a reviewer found (r3 middle review H1, approach review M1
                    ("done",), ("pay", JK, {}, False)),
     "two_controls": (("pay", "BESTÄTIGEN", {}, False), ("pay", JK, {"failure": True}, False), ("done",),
                      ("pay", "BESTÄTIGEN", {}, False), ("pay", JK, {}, False)),
+    "popup_between_grant_and_press": (("pay", JK, {"failure": True}, False), ("done",), ("page", {"popup": True}),
+                                      ("pay", JK, {}, False)),
+    "popup_before_done": (("pay", JK, {"failure": True}, False), ("page", {"popup": True}), ("done",)),
 }
 
 

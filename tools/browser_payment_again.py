@@ -197,16 +197,22 @@ async def probe(sup: Any, sid: str, tree: tuple, child_sessions: dict) -> dict:
 
 def grant(sup: Any, token: Any) -> bool:
     """payment_done's not-reached exit: store ``probe``'s token when it still holds (the same record and latest
-    Pay-like press, no press since, nothing loading). True when stored."""
+    Pay-like press, no press since, nothing loading), else store "no", so the stored answer is always the one of
+    the payment_done that ended last. True when stored."""
     from tools import browser_payment_surface as surface
     from tools.browser_payment_detect import inflight
 
     with surface._LOCK:
         gen = _record(sup)
-    if token is None or gen is None or inflight(sup, gen):
+    if gen is None:
         return False
+    holds = token is not None and not inflight(sup, gen)
     with surface._LOCK:
-        if _record(sup) is not gen or _eligible(gen, token[0][:2]) != token[:2]:
+        if _record(sup) is not gen:
+            return False
+        if not holds or _eligible(gen, token[0][:2]) != token[:2]:
+            if gen.again is not None:
+                gen.again.granted = None
             return False
         gen.again.granted, gen.again.wording = token[0], token[2]
     logger.info("payment_done: pay_again for the latest Pay press")
