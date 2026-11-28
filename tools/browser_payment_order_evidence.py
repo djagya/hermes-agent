@@ -89,7 +89,7 @@ FAILURE_SRC = (
 # word more only refuses more.
 TAKEN_SRC = (r"(?<!%L%)(?:charged|debited|captured|taken|went through|abgebucht|belastet|eingezogen|erfolgt|"
              # the status words alone are no money taken after "not"/"nicht" ("nicht erfolgreich", "not completed")
-             r"(?<!nicht )(?<!not )(?:paid|approved|authori[sz]ed|deducted|billed|succeeded|successful|completed?|"
+             r"(?<!nicht )(?<!not )(?:paid|approved|authori[sz]ed|deducted|billed|succeeded|successful|completed|"
              r"received|bezahlt|gezahlt|genehmigt|autorisiert|freigegeben|verbucht|abgerechnet|reserviert|vorgemerkt|"
              r"erfolgreich|abgeschlossen))(?!%L%)")
 # The payment still on its way (a bank app to approve, a wait): never pay_again, whatever else the page shows.

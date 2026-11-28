@@ -316,7 +316,12 @@ def _three(found):
     return {k: found[k] for k in _THREE}
 
 
-@pytest.mark.parametrize("text", DECLINE_PHRASES + TAKEN_PHRASES + PENDING_PHRASES + PENDING_ONLY_PHRASES)
+# the hints beside a field the form flags (the D-0961 retry): no money-taken word may match them
+FIELD_HINTS = ["Please complete this field.", "Please complete all required fields.",
+               "Bitte füllen Sie dieses Feld aus.", "Bitte vervollständigen Sie Ihre Angaben."]
+
+
+@pytest.mark.parametrize("text", DECLINE_PHRASES + TAKEN_PHRASES + PENDING_PHRASES + PENDING_ONLY_PHRASES + FIELD_HINTS)
 def test_money_taken_or_pending_is_a_veto_and_a_plain_decline_is_none(text):
     found = evidence.wording("Zur Kasse", "Jetzt kaufen Noch nicht registriert? " + text)
     assert found["taken"] is (text in TAKEN_PHRASES), found
