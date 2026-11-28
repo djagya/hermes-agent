@@ -4,6 +4,7 @@ Pay-like press. The whole input: every state Sera can see after a Pay press, eac
 makes for ``pay_again``, and the press after it. Fake supervisor and fake CDP only; synthetic data."""
 
 import asyncio
+import random
 
 import pytest
 
@@ -45,6 +46,8 @@ class AgainSup(detect_tests.ShopSup):
         self.pressable, self.invalid, self.busy, self.gone = True, False, False, False
         self.lose_release, self.popup = False, False
         self.fault, self.armed, self.fired, self.arm_at_release, self.slow_s = None, False, 0, False, 1.3
+        self.stage = None  # the last again-look read seen (``pressable``, then ``tabs``): where a fault lands
+        self.ordered = False  # ``change`` happened: the order shows from then on, whatever a press makes the page show
 
     def _where(self, method, params):
         expression = params.get("expression")
@@ -53,36 +56,41 @@ class AgainSup(detect_tests.ShopSup):
                 "isolated_world": method == "Page.createIsolatedWorld",
                 "wording_scan": expression == evidence.SCAN_JS,
                 "flags": expression == again.FLAGS_JS,
-                "tabs_check": method == "Target.getTargets" and bool(self.calls)
-                and self.calls[-1][1].get("expression") == again.FLAGS_JS,
+                "tabs": method == "Target.getTargets" and self.stage == "pressable",  # the look's tab read
                 "resolve_node": method == "DOM.resolveNode",
                 "pressable": fn == again._PRESSABLE}
 
     async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
-        if self.armed and self.fault and self._where(method, params or {}).get(self.fault[0]):
+        where = self._where(method, params or {})
+        self.stage = ("pressable" if where["pressable"] else "tabs" if where["tabs"]
+                      else None if where["flags"] else self.stage)
+        if self.armed and self.fault and where.get(self.fault[0]):
             self.fired += 1
             kind = self.fault[1]
             if kind == "fail":
                 raise RuntimeError(f"CDP error on id=1: {method} failed")
-            if kind == "slow":  # longer than payment_done's probe bound: the look times out, its answer is late
+            if kind == "slow":  # longer than the read's bound: the look times out, its answer is late
                 await asyncio.sleep(self.slow_s)  # health: allow HX013 -- the injected fault is the slowness itself
             if kind == "state":
                 self.change()
         return await super()._cdp(method, params, session_id=session_id, timeout=timeout)
 
     async def _payment_tree(self, sid, child_sessions):
-        if self.armed and self.fault == ("tree_after", "state") and self.calls and self.calls[-1][1].get(
-                "functionDeclaration") == again._PRESSABLE:
+        if self.armed and self.fault == ("tree_after", "state") and self.stage == "tabs":  # the look's last read
             self.fired += 1
             self.change()
         return self.tree
 
     def change(self):
-        """A state change at the faulted read: a Pay-like press lands (another payment_click) and the page shows
-        the order."""
+        """A state change at the faulted read: another Pay-like press on the latest pressed control lands (a
+        concurrent payment_click) and the page shows the order in place."""
         with surface._LOCK:
             gen = surface._GENS.get(self)
-            gen.pay_presses += 1
+            if gen.again is not None and gen.again.keys:
+                gen.pay_presses += 1
+                last = gen.again.keys[-1]
+                again.book(gen, last[:3], last[3], {"tabs": gen.again.tabs})
+        self.ordered = True
         self.page.update(THANKS)
 
     def answer(self, method, params, session_id=None):
@@ -108,7 +116,10 @@ class AgainSup(detect_tests.ShopSup):
             infos = super().answer(method, params, session_id)
             return {"targetInfos": infos["targetInfos"] + [
                 {"targetId": "POP", "type": "page", "openerId": "TAB", "url": "https://bank.test/redirect"}]}
-        return super().answer(method, params, session_id)
+        out = super().answer(method, params, session_id)
+        if self.ordered and THANKS["text"] not in self.page["text"]:
+            self.page["text"] = THANKS["text"] + " " + self.page["text"]
+        return out
 
 
 def _sunday():
@@ -247,83 +258,6 @@ def test_the_same_pay_control_goes_again_only_after_pay_again(state, ask, pay_ag
             assert "payment_done" in out["error"]
 
 
-# ------------------------------------------------------------------ faults at each read payment_done makes
-
-
-FAULTS = [(where, kind) for where in ("Target.getTargets", "isolated_world", "wording_scan", "flags", "tabs_check",
-                                      "resolve_node", "pressable")
-          for kind in ("fail", "slow", "state")] + [("tree_after", "state")]
-
-
-@pytest.mark.parametrize("fault", FAULTS, ids=[f"{w}-{k}" for w, k in FAULTS])
-def test_a_failed_slow_or_changed_read_gives_no_pay_again(fault):
-    """The pay_again row (a decline in place) with one fault from the first Pay press on: a failed call, a call slower
-    than payment_done's probe bound (its answer comes late), or a state change at that read (another Pay press lands,
-    the page shows the order). Each one turns the row's pay_again off (none is a no-op), and the same control stays
-    refused."""
-    sup = _sunday()
-    first = _pay(sup, after={"page": DECLINED})
-    assert first["pay_pressed"] is True
-    sup.fault, sup.armed = fault, True
-    out = done.payment_done(sup)
-    assert sup.fired > 0, "the fault was injected"
-    assert out["error_type"] == "payment_confirmation_not_reached" and out["pay_again"] is False, out
-    sup.armed = False
-    presses = len(_mouse_presses(sup))
-    second = _pay(sup)
-    assert second["success"] is False and len(_mouse_presses(sup)) == presses, second
-
-
-def test_without_a_fault_the_same_row_gives_pay_again():
-    """The control for the fault table: the same steps with nothing injected."""
-    sup = _sunday()
-    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
-    sup.fault, sup.armed = ("flags", "fail"), False
-    assert done.payment_done(sup)["pay_again"] is True and sup.fired == 0
-
-
-def test_a_granted_press_that_comes_back_uncertain_gives_no_further_pay_again():
-    sup = _sunday()
-    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
-    assert done.payment_done(sup)["pay_again"] is True
-    sup.lose_release = True
-    assert _pay(sup)["error_type"] == "payment_click_uncertain"
-    assert done.payment_done(sup)["pay_again"] is False
-    assert _pay(sup)["error_type"] == SAME and len(_mouse_presses(sup)) == 2
-
-
-def test_another_pay_like_press_after_pay_again_voids_it():
-    sup = _sunday()
-    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
-    assert done.payment_done(sup)["pay_again"] is True
-    assert _press(sup, "BESTÄTIGEN")["pay_pressed"] is True  # another Pay-like control: the next step
-    assert _pay(sup)["error_type"] == SAME, "pay_again was for the press before this one"
-
-
-def test_a_preparatory_press_after_pay_again_keeps_it_while_the_failure_shows():
-    """A checkbox is no Pay-like press: the same Pay then goes once. An answer given on a flagged field alone (no
-    failure wording) survives the field being fixed (the flag is gone by then); an answer given on failure wording
-    needs the failure still showing."""
-    sup = _sunday()
-    sup.rows = list(detect_tests.SUNDAY_ROWS) + [_row("AGB akzeptieren", role="checkbox", i=2)]
-    assert _pay(sup, after={"page": DECLINED, "invalid": True})["pay_pressed"] is True
-    assert done.payment_done(sup)["pay_again"] is True
-    assert _press(sup, "AGB akzeptieren", after={"invalid": False})["success"] is True
-    assert _pay(sup)["pay_pressed"] is True and len(_mouse_presses(sup)) == 3
-    sup2 = _sunday()
-    sup2.rows = list(sup.rows)
-    assert _pay(sup2, after={"invalid": True})["pay_pressed"] is True
-    assert done.payment_done(sup2)["pay_again"] is True
-    assert _press(sup2, "AGB akzeptieren", after={"invalid": False})["success"] is True
-    assert _pay(sup2)["pay_pressed"] is True and len(_mouse_presses(sup2)) == 3, "flag fixed, then the same Pay"
-    sup3 = _sunday()
-    sup3.rows = list(sup.rows)
-    assert _pay(sup3, after={"page": DECLINED})["pay_pressed"] is True
-    assert done.payment_done(sup3)["pay_again"] is True
-    assert _press(sup3, "AGB akzeptieren", after={"page": CART})["success"] is True
-    assert _pay(sup3)["error_type"] == SAME and len(_mouse_presses(sup3)) == 2, "wording gone: refused"
-
-
 # ------------------------------------------------------------------ what the gate never holds
 
 
@@ -396,77 +330,202 @@ def test_a_slow_flags_read_never_delays_the_detection_after_the_press(monkeypatc
         assert surface._GENS[sup].paid is True
 
 
-def test_a_slow_flags_read_before_the_press_gives_no_pay_again(monkeypatch):
-    """The flags read right before the press is dropped when slower than its own bound: no pay_again later."""
-    monkeypatch.setattr(detect, "_FLAGS_S", 0.2, raising=False)
+# ------------------------------------------------------------------ the generator: sequences against a model of the rule
+
+_FAILURE = " Zahlung fehlgeschlagen. Bitte versuche es erneut."
+_ORDER = {"weak": " Your payment is processed securely.", "strong": " Vielen Dank für Ihre Bestellung! Bestellnummer 4711."}
+AGB = "AGB akzeptieren"
+
+
+class Rule:
+    """The rule in words (D-1209 a, D-1237 a, D-0961), written apart from the code: a Pay-like press on a control
+    pressed before in this approval goes only when the last payment_done after the latest Pay-like press said
+    pay_again for that control and the page at the press still allows it. payment_done says pay_again only when the
+    latest press's answer came back, the page showed neither failure wording nor a flagged field right before it,
+    and now shows one of them, with no order wording, nothing busy, the control enabled and no tab a payment tab
+    opened. At the press a failure-wording answer needs the wording still there; a flag-only one does not."""
+
+    def __init__(self):
+        self.page = {"failure": False, "invalid": False, "busy": False, "order": None, "pressable": True,
+                     "popup": False}
+        self.pressed, self.latest, self.answered, self.before, self.grant = set(), None, False, None, None
+
+    def _allows(self, wording):
+        p = self.page
+        if p["order"] or p["busy"] or not p["pressable"] or p["popup"]:
+            return False
+        return p["failure"] or (p["invalid"] if wording is None else not wording)
+
+    def press(self, caption, effect, uncertain):
+        if caption in self.pressed and not (self.grant is not None and self.latest == caption
+                                            and self._allows(self.grant)):
+            return SAME
+        self.before = (self.page["failure"], self.page["invalid"])
+        self.pressed.add(caption)
+        self.latest, self.answered, self.grant = caption, not uncertain, None
+        self.page.update(effect)
+        return "uncertain" if uncertain else "pressed"
+
+    def done(self):
+        ok = self.latest is not None and self.answered and self.before == (False, False) and self._allows(None)
+        self.grant = self.page["failure"] if ok else None
+        return ok
+
+
+def _shown(page):
+    """The fake page for the rule's page."""
+    text = CART["text"] + (_FAILURE if page["failure"] else "") + _ORDER.get(page["order"], "")
+    return {"page": {**CART, "text": text}, **{k: page[k] for k in ("invalid", "busy", "pressable", "popup")}}
+
+
+def _show(sup, page):
+    for key, value in _shown(page).items():
+        sup.page.update(value) if key == "page" else setattr(sup, key, value)
+
+
+def _step(sup, rule, op):
+    """``(what the code did, what the rule says)`` for one step."""
+    if op[0] == "pay":
+        _, caption, effect, uncertain = op
+        sup.lose_release = uncertain
+        out = _press(sup, caption, after=_shown({**rule.page, **effect}))
+        sup.lose_release = False
+        got = "pressed" if out.get("pay_pressed") is True else (
+            "uncertain" if out.get("error_type") == "payment_click_uncertain" else out.get("error_type"))
+        return got, rule.press(caption, effect, uncertain)
+    if op[0] == "done":
+        out = done.payment_done(sup)
+        assert out["error_type"] == "payment_confirmation_not_reached", out
+        return out["pay_again"], rule.done()
+    rule.page.update(op[1] if op[0] == "page" else {"invalid": False})
+    if op[0] == "page":
+        _show(sup, rule.page)
+        return None, None
+    return _press(sup, AGB, after=_shown(rule.page)).get("success"), True  # a fill or preparatory press: no Pay
+
+
+def _start():
     sup = _sunday()
-    sup.fault, sup.armed = ("flags", "slow"), True
-    assert _pay(sup, after={"invalid": True, "armed": False})["pay_pressed"] is True
-    assert done.payment_done(sup)["pay_again"] is False
+    sup.rows = list(detect_tests.SUNDAY_ROWS) + [_row(AGB, role="checkbox", i=2)]
+    return sup, Rule()
 
 
-def test_an_unread_tab_list_before_the_press_gives_no_pay_again(monkeypatch):
-    async def unread(_sup):
-        return None
-
-    monkeypatch.setattr(detect, "page_tabs", unread)
-    sup = _sunday()
-    assert _pay(sup, after={"page": DECLINED, "popup": True})["pay_pressed"] is True
-    assert done.payment_done(sup)["pay_again"] is False
-    assert _pay(sup)["error_type"] == SAME
-
-
-def test_a_tab_the_press_opened_late_gives_no_pay_again():
-    """The bank's tab opens after the press's answer came back (a slow XHR, then window.open)."""
-    sup = _sunday()
-    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
-    sup.popup = True
-    assert done.payment_done(sup)["pay_again"] is False
-    assert _pay(sup)["error_type"] == SAME and len(_mouse_presses(sup)) == 1
-
-
-def _thanks_in_place(sup):  # the order confirmed in place, the Pay control kept, the failure line still there
-    sup.page.update({**CART, "text": "Vielen Dank für Ihre Bestellung! Bestellnummer 12345. Zahlung fehlgeschlagen? "
-                                     "Schreib uns."})
+EFFECTS = [{"failure": True}, {"invalid": True}, {"busy": True}, {}, {"failure": True, "busy": True},
+           {"failure": True, "invalid": True}, {"order": "weak", "failure": True}, {"order": "strong", "failure": True},
+           {"failure": True, "pressable": False}, {"failure": True, "popup": True}]
+CHANGES = [{"busy": True}, {"busy": False}, {"failure": False}, {"failure": True}, {"order": "weak"},
+           {"order": "strong"}, {"order": None}, {"popup": True}, {"pressable": False}, {"pressable": True},
+           {"invalid": True}, {"failure": False, "invalid": True}]
+JK = "JETZT KAUFEN"
+NAMED = {  # the cases a reviewer found (r3 middle review H1, approach review M1) and the owner's D-0961 flag case
+    "false_after_true": (("pay", JK, {"failure": True}, False), ("done",), ("page", {"busy": True}), ("done",),
+                         ("page", {"busy": False}), ("pay", JK, {}, False)),
+    "busy_at_the_press": (("pay", JK, {"failure": True}, False), ("done",), ("page", {"busy": True}),
+                          ("pay", JK, {}, False)),
+    "wording_gone_flag_shown": (("pay", JK, {"failure": True}, False), ("done",),
+                                ("page", {"failure": False, "invalid": True}), ("pay", JK, {}, False)),
+    "flag_fixed": (("pay", JK, {"invalid": True}, False), ("done",), ("fix",), ("pay", JK, {"failure": True}, False),
+                   ("done",), ("pay", JK, {}, False)),
+    "two_controls": (("pay", "BESTÄTIGEN", {}, False), ("pay", JK, {"failure": True}, False), ("done",),
+                     ("pay", "BESTÄTIGEN", {}, False), ("pay", JK, {}, False)),
+}
 
 
-def _order_number_in_place(sup):  # failure wording gone, an order number shown, the Pay control kept
-    sup.page.update({**CART, "text": CART["text"] + " Vielen Dank für Ihre Bestellung! Bestellnummer 4711."})
+def _generated(n=48, length=6):
+    rng = random.Random(1209)
+    out = []
+    for _ in range(n):
+        ops = []
+        while len(ops) < length:
+            r = rng.random()
+            if r < 0.4:
+                ops.append(("pay", JK if r < 0.3 else "BESTÄTIGEN", rng.choice(EFFECTS), rng.random() < 0.08))
+                if rng.random() < 0.6:
+                    ops.append(("done",))
+            elif r < 0.65:
+                ops.append(("done",))
+            elif r < 0.9:
+                ops.append(("page", rng.choice(CHANGES)))
+            else:
+                ops.append(("fix",))
+        out.append(tuple(ops))
+    return out
 
 
-def _failure_gone(sup):  # the page shows nothing any more (the order may have gone through by XHR)
-    sup.page.update(CART)
+SEQUENCES = list(NAMED.values()) + _generated()
 
 
-def _new_tab(sup):  # a tab opened after payment_done's answer
-    sup.popup = True
+@pytest.fixture
+def _short(monkeypatch):
+    monkeypatch.setattr(done, "_WAIT_S", 0.12)
+    monkeypatch.setattr(detect, "_BEFORE_SCAN_S", 0.5)
+    monkeypatch.setattr(detect, "_FLAGS_S", 0.3)
 
 
-@pytest.mark.parametrize("change", [_thanks_in_place, _order_number_in_place, _failure_gone, _new_tab],
-                         ids=lambda f: f.__name__)
-def test_pay_again_counts_only_while_the_page_still_shows_the_failure(change):
-    """payment_done granted pay_again; before the press the page changed: the grant does not cover the press."""
-    sup = _sunday()
-    assert _pay(sup, after={"page": DECLINED})["pay_pressed"] is True
-    assert done.payment_done(sup)["pay_again"] is True
-    change(sup)
-    out = _pay(sup)
-    assert out["error_type"] in (SAME, detect.SPENT) and len(_mouse_presses(sup)) == 1, out
+def test_every_sequence_does_what_the_rule_says(_short):
+    """Done when 1-3: each step of each sequence (Pay presses on two controls with what the page shows after them,
+    payment_done, page changes between calls, a field fixed by a non-Pay press) against the rule."""
+    seen = {"granted": 0, "again": 0, "held": 0}
+    for ops in SEQUENCES:
+        sup, rule = _start()
+        for i, op in enumerate(ops):
+            again_press = op[0] == "pay" and op[1] in rule.pressed
+            got, want = _step(sup, rule, op)
+            assert got == want, (ops, i, got, want)
+            seen["granted"] += got is True and op[0] == "done"
+            seen["again"] += again_press and got == "pressed"
+            seen["held"] += got == SAME
+    assert min(seen.values()) >= 5, seen  # the generator reaches each outcome
 
 
-def _order_wording_only(sup):  # order wording (no thank-you sentence, no order number) beside the Pay control
-    sup.page.update({**CART, "text": CART["text"] + " Your payment is processed securely."})
+def _sites():
+    """Per fault side, the prefixes whose last step is permissive: ``done`` (pay_again true), ``press`` (the same
+    control pressed again), ``base`` (a first Pay press whose payment_done right after it says pay_again)."""
+    sites = {"done": [], "press": [], "base": []}
+    for ops in SEQUENCES:
+        rule, outcomes = Rule(), []
+        for i, op in enumerate(ops):
+            again_press = op[0] == "pay" and op[1] in rule.pressed
+            want = (rule.press(*op[1:]) if op[0] == "pay" else rule.done() if op[0] == "done"
+                    else rule.page.update(op[1] if op[0] == "page" else {"invalid": False}))
+            outcomes.append((op, want, again_press))
+            if op[0] == "done" and want is True:
+                sites["done"].append((ops[:i + 1], i))
+                prev_op, prev_want, prev_again = outcomes[i - 1]
+                if prev_op[0] == "pay" and prev_want == "pressed" and not prev_again:
+                    sites["base"].append((ops[:i + 1], i - 1))
+            if again_press and want == "pressed":
+                sites["press"].append((ops[:i + 1], i))
+    return sites
 
 
-@pytest.mark.parametrize("change", [_thanks_in_place, _order_number_in_place, _order_wording_only, _new_tab],
-                         ids=lambda f: f.__name__)
-def test_a_flag_only_pay_again_still_needs_the_page_free_of_order_signs_at_the_press(change):
-    """payment_done granted pay_again on a flagged field alone; the field is fixed, then the page shows order wording,
-    strong order wording or a new tab before the press: refused (a new document is another control, not held)."""
-    sup = _sunday()
-    assert _pay(sup, after={"invalid": True})["pay_pressed"] is True
-    assert done.payment_done(sup)["pay_again"] is True
-    sup.invalid = False
-    change(sup)
-    out = _pay(sup)
-    assert out["error_type"] in (SAME, detect.SPENT) and len(_mouse_presses(sup)) == 1, out
+KINDS = ("fail", "slow", "state")
+FAULT_RUNS = ([("done", w, k) for w in ("Target.getTargets", "isolated_world", "wording_scan", "flags", "resolve_node",
+                                        "pressable", "tabs") for k in KINDS] + [("done", "tree_after", "state")]
+              + [("press", w, k) for w in ("wording_scan", "flags", "resolve_node", "pressable", "tabs") for k in KINDS]
+              + [("base", w, k) for w in ("wording_scan", "flags", "tabs") for k in KINDS])
+SITES = _sites()
+
+
+@pytest.mark.parametrize("n, run", list(enumerate(FAULT_RUNS)), ids=[f"{s}-{w}-{k}" for s, w, k in FAULT_RUNS])
+def test_a_fault_at_any_read_takes_the_permission_away(_short, n, run):
+    """Each read on both sides failed, slower than its bound (its answer late) or with the state changed at it
+    (another press lands, the order shows), on a step the rule (and the run without the fault, checked above) makes
+    permissive: the step, or the payment_done right after a faulted first press, is no longer permissive, and (no
+    pay_again stored) the same control is then held."""
+    side, where, kind = run
+    ops, at = SITES[side][n % len(SITES[side])]
+    sup, rule = _start()
+    sup.slow_s = 1.1
+    for i, op in enumerate(ops):
+        sup.fault, sup.armed, sup.stage = (where, kind), i == at, None
+        got, want = _step(sup, rule, op)
+        sup.armed = False
+        if i == at:
+            assert sup.fired > 0, "the fault was injected"
+        if i < at or (side == "base" and i == at):
+            assert got == want, (ops, i, got, want)
+    assert got in (False, SAME), (ops, got)  # the clean run said True or pressed here
+    if side != "press":  # no pay_again stored: the same control is held (a refused press leaves the stored one)
+        presses = len(_mouse_presses(sup))
+        assert _press(sup, rule.latest)["error_type"] == SAME and len(_mouse_presses(sup)) == presses
