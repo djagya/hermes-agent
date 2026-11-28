@@ -452,7 +452,8 @@ def _generated(n=48, length=6):
     return out
 
 
-SEQUENCES = list(NAMED.values()) + _generated()
+GENERATED = _generated()
+SEQUENCES = list(NAMED.values()) + GENERATED
 
 
 @pytest.fixture
@@ -462,11 +463,12 @@ def _short(monkeypatch):
     monkeypatch.setattr(detect, "_FLAGS_S", 0.3)
 
 
-def test_every_sequence_does_what_the_rule_says(_short):
+@pytest.mark.parametrize("name", [*NAMED, "generated"])
+def test_every_sequence_does_what_the_rule_says(_short, name):
     """Done when 1-3: each step of each sequence (Pay presses on two controls with what the page shows after them,
     payment_done, page changes between calls, a field fixed by a non-Pay press) against the rule."""
     seen = {"granted": 0, "again": 0, "held": 0}
-    for ops in SEQUENCES:
+    for ops in GENERATED if name == "generated" else [NAMED[name]]:
         sup, rule = _start()
         for i, op in enumerate(ops):
             again_press = op[0] == "pay" and op[1] in rule.pressed
@@ -475,7 +477,7 @@ def test_every_sequence_does_what_the_rule_says(_short):
             seen["granted"] += got is True and op[0] == "done"
             seen["again"] += again_press and got == "pressed"
             seen["held"] += got == SAME
-    assert min(seen.values()) >= 5, seen  # the generator reaches each outcome
+    assert name != "generated" or min(seen.values()) >= 5, seen  # the generator reaches each outcome
 
 
 def _sites():
